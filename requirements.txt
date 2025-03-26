@@ -1,3 +1,5 @@
+torch
+opencv-python
 munch
 grpcio
 grpcio-tools
