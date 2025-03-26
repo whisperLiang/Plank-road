@@ -43,15 +43,7 @@ Please install the following libraries on each edge node.
 1. Install the deep learning framework pytorch and opencv-python on the [Jetson](https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048).
 2. Install dependent libraries.
 ```bash
-pip3 install munch
-pip3 install grpcio
-pip3 install grpcio-tools
-pip3 install loguru
-pip3 install mysql-connector-python
-pip3 install mapcalc
-pip3 install APScheduler
-pip3 install imutils
-pip3 install PyYAML
+pip3 install -r requirements.txt
 ```
 **On cloud**
 
