@@ -149,17 +149,5 @@ cd ~/Plank Road
 python3 edge_client.py
 ```
 
-## Contributing
-
-If you have any questions, please feel free to contact us.
-Email: guanyugao@gmail.com; gygao@njust.edu.cn; dongyuqi@njust.edu.cn
-
-## License
-
-MIT License
-
-Copyright (c) 2023 Multimedia Systems and Networking Group
-
-A copy of the license is available at the following link:
-
-https://opensource.org/license/mit/.
+## Reference
+[EdgeCam](https://github.com/MSNLAB/EdgeCam)
