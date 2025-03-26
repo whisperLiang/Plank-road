@@ -1,0 +1,9 @@
+munch
+grpcio
+grpcio-tools
+loguru
+mysql-connector-python
+mapcalc
+APScheduler
+imutils
+PyYAML
