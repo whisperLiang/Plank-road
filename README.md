@@ -71,7 +71,7 @@ FLUSH PRIVILEGES;
 2.2 修改 MySQL 配置文件
 ```bash
 # 打开配置文件
-sudo nano /etc/mysql/my.cnf
+sudo nano /etc/mysql/mysql.conf.d/mysqld.cnf
 # 修改bind-address配置项
 bind-address = 0.0.0.0
 # 重启mysql服务
