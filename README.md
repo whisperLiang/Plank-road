@@ -56,6 +56,7 @@ Similar to the installation on the edge node, install the corresponding version 
 sudo apt install mysql-server
 ```
 2. The MySQL database is configured to allow remote connections.
+
 2.1 修改用户权限
 ```bash
 # 登录数据库
