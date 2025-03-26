@@ -56,6 +56,40 @@ Similar to the installation on the edge node, install the corresponding version 
 sudo apt install mysql-server
 ```
 2. The MySQL database is configured to allow remote connections.
+2.1 修改用户权限
+```bash
+# 登录数据库
+sudo mysql -u root -p
+# 创建用户
+CREATE USER 'your_user'@'%' IDENTIFIED BY 'your_password';
+# 授予用户权限
+GRANT ALL PRIVILEGES ON *.* TO 'your_user'@'%' WITH GRANT OPTION;
+# 刷新权限
+FLUSH PRIVILEGES;
+```
+2.2 修改 MySQL 配置文件
+```bash
+# 打开配置文件
+sudo nano /etc/mysql/my.cnf
+# 修改bind-address配置项
+bind-address = 0.0.0.0
+# 重启mysql服务
+sudo systemctl restart mysql
+```
+2.3 配置防火墙
+```bash
+# ufw防火墙
+sudo ufw allow 3306/tcp
+sudo ufw reload
+
+# iptables防火墙
+# sudo iptables -A INPUT -p tcp --dport 3306 -j ACCEPT
+```
+2.4 测试远程连接
+```bash
+# 在远程主机上，尝试使用以下命令连接到 MySQL 数据库：
+mysql -u your_user -h your_server_ip -p
+```
 
 ## Usage
 
