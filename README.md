@@ -37,17 +37,74 @@ The main implementation details of Plank Road are shown below.
 
 ## Install
 
+### Create a virtual environment (recommended)
+
+Use [uv](https://github.com/astral-sh/uv) for fast environment management:
+
+```bash
+# Install uv (if not already installed)
+pip install uv
+
+# Create a virtual environment in .venv/
+uv venv
+
+# Activate the environment
+# Linux / macOS
+source .venv/bin/activate
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+```
+
 **On edge** 
 
 Please install the following libraries on each edge node.
 1. Install the deep learning framework pytorch and opencv-python on the [Jetson](https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048).
 2. Install dependent libraries.
 ```bash
-pip3 install -r requirements.txt
+uv pip install -r requirements.txt
 ```
+3. Compile the gRPC stubs (required — the edge imports the generated files to communicate with the cloud).
+```bash
+uv pip install grpcio-tools
+
+python -m grpc_tools.protoc \
+    -I ./grpc_server/protos \
+    --python_out=./grpc_server \
+    --grpc_python_out=./grpc_server \
+    ./grpc_server/protos/message_transmission.proto
+```
+
 **On cloud**
 
 Similar to the installation on the edge node, install the corresponding version of Pytorch and required libraries.
+
+```bash
+uv pip install -r requirements.txt
+```
+Also compile the gRPC stubs:
+```bash
+uv pip install grpcio-tools
+
+python -m grpc_tools.protoc \
+    -I ./grpc_server/protos \
+    --python_out=./grpc_server \
+    --grpc_python_out=./grpc_server \
+    ./grpc_server/protos/message_transmission.proto
+```
+
+### Recompile gRPC stubs after proto changes
+
+After modifying `grpc_server/protos/message_transmission.proto`, re-run the above `grpc_tools.protoc` command on **both the edge and the cloud**.
+
+On Windows (PowerShell), replace the line continuation `\` with a backtick `` ` ``:
+
+```powershell
+python -m grpc_tools.protoc `
+    -I ./grpc_server/protos `
+    --python_out=./grpc_server `
+    --grpc_python_out=./grpc_server `
+    ./grpc_server/protos/message_transmission.proto
+```
 
 **Database**
 
