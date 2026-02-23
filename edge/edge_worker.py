@@ -1,3 +1,5 @@
+import base64
+import io
 import os
 import sys
 import threading
@@ -9,15 +11,17 @@ import random
 import cv2
 import grpc
 import numpy as np
+import torch
 from queue import Queue
 from loguru import logger
 
 from database.database import DataBase
 from difference.diff import DiffProcessor
+from edge.drift_detector import CompositeDriftDetector
 from edge.info import TASK_STATE
-from edge.resample import history_sample, annotion_process
+from edge.resample import history_sample
 from edge.task import Task
-from edge.transmit import get_cloud_target, is_network_connected
+from edge.transmit import is_network_connected, request_cloud_training
 from grpc_server import message_transmission_pb2_grpc, message_transmission_pb2
 from grpc_server.rpc_server import MessageTransmissionServicer
 
@@ -41,6 +45,9 @@ class EdgeWorker:
         self.edge_processor = DiffProcessor.str_to_class(config.feature)()
         self.small_object_detection = Object_Detection(config, type='small inference')
 
+        # Drift detector (RCCDA-inspired)
+        self.drift_detector = CompositeDriftDetector(config)
+
         # create database and tables
         self.database = DataBase(self.config.database)
         self.database.use_database()
@@ -54,7 +61,6 @@ class EdgeWorker:
         self.pred_res = []
         self.avg_scores = []
         self.select_index = []
-        self.annotations = []
 
         # start the thread for diff
         self.diff = 0
@@ -314,9 +320,21 @@ class EdgeWorker:
         if detection_score is not None:
             creat_folder(self.config.retrain.cache_path)
             cv2.imwrite(os.path.join(self.config.retrain.cache_path,'frames', str(task.frame_index) + '.jpg'), frame)
-            self.avg_scores.append({task.frame_index: np.mean(detection_score)})
+            avg_score = float(np.mean(detection_score))
+            self.avg_scores.append({task.frame_index: avg_score})
             self.cache_count += 1
-            if self.cache_count >= self.config.retrain.collect_num:
+
+            # Query the drift detector; it may trigger a retrain ahead of the
+            # count-based threshold when concept drift is detected.
+            drift_detected = self.drift_detector.update(avg_score)
+            min_samples = max(getattr(self.config.retrain, 'select_num', 10), 10)
+            count_trigger = self.cache_count >= self.config.retrain.collect_num
+            drift_trigger = drift_detected and self.cache_count >= min_samples
+
+            if count_trigger or drift_trigger:
+                if drift_trigger and not count_trigger:
+                    logger.info("Drift detected — triggering cloud retraining early "
+                                "(cached={} samples)", self.cache_count)
                 smallest_elements = sorted(self.avg_scores, key=lambda d: list(d.values())[0])[:self.config.retrain.select_num]
                 self.select_index = [list(d.keys())[0] for d in smallest_elements]
                 logger.debug("the select index {}".format(self.select_index))
@@ -326,36 +344,47 @@ class EdgeWorker:
                 self.retrain_flag = True
 
 
-    # retrain
+    # retrain — continual learning is performed entirely on the cloud
     def retrain_worker(self):
-        self.annotations = []
         while True:
             if self.retrain_flag:
-                logger.info("retrain")
-                res_list = get_cloud_target(self.config.server_ip, self.select_index, self.config.retrain.cache_path)
-                for res in res_list:
-                    for score, label, box in zip(res['scores'], res['labels'], res['boxes']):
-                        self.annotations.append((res['index'], label, box[0], box[1], box[2], box[3], score))
-                if len(self.annotations):
-                    np.savetxt(os.path.join(self.config.retrain.cache_path,'annotation.txt'), self.annotations,
-                               fmt=['%d', '%d', '%f', '%f', '%f', '%f', '%f'], delimiter=',')
+                logger.info("Sending {} frames to cloud for continual learning",
+                            len(self.select_index))
+                num_epoch = int(getattr(self.config.retrain, 'num_epoch', 0))
+                success, model_b64, msg = request_cloud_training(
+                    self.config.server_ip,
+                    self.edge_id,
+                    self.select_index,
+                    self.config.retrain.cache_path,
+                    num_epoch,
+                )
 
-                self.small_object_detection.model_evaluation(
-                    self.config.retrain.cache_path, self.select_index)
-                self.small_object_detection.retrain(
-                    self.config.retrain.cache_path, self.select_index[:int(self.config.retrain.select_num*0.8)])
+                if success and model_b64:
+                    try:
+                        buf = io.BytesIO(base64.b64decode(model_b64))
+                        state_dict = torch.load(buf, map_location='cpu')
+                        with self.small_object_detection.model_lock:
+                            self.small_object_detection.model.load_state_dict(state_dict)
+                            self.small_object_detection.model.eval()
+                        logger.success("Edge model updated from cloud successfully")
+                    except Exception as exc:
+                        logger.exception("Failed to load cloud-returned model weights: {}", exc)
+                else:
+                    logger.error("Cloud continual learning failed: {}", msg)
+
                 self.retrain_flag = False
                 if self.use_history:
-                    self.select_index,self.avg_scores = history_sample(self.select_index,self.avg_scores)
-                    self.annotations = annotion_process(self.annotations, self.select_index)
-                    sample_files(os.path.join(self.config.retrain.cache_path, 'frames') ,self.select_index)
+                    self.select_index, self.avg_scores = history_sample(
+                        self.select_index, self.avg_scores)
+                    sample_files(
+                        os.path.join(self.config.retrain.cache_path, 'frames'),
+                        self.select_index)
                     self.cache_count = len(self.select_index)
                 else:
                     clear_folder(self.config.retrain.cache_path)
                     self.select_index = []
                     self.avg_scores = []
-                    self.annotations = []
-                if self.retrain_first == False:
+                if self.retrain_first is False:
                     self.last_collect_time = self.collect_time
                 self.retrain_first = False
                 self.collect_time_flag = True
