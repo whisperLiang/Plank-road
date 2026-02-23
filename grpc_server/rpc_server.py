@@ -1,3 +1,5 @@
+import json
+
 from loguru import logger
 
 from edge.task import Task
@@ -6,11 +8,13 @@ from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
 
 class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmissionServicer):
-    def __init__(self, local_queue, id, object_detection ,queue_info=None):
+    def __init__(self, local_queue, id, object_detection, queue_info=None, continual_learner=None):
         self.local_queue = local_queue
         self.id = id
         self.queue_info = queue_info
         self.object_detection = object_detection
+        # CloudContinualLearner instance; None on edge-side servicers
+        self.continual_learner = continual_learner
 
     def task_processor(self, request, context):
         logger.debug("task_processor")
@@ -71,5 +75,33 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             local_length=self.local_queue.qsize(),
         )
         return reply
+
+    def train_model_request(self, request, context):
+        """Cloud-side continual learning: label frames with the large model then
+        fine-tune the lightweight edge model and return the updated weights."""
+        logger.info(
+            "train_model_request from edge_id={} cache_path={} num_epoch={}",
+            request.edge_id, request.cache_path, request.num_epoch,
+        )
+        if self.continual_learner is None:
+            logger.error("train_model_request: continual_learner not configured")
+            return message_transmission_pb2.TrainReply(
+                success=False, model_data="", message="continual_learner not configured"
+            )
+        try:
+            frame_indices = json.loads(request.frame_indices)
+            success, model_data, message = self.continual_learner.get_ground_truth_and_retrain(
+                request.edge_id,
+                frame_indices,
+                request.cache_path,
+                int(request.num_epoch),
+            )
+        except Exception as exc:
+            logger.exception("train_model_request error: {}", exc)
+            success, model_data, message = False, "", str(exc)
+
+        return message_transmission_pb2.TrainReply(
+            success=success, model_data=model_data, message=message
+        )
 
 

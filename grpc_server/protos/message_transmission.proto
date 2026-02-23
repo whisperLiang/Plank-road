@@ -4,6 +4,9 @@ service MessageTransmission {
   rpc task_processor (MessageRequest) returns (MessageReply) {}
   rpc get_queue_info (InfoRequest) returns (InfoReply) {}
   rpc frame_processor (stream FrameRequest) returns (FrameReply) {}
+  // Cloud-side continual learning: edge sends collected frame indices,
+  // cloud retrains the lightweight model and returns updated weights.
+  rpc train_model_request (TrainRequest) returns (TrainReply) {}
 }
 
 message MessageRequest {
@@ -45,4 +48,22 @@ message InfoRequest {
 message InfoReply {
   int64 destination_id = 1;
   int64 local_length = 2;
+}
+
+// Continual learning messages
+message TrainRequest {
+  int64 edge_id = 1;
+  // JSON-serialised list of integer frame indices to use for retraining
+  string frame_indices = 2;
+  // Absolute path (on cloud) of the frame cache directory
+  string cache_path = 3;
+  // Number of training epochs (0 = use cloud default)
+  int64 num_epoch = 4;
+}
+
+message TrainReply {
+  bool success = 1;
+  // Base-64 encoded PyTorch state-dict bytes of the retrained lightweight model
+  string model_data = 2;
+  string message = 3;
 }

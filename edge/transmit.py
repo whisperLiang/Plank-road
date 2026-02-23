@@ -1,3 +1,4 @@
+import json
 import os
 
 import cv2
@@ -47,3 +48,42 @@ def is_network_connected(address):
         return True
     except OSError:
         return False
+
+
+def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_epoch=0):
+    """Send selected frame indices to the cloud for GT annotation and edge-model
+    fine-tuning.  Returns ``(success, model_data_b64, message)``.
+
+    Parameters
+    ----------
+    server_ip : str
+        gRPC server address, e.g. ``"192.168.1.1:50051"``.
+    edge_id : int
+        Identifier of this edge node.
+    frame_indices : list[int]
+        Frame indices (relative to ``cache_path``) chosen for retraining.
+    cache_path : str
+        Absolute path to the local frame cache directory shared with the cloud
+        (or accessible by both).
+    num_epoch : int
+        Number of fine-tuning epochs; 0 lets the cloud use its configured default.
+
+    Returns
+    -------
+    tuple[bool, str, str]
+        ``(success, base64_model_state_dict, message)``
+    """
+    try:
+        channel = grpc.insecure_channel(server_ip)
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        req = message_transmission_pb2.TrainRequest(
+            edge_id=int(edge_id),
+            frame_indices=json.dumps(frame_indices),
+            cache_path=cache_path,
+            num_epoch=int(num_epoch),
+        )
+        reply = stub.train_model_request(req)
+        return reply.success, reply.model_data, reply.message
+    except Exception as exc:
+        logger.exception("request_cloud_training failed: {}", exc)
+        return False, "", str(exc)
