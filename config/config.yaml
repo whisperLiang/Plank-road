@@ -66,15 +66,37 @@ client:
   collect_num: 20
   select_num: 15
   window: 90
+ # drift detection (RCCDA-inspired)
+ drift_detection:
+  # mode: 'rccda' | 'adwin' | 'window' | 'any' | 'majority'
+  mode: rccda
+  # confidence threshold below which a detection is considered a loss
+  confidence_threshold: 0.5
+  # RCCDA Lyapunov virtual queue parameters
+  pi_bar: 0.1
+  V: 10.0
+  K_p: 1.0
+  K_d: 0.5
+  # ADWIN parameters
+  adwin_delta: 0.02
+  adwin_min_window: 30
+  # Conservative Window parameters
+  window_w: 40
+  window_m: 3
 
 server:
  server_id: 0
  edge_ids: [1]
  large_model_name: fasterrcnn_resnet50_fpn
+ # lightweight model used to generate fine-tuned weights for the edge
+ edge_model_name: fasterrcnn_mobilenet_v3_large_fpn
  #the queue maxsize
  local_queue_maxsize: 10
  # the max wait time
  wait_thresh: 10
+ # continual learning settings
+ continual_learning:
+  num_epoch: 2
  #database config
  database:
   connection: { 'user': 'root', 'password': 'root', 'host': '127.0.0.1', 'raise_on_warnings': True }
