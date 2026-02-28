@@ -83,6 +83,14 @@ client:
   # Conservative Window parameters
   window_w: 40
   window_m: 3
+ # Split learning for continual learning (HSFL-style)
+ # When enabled, backbone features are extracted and cached on the edge.
+ # Only drift-moment samples are annotated by the cloud's large model;
+ # non-drift samples use edge pseudo-labels for training.
+ # The cloud trains only the server-side layers (rpn + roi_heads)
+ # on the intermediate features, reducing annotation cost.
+ split_learning:
+  enabled: True
 
 server:
  server_id: 0
