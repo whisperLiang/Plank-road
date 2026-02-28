@@ -7,6 +7,10 @@ service MessageTransmission {
   // Cloud-side continual learning: edge sends collected frame indices,
   // cloud retrains the lightweight model and returns updated weights.
   rpc train_model_request (TrainRequest) returns (TrainReply) {}
+  // Split-learning continual learning: edge sends intermediate features
+  // (cached on shared filesystem), cloud annotates drift frames only,
+  // then trains server-side model (rpn + roi_heads) on all features.
+  rpc split_train_request (SplitTrainRequest) returns (SplitTrainReply) {}
 }
 
 message MessageRequest {
@@ -64,6 +68,26 @@ message TrainRequest {
 message TrainReply {
   bool success = 1;
   // Base-64 encoded PyTorch state-dict bytes of the retrained lightweight model
+  string model_data = 2;
+  string message = 3;
+}
+
+// Split-learning continual learning messages (HSFL-style)
+message SplitTrainRequest {
+  int64 edge_id = 1;
+  // JSON list of ALL frame indices (features cached on shared filesystem)
+  string all_frame_indices = 2;
+  // JSON list of drift frame indices (subset) for ground-truth annotation
+  string drift_frame_indices = 3;
+  // Absolute path to cache directory (contains features/ and frames/ dirs)
+  string cache_path = 4;
+  // Number of training epochs (0 = use cloud default)
+  int64 num_epoch = 5;
+}
+
+message SplitTrainReply {
+  bool success = 1;
+  // Base-64 encoded PyTorch state-dict bytes of the retrained model
   string model_data = 2;
   string message = 3;
 }

@@ -104,4 +104,36 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             success=success, model_data=model_data, message=message
         )
 
+    def split_train_request(self, request, context):
+        """Split-learning continual learning (HSFL-style): annotate only drift
+        frames with the large model, then train server-side model on all cached
+        backbone features and return the updated state-dict."""
+        logger.info(
+            "split_train_request from edge_id={} cache_path={} num_epoch={}",
+            request.edge_id, request.cache_path, request.num_epoch,
+        )
+        if self.continual_learner is None:
+            logger.error("split_train_request: continual_learner not configured")
+            return message_transmission_pb2.SplitTrainReply(
+                success=False, model_data="", message="continual_learner not configured"
+            )
+        try:
+            all_indices = json.loads(request.all_frame_indices)
+            drift_indices = json.loads(request.drift_frame_indices)
+            success, model_data, message = \
+                self.continual_learner.get_ground_truth_and_split_retrain(
+                    request.edge_id,
+                    all_indices,
+                    drift_indices,
+                    request.cache_path,
+                    int(request.num_epoch),
+                )
+        except Exception as exc:
+            logger.exception("split_train_request error: {}", exc)
+            success, model_data, message = False, "", str(exc)
+
+        return message_transmission_pb2.SplitTrainReply(
+            success=success, model_data=model_data, message=message
+        )
+
 

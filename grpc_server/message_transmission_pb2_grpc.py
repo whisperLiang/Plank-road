@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import message_transmission_pb2 as message__transmission__pb2
+from grpc_server import message_transmission_pb2 as message__transmission__pb2
 
 GRPC_GENERATED_VERSION = '1.78.1'
 GRPC_VERSION = grpc.__version__
@@ -54,6 +54,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.TrainRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.TrainReply.FromString,
                 _registered_method=True)
+        self.split_train_request = channel.unary_unary(
+                '/MessageTransmission/split_train_request',
+                request_serializer=message__transmission__pb2.SplitTrainRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.SplitTrainReply.FromString,
+                _registered_method=True)
 
 
 class MessageTransmissionServicer(object):
@@ -85,6 +90,15 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def split_train_request(self, request, context):
+        """Split-learning continual learning: edge sends intermediate features
+        (cached on shared filesystem), cloud annotates drift frames only,
+        then trains server-side model (rpn + roi_heads) on all features.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -107,6 +121,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.train_model_request,
                     request_deserializer=message__transmission__pb2.TrainRequest.FromString,
                     response_serializer=message__transmission__pb2.TrainReply.SerializeToString,
+            ),
+            'split_train_request': grpc.unary_unary_rpc_method_handler(
+                    servicer.split_train_request,
+                    request_deserializer=message__transmission__pb2.SplitTrainRequest.FromString,
+                    response_serializer=message__transmission__pb2.SplitTrainReply.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -217,6 +236,33 @@ class MessageTransmission(object):
             '/MessageTransmission/train_model_request',
             message__transmission__pb2.TrainRequest.SerializeToString,
             message__transmission__pb2.TrainReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def split_train_request(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/split_train_request',
+            message__transmission__pb2.SplitTrainRequest.SerializeToString,
+            message__transmission__pb2.SplitTrainReply.FromString,
             options,
             channel_credentials,
             insecure,

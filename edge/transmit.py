@@ -87,3 +87,52 @@ def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_ep
     except Exception as exc:
         logger.exception("request_cloud_training failed: {}", exc)
         return False, "", str(exc)
+
+
+def request_cloud_split_training(
+    server_ip, edge_id, all_frame_indices, drift_frame_indices,
+    cache_path, num_epoch=0,
+):
+    """Send frame indices and drift info to cloud for **split-learning**
+    continual learning.
+
+    The cloud will:
+      1. Annotate **only** drift frames with the large model.
+      2. Train the server-side model (rpn + roi_heads) on **all** cached
+         backbone features (using pseudo-labels for non-drift frames).
+      3. Return the updated edge-model state-dict.
+
+    Parameters
+    ----------
+    server_ip : str
+        gRPC server address.
+    edge_id : int
+    all_frame_indices : list[int]
+        Every frame index that has cached backbone features.
+    drift_frame_indices : list[int]
+        Subset of *all_frame_indices* where drift was detected.
+    cache_path : str
+        Shared cache directory containing ``features/`` and ``frames/`` dirs.
+    num_epoch : int
+        Training epochs; 0 → cloud default.
+
+    Returns
+    -------
+    tuple[bool, str, str]
+        ``(success, base64_model_state_dict, message)``
+    """
+    try:
+        channel = grpc.insecure_channel(server_ip)
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        req = message_transmission_pb2.SplitTrainRequest(
+            edge_id=int(edge_id),
+            all_frame_indices=json.dumps(all_frame_indices),
+            drift_frame_indices=json.dumps(drift_frame_indices or []),
+            cache_path=cache_path,
+            num_epoch=int(num_epoch),
+        )
+        reply = stub.split_train_request(req)
+        return reply.success, reply.model_data, reply.message
+    except Exception as exc:
+        logger.exception("request_cloud_split_training failed: {}", exc)
+        return False, "", str(exc)
