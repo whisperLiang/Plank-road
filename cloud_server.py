@@ -4,9 +4,11 @@ import base64
 import io
 import json
 import os
+import random
 import threading
 import time
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
@@ -27,6 +29,11 @@ from model_management.object_detection import Object_Detection
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
+from model_management.model_split import (
+    load_feature_cache,
+    list_cached_features,
+    split_retrain,
+)
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
 
@@ -119,7 +126,143 @@ class CloudContinualLearner:
                 return False, "", str(exc)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Split-learning continual learning (HSFL-style)
+    # ------------------------------------------------------------------
+
+    def get_ground_truth_and_split_retrain(
+        self,
+        edge_id: int,
+        all_frame_indices: list[int],
+        drift_frame_indices: list[int],
+        cache_path: str,
+        num_epoch: int = 0,
+    ) -> tuple[bool, str, str]:
+        """Label **only** drift frames with the large model, then train the
+        server-side model (rpn + roi_heads) on **all** cached backbone
+        features using split learning.
+
+        Non-drift frames use the edge's pseudo-labels (cached alongside
+        the features).  Drift frames receive ground-truth from the cloud's
+        large model.
+
+        Returns
+        -------
+        (success, base64_model_data, message)
+        """
+        if num_epoch <= 0:
+            num_epoch = self.default_num_epoch
+
+        if not all_frame_indices:
+            return False, "", "No frame indices provided."
+
+        with self.lock:
+            try:
+                drift_set = set(drift_frame_indices or [])
+                logger.info(
+                    "[SplitCL] Starting split-learning retraining for edge {}: "
+                    "{} total frames, {} drift frames, {} epochs.",
+                    edge_id, len(all_frame_indices), len(drift_set), num_epoch,
+                )
+
+                # 1. Annotate **only** drift frames with the large model
+                gt_annotations: dict[int, dict] = {}
+                frame_dir = os.path.join(cache_path, "frames")
+                for idx in drift_frame_indices or []:
+                    img_path = os.path.join(frame_dir, f"{idx}.jpg")
+                    if not os.path.exists(img_path):
+                        logger.warning("[SplitCL] Drift frame {} not found, skipping.", idx)
+                        continue
+                    frame = cv2.imread(img_path)
+                    if frame is None:
+                        continue
+                    pred_boxes, pred_class, pred_score = self.large_od.large_inference(frame)
+                    if pred_boxes is None:
+                        continue
+                    gt_annotations[idx] = {
+                        "boxes":  pred_boxes,
+                        "labels": pred_class,
+                    }
+                logger.info(
+                    "[SplitCL] Annotated {} drift frames with large model.",
+                    len(gt_annotations),
+                )
+
+                # 2. Build the lightweight model for split training
+                model_bytes = self._split_retrain_edge_model(
+                    cache_path, all_frame_indices, gt_annotations, num_epoch
+                )
+
+                encoded = base64.b64encode(model_bytes).decode("utf-8")
+                logger.success(
+                    "[SplitCL] Split retraining done for edge {}. "
+                    "Model size: {} KB.",
+                    edge_id, len(model_bytes) // 1024,
+                )
+                return True, encoded, "Split retraining successful"
+            except Exception as exc:
+                logger.exception("[SplitCL] Split retraining failed for edge {}: {}", edge_id, exc)
+                return False, "", str(exc)
+
+    def _split_retrain_edge_model(
+        self,
+        cache_path: str,
+        all_indices: list[int],
+        gt_annotations: dict[int, dict],
+        num_epoch: int,
+    ) -> bytes:
+        """Fine-tune the lightweight model via split learning; return state-dict bytes."""
+        from torchvision.models.detection import (
+            fasterrcnn_mobilenet_v3_large_fpn,
+            fasterrcnn_mobilenet_v3_large_320_fpn,
+            fasterrcnn_resnet50_fpn,
+        )
+
+        model_name = self.edge_model_name
+        tmp_model = eval(model_name)(pretrained_backbone=False, pretrained=False)
+
+        # Load existing edge-model weights
+        edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
+        if os.path.exists(edge_weights):
+            state = torch.load(edge_weights, map_location=self.device)
+        else:
+            if model_name in model_lib:
+                official_path = os.path.join(
+                    self.weight_folder, model_lib[model_name]["model_path"]
+                )
+                if os.path.exists(official_path):
+                    state = torch.load(official_path, map_location=self.device)
+                else:
+                    state = None
+            else:
+                state = None
+
+        if state is not None:
+            tmp_model.load_state_dict(state)
+
+        tmp_model.to(self.device)
+
+        # Use the shared split_retrain loop from model_split
+        split_retrain(
+            model=tmp_model,
+            cache_path=cache_path,
+            all_indices=all_indices,
+            gt_annotations=gt_annotations,
+            device=self.device,
+            num_epoch=num_epoch,
+        )
+
+        # Persist weights so future retraining can fine-tune further
+        torch.save(tmp_model.state_dict(), edge_weights)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        buf = io.BytesIO()
+        torch.save(tmp_model.state_dict(), buf)
+        return buf.getvalue()
+
+    # ------------------------------------------------------------------
+    # Internal helpers (original full-image retraining)
     # ------------------------------------------------------------------
 
     def _generate_annotations(
