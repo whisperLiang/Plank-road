@@ -21,7 +21,7 @@ from edge.drift_detector import CompositeDriftDetector
 from edge.info import TASK_STATE
 from edge.resample import history_sample
 from edge.task import Task
-from edge.transmit import is_network_connected, request_cloud_training
+from edge.transmit import is_network_connected, request_cloud_training, request_cloud_split_training
 from grpc_server import message_transmission_pb2_grpc, message_transmission_pb2
 from grpc_server.rpc_server import MessageTransmissionServicer
 
@@ -29,6 +29,7 @@ from tools.convert_tool import cv2_to_base64
 from tools.file_op import clear_folder, creat_folder, sample_files
 from tools.preprocess import frame_resize
 from model_management.object_detection import Object_Detection
+from model_management.model_split import extract_backbone_features, save_feature_cache
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from tools.video_processor import VideoProcessor
@@ -86,6 +87,13 @@ class EdgeWorker:
         self.cache_count = 0
 
         self.use_history = True
+
+        # Split-learning mode (HSFL-style)
+        sl_cfg = getattr(self.config, 'split_learning', None)
+        self.split_learning_enabled = bool(getattr(sl_cfg, 'enabled', False)) if sl_cfg else False
+        self.drift_frame_indices: list[int] = []
+        if self.split_learning_enabled:
+            logger.info("Split-learning continual learning enabled")
 
         self.retrain_processor = threading.Thread(target=self.retrain_worker,daemon=True)
         self.retrain_processor.start()
@@ -327,6 +335,35 @@ class EdgeWorker:
             # Query the drift detector; it may trigger a retrain ahead of the
             # count-based threshold when concept drift is detected.
             drift_detected = self.drift_detector.update(avg_score)
+
+            # ---- Split learning: extract & cache backbone features ----
+            if self.split_learning_enabled:
+                try:
+                    with self.small_object_detection.model_lock:
+                        features, image_sizes, tensor_shape, original_sizes = \
+                            extract_backbone_features(
+                                self.small_object_detection.model, frame
+                            )
+                    save_feature_cache(
+                        cache_path=self.config.retrain.cache_path,
+                        frame_index=task.frame_index,
+                        features=features,
+                        image_sizes=image_sizes,
+                        tensor_shape=tensor_shape,
+                        original_sizes=original_sizes,
+                        is_drift=drift_detected,
+                        pseudo_boxes=detection_boxes,
+                        pseudo_labels=detection_class,
+                        pseudo_scores=detection_score,
+                    )
+                    if drift_detected:
+                        self.drift_frame_indices.append(task.frame_index)
+                    logger.debug("Cached features for frame {} (drift={})",
+                                 task.frame_index, drift_detected)
+                except Exception as exc:
+                    logger.exception("Failed to extract/cache features for frame {}: {}",
+                                     task.frame_index, exc)
+
             min_samples = max(getattr(self.config.retrain, 'select_num', 10), 10)
             count_trigger = self.cache_count >= self.config.retrain.collect_num
             drift_trigger = drift_detected and self.cache_count >= min_samples
@@ -335,8 +372,15 @@ class EdgeWorker:
                 if drift_trigger and not count_trigger:
                     logger.info("Drift detected — triggering cloud retraining early "
                                 "(cached={} samples)", self.cache_count)
-                smallest_elements = sorted(self.avg_scores, key=lambda d: list(d.values())[0])[:self.config.retrain.select_num]
-                self.select_index = [list(d.keys())[0] for d in smallest_elements]
+
+                if self.split_learning_enabled:
+                    # Split learning: use ALL cached frames for training
+                    self.select_index = [list(d.keys())[0] for d in self.avg_scores]
+                else:
+                    # Original: select worst-confidence frames
+                    smallest_elements = sorted(self.avg_scores, key=lambda d: list(d.values())[0])[:self.config.retrain.select_num]
+                    self.select_index = [list(d.keys())[0] for d in smallest_elements]
+
                 logger.debug("the select index {}".format(self.select_index))
                 self.pred_res = []
                 self.collect_flag = False
@@ -348,16 +392,33 @@ class EdgeWorker:
     def retrain_worker(self):
         while True:
             if self.retrain_flag:
-                logger.info("Sending {} frames to cloud for continual learning",
-                            len(self.select_index))
                 num_epoch = int(getattr(self.config.retrain, 'num_epoch', 0))
-                success, model_b64, msg = request_cloud_training(
-                    self.config.server_ip,
-                    self.edge_id,
-                    self.select_index,
-                    self.config.retrain.cache_path,
-                    num_epoch,
-                )
+
+                if self.split_learning_enabled:
+                    # ---- Split-learning path ----
+                    logger.info(
+                        "Sending {} features ({} drift) to cloud for split-learning CL",
+                        len(self.select_index), len(self.drift_frame_indices),
+                    )
+                    success, model_b64, msg = request_cloud_split_training(
+                        self.config.server_ip,
+                        self.edge_id,
+                        self.select_index,
+                        self.drift_frame_indices,
+                        self.config.retrain.cache_path,
+                        num_epoch,
+                    )
+                else:
+                    # ---- Original full-image path ----
+                    logger.info("Sending {} frames to cloud for continual learning",
+                                len(self.select_index))
+                    success, model_b64, msg = request_cloud_training(
+                        self.config.server_ip,
+                        self.edge_id,
+                        self.select_index,
+                        self.config.retrain.cache_path,
+                        num_epoch,
+                    )
 
                 if success and model_b64:
                     try:
@@ -379,9 +440,30 @@ class EdgeWorker:
                     sample_files(
                         os.path.join(self.config.retrain.cache_path, 'frames'),
                         self.select_index)
+                    # Also prune feature cache when using split learning
+                    if self.split_learning_enabled:
+                        feat_dir = os.path.join(self.config.retrain.cache_path, 'features')
+                        if os.path.isdir(feat_dir):
+                            sample_files(feat_dir, self.select_index)
+                        # Keep only drift indices that survived history sampling
+                        self.drift_frame_indices = [
+                            i for i in self.drift_frame_indices if i in self.select_index
+                        ]
                     self.cache_count = len(self.select_index)
                 else:
                     clear_folder(self.config.retrain.cache_path)
+                    # Also clear feature cache
+                    if self.split_learning_enabled:
+                        feat_dir = os.path.join(self.config.retrain.cache_path, 'features')
+                        if os.path.isdir(feat_dir):
+                            for fn in os.listdir(feat_dir):
+                                fp = os.path.join(feat_dir, fn)
+                                if os.path.isfile(fp):
+                                    try:
+                                        os.remove(fp)
+                                    except OSError:
+                                        pass
+                        self.drift_frame_indices = []
                     self.select_index = []
                     self.avg_scores = []
                 if self.retrain_first is False:
