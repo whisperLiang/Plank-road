@@ -26,6 +26,19 @@ client:
  offloading_max_worker: 1
  frame_cache_maxsize: 100
  small_model_name: fasterrcnn_mobilenet_v3_large_fpn
+ # Supported model names (see model_management/model_zoo.py):
+ #   Faster R-CNN: fasterrcnn_resnet50_fpn, fasterrcnn_mobilenet_v3_large_fpn,
+ #                 fasterrcnn_mobilenet_v3_large_320_fpn
+ #   RetinaNet:    retinanet_resnet50_fpn
+ #   SSD/SSDLite:  ssd300_vgg16, ssdlite320_mobilenet_v3_large
+ #   FCOS:         fcos_resnet50_fpn
+ #   YOLOv5:       yolov5n, yolov5s, yolov5m, yolov5l, yolov5x
+ #   YOLOv8:       yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
+ #   YOLOv10:      yolov10n, yolov10s, yolov10m, yolov10l, yolov10x
+ #   YOLO11:       yolo11n, yolo11s, yolo11m, yolo11l, yolo11x
+ #   YOLO12:       yolo12n, yolo12s, yolo12m, yolo12l, yolo12x
+ #   DETR:         detr_resnet50, detr_resnet101, conditional_detr_resnet50
+ #   RT-DETR:      rtdetr_l, rtdetr_x
  # select the offloading policy
  policy: Edge-Local
  # change frame resolution using frame new height
@@ -83,6 +96,39 @@ client:
   # Conservative Window parameters
   window_w: 40
   window_m: 3
+ # Resource-aware CL trigger (RCCDA multi-queue Lyapunov)
+ # Reference: RCCDA (NeurIPS 2025) — Lyapunov drift-plus-penalty
+ # https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code
+ #
+ # When enabled, *replaces* the drift_detection trigger with a multi-queue
+ # Lyapunov policy that jointly decides (1) whether to trigger CL and
+ # (2) the optimal split point, considering:
+ #   - Cloud resource state (CPU / GPU / memory utilisation)
+ #   - Network bandwidth to the cloud
+ #   - Intermediate-feature privacy leakage
+ #   - Edge-side confidence-score degradation
+ #
+ # Virtual queues:
+ #   Q_update — bounds average retrain rate  ≤  pi_bar
+ #   Q_cloud  — bounds average cloud cost    ≤  lambda_cloud
+ #   Q_bw     — bounds average bandwidth     ≤  lambda_bw
+ #   Q_priv   — bounds privacy leakage       ≤  lambda_priv
+ resource_aware_trigger:
+  enabled: False
+  # --- Shared with drift_detection (RCCDA PD controller) ---
+  # pi_bar: 0.1          # max avg CL trigger rate
+  # V: 10.0              # Lyapunov trade-off coefficient
+  # K_p: 1.0             # PD proportional gain
+  # K_d: 0.5             # PD derivative gain
+  # confidence_threshold: 0.5
+  # --- Multi-queue budget constraints ---
+  lambda_cloud: 0.5      # avg cloud-cost budget per round [0,1]
+  lambda_bw: 0.5         # avg bandwidth budget per round [0,1]
+  lambda_priv: 0.3       # avg privacy-leakage budget per round [0,1]
+  # --- Queue importance weights ---
+  w_cloud: 1.0           # weight for cloud-cost queue
+  w_bw: 1.0              # weight for bandwidth queue
+  w_priv: 1.0            # weight for privacy queue
  # Split learning for continual learning (HSFL-style)
  # When enabled, backbone features are extracted and cached on the edge.
  # Only drift-moment samples are annotated by the cloud's large model;
@@ -91,6 +137,33 @@ client:
  # on the intermediate features, reducing annotation cost.
  split_learning:
   enabled: True
+  # Universal model splitting (model-agnostic, torchlens-based).
+  # When enabled, the edge uses torchlens to trace the model's
+  # computational graph and can split at any arbitrary layer,
+  # not limited to the Faster R-CNN backbone boundary.
+  universal:
+   enabled: False
+   # ---- Explicit split point (highest priority, first match wins) ----
+   # split_module — high-level module name, e.g. 'backbone' or 'features.12'
+   # split_module: backbone
+   # split_layer  — layer index (int) or torchlens layer label (str)
+   # split_layer: 15
+   #
+   # ---- HSFL-style strategy-based split-point selection ----
+   # Activated when neither split_module nor split_layer is set.
+   # strategy options (from ICWS-23-HSFL):
+   #   flops_ratio  — split where cumulative FLOPs ≈ target_flops_ratio
+   #   privacy      — deepest split with leakage ≤ max_privacy_leakage
+   #   midpoint     — split at ~50 % FLOPs (default)
+   #   min_smashed  — minimise intermediate tensor size (bandwidth)
+   #   linucb       — adaptive LinUCB contextual bandit (balances
+   #                   latency and privacy; updates each round)
+   # strategy: midpoint
+   # target_flops_ratio: 0.5      # for 'flops_ratio' strategy
+   # max_privacy_leakage: 0.1     # for 'privacy' strategy
+   # latency_weight: 1.0          # LinUCB: 1.0=pure latency, 0.0=pure privacy
+   # ucb_alpha: 0.25              # LinUCB exploration coefficient
+   # only_parametric: False       # consider only Conv/Linear/BN layers
 
 server:
  server_id: 0
@@ -105,6 +178,24 @@ server:
  # continual learning settings
  continual_learning:
   num_epoch: 2
+ # Dynamic Activation Sparsity (SURGEON-style layer pruning)
+ # Reference: SURGEON (CVPR 2025)
+ # https://github.com/kadmkbl/SURGEON
+ #
+ # When enabled, Conv/BN/FC layers in the **tail partition** (rpn +
+ # roi_heads) are replaced with AutoFreeze versions that dynamically
+ # prune activations stored for the backward pass.
+ #
+ # Per-layer pruning ratios are computed via TGI (Total Gradient
+ # Importance = gradient_norm / sqrt(numel) × log(M_total / M_layer)).
+ # Layers with higher TGI keep more activations.
+ das:
+  enabled: False
+  # bn_only: True → only BN parameters are updated; Conv/FC weight
+  #   gradients are blocked.  Useful for conservative adaptation.
+  bn_only: False
+  # Number of samples used for gradient-importance probing each epoch.
+  probe_samples: 10
  #database config
  database:
   connection: { 'user': 'root', 'password': 'root', 'host': '127.0.0.1', 'raise_on_warnings': True }
