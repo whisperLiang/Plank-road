@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from grpc_server import message_transmission_pb2 as message__transmission__pb2
+import grpc_server.message_transmission_pb2 as message__transmission__pb2
 
 GRPC_GENERATED_VERSION = '1.78.1'
 GRPC_VERSION = grpc.__version__
@@ -59,6 +59,16 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.SplitTrainRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.SplitTrainReply.FromString,
                 _registered_method=True)
+        self.query_resource = channel.unary_unary(
+                '/MessageTransmission/query_resource',
+                request_serializer=message__transmission__pb2.ResourceRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.ResourceReply.FromString,
+                _registered_method=True)
+        self.bandwidth_probe = channel.unary_unary(
+                '/MessageTransmission/bandwidth_probe',
+                request_serializer=message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BandwidthProbeReply.FromString,
+                _registered_method=True)
 
 
 class MessageTransmissionServicer(object):
@@ -99,6 +109,20 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def query_resource(self, request, context):
+        """Resource-aware CL trigger: edge queries cloud resource utilisation.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def bandwidth_probe(self, request, context):
+        """Bandwidth estimation: edge sends a small payload, cloud echoes it.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -126,6 +150,16 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.split_train_request,
                     request_deserializer=message__transmission__pb2.SplitTrainRequest.FromString,
                     response_serializer=message__transmission__pb2.SplitTrainReply.SerializeToString,
+            ),
+            'query_resource': grpc.unary_unary_rpc_method_handler(
+                    servicer.query_resource,
+                    request_deserializer=message__transmission__pb2.ResourceRequest.FromString,
+                    response_serializer=message__transmission__pb2.ResourceReply.SerializeToString,
+            ),
+            'bandwidth_probe': grpc.unary_unary_rpc_method_handler(
+                    servicer.bandwidth_probe,
+                    request_deserializer=message__transmission__pb2.BandwidthProbeRequest.FromString,
+                    response_serializer=message__transmission__pb2.BandwidthProbeReply.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -263,6 +297,60 @@ class MessageTransmission(object):
             '/MessageTransmission/split_train_request',
             message__transmission__pb2.SplitTrainRequest.SerializeToString,
             message__transmission__pb2.SplitTrainReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def query_resource(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/query_resource',
+            message__transmission__pb2.ResourceRequest.SerializeToString,
+            message__transmission__pb2.ResourceReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def bandwidth_probe(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/bandwidth_probe',
+            message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
+            message__transmission__pb2.BandwidthProbeReply.FromString,
             options,
             channel_credentials,
             insecure,

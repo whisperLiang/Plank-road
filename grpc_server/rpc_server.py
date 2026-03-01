@@ -1,10 +1,69 @@
 import json
+import os
+import threading
 
 from loguru import logger
 
 from edge.task import Task
 from tools.convert_tool import base64_to_cv2
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
+
+
+# ── Resource monitoring helpers (psutil optional) ──────────────────
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+try:
+    import torch as _torch
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
+
+def _get_cpu_utilization() -> float:
+    """Return CPU utilisation in [0, 1]."""
+    if _HAS_PSUTIL:
+        return psutil.cpu_percent(interval=0.1) / 100.0
+    return 0.0
+
+
+def _get_memory_utilization() -> float:
+    """Return memory utilisation in [0, 1]."""
+    if _HAS_PSUTIL:
+        return psutil.virtual_memory().percent / 100.0
+    return 0.0
+
+
+def _get_gpu_utilization() -> float:
+    """Return GPU utilisation in [0, 1] (NVIDIA only)."""
+    if not _HAS_TORCH or not _torch.cuda.is_available():
+        return 0.0
+    try:
+        # Try nvidia-smi via pynvml (bundled with recent PyTorch)
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            vals = [float(v.strip()) for v in result.stdout.strip().split("\n") if v.strip()]
+            if vals:
+                return max(vals) / 100.0
+    except Exception:
+        pass
+    # Fallback: memory-based estimate
+    try:
+        allocated = _torch.cuda.memory_allocated()
+        total = _torch.cuda.get_device_properties(0).total_mem
+        if total > 0:
+            return allocated / total
+    except Exception:
+        pass
+    return 0.0
 
 
 class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmissionServicer):
@@ -136,4 +195,34 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             success=success, model_data=model_data, message=message
         )
 
+    # ---- Resource-aware CL trigger: cloud resource query ----
 
+    def query_resource(self, request, context):
+        """Return current cloud resource utilisation for the edge's
+        Lyapunov-based CL trigger decision.
+        """
+        cpu = _get_cpu_utilization()
+        gpu = _get_gpu_utilization()
+        mem = _get_memory_utilization()
+
+        # Approximate train-queue depth: if the continual_learner lock is
+        # held, there is 1 active job; max capacity is treated as 10.
+        train_q = 0
+        max_q = 10
+        if self.continual_learner is not None:
+            if hasattr(self.continual_learner, 'lock'):
+                train_q = 1 if self.continual_learner.lock.locked() else 0
+
+        return message_transmission_pb2.ResourceReply(
+            cpu_utilization=cpu,
+            gpu_utilization=gpu,
+            memory_utilization=mem,
+            train_queue_size=train_q,
+            max_queue_size=max_q,
+        )
+
+    def bandwidth_probe(self, request, context):
+        """Echo the payload back for edge-side RTT / bandwidth estimation."""
+        return message_transmission_pb2.BandwidthProbeReply(
+            payload=request.payload,
+        )

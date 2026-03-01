@@ -115,3 +115,35 @@ class SplitTrainReply(_message.Message):
     model_data: str
     message: str
     def __init__(self, success: bool = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ...) -> None: ...
+
+class ResourceRequest(_message.Message):
+    __slots__ = ("edge_id",)
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    edge_id: int
+    def __init__(self, edge_id: _Optional[int] = ...) -> None: ...
+
+class ResourceReply(_message.Message):
+    __slots__ = ("cpu_utilization", "gpu_utilization", "memory_utilization", "train_queue_size", "max_queue_size")
+    CPU_UTILIZATION_FIELD_NUMBER: _ClassVar[int]
+    GPU_UTILIZATION_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_UTILIZATION_FIELD_NUMBER: _ClassVar[int]
+    TRAIN_QUEUE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    MAX_QUEUE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    cpu_utilization: float
+    gpu_utilization: float
+    memory_utilization: float
+    train_queue_size: int
+    max_queue_size: int
+    def __init__(self, cpu_utilization: float = ..., gpu_utilization: float = ..., memory_utilization: float = ..., train_queue_size: _Optional[int] = ..., max_queue_size: _Optional[int] = ...) -> None: ...
+
+class BandwidthProbeRequest(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: str
+    def __init__(self, payload: _Optional[str] = ...) -> None: ...
+
+class BandwidthProbeReply(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: str
+    def __init__(self, payload: _Optional[str] = ...) -> None: ...

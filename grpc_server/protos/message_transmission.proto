@@ -11,6 +11,10 @@ service MessageTransmission {
   // (cached on shared filesystem), cloud annotates drift frames only,
   // then trains server-side model (rpn + roi_heads) on all features.
   rpc split_train_request (SplitTrainRequest) returns (SplitTrainReply) {}
+  // Resource-aware CL trigger: edge queries cloud resource utilisation.
+  rpc query_resource (ResourceRequest) returns (ResourceReply) {}
+  // Bandwidth estimation: edge sends a small payload, cloud echoes it.
+  rpc bandwidth_probe (BandwidthProbeRequest) returns (BandwidthProbeReply) {}
 }
 
 message MessageRequest {
@@ -90,4 +94,26 @@ message SplitTrainReply {
   // Base-64 encoded PyTorch state-dict bytes of the retrained model
   string model_data = 2;
   string message = 3;
+}
+
+// Resource-aware CL trigger: cloud resource query
+message ResourceRequest {
+  int64 edge_id = 1;
+}
+
+message ResourceReply {
+  double cpu_utilization = 1;      // [0.0, 1.0]
+  double gpu_utilization = 2;      // [0.0, 1.0]
+  double memory_utilization = 3;   // [0.0, 1.0]
+  int64 train_queue_size = 4;      // current training queue depth
+  int64 max_queue_size = 5;        // max training queue capacity
+}
+
+// Bandwidth probe: edge sends payload, cloud echoes back
+message BandwidthProbeRequest {
+  string payload = 1;
+}
+
+message BandwidthProbeReply {
+  string payload = 1;
 }
