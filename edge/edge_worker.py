@@ -30,6 +30,34 @@ from tools.file_op import clear_folder, creat_folder, sample_files
 from tools.preprocess import frame_resize
 from model_management.object_detection import Object_Detection
 from model_management.model_split import extract_backbone_features, save_feature_cache
+
+# Resource-aware CL trigger (RCCDA-inspired multi-queue Lyapunov)
+try:
+    from edge.resource_aware_trigger import (
+        ResourceAwareCLTrigger,
+        CloudResourceState,
+        SplitCandidate,
+        build_split_candidates,
+        query_cloud_resource,
+        estimate_bandwidth,
+        create_resource_aware_trigger,
+    )
+    _HAS_RESOURCE_TRIGGER = True
+except ImportError:
+    _HAS_RESOURCE_TRIGGER = False
+
+# Universal model splitting (optional — requires torchlens)
+try:
+    from model_management.universal_model_split import (
+        UniversalModelSplitter,
+        SplitPointSelector,
+        extract_split_features,
+        save_split_feature_cache,
+    )
+    _HAS_UNIVERSAL_SPLIT = True
+except ImportError:
+    _HAS_UNIVERSAL_SPLIT = False
+
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from tools.video_processor import VideoProcessor
@@ -48,6 +76,31 @@ class EdgeWorker:
 
         # Drift detector (RCCDA-inspired)
         self.drift_detector = CompositeDriftDetector(config)
+
+        # Resource-aware CL trigger (RCCDA multi-queue Lyapunov)
+        # When enabled, this replaces the simple drift_detector trigger with
+        # a Lyapunov drift-plus-penalty policy that considers cloud resource
+        # state, bandwidth, and intermediate-feature privacy leakage.
+        self.resource_trigger: ResourceAwareCLTrigger | None = None  # type: ignore
+        self._cloud_state: CloudResourceState | None = None          # type: ignore
+        self._split_candidates: list | None = None
+        ra_cfg = getattr(config, 'resource_aware_trigger', None)
+        self.resource_trigger_enabled = (
+            _HAS_RESOURCE_TRIGGER
+            and ra_cfg is not None
+            and bool(getattr(ra_cfg, 'enabled', False))
+        )
+        if self.resource_trigger_enabled:
+            self.resource_trigger = create_resource_aware_trigger(config)
+            logger.info(
+                "Resource-aware CL trigger enabled "
+                "(pi_bar={}, V={}, λ_cloud={}, λ_bw={}, λ_priv={})",
+                self.resource_trigger.pi_bar,
+                self.resource_trigger.V,
+                self.resource_trigger.lambda_cloud,
+                self.resource_trigger.lambda_bw,
+                self.resource_trigger.lambda_priv,
+            )
 
         # create database and tables
         self.database = DataBase(self.config.database)
@@ -94,6 +147,84 @@ class EdgeWorker:
         self.drift_frame_indices: list[int] = []
         if self.split_learning_enabled:
             logger.info("Split-learning continual learning enabled")
+
+        # Universal model splitting (model-agnostic, torchlens-based)
+        self.universal_split_enabled = False
+        self.universal_splitter: UniversalModelSplitter | None = None  # type: ignore
+        self.split_selector: SplitPointSelector | None = None  # type: ignore  # HSFL-style adaptive
+        if self.split_learning_enabled and _HAS_UNIVERSAL_SPLIT:
+            us_cfg = getattr(sl_cfg, 'universal', None)
+            if us_cfg and getattr(us_cfg, 'enabled', False):
+                self.universal_split_enabled = True
+                split_layer = getattr(us_cfg, 'split_layer', None)
+                split_module = getattr(us_cfg, 'split_module', None)
+                split_strategy = getattr(us_cfg, 'strategy', None)
+                target_ratio = float(getattr(us_cfg, 'target_flops_ratio', 0.5))
+                max_privacy = float(getattr(us_cfg, 'max_privacy_leakage', 0.1))
+                latency_weight = float(getattr(us_cfg, 'latency_weight', 1.0))
+                ucb_alpha = float(getattr(us_cfg, 'ucb_alpha', 0.25))
+                only_parametric = bool(getattr(us_cfg, 'only_parametric', False))
+                try:
+                    self.universal_splitter = UniversalModelSplitter(
+                        device=next(self.small_object_detection.model.parameters()).device,
+                    )
+                    sample_input = torch.rand(1, 3, 224, 224).to(
+                        next(self.small_object_detection.model.parameters()).device
+                    )
+                    self.universal_splitter.trace(
+                        self.small_object_detection.model, sample_input,
+                    )
+
+                    # ---- Split-point selection (priority: explicit > strategy) ----
+                    if split_module:
+                        # Explicit module-name boundary (e.g. 'backbone')
+                        idx = self.universal_splitter.find_best_split_by_module(split_module)
+                        self.universal_splitter.split(layer_index=idx)
+                    elif split_layer is not None:
+                        # Explicit layer index or label
+                        if isinstance(split_layer, str):
+                            self.universal_splitter.split(layer_label=split_layer)
+                        else:
+                            self.universal_splitter.split(layer_index=int(split_layer))
+                    elif split_strategy:
+                        # HSFL-style strategy: flops_ratio | privacy | midpoint
+                        #                       min_smashed | linucb
+                        if split_strategy == 'linucb':
+                            self.split_selector = \
+                                self.universal_splitter.create_split_selector(
+                                    only_parametric=only_parametric,
+                                    latency_weight=latency_weight,
+                                    alpha=ucb_alpha,
+                                )
+                            idx = self.split_selector.select()
+                            self.universal_splitter.split(layer_index=idx)
+                            logger.info(
+                                "LinUCB initial split selection — layer {}",
+                                idx,
+                            )
+                        else:
+                            self.universal_splitter.select_split_point(
+                                strategy=split_strategy,
+                                target_ratio=target_ratio,
+                                max_privacy_leakage=max_privacy,
+                                only_parametric=only_parametric,
+                            )
+                    else:
+                        # Default: HSFL flops_ratio at 50 % (midpoint)
+                        self.universal_splitter.select_split_point(
+                            strategy='midpoint',
+                            only_parametric=only_parametric,
+                        )
+
+                    logger.info(
+                        "Universal model splitting enabled — split at layer {}",
+                        self.universal_splitter.split_index,
+                    )
+                except Exception as exc:
+                    logger.exception("Failed to init universal splitter: {}", exc)
+                    self.universal_split_enabled = False
+                    self.universal_splitter = None
+                    self.split_selector = None
 
         self.retrain_processor = threading.Thread(target=self.retrain_worker,daemon=True)
         self.retrain_processor.start()
@@ -336,26 +467,150 @@ class EdgeWorker:
             # count-based threshold when concept drift is detected.
             drift_detected = self.drift_detector.update(avg_score)
 
+            # ── Resource-aware CL trigger (RCCDA multi-queue Lyapunov) ──
+            # When enabled, the resource-aware trigger *replaces* the drift
+            # detector's trigger decision with a Lyapunov policy that
+            # considers cloud resource state, bandwidth, and privacy.
+            resource_trigger_fired = False
+            if self.resource_trigger_enabled and self.resource_trigger is not None:
+                try:
+                    # 1. Query cloud resources (non-blocking, cached)
+                    if self._cloud_state is None or self._cloud_state.is_stale(30.0):
+                        self._cloud_state = query_cloud_resource(
+                            self.config.server_ip, timeout_sec=3.0
+                        )
+
+                    # 2. Estimate bandwidth
+                    bw_mbps = estimate_bandwidth(self.config.server_ip)
+
+                    # 3. Estimate smashed-data size for current split
+                    feat_numel = 0
+                    feat_bytes = 0
+                    if (
+                        self.universal_split_enabled
+                        and self.universal_splitter is not None
+                        and self.universal_splitter.split_index is not None
+                    ):
+                        layers = self.universal_splitter.layer_info
+                        if layers and self.universal_splitter.split_index < len(layers):
+                            linfo = layers[self.universal_splitter.split_index]
+                            feat_numel = 1
+                            for d in linfo.output_shape:
+                                feat_numel *= d
+                            feat_bytes = feat_numel * 4  # float32
+
+                    # 4. Make the joint CL-trigger + split-point decision
+                    #    Build split candidates for Lyapunov split selection
+                    if (
+                        self.universal_split_enabled
+                        and self.universal_splitter is not None
+                        and self._split_candidates is None
+                    ):
+                        try:
+                            self._split_candidates = build_split_candidates(
+                                self.universal_splitter,
+                                only_parametric=False,
+                            )
+                        except Exception:
+                            self._split_candidates = []
+
+                    trigger, new_split_idx = self.resource_trigger.decide(
+                        avg_confidence=avg_score,
+                        cloud_state=self._cloud_state,
+                        bandwidth_mbps=bw_mbps,
+                        feature_bytes=feat_bytes,
+                        feature_numel=feat_numel,
+                        split_candidates=self._split_candidates or None,
+                    )
+                    resource_trigger_fired = trigger
+
+                    # 5. Apply Lyapunov-selected split point if changed
+                    if (
+                        new_split_idx is not None
+                        and self.universal_splitter is not None
+                        and new_split_idx != self.universal_splitter.split_index
+                    ):
+                        old_idx = self.universal_splitter.split_index
+                        self.universal_splitter.split(layer_index=new_split_idx)
+                        logger.info(
+                            "[ResourceCLTrigger] Re-split: layer {} → {}",
+                            old_idx, new_split_idx,
+                        )
+                        # Update split_meta.json so cloud uses the new split
+                        import json as _json
+                        meta_path = os.path.join(
+                            self.config.retrain.cache_path, "features", "split_meta.json"
+                        )
+                        os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+                        meta = {
+                            "universal": True,
+                            "split_index": new_split_idx,
+                        }
+                        with open(meta_path, "w") as _mf:
+                            _json.dump(meta, _mf)
+                except Exception as exc:
+                    logger.warning("[ResourceCLTrigger] Decision failed: {}", exc)
+                    resource_trigger_fired = False
+
             # ---- Split learning: extract & cache backbone features ----
             if self.split_learning_enabled:
                 try:
-                    with self.small_object_detection.model_lock:
-                        features, image_sizes, tensor_shape, original_sizes = \
-                            extract_backbone_features(
-                                self.small_object_detection.model, frame
+                    if self.universal_split_enabled and self.universal_splitter is not None:
+                        # ---- Universal path (any model, any split layer) ----
+                        from PIL import Image
+                        from torchvision import transforms as T
+                        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                        img_t = T.ToTensor()(img_pil).unsqueeze(0)
+                        dev = next(self.small_object_detection.model.parameters()).device
+                        img_t = img_t.to(dev)
+                        with self.small_object_detection.model_lock:
+                            intermediate = extract_split_features(
+                                self.universal_splitter, img_t,
                             )
-                    save_feature_cache(
-                        cache_path=self.config.retrain.cache_path,
-                        frame_index=task.frame_index,
-                        features=features,
-                        image_sizes=image_sizes,
-                        tensor_shape=tensor_shape,
-                        original_sizes=original_sizes,
-                        is_drift=drift_detected,
-                        pseudo_boxes=detection_boxes,
-                        pseudo_labels=detection_class,
-                        pseudo_scores=detection_score,
-                    )
+                        save_split_feature_cache(
+                            cache_path=self.config.retrain.cache_path,
+                            frame_index=task.frame_index,
+                            intermediate=intermediate,
+                            is_drift=drift_detected,
+                            pseudo_boxes=detection_boxes,
+                            pseudo_labels=detection_class,
+                            pseudo_scores=detection_score,
+                        )
+                        # Persist split metadata so the cloud knows which
+                        # path / layer index to use during retraining.
+                        import json as _json
+                        meta_path = os.path.join(
+                            self.config.retrain.cache_path, "features", "split_meta.json"
+                        )
+                        if not os.path.exists(meta_path):
+                            os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+                            meta = {
+                                "universal": True,
+                                "split_index": self.universal_splitter.split_index,
+                                "model_name": self.config.client.detection.model_name
+                                    if hasattr(self.config, 'client') else "",
+                            }
+                            with open(meta_path, "w") as _mf:
+                                _json.dump(meta, _mf)
+                    else:
+                        # ---- Legacy Faster R-CNN path ----
+                        with self.small_object_detection.model_lock:
+                            features, image_sizes, tensor_shape, original_sizes = \
+                                extract_backbone_features(
+                                    self.small_object_detection.model, frame
+                                )
+                        save_feature_cache(
+                            cache_path=self.config.retrain.cache_path,
+                            frame_index=task.frame_index,
+                            features=features,
+                            image_sizes=image_sizes,
+                            tensor_shape=tensor_shape,
+                            original_sizes=original_sizes,
+                            is_drift=drift_detected,
+                            pseudo_boxes=detection_boxes,
+                            pseudo_labels=detection_class,
+                            pseudo_scores=detection_score,
+                        )
                     if drift_detected:
                         self.drift_frame_indices.append(task.frame_index)
                     logger.debug("Cached features for frame {} (drift={})",
@@ -366,12 +621,18 @@ class EdgeWorker:
 
             min_samples = max(getattr(self.config.retrain, 'select_num', 10), 10)
             count_trigger = self.cache_count >= self.config.retrain.collect_num
-            drift_trigger = drift_detected and self.cache_count >= min_samples
+
+            # Resource-aware trigger supersedes drift_detected when enabled
+            if self.resource_trigger_enabled:
+                drift_trigger = resource_trigger_fired and self.cache_count >= min_samples
+            else:
+                drift_trigger = drift_detected and self.cache_count >= min_samples
 
             if count_trigger or drift_trigger:
                 if drift_trigger and not count_trigger:
-                    logger.info("Drift detected — triggering cloud retraining early "
-                                "(cached={} samples)", self.cache_count)
+                    trigger_source = "resource-aware" if self.resource_trigger_enabled else "drift"
+                    logger.info("{} trigger — starting cloud retraining early "
+                                "(cached={} samples)", trigger_source, self.cache_count)
 
                 if self.split_learning_enabled:
                     # Split learning: use ALL cached frames for training
@@ -396,6 +657,7 @@ class EdgeWorker:
 
                 if self.split_learning_enabled:
                     # ---- Split-learning path ----
+                    _retrain_start = time.time()
                     logger.info(
                         "Sending {} features ({} drift) to cloud for split-learning CL",
                         len(self.select_index), len(self.drift_frame_indices),
@@ -410,6 +672,7 @@ class EdgeWorker:
                     )
                 else:
                     # ---- Original full-image path ----
+                    _retrain_start = time.time()
                     logger.info("Sending {} frames to cloud for continual learning",
                                 len(self.select_index))
                     success, model_b64, msg = request_cloud_training(
@@ -419,6 +682,8 @@ class EdgeWorker:
                         self.config.retrain.cache_path,
                         num_epoch,
                     )
+
+                _retrain_elapsed = time.time() - _retrain_start
 
                 if success and model_b64:
                     try:
@@ -430,6 +695,29 @@ class EdgeWorker:
                         logger.success("Edge model updated from cloud successfully")
                     except Exception as exc:
                         logger.exception("Failed to load cloud-returned model weights: {}", exc)
+
+                    # ---- LinUCB feedback: update bandit with observed round latency ----
+                    if (
+                        self.universal_split_enabled
+                        and self.split_selector is not None
+                        and self.universal_splitter is not None
+                        and self.universal_splitter.split_index is not None
+                    ):
+                        try:
+                            self.split_selector.update(
+                                self.universal_splitter.split_index,
+                                _retrain_elapsed,
+                            )
+                            # Re-select for the next round
+                            new_idx = self.split_selector.select()
+                            if new_idx != self.universal_splitter.split_index:
+                                self.universal_splitter.split(layer_index=new_idx)
+                                logger.info(
+                                    "LinUCB adapted split point: {} → {}",
+                                    self.universal_splitter.split_index, new_idx,
+                                )
+                        except Exception as exc:
+                            logger.warning("LinUCB update/re-select failed: {}", exc)
                 else:
                     logger.error("Cloud continual learning failed: {}", msg)
 
