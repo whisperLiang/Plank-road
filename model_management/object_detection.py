@@ -7,13 +7,15 @@ import os
 import numpy as np
 from loguru import logger
 from torch.utils.data import DataLoader
-from torchvision.models.detection.backbone_utils import*
+from torchvision.models.detection.backbone_utils import *
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib, COCO_INSTANCE_CATEGORY_NAMES, classes, annotation_cols
+from model_management.model_zoo import (
+    build_detection_model, is_wrapper_model, model_has_roi_heads, get_model_family,
+)
 from PIL import Image
 from torchvision import transforms
-from torchvision.models.detection import *
 from mapcalc import calculate_map
 from model_management.utils import get_offloading_region, get_offloading_image
 
@@ -40,48 +42,121 @@ class Object_Detection:
         else:
             self.model_name = config.golden
         self.model = None
+        self._tmp_weight_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"tmp_model_{self.model_name}.pth",
+        )
         self.load_model()
         self.threshold_low = 0.2
         self.threshold_high = 0.6
 
     def load_model(self):
         weight_folder = os.path.join(os.path.dirname(__file__), 'models')
-        if self.model_name in model_lib.keys():
-            weight_files_path = \
-                os.path.join(weight_folder, model_lib[self.model_name]['model_path'])
-            weight_load = torch.load(weight_files_path, map_location=device)
-            self.model = eval(self.model_name)(pretrained_backbone=False, pretrained=False)
-            self.model.load_state_dict(weight_load)
-            self.model.to(device)
+        family = get_model_family(self.model_name)
+
+        # --- Wrapper models (YOLO / DETR / RT-DETR): built by factory, weights handled internally ---
+        if family in ('yolo', 'detr', 'rtdetr'):
+            weights_path = None
+            if self.model_name in model_lib:
+                candidate = os.path.join(weight_folder, model_lib[self.model_name]['model_path'])
+                if os.path.exists(candidate):
+                    weights_path = candidate
+            self.model = build_detection_model(
+                self.model_name, pretrained=True, device=device, weights_path=weights_path,
+            )
             if self.init_model_flag:
                 self.init_model()
             self.model.eval()
+            return
+
+        # --- Torchvision models: load from local weight file ---
+        if self.model_name in model_lib:
+            weight_files_path = os.path.join(weight_folder, model_lib[self.model_name]['model_path'])
+            if os.path.exists(weight_files_path):
+                weight_load = torch.load(weight_files_path, map_location=device)
+                self.model = build_detection_model(self.model_name, pretrained=False, device=device)
+                self.model.load_state_dict(weight_load)
+            else:
+                logger.warning(f"Weight file not found: {weight_files_path}, building with random init.")
+                self.model = build_detection_model(self.model_name, pretrained=False, device=device)
+        else:
+            # Fallback: try factory anyway (covers unlisted torchvision models)
+            self.model = build_detection_model(self.model_name, pretrained=False, device=device)
+
+        self.model.to(device)
+        if self.init_model_flag:
+            self.init_model()
+        self.model.eval()
 
     def init_model(self):
         logger.debug("init_model")
         for param in self.model.parameters():
             param.requires_grad = False
-        for param in self.model.roi_heads.parameters():
-            param.requires_grad = True
-        """
-        for module in self.model.roi_heads.modules():
-            if isinstance(module, torch.nn.Linear):
-                torch.nn.init.kaiming_normal_(module.weight)
-                if module.bias is not None:
-                    torch.nn.init.constant_(module.bias, 0)
-        """
-        torch.save(self.model.state_dict(), "./model_management/tmp_model.pth")
+
+        if model_has_roi_heads(self.model_name):
+            # Faster R-CNN / legacy path: only fine-tune roi_heads
+            for param in self.model.roi_heads.parameters():
+                param.requires_grad = True
+        elif is_wrapper_model(self.model_name):
+            # YOLO / DETR / RT-DETR wrappers manage their own fine-tuning;
+            # for now unfreeze the last 20 % of parameters as a heuristic.
+            all_params = list(self.model.parameters())
+            trainable_start = int(len(all_params) * 0.8)
+            for p in all_params[trainable_start:]:
+                p.requires_grad = True
+        else:
+            # Other torchvision models (RetinaNet / SSD / FCOS): fine-tune head
+            head_attrs = ['head', 'classification_head', 'regression_head']
+            found = False
+            for attr in head_attrs:
+                if hasattr(self.model, attr):
+                    for param in getattr(self.model, attr).parameters():
+                        param.requires_grad = True
+                    found = True
+            if not found:
+                # Fallback: unfreeze last 20 % of parameters
+                all_params = list(self.model.parameters())
+                trainable_start = int(len(all_params) * 0.8)
+                for p in all_params[trainable_start:]:
+                    p.requires_grad = True
+
+        torch.save(self.model.state_dict(), self._tmp_weight_path)
 
     def retrain(self, path, select_index):
 
-        tmp_model = eval(self.model_name)(pretrained_backbone=False, pretrained=False)
-        state_dict = torch.load("./model_management/tmp_model.pth", map_location=device)
+        # Wrapper models (YOLO/DETR/RT-DETR) don't support torchvision-style
+        # forward(images, targets) → loss_dict training through this path.
+        if is_wrapper_model(self.model_name):
+            logger.warning(
+                "[Retrain] {} ({}) does not support torchvision-style retraining. "
+                "Use the model's native training API (e.g. ultralytics CLI).",
+                self.model_name, get_model_family(self.model_name),
+            )
+            return
+
+        tmp_model = build_detection_model(self.model_name, pretrained=False, device=device)
+        state_dict = torch.load(self._tmp_weight_path, map_location=device)
         tmp_model.load_state_dict(state_dict)
         tmp_model.to(device)
-        for param in self.model.parameters():
+
+        # Freeze backbone, unfreeze head — model-family aware
+        for param in tmp_model.parameters():
             param.requires_grad = False
-        for param in self.model.roi_heads.parameters():
-            param.requires_grad = True
+        if model_has_roi_heads(self.model_name):
+            for param in tmp_model.roi_heads.parameters():
+                param.requires_grad = True
+        else:
+            head_attrs = ['head', 'classification_head', 'regression_head', 'roi_heads']
+            found = False
+            for attr in head_attrs:
+                if hasattr(tmp_model, attr):
+                    for param in getattr(tmp_model, attr).parameters():
+                        param.requires_grad = True
+                    found = True
+            if not found:
+                all_params = list(tmp_model.parameters())
+                for p in all_params[int(len(all_params) * 0.8):]:
+                    p.requires_grad = True
 
         dataset = TrafficDataset(root=path, select_index = select_index)
         data_loader = DataLoader(dataset=dataset, batch_size=2, collate_fn=_collate_fn, )
@@ -89,8 +164,8 @@ class Object_Detection:
 
         # 训练设置
         num_epoch = self.config.retrain.num_epoch
-        roi_parameters = [p for p in tmp_model.parameters() if p.requires_grad]
-        optimizer = torch.optim.SGD(roi_parameters, lr=0.005, momentum=0.9,weight_decay=0.0005)
+        trainable_params = [p for p in tmp_model.parameters() if p.requires_grad]
+        optimizer = torch.optim.SGD(trainable_params, lr=0.005, momentum=0.9,weight_decay=0.0005)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
         for epoch in range(num_epoch):
@@ -106,11 +181,11 @@ class Object_Detection:
                 tr_metric.update(loss_dict, losses)
             # Update the learning rate
             lr_scheduler.step()
-        torch.save(tmp_model.state_dict(), "./model_management/tmp_model.pth")
+        torch.save(tmp_model.state_dict(), self._tmp_weight_path)
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        state_dict = torch.load("./model_management/tmp_model.pth", map_location=device)
+        state_dict = torch.load(self._tmp_weight_path, map_location=device)
         with self.model_lock:
             self.model.load_state_dict(state_dict)
             self.model.eval()
@@ -120,8 +195,8 @@ class Object_Detection:
         frame_path = os.path.join(cache_path, 'frames')
         annotation_path = os.path.join(cache_path, 'annotation.txt')
         annotations_f = pd.read_csv(annotation_path, header=None, names=annotation_cols)
-        test_model = eval(self.model_name)(pretrained_backbone=False, pretrained=False)
-        state_dict = torch.load("./model_management/tmp_model.pth", map_location=device)
+        test_model = build_detection_model(self.model_name, pretrained=False, device=device)
+        state_dict = torch.load(self._tmp_weight_path, map_location=device)
         test_model.load_state_dict(state_dict)
         test_model.to(device)
         test_model.eval()
