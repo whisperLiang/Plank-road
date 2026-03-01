@@ -45,6 +45,34 @@ try:
 except ImportError:  # older torchvision
     from torchvision.models.detection.transform import ImageList
 
+# ── Universal model-agnostic splitting (new) ──────────────────────────────
+# Re-export the new API so callers can do:
+#   from model_management.model_split import UniversalModelSplitter
+try:
+    from model_management.universal_model_split import (  # noqa: F401
+        UniversalModelSplitter,
+        extract_split_features,
+        save_split_feature_cache,
+        load_split_feature_cache,
+        universal_split_retrain,
+        LayerProfile,
+        SplitPointSelector,
+    )
+except ImportError:
+    pass  # torchlens not installed → universal API unavailable
+
+# ── Dynamic Activation Sparsity (SURGEON-style layer pruning) ─────────────
+# Re-export core API for convenience
+try:
+    from model_management.activation_sparsity import (  # noqa: F401
+        DASTrainer,
+        apply_das_to_model,
+        apply_das_to_tail,
+    )
+    _HAS_DAS = True
+except ImportError:
+    _HAS_DAS = False
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1.  Feature extraction  (edge side)
@@ -244,6 +272,69 @@ def server_side_train_step(
 # 5.  Full split-learning training loop  (cloud side)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _das_probe_split(
+    das_trainer,
+    model: torch.nn.Module,
+    cache_path: str,
+    indices: List[int],
+    gt_annotations: Dict[int, dict],
+    device: torch.device,
+    probe_samples: int = 10,
+) -> None:
+    """Probe gradient importance for DAS pruning-ratio computation.
+
+    Loads a small batch of cached features, runs a forward-backward through
+    the tail (``rpn + roi_heads``), and uses ``DASTrainer.probe_with_targets``
+    to compute per-layer pruning ratios.
+    """
+    gt_set = set(gt_annotations.keys())
+    sampled = indices[:probe_samples]
+
+    for idx in sampled:
+        try:
+            data = load_feature_cache(cache_path, idx)
+        except Exception:
+            continue
+
+        features = data["features"]
+        image_sizes = data["image_sizes"]
+        tensor_shape = data["tensor_shape"]
+        original_sizes = data["original_sizes"]
+
+        # Build targets
+        if idx in gt_set:
+            gt = gt_annotations[idx]
+            boxes, labels = gt["boxes"], gt["labels"]
+        else:
+            boxes = data.get("pseudo_boxes", [])
+            labels = data.get("pseudo_labels", [])
+        if not boxes or not labels:
+            continue
+
+        targets = [{
+            "boxes":  torch.tensor(boxes,  dtype=torch.float32),
+            "labels": torch.tensor(labels, dtype=torch.int64),
+        }]
+        targets = transform_targets_to_feature_space(targets, original_sizes, image_sizes)
+
+        def _probe_forward(
+            _model=model, _features=features, _image_sizes=image_sizes,
+            _tensor_shape=tensor_shape, _targets=targets, _device=device,
+        ):
+            return server_side_train_step(
+                _model, _features, _image_sizes, _tensor_shape, _targets, _device
+            )
+
+        try:
+            das_trainer.probe_with_targets(_probe_forward)
+            return  # one successful probe is enough
+        except Exception as exc:
+            logger.debug("[DAS] Probe failed on frame {}: {}", idx, exc)
+            continue
+
+    logger.debug("[DAS] Could not probe any sample; using zero pruning.")
+
+
 def split_retrain(
     model: torch.nn.Module,
     cache_path: str,
@@ -252,6 +343,9 @@ def split_retrain(
     device: torch.device,
     num_epoch: int = 2,
     lr: float = 0.005,
+    das_enabled: bool = False,
+    das_bn_only: bool = False,
+    das_probe_samples: int = 10,
 ) -> None:
     """Train ``rpn + roi_heads`` on cached backbone features.
 
@@ -266,12 +360,35 @@ def split_retrain(
     device : Computation device.
     num_epoch : Number of training epochs.
     lr : Learning rate.
+    das_enabled : bool
+        Enable SURGEON-style Dynamic Activation Sparsity for memory-
+        efficient training.  Conv/BN/FC layers in ``rpn + roi_heads``
+        are replaced with AutoFreeze versions that dynamically prune
+        activations stored for the backward pass.
+    das_bn_only : bool
+        When DAS is enabled and this is *True*, only BN parameters are
+        updated (Conv/FC weight gradients are blocked).
+    das_probe_samples : int
+        Number of samples used for gradient-importance probing per epoch.
     """
     # Ensure only roi_heads is trainable
     for p in model.parameters():
         p.requires_grad = False
     for p in model.roi_heads.parameters():
         p.requires_grad = True
+
+    # ---- DAS: replace tail modules with AutoFreeze versions ----
+    das_trainer = None
+    if das_enabled and _HAS_DAS:
+        das_trainer = apply_das_to_tail(
+            model,
+            ["rpn", "roi_heads"],
+            bn_only=das_bn_only,
+            device=device,
+        )
+        logger.info("[SplitRetrain] DAS (Dynamic Activation Sparsity) enabled.")
+    elif das_enabled and not _HAS_DAS:
+        logger.warning("[SplitRetrain] DAS requested but activation_sparsity module unavailable.")
 
     roi_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(roi_params, lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -288,6 +405,14 @@ def split_retrain(
         n_samples = 0
         indices = all_indices.copy()
         random.shuffle(indices)
+
+        # ---- DAS: probe gradient importance at epoch start ----
+        if das_trainer is not None:
+            _das_probe_split(
+                das_trainer, model, cache_path, indices,
+                gt_annotations, device, das_probe_samples,
+            )
+            das_trainer.activate_sparsity()
 
         for idx in indices:
             try:
@@ -347,4 +472,13 @@ def split_retrain(
         logger.info(
             "[SplitRetrain] Epoch {}/{} — samples={}, avg_loss={:.4f}",
             epoch + 1, num_epoch, n_samples, avg,
+        )
+
+    # ---- DAS: deactivate sparsity after training and log stats ----
+    if das_trainer is not None:
+        das_trainer.deactivate_sparsity()
+        stats = das_trainer.get_memory_stats()
+        logger.info(
+            "[SplitRetrain/DAS] Activation compression: {:.1%}",
+            stats.get("compression_ratio", 1.0),
         )
