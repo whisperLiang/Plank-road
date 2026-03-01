@@ -34,6 +34,18 @@ from model_management.model_split import (
     list_cached_features,
     split_retrain,
 )
+
+# Universal model splitting (optional — requires torchlens)
+try:
+    from model_management.universal_model_split import (
+        UniversalModelSplitter,
+        universal_split_retrain,
+        load_split_feature_cache,
+    )
+    _HAS_UNIVERSAL_SPLIT = True
+except ImportError:
+    _HAS_UNIVERSAL_SPLIT = False
+
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
 
@@ -79,6 +91,12 @@ class CloudContinualLearner:
         # Default training hyper-parameters (overridable from config)
         cl_cfg = getattr(config, "continual_learning", None)
         self.default_num_epoch = int(getattr(cl_cfg, "num_epoch", 2)) if cl_cfg else 2
+
+        # Dynamic Activation Sparsity (SURGEON) config
+        das_cfg = getattr(config, "das", None)
+        self.das_enabled = bool(getattr(das_cfg, "enabled", False)) if das_cfg else False
+        self.das_bn_only = bool(getattr(das_cfg, "bn_only", False)) if das_cfg else False
+        self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
 
     # ------------------------------------------------------------------
     # Public API
@@ -210,15 +228,25 @@ class CloudContinualLearner:
         gt_annotations: dict[int, dict],
         num_epoch: int,
     ) -> bytes:
-        """Fine-tune the lightweight model via split learning; return state-dict bytes."""
-        from torchvision.models.detection import (
-            fasterrcnn_mobilenet_v3_large_fpn,
-            fasterrcnn_mobilenet_v3_large_320_fpn,
-            fasterrcnn_resnet50_fpn,
-        )
+        """Fine-tune the lightweight model via split learning; return state-dict bytes.
+
+        Automatically detects whether the cached features were produced by the
+        *universal* model splitter (``features/split_meta.json`` present) or
+        by the legacy Faster R-CNN backbone extractor, and dispatches to the
+        appropriate training routine.
+        """
+        import json as _json
+        from model_management.model_zoo import build_detection_model, model_has_roi_heads, is_wrapper_model
 
         model_name = self.edge_model_name
-        tmp_model = eval(model_name)(pretrained_backbone=False, pretrained=False)
+
+        if is_wrapper_model(model_name):
+            raise NotImplementedError(
+                f"[SplitCL] {model_name} is a wrapper model (YOLO/DETR/RT-DETR) and "
+                f"does not support torchvision-style split retraining."
+            )
+
+        tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
 
         # Load existing edge-model weights
         edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
@@ -241,15 +269,53 @@ class CloudContinualLearner:
 
         tmp_model.to(self.device)
 
-        # Use the shared split_retrain loop from model_split
-        split_retrain(
-            model=tmp_model,
-            cache_path=cache_path,
-            all_indices=all_indices,
-            gt_annotations=gt_annotations,
-            device=self.device,
-            num_epoch=num_epoch,
-        )
+        # ---- Detect universal split features ----
+        meta_path = os.path.join(cache_path, "features", "split_meta.json")
+        use_universal = False
+        split_index = None
+
+        if os.path.exists(meta_path) and _HAS_UNIVERSAL_SPLIT:
+            try:
+                with open(meta_path, "r") as _mf:
+                    meta = _json.load(_mf)
+                use_universal = meta.get("universal", False)
+                split_index = meta.get("split_index")
+                logger.info(
+                    "[SplitCL] Detected universal split features — split_index={}",
+                    split_index,
+                )
+            except Exception as exc:
+                logger.warning("[SplitCL] Failed to read split_meta.json: {}", exc)
+
+        if use_universal and split_index is not None:
+            # ---- Universal split-learning path (any model, any layer) ----
+            sample_input = torch.rand(1, 3, 224, 224).to(self.device)
+            universal_split_retrain(
+                model=tmp_model,
+                sample_input=sample_input,
+                split_layer=int(split_index),
+                cache_path=cache_path,
+                all_indices=all_indices,
+                gt_annotations=gt_annotations,
+                device=self.device,
+                num_epoch=num_epoch,
+                das_enabled=self.das_enabled,
+                das_bn_only=self.das_bn_only,
+                das_probe_samples=self.das_probe_samples,
+            )
+        else:
+            # ---- Legacy Faster R-CNN split-learning path ----
+            split_retrain(
+                model=tmp_model,
+                cache_path=cache_path,
+                all_indices=all_indices,
+                gt_annotations=gt_annotations,
+                device=self.device,
+                num_epoch=num_epoch,
+                das_enabled=self.das_enabled,
+                das_bn_only=self.das_bn_only,
+                das_probe_samples=self.das_probe_samples,
+            )
 
         # Persist weights so future retraining can fine-tune further
         torch.save(tmp_model.state_dict(), edge_weights)
@@ -302,15 +368,18 @@ class CloudContinualLearner:
         self, cache_path: str, frame_indices: list[int], num_epoch: int
     ) -> bytes:
         """Fine-tune the lightweight model; return its state-dict as bytes."""
-        from torchvision.models.detection import (
-            fasterrcnn_mobilenet_v3_large_fpn,
-            fasterrcnn_mobilenet_v3_large_320_fpn,
-            fasterrcnn_resnet50_fpn,
-        )
+        from model_management.model_zoo import build_detection_model, model_has_roi_heads, is_wrapper_model
 
         model_name = self.edge_model_name
+
+        if is_wrapper_model(model_name):
+            raise NotImplementedError(
+                f"[CL] {model_name} is a wrapper model (YOLO/DETR/RT-DETR) and "
+                f"does not support torchvision-style retraining."
+            )
+
         # Build a fresh copy from the saved edge model weights
-        tmp_model = eval(model_name)(pretrained_backbone=False, pretrained=False)
+        tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
 
         # Prefer the initialised edge-model weights if they exist
         edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
@@ -336,11 +405,24 @@ class CloudContinualLearner:
 
         tmp_model.to(self.device)
 
-        # Freeze backbone; fine-tune only ROI heads
+        # Freeze backbone; fine-tune only head (model-family aware)
         for param in tmp_model.parameters():
             param.requires_grad = False
-        for param in tmp_model.roi_heads.parameters():
-            param.requires_grad = True
+        if model_has_roi_heads(model_name):
+            for param in tmp_model.roi_heads.parameters():
+                param.requires_grad = True
+        else:
+            head_attrs = ['head', 'classification_head', 'regression_head']
+            found = False
+            for attr in head_attrs:
+                if hasattr(tmp_model, attr):
+                    for param in getattr(tmp_model, attr).parameters():
+                        param.requires_grad = True
+                    found = True
+            if not found:
+                all_params = list(tmp_model.parameters())
+                for p in all_params[int(len(all_params) * 0.8):]:
+                    p.requires_grad = True
 
         dataset = TrafficDataset(root=cache_path, select_index=frame_indices)
         if len(dataset) == 0:
