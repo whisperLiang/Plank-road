@@ -128,23 +128,57 @@ def _prepare_replay_graph(layer_list: list) -> dict[str, int]:
 # Helper: layer-by-layer forward pass (full model, eval mode)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _replay_layer(layer, layer_list, label2idx, fallback_input=None):
+def _replay_layer(layer, layer_list, label2idx, fallback_input=None,
+                  model: torch.nn.Module | None = None):
     """Execute one traced layer using ``func_applied`` + ``creation_args``.
 
-    For torchlens ≥ 0.12 which no longer exposes ``replay_fast``.
+    For torchlens >= 0.12 which no longer exposes ``replay_fast``.
     Replaces parent-tensor positions in ``creation_args`` with the freshly
     computed ``tensor_contents`` of the parent layers.
+
+    When *model* is provided (training mode), parameter positions in
+    ``creation_args`` are replaced with the actual ``model.named_parameters()``
+    tensors so that autograd graphs connect to the real model weights.
+
+    Handles two torchlens-specific conventions:
+
+    * **Multi-output functions** (``chunk``, ``split``, ``unbind``):  torchlens
+      creates one layer per output element.  The layer label encodes a
+      1-based output index (e.g. ``chunk_2_11`` → second element).  After
+      calling the function we index into the tuple result.
+
+    * **Nested arg positions** (``cat``, ``stack``):  ``parent_layer_arg_locs``
+      uses tuple keys like ``(0, 0)``, ``(0, 1)`` meaning "position 0 is a
+      list; elements 0, 1, … come from these parents".
     """
     func = layer.func_applied
     if func is None:
-        return fallback_input
+        # Buffer / constant layers keep their original tensor_contents.
+        # Input layers have tensor_contents set by the caller before replay.
+        tc = layer.tensor_contents
+        return tc if tc is not None else fallback_input
 
     creation_args = list(layer.creation_args) if layer.creation_args else []
     arg_locs = getattr(layer, "parent_layer_arg_locs", None) or {"args": {}, "kwargs": {}}
 
-    # Replace parent-layer tensor positions with freshly computed values
-    for pos_str, plabel in arg_locs.get("args", {}).items():
-        pos = int(pos_str) if isinstance(pos_str, str) else pos_str
+    # Separate flat-int keys from tuple keys in arg_locs["args"]
+    flat_parent_locs: dict = {}   # int → parent_label
+    nested_parent_locs: dict = {} # (pos, sub) → parent_label
+    for key, plabel in arg_locs.get("args", {}).items():
+        if isinstance(key, tuple):
+            nested_parent_locs[key] = plabel
+        else:
+            pos = int(key) if isinstance(key, str) else key
+            flat_parent_locs[pos] = plabel
+
+    # Build a set of parent-layer positions (to distinguish from param/buffer positions)
+    parent_positions = set(flat_parent_locs.keys())
+    # Also include the top-level positions that appear in nested keys
+    for (pos, _sub) in nested_parent_locs:
+        parent_positions.add(pos)
+
+    # Replace flat parent-layer tensor positions with freshly computed values
+    for pos, plabel in flat_parent_locs.items():
         if plabel in label2idx:
             parent = layer_list[label2idx[plabel]]
             tc = parent.tensor_contents
@@ -152,6 +186,55 @@ def _replay_layer(layer, layer_list, label2idx, fallback_input=None):
                 creation_args[pos] = tc
             elif fallback_input is not None and pos < len(creation_args):
                 creation_args[pos] = fallback_input
+
+    # Build list arguments from nested (tuple-key) parent positions.
+    # E.g. cat expects a list-of-tensors at position 0.
+    if nested_parent_locs:
+        # Group by top-level position
+        nested_groups: dict[int, dict[int, str]] = {}
+        for (pos, sub), plabel in nested_parent_locs.items():
+            nested_groups.setdefault(pos, {})[sub] = plabel
+        for pos, sub_map in nested_groups.items():
+            elems: list = []
+            for sub_idx in sorted(sub_map.keys()):
+                plabel = sub_map[sub_idx]
+                if plabel in label2idx:
+                    parent = layer_list[label2idx[plabel]]
+                    tc = parent.tensor_contents
+                    elems.append(tc if tc is not None else fallback_input)
+                else:
+                    elems.append(fallback_input)
+            if pos < len(creation_args):
+                creation_args[pos] = elems
+            else:
+                # Extend if necessary
+                while len(creation_args) <= pos:
+                    creation_args.append(None)
+                creation_args[pos] = elems
+
+    # When model is provided (training): inject actual model parameters into
+    # creation_args so grad flows to the real weights, not torchlens copies.
+    if model is not None:
+        param_logs = getattr(layer, "parent_param_logs", None) or []
+        if param_logs:
+            named = dict(model.named_parameters())
+            # Collect actual params in ParamLog order
+            real_params = []
+            for pl in param_logs:
+                key = f"{pl.module_address}.{pl.name}"
+                if key in named:
+                    real_params.append(named[key])
+            # Map to non-parent tensor positions in creation_args.
+            # Don't check requires_grad — trace runs under no_grad so
+            # creation_args tensors have requires_grad=False.
+            param_iter = iter(real_params)
+            for pos, arg in enumerate(creation_args):
+                if pos in parent_positions:
+                    continue
+                if isinstance(arg, torch.Tensor):
+                    rp = next(param_iter, None)
+                    if rp is not None:
+                        creation_args[pos] = rp
 
     kw_args = dict(layer.func_keyword_args_non_tensor) if layer.func_keyword_args_non_tensor else {}
     for kw_name, plabel in arg_locs.get("kwargs", {}).items():
@@ -161,7 +244,41 @@ def _replay_layer(layer, layer_list, label2idx, fallback_input=None):
             if tc is not None:
                 kw_args[kw_name] = tc
 
-    return func(*creation_args, **kw_args)
+    # In-place functions (relu_, etc.) cannot operate on leaf Variables with
+    # requires_grad.  Clone tensor inputs to guarantee safety.
+    func_name = getattr(layer, "func_applied_name", "") or ""
+    if func_name.endswith("_") and model is not None:
+        creation_args = [
+            a.clone() if isinstance(a, torch.Tensor) and a.is_leaf and a.requires_grad else a
+            for a in creation_args
+        ]
+
+    try:
+        result = func(*creation_args, **kw_args)
+    except (IndexError, RuntimeError) as exc:
+        # Dynamic-index layers (gather, select, index_select, …) may use
+        # indices recorded at trace time that no longer match intermediate
+        # tensor shapes during replay.  Fall back to the pre-recorded value.
+        stored = getattr(layer, "tensor_contents", None)
+        if stored is not None:
+            return stored
+        raise exc
+
+    # Handle multi-output functions (chunk, split, unbind, etc.)
+    # torchlens creates one layer per tuple element; extract the right one.
+    if isinstance(result, (tuple, list)):
+        # Determine the 1-based output index from the layer label.
+        # Convention: "chunk_2_11" → layer_label_short "chunk_2" → index 2
+        label_short = getattr(layer, "layer_label_short", "") or ""
+        parts = label_short.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            out_idx = int(parts[1]) - 1  # 1-based → 0-based
+            if 0 <= out_idx < len(result):
+                return result[out_idx]
+        # Fallback: return first element
+        return result[0] if result else result
+
+    return result
 
 
 def _layer_forward_full(
@@ -282,6 +399,7 @@ def _partition_forward_tail_train(
     label2idx: dict[str, int],
     x_inter: torch.Tensor,
     split_index: int,
+    model: torch.nn.Module | None = None,
 ) -> torch.Tensor:
     """Training-mode forward through the tail partition (keeps autograd graph)."""
     layer_list[split_index].tensor_contents = x_inter
@@ -303,7 +421,8 @@ def _partition_forward_tail_train(
                     layer.tensor_contents = x
             continue
 
-        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x_inter)
+        result = _replay_layer(layer, layer_list, label2idx,
+                               fallback_input=x_inter, model=model)
         layer.tensor_contents = result
         x = result
 
@@ -1296,6 +1415,7 @@ class UniversalModelSplitter:
             self._label2idx,
             intermediate,
             self._split_index,
+            model=self._model,
         )
 
         if loss_fn is not None and targets is not None:
