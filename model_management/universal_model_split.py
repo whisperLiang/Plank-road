@@ -95,12 +95,9 @@ from loguru import logger
 # ---------------------------------------------------------------------------
 try:
     import torchlens as tl
-    from torchlens.tensor_log import TensorLogEntry
-
     _HAS_TORCHLENS = True
 except ImportError:
     _HAS_TORCHLENS = False
-    TensorLogEntry = None  # type: ignore[misc,assignment]
 
 # ---------------------------------------------------------------------------
 # Dynamic Activation Sparsity (SURGEON-style layer pruning).
@@ -120,20 +117,10 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _prepare_replay_graph(layer_list: list) -> dict[str, int]:
-    """Build a ``{layer_label: index}`` mapping and call ``prepare_replay``
-    on every non-trivial layer so that ``replay_fast`` can be used later.
-
-    This mirrors the ``prepare_replay_graph`` function from Shawarma /
-    torchlens test_replay.py.
-    """
+    """Build a ``{layer_label: index}`` mapping for the layer list."""
     label2idx: dict[str, int] = {}
     for i, layer in enumerate(layer_list):
         label2idx[layer.layer_label] = i
-        if getattr(layer, "func_applied_name", None) not in (None, "none"):
-            try:
-                layer.prepare_replay()
-            except Exception:
-                pass  # some layers (input/output/buffer) don't need prep
     return label2idx
 
 
@@ -141,17 +128,52 @@ def _prepare_replay_graph(layer_list: list) -> dict[str, int]:
 # Helper: layer-by-layer forward pass (full model, eval mode)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _replay_layer(layer, layer_list, label2idx, fallback_input=None):
+    """Execute one traced layer using ``func_applied`` + ``creation_args``.
+
+    For torchlens ≥ 0.12 which no longer exposes ``replay_fast``.
+    Replaces parent-tensor positions in ``creation_args`` with the freshly
+    computed ``tensor_contents`` of the parent layers.
+    """
+    func = layer.func_applied
+    if func is None:
+        return fallback_input
+
+    creation_args = list(layer.creation_args) if layer.creation_args else []
+    arg_locs = getattr(layer, "parent_layer_arg_locs", None) or {"args": {}, "kwargs": {}}
+
+    # Replace parent-layer tensor positions with freshly computed values
+    for pos_str, plabel in arg_locs.get("args", {}).items():
+        pos = int(pos_str) if isinstance(pos_str, str) else pos_str
+        if plabel in label2idx:
+            parent = layer_list[label2idx[plabel]]
+            tc = parent.tensor_contents
+            if tc is not None and pos < len(creation_args):
+                creation_args[pos] = tc
+            elif fallback_input is not None and pos < len(creation_args):
+                creation_args[pos] = fallback_input
+
+    kw_args = dict(layer.func_keyword_args_non_tensor) if layer.func_keyword_args_non_tensor else {}
+    for kw_name, plabel in arg_locs.get("kwargs", {}).items():
+        if plabel in label2idx:
+            parent = layer_list[label2idx[plabel]]
+            tc = parent.tensor_contents
+            if tc is not None:
+                kw_args[kw_name] = tc
+
+    return func(*creation_args, **kw_args)
+
+
 def _layer_forward_full(
     layer_list: list,
     label2idx: dict[str, int],
     x: torch.Tensor,
 ) -> torch.Tensor:
-    """Execute the full model layer-by-layer using the TorchLens replay
-    mechanism.  This is the Shawarma ``forward_eval`` equivalent.
+    """Execute the full model layer-by-layer via traced graph replay.
 
     Parameters
     ----------
-    layer_list : list[TensorLogEntry]
+    layer_list : list of TensorLog entries
     label2idx  : dict mapping layer_label → list index
     x          : input tensor
 
@@ -163,50 +185,17 @@ def _layer_forward_full(
         func_name = getattr(layer, "func_applied_name", None)
         layer_type = getattr(layer, "layer_type", None)
 
-        # No-op layers: input / output / buffer
         if func_name == "none":
             if layer_type == "input":
                 layer.tensor_contents = x
             elif layer_type == "output":
                 parent_idx = label2idx[layer.parent_layers[0]]
                 layer.tensor_contents = layer_list[parent_idx].tensor_contents
-            # buffer layers keep their pre-existing tensor_contents
             continue
 
-        # Gather inputs from parent layers
-        x_in: list = []
-        buffer_in: list = []
-        op_num = layer.operation_num
-
-        for plabel in layer.parent_layers:
-            p = layer_list[label2idx[plabel]]
-            if p.layer_type == "buffer":
-                buffer_in.append(p.tensor_contents)
-            else:
-                tc = p.tensor_contents
-                if tc is None and p.operation_num == op_num - 1:
-                    x_in.append(x)
-                else:
-                    x_in.append(tc)
-                # Memory: release parent once its last child has consumed it
-                if (
-                    p.layer_type not in ("input", "buffer")
-                    and p.child_layers
-                    and label2idx.get(p.child_layers[-1], 0) <= label2idx[layer.layer_label]
-                ):
-                    p.tensor_contents = None
-
-        # Execute
-        x = layer.replay_fast(x_in, buffer_in)
-
-        # Memory: aggressively free intermediates
-        if (
-            layer.child_layers
-            and layer_list[label2idx[layer.child_layers[-1]]].operation_num <= op_num + 1
-        ):
-            layer.tensor_contents = None
-        else:
-            layer.tensor_contents = x
+        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x)
+        layer.tensor_contents = result
+        x = result
 
     return x
 
@@ -221,11 +210,7 @@ def _partition_forward_head(
     x: torch.Tensor,
     split_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run layers ``[0 .. split_index]`` and return ``(final_output, intermediate)``.
-
-    *intermediate* is the activation at ``split_index`` — this is what the
-    edge sends to the cloud.
-    """
+    """Run layers ``[0 .. split_index]`` and return ``(final_output, intermediate)``."""
     intermediate: torch.Tensor | None = None
 
     for idx, layer in enumerate(layer_list):
@@ -238,45 +223,17 @@ def _partition_forward_head(
         if func_name == "none":
             if layer_type == "input":
                 layer.tensor_contents = x
-            elif layer_type == "buffer":
-                pass  # keep existing contents
-            elif layer_type == "output":
-                if layer.parent_layers:
-                    parent_idx = label2idx[layer.parent_layers[0]]
-                    layer.tensor_contents = layer_list[parent_idx].tensor_contents
+            elif layer_type == "output" and layer.parent_layers:
+                parent_idx = label2idx[layer.parent_layers[0]]
+                layer.tensor_contents = layer_list[parent_idx].tensor_contents
             if idx == split_index:
-                intermediate = (
-                    layer.tensor_contents.detach().clone()
-                    if layer.tensor_contents is not None
-                    else x.detach().clone()
-                )
+                tc = layer.tensor_contents
+                intermediate = tc.detach().clone() if tc is not None else x.detach().clone()
             continue
 
-        # Gather inputs
-        x_in: list = []
-        buffer_in: list = []
-        op_num = layer.operation_num
-
-        for plabel in layer.parent_layers:
-            p = layer_list[label2idx[plabel]]
-            if p.layer_type == "buffer":
-                buffer_in.append(p.tensor_contents)
-            else:
-                tc = p.tensor_contents
-                if tc is None and p.operation_num == op_num - 1:
-                    x_in.append(x)
-                else:
-                    x_in.append(tc)
-                # Cleanup
-                if (
-                    p.layer_type not in ("input", "buffer")
-                    and p.child_layers
-                    and label2idx.get(p.child_layers[-1], 0) <= label2idx[layer.layer_label]
-                ):
-                    p.tensor_contents = None
-
-        x = layer.replay_fast(x_in, buffer_in)
-        layer.tensor_contents = x
+        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x)
+        layer.tensor_contents = result
+        x = result
 
         if idx == split_index:
             intermediate = x.detach().clone()
@@ -292,14 +249,9 @@ def _partition_forward_tail(
     x_inter: torch.Tensor,
     split_index: int,
 ) -> torch.Tensor:
-    """Run layers ``[split_index+1 .. end]`` given the intermediate tensor
-    produced by the head.
-
-    Missing parents (i.e. layers before split_index that are not in the
-    current partition) are replaced by ``x_inter`` the first time they are
-    needed.  This mirrors the Shawarma ``partition_forward_eval`` pattern.
-    """
-    first_in = True
+    """Run layers ``[split_index+1 .. end]`` given the intermediate tensor."""
+    # Inject intermediate into the split-point layer's tensor_contents
+    layer_list[split_index].tensor_contents = x_inter
     x = x_inter
 
     for idx, layer in enumerate(layer_list):
@@ -310,58 +262,17 @@ def _partition_forward_tail(
         layer_type = getattr(layer, "layer_type", None)
 
         if func_name == "none":
-            if layer_type == "buffer":
-                pass  # keep buffer contents
-            elif layer_type == "output":
-                if layer.parent_layers:
-                    parent_label = layer.parent_layers[0]
-                    if parent_label in label2idx and label2idx[parent_label] > split_index:
-                        layer.tensor_contents = layer_list[label2idx[parent_label]].tensor_contents
-                    else:
-                        layer.tensor_contents = x
-            else:
-                layer.tensor_contents = None
+            if layer_type == "output" and layer.parent_layers:
+                plabel = layer.parent_layers[0]
+                if plabel in label2idx and label2idx[plabel] > split_index:
+                    layer.tensor_contents = layer_list[label2idx[plabel]].tensor_contents
+                else:
+                    layer.tensor_contents = x
             continue
 
-        x_in: list = []
-        buffer_in: list = []
-
-        for plabel in layer.parent_layers:
-            if plabel not in label2idx or label2idx[plabel] <= split_index:
-                # Parent is in the head partition — inject intermediate
-                if first_in:
-                    x_in.append(x_inter)
-                    first_in = False
-                continue
-
-            p = layer_list[label2idx[plabel]]
-            if p.layer_type == "buffer":
-                buffer_in.append(p.tensor_contents)
-            else:
-                tc = p.tensor_contents
-                if tc is not None:
-                    x_in.append(tc)
-                    # Cleanup
-                    if (
-                        p.child_layers
-                        and p.child_layers[-1] in label2idx
-                        and label2idx[p.child_layers[-1]] <= label2idx[layer.layer_label]
-                    ):
-                        p.tensor_contents = None
-                elif p.operation_num == layer.operation_num - 1:
-                    x_in.append(x)
-
-        x = layer.replay_fast(x_in, buffer_in)
-
-        # Cleanup current layer
-        if (
-            layer.child_layers
-            and layer.child_layers[-1] in label2idx
-            and layer_list[label2idx[layer.child_layers[-1]]].operation_num <= layer.operation_num + 1
-        ):
-            layer.tensor_contents = None
-        else:
-            layer.tensor_contents = x
+        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x_inter)
+        layer.tensor_contents = result
+        x = result
 
     return x
 
@@ -372,13 +283,8 @@ def _partition_forward_tail_train(
     x_inter: torch.Tensor,
     split_index: int,
 ) -> torch.Tensor:
-    """Training-mode forward through the tail partition.
-
-    Unlike the eval variant this does **not** aggressively release
-    ``tensor_contents`` so that the autograd graph stays intact for
-    ``backward()``.
-    """
-    first_in = True
+    """Training-mode forward through the tail partition (keeps autograd graph)."""
+    layer_list[split_index].tensor_contents = x_inter
     x = x_inter
 
     for idx, layer in enumerate(layer_list):
@@ -389,39 +295,17 @@ def _partition_forward_tail_train(
         layer_type = getattr(layer, "layer_type", None)
 
         if func_name == "none":
-            if layer_type == "input":
-                layer.tensor_contents = x_inter
-            elif layer_type == "output":
-                if layer.parent_layers:
-                    plabel = layer.parent_layers[0]
-                    if plabel in label2idx and label2idx[plabel] > split_index:
-                        layer.tensor_contents = layer_list[label2idx[plabel]].tensor_contents
-                    else:
-                        layer.tensor_contents = x
+            if layer_type == "output" and layer.parent_layers:
+                plabel = layer.parent_layers[0]
+                if plabel in label2idx and label2idx[plabel] > split_index:
+                    layer.tensor_contents = layer_list[label2idx[plabel]].tensor_contents
+                else:
+                    layer.tensor_contents = x
             continue
 
-        x_in: list = []
-        buffer_in: list = []
-
-        for plabel in layer.parent_layers:
-            if plabel not in label2idx or label2idx[plabel] <= split_index:
-                if first_in:
-                    x_in.append(x_inter)
-                    first_in = False
-                continue
-
-            p = layer_list[label2idx[plabel]]
-            if getattr(p, "layer_type", None) == "buffer":
-                buffer_in.append(p.tensor_contents)
-            else:
-                tc = p.tensor_contents
-                if tc is not None:
-                    x_in.append(tc)
-                else:
-                    x_in.append(x)
-
-        x = layer.replay_fast(x_in, buffer_in)
-        layer.tensor_contents = x
+        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x_inter)
+        layer.tensor_contents = result
+        x = result
 
     return x
 
@@ -430,18 +314,37 @@ def _partition_forward_tail_train(
 # Helper: freeze / unfreeze parameters by partition index
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _freeze_head_params(layer_list: list, split_index: int) -> None:
+def _get_param_tensors_for_layer(layer, model: torch.nn.Module) -> list[torch.Tensor]:
+    """Return actual nn.Parameter tensors associated with a traced layer.
+
+    In torchlens >= 0.12 the actual tensors are not stored on the log entry.
+    We resolve ``parent_param_logs`` metadata back to the original model via
+    ``model.named_parameters()`` using ``module_address`` + ``name``.
+    """
+    param_logs = getattr(layer, "parent_param_logs", None)
+    if not param_logs:
+        return []
+    named = dict(model.named_parameters())
+    params: list[torch.Tensor] = []
+    for pl in param_logs:
+        key = f"{pl.module_address}.{pl.name}"
+        if key in named:
+            params.append(named[key])
+    return params
+
+
+def _freeze_head_params(layer_list: list, split_index: int, model: torch.nn.Module) -> None:
     """Freeze all parameters in layers ``[0 .. split_index]``."""
     limit = min(split_index + 1, len(layer_list))
     for i in range(limit):
-        for param in getattr(layer_list[i], "parent_params", []) or []:
+        for param in _get_param_tensors_for_layer(layer_list[i], model):
             param.requires_grad = False
 
 
-def _unfreeze_tail_params(layer_list: list, split_index: int) -> None:
+def _unfreeze_tail_params(layer_list: list, split_index: int, model: torch.nn.Module) -> None:
     """Ensure all parameters in layers ``[split_index+1 .. end]`` are trainable."""
     for i in range(split_index + 1, len(layer_list)):
-        for param in getattr(layer_list[i], "parent_params", []) or []:
+        for param in _get_param_tensors_for_layer(layer_list[i], model):
             param.requires_grad = True
 
 
@@ -449,39 +352,39 @@ def _unfreeze_tail_params(layer_list: list, split_index: int) -> None:
 # Helper: parameter access helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _get_all_params(layer_list: list, device=None) -> list[torch.Tensor]:
+def _get_all_params(layer_list: list, model: torch.nn.Module, device=None) -> list[torch.Tensor]:
     """Flatten and collect all parameters across all layers."""
+    seen: set[int] = set()
     params: list[torch.Tensor] = []
     for layer in layer_list:
-        lp = getattr(layer, "parent_params", None)
-        if lp:
-            if device is None:
-                params.extend(lp)
-            else:
-                params.extend(p.to(device) for p in lp)
+        for p in _get_param_tensors_for_layer(layer, model):
+            pid = id(p)
+            if pid not in seen:
+                seen.add(pid)
+                params.append(p if device is None else p.to(device))
     return params
 
 
-def _get_trainable_params(layer_list: list, split_index: int) -> list[torch.Tensor]:
+def _get_trainable_params(layer_list: list, split_index: int, model: torch.nn.Module) -> list[torch.Tensor]:
     """Return all trainable (``requires_grad=True``) params in the tail partition."""
+    seen: set[int] = set()
     params: list[torch.Tensor] = []
     for i in range(split_index + 1, len(layer_list)):
-        for p in getattr(layer_list[i], "parent_params", []) or []:
-            if p.requires_grad:
+        for p in _get_param_tensors_for_layer(layer_list[i], model):
+            pid = id(p)
+            if pid not in seen and p.requires_grad:
+                seen.add(pid)
                 params.append(p)
     return params
 
 
-def _load_weights_into_layers(layer_list: list, weights: list[torch.Tensor]) -> None:
-    """Load weights sequentially into the layer list (Shawarma ``load_weights``)."""
+def _load_weights_into_layers(layer_list: list, model: torch.nn.Module, weights: list[torch.Tensor]) -> None:
+    """Load weights sequentially into the layer list."""
     weight_iter = iter(weights)
     for layer in layer_list:
-        lp = getattr(layer, "parent_params", None)
-        if not lp:
-            continue
-        for j, _param in enumerate(lp):
+        for p in _get_param_tensors_for_layer(layer, model):
             try:
-                lp[j] = next(weight_iter)
+                p.data.copy_(next(weight_iter))
             except StopIteration:
                 return
 
@@ -1411,26 +1314,26 @@ class UniversalModelSplitter:
     def freeze_head(self) -> None:
         """Freeze all parameters in the head (edge) partition."""
         self._ensure_split()
-        _freeze_head_params(self._layer_list, self._split_index)
+        _freeze_head_params(self._layer_list, self._split_index, self._model)
 
     def unfreeze_tail(self) -> None:
         """Unfreeze all parameters in the tail (cloud) partition."""
         self._ensure_split()
-        _unfreeze_tail_params(self._layer_list, self._split_index)
+        _unfreeze_tail_params(self._layer_list, self._split_index, self._model)
 
     def get_tail_trainable_params(self) -> list[torch.Tensor]:
         """Return a list of trainable parameters in the cloud tail."""
         self._ensure_split()
-        return _get_trainable_params(self._layer_list, self._split_index)
+        return _get_trainable_params(self._layer_list, self._split_index, self._model)
 
     def get_all_params(self) -> list[torch.Tensor]:
         """Return all parameters of the full model."""
         self._ensure_traced()
-        return _get_all_params(self._layer_list)
+        return _get_all_params(self._layer_list, self._model)
 
     def load_weights(self, weights: list[torch.Tensor]) -> None:
         self._ensure_traced()
-        _load_weights_into_layers(self._layer_list, weights)
+        _load_weights_into_layers(self._layer_list, self._model, weights)
 
     # ------------------------------------------------------------------
     # 8. Serialisation for network transmission
@@ -1599,10 +1502,9 @@ class UniversalModelSplitter:
         sd: dict[str, torch.Tensor] = {}
         for i in range(self._split_index + 1, len(self._layer_list)):
             layer = self._layer_list[i]
-            params = getattr(layer, "parent_params", None)
-            if params:
-                for j, p in enumerate(params):
-                    sd[f"layer_{i}_param_{j}"] = p.detach().cpu()
+            params = _get_param_tensors_for_layer(layer, self._model)
+            for j, p in enumerate(params):
+                sd[f"layer_{i}_param_{j}"] = p.detach().cpu()
         return sd
 
     def load_tail_state_dict(self, sd: dict[str, torch.Tensor]) -> None:
@@ -1614,8 +1516,9 @@ class UniversalModelSplitter:
             layer_idx = int(parts[1])
             param_idx = int(parts[3])
             layer = self._layer_list[layer_idx]
-            if layer.parent_params and param_idx < len(layer.parent_params):
-                layer.parent_params[param_idx] = val
+            params = _get_param_tensors_for_layer(layer, self._model)
+            if params and param_idx < len(params):
+                params[param_idx].data.copy_(val)
 
     # ------------------------------------------------------------------
     # Internal helpers
