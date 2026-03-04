@@ -9,18 +9,7 @@ mapcalc
 APScheduler
 imutils
 PyYAML
-# Optional — required only when universal model splitting is enabled
-# (split_learning.universal.enabled = True in config.yaml).
-# Install from the model_partitioning branch:
-#   pip install git+https://github.com/whisperLiang/torchlens.git@model_partitioning
 torchlens
-# Optional — required on the **cloud** for resource monitoring
-# (resource_aware_trigger.enabled = True in config.yaml).
-# Used to report CPU / memory utilisation to edge nodes.
 psutil
-# Optional — required for YOLO / RT-DETR model families in the Model Zoo.
-# (e.g. small_model_name: yolov8s in config.yaml)
-# pip install ultralytics
-# Optional — required for DETR model family in the Model Zoo.
-# (e.g. small_model_name: detr_resnet50 in config.yaml)
-# pip install transformers
+ultralytics
+transformers
