@@ -31,7 +31,7 @@ class Resize(nn.Module):
 
     def forward(self, image: Tensor,
                 target: Optional[Dict[str, Tensor]] = None) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
-        width, height = F._get_image_size(image)
+        width, height = F.get_image_size(image)
         image = F.resize(image, self.size)
         if target is not None:
             scale_w = self.size[1] / width
