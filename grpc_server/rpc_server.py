@@ -1,3 +1,5 @@
+import zipfile
+import io
 import json
 import os
 import threading
@@ -142,6 +144,13 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 success=False, model_data="", message="continual_learner not configured"
             )
         try:
+            if hasattr(request, 'payload_zip') and request.payload_zip:
+                import zipfile
+                import io
+                buf = io.BytesIO(request.payload_zip)
+                with zipfile.ZipFile(buf, "r") as zf:
+                    zf.extractall(request.cache_path)
+                    
             frame_indices = json.loads(request.frame_indices)
             success, model_data, message = self.continual_learner.get_ground_truth_and_retrain(
                 request.edge_id,
@@ -171,6 +180,13 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 success=False, model_data="", message="continual_learner not configured"
             )
         try:
+            if hasattr(request, 'payload_zip') and request.payload_zip:
+                import zipfile
+                import io
+                buf = io.BytesIO(request.payload_zip)
+                with zipfile.ZipFile(buf, "r") as zf:
+                    zf.extractall(request.cache_path)
+                    
             all_indices = json.loads(request.all_frame_indices)
             drift_indices = json.loads(request.drift_frame_indices)
             success, model_data, message = \
