@@ -23,7 +23,6 @@ def _collate_fn(batch):
     return tuple(zip(*batch))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#device = torch.device("cpu")
 logger.debug(device)
 
 class Object_Detection:
