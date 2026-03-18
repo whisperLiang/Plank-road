@@ -13,3 +13,4 @@ torchlens
 psutil
 ultralytics
 transformers
+pytest
