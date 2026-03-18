@@ -8,10 +8,20 @@ import random
 import threading
 import time
 
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
 import cv2
 import numpy as np
 import pandas as pd
 import torch
+import torch
+print(torch.__version__)
+print(torch.version.cuda)
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"Number of GPUs: {torch.cuda.device_count()}")
+if torch.cuda.is_available():
+    print(f"Current device: {torch.cuda.current_device()}")
+
 from queue import Queue
 from datetime import datetime
 import yaml
@@ -144,7 +154,7 @@ class CloudContinualLearner:
                 return False, "", str(exc)
 
     # ------------------------------------------------------------------
-    # Split-learning continual learning (HSFL-style)
+    # Split-learning continual learning 
     # ------------------------------------------------------------------
 
     def get_ground_truth_and_split_retrain(
