@@ -7,6 +7,32 @@ from loguru import logger
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from tools.convert_tool import cv2_to_base64
+import zipfile
+import io
+
+def pack_training_payload(cache_path, all_frame_indices, drift_frame_indices=None):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        if drift_frame_indices is not None:
+            # Split learning mode
+            meta_path = os.path.join(cache_path, "features", "split_meta.json")
+            if os.path.exists(meta_path):
+                zf.write(meta_path, arcname="features/split_meta.json")
+            for idx in all_frame_indices:
+                feat_path = os.path.join(cache_path, "features", f"{idx}.pt")
+                if os.path.exists(feat_path):
+                    zf.write(feat_path, arcname=f"features/{idx}.pt")
+            for idx in drift_frame_indices:
+                frame_path = os.path.join(cache_path, "frames", f"{idx}.jpg")
+                if os.path.exists(frame_path):
+                    zf.write(frame_path, arcname=f"frames/{idx}.jpg")
+        else:
+            # Full frame train mode
+            for idx in all_frame_indices:
+                frame_path = os.path.join(cache_path, "frames", f"{idx}.jpg")
+                if os.path.exists(frame_path):
+                    zf.write(frame_path, arcname=f"frames/{idx}.jpg")
+    return buf.getvalue()
 
 
 
@@ -27,7 +53,7 @@ def get_cloud_target(server_ip, select_index, cache_path):
             yield frame_request
 
     try:
-        channel = grpc.insecure_channel(server_ip)
+        channel = grpc.insecure_channel(server_ip, options=[('grpc.max_send_message_length', 1024 * 1024 * 512), ('grpc.max_receive_message_length', 1024 * 1024 * 512)])
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         res = stub.frame_processor(requset_stream())
         result_dict = eval(res.response)
@@ -74,13 +100,14 @@ def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_ep
         ``(success, base64_model_state_dict, message)``
     """
     try:
-        channel = grpc.insecure_channel(server_ip)
+        channel = grpc.insecure_channel(server_ip, options=[('grpc.max_send_message_length', 1024 * 1024 * 512), ('grpc.max_receive_message_length', 1024 * 1024 * 512)])
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.TrainRequest(
             edge_id=int(edge_id),
             frame_indices=json.dumps(frame_indices),
             cache_path=cache_path,
             num_epoch=int(num_epoch),
+            payload_zip=pack_training_payload(cache_path, frame_indices),
         )
         reply = stub.train_model_request(req)
         return reply.success, reply.model_data, reply.message
@@ -122,7 +149,7 @@ def request_cloud_split_training(
         ``(success, base64_model_state_dict, message)``
     """
     try:
-        channel = grpc.insecure_channel(server_ip)
+        channel = grpc.insecure_channel(server_ip, options=[('grpc.max_send_message_length', 1024 * 1024 * 512), ('grpc.max_receive_message_length', 1024 * 1024 * 512)])
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.SplitTrainRequest(
             edge_id=int(edge_id),
@@ -130,6 +157,7 @@ def request_cloud_split_training(
             drift_frame_indices=json.dumps(drift_frame_indices or []),
             cache_path=cache_path,
             num_epoch=int(num_epoch),
+            payload_zip=pack_training_payload(cache_path, all_frame_indices, drift_frame_indices),
         )
         reply = stub.split_train_request(req)
         return reply.success, reply.model_data, reply.message

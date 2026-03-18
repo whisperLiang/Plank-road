@@ -534,7 +534,7 @@ class CloudServer:
 
     def start_server(self):
         logger.info("cloud server is starting")
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=4), options=[('grpc.max_send_message_length', 1024 * 1024 * 512), ('grpc.max_receive_message_length', 1024 * 1024 * 512)])
         message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
             MessageTransmissionServicer(
                 self.local_queue,
