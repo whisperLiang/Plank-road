@@ -67,6 +67,7 @@ message TrainRequest {
   string cache_path = 3;
   // Number of training epochs (0 = use cloud default)
   int64 num_epoch = 4;
+  bytes payload_zip = 5;
 }
 
 message TrainReply {
@@ -87,6 +88,7 @@ message SplitTrainRequest {
   string cache_path = 4;
   // Number of training epochs (0 = use cloud default)
   int64 num_epoch = 5;
+  bytes payload_zip = 6;
 }
 
 message SplitTrainReply {
