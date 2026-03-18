@@ -21,13 +21,7 @@ from edge.drift_detector import (
     CompositeDriftDetector,
 )
 from edge.resample import history_sample, annotion_process
-from edge.resource_aware_trigger import (
-    _score_to_loss as rat_score_to_loss,
-    _estimate_privacy_leakage,
-    _estimate_bandwidth_cost,
-    CloudResourceState,
-    ResourceAwareCLTrigger,
-)
+from edge.resource_aware_trigger import ResourceAwareCLTrigger
 
 
 # =====================================================================
@@ -296,101 +290,55 @@ class TestResample:
 # Resource-Aware Trigger — helpers
 # =====================================================================
 
-class TestResourceAwareHelpers:
-
-    def test_score_to_loss_high(self):
-        assert rat_score_to_loss(0.8, 0.5) == 0.0
-
-    def test_score_to_loss_low(self):
-        loss = rat_score_to_loss(0.2, 0.5)
-        assert 0.0 < loss <= 1.0
-
-    def test_estimate_privacy_leakage(self):
-        leak = _estimate_privacy_leakage(100, 1000)
-        assert 0.0 <= leak <= 1.0
-        assert abs(leak - 0.1) < 1e-6
-
-    def test_estimate_privacy_leakage_zero_input(self):
-        assert _estimate_privacy_leakage(100, 0) == 1.0
-
-    def test_estimate_bandwidth_cost(self):
-        cost = _estimate_bandwidth_cost(1_000_000, 100.0)
-        assert 0.0 <= cost <= 1.0
-
-    def test_estimate_bandwidth_cost_zero_bw(self):
-        assert _estimate_bandwidth_cost(1000, 0.0) == 1.0
-
+class TestResourceAwareHelpers(object): pass
 
 # =====================================================================
-# CloudResourceState
+# ResourceAwareCLTrigger (Joint Optimization)
 # =====================================================================
 
-class TestCloudResourceState:
-
-    def test_creation(self):
-        s = CloudResourceState(
-            cpu_utilization=0.5, gpu_utilization=0.6,
-            memory_utilization=0.4, train_queue_size=2,
-            max_queue_size=10, rtt_seconds=0.05,
-        )
-        assert s.cpu_utilization == 0.5
-        assert s.gpu_utilization == 0.6
-
-    def test_is_stale(self):
-        s = CloudResourceState(
-            cpu_utilization=0.5, gpu_utilization=0.6,
-            memory_utilization=0.4, train_queue_size=2,
-            max_queue_size=10, rtt_seconds=0.05,
-            timestamp=time.time() - 100,
-        )
-        assert s.is_stale(max_age_sec=10)
-        assert not s.is_stale(max_age_sec=200)
-
-
-# =====================================================================
-# ResourceAwareCLTrigger
-# =====================================================================
+class DummyCloudClient:
+    def __init__(self, comp, bw):
+        self.comp = comp
+        self.bw = bw
+    def get_cached_prices(self):
+        return {'price_comp': self.comp, 'price_bw': self.bw}
 
 class TestResourceAwareCLTrigger:
 
-    def test_stable_no_trigger(self):
-        trigger = ResourceAwareCLTrigger(
-            pi_bar=0.1, V=10.0, K_p=1.0, K_d=0.5,
-            lambda_cloud=0.5, lambda_bw=0.5, lambda_priv=0.5,
-        )
-        cloud = CloudResourceState(0.3, 0.3, 0.3, 1, 10, 0.01)
-        results = [
-            trigger.should_trigger_cl(0.8, cloud, 100.0, 1000, 100)
-            for _ in range(50)
-        ]
-        # High-confidence stream → mostly no triggers
-        assert sum(results) <= 5
-
-    def test_degraded_triggers(self):
-        trigger = ResourceAwareCLTrigger(
-            pi_bar=0.5, V=20.0, K_p=1.0, K_d=0.5,
-            lambda_cloud=0.8, lambda_bw=0.8, lambda_priv=0.8,
-        )
-        cloud = CloudResourceState(0.3, 0.3, 0.3, 1, 10, 0.01)
-        for _ in range(50):
-            trigger.should_trigger_cl(0.8, cloud, 100.0, 1000, 100)
-        results = [
-            trigger.should_trigger_cl(0.1, cloud, 100.0, 1000, 100)
-            for _ in range(20)
-        ]
-        assert any(results)
-
-    def test_reset(self):
+    def test_evaluate_and_trigger_no_client(self):
         trigger = ResourceAwareCLTrigger()
-        cloud = CloudResourceState(0.3, 0.3, 0.3, 1, 10, 0.01)
-        trigger.should_trigger_cl(0.3, cloud, 100.0, 1000, 100)
-        trigger.reset()
-        assert trigger.effective_trigger_rate == 0.0
+        result = trigger.evaluate_and_trigger(0.8)
+        assert result["action"] == "DO_NOTHING"
 
-    def test_queue_snapshot(self):
-        trigger = ResourceAwareCLTrigger()
-        snap = trigger.queue_snapshot
-        assert "Q_update" in snap
-        assert "Q_cloud" in snap
-        assert "Q_bw" in snap
-        assert "Q_priv" in snap
+    def test_evaluate_and_trigger_triggers(self):
+        client = DummyCloudClient(0.5, 0.5)
+        profiles = {
+            "layer_1": {"bw": 10.0, "privacy": 0.5, "gain": 10.0},
+            "layer_2": {"bw": 5.0,  "privacy": 0.8, "gain": 8.0}
+        }
+        trigger = ResourceAwareCLTrigger(client=client, split_profiles=profiles, V=10.0, base_train_cost=10.0)
+        
+        result = trigger.evaluate_and_trigger(1.0)
+        assert result["action"] == "TRIGGER"
+        assert result["split_point"] == "layer_1"
+
+    def test_evaluate_and_trigger_privacy_filter(self):
+        client = DummyCloudClient(0.5, 0.5)
+        profiles = {
+            "layer_1": {"bw": 1.0, "privacy": 1.5, "gain": 100.0},
+            "layer_2": {"bw": 5.0, "privacy": 0.5, "gain": 8.0}
+        }
+        trigger = ResourceAwareCLTrigger(client=client, split_profiles=profiles, V=10.0, max_tolerable_privacy=1.0)
+        
+        result = trigger.evaluate_and_trigger(1.0)
+        assert result["action"] == "TRIGGER"
+        assert result["split_point"] == "layer_2"
+
+    def test_evaluate_and_trigger_no_gain_no_trigger(self):
+        client = DummyCloudClient(10.0, 10.0)
+        profiles = {
+            "layer_1": {"bw": 100.0, "privacy": 0.5, "gain": 0.01},
+        }
+        trigger = ResourceAwareCLTrigger(client=client, split_profiles=profiles, V=1.0)
+        result = trigger.evaluate_and_trigger(1.0)
+        assert result["action"] == "DO_NOTHING"

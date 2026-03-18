@@ -341,15 +341,12 @@ class TestSplitRetrain:
     def test_split_retrain_das_enabled(self):
         """DAS enabled path should train normally (if activation_sparsity available)."""
         gt_annotations = {0: {"boxes": [[30., 30., 150., 150.]], "labels": [1]}}
-        try:
-            split_retrain(
-                self.model, self.cache_dir,
-                all_indices=[0, 1, 2],
-                gt_annotations=gt_annotations,
-                device=self.device,
-                num_epoch=1,
-                das_enabled=True,
-                das_probe_samples=2,
-            )
-        except ImportError:
-            pytest.skip("activation_sparsity module not available")
+        split_retrain(
+            self.model, self.cache_dir,
+            all_indices=[0, 1, 2],
+            gt_annotations=gt_annotations,
+            device=self.device,
+            num_epoch=1,
+            das_enabled=True,
+            das_probe_samples=2,
+        )

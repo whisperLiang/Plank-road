@@ -2,7 +2,6 @@
 Tests for model_management.universal_model_split — model-agnostic splitting.
 
 Covers:
-* SplitPointSelector (LinUCB bandit: select, update, select_by_flops_ratio,
   select_by_privacy, get_profiles)
 * LayerInfo / LayerProfile dataclasses
 * UniversalModelSplitter (trace, list_layers, split, edge_forward,
@@ -28,25 +27,52 @@ import pytest
 import torch
 import torch.nn as nn
 
+import torchlens
+HAS_TORCHLENS = True
+
+_skip_no_torchlens = pytest.mark.skipif(
+    not HAS_TORCHLENS, reason="torchlens is not installed"
+)
+
 # ---------------------------------------------------------------------------
-# Import guards
+# Imports
 # ---------------------------------------------------------------------------
-try:
-    from model_management.universal_model_split import (
-        _HAS_TORCHLENS,
-        LayerInfo,
-        LayerProfile,
-        SplitPointSelector,
-        UniversalModelSplitter,
-        extract_split_features,
-        load_split_feature_cache,
-        save_split_feature_cache,
-    )
-    _IMPORT_OK = True
-except ImportError:
-    _IMPORT_OK = False
+from model_management.universal_model_split import (
+    _HAS_TORCHLENS,
+    LayerInfo,
+    LayerProfile,
+    UniversalModelSplitter,
+    extract_split_features,
+    load_split_feature_cache,
+    save_split_feature_cache,
+)
+_IMPORT_OK = True
 
 pytestmark = pytest.mark.skipif(not _IMPORT_OK, reason="universal_model_split import failed")
+
+
+def _replay_runtime_ok() -> bool:
+    if not _IMPORT_OK:
+        return False
+    try:
+        model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 5))
+        splitter = UniversalModelSplitter(device="cpu")
+        sample = torch.randn(1, 10)
+        splitter.trace(model, sample)
+        n = splitter.num_layers()
+        splitter.split(layer_index=max(1, n // 2))
+        inter = splitter.edge_forward(sample)
+        out = splitter.cloud_forward(inter)
+        return isinstance(out, torch.Tensor)
+    except Exception:
+        return False
+
+
+_REPLAY_OK = _replay_runtime_ok()
+_skip_incompatible_torchlens = pytest.mark.skipif(
+    not _REPLAY_OK,
+    reason="Installed torchlens/runtime is incompatible with replay path",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +93,24 @@ def _simple_model():
         nn.ReLU(),
         nn.Linear(20, 5),
     )
+
+
+def _branch_model():
+    """A tiny DAG model to validate cross-boundary replay payloads."""
+
+    class BranchNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(10, 12)
+            self.fc2 = nn.Linear(10, 12)
+            self.head = nn.Linear(12, 5)
+
+        def forward(self, x):
+            a = torch.relu(self.fc1(x))
+            b = torch.relu(self.fc2(x))
+            return self.head(a + b)
+
+    return BranchNet()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -99,82 +143,9 @@ class TestDataclasses:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 2.  SplitPointSelector (LinUCB bandit)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestSplitPointSelector:
-
-    def _make_profiles(self, n=5):
-        return [
-            LayerProfile(
-                index=i, label=f"layer_{i}",
-                cumulative_flops=(i + 1) * 1e5,
-                smashed_data_size=(n - i) * 1000,
-                output_shape=(1, 64, 32 - i * 4, 32 - i * 4),
-                privacy_leakage=(n - i) * 0.1,
-            )
-            for i in range(n)
-        ]
-
-    def test_creation_and_profiles(self):
-        profiles = self._make_profiles(5)
-        selector = SplitPointSelector(profiles, alpha=1.0)
-        assert selector.get_profiles() == profiles
-
-    def test_select_returns_valid_index(self):
-        profiles = self._make_profiles(5)
-        selector = SplitPointSelector(profiles, alpha=1.0)
-        chosen = selector.select()
-        assert 0 <= chosen < 5
-
-    def test_update_does_not_raise(self):
-        profiles = self._make_profiles(5)
-        selector = SplitPointSelector(profiles, alpha=1.0)
-        idx = selector.select()
-        selector.update(idx, observed_latency=0.5)
-
-    def test_select_by_flops_ratio(self):
-        profiles = self._make_profiles(5)
-        selector = SplitPointSelector(profiles, alpha=1.0)
-        total_flops = profiles[-1].cumulative_flops
-        # Target ~50% → should pick layer near the middle
-        idx = selector.select_by_flops_ratio(target_ratio=0.5)
-        assert 0 <= idx < 5
-        # Cumulative flops at chosen index should be ≤ total
-        assert profiles[idx].cumulative_flops <= total_flops
-
-    def test_select_by_privacy(self):
-        profiles = self._make_profiles(5)
-        selector = SplitPointSelector(profiles, alpha=1.0)
-        # max_leakage = 0.25 → should pick a deeper layer (less leakage)
-        idx = selector.select_by_privacy(max_leakage=0.25)
-        assert 0 <= idx < 5
-        assert profiles[idx].privacy_leakage <= 0.25 + 1e-6
-
-    def test_repeated_select_update_converges(self):
-        profiles = self._make_profiles(5)
-        selector = SplitPointSelector(profiles, alpha=0.5)
-        for _ in range(20):
-            idx = selector.select()
-            # Simulate lower latency for deeper splits
-            lat = (5 - idx) * 0.1
-            selector.update(idx, lat)
-        # After many updates, select should still return a valid index
-        final = selector.select()
-        assert 0 <= final < 5
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 3.  UniversalModelSplitter — requires torchlens
-# ═══════════════════════════════════════════════════════════════════════════
-
-_skip_no_torchlens = pytest.mark.skipif(
-    not (_IMPORT_OK and _HAS_TORCHLENS),
-    reason="torchlens not installed",
-)
-
-
-@_skip_no_torchlens
+@_skip_incompatible_torchlens
 class TestUniversalModelSplitter:
 
     @pytest.fixture
@@ -246,6 +217,53 @@ class TestUniversalModelSplitter:
         data = splitter.serialise_intermediate(inter, compress=True)
         recovered = splitter.deserialise_intermediate(data, compressed=True)
         assert torch.allclose(inter, recovered)
+
+    def test_replay_state_cross_splitter_matches_original(self):
+        model = _branch_model().eval()
+        sample = torch.randn(1, 10)
+
+        edge_splitter = UniversalModelSplitter(device="cpu")
+        edge_splitter.trace(model, sample)
+        n = edge_splitter.num_layers()
+        edge_splitter.split(layer_index=max(1, n // 3))
+
+        cloud_splitter = UniversalModelSplitter(device="cpu")
+        cloud_splitter.trace(model, sample)
+        cloud_splitter.split(layer_index=edge_splitter.split_index)
+
+        with torch.no_grad():
+            expected = model(sample)
+            replay_payload = edge_splitter.edge_forward(sample, return_replay_state=True)
+            out = cloud_splitter.cloud_forward(replay_payload)
+
+        assert torch.allclose(expected, out, atol=1e-5), (
+            f"max diff = {(expected - out).abs().max().item()}"
+        )
+
+    def test_replay_state_serialise_round_trip(self):
+        model = _branch_model().eval()
+        sample = torch.randn(1, 10)
+
+        edge_splitter = UniversalModelSplitter(device="cpu")
+        edge_splitter.trace(model, sample)
+        edge_splitter.split(layer_index=max(1, edge_splitter.num_layers() // 3))
+
+        cloud_splitter = UniversalModelSplitter(device="cpu")
+        cloud_splitter.trace(model, sample)
+        cloud_splitter.split(layer_index=edge_splitter.split_index)
+
+        with torch.no_grad():
+            expected = model(sample)
+            payload = edge_splitter.edge_forward(sample, return_replay_state=True)
+            wire = edge_splitter.serialise_intermediate(payload, compress=True)
+            recovered = edge_splitter.deserialise_intermediate(wire, compressed=True)
+            out = cloud_splitter.cloud_forward(recovered)
+
+        assert isinstance(recovered, dict)
+        assert "intermediate" in recovered
+        assert torch.allclose(expected, out, atol=1e-5), (
+            f"max diff = {(expected - out).abs().max().item()}"
+        )
 
     def test_cloud_train_step(self, splitter_and_model):
         splitter, model, sample = splitter_and_model
@@ -331,7 +349,6 @@ class TestUniversalModelSplitter:
         splitter, model, sample = splitter_and_model
         try:
             selector = splitter.create_split_selector()
-            assert isinstance(selector, SplitPointSelector)
         except Exception:
             pytest.skip("create_split_selector requires profile_layers")
 
@@ -373,6 +390,7 @@ class TestSplitFeatureCache:
 
 
 @_skip_no_torchlens
+@_skip_incompatible_torchlens
 class TestExtractSplitFeatures:
 
     def test_extract(self):

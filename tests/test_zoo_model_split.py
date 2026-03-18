@@ -24,41 +24,27 @@ import torch
 import torch.nn as nn
 
 # ---------------------------------------------------------------------------
-# Import guards
+# Imports
 # ---------------------------------------------------------------------------
-try:
-    from model_management.universal_model_split import (
-        _HAS_TORCHLENS,
-        UniversalModelSplitter,
-    )
-    _IMPORT_OK = True
-except ImportError:
-    _IMPORT_OK = False
+from model_management.universal_model_split import (
+    _HAS_TORCHLENS,
+    UniversalModelSplitter,
+)
+import torchvision.models as tv_models
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from model_management.model_zoo import (
+    build_detection_model,
+    list_available_models,
+    get_model_family,
+    is_wrapper_model,
+    model_has_roi_heads,
+    _HAS_TV_DETECTION,
+)
 
-try:
-    import torchvision.models as tv_models
-    _HAS_TV = True
-except ImportError:
-    _HAS_TV = False
-
-try:
-    from torchvision.models.detection import fasterrcnn_resnet50_fpn
-    _HAS_TV_DET = True
-except ImportError:
-    _HAS_TV_DET = False
-
-try:
-    from model_management.model_zoo import (
-        build_detection_model,
-        list_available_models,
-        get_model_family,
-        is_wrapper_model,
-        model_has_roi_heads,
-        _HAS_TV_DETECTION,
-    )
-    _HAS_ZOO = True
-except ImportError:
-    _HAS_ZOO = False
+_IMPORT_OK = True
+_HAS_TV = True
+_HAS_TV_DET = True
+_HAS_ZOO = True
 
 _skip = pytest.mark.skipif(
     not (_IMPORT_OK and _HAS_TORCHLENS and _HAS_TV),
@@ -152,6 +138,21 @@ class TestResNet18Split:
             expected = m(x)
             inter = sp.edge_forward(x)
             out = sp.cloud_forward(inter)
+        assert torch.allclose(expected, out, atol=1e-5)
+
+    def test_split_forward_matches_original_cross_instance(self, model_and_input):
+        """Replay payload works when edge/cloud run in separate splitter instances."""
+        m, x = model_and_input
+        edge_sp, _, _ = _trace_and_split(m, x)
+
+        cloud_sp = UniversalModelSplitter(device="cpu")
+        cloud_sp.trace(m, x)
+        cloud_sp.split(layer_index=edge_sp.split_index)
+
+        with torch.no_grad():
+            expected = m(x)
+            payload = edge_sp.edge_forward(x, return_replay_state=True)
+            out = cloud_sp.cloud_forward(payload)
         assert torch.allclose(expected, out, atol=1e-5)
 
     def test_split_at_multiple_points(self, model_and_input):
@@ -371,6 +372,45 @@ class TestFasterRCNNBackboneSplit:
         sd = sp.get_tail_state_dict()
         assert len(sd) > 0
         sp.load_tail_state_dict(sd)
+
+
+@_skip_det
+class TestFasterRCNNFullModelSplit:
+    """Split the full torchvision Faster R-CNN graph at arbitrary layers.
+
+    This exercises proxy split mode for complex detection pipelines.
+    """
+
+    @pytest.fixture(scope="class")
+    def model_and_input(self):
+        det = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+        det.eval()
+        # Torchvision detection models expect list[Tensor[C,H,W]].
+        x = ([torch.randn(3, 64, 64)],)
+        return det, x
+
+    def test_trace_and_split_full_model(self, model_and_input):
+        model, x = model_and_input
+        sp = UniversalModelSplitter(device="cpu")
+        sp.trace(model, x)
+        n = sp.num_layers()
+        idx = max(1, min(n // 2, n - 2))
+        sp.split(layer_index=idx)
+        inter = sp.edge_forward(x)
+        assert isinstance(inter, torch.Tensor)
+
+    def test_edge_cloud_forward_full_model(self, model_and_input):
+        model, x = model_and_input
+        sp = UniversalModelSplitter(device="cpu")
+        sp.trace(model, x)
+        n = sp.num_layers()
+        idx = max(1, min(n // 3, n - 2))
+        sp.split(layer_index=idx)
+        inter = sp.edge_forward(x)
+        out = sp.cloud_forward(inter)
+        assert isinstance(out, list)
+        assert len(out) == 1
+        assert "boxes" in out[0] and "scores" in out[0] and "labels" in out[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
