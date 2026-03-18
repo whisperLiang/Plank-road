@@ -64,16 +64,13 @@ class AsyncCloudClient:
         Implement actual gRPC / REST logic here.
         """
         import grpc
-        try:
-            from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
-            channel = grpc.insecure_channel(self.server_ip)
-            stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
-            # Example gRPC call (modify according to actual proto file definition later)
-            # req = message_transmission_pb2.Empty()
-            # reply = stub.get_shadow_prices(req, timeout=3.0)
-            # return {"price_comp": reply.price_comp, "price_bw": reply.price_bw}
-        except ImportError:
-            pass
+        from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
+        channel = grpc.insecure_channel(self.server_ip)
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        # Example gRPC call (modify according to actual proto file definition later)
+        # req = message_transmission_pb2.Empty()
+        # reply = stub.get_shadow_prices(req, timeout=3.0)
+        # return {"price_comp": reply.price_comp, "price_bw": reply.price_bw}
         
         # Simulated successful return
         return {"price_comp": 5.0, "price_bw": 2.0}

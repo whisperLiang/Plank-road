@@ -46,15 +46,11 @@ from model_management.model_split import (
 )
 
 # Universal model splitting (optional — requires torchlens)
-try:
-    from model_management.universal_model_split import (
-        UniversalModelSplitter,
-        universal_split_retrain,
-        load_split_feature_cache,
-    )
-    _HAS_UNIVERSAL_SPLIT = True
-except ImportError:
-    _HAS_UNIVERSAL_SPLIT = False
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
+    universal_split_retrain,
+    load_split_feature_cache,
+)
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
@@ -284,7 +280,7 @@ class CloudContinualLearner:
         use_universal = False
         split_index = None
 
-        if os.path.exists(meta_path) and _HAS_UNIVERSAL_SPLIT:
+        if os.path.exists(meta_path):
             try:
                 with open(meta_path, "r") as _mf:
                     meta = _json.load(_mf)

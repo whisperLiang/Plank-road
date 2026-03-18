@@ -32,31 +32,22 @@ from model_management.object_detection import Object_Detection
 from model_management.model_split import extract_backbone_features, save_feature_cache
 
 # Resource-aware CL trigger (RCCDA-inspired multi-queue Lyapunov)
-try:
-    from edge.resource_aware_trigger import (
-        ResourceAwareCLTrigger,
-        CloudResourceState,
-        SplitCandidate,
-        build_split_candidates,
-        query_cloud_resource,
-        estimate_bandwidth,
-        create_resource_aware_trigger,
-    )
-    _HAS_RESOURCE_TRIGGER = True
-except ImportError:
-    _HAS_RESOURCE_TRIGGER = False
+from edge.resource_aware_trigger import (
+    ResourceAwareCLTrigger,
+    CloudResourceState,
+    SplitCandidate,
+    build_split_candidates,
+    query_cloud_resource,
+    estimate_bandwidth,
+    create_resource_aware_trigger,
+)
 
 # Universal model splitting (optional — requires torchlens)
-try:
-    from model_management.universal_model_split import (
-        UniversalModelSplitter,
-        SplitPointSelector,
-        extract_split_features,
-        save_split_feature_cache,
-    )
-    _HAS_UNIVERSAL_SPLIT = True
-except ImportError:
-    _HAS_UNIVERSAL_SPLIT = False
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
+    extract_split_features,
+    save_split_feature_cache,
+)
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -86,8 +77,7 @@ class EdgeWorker:
         self._split_candidates: list | None = None
         ra_cfg = getattr(config, 'resource_aware_trigger', None)
         self.resource_trigger_enabled = (
-            _HAS_RESOURCE_TRIGGER
-            and ra_cfg is not None
+            ra_cfg is not None
             and bool(getattr(ra_cfg, 'enabled', False))
         )
         if self.resource_trigger_enabled:
@@ -141,7 +131,7 @@ class EdgeWorker:
 
         self.use_history = True
 
-        # Split-learning mode (HSFL-style)
+        # Split-learning mode 
         sl_cfg = getattr(self.config, 'split_learning', None)
         self.split_learning_enabled = bool(getattr(sl_cfg, 'enabled', False)) if sl_cfg else False
         self.drift_frame_indices: list[int] = []
@@ -151,8 +141,7 @@ class EdgeWorker:
         # Universal model splitting (model-agnostic, torchlens-based)
         self.universal_split_enabled = False
         self.universal_splitter: UniversalModelSplitter | None = None  # type: ignore
-        self.split_selector: SplitPointSelector | None = None  # type: ignore  # HSFL-style adaptive
-        if self.split_learning_enabled and _HAS_UNIVERSAL_SPLIT:
+        if self.split_learning_enabled:
             us_cfg = getattr(sl_cfg, 'universal', None)
             if us_cfg and getattr(us_cfg, 'enabled', False):
                 self.universal_split_enabled = True
@@ -186,35 +175,6 @@ class EdgeWorker:
                             self.universal_splitter.split(layer_label=split_layer)
                         else:
                             self.universal_splitter.split(layer_index=int(split_layer))
-                    elif split_strategy:
-                        # HSFL-style strategy: flops_ratio | privacy | midpoint
-                        #                       min_smashed | linucb
-                        if split_strategy == 'linucb':
-                            self.split_selector = \
-                                self.universal_splitter.create_split_selector(
-                                    only_parametric=only_parametric,
-                                    latency_weight=latency_weight,
-                                    alpha=ucb_alpha,
-                                )
-                            idx = self.split_selector.select()
-                            self.universal_splitter.split(layer_index=idx)
-                            logger.info(
-                                "LinUCB initial split selection — layer {}",
-                                idx,
-                            )
-                        else:
-                            self.universal_splitter.select_split_point(
-                                strategy=split_strategy,
-                                target_ratio=target_ratio,
-                                max_privacy_leakage=max_privacy,
-                                only_parametric=only_parametric,
-                            )
-                    else:
-                        # Default: HSFL flops_ratio at 50 % (midpoint)
-                        self.universal_splitter.select_split_point(
-                            strategy='midpoint',
-                            only_parametric=only_parametric,
-                        )
 
                     logger.info(
                         "Universal model splitting enabled — split at layer {}",
@@ -224,7 +184,6 @@ class EdgeWorker:
                     logger.exception("Failed to init universal splitter: {}", exc)
                     self.universal_split_enabled = False
                     self.universal_splitter = None
-                    self.split_selector = None
 
         self.retrain_processor = threading.Thread(target=self.retrain_worker,daemon=True)
         self.retrain_processor.start()
@@ -696,28 +655,6 @@ class EdgeWorker:
                     except Exception as exc:
                         logger.exception("Failed to load cloud-returned model weights: {}", exc)
 
-                    # ---- LinUCB feedback: update bandit with observed round latency ----
-                    if (
-                        self.universal_split_enabled
-                        and self.split_selector is not None
-                        and self.universal_splitter is not None
-                        and self.universal_splitter.split_index is not None
-                    ):
-                        try:
-                            self.split_selector.update(
-                                self.universal_splitter.split_index,
-                                _retrain_elapsed,
-                            )
-                            # Re-select for the next round
-                            new_idx = self.split_selector.select()
-                            if new_idx != self.universal_splitter.split_index:
-                                self.universal_splitter.split(layer_index=new_idx)
-                                logger.info(
-                                    "LinUCB adapted split point: {} → {}",
-                                    self.universal_splitter.split_index, new_idx,
-                                )
-                        except Exception as exc:
-                            logger.warning("LinUCB update/re-select failed: {}", exc)
                 else:
                     logger.error("Cloud continual learning failed: {}", msg)
 
