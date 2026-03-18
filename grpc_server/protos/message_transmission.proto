@@ -76,7 +76,7 @@ message TrainReply {
   string message = 3;
 }
 
-// Split-learning continual learning messages (HSFL-style)
+// Split-learning continual learning messages 
 message SplitTrainRequest {
   int64 edge_id = 1;
   // JSON list of ALL frame indices (features cached on shared filesystem)

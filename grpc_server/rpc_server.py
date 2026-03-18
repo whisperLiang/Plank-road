@@ -9,18 +9,12 @@ from tools.convert_tool import base64_to_cv2
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
 
-# ── Resource monitoring helpers (psutil optional) ──────────────────
-try:
-    import psutil
-    _HAS_PSUTIL = True
-except ImportError:
-    _HAS_PSUTIL = False
+import psutil
+import torch as _torch
 
-try:
-    import torch as _torch
-    _HAS_TORCH = True
-except ImportError:
-    _HAS_TORCH = False
+# ── Resource monitoring helpers ──────────────────
+_HAS_PSUTIL = True
+_HAS_TORCH = True
 
 
 def _get_cpu_utilization() -> float:
@@ -87,7 +81,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
         if request.part_result != "":
             part_result = eval(request.part_result)
-            if len(request.part_result['boxes']) != 0:
+            if len(part_result['boxes']) != 0:
                 task.add_result(part_result['boxes'], part_result['labels'], part_result['scores'])
 
         if request.note == "edge process":
@@ -164,7 +158,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         )
 
     def split_train_request(self, request, context):
-        """Split-learning continual learning (HSFL-style): annotate only drift
+        """Split-learning continual learning : annotate only drift
         frames with the large model, then train server-side model on all cached
         backbone features and return the updated state-dict."""
         logger.info(
