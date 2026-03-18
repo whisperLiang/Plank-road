@@ -2,13 +2,13 @@
 Model Split Utilities for Split-Learning-based Continual Learning
 =================================================================
 
-Splits a Faster R-CNN model at the **backbone** boundary for HSFL-style
+Splits a Faster R-CNN model at the **backbone** boundary for split
 continual learning (Hybrid Split Federated Learning).
 
 Architecture split
 ------------------
-  Edge (client):  ``transform + backbone``  →  intermediate FPN features
-  Cloud (server):  ``rpn + roi_heads``      →  losses / detections
+  Edge (client):  ``transform + backbone``  ->  intermediate FPN features
+  Cloud (server):  ``rpn + roi_heads``      ->  losses / detections
 
 Design highlights
 -----------------
@@ -20,9 +20,6 @@ Design highlights
 
 Reference
 ---------
-  HSFL (ICWS 2023): "HSFL: Efficient and Privacy-Preserving Offloading
-  for Split and Federated Learning in IoT Services"
-  https://github.com/SASA-cloud/ICWS-23-HSFL
 """
 
 from __future__ import annotations
@@ -40,38 +37,28 @@ from PIL import Image
 from torchvision import transforms
 from loguru import logger
 
-try:
-    from torchvision.models.detection.image_list import ImageList
-except ImportError:  # older torchvision
-    from torchvision.models.detection.transform import ImageList
+from torchvision.models.detection.image_list import ImageList
 
 # ── Universal model-agnostic splitting (new) ──────────────────────────────
 # Re-export the new API so callers can do:
 #   from model_management.model_split import UniversalModelSplitter
-try:
-    from model_management.universal_model_split import (  # noqa: F401
-        UniversalModelSplitter,
-        extract_split_features,
-        save_split_feature_cache,
-        load_split_feature_cache,
-        universal_split_retrain,
-        LayerProfile,
-        SplitPointSelector,
-    )
-except ImportError:
-    pass  # torchlens not installed → universal API unavailable
+from model_management.universal_model_split import (  # noqa: F401
+    UniversalModelSplitter,
+    extract_split_features,
+    save_split_feature_cache,
+    load_split_feature_cache,
+    universal_split_retrain,
+    LayerProfile,
+    SplitPointSelector,
+)
 
 # ── Dynamic Activation Sparsity (SURGEON-style layer pruning) ─────────────
 # Re-export core API for convenience
-try:
-    from model_management.activation_sparsity import (  # noqa: F401
-        DASTrainer,
-        apply_das_to_model,
-        apply_das_to_tail,
-    )
-    _HAS_DAS = True
-except ImportError:
-    _HAS_DAS = False
+from model_management.activation_sparsity import (  # noqa: F401
+    DASTrainer,
+    apply_das_to_model,
+    apply_das_to_tail,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -83,20 +70,20 @@ def extract_backbone_features(
     frame: np.ndarray,
     device: torch.device | None = None,
 ) -> Tuple[OrderedDict, List[Tuple[int, int]], Tuple[int, int], List[Tuple[int, int]]]:
-    """Run ``transform → backbone`` of a Faster R-CNN model on a BGR frame.
+    """Run ``transform -> backbone`` of a Faster R-CNN model on a BGR frame.
 
     Parameters
     ----------
     model : torchvision Faster R-CNN model
-    frame : np.ndarray – BGR, HWC
+    frame : np.ndarray - BGR, HWC
     device : computation device (inferred from *model* if ``None``)
 
     Returns
     -------
-    features_cpu   : OrderedDict[str, Tensor] – FPN feature maps (CPU)
-    image_sizes    : [(H_trans, W_trans)]      – sizes after transform
-    tensor_shape   : (H_pad, W_pad)            – padded batch spatial dims
-    original_sizes : [(H_orig, W_orig)]        – original frame sizes
+    features_cpu   : OrderedDict[str, Tensor] - FPN feature maps (CPU)
+    image_sizes    : [(H_trans, W_trans)]      - sizes after transform
+    tensor_shape   : (H_pad, W_pad)            - padded batch spatial dims
+    original_sizes : [(H_orig, W_orig)]        - original frame sizes
     """
     if device is None:
         device = next(model.parameters()).device
@@ -141,7 +128,7 @@ def save_feature_cache(
     pseudo_labels: list | None = None,
     pseudo_scores: list | None = None,
 ) -> str:
-    """Persist one frame's backbone features to ``<cache>/features/<idx>.pt``."""
+    """Persist features."""
     feat_dir = os.path.join(cache_path, "features")
     os.makedirs(feat_dir, exist_ok=True)
     out_path = os.path.join(feat_dir, f"{frame_index}.pt")
@@ -162,7 +149,7 @@ def save_feature_cache(
 
 
 def load_feature_cache(cache_path: str, frame_index: int) -> dict:
-    """Load one frame's cached features and metadata."""
+    """Load features."""
     path = os.path.join(cache_path, "features", f"{frame_index}.pt")
     data = torch.load(path, map_location="cpu")
     data["features"] = OrderedDict(data["features"])
@@ -193,7 +180,7 @@ def transform_targets_to_feature_space(
     original_sizes: List[Tuple[int, int]],
     image_sizes: List[Tuple[int, int]],
 ) -> List[Dict[str, torch.Tensor]]:
-    """Scale target boxes from **original-image** coords → **transformed** coords.
+    """Scale target boxes from **original-image** coords -> **transformed** coords.
 
     Faster R-CNN's ``GeneralizedRCNNTransform`` resizes images (and targets)
     before feeding them to the backbone.  Since our features are already in
@@ -253,7 +240,7 @@ def server_side_train_step(
 
     Returns
     -------
-    dict[str, Tensor] – loss dictionary (rpn + roi_heads losses).
+    dict[str, Tensor] - loss dictionary (rpn + roi_heads losses).
     """
     feat = OrderedDict((k, v.to(device)) for k, v in features.items())
     tgts = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -379,7 +366,7 @@ def split_retrain(
 
     # ---- DAS: replace tail modules with AutoFreeze versions ----
     das_trainer = None
-    if das_enabled and _HAS_DAS:
+    if das_enabled:
         das_trainer = apply_das_to_tail(
             model,
             ["rpn", "roi_heads"],
@@ -387,8 +374,6 @@ def split_retrain(
             device=device,
         )
         logger.info("[SplitRetrain] DAS (Dynamic Activation Sparsity) enabled.")
-    elif das_enabled and not _HAS_DAS:
-        logger.warning("[SplitRetrain] DAS requested but activation_sparsity module unavailable.")
 
     roi_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(roi_params, lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -445,7 +430,7 @@ def split_retrain(
                 "labels": torch.tensor(labels, dtype=torch.int64),
             }]
 
-            # Scale boxes from original-image space → transformed space
+            # Scale boxes from original-image space -> transformed space
             targets = transform_targets_to_feature_space(
                 targets, original_sizes, image_sizes
             )

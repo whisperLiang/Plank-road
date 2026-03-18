@@ -54,33 +54,23 @@ from loguru import logger
 from torchvision import transforms
 
 # ---------------------------------------------------------------------------
-# Optional dependency flags
+# Required dependencies
 # ---------------------------------------------------------------------------
-try:
-    import ultralytics
-    _HAS_ULTRALYTICS = True
-except ImportError:
-    _HAS_ULTRALYTICS = False
+import ultralytics
+from transformers import DetrConfig, DetrForObjectDetection, DetrImageProcessor
+from torchvision.models.detection import (
+    fasterrcnn_resnet50_fpn,
+    fasterrcnn_mobilenet_v3_large_fpn,
+    fasterrcnn_mobilenet_v3_large_320_fpn,
+    retinanet_resnet50_fpn,
+    ssd300_vgg16,
+    ssdlite320_mobilenet_v3_large,
+    fcos_resnet50_fpn,
+)
 
-try:
-    from transformers import DetrForObjectDetection, DetrImageProcessor
-    _HAS_HF_DETR = True
-except ImportError:
-    _HAS_HF_DETR = False
-
-try:
-    from torchvision.models.detection import (
-        fasterrcnn_resnet50_fpn,
-        fasterrcnn_mobilenet_v3_large_fpn,
-        fasterrcnn_mobilenet_v3_large_320_fpn,
-        retinanet_resnet50_fpn,
-        ssd300_vgg16,
-        ssdlite320_mobilenet_v3_large,
-        fcos_resnet50_fpn,
-    )
-    _HAS_TV_DETECTION = True
-except ImportError:
-    _HAS_TV_DETECTION = False
+_HAS_ULTRALYTICS = True
+_HAS_HF_DETR = True
+_HAS_TV_DETECTION = True
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -241,6 +231,7 @@ class DETRDetectionModel(nn.Module):
         confidence: float = 0.5,
         device: str | torch.device = "cpu",
         num_classes: int = 91,
+        pretrained: bool = True,
     ):
         super().__init__()
         if not _HAS_HF_DETR:
@@ -248,8 +239,25 @@ class DETRDetectionModel(nn.Module):
                 "transformers is required for DETR models.  "
                 "Install: pip install transformers"
             )
-        self.processor = DetrImageProcessor.from_pretrained(model_name_or_path)
-        self.detr = DetrForObjectDetection.from_pretrained(model_name_or_path)
+        if pretrained:
+            self.processor = DetrImageProcessor.from_pretrained(model_name_or_path)
+            self.detr = DetrForObjectDetection.from_pretrained(model_name_or_path)
+        else:
+            cfg = DetrConfig(
+                num_labels=num_classes,
+                use_timm_backbone=False,
+                backbone=None,
+                backbone_config={
+                    "model_type": "resnet",
+                    "num_channels": 3,
+                    "embedding_size": 64,
+                    "hidden_sizes": [64, 128, 256, 512],
+                    "depths": [2, 2, 2, 2],
+                    "hidden_act": "relu",
+                },
+            )
+            self.processor = DetrImageProcessor()
+            self.detr = DetrForObjectDetection(cfg)
         self.detr.to(device)
         self.confidence = confidence
         self._device = device
@@ -563,6 +571,7 @@ def build_detection_model(
             confidence=confidence,
             device=device,
             num_classes=num_classes,
+            pretrained=pretrained,
         )
         logger.info("[ModelZoo] Built DETR model: {} ({})", name, hf_id)
         return model
