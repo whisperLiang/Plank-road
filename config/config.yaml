@@ -40,7 +40,7 @@ client:
  #   DETR:         detr_resnet50, detr_resnet101, conditional_detr_resnet50
  #   RT-DETR:      rtdetr_l, rtdetr_x
  # select the offloading policy
- policy: Edge-Local
+ policy: Edge-Clound-Assisted
  # change frame resolution using frame new height
  new_height:
   # offload to another edge node [1080, 720], default 720
@@ -66,7 +66,7 @@ client:
  # edge nodes
  edge_id: 1
  edge_num: 1
- destinations: {'id': [1], 'ip':[192.168.66.156]}
+ destinations: {'id': [1], 'ip':[192.168.66.146]}
  # database config
  database:
   connection: { 'user': 'liang', 'password': '123', 'host': '192.168.66.205', 'raise_on_warnings': True }
@@ -129,7 +129,7 @@ client:
   w_cloud: 1.0           # weight for cloud-cost queue
   w_bw: 1.0              # weight for bandwidth queue
   w_priv: 1.0            # weight for privacy queue
- # Split learning for continual learning (HSFL-style)
+ # Split learning for continual learning 
  # When enabled, backbone features are extracted and cached on the edge.
  # Only drift-moment samples are annotated by the cloud's large model;
  # non-drift samples use edge pseudo-labels for training.
@@ -149,9 +149,9 @@ client:
    # split_layer  — layer index (int) or torchlens layer label (str)
    # split_layer: 15
    #
-   # ---- HSFL-style strategy-based split-point selection ----
+   # ---- strategy-based split-point selection ----
    # Activated when neither split_module nor split_layer is set.
-   # strategy options (from ICWS-23-HSFL):
+   # strategy options :
    #   flops_ratio  — split where cumulative FLOPs ≈ target_flops_ratio
    #   privacy      — deepest split with leakage ≤ max_privacy_leakage
    #   midpoint     — split at ~50 % FLOPs (default)
@@ -169,6 +169,7 @@ server:
  server_id: 0
  edge_ids: [1]
  large_model_name: fasterrcnn_resnet50_fpn
+ golden: fasterrcnn_resnet50_fpn
  # lightweight model used to generate fine-tuned weights for the edge
  edge_model_name: fasterrcnn_mobilenet_v3_large_fpn
  #the queue maxsize

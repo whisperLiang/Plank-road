@@ -66,38 +66,6 @@ inter = splitter.edge_forward(input_tensor)
 output = splitter.cloud_forward(inter)
 ```
 
-### 2. HSFL-Style Adaptive Split Point Selection (自适应分割点选择)
-
-> Reference: [HSFL (ICWS 2023)](https://github.com/SASA-cloud/ICWS-23-HSFL)
-
-`SplitPointSelector` uses a **LinUCB contextual bandit** to adaptively select the optimal split point at each round, balancing training latency and privacy leakage.
-
-**Strategies:**
-
-| Strategy | Description |
-| :---: | :---- |
-| `midpoint` | Split at ≈50% cumulative FLOPs (default) |
-| `flops_ratio` | Split where cumulative FLOPs ≈ `target_flops_ratio` |
-| `privacy` | Deepest split with leakage ≤ `max_privacy_leakage` |
-| `min_smashed` | Minimise intermediate tensor size (bandwidth) |
-| `linucb` | Adaptive LinUCB bandit — balances latency & privacy, updates each round |
-
-**Per-layer profiling:**
-- `profile_layers()` — estimates FLOPs, smashed data size, and privacy leakage for each candidate
-- `get_candidate_split_points()` — returns `LayerProfile` list
-- `create_split_selector()` — instantiates `SplitPointSelector` (LinUCB agent)
-
-```python
-splitter.trace(model, sample_input)
-profiles = splitter.profile_layers(sample_input)
-selector = splitter.create_split_selector(profiles, alpha=0.25)
-
-# Each round
-split_idx = selector.select(context_features)
-splitter.split(layer_index=split_idx)
-# ... train ...
-selector.update(split_idx, reward)  # latency/privacy feedback
-```
 
 ### 3. Dynamic Activation Sparsity — SURGEON (云端持续学习层裁剪率训练)
 
@@ -163,53 +131,28 @@ Multi-strategy drift detection (`edge/drift_detector.py`):
 
 ### 5. Resource-Aware CL Trigger & Split-Point Selection (资源感知持续学习触发与分割点选择)
 
-> Reference: [RCCDA (NeurIPS 2025)](https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code) — *"Adaptive Model Updates in the Presence of Concept Drift under a Constrained Resource Budget"*
+`ResourceAwareCLTrigger` (`edge/resource_aware_trigger.py`) implements the **Edge-side Joint Optimization Decision + Cloud-side Asynchronous Resource Pricing** architecture to **jointly decide**:
 
-`ResourceAwareCLTrigger` (`edge/resource_aware_trigger.py`) extends the RCCDA Lyapunov drift-plus-penalty framework to **jointly decide**:
+1. **Whether to trigger continual learning** — considering cloud resource shadow prices (via async pricing module) and intermediate-feature privacy leakage.
+2. **Where to place the split point** — selecting the layer that best balances latency, bandwidth cost, privacy protection, and calculated performance gains under the objective function.
 
-1. **Whether to trigger continual learning** — considering not only loss degradation but also cloud resource utilisation, network bandwidth, and intermediate-feature privacy leakage.
-2. **Where to place the split point** — selecting the layer that best balances latency, bandwidth cost, privacy protection, and cloud compute load under the Lyapunov objective.
+**Joint Optimization Logic:**
 
-**Multi-Queue Lyapunov Formulation:**
+At each decision epoch, the mechanism computes a potential joint cost for candidate split configurations, leveraging asynchronous caching to strictly avoid blocking the primary inference loops:
 
-Four virtual queues guarantee long-run budget constraints:
+$$\text{net\_value} = \text{cost}(\text{price}_{comp}, \text{price}_{bw}) - V \cdot \text{gain}(\text{drift\_severity})$$
 
-| Queue | Budget | Constraint |
-| :---: | :---: | :---- |
-| $Q_{\text{update}}$ | $\bar{\pi}$ | avg CL trigger rate $\leq \bar{\pi}$ |
-| $Q_{\text{cloud}}$ | $\lambda_{\text{cloud}}$ | avg cloud cost $\leq \lambda_{\text{cloud}}$ |
-| $Q_{\text{bw}}$ | $\lambda_{\text{bw}}$ | avg bandwidth usage $\leq \lambda_{\text{bw}}$ |
-| $Q_{\text{priv}}$ | $\lambda_{\text{priv}}$ | avg privacy leakage $\leq \lambda_{\text{priv}}$ |
-
-At each decision epoch $t$, the greedy-optimal trigger condition is:
-
-$$V \cdot (K_p \cdot e_t + K_d \cdot \Delta e_t) > Q_{\text{update}} + w_c Q_c c_c + w_b Q_b c_b + w_p Q_p l_p + 0.5 - \bar{\pi}$$
-
-**Split-point selection** maximises a Lyapunov-weighted score over candidates:
-
-$$k^* = \arg\max_k \left[ -w_c Q_c \cdot \text{cloud}(k) - w_b Q_b \cdot \text{bw}(k) - w_p Q_p \cdot \text{priv}(k) \right]$$
-
-**Edge ↔ Cloud resource reporting** is provided via gRPC:
-- `query_resource` — edge queries cloud CPU/GPU/memory utilisation
-- `bandwidth_probe` — edge estimates network bandwidth via round-trip probe
+For any network constraints, `AsyncCloudClient` seamlessly enters a conservative state fallback ensuring stable operations without over-requesting cloud compute globally.
 
 ```python
-from edge.resource_aware_trigger import (
-    ResourceAwareCLTrigger,
-    build_split_candidates,
-    query_cloud_resource,
-)
+from edge.resource_aware_trigger import ResourceAwareCLTrigger
+from edge.cloud_client import AsyncCloudClient
 
-trigger = ResourceAwareCLTrigger(pi_bar=0.1, V=10.0, lambda_cloud=0.5)
-cloud_state = query_cloud_resource("192.168.1.1:50051")
-candidates = build_split_candidates(splitter)
+client = AsyncCloudClient('192.168.1.1:50051')
+client.start()
+trigger = ResourceAwareCLTrigger(client=client, split_profiles=candidates)
 
-should_train, split_idx = trigger.decide(
-    avg_confidence=0.6,
-    cloud_state=cloud_state,
-    bandwidth_mbps=8.0,
-    split_candidates=candidates,
-)
+action_dict = trigger.evaluate_and_trigger(drift_severity=0.6)
 ```
 
 ### 6. Model Zoo — 统一目标检测模型工厂 (YOLO / DETR / RT-DETR / RetinaNet / SSD / FCOS)
@@ -275,7 +218,7 @@ Plank-road/
 │   └── transmit.py             # gRPC helpers (cloud training requests)
 ├── model_management/
 │   ├── activation_sparsity.py  # SURGEON DAS (Dynamic Activation Sparsity)
-│   ├── universal_model_split.py# Universal model splitting + HSFL selection
+│   ├── universal_model_split.py# Universal model splitting  
 │   ├── model_split.py          # Faster R-CNN specific split + re-exports
 │   ├── model_zoo.py            # Unified detection model factory (YOLO/DETR/…)
 │   ├── object_detection.py     # Inference wrappers
@@ -522,7 +465,7 @@ split_learning:
   # Explicit split point:
   # split_module: backbone
   # split_layer: 15
-  # Or strategy-based (HSFL):
+  # Or joint-optimization based:
   # strategy: linucb   # midpoint | flops_ratio | privacy | min_smashed | linucb
 ```
 
@@ -596,7 +539,6 @@ python3 edge_client.py
 ## References
 
 - [EdgeCam](https://github.com/MSNLAB/EdgeCam)
-- [HSFL (ICWS 2023)](https://github.com/SASA-cloud/ICWS-23-HSFL) — Hybrid Split Federated Learning with LinUCB split-point selection
 - [SURGEON (CVPR 2025)](https://github.com/kadmkbl/SURGEON) — Memory-Adaptive Fully Test-Time Adaptation via Dynamic Activation Sparsity
 - [RCCDA (NeurIPS 2025)](https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code) — Adaptive Model Updates in the Presence of Concept Drift under a Constrained Resource Budget
 - [Shawarma](https://github.com/Shawarma-sys/Shawarma) — Model partition and split inference
