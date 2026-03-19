@@ -66,6 +66,13 @@ from torchvision.models.detection import (
     ssd300_vgg16,
     ssdlite320_mobilenet_v3_large,
     fcos_resnet50_fpn,
+    FasterRCNN_ResNet50_FPN_Weights,
+    FasterRCNN_MobileNet_V3_Large_FPN_Weights,
+    FasterRCNN_MobileNet_V3_Large_320_FPN_Weights,
+    RetinaNet_ResNet50_FPN_Weights,
+    SSD300_VGG16_Weights,
+    SSDLite320_MobileNet_V3_Large_Weights,
+    FCOS_ResNet50_FPN_Weights,
 )
 
 _HAS_ULTRALYTICS = True
@@ -432,6 +439,16 @@ _TORCHVISION_BUILTIN = {
     "fcos_resnet50_fpn":                       lambda **kw: fcos_resnet50_fpn(**kw),
 } if _HAS_TV_DETECTION else {}
 
+_TORCHVISION_WEIGHT_DEFAULTS = {
+    "fasterrcnn_resnet50_fpn": FasterRCNN_ResNet50_FPN_Weights.DEFAULT,
+    "fasterrcnn_mobilenet_v3_large_fpn": FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT,
+    "fasterrcnn_mobilenet_v3_large_320_fpn": FasterRCNN_MobileNet_V3_Large_320_FPN_Weights.DEFAULT,
+    "retinanet_resnet50_fpn": RetinaNet_ResNet50_FPN_Weights.DEFAULT,
+    "ssd300_vgg16": SSD300_VGG16_Weights.DEFAULT,
+    "ssdlite320_mobilenet_v3_large": SSDLite320_MobileNet_V3_Large_Weights.DEFAULT,
+    "fcos_resnet50_fpn": FCOS_ResNet50_FPN_Weights.DEFAULT,
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  5. YOLO / DETR name mapping
@@ -529,12 +546,19 @@ def build_detection_model(
         build_fn = _TORCHVISION_BUILTIN[name_lower]
         if pretrained:
             try:
-                model = build_fn(pretrained=True, **kwargs)
+                model = build_fn(weights=_TORCHVISION_WEIGHT_DEFAULTS[name_lower], **kwargs)
             except TypeError:
-                # Newer torchvision uses `weights=` instead of `pretrained=`
-                model = build_fn(weights="DEFAULT", **kwargs)
+                # Backward compatibility for older torchvision APIs.
+                model = build_fn(pretrained=True, **kwargs)
         else:
-            model = build_fn(pretrained=False, pretrained_backbone=False, **kwargs)
+            try:
+                model = build_fn(weights=None, weights_backbone=None, **kwargs)
+            except TypeError:
+                # Some constructors do not expose weights_backbone.
+                try:
+                    model = build_fn(weights=None, **kwargs)
+                except TypeError:
+                    model = build_fn(pretrained=False, pretrained_backbone=False, **kwargs)
 
         if weights_path and os.path.isfile(weights_path):
             state = torch.load(weights_path, map_location=device)
@@ -597,11 +621,17 @@ def build_detection_model(
         if fn is not None and callable(fn):
             if pretrained:
                 try:
-                    model = fn(pretrained=True, **kwargs)
-                except TypeError:
                     model = fn(weights="DEFAULT", **kwargs)
+                except TypeError:
+                    model = fn(pretrained=True, **kwargs)
             else:
-                model = fn(**kwargs)
+                try:
+                    model = fn(weights=None, weights_backbone=None, **kwargs)
+                except TypeError:
+                    try:
+                        model = fn(weights=None, **kwargs)
+                    except TypeError:
+                        model = fn(**kwargs)
             if weights_path and os.path.isfile(weights_path):
                 model.load_state_dict(
                     torch.load(weights_path, map_location=device)
