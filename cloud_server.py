@@ -8,20 +8,10 @@ import random
 import threading
 import time
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
 import cv2
 import numpy as np
 import pandas as pd
 import torch
-import torch
-print(torch.__version__)
-print(torch.version.cuda)
-print(f"CUDA available: {torch.cuda.is_available()}")
-print(f"Number of GPUs: {torch.cuda.device_count()}")
-if torch.cuda.is_available():
-    print(f"Current device: {torch.cuda.current_device()}")
-
 from queue import Queue
 from datetime import datetime
 import yaml
@@ -39,18 +29,16 @@ from model_management.object_detection import Object_Detection
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
-from model_management.model_split import (
-    load_feature_cache,
-    list_cached_features,
-    split_retrain,
-)
-
 # Universal model splitting (optional — requires torchlens)
-from model_management.universal_model_split import (
-    UniversalModelSplitter,
-    universal_split_retrain,
-    load_split_feature_cache,
-)
+try:
+    from model_management.universal_model_split import (
+        UniversalModelSplitter,
+        universal_split_retrain,
+        load_split_feature_cache,
+    )
+    _HAS_UNIVERSAL_SPLIT = True
+except ImportError:
+    _HAS_UNIVERSAL_SPLIT = False
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
@@ -150,7 +138,7 @@ class CloudContinualLearner:
                 return False, "", str(exc)
 
     # ------------------------------------------------------------------
-    # Split-learning continual learning 
+    # Split-learning continual learning (HSFL-style)
     # ------------------------------------------------------------------
 
     def get_ground_truth_and_split_retrain(
@@ -236,10 +224,7 @@ class CloudContinualLearner:
     ) -> bytes:
         """Fine-tune the lightweight model via split learning; return state-dict bytes.
 
-        Automatically detects whether the cached features were produced by the
-        *universal* model splitter (``features/split_meta.json`` present) or
-        by the legacy Faster R-CNN backbone extractor, and dispatches to the
-        appropriate training routine.
+        Requires cached features produced by the universal model splitter.
         """
         import json as _json
         from model_management.model_zoo import build_detection_model, model_has_roi_heads, is_wrapper_model
@@ -275,53 +260,45 @@ class CloudContinualLearner:
 
         tmp_model.to(self.device)
 
-        # ---- Detect universal split features ----
         meta_path = os.path.join(cache_path, "features", "split_meta.json")
-        use_universal = False
         split_index = None
 
-        if os.path.exists(meta_path):
-            try:
-                with open(meta_path, "r") as _mf:
-                    meta = _json.load(_mf)
-                use_universal = meta.get("universal", False)
-                split_index = meta.get("split_index")
-                logger.info(
-                    "[SplitCL] Detected universal split features — split_index={}",
-                    split_index,
-                )
-            except Exception as exc:
-                logger.warning("[SplitCL] Failed to read split_meta.json: {}", exc)
+        if not (_HAS_UNIVERSAL_SPLIT and os.path.exists(meta_path)):
+            raise RuntimeError(
+                "Universal split metadata is required for split retraining; "
+                "legacy Faster R-CNN split path has been removed."
+            )
 
-        if use_universal and split_index is not None:
-            # ---- Universal split-learning path (any model, any layer) ----
-            sample_input = torch.rand(1, 3, 224, 224).to(self.device)
-            universal_split_retrain(
-                model=tmp_model,
-                sample_input=sample_input,
-                split_layer=int(split_index),
-                cache_path=cache_path,
-                all_indices=all_indices,
-                gt_annotations=gt_annotations,
-                device=self.device,
-                num_epoch=num_epoch,
-                das_enabled=self.das_enabled,
-                das_bn_only=self.das_bn_only,
-                das_probe_samples=self.das_probe_samples,
+        try:
+            with open(meta_path, "r") as _mf:
+                meta = _json.load(_mf)
+            if not meta.get("universal", False):
+                raise RuntimeError("features/split_meta.json is not marked as a universal split cache.")
+            split_index = meta.get("split_index")
+            logger.info(
+                "[SplitCL] Detected universal split features — split_index={}",
+                split_index,
             )
-        else:
-            # ---- Legacy Faster R-CNN split-learning path ----
-            split_retrain(
-                model=tmp_model,
-                cache_path=cache_path,
-                all_indices=all_indices,
-                gt_annotations=gt_annotations,
-                device=self.device,
-                num_epoch=num_epoch,
-                das_enabled=self.das_enabled,
-                das_bn_only=self.das_bn_only,
-                das_probe_samples=self.das_probe_samples,
-            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load universal split metadata: {exc}") from exc
+
+        if split_index is None:
+            raise RuntimeError("Universal split metadata missing split_index.")
+
+        sample_input = torch.rand(1, 3, 224, 224).to(self.device)
+        universal_split_retrain(
+            model=tmp_model,
+            sample_input=sample_input,
+            split_layer=int(split_index),
+            cache_path=cache_path,
+            all_indices=all_indices,
+            gt_annotations=gt_annotations,
+            device=self.device,
+            num_epoch=num_epoch,
+            das_enabled=self.das_enabled,
+            das_bn_only=self.das_bn_only,
+            das_probe_samples=self.das_probe_samples,
+        )
 
         # Persist weights so future retraining can fine-tune further
         torch.save(tmp_model.state_dict(), edge_weights)
@@ -534,7 +511,7 @@ class CloudServer:
 
     def start_server(self):
         logger.info("cloud server is starting")
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=4), options=[('grpc.max_send_message_length', 1024 * 1024 * 512), ('grpc.max_receive_message_length', 1024 * 1024 * 512)])
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
         message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
             MessageTransmissionServicer(
                 self.local_queue,

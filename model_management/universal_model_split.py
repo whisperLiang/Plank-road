@@ -14,11 +14,17 @@ The core idea comes from two references:
   partitioned at any index, with the head running on the edge and the tail
   on the cloud, for both inference and training.
 
-Split-point selection profile is generalized for arbitrary models:
+Split-point selection is inspired by:
 
-``profile_layers()`` automatically computes FLOPs, tensor size, 
-
-and privacy-leakage estimates into ``LayerProfile``.
+* **HSFL** (ICWS 2023) — ``SASA-cloud/ICWS-23-HSFL``.  HSFL profiles each
+  candidate split layer with ``(cumulative_FLOPs, smashed_data_size)`` and
+  uses a **LinUCB contextual bandit** to adaptively choose the optimal split
+  point at each federated round, balancing *training latency* and *privacy
+  leakage* (proportional to intermediate tensor dimensionality).  We
+  generalise their approach to arbitrary models: ``profile_layers()``
+  automatically computes FLOPs / tensor size / privacy-leakage estimates,
+  ``SplitPointSelector`` wraps the LinUCB agent, and ``select_split_point()``
+  on ``UniversalModelSplitter`` provides a one-call API.
 
 This module adapts both ideas into a single ``UniversalModelSplitter`` class
 that integrates with the existing Plank-road edge-cloud continual-learning
@@ -83,69 +89,25 @@ import torch.nn as nn
 from loguru import logger
 
 # ---------------------------------------------------------------------------
-# Required dependencies.
+# TorchLens is an optional dependency used for model-agnostic tracing.
 # ---------------------------------------------------------------------------
-import torchlens as tl
-from model_management.activation_sparsity import (
-    DASTrainer,
-    apply_das_to_tail,
-)
+try:
+    import torchlens as tl
+    _HAS_TORCHLENS = True
+except ImportError:
+    _HAS_TORCHLENS = False
 
-_HAS_TORCHLENS = True
-_HAS_DAS = True
-
-
-def _move_to_device(obj, device):
-    if isinstance(obj, torch.Tensor):
-        return obj.to(device)
-    if isinstance(obj, list):
-        return [_move_to_device(v, device) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_move_to_device(v, device) for v in obj)
-    if isinstance(obj, dict):
-        return {k: _move_to_device(v, device) for k, v in obj.items()}
-    return obj
-
-
-def _detach_clone_any(obj):
-    if isinstance(obj, torch.Tensor):
-        return obj.detach().clone()
-    if isinstance(obj, list):
-        return [_detach_clone_any(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_detach_clone_any(v) for v in obj)
-    if isinstance(obj, dict):
-        return {k: _detach_clone_any(v) for k, v in obj.items()}
-    return obj
-
-
-def _extract_first_tensor(obj):
-    if isinstance(obj, torch.Tensor):
-        return obj
-    if isinstance(obj, (list, tuple)):
-        for v in obj:
-            t = _extract_first_tensor(v)
-            if t is not None:
-                return t
-        return None
-    if isinstance(obj, dict):
-        for v in obj.values():
-            t = _extract_first_tensor(v)
-            if t is not None:
-                return t
-        return None
-    return None
-
-
-def _is_proxy_split_model(model: nn.Module) -> bool:
-    mod = getattr(model.__class__, "__module__", "")
-    if mod.startswith("ultralytics"):
-        return True
-    if mod.startswith("torchvision.models.detection"):
-        return True
-    if hasattr(model, "rpn") and hasattr(model, "roi_heads"):
-        return True
-    return False
+# ---------------------------------------------------------------------------
+# Dynamic Activation Sparsity (SURGEON-style layer pruning).
+# ---------------------------------------------------------------------------
+try:
+    from model_management.activation_sparsity import (
+        DASTrainer,
+        apply_das_to_tail,
+    )
+    _HAS_DAS = True
+except ImportError:
+    _HAS_DAS = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -160,118 +122,182 @@ def _prepare_replay_graph(layer_list: list) -> dict[str, int]:
     return label2idx
 
 
-def _layer_get_activation(layer):
-    act = getattr(layer, "activation", None)
-    if act is not None:
-        return act
-    return getattr(layer, "tensor_contents", None)
+@dataclass
+class SplitPayload:
+    """Boundary activations required to replay the cloud-side subgraph.
 
-
-def _layer_set_activation(layer, value) -> None:
-    setattr(layer, "activation", value)
-    if hasattr(layer, "tensor_contents"):
-        setattr(layer, "tensor_contents", value)
-
-
-def _layer_func_name(layer) -> str:
-    name = getattr(layer, "func_name", None)
-    if name:
-        return name
-    return getattr(layer, "func_applied_name", "") or ""
-
-
-def _layer_non_tensor_kwargs(layer) -> dict:
-    kw = getattr(layer, "func_kwargs_non_tensor", None)
-    if isinstance(kw, dict):
-        return dict(kw)
-    old_kw = getattr(layer, "func_keyword_args_non_tensor", None)
-    if isinstance(old_kw, dict):
-        return dict(old_kw)
-    return {}
-
-
-def _is_non_splittable_layer(layer) -> bool:
-    """Return True for layers that should never be chosen as split points."""
-    layer_type = str(getattr(layer, "layer_type", "") or "").lower()
-    label = str(getattr(layer, "layer_label", "") or "").lower()
-    if layer_type in {"input", "output", "buffer"}:
-        return True
-    if label.startswith("buffer_"):
-        return True
-    return False
-
-
-def _nearest_splittable_index(layer_list: list, requested_index: int) -> int | None:
-    """Find the nearest valid split index around requested_index.
-
-    Preference order: closest previous layer, then closest next layer.
+    For purely sequential models this usually contains just the split layer's
+    activation. For residual / multi-branch graphs it can contain multiple
+    tensors whose edges cross the partition boundary.
     """
-    n = len(layer_list)
-    if n < 3:
-        return None
 
-    lo = 1
-    hi = n - 2
-    req = max(lo, min(requested_index, hi))
+    tensors: "OrderedDict[str, torch.Tensor]" = field(default_factory=OrderedDict)
+    split_index: int | None = None
+    split_label: str | None = None
 
-    if not _is_non_splittable_layer(layer_list[req]):
-        return req
+    def cpu(self) -> "SplitPayload":
+        return SplitPayload(
+            tensors=OrderedDict((k, v.detach().cpu()) for k, v in self.tensors.items()),
+            split_index=self.split_index,
+            split_label=self.split_label,
+        )
 
-    for delta in range(1, max(req - lo, hi - req) + 1):
-        left = req - delta
-        if left >= lo and not _is_non_splittable_layer(layer_list[left]):
-            return left
-        right = req + delta
-        if right <= hi and not _is_non_splittable_layer(layer_list[right]):
-            return right
-    return None
+    def to(self, device: torch.device | str) -> "SplitPayload":
+        dev = torch.device(device)
+        return SplitPayload(
+            tensors=OrderedDict((k, v.to(dev)) for k, v in self.tensors.items()),
+            split_index=self.split_index,
+            split_label=self.split_label,
+        )
+
+    def detach(self, *, requires_grad: bool = False) -> "SplitPayload":
+        copied = OrderedDict()
+        for k, v in self.tensors.items():
+            t = v.detach()
+            if requires_grad:
+                t = t.requires_grad_(True)
+            copied[k] = t
+        return SplitPayload(
+            tensors=copied,
+            split_index=self.split_index,
+            split_label=self.split_label,
+        )
+
+    def primary_tensor(self) -> torch.Tensor:
+        if self.split_label and self.split_label in self.tensors:
+            return self.tensors[self.split_label]
+        if self.tensors:
+            return next(reversed(self.tensors.values()))
+        raise RuntimeError("SplitPayload is empty.")
 
 
-def _collect_tail_boundary_labels(
+def _collect_parent_layer_labels(layer) -> list[str]:
+    """Collect all tensor-parent labels referenced by a traced layer."""
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    def _maybe_add(value):
+        if isinstance(value, str) and value not in seen:
+            seen.add(value)
+            labels.append(value)
+
+    for plabel in getattr(layer, "parent_layers", None) or []:
+        _maybe_add(plabel)
+
+    arg_locs = getattr(layer, "parent_layer_arg_locs", None) or {}
+    for mapping in (arg_locs.get("args", {}), arg_locs.get("kwargs", {})):
+        for plabel in mapping.values():
+            _maybe_add(plabel)
+
+    return labels
+
+
+def _compute_boundary_labels(
     layer_list: list,
     label2idx: dict[str, int],
     split_index: int,
-) -> set[str]:
-    """Collect head-side layer labels required by tail-side replay.
+) -> list[str]:
+    """Compute the head-side activations required by the tail subgraph."""
+    boundary_indices: set[int] = set()
 
-    For DAG models (e.g. residual/skip connections), layers in the tail can
-    depend on multiple parent activations from the head partition. This helper
-    finds all such cross-boundary parent labels.
-    """
-    needed: set[str] = set()
     for idx in range(split_index + 1, len(layer_list)):
-        layer = layer_list[idx]
-        arg_locs = getattr(layer, "parent_layer_arg_locs", None) or {"args": {}, "kwargs": {}}
-
-        parent_labels = []
-        parent_labels.extend(list(arg_locs.get("args", {}).values()))
-        parent_labels.extend(list(arg_locs.get("kwargs", {}).values()))
-
-        for plabel in parent_labels:
+        for plabel in _collect_parent_layer_labels(layer_list[idx]):
             pidx = label2idx.get(plabel)
             if pidx is not None and pidx <= split_index:
-                needed.add(plabel)
-    return needed
+                boundary_indices.add(pidx)
+
+    if not boundary_indices and 0 <= split_index < len(layer_list):
+        boundary_indices.add(split_index)
+
+    return [layer_list[i].layer_label for i in sorted(boundary_indices)]
 
 
-def _estimate_layer_flops(layer) -> float:
-    """Heuristic FLOPs estimate for one traced layer."""
-    fn = _layer_func_name(layer).lower()
-    shape = getattr(layer, "tensor_shape", None)
-    num_params = float(getattr(layer, "num_params_total", 0) or 0)
+def _payload_to_tensor_map(
+    payload: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
+    split_label: str,
+) -> "OrderedDict[str, torch.Tensor]":
+    """Normalise different payload forms into a label->tensor mapping."""
+    if isinstance(payload, SplitPayload):
+        return OrderedDict(payload.tensors.items())
+    if isinstance(payload, torch.Tensor):
+        return OrderedDict([(split_label, payload)])
+    if isinstance(payload, dict):
+        out: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        for key, value in payload.items():
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"Expected tensor payload for '{key}', got {type(value)!r}")
+            out[str(key)] = value
+        return out
+    raise TypeError(f"Unsupported split payload type: {type(payload)!r}")
 
-    if "conv" in fn:
-        if shape and len(shape) >= 4:
-            _, _, h, w = shape[:4]
-            return max(2.0 * num_params * max(h * w, 1), 0.0)
-        return max(2.0 * num_params, 0.0)
 
-    if "linear" in fn or fn in ("mm", "addmm", "matmul"):
-        return max(2.0 * num_params, 0.0)
+def _payload_primary_tensor(
+    payload: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
+    split_label: str,
+) -> torch.Tensor:
+    """Return the payload tensor that corresponds to the split layer."""
+    tensor_map = _payload_to_tensor_map(payload, split_label)
+    if split_label in tensor_map:
+        return tensor_map[split_label]
+    if tensor_map:
+        return next(reversed(tensor_map.values()))
+    raise RuntimeError("Split payload is empty.")
 
-    if shape:
-        return float(np.prod(shape)) * 0.1
-    return 0.0
+
+def _payload_to_device(
+    payload: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
+    *,
+    split_label: str,
+    device: torch.device | str | None,
+    requires_grad: bool = False,
+) -> Union[torch.Tensor, SplitPayload]:
+    """Move payload tensors to the target device and optionally enable grad."""
+    tensor_map = _payload_to_tensor_map(payload, split_label)
+    dev = torch.device(device) if device is not None else None
+
+    moved = OrderedDict()
+    for label, tensor in tensor_map.items():
+        t = tensor
+        if dev is not None and t.device != dev:
+            t = t.to(dev)
+        t = t.detach()
+        if requires_grad:
+            t = t.requires_grad_(True)
+        moved[label] = t
+
+    if len(moved) == 1 and split_label in moved:
+        return moved[split_label]
+
+    split_index = payload.split_index if isinstance(payload, SplitPayload) else None
+    return SplitPayload(
+        tensors=moved,
+        split_index=split_index,
+        split_label=split_label,
+    )
+
+
+def _transport_payload(
+    payload: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
+    *,
+    split_label: str,
+) -> Union[torch.Tensor, SplitPayload]:
+    """Detach and clone payload tensors for edge->cloud transfer semantics."""
+    tensor_map = _payload_to_tensor_map(payload, split_label)
+    copied = OrderedDict((k, v.detach().clone()) for k, v in tensor_map.items())
+    if len(copied) == 1 and split_label in copied:
+        return copied[split_label]
+    split_index = payload.split_index if isinstance(payload, SplitPayload) else None
+    return SplitPayload(tensors=copied, split_index=split_index, split_label=split_label)
+
+
+def _reset_replay_state(layer_list: list) -> None:
+    """Clear runtime activations so replay does not depend on prior calls."""
+    for layer in layer_list:
+        func = getattr(layer, "func_applied", None)
+        layer_type = getattr(layer, "layer_type", None)
+        if func is None and layer_type not in ("input", "output"):
+            continue
+        layer.tensor_contents = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -280,16 +306,40 @@ def _estimate_layer_flops(layer) -> float:
 
 def _replay_layer(layer, layer_list, label2idx, fallback_input=None,
                   model: torch.nn.Module | None = None):
-    """Execute one traced layer using the latest torchlens LayerPassLog API."""
+    """Execute one traced layer using ``func_applied`` + ``creation_args``.
+
+    For torchlens >= 0.12 which no longer exposes ``replay_fast``.
+    Replaces parent-tensor positions in ``creation_args`` with the freshly
+    computed ``tensor_contents`` of the parent layers.
+
+    When *model* is provided (training mode), parameter positions in
+    ``creation_args`` are replaced with the actual ``model.named_parameters()``
+    tensors so that autograd graphs connect to the real model weights.
+
+    Handles two torchlens-specific conventions:
+
+    * **Multi-output functions** (``chunk``, ``split``, ``unbind``):  torchlens
+      creates one layer per output element.  The layer label encodes a
+      1-based output index (e.g. ``chunk_2_11`` → second element).  After
+      calling the function we index into the tuple result.
+
+    * **Nested arg positions** (``cat``, ``stack``):  ``parent_layer_arg_locs``
+      uses tuple keys like ``(0, 0)``, ``(0, 1)`` meaning "position 0 is a
+      list; elements 0, 1, … come from these parents".
+    """
     func = layer.func_applied
     if func is None:
-        tc = _layer_get_activation(layer)
+        # Buffer / constant layers keep their original tensor_contents.
+        # Input layers have tensor_contents set by the caller before replay.
+        tc = layer.tensor_contents
         return tc if tc is not None else fallback_input
 
+    creation_args = list(layer.creation_args) if layer.creation_args else []
     arg_locs = getattr(layer, "parent_layer_arg_locs", None) or {"args": {}, "kwargs": {}}
 
-    flat_parent_locs: dict = {}
-    nested_parent_locs: dict = {}
+    # Separate flat-int keys from tuple keys in arg_locs["args"]
+    flat_parent_locs: dict = {}   # int → parent_label
+    nested_parent_locs: dict = {} # (pos, sub) → parent_label
     for key, plabel in arg_locs.get("args", {}).items():
         if isinstance(key, tuple):
             nested_parent_locs[key] = plabel
@@ -297,82 +347,26 @@ def _replay_layer(layer, layer_list, label2idx, fallback_input=None,
             pos = int(key) if isinstance(key, str) else key
             flat_parent_locs[pos] = plabel
 
+    # Build a set of parent-layer positions (to distinguish from param/buffer positions)
     parent_positions = set(flat_parent_locs.keys())
+    # Also include the top-level positions that appear in nested keys
     for (pos, _sub) in nested_parent_locs:
         parent_positions.add(pos)
 
-    param_name_to_tensor: dict[str, torch.Tensor] = {}
-    if model is not None:
-        named = dict(model.named_parameters())
-        for pl in (getattr(layer, "parent_param_logs", None) or []):
-            key = f"{pl.module_address}.{pl.name}"
-            if key in named:
-                param_name_to_tensor[pl.name] = named[key]
-
-    func_name = _layer_func_name(layer)
-    argnames = list(getattr(layer, "func_argnames", ()) or ())
-    non_tensor_args = list(getattr(layer, "func_positional_args_non_tensor", []) or [])
-    if not non_tensor_args:
-        non_tensor_args = list(getattr(layer, "func_non_tensor_args", []) or [])
-
-    if func_name == "batch_norm":
-        creation_args = [None] * 9
-        p0 = flat_parent_locs.get(0)
-        if p0 in label2idx:
-            creation_args[0] = _layer_get_activation(layer_list[label2idx[p0]])
-        elif fallback_input is not None:
-            creation_args[0] = fallback_input
-
-        creation_args[1] = param_name_to_tensor.get("weight")
-        creation_args[2] = param_name_to_tensor.get("bias")
-
-        p3 = flat_parent_locs.get(3)
-        if p3 in label2idx:
-            creation_args[3] = _layer_get_activation(layer_list[label2idx[p3]])
-        p4 = flat_parent_locs.get(4)
-        if p4 in label2idx:
-            creation_args[4] = _layer_get_activation(layer_list[label2idx[p4]])
-
-        creation_args[5] = non_tensor_args[0] if len(non_tensor_args) > 0 else False
-        creation_args[6] = non_tensor_args[1] if len(non_tensor_args) > 1 else 0.1
-        creation_args[7] = non_tensor_args[2] if len(non_tensor_args) > 2 else 1e-5
-        creation_args[8] = non_tensor_args[3] if len(non_tensor_args) > 3 else True
-    elif argnames:
-        creation_args = []
-        non_tensor_iter = iter(non_tensor_args)
-        for i, argname in enumerate(argnames):
-            if i in flat_parent_locs:
-                creation_args.append(None)
-            elif argname in param_name_to_tensor:
-                creation_args.append(param_name_to_tensor[argname])
-            else:
-                creation_args.append(next(non_tensor_iter, None))
-
-        # torchlens may store reshape/view target shape as multiple
-        # positional non-tensor args while func_argnames has a single
-        # "shape" or "size" slot.
-        if (
-            func_name in {"reshape", "view"}
-            and len(argnames) >= 2
-            and argnames[1] in {"shape", "size"}
-            and len(non_tensor_args) > 1
-        ):
-            creation_args[1] = tuple(non_tensor_args)
-    else:
-        creation_args = list(getattr(layer, "creation_args", []) or non_tensor_args)
-
+    # Replace flat parent-layer tensor positions with freshly computed values
     for pos, plabel in flat_parent_locs.items():
         if plabel in label2idx:
             parent = layer_list[label2idx[plabel]]
-            tc = _layer_get_activation(parent)
-            while len(creation_args) <= pos:
-                creation_args.append(None)
-            if tc is not None:
+            tc = parent.tensor_contents
+            if tc is not None and pos < len(creation_args):
                 creation_args[pos] = tc
-            elif fallback_input is not None:
+            elif fallback_input is not None and pos < len(creation_args):
                 creation_args[pos] = fallback_input
 
+    # Build list arguments from nested (tuple-key) parent positions.
+    # E.g. cat expects a list-of-tensors at position 0.
     if nested_parent_locs:
+        # Group by top-level position
         nested_groups: dict[int, dict[int, str]] = {}
         for (pos, sub), plabel in nested_parent_locs.items():
             nested_groups.setdefault(pos, {})[sub] = plabel
@@ -382,51 +376,82 @@ def _replay_layer(layer, layer_list, label2idx, fallback_input=None,
                 plabel = sub_map[sub_idx]
                 if plabel in label2idx:
                     parent = layer_list[label2idx[plabel]]
-                    tc = _layer_get_activation(parent)
+                    tc = parent.tensor_contents
                     elems.append(tc if tc is not None else fallback_input)
                 else:
                     elems.append(fallback_input)
             if pos < len(creation_args):
                 creation_args[pos] = elems
             else:
+                # Extend if necessary
                 while len(creation_args) <= pos:
                     creation_args.append(None)
                 creation_args[pos] = elems
 
-    kw_args = _layer_non_tensor_kwargs(layer)
+    # When model is provided (training): inject actual model parameters into
+    # creation_args so grad flows to the real weights, not torchlens copies.
+    if model is not None:
+        param_logs = getattr(layer, "parent_param_logs", None) or []
+        if param_logs:
+            named = dict(model.named_parameters())
+            # Collect actual params in ParamLog order
+            real_params = []
+            for pl in param_logs:
+                key = f"{pl.module_address}.{pl.name}"
+                if key in named:
+                    real_params.append(named[key])
+            # Map to non-parent tensor positions in creation_args.
+            # Don't check requires_grad — trace runs under no_grad so
+            # creation_args tensors have requires_grad=False.
+            param_iter = iter(real_params)
+            for pos, arg in enumerate(creation_args):
+                if pos in parent_positions:
+                    continue
+                if isinstance(arg, torch.Tensor):
+                    rp = next(param_iter, None)
+                    if rp is not None:
+                        creation_args[pos] = rp
+
+    kw_args = dict(layer.func_keyword_args_non_tensor) if layer.func_keyword_args_non_tensor else {}
     for kw_name, plabel in arg_locs.get("kwargs", {}).items():
         if plabel in label2idx:
             parent = layer_list[label2idx[plabel]]
-            tc = _layer_get_activation(parent)
+            tc = parent.tensor_contents
             if tc is not None:
                 kw_args[kw_name] = tc
 
-    if argnames:
-        positional_names = set(argnames[:len(creation_args)])
-        for name in list(kw_args.keys()):
-            if name in positional_names:
-                kw_args.pop(name, None)
-
+    # In-place functions (relu_, etc.) cannot operate on leaf Variables with
+    # requires_grad.  Clone tensor inputs to guarantee safety.
+    func_name = getattr(layer, "func_applied_name", "") or ""
     if func_name.endswith("_") and model is not None:
         creation_args = [
             a.clone() if isinstance(a, torch.Tensor) and a.is_leaf and a.requires_grad else a
             for a in creation_args
         ]
 
-    while creation_args and creation_args[-1] is None:
-        creation_args.pop()
-
-    result = func(*creation_args, **kw_args)
+    try:
+        result = func(*creation_args, **kw_args)
+    except (IndexError, RuntimeError) as exc:
+        # Dynamic-index layers (gather, select, index_select, …) may use
+        # indices recorded at trace time that no longer match intermediate
+        # tensor shapes during replay.  Fall back to the pre-recorded value.
+        stored = getattr(layer, "tensor_contents", None)
+        if stored is not None:
+            return stored
+        raise exc
 
     # Handle multi-output functions (chunk, split, unbind, etc.)
     # torchlens creates one layer per tuple element; extract the right one.
     if isinstance(result, (tuple, list)):
+        # Determine the 1-based output index from the layer label.
+        # Convention: "chunk_2_11" → layer_label_short "chunk_2" → index 2
         label_short = getattr(layer, "layer_label_short", "") or ""
         parts = label_short.rsplit("_", 1)
         if len(parts) == 2 and parts[1].isdigit():
-            out_idx = int(parts[1]) - 1
+            out_idx = int(parts[1]) - 1  # 1-based → 0-based
             if 0 <= out_idx < len(result):
                 return result[out_idx]
+        # Fallback: return first element
         return result[0] if result else result
 
     return result
@@ -436,7 +461,6 @@ def _layer_forward_full(
     layer_list: list,
     label2idx: dict[str, int],
     x: torch.Tensor,
-    model: torch.nn.Module | None = None,
 ) -> torch.Tensor:
     """Execute the full model layer-by-layer via traced graph replay.
 
@@ -450,20 +474,22 @@ def _layer_forward_full(
     -------
     torch.Tensor — model output
     """
+    _reset_replay_state(layer_list)
+
     for layer in layer_list:
-        func_name = _layer_func_name(layer)
+        func_name = getattr(layer, "func_applied_name", None)
         layer_type = getattr(layer, "layer_type", None)
 
         if func_name == "none":
             if layer_type == "input":
-                _layer_set_activation(layer, x)
+                layer.tensor_contents = x
             elif layer_type == "output":
                 parent_idx = label2idx[layer.parent_layers[0]]
-                _layer_set_activation(layer, _layer_get_activation(layer_list[parent_idx]))
+                layer.tensor_contents = layer_list[parent_idx].tensor_contents
             continue
 
-        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x, model=model)
-        _layer_set_activation(layer, result)
+        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x)
+        layer.tensor_contents = result
         x = result
 
     return x
@@ -478,70 +504,92 @@ def _partition_forward_head(
     label2idx: dict[str, int],
     x: torch.Tensor,
     split_index: int,
-    model: torch.nn.Module | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run layers ``[0 .. split_index]`` and return ``(final_output, intermediate)``."""
-    intermediate: torch.Tensor | None = None
+    boundary_labels: list[str],
+) -> Tuple[torch.Tensor, Union[torch.Tensor, SplitPayload]]:
+    """Run layers ``[0 .. split_index]`` and return the split payload."""
+    _reset_replay_state(layer_list)
 
     for idx, layer in enumerate(layer_list):
         if idx > split_index:
             break
 
-        func_name = _layer_func_name(layer)
+        func_name = getattr(layer, "func_applied_name", None)
         layer_type = getattr(layer, "layer_type", None)
 
         if func_name == "none":
             if layer_type == "input":
-                _layer_set_activation(layer, x)
+                layer.tensor_contents = x
             elif layer_type == "output" and layer.parent_layers:
                 parent_idx = label2idx[layer.parent_layers[0]]
-                _layer_set_activation(layer, _layer_get_activation(layer_list[parent_idx]))
-            if idx == split_index:
-                tc = _layer_get_activation(layer)
-                intermediate = tc.detach().clone() if tc is not None else x.detach().clone()
+                layer.tensor_contents = layer_list[parent_idx].tensor_contents
             continue
 
-        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x, model=model)
-        _layer_set_activation(layer, result)
+        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x)
+        layer.tensor_contents = result
         x = result
 
-        if idx == split_index:
-            intermediate = x.detach().clone()
+    split_label = layer_list[split_index].layer_label
+    payload_tensors: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+    for label in boundary_labels:
+        idx = label2idx.get(label)
+        if idx is None:
+            continue
+        tensor = layer_list[idx].tensor_contents
+        if tensor is None:
+            raise RuntimeError(f"Boundary tensor '{label}' was not materialised during edge replay.")
+        payload_tensors[label] = tensor.detach().clone()
 
-    if intermediate is None:
-        intermediate = x.detach().clone()
-    return x, intermediate
+    if not payload_tensors:
+        payload_tensors[split_label] = x.detach().clone()
+
+    payload = SplitPayload(
+        tensors=payload_tensors,
+        split_index=split_index,
+        split_label=split_label,
+    )
+    if len(payload.tensors) == 1 and split_label in payload.tensors:
+        return x, payload.tensors[split_label]
+    return x, payload
 
 
 def _partition_forward_tail(
     layer_list: list,
     label2idx: dict[str, int],
-    x_inter: torch.Tensor,
+    payload: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
     split_index: int,
-    model: torch.nn.Module | None = None,
+    split_label: str,
 ) -> torch.Tensor:
-    """Run layers ``[split_index+1 .. end]`` given the intermediate tensor."""
-    _layer_set_activation(layer_list[split_index], x_inter)
-    x = x_inter
+    """Run layers ``[split_index+1 .. end]`` given the split payload."""
+    _reset_replay_state(layer_list)
+
+    tensor_map = _payload_to_tensor_map(payload, split_label)
+    for label, tensor in tensor_map.items():
+        idx = label2idx.get(label)
+        if idx is not None:
+            layer_list[idx].tensor_contents = tensor
+
+    x = _payload_primary_tensor(payload, split_label)
+    if split_index >= len(layer_list) - 1:
+        return x
 
     for idx, layer in enumerate(layer_list):
         if idx <= split_index:
             continue
 
-        func_name = _layer_func_name(layer)
+        func_name = getattr(layer, "func_applied_name", None)
         layer_type = getattr(layer, "layer_type", None)
 
         if func_name == "none":
             if layer_type == "output" and layer.parent_layers:
                 plabel = layer.parent_layers[0]
                 if plabel in label2idx and label2idx[plabel] > split_index:
-                    _layer_set_activation(layer, _layer_get_activation(layer_list[label2idx[plabel]]))
+                    layer.tensor_contents = layer_list[label2idx[plabel]].tensor_contents
                 else:
-                    _layer_set_activation(layer, x)
+                    layer.tensor_contents = x
             continue
 
-        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x_inter, model=model)
-        _layer_set_activation(layer, result)
+        result = _replay_layer(layer, layer_list, label2idx, fallback_input=x)
+        layer.tensor_contents = result
         x = result
 
     return x
@@ -550,33 +598,43 @@ def _partition_forward_tail(
 def _partition_forward_tail_train(
     layer_list: list,
     label2idx: dict[str, int],
-    x_inter: torch.Tensor,
+    payload: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
     split_index: int,
+    split_label: str,
     model: torch.nn.Module | None = None,
 ) -> torch.Tensor:
     """Training-mode forward through the tail partition (keeps autograd graph)."""
-    _layer_set_activation(layer_list[split_index], x_inter)
-    x = x_inter
+    _reset_replay_state(layer_list)
+
+    tensor_map = _payload_to_tensor_map(payload, split_label)
+    for label, tensor in tensor_map.items():
+        idx = label2idx.get(label)
+        if idx is not None:
+            layer_list[idx].tensor_contents = tensor
+
+    x = _payload_primary_tensor(payload, split_label)
+    if split_index >= len(layer_list) - 1:
+        return x
 
     for idx, layer in enumerate(layer_list):
         if idx <= split_index:
             continue
 
-        func_name = _layer_func_name(layer)
+        func_name = getattr(layer, "func_applied_name", None)
         layer_type = getattr(layer, "layer_type", None)
 
         if func_name == "none":
             if layer_type == "output" and layer.parent_layers:
                 plabel = layer.parent_layers[0]
                 if plabel in label2idx and label2idx[plabel] > split_index:
-                    _layer_set_activation(layer, _layer_get_activation(layer_list[label2idx[plabel]]))
+                    layer.tensor_contents = layer_list[label2idx[plabel]].tensor_contents
                 else:
-                    _layer_set_activation(layer, x)
+                    layer.tensor_contents = x
             continue
 
         result = _replay_layer(layer, layer_list, label2idx,
-                               fallback_input=x_inter, model=model)
-        _layer_set_activation(layer, result)
+                               fallback_input=x, model=model)
+        layer.tensor_contents = result
         x = result
 
     return x
@@ -652,12 +710,13 @@ def _get_trainable_params(layer_list: list, split_index: int, model: torch.nn.Mo
 
 def _load_weights_into_layers(layer_list: list, model: torch.nn.Module, weights: list[torch.Tensor]) -> None:
     """Load weights sequentially into the layer list."""
-    dst_params: list[torch.Tensor] = []
+    weight_iter = iter(weights)
     for layer in layer_list:
-        dst_params.extend(_get_param_tensors_for_layer(layer, model))
-
-    for p, w in zip(dst_params, weights):
-        p.data.copy_(w)
+        for p in _get_param_tensors_for_layer(layer, model):
+            try:
+                p.data.copy_(next(weight_iter))
+            except StopIteration:
+                return
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -672,9 +731,12 @@ def _set_training_flag(layer_list: list, training: bool) -> None:
     for layer in layer_list:
         argnames = getattr(layer, "func_argnames", None)
         if argnames and "training" in argnames:
-            kwargs = getattr(layer, "func_kwargs_non_tensor", None)
-            if isinstance(kwargs, dict) and "training" in kwargs:
-                kwargs["training"] = training
+            args = layer.func_all_args_non_tensor
+            if args:
+                for idx, arg in enumerate(args):
+                    if isinstance(arg, bool):
+                        args[idx] = training
+                        break
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -707,14 +769,14 @@ class LayerInfo:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Layer profiling data
+# Layer profiling data (HSFL-inspired, generalised to arbitrary models)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class LayerProfile:
     """Per-candidate-split-point cost profile.
 
-    This mirrors the ``layer_info`` dict from previous ``config.py``::
+    This mirrors the ``layer_info`` dict from HSFL ``config.py``::
 
         layer_info = { action_idx : [cumulated_flops, smashed_data_size], ... }
 
@@ -752,31 +814,268 @@ class LayerProfile:
         )
 
 
-class SplitPointSelector:
-    """Simple selector over profiled split candidates."""
+# ═══════════════════════════════════════════════════════════════════════════
+# Split-point selector: LinUCB bandit + helper strategies (HSFL-style)
+# ═══════════════════════════════════════════════════════════════════════════
 
-    def __init__(self, profiles: List[LayerProfile]):
+def _estimate_layer_flops(layer) -> float:
+    """Heuristic FLOPs for a single traced layer.
+
+    TorchLens exposes ``func_applied_name``, ``tensor_shape``, and parameter
+    counts.  We use these to compute a rough FLOP estimate:
+
+    * **Conv2d**: ``c_out * h * w * k² * c_in``
+    * **Linear**: ``out_features * in_features``
+    * **BatchNorm / Pool / activation**: 1 × numel (cheap)
+    * **Others**: 0
+
+    This is intentionally approximate; the *relative* ordering of candidate
+    split points is what matters for the LinUCB context.
+    """
+    fn = getattr(layer, "func_applied_name", "") or ""
+    shape = getattr(layer, "tensor_shape", None)
+    num_params = getattr(layer, "num_params_total", 0) or 0
+
+    # Attempt to infer from the function name
+    fn_lower = fn.lower()
+
+    if "conv" in fn_lower:
+        # FLOPs ≈ out_elements * k² * c_in
+        # We approximate k²*c_in from num_params (= c_out*c_in*k*k + bias)
+        if shape and len(shape) >= 3:
+            out_elements = 1
+            for d in shape[1:]:   # skip batch dim
+                out_elements *= d
+            # num_params ≈ c_out*c_in*k*k (+c_out bias)
+            out_channels = shape[1] if len(shape) == 4 else shape[-1]
+            if out_channels > 0 and num_params > 0:
+                # flops ≈ 2 * num_params * spatial_size
+                spatial = out_elements // max(out_channels, 1)
+                return float(2 * num_params * spatial)
+            return float(2 * num_params) if num_params else float(out_elements)
+        return float(2 * num_params) if num_params else 0.0
+
+    if "linear" in fn_lower or "addmm" in fn_lower or "mm" in fn_lower:
+        # FLOPs ≈ 2 * in_features * out_features
+        return float(2 * num_params) if num_params else 0.0
+
+    if any(kw in fn_lower for kw in ("batch_norm", "layer_norm", "group_norm",
+                                      "instance_norm")):
+        if shape:
+            return float(np.prod(shape[1:]))
+        return 0.0
+
+    if any(kw in fn_lower for kw in ("pool", "adaptive_avg", "adaptive_max")):
+        if shape:
+            return float(np.prod(shape[1:]))
+        return 0.0
+
+    if any(kw in fn_lower for kw in ("relu", "gelu", "silu", "sigmoid", "tanh",
+                                      "dropout", "add", "mul", "cat")):
+        if shape:
+            return float(np.prod(shape[1:]))
+        return 0.0
+
+    return 0.0
+
+
+def _estimate_privacy_leakage(
+    smashed_sizes: List[int],
+    input_numel: int,
+) -> List[float]:
+    """Estimate privacy leakage for each candidate split point.
+
+    Following HSFL, privacy leakage is proportional to the amount of
+    information in the intermediate tensor relative to the original input.
+    A larger intermediate is closer to the raw data and reveals more.
+
+    We normalise by the input numel so that leakage ∈ [0, 1].
+    """
+    if input_numel <= 0:
+        input_numel = max(smashed_sizes) if smashed_sizes else 1
+    leakages = []
+    for sz in smashed_sizes:
+        leakages.append(min(float(sz) / float(input_numel), 1.0))
+    return leakages
+
+
+class SplitPointSelector:
+    """Adaptive split-point selector using a **LinUCB contextual bandit**
+    (as in HSFL, ICWS 2023).
+
+    The selector maintains a set of *candidate* split points, each
+    characterised by a context vector ``[cumulative_flops, smashed_data_size]``.
+    At each round it picks the action (split-point) that minimises an
+    estimated cost, balancing *latency* (from the UCB estimate) and *privacy
+    leakage* (a static score per split point).
+
+    After each round the caller feeds back the observed latency, which
+    updates the LinUCB model.
+
+    Parameters
+    ----------
+    profiles : list[LayerProfile]
+        One profile per candidate split point.
+    latency_weight : float
+        Trade-off coefficient.  ``cost = latency_weight * UCB + (1-latency_weight) * privacy``.
+        Default 1.0 → pure latency minimisation (no privacy).
+    alpha : float
+        UCB exploration bonus coefficient (higher → more exploration).
+    """
+
+    def __init__(
+        self,
+        profiles: List[LayerProfile],
+        *,
+        latency_weight: float = 1.0,
+        alpha: float = 0.25,
+    ):
         if not profiles:
-            raise ValueError("profiles must not be empty")
-        self._profiles = list(profiles)
+            raise ValueError("At least one candidate split point is required.")
+
+        self.profiles = list(profiles)
+        self.num_actions = len(self.profiles)
+        self.action_indices = [p.index for p in self.profiles]
+
+        # LinUCB context dimension: [cumulative_flops, smashed_data_size]
+        self._ctx_dim = 2
+        self._x_theta = np.zeros((self._ctx_dim, self.num_actions), dtype=np.float64)
+        for i, p in enumerate(self.profiles):
+            self._x_theta[0][i] = p.cumulative_flops
+            self._x_theta[1][i] = p.smashed_data_size
+
+        # Normalise so features are on similar scales
+        for d in range(self._ctx_dim):
+            row_max = np.max(np.abs(self._x_theta[d]))
+            if row_max > 0:
+                self._x_theta[d] /= row_max
+
+        self._privacy = np.array(
+            [p.privacy_leakage for p in self.profiles], dtype=np.float64,
+        )
+
+        self.alpha = alpha
+        self.latency_weight = latency_weight
+
+        # LinUCB state
+        self._A = np.eye(self._ctx_dim, dtype=np.float64)
+        self._b = np.zeros((self._ctx_dim, 1), dtype=np.float64)
+
+        self._history: List[dict] = []
+
+    # ---- public API -------------------------------------------------
 
     def select(self) -> int:
-        return self.select_by_flops_ratio(0.5)
+        """Choose the best split-point index using LinUCB.
 
-    def select_by_flops_ratio(self, target_ratio: float = 0.5) -> int:
-        total = max(self._profiles[-1].cumulative_flops, 1.0)
-        target = max(0.0, min(1.0, target_ratio)) * total
-        best = min(self._profiles, key=lambda p: abs(p.cumulative_flops - target))
-        return best.index
+        Returns the *layer index* (in the traced graph) of the selected
+        split point.
+        """
+        A_inv = np.linalg.inv(self._A)
+        theta = A_inv @ self._b          # (ctx_dim, 1)
 
-    def select_by_privacy(self, max_leakage: float = 0.5) -> int:
-        valid = [p for p in self._profiles if p.privacy_leakage <= max_leakage]
-        if valid:
-            return valid[-1].index
-        return min(self._profiles, key=lambda p: p.privacy_leakage).index
+        costs: List[float] = []
+        for i in range(self.num_actions):
+            x_i = self._x_theta[:, [i]]                   # (ctx_dim, 1)
+            exploit = float(x_i.T @ theta)                 # estimated latency
+            explore = float(self.alpha * np.sqrt(x_i.T @ A_inv @ x_i))
+            # Lower is better: exploitation minus exploration bonus
+            cost = self.latency_weight * (exploit - explore) + \
+                   (1.0 - self.latency_weight) * self._privacy[i]
+            costs.append(cost)
+
+        best_idx = int(np.argmin(costs))
+        return self.action_indices[best_idx]
+
+    def update(self, selected_layer_index: int, observed_latency: float) -> None:
+        """Feed back the observed training latency after one round.
+
+        Parameters
+        ----------
+        selected_layer_index : int
+            The layer index that was used (as returned by ``select``).
+        observed_latency : float
+            Measured wall-clock training time for that round.
+        """
+        try:
+            action_pos = self.action_indices.index(selected_layer_index)
+        except ValueError:
+            logger.warning(
+                "[SplitSelector] Layer {} not in candidate list — skipping update.",
+                selected_layer_index,
+            )
+            return
+
+        x_i = self._x_theta[:, [action_pos]]
+        self._A += x_i @ x_i.T
+        self._b += x_i * observed_latency
+
+        self._history.append({
+            "layer_index": selected_layer_index,
+            "observed_latency": observed_latency,
+        })
+
+    def select_by_flops_ratio(self, target_ratio: float) -> int:
+        """Select the split point whose cumulative FLOPs ratio is closest
+        to ``target_ratio`` ∈ [0, 1].
+
+        This mirrors HSFL's ``action_to_layer()`` helper (used by the RL
+        agent): it converts a continuous offloading value into a discrete
+        layer index based on cumulative FLOPs.
+
+        Parameters
+        ----------
+        target_ratio : float
+            Desired fraction of total FLOPs to execute on the edge.
+            0.0 → split very early (almost everything on cloud),
+            1.0 → split at the end (everything on edge = no offloading).
+
+        Returns
+        -------
+        int — layer index of the closest candidate.
+        """
+        total_flops = max(p.cumulative_flops for p in self.profiles) if self.profiles else 1.0
+        ratios = np.array(
+            [p.cumulative_flops / total_flops for p in self.profiles],
+            dtype=np.float64,
+        )
+        best = int(np.argmin(np.abs(ratios - target_ratio)))
+        return self.action_indices[best]
+
+    def select_by_privacy(self, max_leakage: float = 0.1) -> int:
+        """Select the deepest split point (most FLOPs on edge) whose
+        privacy leakage does not exceed ``max_leakage``.
+
+        Parameters
+        ----------
+        max_leakage : float
+            Maximum acceptable privacy-leakage score (0–1).
+
+        Returns
+        -------
+        int — layer index.
+        """
+        valid = [(i, p) for i, p in enumerate(self.profiles) if p.privacy_leakage <= max_leakage]
+        if not valid:
+            logger.warning(
+                "[SplitSelector] No candidate has leakage ≤ {}. Using least-leakage point.",
+                max_leakage,
+            )
+            best = int(np.argmin(self._privacy))
+            return self.action_indices[best]
+        # Among valid, pick the one with the most edge-side FLOPs
+        best_action_pos = max(valid, key=lambda t: t[1].cumulative_flops)[0]
+        return self.action_indices[best_action_pos]
 
     def get_profiles(self) -> List[LayerProfile]:
-        return list(self._profiles)
+        """Return the list of candidate profiles (read-only copy)."""
+        return list(self.profiles)
+
+    def __repr__(self) -> str:
+        return (
+            f"SplitPointSelector(candidates={self.num_actions}, "
+            f"alpha={self.alpha}, latency_w={self.latency_weight})"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -818,9 +1117,9 @@ class UniversalModelSplitter:
         self._layer_list: list | None = None  # list[TensorLogEntry]
         self._label2idx: dict[str, int] = {}
         self._split_index: int | None = None
+        self._split_boundary_labels: list[str] = []
+        self._boundary_cache: dict[int, list[str]] = {}
         self._traced = False
-        self._use_proxy_split = False
-        self._proxy_input: Any | None = None
 
     # ------------------------------------------------------------------
     # 1. Tracing
@@ -869,6 +1168,7 @@ class UniversalModelSplitter:
             mh = tl.log_forward_pass(
                 model,
                 sample_input,
+                vis_opt="none",
                 layers_to_save="all",
                 save_function_args=save_function_args,
             )
@@ -878,12 +1178,8 @@ class UniversalModelSplitter:
         self._label2idx = _prepare_replay_graph(self._layer_list)
         self._traced = True
         self._split_index = None
-        self._proxy_input = None
-
-        # Some model families are not reliably replayable op-by-op across
-        # versions. In proxy mode we still allow arbitrary logical split points,
-        # while cloud/head execution uses native model forward.
-        self._use_proxy_split = _is_proxy_split_model(model)
+        self._split_boundary_labels = []
+        self._boundary_cache = {}
 
         logger.info(
             "[UniversalSplit] Traced {} — {} layer operations captured.",
@@ -904,18 +1200,15 @@ class UniversalModelSplitter:
         self._ensure_traced()
         infos: list[LayerInfo] = []
         for i, layer in enumerate(self._layer_list):
-            num_params = int(getattr(layer, "num_params_total", 0) or 0)
-            num_param_tensors = int(getattr(layer, "num_param_tensors", 0) or 0)
-            has_params = bool(num_param_tensors > 0 or num_params > 0)
             infos.append(
                 LayerInfo(
                     index=i,
                     label=getattr(layer, "layer_label", f"layer_{i}"),
                     layer_type=getattr(layer, "layer_type", "unknown"),
-                    func_name=_layer_func_name(layer),
+                    func_name=getattr(layer, "func_applied_name", ""),
                     output_shape=getattr(layer, "tensor_shape", None),
-                    has_params=has_params,
-                    num_params=num_params,
+                    has_params=bool(getattr(layer, "computed_with_params", False)),
+                    num_params=getattr(layer, "num_params_total", 0) or 0,
                     module_name=getattr(layer, "containing_module_origin", None),
                 )
             )
@@ -972,31 +1265,31 @@ class UniversalModelSplitter:
                 f"layer_index {layer_index} out of range [0, {len(self._layer_list) - 1}]"
             )
 
-        resolved = _nearest_splittable_index(self._layer_list, layer_index)
-        if resolved is None:
-            raise ValueError("No valid split point found: graph only contains non-splittable layers.")
-        if resolved != layer_index:
-            logger.warning(
-                "[UniversalSplit] Requested split index {} is non-splittable ({}); "
-                "using nearest valid index {} ({}).",
-                layer_index,
-                getattr(self._layer_list[layer_index], "layer_label", f"layer_{layer_index}"),
-                resolved,
-                getattr(self._layer_list[resolved], "layer_label", f"layer_{resolved}"),
-            )
-        layer_index = resolved
-
         self._split_index = layer_index
+        self._split_boundary_labels = self._get_boundary_labels(layer_index)
         logger.info(
-            "[UniversalSplit] Split point set at layer {} (index {}).",
+            "[UniversalSplit] Split point set at layer {} (index {}, boundary_tensors={}).",
             self._layer_list[layer_index].layer_label,
             layer_index,
+            len(self._split_boundary_labels),
         )
         return self
 
     @property
     def split_index(self) -> int | None:
         return self._split_index
+
+    @property
+    def split_boundary_labels(self) -> list[str]:
+        self._ensure_split()
+        return list(self._split_boundary_labels)
+
+    def _get_boundary_labels(self, split_index: int) -> list[str]:
+        cached = self._boundary_cache.get(split_index)
+        if cached is None:
+            cached = _compute_boundary_labels(self._layer_list, self._label2idx, split_index)
+            self._boundary_cache[split_index] = cached
+        return list(cached)
 
     def find_best_split_by_module(self, module_name: str) -> int:
         """Find the last layer that belongs to *module_name* and return its
@@ -1019,7 +1312,7 @@ class UniversalModelSplitter:
         return best
 
     # ------------------------------------------------------------------
-    # 3b. layer profiling & adaptive split-point selection
+    # 3b. HSFL-style layer profiling & adaptive split-point selection
     # ------------------------------------------------------------------
 
     def profile_layers(self) -> List[LayerProfile]:
@@ -1027,7 +1320,7 @@ class UniversalModelSplitter:
 
         Returns a list of ``LayerProfile`` — one per layer — containing
         cumulative FLOPs, intermediate tensor numel, and a privacy-leakage
-        heuristic.  This is the universalised version of the previous
+        heuristic.  This is the universalised version of HSFL's
         ``config.layer_info`` dictionary.
         """
         self._ensure_traced()
@@ -1048,7 +1341,15 @@ class UniversalModelSplitter:
             cumulative_flops += flops
 
             shape = getattr(layer, "tensor_shape", None)
-            smashed = int(np.prod(shape)) if shape else 0
+            boundary_labels = self._get_boundary_labels(i)
+            smashed = 0
+            for label in boundary_labels:
+                idx = self._label2idx.get(label)
+                if idx is None:
+                    continue
+                bshape = getattr(self._layer_list[idx], "tensor_shape", None)
+                if bshape:
+                    smashed += int(np.prod(bshape))
 
             privacy = min(float(smashed) / float(max(input_numel, 1)), 1.0)
 
@@ -1076,7 +1377,7 @@ class UniversalModelSplitter:
         By default all layers (except the first input and last output) are
         candidates.  Set ``only_parametric=True`` to restrict to layers
         that carry parameters (Conv, Linear, BN, etc.) — this mirrors
-        the previous ``actionList`` which only contains meaningful split-point layer
+        HSFL's ``actionList`` which only contains meaningful split-point layer
         indices (e.g. ``[1,4,7,9,10,13]`` for VGG9).
 
         Parameters
@@ -1107,11 +1408,7 @@ class UniversalModelSplitter:
             lt = getattr(layer, "layer_type", "")
             if skip_input_output and lt in ("input", "output", "buffer"):
                 continue
-            has_params = bool(
-                (getattr(layer, "num_param_tensors", 0) or 0) > 0
-                or (getattr(layer, "num_params_total", 0) or 0) > 0
-            )
-            if only_parametric and not has_params:
+            if only_parametric and not getattr(layer, "computed_with_params", False):
                 continue
             candidates.append(p)
 
@@ -1128,11 +1425,105 @@ class UniversalModelSplitter:
 
         return candidates
 
-    def create_split_selector(self, *, only_parametric: bool = False) -> SplitPointSelector:
-        """Create a split-point selector from current candidate profiles."""
-        candidates = self.get_candidate_split_points(only_parametric=only_parametric)
-        return SplitPointSelector(candidates)
+    def create_split_selector(
+        self,
+        *,
+        only_parametric: bool = False,
+        latency_weight: float = 1.0,
+        alpha: float = 0.25,
+    ) -> SplitPointSelector:
+        """Create a ``SplitPointSelector`` (LinUCB bandit) from the traced
+        model's layer profiles.
 
+        This is the recommended way to perform HSFL-style adaptive split-point
+        selection.  Usage::
+
+            selector = splitter.create_split_selector()
+            layer_idx = selector.select()       # initial choice
+            splitter.split(layer_index=layer_idx)
+            ...
+            # after training round, feed back the measured latency
+            selector.update(layer_idx, observed_latency)
+            # next round
+            layer_idx = selector.select()
+
+        Parameters
+        ----------
+        only_parametric : bool
+            Only include parametric layers as candidates.
+        latency_weight : float
+            Trade-off ``latency`` vs ``privacy`` (1.0 = pure latency).
+        alpha : float
+            LinUCB exploration coefficient.
+
+        Returns
+        -------
+        SplitPointSelector
+        """
+        candidates = self.get_candidate_split_points(only_parametric=only_parametric)
+        return SplitPointSelector(
+            candidates,
+            latency_weight=latency_weight,
+            alpha=alpha,
+        )
+
+    def select_split_point(
+        self,
+        *,
+        strategy: str = "flops_ratio",
+        target_ratio: float = 0.5,
+        max_privacy_leakage: float = 0.1,
+        only_parametric: bool = False,
+    ) -> int:
+        """One-shot convenience: select **and set** the split point.
+
+        Parameters
+        ----------
+        strategy : str
+            ``'flops_ratio'`` — split so that ~``target_ratio`` of total
+              FLOPs run on the edge (HSFL ``action_to_layer``).
+            ``'privacy'`` — deepest split where privacy leakage ≤
+              ``max_privacy_leakage``.
+            ``'midpoint'`` — split at the candidate closest to 50 % FLOPs.
+            ``'min_smashed'`` — split where the intermediate tensor is
+              smallest (minimises communication).
+        target_ratio : float
+            For ``'flops_ratio'`` strategy.
+        max_privacy_leakage : float
+            For ``'privacy'`` strategy.
+        only_parametric : bool
+            Only consider parametric layers as candidates.
+
+        Returns
+        -------
+        int — the chosen layer index (also stored via ``self.split()``).
+        """
+        candidates = self.get_candidate_split_points(only_parametric=only_parametric)
+        selector = SplitPointSelector(candidates)
+
+        if strategy == "flops_ratio":
+            idx = selector.select_by_flops_ratio(target_ratio)
+        elif strategy == "privacy":
+            idx = selector.select_by_privacy(max_privacy_leakage)
+        elif strategy == "midpoint":
+            idx = selector.select_by_flops_ratio(0.5)
+        elif strategy == "min_smashed":
+            best = min(candidates, key=lambda p: p.smashed_data_size)
+            idx = best.index
+        else:
+            raise ValueError(
+                f"Unknown strategy {strategy!r}. "
+                f"Use 'flops_ratio', 'privacy', 'midpoint', or 'min_smashed'."
+            )
+
+        self.split(layer_index=idx)
+        logger.info(
+            "[UniversalSplit] Auto-selected split point via '{}': layer {} (index {}).",
+            strategy,
+            self._layer_list[idx].layer_label,
+            idx,
+        )
+        return idx
 
     # ------------------------------------------------------------------
     # 4. Edge-side forward (head partition)
@@ -1143,10 +1534,8 @@ class UniversalModelSplitter:
         x: torch.Tensor,
         *,
         device: torch.device | str | None = None,
-        return_replay_state: bool = False,
-    ) -> torch.Tensor | dict[str, Any]:
-        """Run the **head** partition (edge side) and return the intermediate
-        activations at the split point.
+    ) -> Union[torch.Tensor, SplitPayload]:
+        """Run the **head** partition (edge side) and return the split payload.
 
         Parameters
         ----------
@@ -1157,41 +1546,13 @@ class UniversalModelSplitter:
 
         Returns
         -------
-        Tensor | dict — by default returns only the split-point intermediate
-        tensor. When ``return_replay_state=True``, returns a dict payload that
-        also includes all cross-boundary parent activations required for
-        faithful cloud-side replay in a separate process.
+        Tensor — intermediate activations (detached, ready for transmission).
         """
         self._ensure_split()
         dev = torch.device(device) if device else self.device
 
-        if dev:
-            x = _move_to_device(x, dev)
-
-        if self._use_proxy_split:
-            with torch.no_grad():
-                mh = tl.log_forward_pass(
-                    self._model,
-                    x,
-                    layers_to_save="all",
-                    save_function_args=False,
-                )
-            self._proxy_input = _detach_clone_any(x)
-            act = mh.layer_list[self._split_index].activation
-            t = _extract_first_tensor(act)
-            if t is None:
-                t = _extract_first_tensor(x)
-            if t is None:
-                raise RuntimeError("Proxy split could not extract tensor activation at split point.")
-            inter = t.detach().clone()
-            if return_replay_state:
-                return {
-                    "intermediate": inter,
-                    "boundary_activations": {},
-                    "split_index": self._split_index,
-                    "split_label": getattr(self._layer_list[self._split_index], "layer_label", ""),
-                }
-            return inter
+        if dev and x.device != dev:
+            x = x.to(dev)
 
         _set_training_flag(self._layer_list, training=False)
         with torch.no_grad():
@@ -1200,35 +1561,9 @@ class UniversalModelSplitter:
                 self._label2idx,
                 x,
                 self._split_index,
-                model=self._model,
+                self._split_boundary_labels,
             )
-
-        if not return_replay_state:
-            return intermediate
-
-        split_label = getattr(self._layer_list[self._split_index], "layer_label", "")
-        needed = _collect_tail_boundary_labels(
-            self._layer_list,
-            self._label2idx,
-            self._split_index,
-        )
-        boundary_activations: dict[str, Any] = {}
-        for label in needed:
-            if label == split_label:
-                continue
-            idx = self._label2idx.get(label)
-            if idx is None:
-                continue
-            act = _layer_get_activation(self._layer_list[idx])
-            if act is not None:
-                boundary_activations[label] = _detach_clone_any(act)
-
-        return {
-            "intermediate": intermediate,
-            "boundary_activations": boundary_activations,
-            "split_index": self._split_index,
-            "split_label": split_label,
-        }
+        return intermediate
 
     # ------------------------------------------------------------------
     # 5. Cloud-side forward (tail partition) — inference
@@ -1236,7 +1571,7 @@ class UniversalModelSplitter:
 
     def cloud_forward(
         self,
-        intermediate: torch.Tensor | dict[str, Any],
+        intermediate: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
         *,
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
@@ -1256,64 +1591,21 @@ class UniversalModelSplitter:
         self._ensure_split()
         dev = torch.device(device) if device else self.device
 
-        boundary_activations: dict[str, Any] = {}
-        if isinstance(intermediate, dict):
-            payload = intermediate
-            if "intermediate" not in payload:
-                raise ValueError("Replay payload dict must contain key 'intermediate'.")
-
-            payload_split_idx = payload.get("split_index")
-            if payload_split_idx is not None and int(payload_split_idx) != int(self._split_index):
-                raise ValueError(
-                    f"Replay payload split_index={payload_split_idx} does not match current split_index={self._split_index}."
-                )
-
-            intermediate = payload["intermediate"]
-            boundary_activations = payload.get("boundary_activations", {}) or {}
-
-            required = _collect_tail_boundary_labels(
-                self._layer_list,
-                self._label2idx,
-                self._split_index,
-            )
-            split_label = getattr(self._layer_list[self._split_index], "layer_label", "")
-            missing = sorted([lb for lb in required if lb != split_label and lb not in boundary_activations])
-            if missing:
-                raise RuntimeError(
-                    "Replay payload is missing required boundary activations: "
-                    + ", ".join(missing[:8])
-                    + (" ..." if len(missing) > 8 else "")
-                )
-
-        if dev and isinstance(intermediate, torch.Tensor) and intermediate.device != dev:
-            intermediate = intermediate.to(dev)
-        if dev and boundary_activations:
-            boundary_activations = _move_to_device(boundary_activations, dev)
-
-        if self._use_proxy_split:
-            if self._proxy_input is None:
-                raise RuntimeError("Proxy split mode requires edge_forward to run before cloud_forward.")
-            x = self._proxy_input
-            if dev:
-                x = _move_to_device(x, dev)
-            with torch.no_grad():
-                if isinstance(x, tuple):
-                    return self._model(*x)
-                return self._model(x)
+        intermediate = _payload_to_device(
+            intermediate,
+            split_label=self._layer_list[self._split_index].layer_label,
+            device=dev,
+            requires_grad=False,
+        )
 
         _set_training_flag(self._layer_list, training=False)
-        for label, value in boundary_activations.items():
-            idx = self._label2idx.get(label)
-            if idx is not None:
-                _layer_set_activation(self._layer_list[idx], value)
-
         with torch.no_grad():
             output = _partition_forward_tail(
                 self._layer_list,
                 self._label2idx,
                 intermediate,
                 self._split_index,
-                model=self._model,
+                self._layer_list[self._split_index].layer_label,
             )
         return output
 
@@ -1323,7 +1615,7 @@ class UniversalModelSplitter:
 
     def cloud_train_step(
         self,
-        intermediate: torch.Tensor,
+        intermediate: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
         targets: Any = None,
         loss_fn: Callable | None = None,
         *,
@@ -1352,54 +1644,12 @@ class UniversalModelSplitter:
         self._ensure_split()
         dev = torch.device(device) if device else self.device
 
-        if dev and intermediate.device != dev:
-            intermediate = intermediate.to(dev)
-
-        # Enable grad on the intermediate so backprop can cross the boundary
-        intermediate = intermediate.detach().requires_grad_(True)
-
-        if self._use_proxy_split:
-            if self._proxy_input is None:
-                raise RuntimeError("Proxy split mode requires edge_forward to run before cloud_train_step.")
-            x = self._proxy_input
-            if dev:
-                x = _move_to_device(x, dev)
-
-            if dev and targets is not None:
-                targets = _move_to_device(targets, dev)
-
-            # Native detection-model training path (returns a loss dict).
-            if (
-                hasattr(self._model, "rpn")
-                and hasattr(self._model, "roi_heads")
-                and targets is not None
-                and loss_fn is None
-            ):
-                self._model.train()
-                images = x[0] if isinstance(x, tuple) and len(x) == 1 else x
-                if isinstance(images, torch.Tensor):
-                    if images.dim() == 4:
-                        images = [img for img in images]
-                    else:
-                        images = [images]
-                target_list = targets if isinstance(targets, list) else [targets]
-                loss_dict = self._model(images, target_list)
-                if isinstance(loss_dict, dict) and loss_dict:
-                    total_loss = sum(loss_dict.values())
-                    return loss_dict, total_loss
-
-            # For non-detection proxy models (e.g. ultralytics), keep eval
-            # mode to preserve inference-like output structure used by tests.
-            self._model.eval()
-            if isinstance(x, tuple):
-                output = self._model(*x)
-            else:
-                output = self._model(x)
-            if loss_fn is not None and targets is not None:
-                loss = loss_fn(output, targets)
-            else:
-                loss = torch.tensor(0.0, device=dev)
-            return output, loss
+        intermediate = _payload_to_device(
+            intermediate,
+            split_label=self._layer_list[self._split_index].layer_label,
+            device=dev,
+            requires_grad=True,
+        )
 
         _set_training_flag(self._layer_list, training=True)
 
@@ -1408,6 +1658,7 @@ class UniversalModelSplitter:
             self._label2idx,
             intermediate,
             self._split_index,
+            self._layer_list[self._split_index].layer_label,
             model=self._model,
         )
 
@@ -1454,15 +1705,15 @@ class UniversalModelSplitter:
 
     @staticmethod
     def serialise_intermediate(
-        tensor: Any,
+        tensor: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
         *,
         compress: bool = False,
     ) -> bytes:
-        """Serialise an intermediate tensor for network transfer.
+        """Serialise a split payload for network transfer.
 
         Parameters
         ----------
-        tensor : Any
+        tensor : Tensor
         compress : bool
             If ``True``, apply zlib compression.
 
@@ -1471,10 +1722,16 @@ class UniversalModelSplitter:
         bytes — serialised payload.
         """
         buf = io.BytesIO()
-        if isinstance(tensor, torch.Tensor):
+        if isinstance(tensor, SplitPayload):
+            payload = tensor.cpu()
+        elif isinstance(tensor, torch.Tensor):
             payload = tensor.detach().cpu()
+        elif isinstance(tensor, dict):
+            payload = SplitPayload(
+                tensors=OrderedDict((str(k), v.detach().cpu()) for k, v in tensor.items()),
+            )
         else:
-            payload = _move_to_device(_detach_clone_any(tensor), torch.device("cpu"))
+            raise TypeError(f"Unsupported payload type: {type(tensor)!r}")
         torch.save(payload, buf)
         data = buf.getvalue()
         if compress:
@@ -1488,8 +1745,8 @@ class UniversalModelSplitter:
         *,
         device: torch.device | str = "cpu",
         compressed: bool = False,
-    ) -> Any:
-        """Deserialise an intermediate tensor received over the network.
+    ) -> Union[torch.Tensor, SplitPayload]:
+        """Deserialise a split payload received over the network.
 
         Parameters
         ----------
@@ -1499,13 +1756,17 @@ class UniversalModelSplitter:
 
         Returns
         -------
-        Deserialised payload on *device*.
+        Tensor on *device*.
         """
         if compressed:
             import zlib
             data = zlib.decompress(data)
         buf = io.BytesIO(data)
         payload = torch.load(buf, map_location=device)
+        if isinstance(payload, SplitPayload):
+            if len(payload.tensors) == 1 and payload.split_label in payload.tensors:
+                return payload.tensors[payload.split_label]
+            return payload
         return payload
 
     # ------------------------------------------------------------------
@@ -1517,12 +1778,9 @@ class UniversalModelSplitter:
         validating that the traced graph is faithful.
         """
         self._ensure_traced()
-        if self._use_proxy_split:
-            with torch.no_grad():
-                return self._model(x)
         _set_training_flag(self._layer_list, training=False)
         with torch.no_grad():
-            return _layer_forward_full(self._layer_list, self._label2idx, x, model=self._model)
+            return _layer_forward_full(self._layer_list, self._label2idx, x)
 
     # ------------------------------------------------------------------
     # 10. Split-learning training loop (convenience wrapper)
@@ -1673,194 +1931,8 @@ class UniversalModelSplitter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Convenience: feature-cache based training (integration with existing
-# pipeline — replaces model_split.split_retrain for the universal case)
+# Convenience: feature-cache based training for universal split caches.
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-def _universal_split_retrain_das(
-    model: nn.Module,
-    cache_path: str,
-    all_indices: List[int],
-    gt_annotations: Dict[int, dict],
-    device: torch.device,
-    num_epoch: int = 2,
-    lr: float = 0.005,
-    das_bn_only: bool = False,
-    das_probe_samples: int = 10,
-) -> None:
-    """DAS-enabled training path for detection models (rpn + roi_heads).
-
-    This bypasses TorchLens replay and uses native module forward so that
-    the AutoFreeze custom autograd functions are invoked, enabling dynamic
-    activation sparsity during backpropagation.
-
-    Requires the model to have ``backbone``, ``rpn``, ``roi_heads``
-    attributes (torchvision detection model convention).
-    """
-    from model_management.model_split import (
-        load_feature_cache,
-        server_side_train_step,
-        transform_targets_to_feature_space,
-        build_image_list,
-    )
-
-    # Freeze backbone, unfreeze rpn + roi_heads
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in model.rpn.parameters():
-        p.requires_grad = True
-    for p in model.roi_heads.parameters():
-        p.requires_grad = True
-
-    # Apply DAS to tail modules
-    das_trainer = apply_das_to_tail(
-        model, ["rpn", "roi_heads"],
-        bn_only=das_bn_only, device=device,
-    )
-
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    if not trainable:
-        logger.warning("[UnivSplitRetrain/DAS] No trainable params in tail!")
-        return
-
-    optimizer = torch.optim.SGD(trainable, lr=lr, momentum=0.9, weight_decay=5e-4)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
-
-    gt_set = set(gt_annotations.keys())
-    model.to(device)
-
-    for epoch in range(num_epoch):
-        epoch_loss = 0.0
-        n_samples = 0
-        indices = all_indices.copy()
-        random.shuffle(indices)
-
-        # ---- DAS Phase 1: probe gradient importance ----
-        _das_probe_for_universal(
-            das_trainer, model, cache_path, indices,
-            gt_annotations, device, das_probe_samples,
-        )
-        das_trainer.activate_sparsity()
-
-        # ---- DAS Phase 2: train with activation sparsity ----
-        model.train()
-        model.backbone.eval()  # BN frozen in backbone
-
-        for idx in indices:
-            try:
-                data = load_feature_cache(cache_path, idx)
-            except (FileNotFoundError, OSError, RuntimeError, KeyError, ValueError, pickle.UnpicklingError):
-                continue
-
-            features = data["features"]
-            image_sizes = data["image_sizes"]
-            tensor_shape = data["tensor_shape"]
-            original_sizes = data["original_sizes"]
-
-            if idx in gt_set:
-                gt = gt_annotations[idx]
-                boxes, labels = gt["boxes"], gt["labels"]
-            else:
-                boxes = data.get("pseudo_boxes", [])
-                labels = data.get("pseudo_labels", [])
-
-            if not boxes or not labels:
-                continue
-
-            targets = [{
-                "boxes":  torch.tensor(boxes,  dtype=torch.float32),
-                "labels": torch.tensor(labels, dtype=torch.int64),
-            }]
-            targets = transform_targets_to_feature_space(
-                targets, original_sizes, image_sizes,
-            )
-
-            try:
-                loss_dict = server_side_train_step(
-                    model, features, image_sizes, tensor_shape, targets, device,
-                )
-                total_loss = sum(loss_dict.values())
-                optimizer.zero_grad()
-                total_loss.backward()
-                optimizer.step()
-
-                epoch_loss += total_loss.item()
-                n_samples += 1
-            except Exception as exc:
-                logger.warning("[UnivSplitRetrain/DAS] Error on frame {}: {}", idx, exc)
-
-        lr_scheduler.step()
-        avg = epoch_loss / max(n_samples, 1)
-        logger.info(
-            "[UnivSplitRetrain/DAS] Epoch {}/{} — samples={}, avg_loss={:.4f}",
-            epoch + 1, num_epoch, n_samples, avg,
-        )
-
-    das_trainer.deactivate_sparsity()
-    stats = das_trainer.get_memory_stats()
-    logger.info(
-        "[UnivSplitRetrain/DAS] Training done. Activation compression: {:.1%}",
-        stats.get("compression_ratio", 1.0),
-    )
-
-
-def _das_probe_for_universal(
-    das_trainer,
-    model: nn.Module,
-    cache_path: str,
-    indices: List[int],
-    gt_annotations: Dict[int, dict],
-    device: torch.device,
-    probe_samples: int = 10,
-) -> None:
-    """Probe gradient importance for DAS in the universal training path."""
-    from model_management.model_split import (
-        load_feature_cache,
-        server_side_train_step,
-        transform_targets_to_feature_space,
-    )
-    gt_set = set(gt_annotations.keys())
-
-    for idx in indices[:probe_samples]:
-        try:
-            data = load_feature_cache(cache_path, idx)
-        except (FileNotFoundError, OSError, RuntimeError, KeyError, ValueError, pickle.UnpicklingError):
-            continue
-
-        features = data["features"]
-        image_sizes = data["image_sizes"]
-        tensor_shape = data["tensor_shape"]
-        original_sizes = data["original_sizes"]
-
-        if idx in gt_set:
-            gt = gt_annotations[idx]
-            boxes, labels = gt["boxes"], gt["labels"]
-        else:
-            boxes = data.get("pseudo_boxes", [])
-            labels = data.get("pseudo_labels", [])
-        if not boxes or not labels:
-            continue
-
-        targets = [{
-            "boxes":  torch.tensor(boxes,  dtype=torch.float32),
-            "labels": torch.tensor(labels, dtype=torch.int64),
-        }]
-        targets = transform_targets_to_feature_space(targets, original_sizes, image_sizes)
-
-        def _probe_fn(
-            _m=model, _f=features, _is=image_sizes,
-            _ts=tensor_shape, _t=targets, _d=device,
-        ):
-            return server_side_train_step(_m, _f, _is, _ts, _t, _d)
-
-        try:
-            das_trainer.probe_with_targets(_probe_fn)
-            return  # one probe is sufficient
-        except Exception as exc:
-            logger.debug("[DAS] Probe failed on frame {}: {}", idx, exc)
-
-    logger.debug("[DAS] Could not probe any sample; using zero pruning.")
 
 
 def universal_split_retrain(
@@ -1878,8 +1950,7 @@ def universal_split_retrain(
     das_bn_only: bool = False,
     das_probe_samples: int = 10,
 ) -> None:
-    """High-level entry point that mirrors ``model_split.split_retrain`` but
-    works for any model and any split point.
+    """High-level entry point for retraining a universally split model.
 
     Parameters
     ----------
@@ -1901,32 +1972,17 @@ def universal_split_retrain(
     loss_fn : Callable | None
         Custom loss function.  If ``None`` a default cross-entropy is used.
     das_enabled : bool
-        Enable SURGEON-style Dynamic Activation Sparsity for memory-
-        efficient training.  When enabled *and* the model is a detection
-        model (has ``rpn`` + ``roi_heads``), DAS is applied to the tail
-        modules and training uses the native module forward path for full
-        DAS benefit.  Otherwise, standard TorchLens replay is used (DAS
-        has no effect on the replay path).
+        Deprecated compatibility flag. Model-specific cached-feature DAS
+        training has been removed; the universal replay path is always used.
     das_bn_only : bool
-        When DAS is active, only update BN parameters.
+        Deprecated compatibility flag; ignored.
     das_probe_samples : int
-        Number of samples for gradient-importance probing.
+        Deprecated compatibility flag; ignored.
     """
-    # ---- DAS path for detection models (rpn + roi_heads) ----
-    if das_enabled and hasattr(model, "rpn") and hasattr(model, "roi_heads"):
-        _universal_split_retrain_das(
-            model=model, cache_path=cache_path,
-            all_indices=all_indices, gt_annotations=gt_annotations,
-            device=device, num_epoch=num_epoch, lr=lr,
-            das_bn_only=das_bn_only, das_probe_samples=das_probe_samples,
-        )
-        return
-
     if das_enabled:
         logger.warning(
-            "[UniversalSplitRetrain] DAS requested but model is not a "
-            "detection model (rpn/roi_heads not found). Falling back to "
-            "standard TorchLens replay (DAS has no effect).",
+            "[UniversalSplitRetrain] DAS-specific cached-feature training path has been removed. "
+            "Continuing with standard universal replay retraining.",
         )
 
     splitter = UniversalModelSplitter(device=device)
@@ -1963,7 +2019,7 @@ def universal_split_retrain(
 
             try:
                 data = torch.load(feat_path, map_location="cpu")
-            except (OSError, RuntimeError, pickle.UnpicklingError, EOFError, ValueError) as exc:
+            except Exception as exc:
                 logger.warning("[UniversalSplitRetrain] Cannot load {}: {}", feat_path, exc)
                 continue
 
@@ -2000,8 +2056,6 @@ def universal_split_retrain(
                 "labels": torch.tensor(labels, dtype=torch.int64).to(device),
             }
 
-            intermediate = intermediate.to(device).detach().requires_grad_(True)
-
             try:
                 output, loss = splitter.cloud_train_step(
                     intermediate,
@@ -2033,25 +2087,27 @@ def universal_split_retrain(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Convenience: extract & cache intermediate features at the split point
-# (replaces model_split.extract_backbone_features for arbitrary models)
+# Convenience: extract & cache intermediate features at the split point.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_split_features(
     splitter: UniversalModelSplitter,
     input_tensor: torch.Tensor,
-) -> torch.Tensor:
-    """Run the edge partition and return intermediate activation on CPU.
+) -> Union[torch.Tensor, SplitPayload]:
+    """Run the edge partition and return the split payload on CPU.
 
-    This is the universal replacement for ``extract_backbone_features``.
+    This helper caches the edge-side split payload produced by the universal splitter.
     """
-    return splitter.edge_forward(input_tensor).cpu()
+    payload = splitter.edge_forward(input_tensor)
+    if isinstance(payload, SplitPayload):
+        return payload.cpu()
+    return payload.detach().cpu()
 
 
 def save_split_feature_cache(
     cache_path: str,
     frame_index: int,
-    intermediate: torch.Tensor,
+    intermediate: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor]],
     is_drift: bool,
     pseudo_boxes: list | None = None,
     pseudo_labels: list | None = None,
@@ -2060,14 +2116,24 @@ def save_split_feature_cache(
 ) -> str:
     """Persist one frame's intermediate features to ``<cache>/features/<idx>.pt``.
 
-    This replaces ``model_split.save_feature_cache`` with a simpler interface
-    that does not assume Faster R-CNN's ``ImageList`` structure.
+    Stores the universal split payload without assuming any model-specific
+    feature structure.
     """
     feat_dir = os.path.join(cache_path, "features")
     os.makedirs(feat_dir, exist_ok=True)
     out_path = os.path.join(feat_dir, f"{frame_index}.pt")
+    if isinstance(intermediate, SplitPayload):
+        stored_intermediate = intermediate.cpu()
+    elif isinstance(intermediate, torch.Tensor):
+        stored_intermediate = intermediate.detach().cpu()
+    elif isinstance(intermediate, dict):
+        stored_intermediate = SplitPayload(
+            tensors=OrderedDict((str(k), v.detach().cpu()) for k, v in intermediate.items()),
+        )
+    else:
+        raise TypeError(f"Unsupported intermediate type: {type(intermediate)!r}")
     payload = {
-        "intermediate": intermediate,
+        "intermediate": stored_intermediate,
         "is_drift": is_drift,
         "pseudo_boxes": pseudo_boxes or [],
         "pseudo_labels": pseudo_labels or [],
@@ -2082,6 +2148,4 @@ def save_split_feature_cache(
 def load_split_feature_cache(cache_path: str, frame_index: int) -> dict:
     """Load one frame's cached intermediate features."""
     path = os.path.join(cache_path, "features", f"{frame_index}.pt")
-    # Cached payload may include non-tensor metadata; allow full load for
-    # trusted artifacts generated by this project.
-    return torch.load(path, map_location="cpu", weights_only=False)
+    return torch.load(path, map_location="cpu")

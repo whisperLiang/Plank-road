@@ -29,8 +29,6 @@ from tools.convert_tool import cv2_to_base64
 from tools.file_op import clear_folder, creat_folder, sample_files
 from tools.preprocess import frame_resize
 from model_management.object_detection import Object_Detection
-from model_management.model_split import extract_backbone_features, save_feature_cache
-
 # Resource-aware CL trigger (RCCDA-inspired multi-queue Lyapunov)
 from edge.resource_aware_trigger import (
     ResourceAwareCLTrigger,
@@ -184,6 +182,13 @@ class EdgeWorker:
                     logger.exception("Failed to init universal splitter: {}", exc)
                     self.universal_split_enabled = False
                     self.universal_splitter = None
+
+        if self.split_learning_enabled and not self.universal_split_enabled:
+            logger.warning(
+                "Split-learning requested but universal model splitting is unavailable; "
+                "disabling split-learning because legacy Faster R-CNN split path has been removed."
+            )
+            self.split_learning_enabled = False
 
         self.retrain_processor = threading.Thread(target=self.retrain_worker,daemon=True)
         self.retrain_processor.start()
@@ -551,25 +556,6 @@ class EdgeWorker:
                             }
                             with open(meta_path, "w") as _mf:
                                 _json.dump(meta, _mf)
-                    else:
-                        # ---- Legacy Faster R-CNN path ----
-                        with self.small_object_detection.model_lock:
-                            features, image_sizes, tensor_shape, original_sizes = \
-                                extract_backbone_features(
-                                    self.small_object_detection.model, frame
-                                )
-                        save_feature_cache(
-                            cache_path=self.config.retrain.cache_path,
-                            frame_index=task.frame_index,
-                            features=features,
-                            image_sizes=image_sizes,
-                            tensor_shape=tensor_shape,
-                            original_sizes=original_sizes,
-                            is_drift=drift_detected,
-                            pseudo_boxes=detection_boxes,
-                            pseudo_labels=detection_class,
-                            pseudo_scores=detection_score,
-                        )
                     if drift_detected:
                         self.drift_frame_indices.append(task.frame_index)
                     logger.debug("Cached features for frame {} (drift={})",
