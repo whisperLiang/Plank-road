@@ -111,6 +111,7 @@ class TestMessageTransmissionServicer:
         request.cache_path = "/tmp/cache"
         request.num_epoch = 2
         request.frame_indices = "[1,2,3]"
+        request.payload_zip = b""
         context = MagicMock()
 
         reply = svc.train_model_request(request, context)
@@ -129,6 +130,7 @@ class TestMessageTransmissionServicer:
         request.cache_path = "/tmp/cache"
         request.num_epoch = 2
         request.frame_indices = "[1,2,3]"
+        request.payload_zip = b""
         context = MagicMock()
 
         reply = svc.train_model_request(request, context)
@@ -143,6 +145,7 @@ class TestMessageTransmissionServicer:
         request.num_epoch = 2
         request.all_frame_indices = "[1,2,3]"
         request.drift_frame_indices = "[2]"
+        request.payload_zip = b""
         context = MagicMock()
 
         reply = svc.split_train_request(request, context)
@@ -161,6 +164,7 @@ class TestMessageTransmissionServicer:
         request.num_epoch = 2
         request.all_frame_indices = "[1,2,3]"
         request.drift_frame_indices = "[2]"
+        request.payload_zip = b""
         context = MagicMock()
 
         reply = svc.split_train_request(request, context)

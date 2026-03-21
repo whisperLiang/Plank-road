@@ -27,6 +27,8 @@ Coverage per model:
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
 import torch.nn as nn
@@ -36,6 +38,7 @@ import torch.nn as nn
 # ---------------------------------------------------------------------------
 from model_management.universal_model_split import (
     _HAS_TORCHLENS,
+    SplitPayload,
     UniversalModelSplitter,
 )
 from model_management.model_zoo import (
@@ -56,6 +59,7 @@ _HAS_TL = True
 _HAS_YOLO = True
 _HAS_RTDETR = True
 _HAS_DETR = True
+_WINDOWS_TORCHLENS_UNSAFE = sys.platform.startswith("win")
 
 
 def _has_local_detr_assets() -> bool:
@@ -131,7 +135,7 @@ def _split_replay_runtime_ok() -> bool:
         return False
 
 
-_REPLAY_OK = _split_replay_runtime_ok()
+_REPLAY_OK = False if _WINDOWS_TORCHLENS_UNSAFE else _split_replay_runtime_ok()
 
 
 def _detr_replay_runtime_ok() -> bool:
@@ -166,22 +170,22 @@ def _detr_replay_runtime_ok() -> bool:
         return False
 
 
-_DETR_REPLAY_OK = _detr_replay_runtime_ok()
+_DETR_REPLAY_OK = False if _WINDOWS_TORCHLENS_UNSAFE else _detr_replay_runtime_ok()
 
 # ---------------------------------------------------------------------------
 # Skip markers
 # ---------------------------------------------------------------------------
 _skip_yolo = pytest.mark.skipif(
     not (_IMPORT_OK and _HAS_TORCHLENS and _HAS_YOLO and _REPLAY_OK),
-    reason="Requires universal_model_split + torchlens + replay-compatible runtime + ultralytics",
+    reason="Requires universal_model_split + torchlens + replay-compatible runtime + ultralytics; Windows torchlens tracing is skipped due to stack-overflow instability",
 )
 _skip_detr = pytest.mark.skipif(
     not (_IMPORT_OK and _HAS_TORCHLENS and _HAS_DETR and _REPLAY_OK and _DETR_REPLAY_OK),
-    reason="Requires universal_model_split + torchlens + replay-compatible runtime + transformers",
+    reason="Requires universal_model_split + torchlens + replay-compatible runtime + transformers; Windows torchlens tracing is skipped due to stack-overflow instability",
 )
 _skip_rtdetr = pytest.mark.skipif(
     not (_IMPORT_OK and _HAS_TORCHLENS and _HAS_RTDETR and _REPLAY_OK),
-    reason="Requires universal_model_split + torchlens + replay-compatible runtime + ultralytics",
+    reason="Requires universal_model_split + torchlens + replay-compatible runtime + ultralytics; Windows torchlens tracing is skipped due to stack-overflow instability",
 )
 
 # ---------------------------------------------------------------------------
@@ -241,6 +245,24 @@ def _unpack_output(out):
     return out
 
 
+def _payload_primary_tensor(payload):
+    if isinstance(payload, SplitPayload):
+        return payload.primary_tensor()
+    return payload
+
+
+def _assert_payload_round_trip(expected, recovered):
+    if isinstance(expected, SplitPayload):
+        assert isinstance(recovered, SplitPayload)
+        assert expected.split_index == recovered.split_index
+        assert expected.split_label == recovered.split_label
+        assert list(expected.tensors.keys()) == list(recovered.tensors.keys())
+        for key in expected.tensors:
+            assert torch.allclose(expected.tensors[key], recovered.tensors[key])
+        return
+    assert torch.allclose(expected, recovered)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. YOLOv8n  (inner DetectionModel from ultralytics)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -288,8 +310,8 @@ class TestYOLOv8nSplit:
         m, x = model_and_input
         sp, n, idx = _trace_and_split(m, x)
         inter = sp.edge_forward(x)
-        assert isinstance(inter, torch.Tensor)
-        assert inter.dim() >= 1
+        assert isinstance(inter, (torch.Tensor, SplitPayload))
+        assert _payload_primary_tensor(inter).dim() >= 1
         out = _unpack_output(sp.cloud_forward(inter))
         assert isinstance(out, torch.Tensor)
 
@@ -359,7 +381,7 @@ class TestYOLOv8nSplit:
         inter = sp.edge_forward(x)
         data = sp.serialise_intermediate(inter)
         recovered = sp.deserialise_intermediate(data)
-        assert torch.allclose(inter, recovered)
+        _assert_payload_round_trip(inter, recovered)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -409,7 +431,7 @@ class TestDETRBackboneSplit:
         m, x = model_and_input
         sp, n, idx = _trace_and_split(m, x)
         inter = sp.edge_forward(x)
-        assert isinstance(inter, torch.Tensor)
+        assert isinstance(inter, (torch.Tensor, SplitPayload))
         out = _unpack_output(sp.cloud_forward(inter))
         assert isinstance(out, torch.Tensor)
 
@@ -516,7 +538,7 @@ class TestRTDETRSplit:
         m, x = model_and_input
         sp, n, idx = _trace_and_split(m, x)
         inter = sp.edge_forward(x)
-        assert isinstance(inter, torch.Tensor)
+        assert isinstance(inter, (torch.Tensor, SplitPayload))
         out = _unpack_output(sp.cloud_forward(inter))
         assert isinstance(out, torch.Tensor)
 
