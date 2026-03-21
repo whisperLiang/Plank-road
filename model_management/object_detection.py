@@ -266,10 +266,22 @@ class Object_Detection:
         self.record_p.write("{}\n".format(map))
         self.record_p.flush()
 
-    def small_inference(self, img):
+    def small_inference(self, img, splitter=None, return_split_payload=False):
+        split_payload = None
         with self.model_lock:
-            pred_boxes, pred_class, pred_score = self.get_model_prediction(img, self.threshold_low)
+            if splitter is not None:
+                img_t = self._prepare_image_tensor(img).unsqueeze(0)
+                replayed, split_payload = splitter.replay_inference(
+                    img_t, return_split_output=True,
+                )
+                pred_boxes, pred_class, pred_score = self._parse_prediction_output(
+                    replayed, self.threshold_low,
+                )
+            else:
+                pred_boxes, pred_class, pred_score = self.get_model_prediction(img, self.threshold_low)
         if pred_boxes == None:
+            if return_split_payload:
+                return None, None, None, None, split_payload
             return None, None, None, None
         #filter high confidence region as the detection result
         try:
@@ -291,6 +303,8 @@ class Object_Detection:
             offloading_image = None
         else:
             offloading_image = get_offloading_image(offloading_region, img)
+        if return_split_payload:
+            return offloading_image, detection_boxes, detection_class, detection_score, split_payload
         return offloading_image, detection_boxes, detection_class, detection_score
 
 
@@ -301,35 +315,50 @@ class Object_Detection:
     def get_model_prediction(self, img, threshold, model=None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        #process the image
-        img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        transform = transforms.Compose([transforms.ToTensor()])
-        img = transform(img)
-        img = img.to(device)
+        img = self._prepare_image_tensor(img)
         #get the inference result
         if model is None:
             res = self.model([img])
         else:
             res = model([img])
-        if torch.cuda.is_available():
-            prediction_class = list(res[0]['labels'].cuda().data.cpu().numpy())
-            prediction_boxes = [[i[0], i[1], i[2], i[3]] for i in list(res[0]['boxes'].detach().cpu().numpy())]
-            prediction_score = list(res[0]['scores'].detach().cpu().numpy())
+        return self._parse_prediction_output(res, threshold)
 
-        else:
-            prediction_class = list(res[0]['labels'].numpy())
-            prediction_boxes = [[i[0], i[1], i[2], i[3]] for i in list(res[0]['boxes'].detach().numpy())]
-            prediction_score = list(res[0]['scores'].detach().numpy())
+    def _prepare_image_tensor(self, img):
+        img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        transform = transforms.Compose([transforms.ToTensor()])
+        img = transform(img)
+        return img.to(device)
+
+    def _parse_prediction_output(self, res, threshold):
+        if isinstance(res, tuple):
+            res = res[0]
+        if isinstance(res, dict):
+            res = [res]
+        if not isinstance(res, (list, tuple)) or len(res) == 0:
+            return None, None, None
+
+        first = res[0]
+        if not isinstance(first, dict):
+            return None, None, None
+
+        labels_t = first.get('labels')
+        boxes_t = first.get('boxes')
+        scores_t = first.get('scores')
+        if labels_t is None or boxes_t is None or scores_t is None:
+            return None, None, None
+
+        prediction_class = list(labels_t.detach().cpu().numpy())
+        prediction_boxes = [[i[0], i[1], i[2], i[3]] for i in list(boxes_t.detach().cpu().numpy())]
+        prediction_score = list(scores_t.detach().cpu().numpy())
 
         try:
             prediction_t = [prediction_score.index(x) for x in prediction_score if x > threshold][-1]
         except IndexError:
             return None, None, None
-        else:
-            pred_boxes = prediction_boxes[:prediction_t+1]
-            pred_class = prediction_class[:prediction_t+1]
-            pred_score = prediction_score[:prediction_t+1]
-            return pred_boxes, pred_class, pred_score
+        pred_boxes = prediction_boxes[:prediction_t + 1]
+        pred_class = prediction_class[:prediction_t + 1]
+        pred_score = prediction_score[:prediction_t + 1]
+        return pred_boxes, pred_class, pred_score
 
 
 

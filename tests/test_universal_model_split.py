@@ -300,6 +300,17 @@ class TestUniversalModelSplitter:
         inter = splitter.edge_forward(sample)
         assert inter is not None
 
+    def test_replay_inference_returns_output_and_payload(self, splitter_and_model):
+        splitter, model, sample = splitter_and_model
+        n = splitter.num_layers()
+        splitter.split(layer_index=n // 2)
+        with torch.no_grad():
+            expected = model(sample)
+            replayed, payload = splitter.replay_inference(sample, return_split_output=True)
+            from_payload = splitter.cloud_forward(payload)
+        assert torch.allclose(expected, replayed, atol=1e-4)
+        assert torch.allclose(expected, from_payload, atol=1e-4)
+
     def test_serialise_deserialise_intermediate(self, splitter_and_model):
         splitter, model, sample = splitter_and_model
         n = splitter.num_layers()

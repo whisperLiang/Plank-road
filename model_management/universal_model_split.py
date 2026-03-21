@@ -528,6 +528,23 @@ def _partition_forward_head(
         layer.tensor_contents = result
         x = result
 
+    return x, _collect_split_payload(
+        layer_list,
+        label2idx,
+        split_index,
+        boundary_labels,
+        x,
+    )
+
+
+def _collect_split_payload(
+    layer_list: list,
+    label2idx: dict[str, int],
+    split_index: int,
+    boundary_labels: list[str],
+    fallback_tensor: torch.Tensor,
+) -> Union[torch.Tensor, SplitPayload]:
+    """Collect the current split payload from already-materialised activations."""
     split_label = layer_list[split_index].layer_label
     payload_tensors: "OrderedDict[str, torch.Tensor]" = OrderedDict()
     for label in boundary_labels:
@@ -540,7 +557,7 @@ def _partition_forward_head(
         payload_tensors[label] = tensor.detach().clone()
 
     if not payload_tensors:
-        payload_tensors[split_label] = x.detach().clone()
+        payload_tensors[split_label] = fallback_tensor.detach().clone()
 
     payload = SplitPayload(
         tensors=payload_tensors,
@@ -548,8 +565,8 @@ def _partition_forward_head(
         split_label=split_label,
     )
     if len(payload.tensors) == 1 and split_label in payload.tensors:
-        return x, payload.tensors[split_label]
-    return x, payload
+        return payload.tensors[split_label]
+    return payload
 
 
 def _partition_forward_tail(
@@ -1534,6 +1551,7 @@ class UniversalModelSplitter:
         x: torch.Tensor,
         *,
         device: torch.device | str | None = None,
+        return_replay_state: bool = False,
     ) -> Union[torch.Tensor, SplitPayload]:
         """Run the **head** partition (edge side) and return the split payload.
 
@@ -1563,7 +1581,38 @@ class UniversalModelSplitter:
                 self._split_index,
                 self._split_boundary_labels,
             )
+        if return_replay_state:
+            return intermediate
         return intermediate
+
+    def replay_inference(
+        self,
+        x: torch.Tensor,
+        *,
+        device: torch.device | str | None = None,
+        return_split_output: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Union[torch.Tensor, SplitPayload]]]:
+        """Replay the full model once and optionally return the split payload."""
+        self._ensure_split()
+        dev = torch.device(device) if device else self.device
+
+        if dev and x.device != dev:
+            x = x.to(dev)
+
+        _set_training_flag(self._layer_list, training=False)
+        with torch.no_grad():
+            output = _layer_forward_full(self._layer_list, self._label2idx, x)
+            split_payload = _collect_split_payload(
+                self._layer_list,
+                self._label2idx,
+                self._split_index,
+                self._split_boundary_labels,
+                output,
+            )
+
+        if return_split_output:
+            return output, split_payload
+        return output
 
     # ------------------------------------------------------------------
     # 5. Cloud-side forward (tail partition) — inference

@@ -286,8 +286,22 @@ class EdgeWorker:
             self.queue_info['{}'.format(self.edge_id)] = self.local_queue.qsize()
             current_frame = task.frame_edge
             # get the query image and the small inference result
-            offloading_image, detection_boxes, detection_class, detection_score \
-                = self.small_object_detection.small_inference(current_frame)
+            split_payload = None
+            if self.split_learning_enabled and self.universal_split_enabled and self.universal_splitter is not None:
+                (
+                    offloading_image,
+                    detection_boxes,
+                    detection_class,
+                    detection_score,
+                    split_payload,
+                ) = self.small_object_detection.small_inference(
+                    current_frame,
+                    splitter=self.universal_splitter,
+                    return_split_payload=True,
+                )
+            else:
+                offloading_image, detection_boxes, detection_class, detection_score \
+                    = self.small_object_detection.small_inference(current_frame)
 
 
 
@@ -297,7 +311,14 @@ class EdgeWorker:
                     self.last_collect_time = time.time()
                     self.collect_time_flag = False
                 logger.debug("ctime L{}, {}".format(self.last_collect_time, self.collect_time))
-                self.collect_data(task, current_frame, detection_boxes, detection_class, detection_score)
+                self.collect_data(
+                    task,
+                    current_frame,
+                    detection_boxes,
+                    detection_class,
+                    detection_score,
+                    split_payload=split_payload,
+                )
             elif self.collect_flag:
                 duration = time.time() - self.last_collect_time
                 logger.debug("duration {}, L{} {}".format(duration,self.last_collect_time, self.collect_time))
@@ -305,7 +326,14 @@ class EdgeWorker:
                     if self.collect_time_flag:
                         self.collect_time = time.time()
                         self.collect_time_flag = False
-                    self.collect_data(task, current_frame ,detection_boxes, detection_class, detection_score)
+                    self.collect_data(
+                        task,
+                        current_frame,
+                        detection_boxes,
+                        detection_class,
+                        detection_score,
+                        split_payload=split_payload,
+                    )
 
             if detection_boxes is not None:
                 task.add_result(detection_boxes, detection_class, detection_score)
@@ -419,7 +447,15 @@ class EdgeWorker:
                 self.queue_info['{}'.format(res.destination_edge_id)] = res.local_length
 
     # collect data for retrain
-    def collect_data(self, task, frame ,detection_boxes, detection_class, detection_score):
+    def collect_data(
+        self,
+        task,
+        frame,
+        detection_boxes,
+        detection_class,
+        detection_score,
+        split_payload=None,
+    ):
         if detection_score is not None:
             creat_folder(self.config.retrain.cache_path)
             cv2.imwrite(os.path.join(self.config.retrain.cache_path,'frames', str(task.frame_index) + '.jpg'), frame)
@@ -527,10 +563,13 @@ class EdgeWorker:
                         img_t = T.ToTensor()(img_pil).unsqueeze(0)
                         dev = next(self.small_object_detection.model.parameters()).device
                         img_t = img_t.to(dev)
-                        with self.small_object_detection.model_lock:
-                            intermediate = extract_split_features(
-                                self.universal_splitter, img_t,
-                            )
+                        if split_payload is not None:
+                            intermediate = split_payload
+                        else:
+                            with self.small_object_detection.model_lock:
+                                intermediate = extract_split_features(
+                                    self.universal_splitter, img_t,
+                                )
                         save_split_feature_cache(
                             cache_path=self.config.retrain.cache_path,
                             frame_index=task.frame_index,
