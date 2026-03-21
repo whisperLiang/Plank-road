@@ -548,6 +548,26 @@ class EdgeWorker:
                         }
                         with open(meta_path, "w") as _mf:
                             _json.dump(meta, _mf)
+                        feat_dir = os.path.join(
+                            self.config.retrain.cache_path, "features"
+                        )
+                        if os.path.isdir(feat_dir):
+                            for fn in os.listdir(feat_dir):
+                                if not fn.endswith(".pt"):
+                                    continue
+                                fp = os.path.join(feat_dir, fn)
+                                if os.path.isfile(fp):
+                                    try:
+                                        os.remove(fp)
+                                    except OSError:
+                                        pass
+                        self.select_index = []
+                        self.avg_scores = []
+                        self.drift_frame_indices = []
+                        self.cache_count = 0
+                        logger.info(
+                            "[ResourceCLTrigger] Cleared cached split payloads after re-split."
+                        )
                 except Exception as exc:
                     logger.warning("[ResourceCLTrigger] Decision failed: {}", exc)
                     resource_trigger_fired = False
@@ -578,6 +598,9 @@ class EdgeWorker:
                             pseudo_boxes=detection_boxes,
                             pseudo_labels=detection_class,
                             pseudo_scores=detection_score,
+                            extra_metadata={
+                                "split_index": self.universal_splitter.split_index,
+                            },
                         )
                         # Persist split metadata so the cloud knows which
                         # path / layer index to use during retraining.

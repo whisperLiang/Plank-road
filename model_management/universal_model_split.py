@@ -1811,7 +1811,7 @@ class UniversalModelSplitter:
             import zlib
             data = zlib.decompress(data)
         buf = io.BytesIO(data)
-        payload = torch.load(buf, map_location=device)
+        payload = torch.load(buf, map_location=device, weights_only=False)
         if isinstance(payload, SplitPayload):
             if len(payload.tensors) == 1 and payload.split_label in payload.tensors:
                 return payload.tensors[payload.split_label]
@@ -1984,6 +1984,135 @@ class UniversalModelSplitter:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _resolve_cached_intermediate(
+    data: dict,
+) -> Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor], None]:
+    intermediate = data.get("intermediate")
+    if intermediate is not None:
+        return intermediate
+
+    features = data.get("features")
+    if features is None:
+        return None
+    if isinstance(features, OrderedDict):
+        return next(iter(features.values()), None)
+    if isinstance(features, dict):
+        values = list(features.values())
+        return values[0] if values else None
+    return features
+
+
+def _extract_cached_split_index(
+    data: dict,
+    intermediate: Union[torch.Tensor, SplitPayload, Dict[str, torch.Tensor], None],
+) -> int | None:
+    if isinstance(intermediate, SplitPayload) and intermediate.split_index is not None:
+        return int(intermediate.split_index)
+
+    for key in ("split_index", "split_layer"):
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[UniversalSplitRetrain] Ignoring non-integer {}={} in cached feature metadata.",
+                key,
+                value,
+            )
+            return None
+    return None
+
+
+def _prepare_universal_split_training_manifest(
+    cache_path: str,
+    all_indices: List[int],
+    gt_annotations: Dict[int, dict],
+    *,
+    expected_split_index: int,
+) -> List[dict]:
+    manifest: List[dict] = []
+    gt_set = set(gt_annotations.keys())
+
+    for idx in all_indices:
+        try:
+            data = load_split_feature_cache(cache_path, idx)
+        except Exception as exc:
+            logger.warning("[UniversalSplitRetrain] Cannot load frame {}: {}", idx, exc)
+            continue
+
+        intermediate = _resolve_cached_intermediate(data)
+        if intermediate is None:
+            logger.warning(
+                "[UniversalSplitRetrain] Frame {} has no cached intermediate payload.",
+                idx,
+            )
+            continue
+
+        cached_split_index = _extract_cached_split_index(data, intermediate)
+        if cached_split_index is not None and cached_split_index != expected_split_index:
+            raise RuntimeError(
+                f"Cached split payload for frame {idx} uses split_index={cached_split_index}, "
+                f"but the current split retrain request expects split_index={expected_split_index}."
+            )
+
+        if idx in gt_set:
+            gt = gt_annotations[idx]
+            boxes = gt.get("boxes", [])
+            labels = gt.get("labels", [])
+        else:
+            boxes = data.get("pseudo_boxes", [])
+            labels = data.get("pseudo_labels", [])
+
+        if boxes is None or labels is None or len(boxes) == 0 or len(labels) == 0:
+            continue
+        if len(boxes) != len(labels):
+            logger.warning(
+                "[UniversalSplitRetrain] Skipping frame {} because boxes/labels length mismatch ({} vs {}).",
+                idx,
+                len(boxes),
+                len(labels),
+            )
+            continue
+
+        manifest.append({
+            "frame_index": idx,
+            "boxes": boxes,
+            "labels": labels,
+        })
+
+    return manifest
+
+
+def _reduce_replayed_output_to_loss(output: Any, *, device: torch.device) -> torch.Tensor:
+    if isinstance(output, torch.Tensor):
+        if output.is_floating_point() or output.is_complex():
+            return output.sum()
+        return torch.tensor(0.0, device=device)
+
+    total: torch.Tensor | None = None
+    if isinstance(output, dict):
+        values = output.values()
+    elif isinstance(output, (list, tuple)):
+        values = output
+    else:
+        values = ()
+
+    for value in values:
+        part = _reduce_replayed_output_to_loss(value, device=device)
+        if total is None:
+            total = part
+        else:
+            total = total + part
+
+    if total is None:
+        raise TypeError(
+            f"Cannot build a surrogate loss from replayed output of type {type(output)!r}."
+        )
+    return total
+
+
 def universal_split_retrain(
     model: nn.Module,
     sample_input: torch.Tensor,
@@ -2019,7 +2148,8 @@ def universal_split_retrain(
     num_epoch : int
     lr : float
     loss_fn : Callable | None
-        Custom loss function.  If ``None`` a default cross-entropy is used.
+        Custom loss function. If ``None``, the replayed output tensors are
+        reduced to a scalar surrogate loss.
     das_enabled : bool
         Deprecated compatibility flag. Model-specific cached-feature DAS
         training has been removed; the universal replay path is always used.
@@ -2042,6 +2172,24 @@ def universal_split_retrain(
     else:
         splitter.split(layer_index=split_layer)
 
+    training_manifest = _prepare_universal_split_training_manifest(
+        cache_path,
+        all_indices,
+        gt_annotations,
+        expected_split_index=int(splitter.split_index),
+    )
+    if not training_manifest:
+        logger.warning(
+            "[UniversalSplitRetrain] No valid cached split payloads found under {}.",
+            cache_path,
+        )
+        return
+    logger.info(
+        "[UniversalSplitRetrain] Prepared {} cached payloads for tail-subgraph replay training at split_index={}.",
+        len(training_manifest),
+        splitter.split_index,
+    )
+
     splitter.freeze_head()
     splitter.unfreeze_tail()
 
@@ -2053,56 +2201,31 @@ def universal_split_retrain(
     optimizer = torch.optim.SGD(tail_params, lr=lr, momentum=0.9, weight_decay=5e-4)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
-    gt_set = set(gt_annotations.keys())
-
     for epoch in range(num_epoch):
         epoch_loss = 0.0
         n_samples = 0
-        indices = all_indices.copy()
-        random.shuffle(indices)
+        samples = training_manifest.copy()
+        random.shuffle(samples)
 
-        for idx in indices:
-            feat_path = os.path.join(cache_path, "features", f"{idx}.pt")
-            if not os.path.exists(feat_path):
-                continue
-
+        for sample in samples:
+            idx = sample["frame_index"]
             try:
-                data = torch.load(feat_path, map_location="cpu")
+                data = load_split_feature_cache(cache_path, idx)
             except Exception as exc:
-                logger.warning("[UniversalSplitRetrain] Cannot load {}: {}", feat_path, exc)
+                logger.warning("[UniversalSplitRetrain] Cannot reload frame {}: {}", idx, exc)
                 continue
 
-            intermediate = data.get("intermediate")
+            intermediate = _resolve_cached_intermediate(data)
             if intermediate is None:
-                # Backward-compat: try to load from old-style feature cache
-                features = data.get("features")
-                if features is not None:
-                    # Use the first feature map as the intermediate
-                    if isinstance(features, dict):
-                        intermediate = list(features.values())[0]
-                    elif isinstance(features, OrderedDict):
-                        intermediate = next(iter(features.values()))
-                    else:
-                        intermediate = features
-
-            if intermediate is None:
-                continue
-
-            # Build targets
-            if idx in gt_set:
-                gt = gt_annotations[idx]
-                boxes = gt["boxes"]
-                labels = gt["labels"]
-            else:
-                boxes = data.get("pseudo_boxes", [])
-                labels = data.get("pseudo_labels", [])
-
-            if not boxes or not labels:
+                logger.warning(
+                    "[UniversalSplitRetrain] Frame {} no longer has a usable cached intermediate.",
+                    idx,
+                )
                 continue
 
             targets_t = {
-                "boxes": torch.tensor(boxes, dtype=torch.float32).to(device),
-                "labels": torch.tensor(labels, dtype=torch.int64).to(device),
+                "boxes": torch.tensor(sample["boxes"], dtype=torch.float32).to(device),
+                "labels": torch.tensor(sample["labels"], dtype=torch.int64).to(device),
             }
 
             try:
@@ -2114,8 +2237,7 @@ def universal_split_retrain(
                 )
 
                 if loss_fn is None:
-                    # If no loss_fn provided, compute a default: sum of output
-                    loss = output.sum()
+                    loss = _reduce_replayed_output_to_loss(output, device=device)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -2188,6 +2310,11 @@ def save_split_feature_cache(
         "pseudo_labels": pseudo_labels or [],
         "pseudo_scores": pseudo_scores or [],
     }
+    if isinstance(stored_intermediate, SplitPayload):
+        if stored_intermediate.split_index is not None:
+            payload["split_index"] = int(stored_intermediate.split_index)
+        if stored_intermediate.split_label is not None:
+            payload["split_label"] = stored_intermediate.split_label
     if extra_metadata:
         payload.update(extra_metadata)
     torch.save(payload, out_path)
@@ -2197,4 +2324,4 @@ def save_split_feature_cache(
 def load_split_feature_cache(cache_path: str, frame_index: int) -> dict:
     """Load one frame's cached intermediate features."""
     path = os.path.join(cache_path, "features", f"{frame_index}.pt")
-    return torch.load(path, map_location="cpu")
+    return torch.load(path, map_location="cpu", weights_only=False)

@@ -32,6 +32,7 @@ import torch.nn as nn
 # Import guards
 # ---------------------------------------------------------------------------
 try:
+    import model_management.universal_model_split as universal_split_module
     from model_management.universal_model_split import (
         _HAS_TORCHLENS,
         LayerInfo,
@@ -46,6 +47,7 @@ try:
         extract_split_features,
         load_split_feature_cache,
         save_split_feature_cache,
+        universal_split_retrain,
     )
     _IMPORT_OK = True
 except ImportError:
@@ -470,6 +472,8 @@ class TestSplitFeatureCache:
         data = load_split_feature_cache(cache_dir, 11)
         restored = data["intermediate"]
         assert isinstance(restored, SplitPayload)
+        assert data["split_index"] == 2
+        assert data["split_label"] == "right_mul"
         assert list(restored.tensors.keys()) == ["left_mul", "right_mul"]
         assert torch.allclose(restored.tensors["left_mul"], torch.tensor([2.0]))
         assert torch.allclose(restored.tensors["right_mul"], torch.tensor([3.0]))
@@ -523,6 +527,207 @@ class TestGraphBoundaryReplay:
         assert isinstance(restored, SplitPayload)
         assert torch.allclose(restored.tensors["left_mul"], torch.tensor([2.0]))
         assert torch.allclose(restored.tensors["right_mul"], torch.tensor([3.0]))
+
+
+class TestUniversalSplitRetrain:
+
+    def test_retrain_iterates_all_cached_payloads(self, cache_dir, monkeypatch):
+        for frame_index, value in ((1, 1.0), (2, 2.0)):
+            payload = SplitPayload(
+                tensors=OrderedDict([("split", torch.tensor([value]))]),
+                split_index=1,
+                split_label="split",
+            )
+            save_split_feature_cache(
+                cache_dir,
+                frame_index,
+                payload,
+                is_drift=False,
+                pseudo_boxes=[[0.0, 0.0, 1.0, 1.0]],
+                pseudo_labels=[1],
+            )
+
+        class _FakeSplitter:
+            last_instance = None
+
+            def __init__(self, device=None):
+                self.device = device
+                self._split_index = None
+                self.tail_param = nn.Parameter(torch.tensor(1.0))
+                self.calls = []
+                _FakeSplitter.last_instance = self
+
+            def trace(self, model, sample_input):
+                return self
+
+            def split(self, layer_index=None, layer_label=None):
+                self._split_index = 1 if layer_index is None else layer_index
+                return self
+
+            @property
+            def split_index(self):
+                return self._split_index
+
+            def freeze_head(self):
+                return None
+
+            def unfreeze_tail(self):
+                return None
+
+            def get_tail_trainable_params(self):
+                return [self.tail_param]
+
+            def cloud_train_step(self, intermediate, targets, loss_fn, device=None):
+                tensor = intermediate.primary_tensor() if isinstance(intermediate, SplitPayload) else intermediate
+                self.calls.append(float(tensor.item()))
+                output = tensor * self.tail_param
+                loss = loss_fn(output, targets)
+                return output, loss
+
+        monkeypatch.setattr(universal_split_module, "UniversalModelSplitter", _FakeSplitter)
+        monkeypatch.setattr(universal_split_module.random, "shuffle", lambda seq: None)
+
+        universal_split_retrain(
+            model=_simple_model(),
+            sample_input=torch.randn(1, 10),
+            split_layer=1,
+            cache_path=cache_dir,
+            all_indices=[1, 2],
+            gt_annotations={},
+            device=torch.device("cpu"),
+            num_epoch=2,
+            loss_fn=lambda output, targets: output.sum(),
+        )
+
+        assert _FakeSplitter.last_instance is not None
+        assert _FakeSplitter.last_instance.calls == [1.0, 2.0, 1.0, 2.0]
+
+    def test_retrain_rejects_mismatched_split_index(self, cache_dir, monkeypatch):
+        payload = SplitPayload(
+            tensors=OrderedDict([("split", torch.tensor([1.0]))]),
+            split_index=3,
+            split_label="split",
+        )
+        save_split_feature_cache(
+            cache_dir,
+            1,
+            payload,
+            is_drift=False,
+            pseudo_boxes=[[0.0, 0.0, 1.0, 1.0]],
+            pseudo_labels=[1],
+        )
+
+        class _FakeSplitter:
+            def __init__(self, device=None):
+                self.device = device
+                self._split_index = None
+
+            def trace(self, model, sample_input):
+                return self
+
+            def split(self, layer_index=None, layer_label=None):
+                self._split_index = 1 if layer_index is None else layer_index
+                return self
+
+            @property
+            def split_index(self):
+                return self._split_index
+
+            def freeze_head(self):
+                return None
+
+            def unfreeze_tail(self):
+                return None
+
+            def get_tail_trainable_params(self):
+                return []
+
+        monkeypatch.setattr(universal_split_module, "UniversalModelSplitter", _FakeSplitter)
+
+        with pytest.raises(RuntimeError, match="split_index=3"):
+            universal_split_retrain(
+                model=_simple_model(),
+                sample_input=torch.randn(1, 10),
+                split_layer=1,
+                cache_path=cache_dir,
+                all_indices=[1],
+                gt_annotations={},
+                device=torch.device("cpu"),
+                num_epoch=1,
+                loss_fn=lambda output, targets: output.sum(),
+            )
+
+    def test_retrain_without_loss_fn_reduces_structured_output(self, cache_dir, monkeypatch):
+        payload = SplitPayload(
+            tensors=OrderedDict([("split", torch.tensor([2.0]))]),
+            split_index=1,
+            split_label="split",
+        )
+        save_split_feature_cache(
+            cache_dir,
+            1,
+            payload,
+            is_drift=False,
+            pseudo_boxes=[[0.0, 0.0, 1.0, 1.0]],
+            pseudo_labels=[1],
+        )
+
+        class _FakeSplitter:
+            last_instance = None
+
+            def __init__(self, device=None):
+                self.device = device
+                self._split_index = None
+                self.tail_param = nn.Parameter(torch.tensor(1.0))
+                self.calls = 0
+                _FakeSplitter.last_instance = self
+
+            def trace(self, model, sample_input):
+                return self
+
+            def split(self, layer_index=None, layer_label=None):
+                self._split_index = 1 if layer_index is None else layer_index
+                return self
+
+            @property
+            def split_index(self):
+                return self._split_index
+
+            def freeze_head(self):
+                return None
+
+            def unfreeze_tail(self):
+                return None
+
+            def get_tail_trainable_params(self):
+                return [self.tail_param]
+
+            def cloud_train_step(self, intermediate, targets, loss_fn, device=None):
+                tensor = intermediate.primary_tensor() if isinstance(intermediate, SplitPayload) else intermediate
+                self.calls += 1
+                output = [{
+                    "boxes": tensor.unsqueeze(0) * self.tail_param,
+                    "scores": tensor * self.tail_param,
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                }]
+                return output, torch.tensor(0.0)
+
+        monkeypatch.setattr(universal_split_module, "UniversalModelSplitter", _FakeSplitter)
+
+        universal_split_retrain(
+            model=_simple_model(),
+            sample_input=torch.randn(1, 10),
+            split_layer=1,
+            cache_path=cache_dir,
+            all_indices=[1],
+            gt_annotations={},
+            device=torch.device("cpu"),
+            num_epoch=1,
+            loss_fn=None,
+        )
+
+        assert _FakeSplitter.last_instance is not None
+        assert _FakeSplitter.last_instance.calls == 1
 
 
 @_skip_no_torchlens
