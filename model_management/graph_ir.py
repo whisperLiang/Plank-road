@@ -4,8 +4,8 @@ import copy
 import dataclasses
 import inspect
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 
@@ -29,23 +29,6 @@ def _normalize_path_key(path: Any) -> tuple[Any, ...]:
     if isinstance(path, tuple):
         return path
     return (path,)
-
-
-def _iter_tensor_leaves(obj: Any, prefix: tuple[Any, ...] = ()) -> Iterator[tuple[tuple[Any, ...], torch.Tensor]]:
-    if isinstance(obj, torch.Tensor):
-        yield prefix, obj
-        return
-    if isinstance(obj, (list, tuple)):
-        for index, item in enumerate(obj):
-            yield from _iter_tensor_leaves(item, prefix + (index,))
-        return
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            yield from _iter_tensor_leaves(value, prefix + (key,))
-
-
-def _structure_is_tensor_leaf(obj: Any) -> bool:
-    return isinstance(obj, torch.Tensor)
 
 
 def _safe_deepcopy(obj: Any) -> Any:
@@ -182,26 +165,6 @@ def materialize_tree_spec(spec: TreeSpec, tensor_map: Mapping[str, torch.Tensor]
         values = {key: materialize_tree_spec(child, tensor_map) for key, child in spec.children.items()}
         return values
     raise ValueError(f"Unsupported TreeSpec kind: {spec.kind}")
-
-
-def _set_path(container: Any, path: tuple[Any, ...], value: Any) -> Any:
-    if not path:
-        return value
-    head = path[0]
-    tail = path[1:]
-    if isinstance(container, tuple):
-        updated = list(container)
-        updated[head] = _set_path(updated[head], tail, value)
-        return tuple(updated)
-    if isinstance(container, list):
-        updated = list(container)
-        updated[head] = _set_path(updated[head], tail, value)
-        return updated
-    if isinstance(container, dict):
-        updated = dict(container)
-        updated[head] = _set_path(updated[head], tail, value)
-        return updated
-    raise TypeError(f"Cannot set nested path on object of type {type(container)!r}")
 
 
 def _replace_placeholders(obj: Any, resolver) -> Any:

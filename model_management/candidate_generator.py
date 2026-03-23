@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
-from model_management.graph_ir import GraphIR, GraphNode
+from model_management.graph_ir import GraphIR
 from model_management.split_candidate import SplitCandidate
 
 

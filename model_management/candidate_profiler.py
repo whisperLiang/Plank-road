@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 

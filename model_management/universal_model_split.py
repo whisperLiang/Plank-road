@@ -10,22 +10,19 @@ candidate-driven:
 
 from __future__ import annotations
 
-import json
 import os
-import random
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 
 from model_management.candidate_generator import build_candidate_from_edge_seed, enumerate_candidates
 from model_management.candidate_profiler import profile_candidates
 from model_management.candidate_selector import SplitCandidateSelector, SplitPointSelector
-from model_management.graph_ir import trace_model
 from model_management.payload import SplitPayload
 from model_management.split_candidate import CandidateProfile, SplitCandidate
-from model_management.split_runtime import GraphSplitRuntime, compare_outputs, reduce_output_to_loss
+from model_management.split_runtime import GraphSplitRuntime
 
 try:
     import torchlens as tl
@@ -75,12 +72,6 @@ def _cache_feature_dir(cache_path: str) -> str:
     feature_dir = os.path.join(cache_path, "features")
     os.makedirs(feature_dir, exist_ok=True)
     return feature_dir
-
-
-def _payload_or_tensor(payload: SplitPayload) -> SplitPayload | torch.Tensor:
-    if len(payload.tensors) == 1:
-        return payload.primary_tensor()
-    return payload
 
 
 class UniversalModelSplitter(GraphSplitRuntime):

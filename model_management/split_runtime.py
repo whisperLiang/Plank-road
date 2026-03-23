@@ -1,23 +1,15 @@
 from __future__ import annotations
 
-import copy
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 
 import torch
 
-from model_management.candidate_generator import (
-    compute_boundary_tensors,
-    compute_cloud_closure,
-    compute_edge_closure,
-    compute_minimal_execution_sets,
-    enumerate_candidates,
-)
+from model_management.candidate_generator import enumerate_candidates
 from model_management.graph_ir import (
     GraphIR,
-    GraphNode,
     build_graph_from_trace,
     flatten_bound_inputs,
     materialize_tree_spec,
