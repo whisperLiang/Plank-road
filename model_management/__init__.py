@@ -9,6 +9,11 @@ from model_management.universal_model_split import (  # noqa: F401
     universal_split_retrain,
     LayerInfo,
     LayerProfile,
+    SplitPayload,
+    SplitCandidate,
+    CandidateProfile,
+    SplitCandidateSelector,
+    SplitPointSelector,
 )
 
 # Re-export Dynamic Activation Sparsity (SURGEON-style) API
