@@ -1,5 +1,6 @@
 # Plank-Road
-A dynamic Plank Road for continuous learning on the edge.
+
+Plank-Road is a distributed edge-cloud video analytics system with offloading, drift detection, and continual learning.
 
 ## Overview
 
@@ -7,331 +8,210 @@ A dynamic Plank Road for continuous learning on the edge.
 <img src="./docs/structure.png" width="60%" height="60%">
 </div>
 
-Plank Road is an open-source distributed camera system that incorporates inference scheduling and continuous learning for video analytics. 
-The system comprises multiple edge nodes and the cloud, enabling collaborative video analytics. 
-The edge node also gathers drift data to support continuous learning and maintain recognition accuracy.
-
-Firstly, for the video collected from on-edge camera, our system supports a filter engine that can determine whether a video frame needs to be filtered or not, so as to save the downstream resource costs.
-Then, our system has a decision engine to intelligently select offloading strategies for video frames, while adjusting their resolutions and encoding qualities adaptively.
-Moreover, Plank Road implements continuous learning to enhance the accuracy of lightweight models on edge nodes, enabling them to handle data drift.
-
-The main implementation details of Plank Road are shown below.
+The system includes multiple edge nodes and a cloud server. Edge nodes perform filtering, scheduling, local inference, and drift collection. The cloud provides heavyweight inference, split-tail retraining, and updated weights for edge deployment.
 
 <div align="center">
 <img src="./docs/modules.png" width="75%" height="75%">
 </div>
 
-
-| Module | Description |
-| :---: |    :----   |
-| Video Reader | Provides user-friendly interfaces for reading video streams using OpenCV. Supports offline video files and network cameras using the Real-Time Streaming Protocol (RTSP). |
-| Filter |  Aims to filter out the redundant video frames. Implements four methods to compute differences. |
-| Decision Engine | Encapsulates different offloading and video processing policies, each governing the workflow of video frames. | 
-| Standalone Worker | A thread that continuously extracts tasks from the local queue and then uses the locally deployed DNN model to perform inference. | 
-| Offloading Worker | Each offloading task will be assigned an offloading thread from the thread pool. The offloading thread dispatches the task to the corresponding edge server or offloads it to the cloud server. |
-| Drift Data Collector | Periodically selects a subset of video frames with lower average confidence in the predicted results from locally inferred frames. |
-| Model Retraining Worker | A thread that sends the selected frames for retraining to the cloud to get ground truth accuracy. Utilizes these frames and ground truth to retrain the current model. |
-| Request Handler | A thread that listens to the requests from the edge nodes. |
-
----
-
 ## Key Features
 
-### 1. Universal Model Splitting (任意模型、任意层分割)
+### 1. Graph-Based Universal Model Splitting
 
-> Reference: [Shawarma model_utils.py](https://github.com/Shawarma-sys/Shawarma) + [TorchLens](https://github.com/johnmarktaylor91/torchlens)
+The universal split runtime is implemented around an explicit graph partition abstraction.
 
-The `UniversalModelSplitter` class (`model_management/universal_model_split.py`) enables **any PyTorch model** to be split at **any arbitrary layer** for edge-cloud split inference and training — not limited to Faster R-CNN or the backbone boundary.
+It no longer assumes:
+- split = one `layer_index`
+- edge = prefix layers
+- cloud = suffix layers
+- payload = one split-layer output
 
-**Core API:**
-- `trace(model, sample_input)` — traces the full computational graph via TorchLens
-- `list_layers()` — returns all available split points
-- `split(layer_index)` — performs the split
-- `edge_forward(x)` — runs the head partition (edge side)
-- `cloud_forward(intermediate)` — runs the tail partition (cloud side)
-- `cloud_train_step(intermediate, targets, loss_fn)` — forward + backward on cloud tail
-- `serialise_intermediate()` / `deserialise_intermediate()` — network transmission helpers
+Instead, Plank-Road now:
+- traces the TorchLens computation graph
+- builds a DAG IR
+- enumerates valid edge/cloud graph-cut candidates
+- replays each side as a dependency-closed subgraph
+- trains the cloud tail using real tail parameters
+
+Core implementation files:
+- [graph_ir.py](./model_management/graph_ir.py)
+- [split_candidate.py](./model_management/split_candidate.py)
+- [payload.py](./model_management/payload.py)
+- [candidate_generator.py](./model_management/candidate_generator.py)
+- [split_runtime.py](./model_management/split_runtime.py)
+- [candidate_profiler.py](./model_management/candidate_profiler.py)
+- [candidate_selector.py](./model_management/candidate_selector.py)
+- [universal_model_split.py](./model_management/universal_model_split.py)
+
+Key properties:
+- works for arbitrary TorchLens-traceable PyTorch models
+- supports residual and multi-branch DAGs
+- payloads contain only minimal cross-boundary tensors
+- cloud replay does not depend on hidden edge runtime state
+- supports both split inference and split tail training
+
+Example:
 
 ```python
 from model_management import UniversalModelSplitter
 
-splitter = UniversalModelSplitter()
-splitter.trace(model, torch.rand(1, 3, 224, 224))
-splitter.list_layers()          # inspect split points
-splitter.split(layer_index=15)  # split after the 15th operation
-
-# Edge side
-inter = splitter.edge_forward(input_tensor)
-# Cloud side
-output = splitter.cloud_forward(inter)
-```
-
-### 2. HSFL-Style Adaptive Split Point Selection (自适应分割点选择)
-
-> Reference: [HSFL (ICWS 2023)](https://github.com/SASA-cloud/ICWS-23-HSFL)
-
-`SplitPointSelector` uses a **LinUCB contextual bandit** to adaptively select the optimal split point at each round, balancing training latency and privacy leakage.
-
-**Strategies:**
-
-| Strategy | Description |
-| :---: | :---- |
-| `midpoint` | Split at ≈50% cumulative FLOPs (default) |
-| `flops_ratio` | Split where cumulative FLOPs ≈ `target_flops_ratio` |
-| `privacy` | Deepest split with leakage ≤ `max_privacy_leakage` |
-| `min_smashed` | Minimise intermediate tensor size (bandwidth) |
-| `linucb` | Adaptive LinUCB bandit — balances latency & privacy, updates each round |
-
-**Per-layer profiling:**
-- `profile_layers()` — estimates FLOPs, smashed data size, and privacy leakage for each candidate
-- `get_candidate_split_points()` — returns `LayerProfile` list
-- `create_split_selector()` — instantiates `SplitPointSelector` (LinUCB agent)
-
-```python
+splitter = UniversalModelSplitter(device="cpu")
 splitter.trace(model, sample_input)
-profiles = splitter.profile_layers(sample_input)
-selector = splitter.create_split_selector(profiles, alpha=0.25)
 
-# Each round
-split_idx = selector.select(context_features)
-splitter.split(layer_index=split_idx)
-# ... train ...
-selector.update(split_idx, reward)  # latency/privacy feedback
+candidates = splitter.enumerate_candidates(max_candidates=8)
+chosen = candidates[0]
+splitter.split(candidate_id=chosen.candidate_id)
+
+payload = splitter.edge_forward(sample_input)
+output = splitter.cloud_forward(payload)
 ```
 
-### 3. Dynamic Activation Sparsity — SURGEON (云端持续学习层裁剪率训练)
+### 2. Candidate-Based Profiling And Selection
 
-> Reference: [SURGEON (CVPR 2025)](https://github.com/kadmkbl/SURGEON) — *"Memory-Adaptive Fully Test-Time Adaptation via Dynamic Activation Sparsity"*
+Split selection is candidate-based, not layer-based.
 
-`DASTrainer` (`model_management/activation_sparsity.py`) implements per-layer activation pruning for **memory-efficient cloud-side continual learning** of the split model's tail partition.
+Each candidate represents a graph partition and includes:
+- `edge_nodes`
+- `cloud_nodes`
+- `boundary_tensor_labels`
+- `estimated_edge_flops`
+- `estimated_cloud_flops`
+- `estimated_payload_bytes`
+- `estimated_privacy_risk`
+- `estimated_latency`
+- `is_trainable_tail`
 
-**Mechanism:**
+`SplitCandidateSelector` uses candidate-level context features such as:
+- edge / cloud FLOPs
+- payload bytes
+- boundary count
+- privacy score
+- measured latency
+- bandwidth
+- edge load
+- cloud load
+- validation pass/fail
+- replay stability
+- tail trainability
+- historical reward
 
-During backpropagation, activations cached for gradient computation are dynamically pruned on a per-layer basis. Pruning ratios are computed via **TGI (Total Gradient Importance)**:
-
-$$\text{TGI}_l = \frac{\|\nabla_l\|}{\sqrt{|\nabla_l|}} \times \log\frac{M_{\text{total}}}{M_l}$$
-
-Layers with higher TGI retain more activations (lower pruning ratio), reducing GPU memory while maintaining training performance.
-
-**Two-phase training step:**
-1. **Probe phase**: Disable sparsity → forward-backward on a subsample → compute per-layer TGI → derive `clip_ratio = 1 − TGI / max(TGI)`
-2. **Train phase**: Enable sparsity → forward-backward with pruned activations → update parameters
-
-**Components:**
-
-| Component | Description |
-| :---: | :---- |
-| `AutoFreezeConv2d` | `nn.Conv2d` replacement with custom autograd — backward uses pruned activations |
-| `DASBatchNorm2d` | `nn.BatchNorm2d` with SURGEON-style reparameterised backward |
-| `AutoFreezeFC` | `nn.Linear` replacement with activation sparsity |
-| `ActivationClipper` | Keeps top-k elements by absolute value, discards the rest |
-| `compute_tgi()` | Per-layer Total Gradient Importance |
-| `DASTrainer` | High-level class: module replacement, probing, pruning-ratio management |
-| `apply_das_to_tail()` | Convenience — applies DAS only to tail sub-modules (e.g. `rpn`, `roi_heads`) |
-
-```python
-from model_management import DASTrainer, apply_das_to_tail
-
-# Apply DAS to the tail partition
-trainer = apply_das_to_tail(model, ["rpn", "roi_heads"], device="cuda")
-
-# Probe → compute per-layer pruning ratios
-trainer.probe_with_targets(forward_fn)
-
-# Enable sparsity for training
-trainer.activate_sparsity()
-# ... normal training loop (DAS is transparent) ...
-output = model(x)
-loss.backward()
-optimizer.step()
-
-# Check memory stats
-stats = trainer.get_memory_stats()
-print(f"Activation compression: {stats['compression_ratio']:.1%}")
-```
-
-### 4. Drift Detection (数据漂移检测)
-
-Multi-strategy drift detection (`edge/drift_detector.py`):
-
-| Detector | Description |
-| :---: | :---- |
-| `RCCDAPolicy` | Lyapunov-based virtual queue with PD control |
-| `ADWINDetector` | Adaptive windowing statistical test |
-| `ConservativeWindowDetector` | Fixed-window consecutive outlier count |
-| `CompositeDriftDetector` | Ensemble: `any` / `majority` mode |
-
-### 5. Resource-Aware CL Trigger & Split-Point Selection (资源感知持续学习触发与分割点选择)
-
-> Reference: [RCCDA (NeurIPS 2025)](https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code) — *"Adaptive Model Updates in the Presence of Concept Drift under a Constrained Resource Budget"*
-
-`ResourceAwareCLTrigger` (`edge/resource_aware_trigger.py`) extends the RCCDA Lyapunov drift-plus-penalty framework to **jointly decide**:
-
-1. **Whether to trigger continual learning** — considering not only loss degradation but also cloud resource utilisation, network bandwidth, and intermediate-feature privacy leakage.
-2. **Where to place the split point** — selecting the layer that best balances latency, bandwidth cost, privacy protection, and cloud compute load under the Lyapunov objective.
-
-**Multi-Queue Lyapunov Formulation:**
-
-Four virtual queues guarantee long-run budget constraints:
-
-| Queue | Budget | Constraint |
-| :---: | :---: | :---- |
-| $Q_{\text{update}}$ | $\bar{\pi}$ | avg CL trigger rate $\leq \bar{\pi}$ |
-| $Q_{\text{cloud}}$ | $\lambda_{\text{cloud}}$ | avg cloud cost $\leq \lambda_{\text{cloud}}$ |
-| $Q_{\text{bw}}$ | $\lambda_{\text{bw}}$ | avg bandwidth usage $\leq \lambda_{\text{bw}}$ |
-| $Q_{\text{priv}}$ | $\lambda_{\text{priv}}$ | avg privacy leakage $\leq \lambda_{\text{priv}}$ |
-
-At each decision epoch $t$, the greedy-optimal trigger condition is:
-
-$$V \cdot (K_p \cdot e_t + K_d \cdot \Delta e_t) > Q_{\text{update}} + w_c Q_c c_c + w_b Q_b c_b + w_p Q_p l_p + 0.5 - \bar{\pi}$$
-
-**Split-point selection** maximises a Lyapunov-weighted score over candidates:
-
-$$k^* = \arg\max_k \left[ -w_c Q_c \cdot \text{cloud}(k) - w_b Q_b \cdot \text{bw}(k) - w_p Q_p \cdot \text{priv}(k) \right]$$
-
-**Edge ↔ Cloud resource reporting** is provided via gRPC:
-- `query_resource` — edge queries cloud CPU/GPU/memory utilisation
-- `bandwidth_probe` — edge estimates network bandwidth via round-trip probe
+Example:
 
 ```python
-from edge.resource_aware_trigger import (
-    ResourceAwareCLTrigger,
-    build_split_candidates,
-    query_cloud_resource,
+profiles = splitter.profile_candidates(validate=True)
+selector = splitter.create_split_selector(profiles, alpha=0.2)
+
+candidate_id = selector.select_candidate(
+    bandwidth=10.0,
+    edge_load=0.2,
+    cloud_load=0.4,
 )
 
-trigger = ResourceAwareCLTrigger(pi_bar=0.1, V=10.0, lambda_cloud=0.5)
-cloud_state = query_cloud_resource("192.168.1.1:50051")
-candidates = build_split_candidates(splitter)
-
-should_train, split_idx = trigger.decide(
-    avg_confidence=0.6,
-    cloud_state=cloud_state,
-    bandwidth_mbps=8.0,
-    split_candidates=candidates,
-)
+splitter.split(candidate_id=candidate_id)
+selector.update_reward(candidate_id, reward=0.8)
 ```
 
-### 6. Model Zoo — 统一目标检测模型工厂 (YOLO / DETR / RT-DETR / RetinaNet / SSD / FCOS)
+### 3. Dynamic Activation Sparsity
 
-`model_management/model_zoo.py` provides a **unified factory** that lets you swap in any supported detection model with a single config change. All wrappers produce the standard torchvision output format (`[{"boxes", "labels", "scores"}]`), so the rest of the pipeline — inference, drift detection, and continual learning — works without modification.
+`model_management/activation_sparsity.py` implements SURGEON-style activation sparsity for cloud-side continual learning.
 
-| Family | Models | Backend |
-| :--- | :---- | :---- |
-| **Faster R-CNN** | `fasterrcnn_resnet50_fpn`, `fasterrcnn_mobilenet_v3_large_fpn`, `fasterrcnn_mobilenet_v3_large_320_fpn` | torchvision |
-| **RetinaNet** | `retinanet_resnet50_fpn` | torchvision |
-| **SSD / SSDLite** | `ssd300_vgg16`, `ssdlite320_mobilenet_v3_large` | torchvision |
-| **FCOS** | `fcos_resnet50_fpn` | torchvision |
-| **YOLOv5** | `yolov5n`, `yolov5s`, `yolov5m`, `yolov5l`, `yolov5x` | ultralytics |
-| **YOLOv8** | `yolov8n`, `yolov8s`, `yolov8m`, `yolov8l`, `yolov8x` | ultralytics |
-| **YOLOv10** | `yolov10n`, `yolov10s`, `yolov10m`, `yolov10l`, `yolov10x` | ultralytics |
-| **YOLO11** | `yolo11n`, `yolo11s`, `yolo11m`, `yolo11l`, `yolo11x` | ultralytics |
-| **YOLO12** | `yolo12n`, `yolo12s`, `yolo12m`, `yolo12l`, `yolo12x` | ultralytics |
-| **DETR** | `detr_resnet50`, `detr_resnet101`, `conditional_detr_resnet50` | HuggingFace transformers |
-| **RT-DETR** | `rtdetr_l`, `rtdetr_x` | ultralytics |
+### 4. Drift Detection
 
-**Quick usage:**
-```python
-from model_management.model_zoo import build_detection_model, list_available_models
+`edge/drift_detector.py` provides:
+- `RCCDAPolicy`
+- `ADWINDetector`
+- `ConservativeWindowDetector`
+- `CompositeDriftDetector`
 
-# List every supported model name
-print(list_available_models())
+### 5. Resource-Aware Triggering
 
-# Build a YOLOv8s wrapper that outputs torchvision-compatible dicts
-model = build_detection_model("yolov8s", pretrained=True, device="cuda")
-results = model([image_tensor])        # → [{"boxes": ..., "labels": ..., "scores": ...}]
+`edge/resource_aware_trigger.py` extends the RCCDA Lyapunov formulation to jointly decide:
+- whether continual learning should be triggered
+- which split candidate should be used under resource, bandwidth, and privacy constraints
 
-# Switch to DETR in config.yaml:
-#   small_model_name: detr_resnet50
-```
+### 6. Unified Detection Model Zoo
 
-**在配置文件中切换模型** — only change `small_model_name` (edge) / `large_model_name` (cloud):
-
-```yaml
-client:
-  small_model_name: yolov8s        # or detr_resnet50, rtdetr_l, fcos_resnet50_fpn, ...
-server:
-  large_model_name: yolov8x        # large model for ground truth annotation
-  edge_model_name: yolov8s         # lightweight model retrained via CL
-```
-
----
+`model_management/model_zoo.py` provides a unified factory for:
+- Faster R-CNN
+- RetinaNet
+- SSD / SSDLite
+- FCOS
+- YOLO families
+- DETR
+- RT-DETR
 
 ## Project Structure
 
-```
+```text
 Plank-road/
-├── edge_client.py              # Edge node entry point
-├── cloud_server.py             # Cloud server entry point
+├── edge_client.py
+├── cloud_server.py
 ├── config/
-│   └── config.yaml             # All configuration
 ├── edge/
-│   ├── edge_worker.py          # Standalone inference + retrain scheduling
-│   ├── drift_detector.py       # RCCDA / ADWIN / Window drift detection
-│   ├── resource_aware_trigger.py # RCCDA multi-queue Lyapunov CL trigger
-│   ├── info.py                 # Task state definitions
-│   ├── resample.py             # Frame resampling
-│   ├── task.py                 # Task encapsulation
-│   └── transmit.py             # gRPC helpers (cloud training requests)
-├── model_management/
-│   ├── activation_sparsity.py  # SURGEON DAS (Dynamic Activation Sparsity)
-│   ├── universal_model_split.py# Universal model splitting + HSFL selection
-│   ├── model_zoo.py            # Unified detection model factory (YOLO/DETR/…)
-│   ├── object_detection.py     # Inference wrappers
-│   ├── detection_dataset.py    # Training dataset
-│   ├── detection_metric.py     # Training metrics
-│   ├── detection_transforms.py # Data augmentation
-│   ├── model_info.py           # Model registry
-│   ├── utils.py                # Utilities
-│   └── models/                 # Pre-trained model weights
 ├── grpc_server/
-│   ├── rpc_server.py           # gRPC servicer
-│   ├── message_transmission_pb2*.py  # Generated stubs
-│   └── protos/
-│       └── message_transmission.proto
 ├── difference/
-│   └── diff.py                 # Frame difference computation
 ├── database/
-│   └── database.py             # MySQL operations
 ├── tools/
-│   ├── convert_tool.py         # Format conversion
-│   ├── file_op.py              # File operations
-│   ├── preprocess.py           # Preprocessing
-│   └── video_processor.py      # Video stream reader
-└── video_data/                 # Sample video files
+├── model_management/
+│   ├── activation_sparsity.py
+│   ├── graph_ir.py
+│   ├── split_candidate.py
+│   ├── payload.py
+│   ├── candidate_generator.py
+│   ├── split_runtime.py
+│   ├── candidate_profiler.py
+│   ├── candidate_selector.py
+│   ├── universal_model_split.py
+│   ├── model_zoo.py
+│   ├── object_detection.py
+│   ├── detection_dataset.py
+│   ├── detection_metric.py
+│   ├── detection_transforms.py
+│   ├── model_info.py
+│   └── models/
+├── tests/
+│   ├── test_split_runtime_graph.py
+│   ├── test_split_runtime_detection.py
+│   └── test_candidate_selection.py
+└── video_data/
 ```
 
----
+## Installation
 
-## Install
+### Recommended Environment
 
-### Create a virtual environment (recommended)
+The current split runtime has been validated with:
+- `torchlens==1.0.1`
+- `numpy==1.26.4`
+- `opencv-python==4.11.0.86`
 
-Use [uv](https://github.com/astral-sh/uv) for fast environment management:
+These versions are pinned in [requirements.txt](./requirements.txt) to avoid large TorchLens warning floods caused by NumPy 2.x together with newer OpenCV releases.
+
+### Create A Virtual Environment
 
 ```bash
-# Install uv (if not already installed)
 pip install uv
-
-# Create a virtual environment in .venv/
 uv venv
+```
 
-# Activate the environment
+Activate the environment:
+
+```bash
 # Linux / macOS
 source .venv/bin/activate
-# Windows (PowerShell)
+
+# Windows PowerShell
 .venv\Scripts\Activate.ps1
 ```
 
-**On edge** 
+### Install Dependencies
 
-Please install the following libraries on each edge node.
-1. Install the deep learning framework pytorch and opencv-python on the [Jetson](https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048).
-2. Install dependent libraries.
 ```bash
 uv pip install -r requirements.txt
 ```
-3. Compile the gRPC stubs (required — the edge imports the generated files to communicate with the cloud).
+
+### Compile gRPC Stubs
+
 ```bash
 uv pip install grpcio-tools
 
@@ -342,41 +222,7 @@ python -m grpc_tools.protoc \
     ./grpc_server/protos/message_transmission.proto
 ```
 
-**On cloud**
-
-Similar to the installation on the edge node, install the corresponding version of Pytorch and required libraries.
-
-```bash
-uv pip install -r requirements.txt
-```
-Also compile the gRPC stubs:
-```bash
-uv pip install grpcio-tools
-
-python -m grpc_tools.protoc \
-    -I ./grpc_server/protos \
-    --python_out=./grpc_server \
-    --grpc_python_out=./grpc_server \
-    ./grpc_server/protos/message_transmission.proto
-```
-
-### Optional dependencies
-
-| Package | Purpose | Required by |
-| :--- | :---- | :---- |
-| `torchlens` | Model-agnostic graph tracing | Universal model splitting |
-| `psutil` | CPU / memory utilisation monitoring | Resource-aware CL trigger (cloud-side) |
-| `ultralytics` | YOLO / RT-DETR model backends | Model Zoo (YOLO & RT-DETR families) |
-| `transformers` | HuggingFace DETR model backends | Model Zoo (DETR family) |
-| `numpy`, `torch`, `torchvision` | Core computation | All modules |
-| `loguru` | Logging | All modules |
-| `grpcio`, `grpcio-tools` | Edge-cloud communication | gRPC server/client |
-
-### Recompile gRPC stubs after proto changes
-
-After modifying `grpc_server/protos/message_transmission.proto`, re-run the above `grpc_tools.protoc` command on **both the edge and the cloud**.
-
-On Windows (PowerShell), replace the line continuation `\` with a backtick `` ` ``:
+Windows PowerShell:
 
 ```powershell
 python -m grpc_tools.protoc `
@@ -386,217 +232,97 @@ python -m grpc_tools.protoc `
     ./grpc_server/protos/message_transmission.proto
 ```
 
-**Database**
-
-1. Install the MySQL database.
-```bash
-sudo apt install mysql-server
-```
-2. The MySQL database is configured to allow remote connections.
-
-2.1 修改用户权限
-```bash
-# 登录数据库
-sudo mysql -u root -p
-# 创建用户
-CREATE USER 'your_user'@'%' IDENTIFIED BY 'your_password';
-# 授予用户权限
-GRANT ALL PRIVILEGES ON *.* TO 'your_user'@'%' WITH GRANT OPTION;
-# 刷新权限
-FLUSH PRIVILEGES;
-```
-2.2 修改 MySQL 配置文件
-```bash
-# 打开配置文件
-sudo nano /etc/mysql/mysql.conf.d/mysqld.cnf
-# 修改bind-address配置项
-bind-address = 0.0.0.0
-# 重启mysql服务
-sudo systemctl restart mysql
-```
-2.3 配置防火墙
-```bash
-# ufw防火墙
-sudo ufw allow 3306/tcp
-sudo ufw reload
-
-# iptables防火墙
-# sudo iptables -A INPUT -p tcp --dport 3306 -j ACCEPT
-```
-2.4 测试远程连接
-```bash
-# 在远程主机上，尝试使用以下命令连接到 MySQL 数据库：
-mysql -u your_user -h your_server_ip -p
-```
-
 ## Usage
 
-#### 1. Modify the configuration file (config/config.yaml) as needed.
-
-**Video Source**
-
-If the video source is a video file, please configure the path of the video file.
-```yaml
-video_path: your video path
-```
-
-If the video source is a network camera, please configure the account, password, and IP address.
-```yaml
-rtsp:
- label: True
- account: your account
- password: your password
- ip_address: your camera ip
- channel: 1
-```
-
-**Feature Type**
-
-One can choose different features to calculate video frame difference, including pixel, edge, area, and corner features.
-```yaml
-feature: edge
-```
-
-**IP configuration**
-
-Please configure the IP address of the cloud server.
-```yaml
-server_ip: 'server ip:50051'
-```
-
-Please configure the number and IP addresses of edge nodes.
-```yaml
-edge_id: the edge node ID
-edge_num: the number of edge nodes
-destinations: {'id': [1, 2, ...], 'ip':[ip1, ip2, ...]}
-```
-
-**Deployed Model** 
-
-The models deployed on the edge node and the cloud can be configured by specifying model names. The pre-trained model directory is `model_management/models`.
-```yaml
-small_model_name: fasterrcnn_mobilenet_v3_large_fpn 
-large_model_name: fasterrcnn_resnet50_fpn
-```
-
-**Retraining configuration**
-
-The users can configure whether to collect frames for model retraining, the window size of retraining, the number of collected frames, the number of training epochs, etc.
+### Configure Models
 
 ```yaml
-retrain:
- flag: True
- num_epoch: 2
- cache_path: './cache'
- collect_num: 20
- select_num: 15
- window: 90
+client:
+  small_model_name: yolov8s
+
+server:
+  large_model_name: yolov8x
+  edge_model_name: yolov8s
 ```
 
-**Drift Detection configuration**
+### Enable Split Learning
 
-Configure the drift detection strategy and parameters.
-```yaml
-drift_detection:
- mode: rccda          # rccda | adwin | window | any | majority
- confidence_threshold: 0.5
- pi_bar: 0.1          # RCCDA virtual queue target
- V: 10.0              # RCCDA Lyapunov param
- adwin_delta: 0.02    # ADWIN significance
-```
-
-**Split Learning configuration**
-
-Enable split-learning-based continual learning. When enabled, backbone features are cached on the edge and the cloud trains only the tail layers (e.g. `rpn + roi_heads`).
 ```yaml
 split_learning:
- enabled: True
-```
-
-For universal model splitting (any model, any layer):
-```yaml
-split_learning:
- universal:
   enabled: True
-  # Explicit split point:
-  # split_module: backbone
-  # split_layer: 15
-  # Or strategy-based (HSFL):
-  # strategy: linucb   # midpoint | flops_ratio | privacy | min_smashed | linucb
 ```
 
-**SURGEON DAS configuration (Dynamic Activation Sparsity)**
+For the universal graph-based runtime:
 
-Enable memory-efficient cloud-side training via per-layer activation pruning.
+```yaml
+split_learning:
+  universal:
+    enabled: True
+    # Optional explicit legacy compatibility entry:
+    # split_layer: 15
+```
+
+At runtime, the new split system works primarily through graph candidates rather than single split indices.
+
+### Enable Dynamic Activation Sparsity
+
 ```yaml
 server:
- das:
-  enabled: True
-  bn_only: False       # True → only update BN params
-  probe_samples: 10    # samples for gradient-importance probing
+  das:
+    enabled: True
+    bn_only: False
+    probe_samples: 10
 ```
 
-**Resource-Aware CL Trigger configuration**
+### Enable Resource-Aware Triggering
 
-Enable the RCCDA multi-queue Lyapunov trigger to jointly decide CL timing and split-point placement based on cloud resource state, bandwidth, and privacy leakage.
 ```yaml
 resource_aware_trigger:
- enabled: True
- # Shared RCCDA PD params (falls back to drift_detection values)
- # pi_bar: 0.1
- # V: 10.0
- # Multi-queue budget constraints
- lambda_cloud: 0.5     # avg cloud-cost budget per round
- lambda_bw: 0.5        # avg bandwidth budget per round
- lambda_priv: 0.3      # avg privacy-leakage budget per round
- # Queue importance weights
- w_cloud: 1.0
- w_bw: 1.0
- w_priv: 1.0
+  enabled: True
+  lambda_cloud: 0.5
+  lambda_bw: 0.5
+  lambda_priv: 0.3
+  w_cloud: 1.0
+  w_bw: 1.0
+  w_priv: 1.0
 ```
 
-**Database**
+### Start The Cloud Server
 
-To be able to connect to the database, please configure user name, password, and IP address of the database.
-```yaml
-connection: {'user': 'your name', 'password': 'your password', 'host': 'database ip', 'raise_on_warnings': True}
-```
-
-**Offloading policy**
-
-Please configure offloading policy. 
-```yaml
-policy: Edge-Cloud-Assisted
-```
-
-| Policy | Description |
-| :---: | :---- |
-| `Edge-Local` | Video frames received by an edge node are processed exclusively by that node. |
-| `Edge-Shortest` | Video frames are dispatched to the edge node with the shortest inference queue. |
-| `Shortest-Cloud-Threshold` | If all edge queue lengths exceed a threshold, offload to the cloud; otherwise dispatch to the shortest-queue edge. |
-| `Edge-Cloud-Assisted` | Inference on the edge first; low-confidence regions are offloaded to the cloud. |
-
-#### 2. Start the cloud server.
 ```bash
-cd ~/Plank-Road
 python3 cloud_server.py
 ```
 
-#### 3. Start the edge node.
+### Start The Edge Client
 
-Please use the following command for each edge node.
 ```bash
-cd ~/Plank-Road
 python3 edge_client.py
 ```
 
----
+## Testing
+
+The graph-based split runtime is covered by:
+- [test_split_runtime_graph.py](./tests/test_split_runtime_graph.py)
+- [test_split_runtime_detection.py](./tests/test_split_runtime_detection.py)
+- [test_candidate_selection.py](./tests/test_candidate_selection.py)
+
+The lightweight model coverage focuses on:
+- Faster R-CNN
+- SSD
+- ViT
+- DETR
+- YOLO
+
+Validated command:
+
+```bash
+.venv\Scripts\python.exe -m pytest tests/test_split_runtime_graph.py tests/test_candidate_selection.py tests/test_split_runtime_detection.py -q
+```
 
 ## References
 
 - [EdgeCam](https://github.com/MSNLAB/EdgeCam)
-- [HSFL (ICWS 2023)](https://github.com/SASA-cloud/ICWS-23-HSFL) — Hybrid Split Federated Learning with LinUCB split-point selection
-- [SURGEON (CVPR 2025)](https://github.com/kadmkbl/SURGEON) — Memory-Adaptive Fully Test-Time Adaptation via Dynamic Activation Sparsity
-- [RCCDA (NeurIPS 2025)](https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code) — Adaptive Model Updates in the Presence of Concept Drift under a Constrained Resource Budget
-- [Shawarma](https://github.com/Shawarma-sys/Shawarma) — Model partition and split inference
-- [TorchLens](https://github.com/johnmarktaylor91/torchlens) — Model-agnostic computational graph tracing
+- [TorchLens](https://github.com/johnmarktaylor91/torchlens)
+- [SURGEON](https://github.com/kadmkbl/SURGEON)
+- [RCCDA](https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code)
+- [Shawarma](https://github.com/Shawarma-sys/Shawarma)
