@@ -155,9 +155,7 @@ class EdgeWorker:
                     self.universal_splitter = UniversalModelSplitter(
                         device=next(self.small_object_detection.model.parameters()).device,
                     )
-                    sample_input = torch.rand(1, 3, 224, 224).to(
-                        next(self.small_object_detection.model.parameters()).device
-                    )
+                    sample_input = self.small_object_detection.build_split_sample_input((224, 224))
                     self.universal_splitter.trace(
                         self.small_object_detection.model, sample_input,
                     )
@@ -577,18 +575,15 @@ class EdgeWorker:
                 try:
                     if self.universal_split_enabled and self.universal_splitter is not None:
                         # ---- Universal path (any model, any split layer) ----
-                        from PIL import Image
-                        from torchvision import transforms as T
-                        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                        img_t = T.ToTensor()(img_pil).unsqueeze(0)
-                        dev = next(self.small_object_detection.model.parameters()).device
-                        img_t = img_t.to(dev)
                         if split_payload is not None:
                             intermediate = split_payload
+                            splitter_input = self.small_object_detection.prepare_splitter_input(frame)
                         else:
+                            splitter_input = self.small_object_detection.prepare_splitter_input(frame)
                             with self.small_object_detection.model_lock:
                                 intermediate = extract_split_features(
-                                    self.universal_splitter, img_t,
+                                    self.universal_splitter,
+                                    splitter_input,
                                 )
                         save_split_feature_cache(
                             cache_path=self.config.retrain.cache_path,
@@ -600,6 +595,7 @@ class EdgeWorker:
                             pseudo_scores=detection_score,
                             extra_metadata={
                                 "split_index": self.universal_splitter.split_index,
+                                "input_tensor_shape": list(splitter_input[0].shape) if splitter_input else None,
                             },
                         )
                         # Persist split metadata so the cloud knows which
@@ -612,9 +608,9 @@ class EdgeWorker:
                             os.makedirs(os.path.dirname(meta_path), exist_ok=True)
                             meta = {
                                 "universal": True,
+                                "candidate_id": self.universal_splitter.split_candidate_id,
                                 "split_index": self.universal_splitter.split_index,
-                                "model_name": self.config.client.detection.model_name
-                                    if hasattr(self.config, 'client') else "",
+                                "model_name": getattr(self.small_object_detection, "model_name", ""),
                             }
                             with open(meta_path, "w") as _mf:
                                 _json.dump(meta, _mf)

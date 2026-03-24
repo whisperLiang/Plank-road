@@ -266,13 +266,23 @@ class Object_Detection:
         self.record_p.write("{}\n".format(map))
         self.record_p.flush()
 
+    def prepare_splitter_input(self, img):
+        """Split runtime traces full detection models with torchvision-style
+        ``list[Tensor]`` inputs, so replay must use the same structure.
+        """
+        return [self._prepare_image_tensor(img)]
+
+    def build_split_sample_input(self, image_size=(224, 224)):
+        height, width = image_size
+        return [torch.rand(3, height, width, device=device)]
+
     def small_inference(self, img, splitter=None, return_split_payload=False):
         split_payload = None
         with self.model_lock:
             if splitter is not None:
-                img_t = self._prepare_image_tensor(img).unsqueeze(0)
+                splitter_input = self.prepare_splitter_input(img)
                 replayed, split_payload = splitter.replay_inference(
-                    img_t, return_split_output=True,
+                    splitter_input, return_split_output=True,
                 )
                 pred_boxes, pred_class, pred_score = self._parse_prediction_output(
                     replayed, self.threshold_low,

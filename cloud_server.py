@@ -29,7 +29,8 @@ from model_management.object_detection import Object_Detection
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
-# Universal model splitting (optional — requires torchlens)
+from model_management.model_zoo import build_model_sample_input
+# Universal model splitting (optional, requires torchlens)
 try:
     from model_management.universal_model_split import (
         UniversalModelSplitter,
@@ -226,7 +227,6 @@ class CloudContinualLearner:
 
         Requires cached features produced by the universal model splitter.
         """
-        import json as _json
         from model_management.model_zoo import build_detection_model, model_has_roi_heads, is_wrapper_model
 
         model_name = self.edge_model_name
@@ -260,36 +260,45 @@ class CloudContinualLearner:
 
         tmp_model.to(self.device)
 
-        meta_path = os.path.join(cache_path, "features", "split_meta.json")
-        split_index = None
+        if not _HAS_UNIVERSAL_SPLIT:
+            raise RuntimeError("Universal split runtime is required for split retraining.")
 
-        if not (_HAS_UNIVERSAL_SPLIT and os.path.exists(meta_path)):
-            raise RuntimeError(
-                "Universal split metadata is required for split retraining; "
-                "legacy Faster R-CNN split path has been removed."
+        sample_input = None
+        frame_dir = os.path.join(cache_path, "frames")
+        for frame_index in list(all_indices):
+            frame_path = os.path.join(frame_dir, f"{frame_index}.jpg")
+            if not os.path.exists(frame_path):
+                continue
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                continue
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(self.device)
+            sample_input = [tensor]
+            break
+
+        if sample_input is None:
+            input_image_size = None
+            for frame_index in list(all_indices):
+                try:
+                    record = load_split_feature_cache(cache_path, frame_index)
+                except FileNotFoundError:
+                    continue
+                input_tensor_shape = record.get("input_tensor_shape")
+                if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
+                    input_image_size = (int(input_tensor_shape[-2]), int(input_tensor_shape[-1]))
+                    break
+
+            # The graph-based split runtime now infers the selected candidate
+            # directly from cached SplitPayload records.
+            sample_input = build_model_sample_input(
+                model_name,
+                image_size=input_image_size or (224, 224),
+                device=self.device,
             )
-
-        try:
-            with open(meta_path, "r") as _mf:
-                meta = _json.load(_mf)
-            if not meta.get("universal", False):
-                raise RuntimeError("features/split_meta.json is not marked as a universal split cache.")
-            split_index = meta.get("split_index")
-            logger.info(
-                "[SplitCL] Detected universal split features — split_index={}",
-                split_index,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load universal split metadata: {exc}") from exc
-
-        if split_index is None:
-            raise RuntimeError("Universal split metadata missing split_index.")
-
-        sample_input = torch.rand(1, 3, 224, 224).to(self.device)
         universal_split_retrain(
             model=tmp_model,
             sample_input=sample_input,
-            split_layer=int(split_index),
             cache_path=cache_path,
             all_indices=all_indices,
             gt_annotations=gt_annotations,
@@ -409,7 +418,7 @@ class CloudContinualLearner:
 
         dataset = TrafficDataset(root=cache_path, select_index=frame_indices)
         if len(dataset) == 0:
-            raise ValueError("TrafficDataset is empty — no annotated frames found.")
+            raise ValueError("TrafficDataset is empty - no annotated frames found.")
 
         data_loader = DataLoader(dataset=dataset, batch_size=2, collate_fn=_collate_fn)
         tr_metric = RetrainMetric()

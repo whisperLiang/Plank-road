@@ -662,6 +662,34 @@ def list_available_models() -> List[str]:
     return sorted(set(models))
 
 
+def build_model_sample_input(
+    model_or_name,
+    *,
+    image_size: Tuple[int, int] = (224, 224),
+    device: str | torch.device = "cpu",
+):
+    """Return a representative sample input that matches the model's public
+    forward signature.
+
+    Detection models in this repository use ``list[Tensor[C,H,W]]`` inputs,
+    while generic backbones/classifiers use a batched ``Tensor[N,C,H,W]``.
+    """
+    height, width = image_size
+    if isinstance(model_or_name, str):
+        family = get_model_family(model_or_name)
+        is_wrapper = family in ("fasterrcnn", "retinanet", "ssd", "fcos", "yolo", "detr", "rtdetr")
+    else:
+        is_wrapper = (
+            hasattr(model_or_name, "roi_heads")
+            or hasattr(model_or_name, "transform")
+            or is_wrapper_model(model_or_name)
+        )
+    sample = torch.rand(3, height, width, device=device)
+    if is_wrapper:
+        return [sample]
+    return sample.unsqueeze(0)
+
+
 def is_wrapper_model(model_or_name) -> bool:
     """Return True if model is a non-torchvision wrapper (YOLO/DETR/RT-DETR).
 
