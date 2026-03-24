@@ -1,6 +1,8 @@
 # Plank-Road
 
-Plank-Road is a distributed edge-cloud video analytics system with offloading, drift detection, and continual learning.
+Plank-Road is a distributed edge-cloud video analytics system with drift-aware continual learning and graph-based split execution.
+
+The current implementation uses a fixed split plan that is computed once at startup, structured edge-local sample storage, and a versioned upload contract for continual learning.
 
 ## Overview
 
@@ -8,137 +10,111 @@ Plank-Road is a distributed edge-cloud video analytics system with offloading, d
 <img src="./docs/structure.png" width="60%" height="60%">
 </div>
 
-The system includes multiple edge nodes and a cloud server. Edge nodes perform filtering, scheduling, local inference, and drift collection. The cloud provides heavyweight inference, split-tail retraining, and updated weights for edge deployment.
+The runtime is organized as three chains:
+
+1. Edge preprocessing:
+   `input -> differencing/filtering -> local inference queue`
+2. Edge inference with a fixed split plan:
+   local inference always produces `intermediate feature + final result + confidence`
+3. Lyapunov-based continual learning trigger:
+   decides `train_now` and `send_low_conf_features`
+
+The edge no longer uses normal cloud inference offloading as a branch after filtering. Filtered frames always enter the local inference queue first.
 
 <div align="center">
 <img src="./docs/modules.png" width="75%" height="75%">
 </div>
 
-## Key Features
+## Current Architecture
 
-### 1. Graph-Based Universal Model Splitting
+### 1. Fixed Split Planning At Startup
 
-The universal split runtime is implemented around an explicit graph partition abstraction.
+The split point combination is fixed for a given model and constraint pair.
 
-It no longer assumes:
-- split = one `layer_index`
-- edge = prefix layers
-- cloud = suffix layers
-- payload = one split-layer output
+At startup, the edge:
+- traces the model graph with TorchLens
+- enumerates legal graph-cut candidates
+- validates replayability
+- selects the candidate that minimizes intermediate feature size
+- enforces:
+  - privacy metric lower bound
+  - maximum layer freezing ratio upper bound
+- persists the result to `fixed_split_plan.json`
 
-Instead, Plank-Road now:
-- traces the TorchLens computation graph
-- builds a DAG IR
-- enumerates valid edge/cloud graph-cut candidates
-- replays each side as a dependency-closed subgraph
-- trains the cloud tail using real tail parameters
+Runtime inference does not adaptively switch split points.
 
-Core implementation files:
-- [graph_ir.py](./model_management/graph_ir.py)
-- [split_candidate.py](./model_management/split_candidate.py)
-- [payload.py](./model_management/payload.py)
-- [candidate_generator.py](./model_management/candidate_generator.py)
-- [split_runtime.py](./model_management/split_runtime.py)
-- [candidate_profiler.py](./model_management/candidate_profiler.py)
-- [candidate_selector.py](./model_management/candidate_selector.py)
-- [universal_model_split.py](./model_management/universal_model_split.py)
+Core files:
+- [model_management/fixed_split.py](./model_management/fixed_split.py)
+- [model_management/universal_model_split.py](./model_management/universal_model_split.py)
+- [model_management/split_runtime.py](./model_management/split_runtime.py)
+- [model_management/candidate_generator.py](./model_management/candidate_generator.py)
+- [model_management/candidate_profiler.py](./model_management/candidate_profiler.py)
+- [model_management/split_candidate.py](./model_management/split_candidate.py)
 
-Key properties:
-- works for arbitrary TorchLens-traceable PyTorch models
-- supports residual and multi-branch DAGs
-- payloads contain only minimal cross-boundary tensors
-- cloud replay does not depend on hidden edge runtime state
-- supports both split inference and split tail training
+### 2. Edge Inference And Local Sample Storage
 
-Example:
+Each inference sample produces:
+- split intermediate feature
+- final detection result
+- sample confidence
 
-```python
-from model_management import UniversalModelSplitter
+Samples are stored locally on the edge with different policies:
+- high-confidence: `feature + result`
+- low-confidence: `feature + result + raw sample`
+- drift samples: flagged in metadata and included in upload selection
 
-splitter = UniversalModelSplitter(device="cpu")
-splitter.trace(model, sample_input)
+Local storage is structured so the edge can batch:
+- high-confidence feature/result pairs
+- low-confidence feature/result/raw triplets
+- drift samples
 
-candidates = splitter.enumerate_candidates(max_candidates=8)
-chosen = candidates[0]
-splitter.split(candidate_id=chosen.candidate_id)
+Core files:
+- [edge/edge_worker.py](./edge/edge_worker.py)
+- [edge/sample_store.py](./edge/sample_store.py)
+- [model_management/object_detection.py](./model_management/object_detection.py)
 
-payload = splitter.edge_forward(sample_input)
-output = splitter.cloud_forward(payload)
-```
+### 3. Lyapunov-Based Training Decision
 
-### 2. Candidate-Based Profiling And Selection
+The resource-aware trigger no longer chooses a split point.
 
-Split selection is candidate-based, not layer-based.
+It now decides:
+- whether continual learning should trigger now
+- whether low-confidence samples should also upload intermediate features
 
-Each candidate represents a graph partition and includes:
-- `edge_nodes`
-- `cloud_nodes`
-- `boundary_tensor_labels`
-- `estimated_edge_flops`
-- `estimated_cloud_flops`
-- `estimated_payload_bytes`
-- `estimated_privacy_risk`
-- `estimated_latency`
-- `is_trainable_tail`
+Invariants:
+- when training is triggered, high-confidence features and results are always uploaded
+- low-confidence raw samples are always available for upload
+- low-confidence feature upload is conditional
 
-`SplitCandidateSelector` uses candidate-level context features such as:
-- edge / cloud FLOPs
-- payload bytes
-- boundary count
-- privacy score
-- measured latency
-- bandwidth
-- edge load
-- cloud load
-- validation pass/fail
-- replay stability
-- tail trainability
-- historical reward
+Preferences encoded in the trigger:
+- tight cloud compute:
+  avoid training, but if training happens prefer `raw + feature`
+- tight bandwidth:
+  avoid training, but if training happens prefer `raw only`
 
-Example:
+Core file:
+- [edge/resource_aware_trigger.py](./edge/resource_aware_trigger.py)
 
-```python
-profiles = splitter.profile_candidates(validate=True)
-selector = splitter.create_split_selector(profiles, alpha=0.2)
+### 4. Versioned Continual Learning Bundle
 
-candidate_id = selector.select_candidate(
-    bandwidth=10.0,
-    edge_load=0.2,
-    cloud_load=0.4,
-)
+When continual learning is triggered, the edge uploads a versioned bundle containing:
+- high-confidence features + results
+- low-confidence raw samples + results
+- optional low-confidence features
+- drift flags and split-plan metadata
 
-splitter.split(candidate_id=candidate_id)
-selector.update_reward(candidate_id, reward=0.8)
-```
+The server supports two low-confidence modes:
+- `raw-only`
+- `raw+feature`
 
-### 3. Dynamic Activation Sparsity
+In `raw-only` mode, the server reconstructs missing low-confidence features from uploaded raw samples before split-tail retraining.
 
-`model_management/activation_sparsity.py` implements SURGEON-style activation sparsity for cloud-side continual learning.
-
-### 4. Drift Detection
-
-`edge/drift_detector.py` provides:
-- `RCCDAPolicy`
-- `ADWINDetector`
-- `ConservativeWindowDetector`
-- `CompositeDriftDetector`
-
-### 5. Resource-Aware Triggering
-
-`edge/resource_aware_trigger.py` extends the RCCDA Lyapunov formulation to jointly decide:
-- whether continual learning should be triggered
-- which split candidate should be used under resource, bandwidth, and privacy constraints
-
-### 6. Unified Detection Model Zoo
-
-`model_management/model_zoo.py` provides a unified factory for:
-- Faster R-CNN
-- RetinaNet
-- SSD / SSDLite
-- FCOS
-- YOLO families
-- DETR
-- RT-DETR
+Core files:
+- [edge/transmit.py](./edge/transmit.py)
+- [model_management/continual_learning_bundle.py](./model_management/continual_learning_bundle.py)
+- [grpc_server/protos/message_transmission.proto](./grpc_server/protos/message_transmission.proto)
+- [grpc_server/rpc_server.py](./grpc_server/rpc_server.py)
+- [cloud_server.py](./cloud_server.py)
 
 ## Project Structure
 
@@ -148,44 +124,45 @@ Plank-road/
 ├── cloud_server.py
 ├── config/
 ├── edge/
+│   ├── edge_worker.py
+│   ├── resource_aware_trigger.py
+│   ├── sample_store.py
+│   └── transmit.py
 ├── grpc_server/
+│   ├── protos/
+│   │   └── message_transmission.proto
+│   ├── message_transmission_pb2.py
+│   ├── message_transmission_pb2_grpc.py
+│   └── rpc_server.py
 ├── difference/
 ├── database/
 ├── tools/
 ├── model_management/
 │   ├── activation_sparsity.py
+│   ├── continual_learning_bundle.py
+│   ├── fixed_split.py
 │   ├── graph_ir.py
 │   ├── split_candidate.py
 │   ├── payload.py
 │   ├── candidate_generator.py
-│   ├── split_runtime.py
 │   ├── candidate_profiler.py
-│   ├── candidate_selector.py
+│   ├── split_runtime.py
 │   ├── universal_model_split.py
-│   ├── model_zoo.py
 │   ├── object_detection.py
-│   ├── detection_dataset.py
-│   ├── detection_metric.py
-│   ├── detection_transforms.py
-│   ├── model_info.py
-│   └── models/
-├── tests/
-│   ├── test_split_runtime_graph.py
-│   ├── test_split_runtime_detection.py
-│   └── test_candidate_selection.py
-└── video_data/
+│   └── model_zoo.py
+└── tests/
 ```
 
 ## Installation
 
 ### Recommended Environment
 
-The current split runtime has been validated with:
+The graph-based split runtime has been validated with:
 - `torchlens==1.0.1`
 - `numpy==1.26.4`
 - `opencv-python==4.11.0.86`
 
-These versions are pinned in [requirements.txt](./requirements.txt) to avoid large TorchLens warning floods caused by NumPy 2.x together with newer OpenCV releases.
+These versions are pinned in [requirements.txt](./requirements.txt).
 
 ### Create A Virtual Environment
 
@@ -232,9 +209,9 @@ python -m grpc_tools.protoc `
     ./grpc_server/protos/message_transmission.proto
 ```
 
-## Usage
+## Configuration
 
-### Configure Models
+### Models
 
 ```yaml
 client:
@@ -245,26 +222,37 @@ server:
   edge_model_name: yolov8s
 ```
 
-### Enable Split Learning
+### Fixed Split Planning
 
 ```yaml
-split_learning:
-  enabled: True
-```
-
-For the universal graph-based runtime:
-
-```yaml
-split_learning:
-  universal:
+client:
+  split_learning:
     enabled: True
-    # Optional explicit legacy compatibility entry:
-    # split_layer: 15
+    fixed_split:
+      privacy_metric_lower_bound: 0.15
+      max_layer_freezing_ratio: 0.75
+      validate_candidates: True
+      max_candidates: 24
+      max_boundary_count: 8
+      max_payload_bytes: 33554432
 ```
 
-At runtime, the new split system works primarily through graph candidates rather than single split indices.
+### Resource-Aware Trigger
 
-### Enable Dynamic Activation Sparsity
+```yaml
+client:
+  resource_aware_trigger:
+    enabled: True
+    lambda_cloud: 0.5
+    lambda_bw: 0.5
+    w_cloud: 1.0
+    w_bw: 1.0
+    min_training_samples: 10
+    drift_bonus: 0.35
+    upload_time_budget_sec: 5.0
+```
+
+### Dynamic Activation Sparsity
 
 ```yaml
 server:
@@ -274,49 +262,67 @@ server:
     probe_samples: 10
 ```
 
-### Enable Resource-Aware Triggering
+## Runtime Flow
 
-```yaml
-resource_aware_trigger:
-  enabled: True
-  lambda_cloud: 0.5
-  lambda_bw: 0.5
-  lambda_priv: 0.3
-  w_cloud: 1.0
-  w_bw: 1.0
-  w_priv: 1.0
-```
+### Edge Startup
+
+1. Build the lightweight detection model
+2. Trace the model graph
+3. Compute or load the fixed split plan
+4. Validate the selected split plan
+5. Start:
+   - differencing thread
+   - local inference worker
+   - continual learning worker
+
+### Continual Learning Trigger
+
+When the trigger fires:
+- high-confidence features + results are always bundled
+- low-confidence raw samples are always bundled
+- low-confidence features are bundled only if `send_low_conf_features=True`
+- drift samples are marked in the bundle manifest
+
+### Cloud Retraining
+
+The cloud:
+1. receives the versioned bundle
+2. expands it into a working cache
+3. reconstructs low-confidence features if necessary
+4. annotates drift samples with the large model
+5. runs split-tail retraining
+6. returns updated edge model weights
+
+## Usage
 
 ### Start The Cloud Server
 
 ```bash
-python3 cloud_server.py
+python cloud_server.py
 ```
 
 ### Start The Edge Client
 
 ```bash
-python3 edge_client.py
+python edge_client.py
 ```
 
 ## Testing
 
-The graph-based split runtime is covered by:
-- [test_split_runtime_graph.py](./tests/test_split_runtime_graph.py)
-- [test_split_runtime_detection.py](./tests/test_split_runtime_detection.py)
-- [test_candidate_selection.py](./tests/test_candidate_selection.py)
+Core coverage includes:
+- [tests/test_edge.py](./tests/test_edge.py)
+- [tests/test_grpc_server.py](./tests/test_grpc_server.py)
+- [tests/test_continual_learning_pipeline.py](./tests/test_continual_learning_pipeline.py)
+- [tests/test_split_runtime_edge_cloud_pipeline.py](./tests/test_split_runtime_edge_cloud_pipeline.py)
 
-The lightweight model coverage focuses on:
-- Faster R-CNN
-- SSD
-- ViT
-- DETR
-- YOLO
-
-Validated command:
+Focused validation command:
 
 ```bash
-.venv\Scripts\python.exe -m pytest tests/test_split_runtime_graph.py tests/test_candidate_selection.py tests/test_split_runtime_detection.py -q
+.venv\Scripts\python.exe -m pytest \
+    tests/test_edge.py \
+    tests/test_grpc_server.py \
+    tests/test_continual_learning_pipeline.py \
+    tests/test_split_runtime_edge_cloud_pipeline.py::test_feature_transfer_and_weight_download_over_grpc -q
 ```
 
 ## References
