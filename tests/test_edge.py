@@ -7,6 +7,7 @@ Tests for edge/ module:
   - resource_aware_trigger.py (helper functions, CloudResourceState, ResourceAwareCLTrigger)
 """
 import time
+from queue import Queue
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,12 @@ from edge.drift_detector import (
     CompositeDriftDetector,
 )
 from edge.resample import history_sample, annotion_process
-from edge.resource_aware_trigger import ResourceAwareCLTrigger
+from edge.resource_aware_trigger import (
+    CloudResourceState,
+    PendingTrainingStats,
+    ResourceAwareCLTrigger,
+)
+from edge.edge_worker import EdgeWorker
 
 
 # =====================================================================
@@ -68,6 +74,20 @@ class TestTask:
         assert t.directly_cloud is False
         assert t.edge_process is False
         assert t.frame_cloud is None
+
+
+class TestEdgeWorkerRouting:
+
+    def test_filtered_frames_only_enter_local_inference_queue(self, sample_bgr_frame):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.local_queue = Queue()
+        task = Task(1, 1, sample_bgr_frame, time.time(), sample_bgr_frame.shape)
+
+        worker.decision_worker(task)
+
+        queued = worker.local_queue.get_nowait()
+        assert queued is task
+        assert task.edge_process is True
 
 
 # =====================================================================
@@ -293,52 +313,82 @@ class TestResample:
 class TestResourceAwareHelpers(object): pass
 
 # =====================================================================
-# ResourceAwareCLTrigger (Joint Optimization)
+# ResourceAwareCLTrigger
 # =====================================================================
-
-class DummyCloudClient:
-    def __init__(self, comp, bw):
-        self.comp = comp
-        self.bw = bw
-    def get_cached_prices(self):
-        return {'price_comp': self.comp, 'price_bw': self.bw}
 
 class TestResourceAwareCLTrigger:
 
-    def test_evaluate_and_trigger_no_client(self):
-        trigger = ResourceAwareCLTrigger()
-        result = trigger.evaluate_and_trigger(0.8)
-        assert result["action"] == "DO_NOTHING"
+    def _stats(self):
+        return PendingTrainingStats(
+            total_samples=12,
+            high_confidence_count=6,
+            low_confidence_count=6,
+            drift_count=2,
+            high_confidence_feature_bytes=1200,
+            low_confidence_feature_bytes=600,
+            low_confidence_raw_bytes=300,
+        )
 
-    def test_evaluate_and_trigger_triggers(self):
-        client = DummyCloudClient(0.5, 0.5)
-        profiles = {
-            "layer_1": {"bw": 10.0, "privacy": 0.5, "gain": 10.0},
-            "layer_2": {"bw": 5.0,  "privacy": 0.8, "gain": 8.0}
-        }
-        trigger = ResourceAwareCLTrigger(client=client, split_profiles=profiles, V=10.0, base_train_cost=10.0)
-        
-        result = trigger.evaluate_and_trigger(1.0)
-        assert result["action"] == "TRIGGER"
-        assert result["split_point"] == "layer_1"
+    def _cloud_state(self, pressure: float):
+        return CloudResourceState(
+            cpu_utilization=pressure,
+            gpu_utilization=pressure,
+            memory_utilization=pressure,
+            train_queue_size=int(pressure * 10),
+            max_queue_size=10,
+        )
 
-    def test_evaluate_and_trigger_privacy_filter(self):
-        client = DummyCloudClient(0.5, 0.5)
-        profiles = {
-            "layer_1": {"bw": 1.0, "privacy": 1.5, "gain": 100.0},
-            "layer_2": {"bw": 5.0, "privacy": 0.5, "gain": 8.0}
-        }
-        trigger = ResourceAwareCLTrigger(client=client, split_profiles=profiles, V=10.0, max_tolerable_privacy=1.0)
-        
-        result = trigger.evaluate_and_trigger(1.0)
-        assert result["action"] == "TRIGGER"
-        assert result["split_point"] == "layer_2"
+    def test_bandwidth_tight_case_prefers_raw_only_low_conf_upload(self):
+        trigger = ResourceAwareCLTrigger(min_training_samples=1, V=10.0)
+        stats = PendingTrainingStats(
+            total_samples=12,
+            high_confidence_count=6,
+            low_confidence_count=6,
+            drift_count=2,
+            high_confidence_feature_bytes=4_000_000,
+            low_confidence_feature_bytes=8_000_000,
+            low_confidence_raw_bytes=2_000_000,
+        )
+        decision = trigger.decide(
+            avg_confidence=0.2,
+            drift_detected=True,
+            cloud_state=self._cloud_state(0.2),
+            bandwidth_mbps=0.1,
+            sample_stats=stats,
+        )
+        assert decision.train_now is True
+        assert decision.send_low_conf_features is False
 
-    def test_evaluate_and_trigger_no_gain_no_trigger(self):
-        client = DummyCloudClient(10.0, 10.0)
-        profiles = {
-            "layer_1": {"bw": 100.0, "privacy": 0.5, "gain": 0.01},
-        }
-        trigger = ResourceAwareCLTrigger(client=client, split_profiles=profiles, V=1.0)
-        result = trigger.evaluate_and_trigger(1.0)
-        assert result["action"] == "DO_NOTHING"
+    def test_compute_tight_case_prefers_low_conf_feature_upload_when_training(self):
+        trigger = ResourceAwareCLTrigger(min_training_samples=1, V=10.0)
+        decision = trigger.decide(
+            avg_confidence=0.2,
+            drift_detected=True,
+            cloud_state=self._cloud_state(0.95),
+            bandwidth_mbps=100.0,
+            sample_stats=self._stats(),
+        )
+        assert decision.train_now is True
+        assert decision.send_low_conf_features is True
+
+    def test_trigger_can_skip_training_when_urgency_is_low(self):
+        trigger = ResourceAwareCLTrigger(min_training_samples=1, V=1.0)
+        decision = trigger.decide(
+            avg_confidence=0.95,
+            drift_detected=False,
+            cloud_state=self._cloud_state(0.9),
+            bandwidth_mbps=0.5,
+            sample_stats=self._stats(),
+        )
+        assert decision.train_now is False
+
+    def test_trigger_respects_minimum_sample_gate(self):
+        trigger = ResourceAwareCLTrigger(min_training_samples=20, V=10.0)
+        decision = trigger.decide(
+            avg_confidence=0.1,
+            drift_detected=True,
+            cloud_state=self._cloud_state(0.1),
+            bandwidth_mbps=100.0,
+            sample_stats=self._stats(),
+        )
+        assert decision.train_now is False

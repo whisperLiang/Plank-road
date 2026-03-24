@@ -1,238 +1,363 @@
-"""
-Resource-Aware Continual Learning Trigger & Split-Point Selector
-================================================================
-
-Implements "Edge-side Joint Optimization Decision + Cloud-side Asynchronous Resource Pricing"
-to jointly decide:
-
-    1. **Whether to trigger continual learning** — considering cloud
-       resource pricing, network bandwidth, and intermediate-feature
-       privacy constraints.
-    2. **Where to place the split point** — selecting the layer that best
-       balances latency, bandwidth cost, privacy leakage, and cloud
-       compute cost.
-
-At each decision epoch, we evaluate candidate split points by comparing
-resource costs (based on async shadow prices from the cloud) against 
-performance gains.
-"""
-
 from __future__ import annotations
 
-import math
 import time
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any
 
-from loguru import logger
+import grpc
+
+from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
 
-# ── ResourceAwareCLTrigger ───────────────────────────────────────────
+@dataclass
+class CloudResourceState:
+    cpu_utilization: float
+    gpu_utilization: float
+    memory_utilization: float
+    train_queue_size: int
+    max_queue_size: int
+    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def queue_pressure(self) -> float:
+        if self.max_queue_size <= 0:
+            return 0.0
+        return max(0.0, min(1.0, self.train_queue_size / float(self.max_queue_size)))
+
+    @property
+    def compute_pressure(self) -> float:
+        return max(
+            0.0,
+            min(
+                1.0,
+                max(
+                    float(self.cpu_utilization),
+                    float(self.gpu_utilization),
+                    float(self.memory_utilization),
+                    self.queue_pressure,
+                ),
+            ),
+        )
+
+    def is_stale(self, max_age_sec: float) -> bool:
+        return (time.time() - float(self.timestamp)) > float(max_age_sec)
+
+
+@dataclass
+class PendingTrainingStats:
+    total_samples: int
+    high_confidence_count: int
+    low_confidence_count: int
+    drift_count: int
+    high_confidence_feature_bytes: int
+    low_confidence_feature_bytes: int
+    low_confidence_raw_bytes: int
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> "PendingTrainingStats":
+        return cls(
+            total_samples=int(payload.get("total_samples", 0)),
+            high_confidence_count=int(payload.get("high_confidence_count", 0)),
+            low_confidence_count=int(payload.get("low_confidence_count", 0)),
+            drift_count=int(payload.get("drift_count", 0)),
+            high_confidence_feature_bytes=int(payload.get("high_confidence_feature_bytes", 0)),
+            low_confidence_feature_bytes=int(payload.get("low_confidence_feature_bytes", 0)),
+            low_confidence_raw_bytes=int(payload.get("low_confidence_raw_bytes", 0)),
+        )
+
+    @property
+    def always_sent_bytes(self) -> int:
+        return self.high_confidence_feature_bytes + self.low_confidence_raw_bytes
+
+
+@dataclass
+class TrainingDecision:
+    train_now: bool
+    send_low_conf_features: bool
+    urgency: float
+    compute_pressure: float
+    bandwidth_pressure: float
+    action_scores: dict[str, float] = field(default_factory=dict)
+    reason: str = ""
+
 
 class ResourceAwareCLTrigger:
-    """Multi-queue Lyapunov policy for resource-aware CL triggering.
+    """Lyapunov-style trigger that chooses training and low-confidence feature upload.
 
-    Extends RCCDA's single-queue policy to four virtual queues that
-    track update rate, cloud cost, bandwidth, and privacy budgets.
-
-    Parameters
-    ----------
-    pi_bar : float
-        Maximum allowed average CL trigger rate.
-    V : float
-        Lyapunov trade-off: larger → more responsive to loss changes.
-    K_p, K_d : float
-        PD controller gains for loss error / derivative.
-    lambda_cloud : float
-        Average cloud-cost budget per round (∈ (0, 1]).
-    lambda_bw : float
-        Average bandwidth budget per round (∈ (0, 1]).
-    lambda_priv : float
-        Average privacy-leakage budget per round (∈ (0, 1]).
-    w_cloud, w_bw, w_priv : float
-        Relative importance weights for each queue in the Lyapunov
-        drift expression.  Higher → stricter enforcement.
-    confidence_threshold : float
-        Confidence score below which a detection is a "loss".
+    The fixed split plan is computed separately at startup. Runtime decisions are
+    limited to:
+      1. whether continual learning should start now
+      2. whether low-confidence samples should also upload intermediate features
     """
 
     def __init__(
         self,
-        # RCCDA core
+        *,
         pi_bar: float = 0.1,
         V: float = 10.0,
         K_p: float = 1.0,
         K_d: float = 0.5,
-        # Multi-queue budgets
         lambda_cloud: float = 0.5,
         lambda_bw: float = 0.5,
-        lambda_priv: float = 0.3,
-        # Queue weights
         w_cloud: float = 1.0,
         w_bw: float = 1.0,
-        w_priv: float = 1.0,
-        # Loss
         confidence_threshold: float = 0.5,
-        # For Refactored Joint-Optimization
-        client = None,
-        split_profiles: dict = None,
-        max_tolerable_privacy: float = 1.0,
-        base_train_cost: float = 10.0,
+        min_training_samples: int = 1,
+        drift_bonus: float = 0.35,
+        upload_time_budget_sec: float = 5.0,
     ) -> None:
-        # ── RCCDA PD parameters ──
-        self.pi_bar = pi_bar
-        self.V = V
-        self.K_p = K_p
-        self.K_d = K_d
-        self.confidence_threshold = confidence_threshold
+        self.pi_bar = float(pi_bar)
+        self.V = float(V)
+        self.K_p = float(K_p)
+        self.K_d = float(K_d)
+        self.lambda_cloud = float(lambda_cloud)
+        self.lambda_bw = float(lambda_bw)
+        self.lambda_priv = 0.0
+        self.w_cloud = float(w_cloud)
+        self.w_bw = float(w_bw)
+        self.confidence_threshold = float(confidence_threshold)
+        self.min_training_samples = int(min_training_samples)
+        self.drift_bonus = float(drift_bonus)
+        self.upload_time_budget_sec = float(upload_time_budget_sec)
 
-        # ── Multi-queue budgets ──
-        self.lambda_cloud = lambda_cloud
-        self.lambda_bw = lambda_bw
-        self.lambda_priv = lambda_priv
+        self.Q_update = 0.0
+        self.Q_cloud = 0.0
+        self.Q_bw = 0.0
+        self.loss_best = float("inf")
+        self.loss_prev = 0.0
+        self.step = 0
+        self.trigger_count = 0
+        self.history: list[dict[str, Any]] = []
 
-        # ── Queue weights ──
-        self.w_cloud = w_cloud
-        self.w_bw = w_bw
-        self.w_priv = w_priv
+    @property
+    def effective_trigger_rate(self) -> float:
+        if self.step == 0:
+            return 0.0
+        return self.trigger_count / float(self.step)
 
-        # ── Joint-Optimization parameters ──
-        self.client = client
-        self.split_profiles = split_profiles or {}
-        self.max_tolerable_privacy = max_tolerable_privacy
-        self.base_train_cost = base_train_cost
-
-        # ── Virtual queues (initialised to 0) ──
-        self.Q_update: float = 0.0     # update-rate queue
-        self.Q_cloud: float = 0.0      # cloud-cost queue
-        self.Q_bw: float = 0.0         # bandwidth queue
-        self.Q_priv: float = 0.0       # privacy queue
-
-        # ── Loss tracking (RCCDA-style) ──
-        self.loss_best: float = float("inf")
-        self.loss_prev: float = 0.0
-        self.loss_initial: Optional[float] = None
-
-        # ── Statistics ──
-        self.step: int = 0
-        self.trigger_count: int = 0
-        self.history: List[Dict] = []
-
-    # ──────── reset ──────────────────────────────────────────────────
+    @property
+    def queue_snapshot(self) -> dict[str, float]:
+        return {
+            "Q_update": self.Q_update,
+            "Q_cloud": self.Q_cloud,
+            "Q_bw": self.Q_bw,
+        }
 
     def reset(self) -> None:
         self.Q_update = 0.0
         self.Q_cloud = 0.0
         self.Q_bw = 0.0
-        self.Q_priv = 0.0
         self.loss_best = float("inf")
         self.loss_prev = 0.0
-        self.loss_initial = None
         self.step = 0
         self.trigger_count = 0
         self.history.clear()
 
-    # ──────── Joint Optimization Refactor ────────────────────────────
+    def _loss_signal(self, avg_confidence: float, drift_detected: bool) -> float:
+        if avg_confidence is None:
+            avg_confidence = 0.0
+        base = max(0.0, self.confidence_threshold - float(avg_confidence))
+        normalised = base / max(self.confidence_threshold, 1e-6)
+        if drift_detected:
+            normalised += self.drift_bonus
+        return normalised
 
-    def evaluate_and_trigger(self, drift_severity: float) -> dict:
-        """
-        Execute joint optimization decision in the edge inference loop.
-        Uses cached cloud prices for asynchronous operations.
-        
-        Evaluates potential split strategies and returns the optimal action.
-        """
-        if not self.client:
-            logger.warning("Cloud client not initialized. Returning DO_NOTHING.")
-            return {"action": "DO_NOTHING"}
+    def _urgency(self, avg_confidence: float, drift_detected: bool, stats: PendingTrainingStats) -> float:
+        loss = self._loss_signal(avg_confidence, drift_detected)
+        self.loss_best = min(self.loss_best, loss)
+        derivative = max(0.0, loss - self.loss_prev)
+        sample_factor = 1.0
+        if self.min_training_samples > 0:
+            sample_factor = min(
+                1.0,
+                max(0.1, stats.total_samples / float(self.min_training_samples)),
+            )
+        urgency = max(
+            0.0,
+            (self.K_p * (loss - self.loss_best)) + (self.K_d * derivative) + loss,
+        )
+        urgency *= sample_factor
+        if drift_detected and stats.drift_count > 0:
+            urgency += min(1.0, stats.drift_count / float(max(1, stats.total_samples)))
+        self.loss_prev = loss
+        return urgency
 
-        prices = self.client.get_cached_prices()
-        best_action = {"action": "DO_NOTHING"}
-        min_net_value = 0.0  # gating threshold: cost must be less than gain (net_value = cost - gain < 0)
-        
-        for s in self.split_profiles:
-            profile = self.split_profiles[s]
-            
-            # 1. Hard constraint filtering
-            if profile.get('privacy', 1.0) > self.max_tolerable_privacy:
-                continue
-                
-            # 2. Calculate joint cost: (resource cost) - (performance gain)
-            # Assuming 'bw' is network bandwidth used and 'gain' provides the performance gain
-            cost = (prices.get('price_comp', float('inf')) * self.base_train_cost) + \
-                   (prices.get('price_bw', float('inf')) * profile.get('bw', 0.0))
-                   
-            gain_func = profile.get('gain')
-            actual_gain = gain_func(drift_severity) if callable(gain_func) else profile.get('gain', 0.0)
-            gain = self.V * actual_gain
-            
-            net_value = cost - gain
-            
-            # 3. Search for optimal solution
-            if net_value < min_net_value:
-                min_net_value = net_value
-                best_action = {"action": "TRIGGER", "split_point": s}
-                
-        return best_action
-
-    # ──────── Properties ─────────────────────────────────────────────
-
-    @property
-    def effective_trigger_rate(self) -> float:
-        """Empirical average CL trigger rate so far."""
-        if self.step == 0:
+    def _bandwidth_pressure(self, bandwidth_mbps: float, payload_bytes: int) -> float:
+        if payload_bytes <= 0:
             return 0.0
-        return self.trigger_count / self.step
+        if bandwidth_mbps <= 0:
+            return 1.0
+        transfer_sec = (payload_bytes * 8.0) / (bandwidth_mbps * 1_000_000.0)
+        return max(0.0, min(1.0, transfer_sec / max(self.upload_time_budget_sec, 1e-6)))
 
-    @property
-    def queue_snapshot(self) -> Dict[str, float]:
-        return {
-            "Q_update": self.Q_update,
-            "Q_cloud": self.Q_cloud,
-            "Q_bw": self.Q_bw,
-            "Q_priv": self.Q_priv,
+    def decide(
+        self,
+        *,
+        avg_confidence: float,
+        drift_detected: bool,
+        cloud_state: CloudResourceState,
+        bandwidth_mbps: float,
+        sample_stats: PendingTrainingStats | dict[str, Any],
+    ) -> TrainingDecision:
+        stats = (
+            sample_stats
+            if isinstance(sample_stats, PendingTrainingStats)
+            else PendingTrainingStats.from_mapping(sample_stats)
+        )
+        urgency = self._urgency(avg_confidence, drift_detected, stats)
+        compute_pressure = cloud_state.compute_pressure
+
+        raw_only_payload_bytes = stats.always_sent_bytes
+        raw_plus_feature_payload_bytes = (
+            stats.always_sent_bytes + stats.low_confidence_feature_bytes
+        )
+        raw_only_bw_pressure = self._bandwidth_pressure(
+            bandwidth_mbps, raw_only_payload_bytes
+        )
+        raw_plus_feature_bw_pressure = self._bandwidth_pressure(
+            bandwidth_mbps, raw_plus_feature_payload_bytes
+        )
+        training_disabled = stats.total_samples < max(1, self.min_training_samples)
+
+        no_train_score = self.V * urgency
+        raw_only_score = (
+            self.Q_update + 1.0 - self.pi_bar
+            + self.w_cloud * (self.Q_cloud + compute_pressure) * (1.0 + compute_pressure)
+            + self.w_bw * (self.Q_bw + raw_only_bw_pressure) * (1.0 + raw_only_bw_pressure)
+            + compute_pressure
+            * (stats.low_confidence_feature_bytes / float(max(raw_plus_feature_payload_bytes, 1)))
+        )
+        low_conf_feature_ratio = (
+            stats.low_confidence_feature_bytes
+            / float(max(raw_plus_feature_payload_bytes, 1))
+        )
+        raw_plus_feature_score = (
+            self.Q_update + 1.0 - self.pi_bar
+            + self.w_cloud * (self.Q_cloud + compute_pressure) * (1.0 + 0.5 * compute_pressure)
+            + self.w_bw * (self.Q_bw + raw_plus_feature_bw_pressure) * (1.0 + raw_plus_feature_bw_pressure)
+            + (1.0 + raw_plus_feature_bw_pressure) * low_conf_feature_ratio
+        )
+        if training_disabled:
+            raw_only_score = float("inf")
+            raw_plus_feature_score = float("inf")
+
+        action_scores = {
+            "skip_training": float(no_train_score),
+            "train_raw_only": float(raw_only_score),
+            "train_raw_plus_feature": float(raw_plus_feature_score),
         }
+        selected_action = min(action_scores, key=action_scores.get)
+        train_now = selected_action != "skip_training"
+        send_low_conf_features = selected_action == "train_raw_plus_feature"
 
-# ── Factory ──────────────────────────────────────────────────────────
+        selected_cloud_cost = 0.0
+        selected_bw_cost = 0.0
+        if train_now:
+            selected_cloud_cost = 1.0 + compute_pressure
+            selected_bw_cost = (
+                raw_plus_feature_bw_pressure
+                if send_low_conf_features
+                else raw_only_bw_pressure
+            )
+            self.trigger_count += 1
 
-def create_resource_aware_trigger(config, client=None, split_profiles=None) -> ResourceAwareCLTrigger:
-    """Build a ``ResourceAwareCLTrigger`` from the config object.
-    """
-    ra = getattr(config, "resource_aware_trigger", None)
-    dd = getattr(config, "drift_detection", None)
+        self.step += 1
+        self.Q_update = max(0.0, self.Q_update + (1.0 if train_now else 0.0) - self.pi_bar)
+        self.Q_cloud = max(0.0, self.Q_cloud + selected_cloud_cost - self.lambda_cloud)
+        self.Q_bw = max(0.0, self.Q_bw + selected_bw_cost - self.lambda_bw)
 
-    def _get(key, default, *sources):
-        for src in sources:
-            if src is not None:
-                v = getattr(src, key, None)
-                if v is not None:
-                    return v
-        return default
+        if not train_now:
+            reason = "Skipped training because Lyapunov penalty outweighed adaptation gain."
+        elif send_low_conf_features:
+            reason = (
+                "Triggered training and included low-confidence features to reduce "
+                "server recomputation under cloud compute pressure."
+            )
+        else:
+            reason = (
+                "Triggered training in raw-only low-confidence mode to reduce "
+                "bandwidth pressure."
+            )
 
-    return ResourceAwareCLTrigger(
-        pi_bar=float(_get("pi_bar", 0.1, ra, dd)),
-        V=float(_get("V", 10.0, ra, dd)),
-        K_p=float(_get("K_p", 1.0, ra, dd)),
-        K_d=float(_get("K_d", 0.5, ra, dd)),
-        lambda_cloud=float(_get("lambda_cloud", 0.5, ra)),
-        lambda_bw=float(_get("lambda_bw", 0.5, ra)),
-        lambda_priv=float(_get("lambda_priv", 0.3, ra)),
-        w_cloud=float(_get("w_cloud", 1.0, ra)),
-        w_bw=float(_get("w_bw", 1.0, ra)),
-        w_priv=float(_get("w_priv", 1.0, ra)),
-        confidence_threshold=float(_get("confidence_threshold", 0.5, ra, dd)),
-        client=client,
-        split_profiles=split_profiles or {},
-        max_tolerable_privacy=float(_get("max_tolerable_privacy", 1.0, ra)),
-        base_train_cost=float(_get("base_train_cost", 10.0, ra)),
+        decision = TrainingDecision(
+            train_now=train_now,
+            send_low_conf_features=send_low_conf_features,
+            urgency=float(urgency),
+            compute_pressure=float(compute_pressure),
+            bandwidth_pressure=float(
+                raw_plus_feature_bw_pressure
+                if send_low_conf_features
+                else raw_only_bw_pressure
+            ),
+            action_scores=action_scores,
+            reason=reason,
+        )
+        self.history.append(
+            {
+                "timestamp": time.time(),
+                "train_now": train_now,
+                "send_low_conf_features": send_low_conf_features,
+                "avg_confidence": float(avg_confidence),
+                "drift_detected": bool(drift_detected),
+                "urgency": float(urgency),
+                "compute_pressure": float(compute_pressure),
+                "bandwidth_mbps": float(bandwidth_mbps),
+                "action_scores": action_scores,
+            }
+        )
+        return decision
+
+
+def query_cloud_resource(server_ip: str, *, edge_id: int = 0, timeout_sec: float = 3.0) -> CloudResourceState:
+    with grpc.insecure_channel(server_ip) as channel:
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        reply = stub.query_resource(
+            message_transmission_pb2.ResourceRequest(edge_id=int(edge_id)),
+            timeout=timeout_sec,
+        )
+    return CloudResourceState(
+        cpu_utilization=float(reply.cpu_utilization),
+        gpu_utilization=float(reply.gpu_utilization),
+        memory_utilization=float(reply.memory_utilization),
+        train_queue_size=int(reply.train_queue_size),
+        max_queue_size=int(reply.max_queue_size),
     )
+
+
+def estimate_bandwidth(
+    server_ip: str,
+    *,
+    probe_size_bytes: int = 64 * 1024,
+    timeout_sec: float = 3.0,
+) -> float:
+    payload = "x" * max(1, int(probe_size_bytes))
+    started = time.perf_counter()
+    try:
+        with grpc.insecure_channel(server_ip) as channel:
+            stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+            reply = stub.bandwidth_probe(
+                message_transmission_pb2.BandwidthProbeRequest(payload=payload),
+                timeout=timeout_sec,
+            )
+        round_trip_sec = max(time.perf_counter() - started, 1e-6)
+        echoed_bytes = len(reply.payload.encode("utf-8"))
+        return (echoed_bytes * 8.0) / round_trip_sec / 1_000_000.0
+    except Exception:
+        return 0.0
+
+
+def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
     ra = getattr(config, "resource_aware_trigger", None)
     dd = getattr(config, "drift_detection", None)
+    retrain = getattr(config, "retrain", None)
 
-    def _get(key, default, *sources):
-        for src in sources:
-            if src is not None:
-                v = getattr(src, key, None)
-                if v is not None:
-                    return v
+    def _get(key: str, default: Any, *sources: Any) -> Any:
+        for source in sources:
+            if source is None:
+                continue
+            value = getattr(source, key, None)
+            if value is not None:
+                return value
         return default
 
     return ResourceAwareCLTrigger(
@@ -242,9 +367,10 @@ def create_resource_aware_trigger(config, client=None, split_profiles=None) -> R
         K_d=float(_get("K_d", 0.5, ra, dd)),
         lambda_cloud=float(_get("lambda_cloud", 0.5, ra)),
         lambda_bw=float(_get("lambda_bw", 0.5, ra)),
-        lambda_priv=float(_get("lambda_priv", 0.3, ra)),
         w_cloud=float(_get("w_cloud", 1.0, ra)),
         w_bw=float(_get("w_bw", 1.0, ra)),
-        w_priv=float(_get("w_priv", 1.0, ra)),
         confidence_threshold=float(_get("confidence_threshold", 0.5, ra, dd)),
+        min_training_samples=int(_get("min_training_samples", getattr(retrain, "collect_num", 1), ra)),
+        drift_bonus=float(_get("drift_bonus", 0.35, ra)),
+        upload_time_budget_sec=float(_get("upload_time_budget_sec", 5.0, ra)),
     )
