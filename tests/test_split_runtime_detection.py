@@ -14,8 +14,10 @@ from transformers import DetrConfig, DetrForObjectDetection
 from ultralytics import YOLO
 
 from model_management.candidate_profiler import profile_candidates
+from model_management.model_zoo import build_model_sample_input
+from model_management.object_detection import build_detection_model
 from model_management.payload import SplitPayload
-from model_management.split_runtime import compare_outputs
+from model_management.split_runtime import compare_outputs, reduce_output_to_loss
 from model_management.universal_model_split import UniversalModelSplitter
 
 
@@ -143,6 +145,19 @@ MODEL_FACTORIES = [
 ]
 
 
+ORIGINAL_TORCHVISION_DETECTORS = [
+    "fasterrcnn_mobilenet_v3_large_320_fpn",
+    "ssdlite320_mobilenet_v3_large",
+]
+
+
+def _make_original_detector(model_name: str) -> tuple[nn.Module, list[torch.Tensor]]:
+    torch.manual_seed(0)
+    model = build_detection_model(model_name, pretrained=False, device="cpu").eval()
+    sample = build_model_sample_input(model_name, image_size=(96, 96), device="cpu")
+    return model, sample
+
+
 def _valid_detection_candidates(splitter: UniversalModelSplitter, *, minimum_valid: int = 2):
     candidates = splitter.enumerate_candidates(max_candidates=6)
     assert candidates
@@ -266,3 +281,103 @@ def test_complex_model_tail_backward_works(family, factory):
         parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
         for parameter in params
     ), family
+
+
+@pytest.mark.parametrize("model_name", ORIGINAL_TORCHVISION_DETECTORS)
+def test_original_torchvision_detector_full_replay_matches(model_name):
+    model, sample = _make_original_detector(model_name)
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trace(model, sample)
+
+    expected = model(sample)
+    replayed = splitter.full_replay(*splitter.graph.sample_args, **splitter.graph.sample_kwargs)
+    ok, max_diff = compare_outputs(expected, replayed)
+    assert ok, (model_name, max_diff)
+
+
+@pytest.mark.parametrize("model_name", ORIGINAL_TORCHVISION_DETECTORS)
+def test_original_torchvision_detector_split_replay_matches_and_is_cache_independent(model_name):
+    model, sample = _make_original_detector(model_name)
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trace(model, sample)
+
+    chosen_candidates = []
+    for candidate in splitter.enumerate_candidates(max_candidates=8):
+        report = splitter.validate_candidate(candidate)
+        if report["success"]:
+            chosen_candidates.append(candidate)
+        if len(chosen_candidates) >= 2:
+            break
+
+    assert chosen_candidates, model_name
+    expected = model(sample)
+    for candidate in chosen_candidates[:2]:
+        splitter.split(candidate_id=candidate.candidate_id)
+        payload = splitter.edge_forward(sample)
+        replayed = splitter.cloud_forward(payload)
+        ok, max_diff = compare_outputs(expected, replayed)
+        assert ok, (model_name, candidate.candidate_id, max_diff)
+
+        fresh = UniversalModelSplitter(device="cpu")
+        fresh.trace(model, sample)
+        fresh.split(candidate_id=candidate.candidate_id)
+        clean = fresh.cloud_forward(payload.detach())
+        ok, max_diff = compare_outputs(expected, clean)
+        assert ok, (model_name, candidate.candidate_id, max_diff)
+
+
+@pytest.mark.parametrize("model_name", ORIGINAL_TORCHVISION_DETECTORS)
+def test_original_torchvision_detector_random_candidate_sample_replay_matches(model_name):
+    model, sample = _make_original_detector(model_name)
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trace(model, sample)
+
+    sampled = splitter.sample_candidates(
+        sample_size=3,
+        seed=23,
+        require_validated=True,
+        max_candidates=12,
+    )
+    assert sampled, model_name
+
+    expected = model(sample)
+    for candidate in sampled:
+        splitter.split(candidate=candidate)
+        payload = splitter.edge_forward(sample, candidate=candidate)
+        replayed = splitter.cloud_forward(payload, candidate=candidate)
+        ok, max_diff = compare_outputs(expected, replayed)
+        assert ok, (model_name, candidate.candidate_id, max_diff)
+
+
+def test_reduce_output_to_loss_supports_single_detection_dict_target():
+    boxes = torch.tensor([[1.0, 2.0, 3.0, 4.0]], requires_grad=True)
+    scores = torch.tensor([0.8], requires_grad=True)
+    outputs = [{"boxes": boxes, "labels": torch.tensor([1]), "scores": scores}]
+    targets = {
+        "boxes": torch.tensor([[1.5, 2.5, 3.5, 4.5]]),
+        "labels": torch.tensor([1]),
+        "scores": torch.tensor([0.2]),
+    }
+
+    loss = reduce_output_to_loss(outputs, targets)
+    assert torch.isfinite(loss)
+    assert float(loss.item()) > 0.0
+    loss.backward()
+    assert boxes.grad is not None and torch.count_nonzero(boxes.grad).item() > 0
+    assert scores.grad is not None and torch.count_nonzero(scores.grad).item() > 0
+
+
+def test_reduce_output_to_loss_handles_empty_detection_outputs_without_nan():
+    boxes = torch.empty((0, 4), requires_grad=True)
+    scores = torch.empty((0,), requires_grad=True)
+    outputs = [{"boxes": boxes, "labels": torch.empty((0,), dtype=torch.int64), "scores": scores}]
+    targets = {
+        "boxes": torch.empty((0, 4)),
+        "labels": torch.empty((0,), dtype=torch.int64),
+        "scores": torch.empty((0,)),
+    }
+
+    loss = reduce_output_to_loss(outputs, targets)
+    assert torch.isfinite(loss)
+    assert float(loss.item()) == 0.0
+    loss.backward()
