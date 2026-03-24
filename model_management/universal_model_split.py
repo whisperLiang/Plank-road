@@ -11,6 +11,7 @@ candidate-driven:
 from __future__ import annotations
 
 import os
+import random
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -72,6 +73,86 @@ def _cache_feature_dir(cache_path: str) -> str:
     feature_dir = os.path.join(cache_path, "features")
     os.makedirs(feature_dir, exist_ok=True)
     return feature_dir
+
+
+def _split_meta_path(cache_path: str) -> str:
+    return os.path.join(_cache_feature_dir(cache_path), "split_meta.json")
+
+
+def _write_split_cache_metadata(
+    cache_path: str,
+    payload: SplitPayload,
+    extra_metadata: Mapping[str, Any] | None = None,
+) -> None:
+    if payload.candidate_id is None and payload.split_index is None and payload.split_label is None:
+        return
+    meta_path = _split_meta_path(cache_path)
+    metadata = {
+        "universal": True,
+        "candidate_id": payload.candidate_id,
+        "split_index": payload.split_index,
+        "split_label": payload.split_label,
+        "boundary_tensor_labels": list(payload.boundary_tensor_labels),
+    }
+    if extra_metadata:
+        metadata.update(dict(extra_metadata))
+    if os.path.exists(meta_path):
+        try:
+            existing = _load_split_cache_metadata(cache_path)
+            if existing:
+                metadata = {**existing, **metadata}
+        except Exception:
+            pass
+    import json
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle)
+
+
+def _load_split_cache_metadata(cache_path: str) -> dict[str, Any]:
+    meta_path = _split_meta_path(cache_path)
+    if not os.path.exists(meta_path):
+        return {}
+    try:
+        metadata = torch.load(meta_path, map_location="cpu", weights_only=False)
+        return metadata if isinstance(metadata, dict) else {}
+    except Exception:
+        try:
+            import json
+
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+
+def _infer_cached_split_choice(
+    cache_path: str,
+    all_indices: Sequence[int],
+) -> tuple[str | None, int | None, list[str] | None]:
+    metadata = _load_split_cache_metadata(cache_path)
+    candidate_id = metadata.get("candidate_id")
+    split_index = metadata.get("split_index")
+    boundary_labels = metadata.get("boundary_tensor_labels")
+    if candidate_id is not None or split_index is not None:
+        return candidate_id, split_index, list(boundary_labels) if boundary_labels else None
+
+    for frame_index in list(all_indices):
+        try:
+            record = load_split_feature_cache(cache_path, frame_index)
+        except FileNotFoundError:
+            continue
+        payload = record.get("intermediate")
+        if isinstance(payload, SplitPayload):
+            return payload.candidate_id, payload.split_index, list(payload.boundary_tensor_labels)
+        record_boundary = record.get("boundary_tensor_labels")
+        return (
+            record.get("candidate_id"),
+            record.get("split_index"),
+            list(record_boundary) if record_boundary else None,
+        )
+    return None, None, None
 
 
 class UniversalModelSplitter(GraphSplitRuntime):
@@ -141,6 +222,57 @@ class UniversalModelSplitter(GraphSplitRuntime):
         )
         return list(self.candidates)
 
+    def sample_candidates(
+        self,
+        *,
+        sample_size: int = 3,
+        seed: int = 0,
+        require_validated: bool = True,
+        require_trainable: bool = False,
+        max_candidates: int | None = None,
+        max_boundary_count: int = 8,
+        max_payload_bytes: int = 32 * 1024 * 1024,
+    ) -> list[SplitCandidate]:
+        """Return a deterministic random sample of graph-cut candidates.
+
+        This is intended for smoke/regression runs that should exercise several
+        different graph partitions instead of always testing the same frontier.
+        When validation is requested, only replay-correct candidates are
+        sampled. Trainable sampling additionally filters to candidates whose
+        cloud tail can receive gradients during validation.
+        """
+
+        if not self.candidates:
+            self.enumerate_candidates(
+                max_candidates=max_candidates or 24,
+                max_boundary_count=max_boundary_count,
+                max_payload_bytes=max_payload_bytes,
+            )
+
+        pool = list(self.candidates[:max_candidates] if max_candidates is not None else self.candidates)
+        if require_validated:
+            validated: list[SplitCandidate] = []
+            for candidate in pool:
+                report = self.validate_candidate(candidate)
+                if not report["success"]:
+                    continue
+                if require_trainable and not report["tail_trainability"]:
+                    continue
+                validated.append(candidate)
+            pool = validated
+        elif require_trainable:
+            pool = [candidate for candidate in pool if candidate.is_trainable_tail]
+
+        if not pool:
+            return []
+
+        rng = random.Random(seed)
+        if sample_size >= len(pool):
+            sampled = list(pool)
+            rng.shuffle(sampled)
+            return sampled
+        return rng.sample(pool, sample_size)
+
     def _candidate_from_layer_index(self, layer_index: int) -> SplitCandidate:
         _, graph = self._ensure_ready()
         relevant = graph.relevant_labels
@@ -165,6 +297,7 @@ class UniversalModelSplitter(GraphSplitRuntime):
         candidate_id: str | None = None,
         layer_index: int | None = None,
         layer_label: str | None = None,
+        boundary_tensor_labels: Sequence[str] | None = None,
         candidate: SplitCandidate | None = None,
     ) -> SplitCandidate:
         if candidate is not None:
@@ -174,6 +307,18 @@ class UniversalModelSplitter(GraphSplitRuntime):
 
         if candidate_id is not None:
             self.current_candidate = self._candidate_or_default(candidate_id)
+        elif boundary_tensor_labels is not None:
+            boundary_list = list(boundary_tensor_labels)
+            boundary_set = set(boundary_list)
+            matches = [
+                item
+                for item in self.candidates
+                if item.boundary_tensor_labels == boundary_list
+                or set(item.boundary_tensor_labels) == boundary_set
+            ]
+            if not matches:
+                raise KeyError(f"No candidate matches boundary tensor labels {boundary_list!r}.")
+            self.current_candidate = matches[0]
         elif layer_label is not None:
             matches = [
                 item
@@ -202,6 +347,32 @@ class UniversalModelSplitter(GraphSplitRuntime):
 
     def full_forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.full_replay(*args, **kwargs)
+
+    def replay_inference(
+        self,
+        *args: Any,
+        candidate: SplitCandidate | str | None = None,
+        return_split_output: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        chosen = self._candidate_or_default(candidate)
+        payload = super().edge_forward(*args, candidate=chosen, **kwargs)
+        replayed = super().cloud_forward(payload.detach(), *args, candidate=chosen, **kwargs)
+        if return_split_output:
+            return replayed, payload
+        return replayed
+
+    def find_best_split_by_module(self, module_name: str) -> int:
+        _, graph = self._ensure_ready()
+        module_name = module_name.strip()
+        if not module_name:
+            raise ValueError("module_name must be non-empty.")
+        for candidate in self.candidates:
+            for label in candidate.edge_nodes:
+                node = graph.nodes[label]
+                if node.containing_module and module_name in node.containing_module:
+                    return candidate.legacy_layer_index if candidate.legacy_layer_index is not None else 0
+        raise KeyError(f"No candidate matched module name {module_name!r}.")
 
     def profile_layers(self) -> list[LayerProfile]:
         _, graph = self._ensure_ready()
@@ -326,6 +497,7 @@ def save_split_feature_cache(
     record.update(dict(extra_metadata or {}))
     out_path = os.path.join(feature_dir, f"{frame_index}.pt")
     torch.save(record, out_path)
+    _write_split_cache_metadata(cache_path, payload, extra_metadata=extra_metadata)
     return out_path
 
 
@@ -355,12 +527,22 @@ def universal_split_retrain(
 ) -> list[float]:
     splitter = UniversalModelSplitter(device=device)
     splitter.trace(model, _move_nested(sample_input, splitter.device))
-    chosen = splitter.split(candidate_id=candidate_id, layer_index=split_layer)
+    boundary_labels: list[str] | None = None
+    if candidate_id is None and split_layer is None:
+        candidate_id, split_layer, boundary_labels = _infer_cached_split_choice(cache_path, all_indices)
+    if boundary_labels:
+        try:
+            chosen = splitter.split(boundary_tensor_labels=boundary_labels)
+        except KeyError:
+            chosen = splitter.split(candidate_id=candidate_id, layer_index=split_layer)
+    else:
+        chosen = splitter.split(candidate_id=candidate_id, layer_index=split_layer)
     splitter.freeze_head(chosen)
     splitter.unfreeze_tail(chosen)
     params = splitter.get_tail_trainable_params(chosen)
     optimizer = torch.optim.Adam(params, lr=1e-3) if params else None
     losses: list[float] = []
+    finite_steps = 0
 
     for _ in range(num_epoch):
         epoch_loss = 0.0
@@ -369,11 +551,31 @@ def universal_split_retrain(
             payload = record["intermediate"]
             cached_candidate_id = record.get("candidate_id")
             cached_split_index = record.get("split_index")
-            if cached_candidate_id and cached_candidate_id != chosen.candidate_id:
+            payload_boundary_labels = None
+            if isinstance(payload, SplitPayload):
+                payload_boundary_labels = list(payload.boundary_tensor_labels)
+            if payload_boundary_labels is None:
+                record_boundary = record.get("boundary_tensor_labels")
+                payload_boundary_labels = list(record_boundary) if record_boundary else None
+            if payload_boundary_labels and list(chosen.boundary_tensor_labels) != payload_boundary_labels:
+                raise RuntimeError(
+                    "Cached boundary tensor labels do not match the selected candidate. "
+                    f"cached={payload_boundary_labels}, selected={chosen.boundary_tensor_labels}."
+                )
+            if (
+                payload_boundary_labels is None
+                and cached_candidate_id
+                and cached_candidate_id != chosen.candidate_id
+            ):
                 raise RuntimeError(
                     f"Cached candidate_id={cached_candidate_id} does not match selected {chosen.candidate_id}."
                 )
-            if cached_split_index is not None and chosen.legacy_layer_index is not None and cached_split_index != chosen.legacy_layer_index:
+            if (
+                payload_boundary_labels is None
+                and cached_split_index is not None
+                and chosen.legacy_layer_index is not None
+                and cached_split_index != chosen.legacy_layer_index
+            ):
                 raise RuntimeError(
                     f"Cached split_index={cached_split_index} does not match selected {chosen.legacy_layer_index}."
                 )
@@ -392,8 +594,18 @@ def universal_split_retrain(
                 optimizer=optimizer,
                 candidate=chosen,
             )
+            if not bool(torch.isfinite(loss).item()):
+                if optimizer is not None:
+                    optimizer.zero_grad(set_to_none=True)
+                continue
+            finite_steps += 1
             epoch_loss += float(loss.item())
         losses.append(epoch_loss / max(1, len(all_indices)))
+    if optimizer is not None and params and finite_steps == 0:
+        raise RuntimeError(
+            "Split retraining did not produce any finite optimization step. "
+            "The selected candidate may replay empty/non-differentiable detector outputs."
+        )
     return losses
 
 

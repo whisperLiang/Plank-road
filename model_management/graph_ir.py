@@ -34,16 +34,188 @@ def _normalize_path_key(path: Any) -> tuple[Any, ...]:
 def _safe_deepcopy(obj: Any) -> Any:
     if isinstance(obj, torch.Tensor):
         return obj.detach().cpu()
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        values = {
+            field.name: _safe_deepcopy(getattr(obj, field.name))
+            for field in dataclasses.fields(obj)
+        }
+        try:
+            return type(obj)(**values)
+        except Exception:
+            return values
     if isinstance(obj, list):
         return [_safe_deepcopy(item) for item in obj]
+    if isinstance(obj, tuple) and hasattr(type(obj), "_fields"):
+        values = [_safe_deepcopy(item) for item in obj]
+        try:
+            return type(obj)(*values)
+        except Exception:
+            return tuple(values)
     if isinstance(obj, tuple):
         return tuple(_safe_deepcopy(item) for item in obj)
     if isinstance(obj, dict):
-        return {key: _safe_deepcopy(value) for key, value in obj.items()}
+        values = {key: _safe_deepcopy(value) for key, value in obj.items()}
+        if type(obj) is dict:
+            return values
+        try:
+            return type(obj)(values)
+        except Exception:
+            return values
     try:
         return copy.deepcopy(obj)
     except Exception:
         return obj
+
+
+def _resolve_attr_path(root: Any, dotted_path: str | None) -> Any:
+    if not dotted_path:
+        return root
+    current = root
+    for part in dotted_path.split("."):
+        if isinstance(current, (list, tuple)) and part.isdigit():
+            current = current[int(part)]
+        elif isinstance(current, dict):
+            current = current[part]
+        else:
+            current = getattr(current, part)
+    return current
+
+
+def _index_nested(obj: Any, path: Sequence[Any]) -> Any:
+    current = obj
+    for part in path:
+        if dataclasses.is_dataclass(current) and not isinstance(current, type):
+            current = getattr(current, str(part))
+        else:
+            current = current[part]
+    return current
+
+
+def _clone_tree_tensors(tree: Any, *, device: torch.device | None = None, detach: bool = False) -> Any:
+    memo: dict[int, Any] = {}
+
+    def _clone(value: Any) -> Any:
+        value_id = id(value)
+        if value_id in memo:
+            return memo[value_id]
+        if isinstance(value, torch.Tensor):
+            cloned = value.detach().clone() if detach else value.clone()
+            if device is not None:
+                cloned = cloned.to(device)
+            memo[value_id] = cloned
+            return cloned
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            kwargs = {
+                field.name: _clone(getattr(value, field.name))
+                for field in dataclasses.fields(value)
+            }
+            try:
+                cloned = type(value)(**kwargs)
+            except Exception:
+                cloned = kwargs
+            memo[value_id] = cloned
+            return cloned
+        if isinstance(value, list):
+            cloned_list: list[Any] = []
+            memo[value_id] = cloned_list
+            cloned_list.extend(_clone(item) for item in value)
+            return cloned_list
+        if isinstance(value, tuple):
+            items = [_clone(item) for item in value]
+            if hasattr(type(value), "_fields"):
+                try:
+                    cloned_tuple = type(value)(*items)
+                except Exception:
+                    cloned_tuple = tuple(items)
+            else:
+                cloned_tuple = tuple(items)
+            memo[value_id] = cloned_tuple
+            return cloned_tuple
+        if isinstance(value, dict):
+            cloned_dict = {key: _clone(item) for key, item in value.items()}
+            if type(value) is not dict:
+                try:
+                    cloned_dict = type(value)(cloned_dict)
+                except Exception:
+                    pass
+            memo[value_id] = cloned_dict
+            return cloned_dict
+        try:
+            cloned = copy.copy(value)
+        except Exception:
+            cloned = value
+        memo[value_id] = cloned
+        return cloned
+
+    return _clone(tree)
+
+
+def _tensor_exact_match(candidate: Any, target: torch.Tensor) -> bool:
+    return (
+        isinstance(candidate, torch.Tensor)
+        and candidate.shape == target.shape
+        and candidate.dtype == target.dtype
+        and torch.equal(candidate, target)
+    )
+
+
+def _find_tensor_path(container: Any, target: torch.Tensor) -> tuple[Any, ...] | None:
+    if isinstance(container, torch.Tensor):
+        return () if _tensor_exact_match(container, target) else None
+    if dataclasses.is_dataclass(container) and not isinstance(container, type):
+        for field in dataclasses.fields(container):
+            subpath = _find_tensor_path(getattr(container, field.name), target)
+            if subpath is not None:
+                return (field.name,) + subpath
+        return None
+    if isinstance(container, (list, tuple)):
+        for index, value in enumerate(container):
+            subpath = _find_tensor_path(value, target)
+            if subpath is not None:
+                return (index,) + subpath
+        return None
+    if isinstance(container, dict):
+        for key, value in container.items():
+            subpath = _find_tensor_path(value, target)
+            if subpath is not None:
+                return (key,) + subpath
+        return None
+    return None
+
+
+def _infer_parent_output_path(parent_layer: Any, child_label: str) -> tuple[Any, ...] | None:
+    child_versions = _get_attr(parent_layer, "children_tensor_versions", default={}) or {}
+    if child_label not in child_versions:
+        return None
+    child_saved_value = child_versions[child_label]
+    parent_activation = _get_attr(parent_layer, "activation", default=None)
+    if not isinstance(child_saved_value, torch.Tensor) or parent_activation is None:
+        return None
+    return _find_tensor_path(parent_activation, child_saved_value)
+
+
+def _infer_child_specific_frozen_value(
+    *,
+    parent_layer: Any,
+    child_label: str,
+    captured_container: Any,
+    location: tuple[Any, ...],
+) -> Any:
+    child_versions = _get_attr(parent_layer, "children_tensor_versions", default={}) or {}
+    child_saved_value = child_versions.get(child_label)
+    if not isinstance(child_saved_value, torch.Tensor):
+        return None
+    if child_saved_value.requires_grad:
+        return None
+    if _infer_parent_output_path(parent_layer, child_label) is not None:
+        return None
+    try:
+        captured_value = _index_nested(captured_container, location)
+    except Exception:
+        return None
+    if not _tensor_exact_match(child_saved_value, captured_value):
+        return None
+    return _clone_tree_tensors(child_saved_value.detach().cpu(), detach=True)
 
 
 def _infer_func_name(layer: Any) -> str:
@@ -77,6 +249,8 @@ def _layer_creation_kwargs(layer: Any) -> dict[str, Any]:
 @dataclass(frozen=True)
 class ParentTensorRef:
     parent_label: str
+    path: tuple[Any, ...] | None = None
+    frozen_value: Any = None
 
 
 @dataclass(frozen=True)
@@ -107,7 +281,7 @@ class TreeSpec:
     address: str | None = None
     value: Any = None
     children: Any = None
-    type_name: str | None = None
+    type_ref: Any = None
 
 
 def build_tree_spec(obj: Any, prefix: str) -> tuple[TreeSpec, OrderedDict[str, torch.Tensor]]:
@@ -121,12 +295,12 @@ def build_tree_spec(obj: Any, prefix: str) -> tuple[TreeSpec, OrderedDict[str, t
             fields = OrderedDict()
             for field_info in dataclasses.fields(current):
                 fields[field_info.name] = _build(getattr(current, field_info.name), f"{address}.{field_info.name}")
-            return TreeSpec(kind="dataclass", type_name=type(current).__name__, children=fields)
+            return TreeSpec(kind="dataclass", type_ref=type(current), children=fields)
         if isinstance(current, tuple) and hasattr(current, "_fields"):
             fields = OrderedDict()
             for field_name in current._fields:
                 fields[field_name] = _build(getattr(current, field_name), f"{address}.{field_name}")
-            return TreeSpec(kind="namedtuple", type_name=type(current).__name__, children=fields)
+            return TreeSpec(kind="namedtuple", type_ref=type(current), children=fields)
         if isinstance(current, list):
             return TreeSpec(
                 kind="list",
@@ -135,13 +309,14 @@ def build_tree_spec(obj: Any, prefix: str) -> tuple[TreeSpec, OrderedDict[str, t
         if isinstance(current, tuple):
             return TreeSpec(
                 kind="tuple",
+                type_ref=type(current),
                 children=[_build(item, f"{address}.{index}") for index, item in enumerate(current)],
             )
         if isinstance(current, dict):
             fields = OrderedDict()
             for key, value in current.items():
                 fields[key] = _build(value, f"{address}.{key}")
-            return TreeSpec(kind="dict", children=fields)
+            return TreeSpec(kind="dict", type_ref=type(current), children=fields)
         return TreeSpec(kind="const", value=_safe_deepcopy(current))
 
     return _build(obj, prefix), leaves
@@ -155,27 +330,77 @@ def materialize_tree_spec(spec: TreeSpec, tensor_map: Mapping[str, torch.Tensor]
     if spec.kind == "list":
         return [materialize_tree_spec(child, tensor_map) for child in spec.children]
     if spec.kind == "tuple":
-        return tuple(materialize_tree_spec(child, tensor_map) for child in spec.children)
+        items = [materialize_tree_spec(child, tensor_map) for child in spec.children]
+        tuple_type = spec.type_ref or tuple
+        if tuple_type is tuple:
+            return tuple(items)
+        try:
+            return tuple_type(items)
+        except Exception:
+            return tuple(items)
     if spec.kind == "dict":
-        return {key: materialize_tree_spec(child, tensor_map) for key, child in spec.children.items()}
+        rebuilt = {key: materialize_tree_spec(child, tensor_map) for key, child in spec.children.items()}
+        dict_type = spec.type_ref or dict
+        if dict_type is dict:
+            return rebuilt
+        try:
+            return dict_type(rebuilt)
+        except Exception:
+            return rebuilt
     if spec.kind == "namedtuple":
         values = {key: materialize_tree_spec(child, tensor_map) for key, child in spec.children.items()}
-        return values
+        tuple_type = spec.type_ref
+        if tuple_type is None:
+            return values
+        try:
+            return tuple_type(**values)
+        except Exception:
+            try:
+                return tuple_type(*values.values())
+            except Exception:
+                return values
     if spec.kind == "dataclass":
         values = {key: materialize_tree_spec(child, tensor_map) for key, child in spec.children.items()}
-        return values
+        dataclass_type = spec.type_ref
+        if dataclass_type is None:
+            return values
+        try:
+            return dataclass_type(**values)
+        except Exception:
+            return values
     raise ValueError(f"Unsupported TreeSpec kind: {spec.kind}")
 
 
 def _replace_placeholders(obj: Any, resolver) -> Any:
     if isinstance(obj, (ParentTensorRef, ParameterTensorRef, BufferTensorRef, ConstantTensorRef)):
         return resolver(obj)
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        values = {
+            field.name: _replace_placeholders(getattr(obj, field.name), resolver)
+            for field in dataclasses.fields(obj)
+        }
+        try:
+            return type(obj)(**values)
+        except Exception:
+            return values
     if isinstance(obj, list):
         return [_replace_placeholders(item, resolver) for item in obj]
     if isinstance(obj, tuple):
-        return tuple(_replace_placeholders(item, resolver) for item in obj)
+        values = [_replace_placeholders(item, resolver) for item in obj]
+        if hasattr(type(obj), "_fields"):
+            try:
+                return type(obj)(*values)
+            except Exception:
+                return tuple(values)
+        return tuple(values)
     if isinstance(obj, dict):
-        return {key: _replace_placeholders(value, resolver) for key, value in obj.items()}
+        rebuilt = {key: _replace_placeholders(value, resolver) for key, value in obj.items()}
+        if type(obj) is dict:
+            return rebuilt
+        try:
+            return type(obj)(rebuilt)
+        except Exception:
+            return rebuilt
     return _safe_deepcopy(obj)
 
 
@@ -197,11 +422,19 @@ def flatten_bound_inputs(bound: inspect.BoundArguments) -> "OrderedDict[str, tor
         if isinstance(value, torch.Tensor):
             flattened[prefix] = value
             return
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            for field in dataclasses.fields(value):
+                _walk(getattr(value, field.name), f"{prefix}.{field.name}")
+            return
         if isinstance(value, list):
             for index, item in enumerate(value):
                 _walk(item, f"{prefix}.{index}")
             return
         if isinstance(value, tuple):
+            if hasattr(type(value), "_fields"):
+                for field in value._fields:
+                    _walk(getattr(value, field), f"{prefix}.{field}")
+                return
             for index, item in enumerate(value):
                 _walk(item, f"{prefix}.{index}")
             return
@@ -233,6 +466,7 @@ class GraphNode:
     containing_modules: list[str]
     is_input: bool
     is_output: bool
+    is_inplace: bool
     is_multi_output: bool
     multi_output_index: int | None
     aggregation_kind: str | None
@@ -249,21 +483,40 @@ class GraphNode:
 
     def resolve_args(
         self,
-        available_tensors: Mapping[str, torch.Tensor],
+        available_tensors: Mapping[str, Any],
         model: torch.nn.Module,
         device: torch.device | None = None,
+        clone_parent_labels: set[str] | None = None,
+        clone_cache: dict[tuple[str, tuple[Any, ...] | None], Any] | None = None,
     ) -> tuple[list[Any], dict[str, Any]]:
+        clone_parent_labels = clone_parent_labels or set()
+        clone_cache = clone_cache or {}
+
         def _resolve(ref: ArgPlaceholder) -> Any:
             if isinstance(ref, ParentTensorRef):
-                return available_tensors[ref.parent_label]
+                if ref.frozen_value is not None:
+                    return _clone_tree_tensors(ref.frozen_value, device=device, detach=True)
+                value = available_tensors[ref.parent_label]
+                if ref.path:
+                    value = _index_nested(value, ref.path)
+                if ref.parent_label not in clone_parent_labels:
+                    return value
+                cache_key = (ref.parent_label, ref.path)
+                if cache_key not in clone_cache:
+                    clone_cache[cache_key] = _clone_tree_tensors(value, device=device, detach=False)
+                return clone_cache[cache_key]
             if isinstance(ref, ParameterTensorRef):
-                module = model.get_submodule(ref.module_path) if ref.module_path else model
+                module = _resolve_attr_path(model, ref.module_path)
                 return getattr(module, ref.param_name)
             if isinstance(ref, BufferTensorRef):
-                module = model.get_submodule(ref.module_path) if ref.module_path else model
+                module = _resolve_attr_path(model, ref.module_path)
                 try:
                     return module.get_buffer(ref.buffer_name)
-                except AttributeError:
+                except (AttributeError, TypeError):
+                    if isinstance(module, (list, tuple)) and ref.buffer_name.isdigit():
+                        return module[int(ref.buffer_name)]
+                    if isinstance(module, dict):
+                        return module[ref.buffer_name]
                     return getattr(module, ref.buffer_name)
             if isinstance(ref, ConstantTensorRef):
                 tensor = ref.tensor
@@ -323,9 +576,106 @@ def estimate_node_flops(layer_type: str, output_shape: tuple[int, ...] | None, c
     return output_elements
 
 
-def _build_arg_templates(layer: Any) -> tuple[list[Any], dict[str, Any], list[ParameterTensorRef]]:
+def _tensor_ref_from_address(address: str | None, *, kind: str) -> ParameterTensorRef | BufferTensorRef | None:
+    if not address:
+        return None
+    if "." in address:
+        module_path, name = address.rsplit(".", 1)
+    else:
+        module_path, name = "", address
+    fq_name = f"{module_path}.{name}" if module_path else name
+    if kind == "param":
+        return ParameterTensorRef(module_path=module_path, param_name=name, fq_name=fq_name)
+    return BufferTensorRef(module_path=module_path, buffer_name=name, fq_name=fq_name)
+
+
+def _iter_constant_tensor_paths(value: Any, path: tuple[Any, ...] = ()) -> Iterator[tuple[tuple[Any, ...], ConstantTensorRef]]:
+    if isinstance(value, ConstantTensorRef):
+        yield path, value
+        return
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for field in dataclasses.fields(value):
+            yield from _iter_constant_tensor_paths(getattr(value, field.name), path + (field.name,))
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from _iter_constant_tensor_paths(item, path + (index,))
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_constant_tensor_paths(item, path + (key,))
+
+
+def _apply_placeholder_at_path(template: Any, path: tuple[Any, ...], placeholder: ArgPlaceholder) -> Any:
+    if not path:
+        return placeholder
+    head, *tail = path
+    if dataclasses.is_dataclass(template) and not isinstance(template, type):
+        values = {field.name: getattr(template, field.name) for field in dataclasses.fields(template)}
+        values[str(head)] = _apply_placeholder_at_path(values[str(head)], tuple(tail), placeholder)
+        try:
+            return type(template)(**values)
+        except Exception:
+            return values
+    if isinstance(template, list):
+        updated = list(template)
+        updated[int(head)] = _apply_placeholder_at_path(updated[int(head)], tuple(tail), placeholder)
+        return updated
+    if isinstance(template, tuple):
+        updated = list(template)
+        updated[int(head)] = _apply_placeholder_at_path(updated[int(head)], tuple(tail), placeholder)
+        if hasattr(type(template), "_fields"):
+            try:
+                return type(template)(*updated)
+            except Exception:
+                return tuple(updated)
+        return tuple(updated)
+    if isinstance(template, dict):
+        updated = dict(template)
+        updated[head] = _apply_placeholder_at_path(updated[head], tuple(tail), placeholder)
+        if type(template) is not dict:
+            try:
+                return type(template)(updated)
+            except Exception:
+                return updated
+        return updated
+    return template
+
+
+def _find_matching_parent_ref(
+    target: torch.Tensor,
+    *,
+    current_label: str,
+    previous_layers: Sequence[Any],
+) -> ParentTensorRef | None:
+    for parent_layer in reversed(list(previous_layers)):
+        parent_label = _get_attr(parent_layer, "layer_label", default=None)
+        if parent_label is None:
+            continue
+        child_versions = _get_attr(parent_layer, "children_tensor_versions", default={}) or {}
+        child_version = child_versions.get(current_label)
+        if _tensor_exact_match(child_version, target):
+            path = _find_tensor_path(_get_attr(parent_layer, "activation", default=None), child_version)
+            frozen_value = None
+            if path is None and isinstance(child_version, torch.Tensor) and not child_version.requires_grad:
+                frozen_value = _clone_tree_tensors(child_version.detach().cpu(), detach=True)
+            return ParentTensorRef(parent_label=parent_label, path=path, frozen_value=frozen_value)
+        parent_activation = _get_attr(parent_layer, "activation", default=None)
+        path = _find_tensor_path(parent_activation, target)
+        if path is not None:
+            return ParentTensorRef(parent_label=parent_label, path=path)
+    return None
+
+
+def _build_arg_templates(
+    layer: Any,
+    *,
+    previous_layers: Sequence[Any],
+    parent_layer_lookup: Mapping[str, Any],
+) -> tuple[list[Any], dict[str, Any], list[ParameterTensorRef], list[str]]:
     creation_args = _layer_creation_args(layer)
     creation_kwargs = _layer_creation_kwargs(layer)
+    current_label = _get_attr(layer, "layer_label", default="")
 
     parent_arg_locations_raw = _get_attr(layer, "parent_layer_arg_locs", default={}) or {}
     parent_arg_locations = {
@@ -349,28 +699,98 @@ def _build_arg_templates(layer: Any) -> tuple[list[Any], dict[str, Any], list[Pa
         param_refs.append(ref)
         param_queue.append(ref)
 
+    inferred_parent_labels: list[str] = []
+
     def _mark(obj: Any, location_kind: str, prefix: tuple[Any, ...] = ()) -> Any:
         if isinstance(obj, torch.Tensor):
+            param_address = getattr(obj, "tl_param_address", None)
+            if param_address:
+                ref = _tensor_ref_from_address(param_address, kind="param")
+                if isinstance(ref, ParameterTensorRef):
+                    if all(existing.fq_name != ref.fq_name for existing in param_refs):
+                        param_refs.append(ref)
+                    return ref
+            buffer_address = getattr(obj, "tl_buffer_address", None)
+            if buffer_address:
+                ref = _tensor_ref_from_address(buffer_address, kind="buffer")
+                if isinstance(ref, BufferTensorRef):
+                    return ref
             parent_label = parent_arg_locations[location_kind].get(prefix)
             if parent_label is not None:
-                return ParentTensorRef(parent_label)
+                parent_layer = parent_layer_lookup.get(parent_label)
+                inferred_parent_labels.append(parent_label)
+                return ParentTensorRef(
+                    parent_label=parent_label,
+                    path=_infer_parent_output_path(parent_layer, current_label) if parent_layer is not None else None,
+                    frozen_value=(
+                        _infer_child_specific_frozen_value(
+                            parent_layer=parent_layer,
+                            child_label=current_label,
+                            captured_container=creation_args if location_kind == "args" else creation_kwargs,
+                            location=prefix,
+                        )
+                        if parent_layer is not None
+                        else None
+                    ),
+                )
             if param_queue:
                 return param_queue.pop(0)
             return ConstantTensorRef(obj.detach().cpu())
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            values = {
+                field.name: _mark(getattr(obj, field.name), location_kind, prefix + (field.name,))
+                for field in dataclasses.fields(obj)
+            }
+            try:
+                return type(obj)(**values)
+            except Exception:
+                return values
         if isinstance(obj, list):
             return [_mark(item, location_kind, prefix + (index,)) for index, item in enumerate(obj)]
         if isinstance(obj, tuple):
-            return tuple(_mark(item, location_kind, prefix + (index,)) for index, item in enumerate(obj))
+            values = [_mark(item, location_kind, prefix + (index,)) for index, item in enumerate(obj)]
+            if hasattr(type(obj), "_fields"):
+                try:
+                    return type(obj)(*values)
+                except Exception:
+                    return tuple(values)
+            return tuple(values)
         if isinstance(obj, dict):
-            return {
-                key: _mark(value, location_kind, prefix + (key,))
-                for key, value in obj.items()
-            }
+            values = {key: _mark(value, location_kind, prefix + (key,)) for key, value in obj.items()}
+            if type(obj) is not dict:
+                try:
+                    return type(obj)(values)
+                except Exception:
+                    return values
+            return values
         return _safe_deepcopy(obj)
 
     arg_template = _mark(creation_args, "args", ())
     kwarg_template = _mark(creation_kwargs, "kwargs", ())
-    return arg_template, kwarg_template, param_refs
+
+    for path, tensor_const in list(_iter_constant_tensor_paths(arg_template)):
+        parent_ref = _find_matching_parent_ref(
+            tensor_const.tensor,
+            current_label=current_label,
+            previous_layers=previous_layers,
+        )
+        if parent_ref is None:
+            continue
+        arg_template = _apply_placeholder_at_path(arg_template, path, parent_ref)
+        inferred_parent_labels.append(parent_ref.parent_label)
+
+    for path, tensor_const in list(_iter_constant_tensor_paths(kwarg_template)):
+        parent_ref = _find_matching_parent_ref(
+            tensor_const.tensor,
+            current_label=current_label,
+            previous_layers=previous_layers,
+        )
+        if parent_ref is None:
+            continue
+        kwarg_template = _apply_placeholder_at_path(kwarg_template, path, parent_ref)
+        inferred_parent_labels.append(parent_ref.parent_label)
+
+    return arg_template, kwarg_template, param_refs, inferred_parent_labels
 
 
 def _buffer_ref_from_layer(layer: Any) -> list[BufferTensorRef]:
@@ -518,6 +938,10 @@ def build_graph_from_trace(
     sample_output: Any,
 ) -> GraphIR:
     layer_list = list(_get_attr(history, "layer_list", default=[])) or []
+    parent_layer_lookup = {
+        _get_attr(layer, "layer_label", default=f"layer_{index}"): layer
+        for index, layer in enumerate(layer_list)
+    }
     label2idx = build_label_maps(history)
     input_labels, output_labels = identify_io_nodes(history)
     topo = _topological_order_from_history(history)
@@ -525,12 +949,19 @@ def build_graph_from_trace(
 
     for index, layer in enumerate(layer_list):
         label = _get_attr(layer, "layer_label", default=f"layer_{index}")
-        parent_labels = list(_get_attr(layer, "parent_layers", default=[])) or []
+        explicit_parent_labels = list(_get_attr(layer, "parent_layers", default=[])) or []
         func_name = _infer_func_name(layer)
         node_type = (_get_attr(layer, "layer_type", default="operation") or "operation").lower()
         if label not in topo:
             topo.append(label)
-        arg_template, kwarg_template, param_refs = _build_arg_templates(layer)
+        arg_template, kwarg_template, param_refs, inferred_parent_labels = _build_arg_templates(
+            layer,
+            previous_layers=layer_list[:index],
+            parent_layer_lookup=parent_layer_lookup,
+        )
+        parent_labels = list(
+            OrderedDict.fromkeys(explicit_parent_labels + [parent for parent in inferred_parent_labels if parent != label])
+        )
         buffer_refs = _buffer_ref_from_layer(layer)
         tensor_shape = tuple(_get_attr(layer, "tensor_shape", default=()) or ()) or None
         tensor_dtype = _get_attr(layer, "tensor_dtype", default=None)
@@ -570,6 +1001,7 @@ def build_graph_from_trace(
             containing_modules=list(_get_attr(layer, "containing_modules_origin_nested", default=[])) or [],
             is_input=bool(_get_attr(layer, "is_input_layer", default=node_type == "input")),
             is_output=bool(_get_attr(layer, "is_output_layer", default=node_type == "output") or node_type == "output"),
+            is_inplace=bool(_get_attr(layer, "func_is_inplace", default=False)),
             is_multi_output=bool(_get_attr(layer, "is_part_of_iterable_output", default=False)),
             multi_output_index=_get_attr(layer, "iterable_output_index", default=None),
             aggregation_kind=_aggregation_kind(func_name),

@@ -237,6 +237,37 @@ def _module_frontiers(graph: GraphIR) -> list[set[str]]:
     return frontiers
 
 
+def _trainable_prefix_seeds(graph: GraphIR) -> list[set[str]]:
+    relevant = list(graph.relevant_labels)
+    trainable_positions = [
+        index
+        for index, label in enumerate(relevant[:-1])
+        if graph.nodes[label].has_trainable_params
+        and not graph.nodes[label].is_input
+        and not graph.nodes[label].is_output
+    ]
+    if not trainable_positions:
+        return []
+
+    targets = [0.1, 0.25, 0.4, 0.55, 0.7]
+    sampled_positions: list[int] = []
+    for ratio in targets:
+        picked = trainable_positions[min(len(trainable_positions) - 1, int(len(trainable_positions) * ratio))]
+        if picked not in sampled_positions:
+            sampled_positions.append(picked)
+
+    seeds: list[set[str]] = []
+    for position in sampled_positions:
+        prefix = {
+            label
+            for label in relevant[: position + 1]
+            if not graph.nodes[label].is_input and not graph.nodes[label].is_output
+        }
+        if prefix:
+            seeds.append(prefix)
+    return seeds
+
+
 def generate_candidates_from_graph(
     graph: GraphIR,
     *,
@@ -268,8 +299,29 @@ def generate_candidates_from_graph(
             continue
         candidates.append(candidate)
 
+    for index, seed in enumerate(_trainable_prefix_seeds(graph), start=len(tentative_frontiers)):
+        candidate = build_candidate_from_edge_seed(
+            graph,
+            candidate_id=f"candidate_{index:03d}",
+            edge_seed_nodes=seed,
+            legacy_layer_index=max(graph.nodes[label].topological_index for label in seed),
+            metadata={"source": "trainable_prefix"},
+        )
+        if candidate is None:
+            continue
+        key = tuple(sorted(candidate.edge_nodes))
+        if key in dedupe:
+            continue
+        dedupe.add(key)
+        if candidate.boundary_count > max_boundary_count:
+            continue
+        if candidate.estimated_payload_bytes > max_payload_bytes:
+            continue
+        candidates.append(candidate)
+
     candidates.sort(
         key=lambda item: (
+            not item.is_trainable_tail,
             item.estimated_latency,
             abs(item.estimated_edge_flops - item.estimated_cloud_flops),
             item.estimated_payload_bytes,
@@ -294,6 +346,7 @@ def prune_candidates(
     filtered.sort(
         key=lambda item: (
             item.validation_error is not None,
+            not item.is_trainable_tail,
             item.estimated_latency,
             item.estimated_payload_bytes,
             -item.estimated_cloud_flops,
