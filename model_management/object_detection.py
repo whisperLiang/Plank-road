@@ -1,4 +1,5 @@
 import threading
+from dataclasses import dataclass
 
 import cv2
 import pandas as pd
@@ -17,7 +18,15 @@ from model_management.model_zoo import (
 from PIL import Image
 from torchvision import transforms
 from mapcalc import calculate_map
-from model_management.utils import get_offloading_region, get_offloading_image
+
+
+@dataclass
+class InferenceArtifacts:
+    intermediate: object | None
+    detection_boxes: list
+    detection_class: list
+    detection_score: list
+    confidence: float
 
 def _collate_fn(batch):
     return tuple(zip(*batch))
@@ -276,7 +285,7 @@ class Object_Detection:
         height, width = image_size
         return [torch.rand(3, height, width, device=device)]
 
-    def small_inference(self, img, splitter=None, return_split_payload=False):
+    def infer_sample(self, img, splitter=None) -> InferenceArtifacts:
         split_payload = None
         with self.model_lock:
             if splitter is not None:
@@ -289,33 +298,52 @@ class Object_Detection:
                 )
             else:
                 pred_boxes, pred_class, pred_score = self.get_model_prediction(img, self.threshold_low)
-        if pred_boxes == None:
-            if return_split_payload:
-                return None, None, None, None, split_payload
-            return None, None, None, None
-        #filter high confidence region as the detection result
+
+        if pred_boxes is None or pred_score is None:
+            return InferenceArtifacts(
+                intermediate=split_payload,
+                detection_boxes=[],
+                detection_class=[],
+                detection_score=[],
+                confidence=0.0,
+            )
+
+        confidence = float(np.mean(pred_score)) if len(pred_score) else 0.0
         try:
             prediction_index = [pred_score.index(x) for x in pred_score if x > self.threshold_high][-1]
         except IndexError:
-            detection_boxes = None
-            detection_class = None
-            detection_score = None
+            detection_boxes = []
+            detection_class = []
+            detection_score = []
         else:
             detection_boxes = pred_boxes[:prediction_index + 1]
             detection_class = pred_class[:prediction_index + 1]
             detection_score = pred_score[:prediction_index + 1]
-        #split into high and low confidence region
-        high_detections = detection_boxes
-        low_regions = pred_boxes
-        #get the inferencer that need to query
-        offloading_region = get_offloading_region(high_detections, low_regions, img.shape)
-        if len(offloading_region) == 0:
-            offloading_image = None
-        else:
-            offloading_image = get_offloading_image(offloading_region, img)
+
+        return InferenceArtifacts(
+            intermediate=split_payload,
+            detection_boxes=detection_boxes,
+            detection_class=detection_class,
+            detection_score=detection_score,
+            confidence=confidence,
+        )
+
+    def small_inference(self, img, splitter=None, return_split_payload=False):
+        artifacts = self.infer_sample(img, splitter=splitter)
         if return_split_payload:
-            return offloading_image, detection_boxes, detection_class, detection_score, split_payload
-        return offloading_image, detection_boxes, detection_class, detection_score
+            return (
+                None,
+                artifacts.detection_boxes or None,
+                artifacts.detection_class or None,
+                artifacts.detection_score or None,
+                artifacts.intermediate,
+            )
+        return (
+            None,
+            artifacts.detection_boxes or None,
+            artifacts.detection_class or None,
+            artifacts.detection_score or None,
+        )
 
 
     def large_inference(self, img):

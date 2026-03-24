@@ -114,7 +114,7 @@ client:
  #   Q_bw     — bounds average bandwidth     ≤  lambda_bw
  #   Q_priv   — bounds privacy leakage       ≤  lambda_priv
  resource_aware_trigger:
-  enabled: False
+  enabled: True
   # --- Shared with drift_detection (RCCDA PD controller) ---
   # pi_bar: 0.1          # max avg CL trigger rate
   # V: 10.0              # Lyapunov trade-off coefficient
@@ -129,6 +129,9 @@ client:
   w_cloud: 1.0           # weight for cloud-cost queue
   w_bw: 1.0              # weight for bandwidth queue
   w_priv: 1.0            # weight for privacy queue
+  min_training_samples: 10
+  drift_bonus: 0.35
+  upload_time_budget_sec: 5.0
  # Split learning for continual learning 
  # When enabled, backbone features are extracted and cached on the edge.
  # Only drift-moment samples are annotated by the cloud's large model;
@@ -164,6 +167,13 @@ client:
    # latency_weight: 1.0          # LinUCB: 1.0=pure latency, 0.0=pure privacy
    # ucb_alpha: 0.25              # LinUCB exploration coefficient
    # only_parametric: False       # consider only Conv/Linear/BN layers
+  fixed_split:
+   privacy_metric_lower_bound: 0.15
+   max_layer_freezing_ratio: 0.75
+   validate_candidates: True
+   max_candidates: 24
+   max_boundary_count: 8
+   max_payload_bytes: 33554432
 
 server:
  server_id: 0
