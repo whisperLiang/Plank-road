@@ -10,6 +10,12 @@ from tools.convert_tool import cv2_to_base64
 import zipfile
 import io
 
+from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
+from model_management.fixed_split import SplitPlan
+from model_management.continual_learning_bundle import (
+    CONTINUAL_LEARNING_PROTOCOL_VERSION,
+)
+
 def pack_training_payload(cache_path, all_frame_indices, drift_frame_indices=None):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -33,6 +39,58 @@ def pack_training_payload(cache_path, all_frame_indices, drift_frame_indices=Non
                 if os.path.exists(frame_path):
                     zf.write(frame_path, arcname=f"frames/{idx}.jpg")
     return buf.getvalue()
+
+
+def pack_continual_learning_bundle(
+    sample_store: EdgeSampleStore,
+    *,
+    edge_id: int,
+    send_low_conf_features: bool,
+    split_plan: SplitPlan,
+    model_id: str,
+    model_version: str,
+) -> tuple[bytes, dict]:
+    records = sample_store.list_records()
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "edge_id": int(edge_id),
+        "model": {
+            "model_id": str(model_id),
+            "model_version": str(model_version),
+        },
+        "split_plan": split_plan.to_dict(),
+        "training_mode": {
+            "send_low_conf_features": bool(send_low_conf_features),
+            "low_confidence_mode": "raw+feature" if send_low_conf_features else "raw-only",
+        },
+        "drift_sample_ids": [record.sample_id for record in records if record.drift_flag],
+        "samples": [],
+    }
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for record in records:
+            include_feature = (
+                record.confidence_bucket == HIGH_CONFIDENCE
+                or (record.confidence_bucket == LOW_CONFIDENCE and send_low_conf_features)
+            )
+            sample_entry = record.to_dict()
+            if not include_feature:
+                sample_entry["feature_relpath"] = None
+                sample_entry["feature_bytes"] = 0
+            manifest["samples"].append(sample_entry)
+
+            for path in sample_store.iter_existing_paths(record):
+                relpath = os.path.relpath(path, sample_store.root_dir).replace("\\", "/")
+                if not include_feature and relpath == record.feature_relpath:
+                    continue
+                zf.write(path, arcname=relpath)
+
+        zf.writestr(
+            "bundle_manifest.json",
+            json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
+        )
+    return buf.getvalue(), manifest
 
 
 
@@ -163,4 +221,49 @@ def request_cloud_split_training(
         return reply.success, reply.model_data, reply.message
     except Exception as exc:
         logger.exception("request_cloud_split_training failed: {}", exc)
+        return False, "", str(exc)
+
+
+def request_continual_learning(
+    server_ip: str,
+    *,
+    edge_id: int,
+    cache_path: str,
+    sample_store: EdgeSampleStore,
+    split_plan: SplitPlan,
+    model_id: str,
+    model_version: str,
+    send_low_conf_features: bool,
+    num_epoch: int = 0,
+):
+    try:
+        payload_zip, manifest = pack_continual_learning_bundle(
+            sample_store,
+            edge_id=edge_id,
+            send_low_conf_features=send_low_conf_features,
+            split_plan=split_plan,
+            model_id=model_id,
+            model_version=model_version,
+        )
+        channel = grpc.insecure_channel(
+            server_ip,
+            options=[
+                ("grpc.max_send_message_length", 1024 * 1024 * 512),
+                ("grpc.max_receive_message_length", 1024 * 1024 * 512),
+            ],
+        )
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        req = message_transmission_pb2.ContinualLearningRequest(
+            protocol_version=manifest["protocol_version"],
+            edge_id=int(edge_id),
+            cache_path=str(cache_path),
+            num_epoch=int(num_epoch),
+            send_low_conf_features=bool(send_low_conf_features),
+            bundle_manifest_json=json.dumps(manifest),
+            payload_zip=payload_zip,
+        )
+        reply = stub.continual_learning_request(req)
+        return reply.success, reply.model_data, reply.message
+    except Exception as exc:
+        logger.exception("request_continual_learning failed: {}", exc)
         return False, "", str(exc)

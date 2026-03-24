@@ -5,6 +5,7 @@ import io
 import json
 import os
 import random
+import shutil
 import threading
 import time
 
@@ -40,6 +41,12 @@ try:
     _HAS_UNIVERSAL_SPLIT = True
 except ImportError:
     _HAS_UNIVERSAL_SPLIT = False
+from model_management.continual_learning_bundle import (
+    CONTINUAL_LEARNING_PROTOCOL_VERSION,
+    load_training_bundle_manifest,
+    prepare_split_training_cache,
+)
+from model_management.fixed_split import SplitPlan, apply_split_plan
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
@@ -92,6 +99,74 @@ class CloudContinualLearner:
         self.das_enabled = bool(getattr(das_cfg, "enabled", False)) if das_cfg else False
         self.das_bn_only = bool(getattr(das_cfg, "bn_only", False)) if das_cfg else False
         self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
+
+    def _load_edge_training_model(self) -> torch.nn.Module:
+        from model_management.model_zoo import build_detection_model, is_wrapper_model
+
+        model_name = self.edge_model_name
+        if is_wrapper_model(model_name):
+            raise NotImplementedError(
+                f"[SplitCL] {model_name} is a wrapper model (YOLO/DETR/RT-DETR) and "
+                f"does not support torchvision-style split retraining."
+            )
+
+        tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
+        edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
+        if os.path.exists(edge_weights):
+            state = torch.load(edge_weights, map_location=self.device)
+        else:
+            if model_name in model_lib:
+                official_path = os.path.join(
+                    self.weight_folder, model_lib[model_name]["model_path"]
+                )
+                state = (
+                    torch.load(official_path, map_location=self.device)
+                    if os.path.exists(official_path)
+                    else None
+                )
+            else:
+                state = None
+        if state is not None:
+            tmp_model.load_state_dict(state)
+        tmp_model.to(self.device)
+        return tmp_model
+
+    def _serialise_model_bytes(self, model: torch.nn.Module) -> bytes:
+        edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
+        torch.save(model.state_dict(), edge_weights)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        buf = io.BytesIO()
+        torch.save(model.state_dict(), buf)
+        return buf.getvalue()
+
+    def _prepare_split_runtime_input(self, frame) -> list[torch.Tensor]:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(self.device)
+        return [tensor]
+
+    def _bundle_feature_provider(
+        self,
+        model: torch.nn.Module,
+        manifest: dict[str, object],
+    ):
+        split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
+        splitter = UniversalModelSplitter(device=self.device)
+        sample_input = build_model_sample_input(
+            self.edge_model_name,
+            image_size=(224, 224),
+            device=self.device,
+        )
+        splitter.trace(model, sample_input)
+        apply_split_plan(splitter, split_plan)
+
+        def _provider(raw_path: str, sample: dict[str, object], manifest_payload: dict[str, object]):
+            frame = cv2.imread(raw_path)
+            if frame is None:
+                raise FileNotFoundError(raw_path)
+            return splitter.edge_forward(self._prepare_split_runtime_input(frame))
+
+        return _provider
 
     # ------------------------------------------------------------------
     # Public API
@@ -216,6 +291,82 @@ class CloudContinualLearner:
                 logger.exception("[SplitCL] Split retraining failed for edge {}: {}", edge_id, exc)
                 return False, "", str(exc)
 
+    def get_ground_truth_and_fixed_split_retrain(
+        self,
+        edge_id: int,
+        bundle_cache_path: str,
+        num_epoch: int = 0,
+    ) -> tuple[bool, str, str]:
+        if num_epoch <= 0:
+            num_epoch = self.default_num_epoch
+
+        with self.lock:
+            try:
+                manifest = load_training_bundle_manifest(bundle_cache_path)
+                if manifest.get("protocol_version") != CONTINUAL_LEARNING_PROTOCOL_VERSION:
+                    raise RuntimeError(
+                        f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
+                    )
+
+                tmp_model = self._load_edge_training_model()
+                working_cache = os.path.join(bundle_cache_path, "working_cache")
+                if os.path.isdir(working_cache):
+                    shutil.rmtree(working_cache, ignore_errors=True)
+                bundle_info = prepare_split_training_cache(
+                    bundle_cache_path,
+                    working_cache,
+                    feature_provider=self._bundle_feature_provider(tmp_model, manifest),
+                )
+
+                gt_annotations: dict[str, dict] = {}
+                frame_dir = os.path.join(working_cache, "frames")
+                for sample_id in bundle_info["drift_sample_ids"]:
+                    img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
+                    if not os.path.exists(img_path):
+                        logger.warning("[FixedSplitCL] Drift sample {} missing raw frame.", sample_id)
+                        continue
+                    frame = cv2.imread(img_path)
+                    if frame is None:
+                        continue
+                    pred_boxes, pred_class, pred_score = self.large_od.large_inference(frame)
+                    if pred_boxes is None:
+                        continue
+                    gt_annotations[str(sample_id)] = {
+                        "boxes": pred_boxes,
+                        "labels": pred_class,
+                    }
+
+                sample_input = build_model_sample_input(
+                    self.edge_model_name,
+                    image_size=(224, 224),
+                    device=self.device,
+                )
+                universal_split_retrain(
+                    model=tmp_model,
+                    sample_input=sample_input,
+                    cache_path=working_cache,
+                    all_indices=bundle_info["all_sample_ids"],
+                    gt_annotations=gt_annotations,
+                    device=self.device,
+                    num_epoch=num_epoch,
+                    das_enabled=self.das_enabled,
+                    das_bn_only=self.das_bn_only,
+                    das_probe_samples=self.das_probe_samples,
+                )
+
+                encoded = base64.b64encode(
+                    self._serialise_model_bytes(tmp_model)
+                ).decode("utf-8")
+                logger.success(
+                    "[FixedSplitCL] Retraining done for edge {} with {} samples.",
+                    edge_id,
+                    len(bundle_info["all_sample_ids"]),
+                )
+                return True, encoded, "Fixed split retraining successful"
+            except Exception as exc:
+                logger.exception("[FixedSplitCL] Retraining failed for edge {}: {}", edge_id, exc)
+                return False, "", str(exc)
+
     def _split_retrain_edge_model(
         self,
         cache_path: str,
@@ -227,38 +378,8 @@ class CloudContinualLearner:
 
         Requires cached features produced by the universal model splitter.
         """
-        from model_management.model_zoo import build_detection_model, model_has_roi_heads, is_wrapper_model
-
         model_name = self.edge_model_name
-
-        if is_wrapper_model(model_name):
-            raise NotImplementedError(
-                f"[SplitCL] {model_name} is a wrapper model (YOLO/DETR/RT-DETR) and "
-                f"does not support torchvision-style split retraining."
-            )
-
-        tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
-
-        # Load existing edge-model weights
-        edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
-        if os.path.exists(edge_weights):
-            state = torch.load(edge_weights, map_location=self.device)
-        else:
-            if model_name in model_lib:
-                official_path = os.path.join(
-                    self.weight_folder, model_lib[model_name]["model_path"]
-                )
-                if os.path.exists(official_path):
-                    state = torch.load(official_path, map_location=self.device)
-                else:
-                    state = None
-            else:
-                state = None
-
-        if state is not None:
-            tmp_model.load_state_dict(state)
-
-        tmp_model.to(self.device)
+        tmp_model = self._load_edge_training_model()
 
         if not _HAS_UNIVERSAL_SPLIT:
             raise RuntimeError("Universal split runtime is required for split retraining.")
@@ -309,15 +430,7 @@ class CloudContinualLearner:
             das_probe_samples=self.das_probe_samples,
         )
 
-        # Persist weights so future retraining can fine-tune further
-        torch.save(tmp_model.state_dict(), edge_weights)
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        buf = io.BytesIO()
-        torch.save(tmp_model.state_dict(), buf)
-        return buf.getvalue()
+        return self._serialise_model_bytes(tmp_model)
 
     # ------------------------------------------------------------------
     # Internal helpers (original full-image retraining)

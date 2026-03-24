@@ -170,3 +170,38 @@ class TestMessageTransmissionServicer:
         reply = svc.split_train_request(request, context)
         assert reply.success is True
         mock_learner.get_ground_truth_and_split_retrain.assert_called_once()
+
+    def test_continual_learning_request_no_learner(self):
+        svc = self._make_servicer(continual_learner=None)
+        request = MagicMock()
+        request.edge_id = 1
+        request.cache_path = "/tmp/cache"
+        request.num_epoch = 2
+        request.send_low_conf_features = False
+        request.protocol_version = "edge-cl-bundle.v1"
+        request.payload_zip = b""
+        context = MagicMock()
+
+        reply = svc.continual_learning_request(request, context)
+        assert reply.success is False
+        assert "not configured" in reply.message
+
+    def test_continual_learning_request_with_learner(self):
+        mock_learner = MagicMock()
+        mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
+            True, "model_data", "ok"
+        )
+        svc = self._make_servicer(continual_learner=mock_learner)
+
+        request = MagicMock()
+        request.edge_id = 1
+        request.cache_path = "/tmp/cache"
+        request.num_epoch = 2
+        request.send_low_conf_features = True
+        request.protocol_version = "edge-cl-bundle.v1"
+        request.payload_zip = b""
+        context = MagicMock()
+
+        reply = svc.continual_learning_request(request, context)
+        assert reply.success is True
+        mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once()

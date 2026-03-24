@@ -5,7 +5,7 @@ import warnings
 
 from grpc_server import message_transmission_pb2 as message__transmission__pb2
 
-GRPC_GENERATED_VERSION = '1.78.0'
+GRPC_GENERATED_VERSION = '1.78.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -59,6 +59,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.SplitTrainRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.SplitTrainReply.FromString,
                 _registered_method=True)
+        self.continual_learning_request = channel.unary_unary(
+                '/MessageTransmission/continual_learning_request',
+                request_serializer=message__transmission__pb2.ContinualLearningRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.ContinualLearningReply.FromString,
+                _registered_method=True)
         self.query_resource = channel.unary_unary(
                 '/MessageTransmission/query_resource',
                 request_serializer=message__transmission__pb2.ResourceRequest.SerializeToString,
@@ -109,6 +114,13 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def continual_learning_request(self, request, context):
+        """Versioned continual-learning bundle upload for the fixed-split pipeline.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def query_resource(self, request, context):
         """Resource-aware CL trigger: edge queries cloud resource utilisation.
         """
@@ -150,6 +162,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.split_train_request,
                     request_deserializer=message__transmission__pb2.SplitTrainRequest.FromString,
                     response_serializer=message__transmission__pb2.SplitTrainReply.SerializeToString,
+            ),
+            'continual_learning_request': grpc.unary_unary_rpc_method_handler(
+                    servicer.continual_learning_request,
+                    request_deserializer=message__transmission__pb2.ContinualLearningRequest.FromString,
+                    response_serializer=message__transmission__pb2.ContinualLearningReply.SerializeToString,
             ),
             'query_resource': grpc.unary_unary_rpc_method_handler(
                     servicer.query_resource,
@@ -297,6 +314,33 @@ class MessageTransmission(object):
             '/MessageTransmission/split_train_request',
             message__transmission__pb2.SplitTrainRequest.SerializeToString,
             message__transmission__pb2.SplitTrainReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def continual_learning_request(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/continual_learning_request',
+            message__transmission__pb2.ContinualLearningRequest.SerializeToString,
+            message__transmission__pb2.ContinualLearningReply.FromString,
             options,
             channel_credentials,
             insecure,

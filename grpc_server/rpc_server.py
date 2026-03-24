@@ -205,6 +205,46 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             success=success, model_data=model_data, message=message
         )
 
+    def continual_learning_request(self, request, context):
+        logger.info(
+            "continual_learning_request from edge_id={} cache_path={} num_epoch={} send_low_conf_features={}",
+            request.edge_id,
+            request.cache_path,
+            request.num_epoch,
+            request.send_low_conf_features,
+        )
+        if self.continual_learner is None:
+            logger.error("continual_learning_request: continual_learner not configured")
+            return message_transmission_pb2.ContinualLearningReply(
+                success=False,
+                model_data="",
+                message="continual_learner not configured",
+                protocol_version=request.protocol_version,
+            )
+        try:
+            if request.payload_zip:
+                buf = io.BytesIO(request.payload_zip)
+                with zipfile.ZipFile(buf, "r") as zf:
+                    zf.extractall(request.cache_path)
+
+            success, model_data, message = (
+                self.continual_learner.get_ground_truth_and_fixed_split_retrain(
+                    request.edge_id,
+                    request.cache_path,
+                    int(request.num_epoch),
+                )
+            )
+        except Exception as exc:
+            logger.exception("continual_learning_request error: {}", exc)
+            success, model_data, message = False, "", str(exc)
+
+        return message_transmission_pb2.ContinualLearningReply(
+            success=success,
+            model_data=model_data,
+            message=message,
+            protocol_version=request.protocol_version,
+        )
+
     # ---- Resource-aware CL trigger: cloud resource query ----
 
     def query_resource(self, request, context):

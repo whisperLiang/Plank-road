@@ -11,6 +11,8 @@ service MessageTransmission {
   // (cached on shared filesystem), cloud annotates drift frames only,
   // then trains server-side model (rpn + roi_heads) on all features.
   rpc split_train_request (SplitTrainRequest) returns (SplitTrainReply) {}
+  // Versioned continual-learning bundle upload for the fixed-split pipeline.
+  rpc continual_learning_request (ContinualLearningRequest) returns (ContinualLearningReply) {}
   // Resource-aware CL trigger: edge queries cloud resource utilisation.
   rpc query_resource (ResourceRequest) returns (ResourceReply) {}
   // Bandwidth estimation: edge sends a small payload, cloud echoes it.
@@ -96,6 +98,23 @@ message SplitTrainReply {
   // Base-64 encoded PyTorch state-dict bytes of the retrained model
   string model_data = 2;
   string message = 3;
+}
+
+message ContinualLearningRequest {
+  string protocol_version = 1;
+  int64 edge_id = 2;
+  string cache_path = 3;
+  int64 num_epoch = 4;
+  bool send_low_conf_features = 5;
+  string bundle_manifest_json = 6;
+  bytes payload_zip = 7;
+}
+
+message ContinualLearningReply {
+  bool success = 1;
+  string model_data = 2;
+  string message = 3;
+  string protocol_version = 4;
 }
 
 // Resource-aware CL trigger: cloud resource query
