@@ -33,6 +33,7 @@ class InferenceArtifacts:
     detection_class: list
     detection_score: list
     confidence: float
+    input_tensor_shape: list[int] | None = None
 
 def _collate_fn(batch):
     return tuple(zip(*batch))
@@ -294,9 +295,18 @@ class Object_Detection:
 
     def infer_sample(self, img, splitter=None) -> InferenceArtifacts:
         split_payload = None
+        input_tensor_shape = None
         with self.model_lock:
             if splitter is not None:
                 splitter_input = self.prepare_splitter_input(img)
+                if isinstance(splitter_input, torch.Tensor):
+                    input_tensor_shape = [int(dim) for dim in splitter_input.shape]
+                elif (
+                    isinstance(splitter_input, (list, tuple))
+                    and splitter_input
+                    and isinstance(splitter_input[0], torch.Tensor)
+                ):
+                    input_tensor_shape = [int(dim) for dim in splitter_input[0].shape]
                 replayed, split_payload = splitter.replay_inference(
                     splitter_input, return_split_output=True,
                 )
@@ -304,7 +314,8 @@ class Object_Detection:
                     self.model,
                     replayed,
                     threshold=self.threshold_low,
-                    image_size=img.shape[:2],
+                    model_input=splitter_input,
+                    orig_image=img,
                 )
                 pred_boxes, pred_class, pred_score = self._parse_prediction_output(
                     replayed, self.threshold_low,
@@ -319,6 +330,7 @@ class Object_Detection:
                 detection_class=[],
                 detection_score=[],
                 confidence=0.0,
+                input_tensor_shape=input_tensor_shape,
             )
 
         confidence = float(np.mean(pred_score)) if len(pred_score) else 0.0
@@ -339,6 +351,7 @@ class Object_Detection:
             detection_class=detection_class,
             detection_score=detection_score,
             confidence=confidence,
+            input_tensor_shape=input_tensor_shape,
         )
 
     def small_inference(self, img, splitter=None, return_split_payload=False):

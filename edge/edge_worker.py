@@ -381,6 +381,7 @@ class EdgeWorker:
             drift_flag=drift_detected,
             raw_frame=frame if save_raw else None,
             input_image_size=list(frame.shape[:2]),
+            input_tensor_shape=inference.input_tensor_shape,
         )
 
         if self.retrain_flag:

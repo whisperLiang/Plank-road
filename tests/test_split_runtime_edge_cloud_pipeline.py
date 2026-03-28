@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import cv2
 import grpc
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -25,6 +26,12 @@ from grpc_server.rpc_server import MessageTransmissionServicer
 from model_management.model_zoo import build_detection_model, build_model_sample_input
 from model_management.object_detection import Object_Detection
 from model_management.payload import SplitPayload
+from model_management.split_model_adapters import (
+    build_split_runtime_sample_input,
+    get_split_runtime_model,
+    postprocess_split_runtime_output,
+    prepare_split_runtime_input,
+)
 from model_management.split_runtime import compare_outputs
 from model_management.universal_model_split import (
     UniversalModelSplitter,
@@ -420,6 +427,65 @@ def test_real_yolov8_runs_end_to_end_on_road_video():
         total_detections += int(output["boxes"].shape[0])
 
     assert total_detections > 0
+
+
+def test_real_yolov8_split_runtime_pads_non_stride_aligned_inputs():
+    if not YOLO_WEIGHTS.exists():
+        pytest.skip(f"Missing weights: {YOLO_WEIGHTS}")
+
+    model = build_detection_model(
+        "yolov8n",
+        pretrained=True,
+        device="cpu",
+        weights_path=str(YOLO_WEIGHTS),
+    ).eval()
+    core_model = get_split_runtime_model(model).eval()
+
+    sample_input = build_split_runtime_sample_input(
+        model,
+        image_size=(360, 640),
+        device="cpu",
+    )
+    runtime_input = prepare_split_runtime_input(
+        model,
+        np.zeros((360, 640, 3), dtype=np.uint8),
+        device="cpu",
+    )
+
+    assert tuple(sample_input.shape[-2:]) == (384, 640)
+    assert tuple(runtime_input.shape[-2:]) == (384, 640)
+
+    output = core_model(runtime_input)
+    assert isinstance(output, (list, tuple))
+
+
+def test_real_yolov8_split_runtime_matches_wrapper_output():
+    if not YOLO_WEIGHTS.exists():
+        pytest.skip(f"Missing weights: {YOLO_WEIGHTS}")
+
+    model = build_detection_model(
+        "yolov8n",
+        pretrained=True,
+        device="cpu",
+        weights_path=str(YOLO_WEIGHTS),
+    ).eval()
+    frame = _read_video_frames(count=1, size=(640, 360))[0]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    input_tensor = transforms.ToTensor()(rgb)
+
+    expected = model([input_tensor])[0]
+    runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
+    raw_outputs = get_split_runtime_model(model).eval()(runtime_input)
+    replayed = postprocess_split_runtime_output(
+        model,
+        raw_outputs,
+        threshold=0.2,
+        model_input=runtime_input,
+        orig_image=frame,
+    )[0]
+
+    ok, max_diff = compare_outputs([expected], [replayed])
+    assert ok, max_diff
 
 
 def test_random_trainable_candidates_replay_and_split_retrain(tmp_path):

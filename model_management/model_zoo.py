@@ -74,6 +74,11 @@ from torchvision.models.detection import (
     SSDLite320_MobileNet_V3_Large_Weights,
     FCOS_ResNet50_FPN_Weights,
 )
+from model_management.ultralytics_parity import (
+    postprocess_predictions,
+    preprocess_bgr_images,
+    rgb_tensor_to_bgr_uint8,
+)
 
 _HAS_ULTRALYTICS = True
 _HAS_HF_DETR = True
@@ -153,43 +158,49 @@ class YOLODetectionModel(nn.Module):
         -------
         list of dict  with keys ``boxes``, ``labels``, ``scores``
         """
-        results: List[Dict[str, torch.Tensor]] = []
-        for img_tensor in images:
-            # ultralytics accepts numpy HWC uint8 or PIL or path
-            img_np = (
-                img_tensor.detach().cpu().permute(1, 2, 0).numpy() * 255
-            ).astype("uint8")
+        images_bgr = [rgb_tensor_to_bgr_uint8(image) for image in images]
+        _, model_input = preprocess_bgr_images(
+            self.yolo,
+            images_bgr,
+            conf=self.confidence,
+        )
+        preds = self.yolo.model(model_input)
+        results = postprocess_predictions(
+            self.yolo,
+            preds,
+            model_input,
+            images_bgr,
+            conf=self.confidence,
+        )
 
-            preds = self.yolo.predict(
-                img_np, conf=self.confidence, verbose=False,
-            )
-
-            if preds and len(preds) > 0 and preds[0].boxes is not None:
-                boxes_xyxy = preds[0].boxes.xyxy.cpu()
-                scores = preds[0].boxes.conf.cpu()
-                cls_ids = preds[0].boxes.cls.cpu().long()
-
-                # Map YOLO 80-class indices → COCO 91-class IDs
-                if self._map_labels:
-                    labels = torch.tensor(
-                        [COCO_80_TO_91[c] if c < 80 else int(c) + 1 for c in cls_ids],
-                        dtype=torch.int64,
-                    )
-                else:
-                    labels = cls_ids + 1  # 0-indexed → 1-indexed
-
-                results.append({
-                    "boxes": boxes_xyxy.float(),
-                    "labels": labels,
-                    "scores": scores.float(),
+        detections: List[Dict[str, torch.Tensor]] = []
+        for result in results:
+            if result.boxes is None or result.boxes.data.numel() == 0:
+                detections.append({
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                    "labels": torch.zeros((0,), dtype=torch.int64),
+                    "scores": torch.zeros((0,), dtype=torch.float32),
                 })
+                continue
+
+            boxes_xyxy = result.boxes.xyxy.detach().cpu().float()
+            scores = result.boxes.conf.detach().cpu().float()
+            cls_ids = result.boxes.cls.detach().cpu().long()
+
+            if self._map_labels:
+                labels = torch.tensor(
+                    [COCO_80_TO_91[c] if c < 80 else int(c) + 1 for c in cls_ids.tolist()],
+                    dtype=torch.int64,
+                )
             else:
-                results.append({
-                    "boxes": torch.zeros(0, 4),
-                    "labels": torch.zeros(0, dtype=torch.int64),
-                    "scores": torch.zeros(0),
-                })
-        return results
+                labels = cls_ids + 1
+
+            detections.append({
+                "boxes": boxes_xyxy,
+                "labels": labels,
+                "scores": scores,
+            })
+        return detections
 
     def train(self, mode: bool = True):
         """YOLO training is done via ultralytics CLI / API — not via this wrapper."""
@@ -364,38 +375,49 @@ class RTDETRDetectionModel(nn.Module):
     def forward(
         self, images: List[torch.Tensor], targets=None
     ) -> List[Dict[str, torch.Tensor]]:
-        results: List[Dict[str, torch.Tensor]] = []
-        for img_tensor in images:
-            img_np = (
-                img_tensor.detach().cpu().permute(1, 2, 0).numpy() * 255
-            ).astype("uint8")
-            preds = self.rtdetr.predict(img_np, conf=self.confidence, verbose=False)
+        images_bgr = [rgb_tensor_to_bgr_uint8(image) for image in images]
+        _, model_input = preprocess_bgr_images(
+            self.rtdetr,
+            images_bgr,
+            conf=self.confidence,
+        )
+        preds = self.rtdetr.model(model_input)
+        results = postprocess_predictions(
+            self.rtdetr,
+            preds,
+            model_input,
+            images_bgr,
+            conf=self.confidence,
+        )
 
-            if preds and len(preds) > 0 and preds[0].boxes is not None:
-                boxes_xyxy = preds[0].boxes.xyxy.cpu()
-                scores = preds[0].boxes.conf.cpu()
-                cls_ids = preds[0].boxes.cls.cpu().long()
-
-                if self._map_labels:
-                    labels = torch.tensor(
-                        [COCO_80_TO_91[c] if c < 80 else int(c) + 1 for c in cls_ids],
-                        dtype=torch.int64,
-                    )
-                else:
-                    labels = cls_ids + 1
-
-                results.append({
-                    "boxes": boxes_xyxy.float(),
-                    "labels": labels,
-                    "scores": scores.float(),
+        detections: List[Dict[str, torch.Tensor]] = []
+        for result in results:
+            if result.boxes is None or result.boxes.data.numel() == 0:
+                detections.append({
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                    "labels": torch.zeros((0,), dtype=torch.int64),
+                    "scores": torch.zeros((0,), dtype=torch.float32),
                 })
+                continue
+
+            boxes_xyxy = result.boxes.xyxy.detach().cpu().float()
+            scores = result.boxes.conf.detach().cpu().float()
+            cls_ids = result.boxes.cls.detach().cpu().long()
+
+            if self._map_labels:
+                labels = torch.tensor(
+                    [COCO_80_TO_91[c] if c < 80 else int(c) + 1 for c in cls_ids.tolist()],
+                    dtype=torch.int64,
+                )
             else:
-                results.append({
-                    "boxes": torch.zeros(0, 4),
-                    "labels": torch.zeros(0, dtype=torch.int64),
-                    "scores": torch.zeros(0),
-                })
-        return results
+                labels = cls_ids + 1
+
+            detections.append({
+                "boxes": boxes_xyxy,
+                "labels": labels,
+                "scores": scores,
+            })
+        return detections
 
     def train(self, mode: bool = True):
         return self

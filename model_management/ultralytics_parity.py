@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import torch
+from ultralytics.cfg import get_cfg
+from ultralytics.utils.checks import check_imgsz
+
+
+def _predictor_overrides(
+    engine: Any,
+    *,
+    conf: float,
+) -> dict[str, Any]:
+    custom = {
+        "conf": float(conf),
+        "batch": 1,
+        "save": False,
+        "mode": "predict",
+        "rect": True,
+    }
+    return {**getattr(engine, "overrides", {}), **custom}
+
+
+def ensure_predictor(
+    engine: Any,
+    *,
+    conf: float,
+):
+    args = _predictor_overrides(engine, conf=conf)
+    predictor = getattr(engine, "predictor", None)
+    current_device = getattr(getattr(predictor, "args", None), "device", None)
+    requested_device = args.get("device", current_device)
+
+    if predictor is None or current_device != requested_device:
+        predictor = engine._smart_load("predictor")(overrides=args, _callbacks=engine.callbacks)
+        predictor.setup_model(model=engine.model, verbose=False)
+        engine.predictor = predictor
+    else:
+        predictor.args = get_cfg(predictor.args, args)
+
+    predictor.imgsz = check_imgsz(
+        predictor.args.imgsz,
+        stride=predictor.model.stride,
+        min_dim=2,
+    )
+    return predictor
+
+
+def rgb_tensor_to_bgr_uint8(image: torch.Tensor) -> np.ndarray:
+    rgb = image.detach().cpu()
+    if rgb.ndim != 3:
+        raise RuntimeError(f"Expected CHW image tensor, got shape {tuple(rgb.shape)!r}.")
+    rgb = rgb.permute(1, 2, 0).contiguous().numpy()
+    if np.issubdtype(rgb.dtype, np.floating):
+        rgb = np.clip(rgb * 255.0, 0.0, 255.0).astype("uint8")
+    else:
+        rgb = np.clip(rgb, 0, 255).astype("uint8")
+    return np.ascontiguousarray(rgb[..., ::-1])
+
+
+def preprocess_bgr_images(
+    engine: Any,
+    images_bgr: list[np.ndarray],
+    *,
+    conf: float,
+) -> tuple[Any, torch.Tensor]:
+    predictor = ensure_predictor(engine, conf=conf)
+    predictor.batch = ([f"image{i}.jpg" for i in range(len(images_bgr))], None, None)
+    prepared = [np.ascontiguousarray(image) for image in images_bgr]
+    return predictor, predictor.preprocess(prepared)
+
+
+def postprocess_predictions(
+    engine: Any,
+    predictions: Any,
+    model_input: torch.Tensor,
+    images_bgr: list[np.ndarray],
+    *,
+    conf: float,
+):
+    predictor = ensure_predictor(engine, conf=conf)
+    predictor.batch = ([f"image{i}.jpg" for i in range(len(images_bgr))], None, None)
+    prepared = [np.ascontiguousarray(image) for image in images_bgr]
+    return predictor.postprocess(predictions, model_input, prepared)

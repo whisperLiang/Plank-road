@@ -9,13 +9,17 @@ import numpy as np
 import torch
 from PIL import Image
 from ultralytics.models.utils.loss import RTDETRDetectionLoss
-from ultralytics.utils import nms, ops
+from ultralytics.utils import ops
 
 from model_management.model_zoo import (
     COCO_80_TO_91,
     DETRDetectionModel,
     RTDETRDetectionModel,
     YOLODetectionModel,
+)
+from model_management.ultralytics_parity import (
+    postprocess_predictions,
+    preprocess_bgr_images,
 )
 
 
@@ -40,8 +44,22 @@ def build_split_runtime_sample_input(
 ):
     height, width = image_size
     device = torch.device(device)
-    if isinstance(model, (YOLODetectionModel, RTDETRDetectionModel)):
-        return torch.rand(1, 3, height, width, device=device)
+    if isinstance(model, YOLODetectionModel):
+        sample = (np.random.rand(height, width, 3) * 255).astype("uint8")
+        _, tensor = preprocess_bgr_images(
+            model.yolo,
+            [sample],
+            conf=model.confidence,
+        )
+        return tensor.to(device)
+    if isinstance(model, RTDETRDetectionModel):
+        sample = (np.random.rand(height, width, 3) * 255).astype("uint8")
+        _, tensor = preprocess_bgr_images(
+            model.rtdetr,
+            [sample],
+            conf=model.confidence,
+        )
+        return tensor.to(device)
     if isinstance(model, DETRDetectionModel):
         image = (np.random.rand(height, width, 3) * 255).astype("uint8")
         pixel_values = model.processor(
@@ -59,18 +77,31 @@ def prepare_split_runtime_input(
     device: str | torch.device,
 ):
     device = torch.device(device)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
     if isinstance(model, DETRDetectionModel):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pixel_values = model.processor(
             images=Image.fromarray(rgb),
             return_tensors="pt",
         )["pixel_values"]
         return pixel_values.to(device)
 
+    if isinstance(model, YOLODetectionModel):
+        _, tensor = preprocess_bgr_images(
+            model.yolo,
+            [frame],
+            conf=model.confidence,
+        )
+        return tensor.to(device)
+    if isinstance(model, RTDETRDetectionModel):
+        _, tensor = preprocess_bgr_images(
+            model.rtdetr,
+            [frame],
+            conf=model.confidence,
+        )
+        return tensor.to(device)
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(device)
-    if isinstance(model, (YOLODetectionModel, RTDETRDetectionModel)):
-        return tensor.unsqueeze(0)
     return [tensor]
 
 
@@ -79,14 +110,32 @@ def postprocess_split_runtime_output(
     outputs: Any,
     *,
     threshold: float,
-    image_size: tuple[int, int],
+    model_input: Any | None = None,
+    orig_image: np.ndarray | None = None,
 ) -> list[dict[str, torch.Tensor]]:
     if isinstance(model, YOLODetectionModel):
-        return _postprocess_yolo_output(model, outputs, threshold=threshold, image_size=image_size)
+        return _postprocess_yolo_output(
+            model,
+            outputs,
+            model_input=model_input,
+            orig_image=orig_image,
+        )
     if isinstance(model, RTDETRDetectionModel):
-        return _postprocess_rtdetr_output(model, outputs, threshold=threshold, image_size=image_size)
+        return _postprocess_rtdetr_output(
+            model,
+            outputs,
+            model_input=model_input,
+            orig_image=orig_image,
+        )
     if isinstance(model, DETRDetectionModel):
-        return _postprocess_detr_output(model, outputs, threshold=threshold, image_size=image_size)
+        if orig_image is None:
+            raise RuntimeError("DETR split postprocess requires the original image.")
+        return _postprocess_detr_output(
+            model,
+            outputs,
+            threshold=threshold,
+            image_size=orig_image.shape[:2],
+        )
     return outputs
 
 
@@ -194,70 +243,60 @@ def _postprocess_yolo_output(
     model: YOLODetectionModel,
     outputs: Any,
     *,
-    threshold: float,
-    image_size: tuple[int, int],
+    model_input: Any | None,
+    orig_image: np.ndarray | None,
 ) -> list[dict[str, torch.Tensor]]:
-    raw = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
-    if not isinstance(raw, torch.Tensor):
-        return _empty_detection_result(next(get_split_runtime_model(model).parameters()).device)
+    if not isinstance(model_input, torch.Tensor) or orig_image is None:
+        raise RuntimeError("YOLO split postprocess requires the model input tensor and original frame.")
 
-    processed = nms.non_max_suppression(
-        raw,
-        threshold,
-        0.7,
-        None,
-        False,
-        max_det=300,
-        nc=0,
-        end2end=bool(getattr(get_split_runtime_model(model), "end2end", False)),
+    results = postprocess_predictions(
+        model.yolo,
+        outputs,
+        model_input,
+        [orig_image],
+        conf=model.confidence,
     )
-    pred = processed[0] if processed else None
-    if pred is None or pred.numel() == 0:
-        return _empty_detection_result(raw.device)
+    result = results[0]
+    if result.boxes is None or result.boxes.data.numel() == 0:
+        return _empty_detection_result(model_input.device)
 
-    boxes = _clamp_xyxy_boxes(pred[:, :4], image_size)
-    scores = pred[:, 4].float()
-    labels = _map_wrapper_labels(model, pred[:, 5].long())
-    return [{"boxes": boxes.float(), "labels": labels, "scores": scores}]
+    boxes = result.boxes.xyxy.detach().to(model_input.device).float()
+    scores = result.boxes.conf.detach().to(model_input.device).float()
+    labels = _map_wrapper_labels(
+        model,
+        result.boxes.cls.detach().to(model_input.device).long(),
+    )
+    return [{"boxes": boxes, "labels": labels, "scores": scores}]
 
 
 def _postprocess_rtdetr_output(
     model: RTDETRDetectionModel,
     outputs: Any,
     *,
-    threshold: float,
-    image_size: tuple[int, int],
+    model_input: Any | None,
+    orig_image: np.ndarray | None,
 ) -> list[dict[str, torch.Tensor]]:
-    raw = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
-    if not isinstance(raw, torch.Tensor):
-        return _empty_detection_result(next(get_split_runtime_model(model).parameters()).device)
+    if not isinstance(model_input, torch.Tensor) or orig_image is None:
+        raise RuntimeError("RT-DETR split postprocess requires the model input tensor and original frame.")
 
-    if raw.ndim == 2:
-        raw = raw.unsqueeze(0)
-    if raw.ndim != 3 or raw.shape[-1] < 5:
-        return _empty_detection_result(raw.device)
+    results = postprocess_predictions(
+        model.rtdetr,
+        outputs,
+        model_input,
+        [orig_image],
+        conf=model.confidence,
+    )
+    result = results[0]
+    if result.boxes is None or result.boxes.data.numel() == 0:
+        return _empty_detection_result(model_input.device)
 
-    height, width = image_size
-    bboxes, scores = raw.split((4, raw.shape[-1] - 4), dim=-1)
-    bbox = ops.xywh2xyxy(bboxes[0])
-    score = scores[0]
-    max_score, cls = score.max(-1)
-    keep = max_score > threshold
-    if not torch.any(keep):
-        return _empty_detection_result(raw.device)
-
-    bbox = bbox[keep]
-    max_score = max_score[keep]
-    cls = cls[keep]
-    order = max_score.argsort(descending=True)[:300]
-    bbox = bbox[order]
-    max_score = max_score[order]
-    cls = cls[order]
-    bbox[..., [0, 2]] *= float(width)
-    bbox[..., [1, 3]] *= float(height)
-    bbox = _clamp_xyxy_boxes(bbox, image_size)
-    labels = _map_wrapper_labels(model, cls.long())
-    return [{"boxes": bbox.float(), "labels": labels, "scores": max_score.float()}]
+    boxes = result.boxes.xyxy.detach().to(model_input.device).float()
+    scores = result.boxes.conf.detach().to(model_input.device).float()
+    labels = _map_wrapper_labels(
+        model,
+        result.boxes.cls.detach().to(model_input.device).long(),
+    )
+    return [{"boxes": boxes, "labels": labels, "scores": scores}]
 
 
 def _postprocess_detr_output(
@@ -358,12 +397,12 @@ def _infer_input_image_size(targets: Any) -> tuple[int, int]:
     if not isinstance(targets, dict):
         raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
     split_meta = targets.get("_split_meta", {})
-    input_image_size = split_meta.get("input_image_size")
-    if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
-        return int(input_image_size[0]), int(input_image_size[1])
     input_tensor_shape = split_meta.get("input_tensor_shape")
     if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
         return int(input_tensor_shape[-2]), int(input_tensor_shape[-1])
+    input_image_size = split_meta.get("input_image_size")
+    if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
+        return int(input_image_size[0]), int(input_image_size[1])
     raise RuntimeError("Missing input image size metadata required for wrapper-model split retraining.")
 
 

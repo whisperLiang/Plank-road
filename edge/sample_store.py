@@ -52,6 +52,7 @@ class StoredSampleRecord:
     has_feature: bool
     drift_flag: bool
     input_image_size: list[int] | None
+    input_tensor_shape: list[int] | None
     feature_relpath: str | None
     result_relpath: str
     metadata_relpath: str
@@ -73,6 +74,7 @@ class StoredSampleRecord:
             "has_feature": self.has_feature,
             "drift_flag": self.drift_flag,
             "input_image_size": self.input_image_size,
+            "input_tensor_shape": self.input_tensor_shape,
             "feature_relpath": self.feature_relpath,
             "result_relpath": self.result_relpath,
             "metadata_relpath": self.metadata_relpath,
@@ -96,6 +98,7 @@ class StoredSampleRecord:
             has_feature=bool(payload.get("has_feature", False)),
             drift_flag=bool(payload.get("drift_flag", False)),
             input_image_size=list(payload["input_image_size"]) if payload.get("input_image_size") is not None else None,
+            input_tensor_shape=list(payload["input_tensor_shape"]) if payload.get("input_tensor_shape") is not None else None,
             feature_relpath=payload.get("feature_relpath"),
             result_relpath=str(payload["result_relpath"]),
             metadata_relpath=str(payload["metadata_relpath"]),
@@ -163,6 +166,7 @@ class EdgeSampleStore:
         raw_frame: Any | None = None,
         timestamp: str | None = None,
         input_image_size: list[int] | tuple[int, int] | None = None,
+        input_tensor_shape: list[int] | tuple[int, ...] | None = None,
     ) -> StoredSampleRecord:
         self._ensure_layout()
         if confidence_bucket not in {HIGH_CONFIDENCE, LOW_CONFIDENCE}:
@@ -196,6 +200,7 @@ class EdgeSampleStore:
             has_feature=True,
             drift_flag=bool(drift_flag),
             input_image_size=list(input_image_size) if input_image_size is not None else None,
+            input_tensor_shape=list(input_tensor_shape) if input_tensor_shape is not None else None,
             feature_relpath=_to_relpath(self.root_dir, feature_path),
             result_relpath=_to_relpath(self.root_dir, result_path),
             metadata_relpath=_to_relpath(self.root_dir, metadata_path),
