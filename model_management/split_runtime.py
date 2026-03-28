@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -233,14 +234,23 @@ class GraphSplitRuntime:
             sample_input,
             sample_kwargs=sample_kwargs,
         )
-        self.history = history
-        self.graph = build_graph_from_trace(
-            model,
-            history,
-            sample_args,
-            sample_kwargs_dict,
-            sample_output,
-        )
+        try:
+            self.graph = build_graph_from_trace(
+                model,
+                history,
+                sample_args,
+                sample_kwargs_dict,
+                sample_output,
+            )
+        finally:
+            # The runtime only needs the derived graph; retaining the raw
+            # TorchLens history keeps large trace-time intermediates alive.
+            self.history = None
+            cleanup = getattr(history, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+            del history
+            gc.collect()
         self.candidates = enumerate_candidates(self.graph)
         self.current_candidate = self.candidates[0] if self.candidates else None
         self.reset_runtime_state()

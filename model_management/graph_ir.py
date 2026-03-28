@@ -1077,25 +1077,21 @@ def trace_model(
     args, kwargs = _sample_args_kwargs(sample_input, sample_kwargs)
     with torch.no_grad():
         sample_output = model(*args, **kwargs)
+    trace_kwargs = {
+        "input_kwargs": kwargs or None,
+        # TorchLens only captures the replay-critical per-layer call
+        # arguments when activations are saved. We therefore keep the
+        # exhaustive trace here, but immediately dispose of the raw
+        # history once the graph IR has been built.
+        "layers_to_save": "all",
+        "keep_unsaved_layers": True,
+        "save_function_args": True,
+        "mark_input_output_distances": False,
+        "detect_loops": False,
+    }
     try:
-        history = tl.log_forward_pass(
-            model,
-            args,
-            input_kwargs=kwargs or None,
-            layers_to_save="all",
-            keep_unsaved_layers=True,
-            save_function_args=True,
-            mark_input_output_distances=False,
-        )
+        history = tl.log_forward_pass(model, args, **trace_kwargs)
     except Exception:
-        tl.log_forward_pass(model, args, input_kwargs=kwargs or None)
-        history = tl.log_forward_pass(
-            model,
-            args,
-            input_kwargs=kwargs or None,
-            layers_to_save="all",
-            keep_unsaved_layers=True,
-            save_function_args=True,
-            mark_input_output_distances=False,
-        )
+        tl.log_forward_pass(model, args, **trace_kwargs)
+        history = tl.log_forward_pass(model, args, **trace_kwargs)
     return history, args, kwargs, sample_output

@@ -13,7 +13,7 @@ from model_management.candidate_generator import (
     prune_candidates,
 )
 from model_management.payload import SplitPayload
-from model_management.split_runtime import compare_outputs
+from model_management.split_runtime import GraphSplitRuntime, compare_outputs
 from model_management.universal_model_split import (
     UniversalModelSplitter,
     extract_split_features,
@@ -89,6 +89,7 @@ def test_graph_build_candidate_enumeration_pruning_and_replay(factory, minimum_n
     splitter.trace(model, sample)
 
     assert splitter.graph is not None
+    assert splitter.history is None
     assert splitter.graph.num_nodes >= minimum_nodes
     assert splitter.graph.input_labels
     assert splitter.graph.output_labels
@@ -122,6 +123,37 @@ def test_graph_build_candidate_enumeration_pruning_and_replay(factory, minimum_n
 
     features = extract_split_features(splitter, sample)
     assert isinstance(features, (torch.Tensor, SplitPayload))
+
+
+def test_runtime_trace_cleans_up_raw_torchlens_history(monkeypatch):
+    model, sample = _make_sequential_model()
+    cleanup_called = False
+    fake_graph = object()
+
+    class DummyHistory:
+        def cleanup(self):
+            nonlocal cleanup_called
+            cleanup_called = True
+
+    monkeypatch.setattr(
+        "model_management.split_runtime.trace_model",
+        lambda *args, **kwargs: (DummyHistory(), ("sample",), {}, torch.tensor(0.0)),
+    )
+    monkeypatch.setattr(
+        "model_management.split_runtime.build_graph_from_trace",
+        lambda *args, **kwargs: fake_graph,
+    )
+    monkeypatch.setattr(
+        "model_management.split_runtime.enumerate_candidates",
+        lambda graph: [],
+    )
+
+    runtime = GraphSplitRuntime(device="cpu")
+    runtime.trace(model, sample)
+
+    assert cleanup_called
+    assert runtime.history is None
+    assert runtime.graph is fake_graph
 
 
 def test_dag_boundary_payload_is_minimal_and_cache_independent():
