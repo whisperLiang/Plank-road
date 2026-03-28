@@ -70,16 +70,26 @@ def _build_display_frame(
     sampled: bool,
     latency_ms: float | None = None,
     ref: int | None = None,
+    latest_result_frame: int | None = None,
+    show_boxes: bool = True,
+    detection_count: int | None = None,
 ):
-    rendered = draw_detection(frame, detection_boxes, detection_class, detection_score)
+    display_boxes = detection_boxes if show_boxes else []
+    display_class = detection_class if show_boxes else []
+    display_score = detection_score if show_boxes else []
+    rendered = draw_detection(frame, display_boxes, display_class, display_score)
     lines = [
         f"Frame: {frame_index}",
-        f"Detections: {len(detection_boxes)}",
+        f"Detections: {detection_count if detection_count is not None else len(display_boxes)}",
         f"Mode: {mode}",
         f"Sampled: {'yes' if sampled else 'no'}",
     ]
     if latency_ms is not None:
         lines.append(f"Latency: {latency_ms:.1f} ms")
+    if latest_result_frame is not None and latest_result_frame != frame_index:
+        lines.append(f"Latest result frame: {latest_result_frame}")
+        if detection_count:
+            lines.append(f"Overlay: reused ({frame_index - latest_result_frame} frames old)")
     if ref is not None:
         lines.append(f"Reference frame: {ref}")
     lines.append("Press q or ESC to quit")
@@ -101,6 +111,7 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
         "mode": "Waiting",
         "latency_ms": None,
         "ref": None,
+        "frame_index": None,
     }
 
     with result_path.open("w", encoding="utf-8") as result_file:
@@ -150,6 +161,7 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
                     else:
                         mode = "Inference"
 
+                    show_boxes = bool(detection_boxes)
                     last_visual = {
                         "boxes": [list(box) for box in detection_boxes],
                         "labels": list(detection_class),
@@ -157,6 +169,7 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
                         "mode": mode,
                         "latency_ms": latency_ms,
                         "ref": task.ref,
+                        "frame_index": index if task.ref is None else task.ref,
                     }
                     _write_task_result(result_file, task)
                     display_frame = _build_display_frame(
@@ -169,6 +182,9 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
                         sampled=True,
                         latency_ms=latency_ms,
                         ref=task.ref,
+                        latest_result_frame=last_visual["frame_index"],
+                        show_boxes=show_boxes,
+                        detection_count=len(last_visual["boxes"]),
                     )
                 else:
                     display_frame = _build_display_frame(
@@ -181,6 +197,9 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
                         sampled=False,
                         latency_ms=last_visual["latency_ms"],
                         ref=last_visual["ref"],
+                        latest_result_frame=last_visual["frame_index"],
+                        show_boxes=bool(last_visual["boxes"]),
+                        detection_count=len(last_visual["boxes"]),
                     )
 
                 cv2.imshow(window_name, display_frame)

@@ -17,7 +17,13 @@ import torch
 from PIL import Image
 
 from model_management.model_info import model_lib, COCO_INSTANCE_CATEGORY_NAMES, classes
-from model_management.utils import cal_iou, get_offloading_region, get_offloading_image, draw_detection
+from model_management.utils import (
+    _clip_box_to_image,
+    cal_iou,
+    get_offloading_region,
+    get_offloading_image,
+    draw_detection,
+)
 from model_management.detection_transforms import Compose, ToTensor, Resize
 from model_management.detection_metric import RetrainMetric
 from model_management.detection_dataset import DetectionDataset
@@ -163,6 +169,20 @@ class TestDrawDetection:
     def test_none_predictions(self, sample_bgr_frame):
         result = draw_detection(sample_bgr_frame, None, None, None)
         assert result.shape == sample_bgr_frame.shape
+
+    def test_clip_box_to_image_bounds(self, sample_bgr_frame):
+        clipped = _clip_box_to_image([-20, -10, 2000, 1500], sample_bgr_frame.shape)
+        assert clipped == (0, 0, sample_bgr_frame.shape[1] - 1, sample_bgr_frame.shape[0] - 1)
+
+    def test_draw_detection_clips_partial_boxes(self, sample_bgr_frame):
+        blank = np.zeros_like(sample_bgr_frame)
+        result = draw_detection(blank, [[-20, -20, 40, 40]], [1], [0.9])
+        assert tuple(result[0, 0]) == (0, 255, 0)
+
+    def test_draw_detection_skips_invalid_boxes(self, sample_bgr_frame):
+        blank = np.zeros_like(sample_bgr_frame)
+        result = draw_detection(blank, [[-10, -10, -1, -1]], [1], [0.9])
+        assert np.array_equal(result, blank)
 
 
 # =====================================================================

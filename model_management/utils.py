@@ -86,14 +86,43 @@ def get_offloading_image(offloading_region, image):
     return cropped_image
 
 
+def _clip_box_to_image(box, image_shape):
+    if box is None or len(box) < 4:
+        return None
+
+    height, width = image_shape[:2]
+    if height <= 0 or width <= 0:
+        return None
+
+    x1 = int(round(float(box[0])))
+    y1 = int(round(float(box[1])))
+    x2 = int(round(float(box[2])))
+    y2 = int(round(float(box[3])))
+
+    x1 = min(max(x1, 0), width - 1)
+    y1 = min(max(y1, 0), height - 1)
+    x2 = min(max(x2, 0), width - 1)
+    y2 = min(max(y2, 0), height - 1)
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
 def draw_detection(img, pred_boxes, pred_cls, pred_score):
     cached_img = img.copy()
     rect_th = 1
     text_th = 1
     text_size = 0.6
-    if pred_boxes is None and pred_cls is None:
+    if pred_boxes is None or pred_cls is None:
         return cached_img
+    height, width = cached_img.shape[:2]
     for i in range(len(pred_boxes)):
+        if i >= len(pred_cls):
+            break
+        clipped_box = _clip_box_to_image(pred_boxes[i], cached_img.shape)
+        if clipped_box is None:
+            continue
         label = pred_cls[i]
         if isinstance(label, (int, np.integer)):
             label_text = (
@@ -108,10 +137,7 @@ def draw_detection(img, pred_boxes, pred_cls, pred_score):
         if pred_score is not None and i < len(pred_score):
             score_text = f" {float(pred_score[i]):.2f}"
 
-        x1 = int(pred_boxes[i][0])
-        y1 = int(pred_boxes[i][1])
-        x2 = int(pred_boxes[i][2])
-        y2 = int(pred_boxes[i][3])
+        x1, y1, x2, y2 = clipped_box
         cv2.rectangle(
             cached_img,
             (x1, y1),
@@ -122,7 +148,7 @@ def draw_detection(img, pred_boxes, pred_cls, pred_score):
         cv2.putText(
             cached_img,
             f"{label_text}{score_text}",
-            (x1, max(18, y1 - 6)),
+            (min(max(x1, 0), width - 1), min(max(18, y1 - 6), height - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             text_size,
             (0, 255, 0),
