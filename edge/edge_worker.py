@@ -10,7 +10,6 @@ import grpc
 import torch
 from loguru import logger
 
-from database.database import DataBase
 from difference.diff import DiffProcessor
 from edge.drift_detector import CompositeDriftDetector
 from edge.info import TASK_STATE
@@ -62,14 +61,16 @@ class EdgeWorker:
                 self.resource_trigger.lambda_bw,
             )
 
-        self.database = DataBase(self.config.database)
-        self.database.use_database()
-        self.database.clear_table(self.edge_id)
-        self.data_lock = threading.Lock()
-
         self.queue_info = {f"{i + 1}": 0 for i in range(self.config.edge_num)}
         self.frame_cache = Queue(config.frame_cache_maxsize)
         self.local_queue = Queue(config.local_queue_maxsize)
+        self.latest_result_lock = threading.Lock()
+        self.latest_result = {
+            "frame_index": None,
+            "boxes": [],
+            "labels": [],
+            "scores": [],
+        }
 
         self.collect_flag = bool(self.config.retrain.flag)
         self.retrain_flag = False
@@ -183,6 +184,52 @@ class EdgeWorker:
     def _next_sample_id(self, task: Task) -> str:
         return f"{task.frame_index}-{int(task.start_time * 1000)}"
 
+    def submit_task(self, task: Task) -> Task:
+        self.frame_cache.put(task, block=True)
+        return task
+
+    def _snapshot_result(self, task: Task) -> tuple[list, list, list]:
+        detection_boxes, detection_class, detection_score = task.get_result()
+        return (
+            [list(box) for box in detection_boxes],
+            list(detection_class),
+            list(detection_score),
+        )
+
+    def _remember_latest_result(self, task: Task) -> None:
+        detection_boxes, detection_class, detection_score = self._snapshot_result(task)
+        with self.latest_result_lock:
+            self.latest_result = {
+                "frame_index": task.frame_index,
+                "boxes": detection_boxes,
+                "labels": detection_class,
+                "scores": detection_score,
+            }
+
+    def _reuse_latest_result(self, task: Task) -> None:
+        with self.latest_result_lock:
+            cached = {
+                "frame_index": self.latest_result["frame_index"],
+                "boxes": [list(box) for box in self.latest_result["boxes"]],
+                "labels": list(self.latest_result["labels"]),
+                "scores": list(self.latest_result["scores"]),
+            }
+        task.replace_result(
+            cached["boxes"],
+            cached["labels"],
+            cached["scores"],
+        )
+        if cached["frame_index"] is not None:
+            task.ref = cached["frame_index"]
+            task.result_source = "cached"
+        else:
+            task.result_source = "empty"
+
+    def _finalize_task(self, task: Task) -> None:
+        if task.state == TASK_STATE.FINISHED and task.result_source == "inference":
+            self._remember_latest_result(task)
+        task.mark_done()
+
     def _make_training_decision(
         self,
         *,
@@ -226,19 +273,16 @@ class EdgeWorker:
         if not self.config.diff_flag:
             while True:
                 task = self.frame_cache.get(block=True)
-                self._insert_task_row(task)
                 self.decision_worker(task)
 
         task = self.frame_cache.get(block=True)
         frame = task.frame_edge
         self.pre_frame_feature = self.edge_processor.get_frame_feature(frame)
         self.key_task = task
-        self._insert_task_row(task)
         self.decision_worker(task)
 
         while True:
             task = self.frame_cache.get(block=True)
-            self._insert_task_row(task)
             frame = task.frame_edge
             self.frame_feature = self.edge_processor.get_frame_feature(frame)
             self.diff += self.edge_processor.cal_frame_diff(
@@ -252,45 +296,9 @@ class EdgeWorker:
                 self.decision_worker(task)
             else:
                 task.end_time = time.time()
-                task.ref = self.key_task.frame_index
                 task.state = TASK_STATE.FINISHED
-                self.update_table(task)
-
-    def _insert_task_row(self, task: Task) -> None:
-        data = (
-            task.frame_index,
-            task.start_time,
-            None,
-            "",
-            "",
-        )
-        with self.data_lock:
-            self.database.insert_data(self.edge_id, data)
-
-    def update_table(self, task):
-        if task.state == TASK_STATE.FINISHED:
-            state = "Finished"
-        elif task.state == TASK_STATE.TIMEOUT:
-            state = "Timeout"
-        else:
-            state = ""
-        if task.ref is not None:
-            result = {"ref": task.ref}
-        else:
-            detection_boxes, detection_class, detection_score = task.get_result()
-            result = {
-                "labels": detection_class,
-                "boxes": detection_boxes,
-                "scores": detection_score,
-            }
-        data = (
-            task.end_time,
-            str(result),
-            state,
-            task.frame_index,
-        )
-        with self.data_lock:
-            self.database.update_data(task.edge_id, data)
+                self._reuse_latest_result(task)
+                self._finalize_task(task)
 
     def local_worker(self):
         while True:
@@ -298,7 +306,8 @@ class EdgeWorker:
             if time.time() - task.start_time >= self.config.wait_thresh:
                 task.end_time = time.time()
                 task.state = TASK_STATE.TIMEOUT
-                self.update_table(task)
+                task.result_source = "timeout"
+                self._finalize_task(task)
                 continue
 
             self.queue_info[f"{self.edge_id}"] = self.local_queue.qsize()
@@ -352,7 +361,8 @@ class EdgeWorker:
 
             task.end_time = time.time()
             task.state = TASK_STATE.FINISHED
-            self.update_table(task)
+            task.result_source = "inference"
+            self._finalize_task(task)
 
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> None:
         confidence = float(inference.confidence)

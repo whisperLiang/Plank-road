@@ -10,6 +10,7 @@ import time
 from queue import Queue
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from edge.task import Task
@@ -67,6 +68,18 @@ class TestTask:
         t.add_result(None, None, None)
         b, c, s = t.get_result()
         assert b == [] and c == [] and s == []
+
+    def test_add_result_normalizes_numpy_scalars(self, sample_bgr_frame):
+        t = Task(1, 0, sample_bgr_frame, time.time(), (480, 640))
+        t.add_result(
+            [np.array([10, 20, 100, 200], dtype=np.int64)],
+            np.array([3], dtype=np.int64),
+            np.array([0.9], dtype=np.float32),
+        )
+        b, c, s = t.get_result()
+        assert b == [[10, 20, 100, 200]]
+        assert c == [3]
+        assert s == pytest.approx([0.9])
 
     def test_default_fields(self, sample_bgr_frame):
         t = Task(1, 0, sample_bgr_frame, time.time(), (480, 640))

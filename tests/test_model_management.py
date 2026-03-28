@@ -22,6 +22,8 @@ from model_management.detection_transforms import Compose, ToTensor, Resize
 from model_management.detection_metric import RetrainMetric
 from model_management.detection_dataset import DetectionDataset
 from model_management.model_zoo import (
+    get_model_artifact_path,
+    get_models_dir,
     list_available_models,
     get_model_family,
     is_wrapper_model,
@@ -54,6 +56,11 @@ class TestModelInfo:
 
     def test_fasterrcnn_family(self):
         assert model_lib["fasterrcnn_resnet50_fpn"]["family"] == "fasterrcnn"
+
+    def test_model_paths_are_local_relative_paths(self):
+        for info in model_lib.values():
+            assert "://" not in info["model_path"]
+            assert "/" not in info["model_path"].replace("\\", "/").strip("/")
 
 
 # =====================================================================
@@ -294,3 +301,14 @@ class TestModelZoo:
         assert is_wrapper_model("yolov8n") is True
         # torchvision built-in are not wrappers
         assert is_wrapper_model("fasterrcnn_resnet50_fpn") is False
+
+    def test_models_dir_path(self):
+        models_dir = get_models_dir()
+        assert models_dir.name == "models"
+        assert models_dir.exists()
+
+    def test_model_artifact_paths_resolve_under_models_dir(self):
+        models_dir = get_models_dir().resolve()
+        for model_name in ["fasterrcnn_resnet50_fpn", "yolov8n", "detr_resnet50", "rtdetr_l"]:
+            artifact_path = get_model_artifact_path(model_name).resolve()
+            assert models_dir == artifact_path.parent or models_dir in artifact_path.parents

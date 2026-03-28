@@ -25,8 +25,8 @@ client:
  # Number of worker threads to offloading thread pool
  offloading_max_worker: 1
  frame_cache_maxsize: 100
- small_model_name: fasterrcnn_mobilenet_v3_large_fpn
- lightweight: fasterrcnn_mobilenet_v3_large_fpn
+ small_model_name: yolov8n
+ lightweight: yolov8n
  # Supported model names (see model_management/model_zoo.py):
  #   Faster R-CNN: fasterrcnn_resnet50_fpn, fasterrcnn_mobilenet_v3_large_fpn,
  #                 fasterrcnn_mobilenet_v3_large_320_fpn
@@ -68,10 +68,6 @@ client:
  edge_id: 1
  edge_num: 1
  destinations: {'id': [1], 'ip':[192.168.66.136]}
- # database config
- database:
-  connection: { 'user': 'liang', 'password': '123', 'host': '192.168.66.205', 'raise_on_warnings': True }
-  database_name: 'mydatabase'
  # retrain
  retrain:
   flag: True
@@ -208,8 +204,3 @@ server:
   bn_only: False
   # Number of samples used for gradient-importance probing each epoch.
   probe_samples: 10
- #database config
- database:
-  connection: { 'user': 'root', 'password': 'root', 'host': '127.0.0.1', 'raise_on_warnings': True }
-  database_name: 'mydatabase'
-

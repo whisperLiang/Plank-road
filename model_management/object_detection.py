@@ -11,9 +11,9 @@ from torch.utils.data import DataLoader
 from torchvision.models.detection.backbone_utils import *
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
-from model_management.model_info import model_lib, COCO_INSTANCE_CATEGORY_NAMES, classes, annotation_cols
+from model_management.model_info import annotation_cols
 from model_management.model_zoo import (
-    build_detection_model, is_wrapper_model, model_has_roi_heads, get_model_family,
+    build_detection_model, get_models_dir, is_wrapper_model, model_has_roi_heads, get_model_family,
 )
 from model_management.split_model_adapters import (
     build_split_runtime_sample_input,
@@ -58,7 +58,7 @@ class Object_Detection:
             self.model_name = config.golden
         self.model = None
         self._tmp_weight_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
+            str(get_models_dir()),
             f"tmp_model_{self.model_name}.pth",
         )
         self.load_model()
@@ -66,38 +66,13 @@ class Object_Detection:
         self.threshold_high = 0.6
 
     def load_model(self):
-        weight_folder = os.path.join(os.path.dirname(__file__), 'models')
-        family = get_model_family(self.model_name)
-
-        # --- Wrapper models (YOLO / DETR / RT-DETR): built by factory, weights handled internally ---
-        if family in ('yolo', 'detr', 'rtdetr'):
-            weights_path = None
-            if self.model_name in model_lib:
-                candidate = os.path.join(weight_folder, model_lib[self.model_name]['model_path'])
-                if os.path.exists(candidate):
-                    weights_path = candidate
-            self.model = build_detection_model(
-                self.model_name, pretrained=True, device=device, weights_path=weights_path,
-            )
-            if self.init_model_flag:
-                self.init_model()
-            self.model.eval()
-            get_split_runtime_model(self.model).eval()
-            return
-
-        # --- Torchvision models: load from local weight file ---
-        if self.model_name in model_lib:
-            weight_files_path = os.path.join(weight_folder, model_lib[self.model_name]['model_path'])
-            if os.path.exists(weight_files_path):
-                weight_load = torch.load(weight_files_path, map_location=device)
-                self.model = build_detection_model(self.model_name, pretrained=False, device=device)
-                self.model.load_state_dict(weight_load)
-            else:
-                logger.warning(f"Weight file not found: {weight_files_path}, building with random init.")
-                self.model = build_detection_model(self.model_name, pretrained=False, device=device)
-        else:
-            # Fallback: try factory anyway (covers unlisted torchvision models)
-            self.model = build_detection_model(self.model_name, pretrained=False, device=device)
+        explicit_weights_path = getattr(self.config, "weights_path", None)
+        self.model = build_detection_model(
+            self.model_name,
+            pretrained=True,
+            device=device,
+            weights_path=explicit_weights_path,
+        )
 
         self.model.to(device)
         if self.init_model_flag:
@@ -411,9 +386,9 @@ class Object_Detection:
         if labels_t is None or boxes_t is None or scores_t is None:
             return None, None, None
 
-        prediction_class = list(labels_t.detach().cpu().numpy())
-        prediction_boxes = [[i[0], i[1], i[2], i[3]] for i in list(boxes_t.detach().cpu().numpy())]
-        prediction_score = list(scores_t.detach().cpu().numpy())
+        prediction_class = labels_t.detach().cpu().tolist()
+        prediction_boxes = boxes_t.detach().cpu().tolist()
+        prediction_score = scores_t.detach().cpu().tolist()
 
         try:
             prediction_t = [prediction_score.index(x) for x in prediction_score if x > threshold][-1]

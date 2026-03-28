@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from loguru import logger
 from mapcalc import calculate_map
-from model_management.model_info import classes
+from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES
 
 
 def cal_iou(a, b):
@@ -87,22 +87,47 @@ def get_offloading_image(offloading_region, image):
 
 
 def draw_detection(img, pred_boxes, pred_cls, pred_score):
-    cached_img = img
+    cached_img = img.copy()
     rect_th = 1
     text_th = 1
-    text_size = 1
+    text_size = 0.6
     if pred_boxes is None and pred_cls is None:
         return cached_img
-    vehicle_classes = classes['vehicle']
     for i in range(len(pred_boxes)):
-        # draw the image and label
-        if pred_cls[i] in vehicle_classes:
-            # Draw Rectangle with the coordinates
-            cv2.rectangle(cached_img, (int(pred_boxes[i][0]), int(pred_boxes[i][1])), (int(pred_boxes[i][2]), int(pred_boxes[i][3])),
-                          color=(0, 255, 0), thickness=rect_th)
-            # Write the prediction class
-            cv2.putText(cached_img, pred_cls[i], (int(pred_boxes[i][0]), int(pred_boxes[i][1])),
-                        cv2.FONT_HERSHEY_SIMPLEX, text_size, (0, 255, 0), thickness=text_th)
+        label = pred_cls[i]
+        if isinstance(label, (int, np.integer)):
+            label_text = (
+                COCO_INSTANCE_CATEGORY_NAMES[int(label)]
+                if 0 <= int(label) < len(COCO_INSTANCE_CATEGORY_NAMES)
+                else str(int(label))
+            )
+        else:
+            label_text = str(label)
+
+        score_text = ""
+        if pred_score is not None and i < len(pred_score):
+            score_text = f" {float(pred_score[i]):.2f}"
+
+        x1 = int(pred_boxes[i][0])
+        y1 = int(pred_boxes[i][1])
+        x2 = int(pred_boxes[i][2])
+        y2 = int(pred_boxes[i][3])
+        cv2.rectangle(
+            cached_img,
+            (x1, y1),
+            (x2, y2),
+            color=(0, 255, 0),
+            thickness=rect_th,
+        )
+        cv2.putText(
+            cached_img,
+            f"{label_text}{score_text}",
+            (x1, max(18, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            text_size,
+            (0, 255, 0),
+            thickness=text_th,
+        )
     return cached_img
 
 

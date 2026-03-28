@@ -45,12 +45,15 @@ Usage
 
 from __future__ import annotations
 
-import os
+import hashlib
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from huggingface_hub import snapshot_download
 from loguru import logger
+from torch.hub import download_url_to_file
 from torchvision import transforms
 
 # ---------------------------------------------------------------------------
@@ -74,6 +77,7 @@ from torchvision.models.detection import (
     SSDLite320_MobileNet_V3_Large_Weights,
     FCOS_ResNet50_FPN_Weights,
 )
+from model_management.model_info import model_lib
 from model_management.ultralytics_parity import (
     postprocess_predictions,
     preprocess_bgr_images,
@@ -521,6 +525,126 @@ _RTDETR_MODELS: Dict[str, str] = {
     "rtdetr_x":  "rtdetr-x.pt",
 }
 
+_MODELS_DIR = Path(__file__).resolve().parent / "models"
+
+
+def _normalise_model_name(name: str) -> str:
+    return name.lower().replace("-", "_")
+
+
+def get_models_dir() -> Path:
+    _MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    return _MODELS_DIR
+
+
+def get_model_artifact_path(name: str) -> Path:
+    name_lower = _normalise_model_name(name)
+    model_info = model_lib.get(name_lower, {})
+    artifact_name = model_info.get("model_path", name_lower)
+    return get_models_dir() / artifact_name
+
+
+def _expected_hash_prefix(filename: str) -> str | None:
+    stem = Path(filename).name
+    if "." not in stem or "-" not in stem:
+        return None
+    suffix = stem.rsplit("-", 1)[-1].split(".", 1)[0].lower()
+    if suffix and all(ch in "0123456789abcdef" for ch in suffix):
+        return suffix
+    return None
+
+
+def _matches_expected_hash(path: Path, hash_prefix: str | None) -> bool:
+    if hash_prefix is None:
+        return True
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().startswith(hash_prefix)
+
+
+def _download_file(url: str, destination: Path, hash_prefix: str | None = None) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination.with_name(destination.name + ".download")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    try:
+        download_url_to_file(url, str(tmp_path), hash_prefix=hash_prefix, progress=True)
+        tmp_path.replace(destination)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    return destination
+
+
+def _ensure_torchvision_artifact(name: str) -> Path:
+    name_lower = _normalise_model_name(name)
+    artifact_path = get_model_artifact_path(name_lower)
+    hash_prefix = _expected_hash_prefix(artifact_path.name)
+    if artifact_path.is_file() and _matches_expected_hash(artifact_path, hash_prefix):
+        return artifact_path
+    if artifact_path.exists():
+        logger.warning("Existing weights {} failed validation; redownloading.", artifact_path)
+        artifact_path.unlink()
+    weights_enum = _TORCHVISION_WEIGHT_DEFAULTS[name_lower]
+    logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+    return _download_file(weights_enum.url, artifact_path, hash_prefix=hash_prefix)
+
+
+def _has_hf_snapshot(local_dir: Path) -> bool:
+    if not local_dir.is_dir():
+        return False
+    has_config = (local_dir / "config.json").exists()
+    has_weights = any(
+        (local_dir / filename).exists()
+        for filename in ("model.safetensors", "pytorch_model.bin")
+    )
+    has_processor = (local_dir / "preprocessor_config.json").exists()
+    return has_config and has_weights and has_processor
+
+
+def _ensure_detr_artifact(name: str) -> Path:
+    name_lower = _normalise_model_name(name)
+    artifact_path = get_model_artifact_path(name_lower)
+    if _has_hf_snapshot(artifact_path):
+        return artifact_path
+    artifact_path.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+    snapshot_download(
+        repo_id=_DETR_MODELS[name_lower],
+        local_dir=artifact_path,
+        cache_dir=get_models_dir() / ".hf_cache",
+        ignore_patterns=["*.h5", "*.msgpack", "*.onnx", "*.tflite"],
+    )
+    return artifact_path
+
+
+def _ensure_ultralytics_artifact(name: str) -> Path:
+    name_lower = _normalise_model_name(name)
+    artifact_path = get_model_artifact_path(name_lower)
+    if artifact_path.is_file():
+        return artifact_path
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+    from ultralytics.utils.downloads import attempt_download_asset
+
+    downloaded = Path(attempt_download_asset(str(artifact_path), release="latest"))
+    if downloaded.resolve() != artifact_path.resolve():
+        artifact_path.write_bytes(downloaded.read_bytes())
+    return artifact_path
+
+
+def ensure_local_model_artifact(name: str) -> Path:
+    name_lower = _normalise_model_name(name)
+    if name_lower in _TORCHVISION_WEIGHT_DEFAULTS:
+        return _ensure_torchvision_artifact(name_lower)
+    if name_lower in _DETR_MODELS:
+        return _ensure_detr_artifact(name_lower)
+    if name_lower in _YOLO_MODELS or name_lower in _RTDETR_MODELS:
+        return _ensure_ultralytics_artifact(name_lower)
+    return get_model_artifact_path(name_lower)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  6. Unified factory
@@ -561,31 +685,30 @@ def build_detection_model(
         A model whose ``forward([img_tensor])`` returns the standard
         torchvision detection output format.
     """
-    name_lower = name.lower().replace("-", "_")
+    name_lower = _normalise_model_name(name)
+    artifact_path = Path(weights_path) if weights_path is not None else None
+    if artifact_path is not None and not artifact_path.exists():
+        raise FileNotFoundError(f"Weights path does not exist: {artifact_path}")
 
     # ── 1. Torchvision built-in ──
     if name_lower in _TORCHVISION_BUILTIN:
         build_fn = _TORCHVISION_BUILTIN[name_lower]
-        if pretrained:
+        try:
+            model = build_fn(weights=None, weights_backbone=None, **kwargs)
+        except TypeError:
+            # Some constructors do not expose weights_backbone.
             try:
-                model = build_fn(weights=_TORCHVISION_WEIGHT_DEFAULTS[name_lower], **kwargs)
+                model = build_fn(weights=None, **kwargs)
             except TypeError:
-                # Backward compatibility for older torchvision APIs.
-                model = build_fn(pretrained=True, **kwargs)
-        else:
-            try:
-                model = build_fn(weights=None, weights_backbone=None, **kwargs)
-            except TypeError:
-                # Some constructors do not expose weights_backbone.
-                try:
-                    model = build_fn(weights=None, **kwargs)
-                except TypeError:
-                    model = build_fn(pretrained=False, pretrained_backbone=False, **kwargs)
+                model = build_fn(pretrained=False, pretrained_backbone=False, **kwargs)
 
-        if weights_path and os.path.isfile(weights_path):
-            state = torch.load(weights_path, map_location=device)
+        if artifact_path is None and pretrained:
+            artifact_path = ensure_local_model_artifact(name_lower)
+
+        if artifact_path is not None and artifact_path.is_file():
+            state = torch.load(artifact_path, map_location=device, weights_only=False)
             model.load_state_dict(state)
-            logger.info("[ModelZoo] Loaded weights from {}", weights_path)
+            logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
 
         model.to(device)
         model.eval()
@@ -594,10 +717,9 @@ def build_detection_model(
 
     # ── 2. YOLO ──
     if name_lower in _YOLO_MODELS:
-        pt_name = _YOLO_MODELS[name_lower]
-        # If user has a local weights file, use it
-        if weights_path and os.path.isfile(weights_path):
-            pt_name = weights_path
+        if artifact_path is None:
+            artifact_path = ensure_local_model_artifact(name_lower)
+        pt_name = str(artifact_path)
         model = YOLODetectionModel(
             model_name=pt_name,
             confidence=confidence,
@@ -609,24 +731,25 @@ def build_detection_model(
 
     # ── 3. DETR (HuggingFace) ──
     if name_lower in _DETR_MODELS:
-        hf_id = _DETR_MODELS[name_lower]
-        if weights_path and os.path.isdir(weights_path):
-            hf_id = weights_path
+        model_source = str(artifact_path) if artifact_path is not None else _DETR_MODELS[name_lower]
+        if pretrained and artifact_path is None:
+            artifact_path = ensure_local_model_artifact(name_lower)
+            model_source = str(artifact_path)
         model = DETRDetectionModel(
-            model_name_or_path=hf_id,
+            model_name_or_path=model_source,
             confidence=confidence,
             device=device,
             num_classes=num_classes,
             pretrained=pretrained,
         )
-        logger.info("[ModelZoo] Built DETR model: {} ({})", name, hf_id)
+        logger.info("[ModelZoo] Built DETR model: {} ({})", name, model_source)
         return model
 
     # ── 4. RT-DETR (ultralytics) ──
     if name_lower in _RTDETR_MODELS:
-        pt_name = _RTDETR_MODELS[name_lower]
-        if weights_path and os.path.isfile(weights_path):
-            pt_name = weights_path
+        if artifact_path is None:
+            artifact_path = ensure_local_model_artifact(name_lower)
+        pt_name = str(artifact_path)
         model = RTDETRDetectionModel(
             model_name=pt_name,
             confidence=confidence,
@@ -641,22 +764,16 @@ def build_detection_model(
         import torchvision.models.detection as _tv_det_module
         fn = getattr(_tv_det_module, name_lower, None)
         if fn is not None and callable(fn):
-            if pretrained:
+            try:
+                model = fn(weights=None, weights_backbone=None, **kwargs)
+            except TypeError:
                 try:
-                    model = fn(weights="DEFAULT", **kwargs)
+                    model = fn(weights=None, **kwargs)
                 except TypeError:
-                    model = fn(pretrained=True, **kwargs)
-            else:
-                try:
-                    model = fn(weights=None, weights_backbone=None, **kwargs)
-                except TypeError:
-                    try:
-                        model = fn(weights=None, **kwargs)
-                    except TypeError:
-                        model = fn(**kwargs)
-            if weights_path and os.path.isfile(weights_path):
+                    model = fn(**kwargs)
+            if artifact_path is not None and artifact_path.is_file():
                 model.load_state_dict(
-                    torch.load(weights_path, map_location=device)
+                    torch.load(artifact_path, map_location=device, weights_only=False)
                 )
             model.to(device)
             model.eval()

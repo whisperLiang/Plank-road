@@ -22,7 +22,6 @@ from concurrent import futures
 from torch.utils.data import DataLoader
 
 from loguru import logger
-from database.database import DataBase
 from edge.info import TASK_STATE
 from grpc_server.rpc_server import MessageTransmissionServicer
 from tools.grpc_options import grpc_message_options
@@ -31,6 +30,7 @@ from model_management.object_detection import Object_Detection
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
+from model_management.model_zoo import ensure_local_model_artifact
 from model_management.split_model_adapters import (
     build_split_runtime_sample_input,
     build_split_training_loss,
@@ -116,12 +116,10 @@ class CloudContinualLearner:
             state = torch.load(edge_weights, map_location=self.device)
         else:
             if model_name in model_lib:
-                official_path = os.path.join(
-                    self.weight_folder, model_lib[model_name]["model_path"]
-                )
+                official_path = ensure_local_model_artifact(model_name)
                 state = (
                     torch.load(official_path, map_location=self.device)
-                    if os.path.exists(official_path)
+                    if official_path.is_file()
                     else None
                 )
             else:
@@ -518,10 +516,8 @@ class CloudContinualLearner:
         else:
             # Fall back to the model-lib path
             if model_name in model_lib:
-                official_path = os.path.join(
-                    self.weight_folder, model_lib[model_name]["model_path"]
-                )
-                if os.path.exists(official_path):
+                official_path = ensure_local_model_artifact(model_name)
+                if official_path.is_file():
                     state = torch.load(official_path, map_location=self.device)
                     logger.info(f"[CL] Loaded official weights from {official_path}")
                 else:
@@ -599,11 +595,6 @@ class CloudServer:
         # Cloud-side continual learner (retrains the edge lightweight model)
         self.continual_learner = CloudContinualLearner(config, self.large_object_detection)
 
-        #create database and tables
-        self.database = DataBase(self.config.database)
-        self.database.use_database()
-        self.database.create_table(self.config.edge_ids)
-
         # start the thread for local process
         self.local_queue = Queue(config.local_queue_maxsize)
         self.local_processor = threading.Thread(target=self.cloud_local, daemon=True)
@@ -617,7 +608,7 @@ class CloudServer:
                 end_time = time.time()
                 task.end_time = end_time
                 task.state = TASK_STATE.TIMEOUT
-                self.update_table(task)
+                self._log_task(task)
                 continue
             task.frame_cloud = task.frame_edge
             frame = task.frame_cloud
@@ -629,31 +620,18 @@ class CloudServer:
                 task.add_result(high_boxes, high_class, high_score)
             end_time = time.time()
             task.end_time = end_time
-            # upload the result to database
             task.state = TASK_STATE.FINISHED
-            self.update_table(task)
+            self._log_task(task)
 
-
-    def update_table(self, task):
-        if task.state == TASK_STATE.FINISHED:
-            state = "Finished"
-        elif task.state == TASK_STATE.TIMEOUT:
-            state = "Timeout"
-        else:
-            state = ""
-        detection_boxes, detection_class, detection_score = task.get_result()
-        result = {
-            'labels': detection_class,
-            'boxes': detection_boxes,
-            'scores': detection_score
-        }
-        # upload the result to database
-        data = (
-            task.end_time,
-            str(result),
-            state,
-            task.frame_index)
-        self.database.update_data(task.edge_id, data)
+    def _log_task(self, task):
+        detection_boxes, _, _ = task.get_result()
+        logger.info(
+            "Cloud task edge={} frame={} state={} detections={}",
+            task.edge_id,
+            task.frame_index,
+            task.state.name if task.state else "UNKNOWN",
+            len(detection_boxes),
+        )
 
 
     def start_server(self):

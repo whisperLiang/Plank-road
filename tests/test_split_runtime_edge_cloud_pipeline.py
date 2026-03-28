@@ -23,7 +23,11 @@ from edge.transmit import pack_training_payload
 from cloud_server import CloudContinualLearner
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from grpc_server.rpc_server import MessageTransmissionServicer
-from model_management.model_zoo import build_detection_model, build_model_sample_input
+from model_management.model_zoo import (
+    build_detection_model,
+    build_model_sample_input,
+    ensure_local_model_artifact,
+)
 from model_management.object_detection import Object_Detection
 from model_management.payload import SplitPayload
 from model_management.split_model_adapters import (
@@ -44,8 +48,6 @@ from tools.grpc_options import grpc_message_options
 
 REPO_ROOT = Path(r"D:\ProgramCode\Plank-road")
 ROAD_VIDEO = REPO_ROOT / "video_data" / "road.mp4"
-YOLO_WEIGHTS = REPO_ROOT / "yolov8n.pt"
-FASTERRCNN_MOBILENET_CHECKPOINT = Path(torch.hub.get_dir()) / "checkpoints" / "fasterrcnn_mobilenet_v3_large_320_fpn-907ea3f9.pth"
 
 
 class TraceableFasterRCNNDetector(nn.Module):
@@ -407,14 +409,10 @@ def test_feature_transfer_and_weight_download_over_grpc(tmp_path):
 
 
 def test_real_yolov8_runs_end_to_end_on_road_video():
-    if not YOLO_WEIGHTS.exists():
-        pytest.skip(f"Missing weights: {YOLO_WEIGHTS}")
-
     model = build_detection_model(
         "yolov8n",
         pretrained=True,
         device="cpu",
-        weights_path=str(YOLO_WEIGHTS),
     )
     frames = _read_video_frames(count=3, size=(640, 360))
     to_tensor = transforms.ToTensor()
@@ -431,14 +429,10 @@ def test_real_yolov8_runs_end_to_end_on_road_video():
 
 
 def test_real_yolov8_split_runtime_pads_non_stride_aligned_inputs():
-    if not YOLO_WEIGHTS.exists():
-        pytest.skip(f"Missing weights: {YOLO_WEIGHTS}")
-
     model = build_detection_model(
         "yolov8n",
         pretrained=True,
         device="cpu",
-        weights_path=str(YOLO_WEIGHTS),
     ).eval()
     core_model = get_split_runtime_model(model).eval()
 
@@ -461,14 +455,10 @@ def test_real_yolov8_split_runtime_pads_non_stride_aligned_inputs():
 
 
 def test_real_yolov8_split_runtime_matches_wrapper_output():
-    if not YOLO_WEIGHTS.exists():
-        pytest.skip(f"Missing weights: {YOLO_WEIGHTS}")
-
     model = build_detection_model(
         "yolov8n",
         pretrained=True,
         device="cpu",
-        weights_path=str(YOLO_WEIGHTS),
     ).eval()
     frame = _read_video_frames(count=1, size=(640, 360))[0]
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -490,14 +480,10 @@ def test_real_yolov8_split_runtime_matches_wrapper_output():
 
 
 def test_real_yolov8_fixed_split_recovers_trainable_tail_from_parameter_refs():
-    if not YOLO_WEIGHTS.exists():
-        pytest.skip(f"Missing weights: {YOLO_WEIGHTS}")
-
     model = build_detection_model(
         "yolov8n",
         pretrained=True,
         device="cpu",
-        weights_path=str(YOLO_WEIGHTS),
     ).eval()
     for parameter in model.parameters():
         parameter.requires_grad = False
@@ -719,8 +705,6 @@ def test_original_ssd_service_split_retrain_updates_weights(tmp_path):
 def test_original_fasterrcnn_service_split_retrain_recovers_cached_candidate_by_boundary_labels(tmp_path):
     if not ROAD_VIDEO.exists():
         pytest.skip(f"Missing video: {ROAD_VIDEO}")
-    if not FASTERRCNN_MOBILENET_CHECKPOINT.exists():
-        pytest.skip(f"Missing cached checkpoint: {FASTERRCNN_MOBILENET_CHECKPOINT}")
 
     frames = _read_video_frames(count=2, size=(320, 192))
     runtime_inputs = [
@@ -732,17 +716,18 @@ def test_original_fasterrcnn_service_split_retrain_recovers_cached_candidate_by_
     for index, frame in enumerate(frames):
         cv2.imwrite(str(frame_dir / f"{index}.jpg"), frame)
     model_name = "fasterrcnn_mobilenet_v3_large_320_fpn"
+    checkpoint_path = ensure_local_model_artifact(model_name)
     model, splitter, candidate = _build_original_splitter(
         model_name,
         runtime_inputs[0],
-        weights_path=str(FASTERRCNN_MOBILENET_CHECKPOINT),
+        weights_path=str(checkpoint_path),
     )
 
     # Re-tracing with the service-side default sample input changes the frontier ordering,
     # so the cached candidate must be recovered by boundary labels rather than raw candidate_id.
     service_trace = UniversalModelSplitter(device="cpu")
     service_trace.trace(
-        build_detection_model(model_name, pretrained=False, device="cpu", weights_path=str(FASTERRCNN_MOBILENET_CHECKPOINT)).eval(),
+        build_detection_model(model_name, pretrained=False, device="cpu", weights_path=str(checkpoint_path)).eval(),
         build_model_sample_input(model_name, image_size=(224, 224), device="cpu"),
     )
     service_trace.enumerate_candidates(max_candidates=24)

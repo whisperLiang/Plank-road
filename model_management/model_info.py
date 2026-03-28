@@ -32,10 +32,9 @@ model_lib = {
         'family': 'fcos',
     },
     # ── YOLO (ultralytics — weights auto-downloaded on first use) ──
-    # NOTE: For YOLO / DETR / RT-DETR, ``model_path`` is the download
-    # identifier (ultralytics .pt name or HuggingFace repo ID), NOT a
-    # local file path.  Weights are fetched on first use; place local
-    # overrides in ``models/`` to skip the download.
+    # ``model_path`` always refers to the local artifact path relative
+    # to ``model_management/models``. Remote download identifiers are
+    # resolved by the model zoo when the artifact is missing.
     'yolov5n': {'model_path': 'yolov5nu.pt', 'family': 'yolo'},
     'yolov5s': {'model_path': 'yolov5su.pt', 'family': 'yolo'},
     'yolov5m': {'model_path': 'yolov5mu.pt', 'family': 'yolo'},
@@ -62,9 +61,9 @@ model_lib = {
     'yolo12l': {'model_path': 'yolo12l.pt', 'family': 'yolo'},
     'yolo12x': {'model_path': 'yolo12x.pt', 'family': 'yolo'},
     # ── DETR (HuggingFace — auto-downloaded on first use) ──
-    'detr_resnet50': {'model_path': 'facebook/detr-resnet-50', 'family': 'detr'},
-    'detr_resnet101': {'model_path': 'facebook/detr-resnet-101', 'family': 'detr'},
-    'conditional_detr_resnet50': {'model_path': 'microsoft/conditional-detr-resnet-50', 'family': 'detr'},
+    'detr_resnet50': {'model_path': 'detr_resnet50', 'family': 'detr'},
+    'detr_resnet101': {'model_path': 'detr_resnet101', 'family': 'detr'},
+    'conditional_detr_resnet50': {'model_path': 'conditional_detr_resnet50', 'family': 'detr'},
     # ── RT-DETR (ultralytics) ──
     'rtdetr_l': {'model_path': 'rtdetr-l.pt', 'family': 'rtdetr'},
     'rtdetr_x': {'model_path': 'rtdetr-x.pt', 'family': 'rtdetr'},

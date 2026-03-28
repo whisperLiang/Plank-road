@@ -135,7 +135,6 @@ Plank-road/
 │   ├── message_transmission_pb2_grpc.py
 │   └── rpc_server.py
 ├── difference/
-├── database/
 ├── tools/
 ├── model_management/
 │   ├── activation_sparsity.py

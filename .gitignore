@@ -4,3 +4,4 @@ AGENTS.md
 .agents/
 cache/
 log/
+model_management/models/
