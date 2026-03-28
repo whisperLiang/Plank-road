@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
@@ -115,15 +116,6 @@ def _trace_signature(splitter: UniversalModelSplitter) -> str:
     return hashlib.sha1(raw).hexdigest()
 
 
-def _profile_map(
-    splitter: UniversalModelSplitter,
-    *,
-    validate_candidates: bool,
-) -> dict[str, CandidateProfile]:
-    profiles = splitter.profile_candidates(validate=validate_candidates)
-    return {profile.candidate_id: profile for profile in profiles}
-
-
 def _total_trainable_layers(splitter: UniversalModelSplitter) -> int:
     _, graph = splitter._ensure_ready()
     return sum(1 for label in graph.relevant_labels if graph.nodes[label].has_trainable_params)
@@ -169,6 +161,60 @@ def _make_plan_id(
     return hashlib.sha1(raw).hexdigest()
 
 
+def _ensure_candidate_pool(
+    runtime: UniversalModelSplitter,
+    constraints: SplitConstraints,
+) -> list[SplitCandidate]:
+    expected = (
+        int(constraints.max_candidates),
+        int(constraints.max_boundary_count),
+        int(constraints.max_payload_bytes),
+    )
+    current_candidates = getattr(runtime, "candidates", None)
+    if (
+        not current_candidates
+        or getattr(runtime, "_candidate_enumeration_config", None) != expected
+    ):
+        enumerated = runtime.enumerate_candidates(
+            max_candidates=constraints.max_candidates,
+            max_boundary_count=constraints.max_boundary_count,
+            max_payload_bytes=constraints.max_payload_bytes,
+        )
+        if current_candidates is None:
+            setattr(runtime, "candidates", list(enumerated))
+        current_candidates = getattr(runtime, "candidates", enumerated)
+    return list(current_candidates or [])
+
+
+def _profile_from_report(
+    runtime: UniversalModelSplitter,
+    candidate: SplitCandidate,
+    report: Mapping[str, Any],
+) -> CandidateProfile:
+    _, graph = runtime._ensure_ready()
+    error = report.get("error")
+    return CandidateProfile(
+        candidate_id=candidate.candidate_id,
+        edge_flops=candidate.estimated_edge_flops,
+        cloud_flops=candidate.estimated_cloud_flops,
+        payload_bytes=candidate.estimated_payload_bytes,
+        boundary_tensor_count=candidate.boundary_count,
+        boundary_shape_summary=[
+            (label, graph.nodes[label].tensor_shape)
+            for label in candidate.boundary_tensor_labels
+        ],
+        estimated_privacy_leakage=candidate.estimated_privacy_risk,
+        measured_edge_latency=float(report.get("edge_latency", 0.0)),
+        measured_cloud_latency=float(report.get("cloud_latency", 0.0)),
+        measured_end_to_end_latency=float(report.get("end_to_end_latency", 0.0)),
+        replay_success_rate=1.0 if bool(report.get("success", False)) else 0.0,
+        tail_trainability=bool(report.get("tail_trainability", candidate.is_trainable_tail)),
+        stability_score=float(report.get("stability_score", 0.0)),
+        validation_passed=error is None and bool(report.get("success", False)),
+        metadata={"error": error} if error else {},
+    )
+
+
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
     if plan.boundary_tensor_labels:
         return splitter.split(boundary_tensor_labels=plan.boundary_tensor_labels)
@@ -201,34 +247,18 @@ def compute_fixed_split_for_model(
     runtime = splitter or UniversalModelSplitter(device=device)
     if runtime.graph is None or runtime.model is None:
         runtime.trace(model, sample_input, sample_kwargs=sample_kwargs)
-    runtime.enumerate_candidates(
-        max_candidates=constraints.max_candidates,
-        max_boundary_count=constraints.max_boundary_count,
-        max_payload_bytes=constraints.max_payload_bytes,
-    )
+    _ensure_candidate_pool(runtime, constraints)
     if not runtime.candidates:
         raise RuntimeError("No split candidates were generated for the model.")
 
-    profile_by_id = _profile_map(
-        runtime,
-        validate_candidates=constraints.validate_candidates,
-    )
     max_privacy_risk = max(
         float(candidate.estimated_privacy_risk) for candidate in runtime.candidates
     )
     total_trainable_layers = _total_trainable_layers(runtime)
 
-    eligible: list[tuple[tuple[Any, ...], SplitCandidate, CandidateProfile | None, float, float]] = []
+    eligible: list[tuple[SplitCandidate, float, float]] = []
     for candidate in runtime.candidates:
-        profile = profile_by_id.get(candidate.candidate_id)
-        if constraints.validate_candidates and (
-            profile is None or not profile.validation_passed
-        ):
-            continue
-        if not (
-            candidate.is_trainable_tail
-            or (profile is not None and profile.tail_trainability)
-        ):
+        if not candidate.is_trainable_tail:
             continue
 
         privacy_metric = _privacy_metric(candidate, max_privacy_risk)
@@ -241,28 +271,7 @@ def compute_fixed_split_for_model(
             continue
         if freezing_ratio > constraints.max_layer_freezing_ratio:
             continue
-
-        measured_latency = (
-            float(profile.measured_end_to_end_latency)
-            if profile is not None and profile.measured_end_to_end_latency is not None
-            else float(candidate.estimated_latency)
-        )
-        eligible.append(
-            (
-                (
-                    int(candidate.estimated_payload_bytes),
-                    measured_latency,
-                    candidate.legacy_layer_index
-                    if candidate.legacy_layer_index is not None
-                    else 10**9,
-                    candidate.candidate_id,
-                ),
-                candidate,
-                profile,
-                privacy_metric,
-                freezing_ratio,
-            )
-        )
+        eligible.append((candidate, privacy_metric, freezing_ratio))
 
     if not eligible:
         raise RuntimeError(
@@ -271,10 +280,82 @@ def compute_fixed_split_for_model(
             f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
         )
 
-    _, chosen, profile, privacy_metric, freezing_ratio = min(eligible, key=lambda item: item[0])
+    if not constraints.validate_candidates:
+        chosen, privacy_metric, freezing_ratio = min(
+            eligible,
+            key=lambda item: (
+                int(item[0].estimated_payload_bytes),
+                float(item[0].estimated_latency),
+                item[0].legacy_layer_index
+                if item[0].legacy_layer_index is not None
+                else 10**9,
+                item[0].candidate_id,
+            ),
+        )
+        profile = None
+    else:
+        grouped: dict[int, list[tuple[SplitCandidate, float, float]]] = defaultdict(list)
+        for candidate, privacy_metric, freezing_ratio in eligible:
+            grouped[int(candidate.estimated_payload_bytes)].append(
+                (candidate, privacy_metric, freezing_ratio)
+            )
+
+        chosen: SplitCandidate | None = None
+        chosen_profile: CandidateProfile | None = None
+        chosen_privacy_metric = 0.0
+        chosen_freezing_ratio = 0.0
+        for payload_bytes in sorted(grouped):
+            validated_group: list[tuple[CandidateProfile, SplitCandidate, float, float]] = []
+            group = sorted(
+                grouped[payload_bytes],
+                key=lambda item: (
+                    float(item[0].estimated_latency),
+                    item[0].legacy_layer_index
+                    if item[0].legacy_layer_index is not None
+                    else 10**9,
+                    item[0].candidate_id,
+                ),
+            )
+            for candidate, privacy_metric, freezing_ratio in group:
+                report = runtime.validate_candidate(candidate)
+                if not bool(report.get("success", False)):
+                    continue
+                if not bool(report.get("tail_trainability", candidate.is_trainable_tail)):
+                    continue
+                validated_group.append(
+                    (
+                        _profile_from_report(runtime, candidate, report),
+                        candidate,
+                        privacy_metric,
+                        freezing_ratio,
+                    )
+                )
+            if validated_group:
+                chosen_profile, chosen, chosen_privacy_metric, chosen_freezing_ratio = min(
+                    validated_group,
+                    key=lambda item: (
+                        float(item[0].measured_end_to_end_latency),
+                        item[1].legacy_layer_index
+                        if item[1].legacy_layer_index is not None
+                        else 10**9,
+                        item[1].candidate_id,
+                    ),
+                )
+                break
+
+        if chosen is None or chosen_profile is None:
+            raise RuntimeError(
+                "No replayable split candidate satisfies the fixed split constraints. "
+                f"privacy_metric_lower_bound={constraints.privacy_metric_lower_bound}, "
+                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
+            )
+        profile = chosen_profile
+        privacy_metric = chosen_privacy_metric
+        freezing_ratio = chosen_freezing_ratio
+
     validation = {
         "validation_passed": bool(profile.validation_passed) if profile is not None else True,
-        "tail_trainability": bool(profile.tail_trainability) if profile is not None else chosen.is_trainable_tail,
+        "tail_trainability": bool(profile.tail_trainability) if profile is not None else bool(chosen.is_trainable_tail),
         "replay_success_rate": float(profile.replay_success_rate) if profile is not None else 1.0,
         "stability_score": float(profile.stability_score) if profile is not None else 1.0,
     }
@@ -337,11 +418,6 @@ def load_or_compute_fixed_split_plan(
     runtime = splitter or UniversalModelSplitter(device=device)
     if runtime.graph is None or runtime.model is None:
         runtime.trace(model, sample_input, sample_kwargs=sample_kwargs)
-    runtime.enumerate_candidates(
-        max_candidates=constraints.max_candidates,
-        max_boundary_count=constraints.max_boundary_count,
-        max_payload_bytes=constraints.max_payload_bytes,
-    )
     trace_signature = _trace_signature(runtime)
     model_key = model_name or model.__class__.__name__
 
@@ -352,6 +428,7 @@ def load_or_compute_fixed_split_plan(
             constraints=constraints,
             trace_signature=trace_signature,
         ):
+            _ensure_candidate_pool(runtime, constraints)
             if validate_cached_plan:
                 report = validate_split_plan(runtime, cached)
                 cached.validation = {**cached.validation, **report}
@@ -359,6 +436,7 @@ def load_or_compute_fixed_split_plan(
                 apply_split_plan(runtime, cached)
             return cached
 
+    _ensure_candidate_pool(runtime, constraints)
     plan = compute_fixed_split_for_model(
         model,
         constraints,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -161,6 +162,33 @@ def reduce_output_to_loss(outputs: Any, targets: Any = None) -> torch.Tensor:
     return accumulator
 
 
+def _call_loss_fn(
+    loss_fn,
+    outputs: Any,
+    targets: Any = None,
+    *,
+    runtime: "GraphSplitRuntime | None" = None,
+    candidate: SplitCandidate | None = None,
+) -> torch.Tensor:
+    if loss_fn is None:
+        return reduce_output_to_loss(outputs, targets)
+
+    kwargs: dict[str, Any] = {}
+    try:
+        parameters = inspect.signature(loss_fn).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if runtime is not None and ("runtime" in parameters or accepts_kwargs):
+        kwargs["runtime"] = runtime
+    if candidate is not None and ("candidate" in parameters or accepts_kwargs):
+        kwargs["candidate"] = candidate
+    return loss_fn(outputs, targets, **kwargs)
+
+
 def compare_outputs(expected: Any, replayed: Any, *, atol: float = 1e-4, rtol: float = 1e-4) -> tuple[bool, float]:
     expected_tensors = _flatten_tensors(expected)
     replayed_tensors = _flatten_tensors(replayed)
@@ -221,6 +249,10 @@ class GraphSplitRuntime:
         self.current_candidate: SplitCandidate | None = None
         self.runtime_state: RuntimeState = RuntimeState(values=OrderedDict())
         self.trainability_loss_fn = None
+        self._validation_cache: dict[tuple[str, float, float], dict[str, Any]] = {}
+
+    def _invalidate_validation_cache(self) -> None:
+        self._validation_cache.clear()
 
     def trace(
         self,
@@ -229,18 +261,28 @@ class GraphSplitRuntime:
         sample_kwargs: Mapping[str, Any] | None = None,
     ) -> "GraphSplitRuntime":
         self.model = model
+        grad_state = {
+            name: parameter.requires_grad
+            for name, parameter in model.named_parameters()
+        }
+        trainable_param_names = {
+            name for name, is_trainable in grad_state.items() if is_trainable
+        }
         history, sample_args, sample_kwargs_dict, sample_output = trace_model(
             model,
             sample_input,
             sample_kwargs=sample_kwargs,
         )
         try:
+            for name, parameter in model.named_parameters():
+                parameter.requires_grad_(grad_state.get(name, parameter.requires_grad))
             self.graph = build_graph_from_trace(
                 model,
                 history,
                 sample_args,
                 sample_kwargs_dict,
                 sample_output,
+                trainable_param_names=trainable_param_names,
             )
         finally:
             # The runtime only needs the derived graph; retaining the raw
@@ -251,9 +293,12 @@ class GraphSplitRuntime:
                 cleanup()
             del history
             gc.collect()
+            for name, parameter in model.named_parameters():
+                parameter.requires_grad_(grad_state.get(name, parameter.requires_grad))
         self.candidates = enumerate_candidates(self.graph)
         self.current_candidate = self.candidates[0] if self.candidates else None
         self.reset_runtime_state()
+        self._invalidate_validation_cache()
         return self
 
     def reset_runtime_state(self) -> None:
@@ -489,6 +534,13 @@ class GraphSplitRuntime:
     ) -> dict[str, Any]:
         model, graph = self._ensure_ready()
         chosen = self._candidate_or_default(candidate)
+        cache_key = (chosen.candidate_id, float(atol), float(rtol))
+        cached = self._validation_cache.get(cache_key)
+        if cached is not None:
+            chosen.is_validated = bool(cached.get("success", False))
+            chosen.is_trainable_tail = bool(cached.get("tail_trainability", chosen.is_trainable_tail))
+            chosen.validation_error = cached.get("error")
+            return dict(cached)
         sample_args = tuple(arg.to(self.device) if isinstance(arg, torch.Tensor) else arg for arg in graph.sample_args)
         sample_kwargs = {
             key: value.to(self.device) if isinstance(value, torch.Tensor) else value
@@ -515,7 +567,7 @@ class GraphSplitRuntime:
         chosen.is_validated = success
         chosen.is_trainable_tail = trainability
         chosen.validation_error = None if success else f"max_diff={max_diff}"
-        return {
+        report = {
             "success": success,
             "max_diff": max_diff,
             "edge_latency": edge_elapsed,
@@ -525,6 +577,8 @@ class GraphSplitRuntime:
             "stability_score": 1.0 if success else 0.0,
             "error": chosen.validation_error,
         }
+        self._validation_cache[cache_key] = dict(report)
+        return report
 
     def _check_tail_trainability(
         self,
@@ -545,9 +599,12 @@ class GraphSplitRuntime:
         self._zero_candidate_grads(candidate.cloud_nodes)
         outputs = self.cloud_forward(payload, *args, candidate=candidate, **kwargs)
         if self.trainability_loss_fn is not None:
-            loss = self.trainability_loss_fn(
+            loss = _call_loss_fn(
+                self.trainability_loss_fn,
                 outputs,
                 _make_dummy_detection_targets(args, device=self.device),
+                runtime=self,
+                candidate=candidate,
             )
         else:
             loss = reduce_output_to_loss(outputs)
@@ -622,10 +679,18 @@ class GraphSplitRuntime:
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
         outputs = self.cloud_forward(payload, *args, candidate=chosen, **kwargs)
-        loss = loss_fn(outputs, targets) if loss_fn is not None else reduce_output_to_loss(outputs, targets)
+        effective_loss_fn = loss_fn if loss_fn is not None else self.trainability_loss_fn
+        loss = _call_loss_fn(
+            effective_loss_fn,
+            outputs,
+            targets,
+            runtime=self,
+            candidate=chosen,
+        )
         if optimizer is not None:
             loss.backward()
             optimizer.step()
+            self._invalidate_validation_cache()
         return outputs, loss
 
     def get_tail_state_dict(self, candidate: SplitCandidate | str | None = None) -> OrderedDict[str, torch.Tensor]:
@@ -639,6 +704,7 @@ class GraphSplitRuntime:
 
     def load_tail_state_dict(self, state_dict: Mapping[str, torch.Tensor]) -> None:
         self.model.load_state_dict(state_dict, strict=False)
+        self._invalidate_validation_cache()
 
 
 def _make_dummy_detection_targets(

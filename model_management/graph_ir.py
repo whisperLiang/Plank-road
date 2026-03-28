@@ -917,6 +917,34 @@ def _relevant_labels(nodes: Mapping[str, GraphNode], output_labels: Sequence[str
     return [label for label in nodes if label in visited]
 
 
+def _resolve_parameter_from_ref(model: torch.nn.Module, ref: ParameterTensorRef) -> torch.nn.Parameter | None:
+    try:
+        parameter = model.get_parameter(ref.fq_name)
+    except Exception:
+        try:
+            module = _resolve_attr_path(model, ref.module_path)
+            parameter = getattr(module, ref.param_name)
+        except Exception:
+            return None
+    return parameter if isinstance(parameter, torch.nn.Parameter) else None
+
+
+def _node_has_trainable_params(
+    model: torch.nn.Module,
+    param_refs: Sequence[ParameterTensorRef],
+    *,
+    fallback: bool,
+    trainable_param_names: set[str] | None = None,
+) -> bool:
+    if trainable_param_names is not None:
+        return any(ref.fq_name in trainable_param_names for ref in param_refs)
+    for ref in param_refs:
+        parameter = _resolve_parameter_from_ref(model, ref)
+        if parameter is not None and parameter.requires_grad:
+            return True
+    return fallback
+
+
 def _sample_args_kwargs(sample_input: Any, sample_kwargs: Mapping[str, Any] | None) -> tuple[tuple[Any, ...], dict[str, Any]]:
     kwargs = dict(sample_kwargs or {})
     if isinstance(sample_input, tuple):
@@ -936,6 +964,7 @@ def build_graph_from_trace(
     sample_args: tuple[Any, ...],
     sample_kwargs: dict[str, Any],
     sample_output: Any,
+    trainable_param_names: set[str] | None = None,
 ) -> GraphIR:
     layer_list = list(_get_attr(history, "layer_list", default=[])) or []
     parent_layer_lookup = {
@@ -1011,7 +1040,12 @@ def build_graph_from_trace(
             numel=numel,
             estimated_bytes=estimated_bytes,
             estimated_flops=estimate_node_flops(node_type or func_name, tensor_shape, creation_args),
-            has_trainable_params=bool(_get_attr(layer, "num_params_trainable", default=0)),
+            has_trainable_params=_node_has_trainable_params(
+                model,
+                param_refs,
+                fallback=bool(_get_attr(layer, "num_params_trainable", default=0)),
+                trainable_param_names=trainable_param_names,
+            ),
             topological_index=index,
         )
         nodes[label] = node

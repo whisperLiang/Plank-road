@@ -209,6 +209,27 @@ def build_split_training_loss(model: torch.nn.Module):
 
         return _loss_fn
 
+    if hasattr(model, "roi_heads"):
+        def _loss_fn(
+            outputs: Any,
+            targets: Any,
+            *,
+            runtime=None,
+            candidate=None,
+        ) -> torch.Tensor:
+            from model_management.split_runtime import reduce_output_to_loss
+
+            loss = reduce_output_to_loss(outputs, targets)
+            if _has_nonempty_floating_tensors(outputs) and _loss_has_signal(loss):
+                return loss
+
+            activation_loss = _tail_activation_probe_loss(runtime, candidate)
+            if activation_loss is not None:
+                return activation_loss
+            return loss
+
+        return _loss_fn
+
     return None
 
 
@@ -374,6 +395,57 @@ def _iter_tensors(value: Any):
 def _first_tensor_device(value: Any, *, fallback: torch.device) -> torch.device:
     first = next(_iter_tensors(value), None)
     return first.device if isinstance(first, torch.Tensor) else fallback
+
+
+def _loss_has_signal(loss: Any) -> bool:
+    return (
+        isinstance(loss, torch.Tensor)
+        and loss.requires_grad
+        and bool(torch.isfinite(loss).item())
+    )
+
+
+def _has_nonempty_floating_tensors(value: Any) -> bool:
+    for tensor in _iter_tensors(value):
+        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point() and tensor.numel() > 0:
+            return True
+    return False
+
+
+def _tail_activation_probe_loss(runtime, candidate) -> torch.Tensor | None:
+    if runtime is None or candidate is None or getattr(runtime, "graph", None) is None:
+        return None
+
+    graph = runtime.graph
+    selected_labels: list[str] = []
+    for label in reversed(candidate.cloud_nodes):
+        node = graph.nodes.get(label)
+        if node is None or not node.has_trainable_params:
+            continue
+        if label not in runtime.runtime_state.values:
+            continue
+        selected_labels.append(label)
+        if len(selected_labels) >= 4:
+            break
+
+    total: torch.Tensor | None = None
+    pieces = 0
+    for label in selected_labels:
+        value = runtime.runtime_state.values.get(label)
+        for tensor in _iter_tensors(value):
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+                continue
+            if tensor.numel() == 0:
+                continue
+            finite = tensor[torch.isfinite(tensor)]
+            if finite.numel() == 0:
+                continue
+            partial = finite.square().mean()
+            total = partial if total is None else total + partial
+            pieces += 1
+    if total is None or pieces == 0:
+        return None
+    return total / float(pieces)
 
 
 def _ensure_ultralytics_loss_args(core_model: torch.nn.Module) -> None:

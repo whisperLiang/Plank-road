@@ -27,6 +27,7 @@ from model_management.model_zoo import build_detection_model, build_model_sample
 from model_management.object_detection import Object_Detection
 from model_management.payload import SplitPayload
 from model_management.split_model_adapters import (
+    build_split_training_loss,
     build_split_runtime_sample_input,
     get_split_runtime_model,
     postprocess_split_runtime_output,
@@ -486,6 +487,90 @@ def test_real_yolov8_split_runtime_matches_wrapper_output():
 
     ok, max_diff = compare_outputs([expected], [replayed])
     assert ok, max_diff
+
+
+def test_real_yolov8_fixed_split_recovers_trainable_tail_from_parameter_refs():
+    if not YOLO_WEIGHTS.exists():
+        pytest.skip(f"Missing weights: {YOLO_WEIGHTS}")
+
+    model = build_detection_model(
+        "yolov8n",
+        pretrained=True,
+        device="cpu",
+        weights_path=str(YOLO_WEIGHTS),
+    ).eval()
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    all_params = list(model.parameters())
+    trainable_start = int(len(all_params) * 0.8)
+    for parameter in all_params[trainable_start:]:
+        parameter.requires_grad = True
+
+    splitter = UniversalModelSplitter(device="cpu")
+    sample_input = build_split_runtime_sample_input(
+        model,
+        image_size=(1080, 1920),
+        device="cpu",
+    )
+    splitter.trace(get_split_runtime_model(model).eval(), sample_input)
+    candidates = splitter.enumerate_candidates(max_candidates=24, max_boundary_count=8, max_payload_bytes=32 * 1024 * 1024)
+
+    trainable_labels = [
+        label
+        for label in splitter.graph.relevant_labels
+        if splitter.graph.nodes[label].has_trainable_params
+    ]
+    assert trainable_labels
+    assert any(candidate.is_trainable_tail for candidate in candidates)
+
+
+def test_original_fasterrcnn_split_loss_makes_trainable_candidates_valid_and_trainable():
+    model = build_detection_model(
+        "fasterrcnn_mobilenet_v3_large_320_fpn",
+        pretrained=False,
+        device="cpu",
+    ).eval()
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    for parameter in model.roi_heads.parameters():
+        parameter.requires_grad = True
+
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trainability_loss_fn = build_split_training_loss(model)
+    sample_input = build_split_runtime_sample_input(model, image_size=(96, 96), device="cpu")
+    splitter.trace(get_split_runtime_model(model).eval(), sample_input)
+    candidates = splitter.enumerate_candidates(max_candidates=24, max_boundary_count=8, max_payload_bytes=32 * 1024 * 1024)
+
+    chosen = None
+    report = None
+    for candidate in candidates:
+        if not candidate.is_trainable_tail:
+            continue
+        candidate_report = splitter.validate_candidate(candidate)
+        if candidate_report["success"] and candidate_report["tail_trainability"]:
+            chosen = candidate
+            report = candidate_report
+            break
+
+    assert chosen is not None
+    assert report is not None and report["tail_trainability"]
+
+    splitter.freeze_head(chosen)
+    splitter.unfreeze_tail(chosen)
+    optimizer = torch.optim.Adam(splitter.get_tail_trainable_params(chosen), lr=1e-3)
+    payload = splitter.edge_forward(sample_input, candidate=chosen)
+    before = splitter.get_tail_state_dict(chosen)
+    _, loss = splitter.cloud_train_step(
+        payload,
+        targets={"boxes": [], "labels": [], "scores": []},
+        loss_fn=build_split_training_loss(model),
+        optimizer=optimizer,
+        candidate=chosen,
+    )
+    after = splitter.get_tail_state_dict(chosen)
+
+    assert bool(torch.isfinite(loss).item())
+    assert _changed_state_names(before, after)
 
 
 def test_random_trainable_candidates_replay_and_split_retrain(tmp_path):

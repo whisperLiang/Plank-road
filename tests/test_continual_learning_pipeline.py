@@ -1,18 +1,21 @@
 import io
 import json
 import zipfile
+from types import SimpleNamespace
 
 import torch
 
 from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
 from edge.transmit import pack_continual_learning_bundle
 from model_management.fixed_split import (
+    compute_fixed_split_for_model,
     SplitConstraints,
     SplitPlan,
     load_or_compute_fixed_split_plan,
 )
 from model_management.payload import SplitPayload
 from model_management.continual_learning_bundle import prepare_split_training_cache
+from model_management.split_candidate import SplitCandidate
 
 
 def _dummy_plan() -> SplitPlan:
@@ -90,6 +93,119 @@ def test_fixed_split_is_computed_once_and_reused(tmp_path, monkeypatch):
 
     assert calls["count"] == 1
     assert first.split_config_id == second.split_config_id
+
+
+def test_fixed_split_validates_only_lowest_payload_group_until_success():
+    constraints = SplitConstraints()
+
+    def _candidate(candidate_id: str, *, edge_nodes: list[str], payload_bytes: int, layer_index: int) -> SplitCandidate:
+        return SplitCandidate(
+            candidate_id=candidate_id,
+            edge_nodes=edge_nodes,
+            cloud_nodes=[label for label in ["n1", "n2", "n3"] if label not in edge_nodes],
+            boundary_edges=[],
+            boundary_tensor_labels=[edge_nodes[-1]],
+            edge_input_labels=[],
+            cloud_input_labels=[],
+            cloud_output_labels=["n3"],
+            estimated_edge_flops=1.0,
+            estimated_cloud_flops=1.0,
+            estimated_payload_bytes=payload_bytes,
+            estimated_privacy_risk=1.0,
+            estimated_latency=float(layer_index),
+            is_trainable_tail=True,
+            legacy_layer_index=layer_index,
+            boundary_count=1,
+        )
+
+    candidates = [
+        _candidate("candidate-low-invalid", edge_nodes=["n1"], payload_bytes=10, layer_index=1),
+        _candidate("candidate-low-valid", edge_nodes=["n1", "n2"], payload_bytes=10, layer_index=2),
+        _candidate("candidate-high-valid", edge_nodes=["n1"], payload_bytes=20, layer_index=3),
+    ]
+
+    reports = {
+        "candidate-low-invalid": {
+            "success": False,
+            "edge_latency": 0.1,
+            "cloud_latency": 0.1,
+            "end_to_end_latency": 0.2,
+            "tail_trainability": False,
+            "stability_score": 0.0,
+            "error": "mismatch",
+        },
+        "candidate-low-valid": {
+            "success": True,
+            "edge_latency": 0.1,
+            "cloud_latency": 0.2,
+            "end_to_end_latency": 0.3,
+            "tail_trainability": True,
+            "stability_score": 1.0,
+            "error": None,
+        },
+        "candidate-high-valid": {
+            "success": True,
+            "edge_latency": 0.05,
+            "cloud_latency": 0.05,
+            "end_to_end_latency": 0.1,
+            "tail_trainability": True,
+            "stability_score": 1.0,
+            "error": None,
+        },
+    }
+
+    class DummyRuntime:
+        def __init__(self):
+            self.graph = SimpleNamespace(
+                relevant_labels=["n1", "n2", "n3"],
+                nodes={
+                    "n1": SimpleNamespace(
+                        has_trainable_params=True,
+                        tensor_shape=(1, 4, 4),
+                        containing_module="m.n1",
+                    ),
+                    "n2": SimpleNamespace(
+                        has_trainable_params=True,
+                        tensor_shape=(1, 4, 4),
+                        containing_module="m.n2",
+                    ),
+                    "n3": SimpleNamespace(
+                        has_trainable_params=True,
+                        tensor_shape=(1, 4, 4),
+                        containing_module="m.n3",
+                    ),
+                },
+            )
+            self.model = object()
+            self.candidates = candidates
+            self._candidate_enumeration_config = (
+                constraints.max_candidates,
+                constraints.max_boundary_count,
+                constraints.max_payload_bytes,
+            )
+            self.validation_calls: list[str] = []
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+        def validate_candidate(self, candidate):
+            self.validation_calls.append(candidate.candidate_id)
+            return dict(reports[candidate.candidate_id])
+
+    runtime = DummyRuntime()
+    plan = compute_fixed_split_for_model(
+        torch.nn.Linear(1, 1),
+        constraints,
+        sample_input=[torch.rand(1)],
+        splitter=runtime,
+        model_name="dummy-model",
+    )
+
+    assert plan.candidate_id == "candidate-low-valid"
+    assert runtime.validation_calls == [
+        "candidate-low-invalid",
+        "candidate-low-valid",
+    ]
 
 
 def test_high_confidence_sample_saves_feature_and_result_without_raw(tmp_path):

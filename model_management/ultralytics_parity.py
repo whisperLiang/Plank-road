@@ -8,6 +8,22 @@ from ultralytics.cfg import get_cfg
 from ultralytics.utils.checks import check_imgsz
 
 
+def _parameter_grad_state(module: Any) -> dict[str, bool]:
+    if not isinstance(module, torch.nn.Module):
+        return {}
+    return {
+        name: parameter.requires_grad
+        for name, parameter in module.named_parameters()
+    }
+
+
+def _restore_parameter_grad_state(module: Any, grad_state: dict[str, bool]) -> None:
+    if not isinstance(module, torch.nn.Module):
+        return
+    for name, parameter in module.named_parameters():
+        parameter.requires_grad_(grad_state.get(name, parameter.requires_grad))
+
+
 def _predictor_overrides(
     engine: Any,
     *,
@@ -66,10 +82,14 @@ def preprocess_bgr_images(
     *,
     conf: float,
 ) -> tuple[Any, torch.Tensor]:
-    predictor = ensure_predictor(engine, conf=conf)
-    predictor.batch = ([f"image{i}.jpg" for i in range(len(images_bgr))], None, None)
-    prepared = [np.ascontiguousarray(image) for image in images_bgr]
-    return predictor, predictor.preprocess(prepared)
+    grad_state = _parameter_grad_state(getattr(engine, "model", None))
+    try:
+        predictor = ensure_predictor(engine, conf=conf)
+        predictor.batch = ([f"image{i}.jpg" for i in range(len(images_bgr))], None, None)
+        prepared = [np.ascontiguousarray(image) for image in images_bgr]
+        return predictor, predictor.preprocess(prepared)
+    finally:
+        _restore_parameter_grad_state(getattr(engine, "model", None), grad_state)
 
 
 def postprocess_predictions(
@@ -80,7 +100,11 @@ def postprocess_predictions(
     *,
     conf: float,
 ):
-    predictor = ensure_predictor(engine, conf=conf)
-    predictor.batch = ([f"image{i}.jpg" for i in range(len(images_bgr))], None, None)
-    prepared = [np.ascontiguousarray(image) for image in images_bgr]
-    return predictor.postprocess(predictions, model_input, prepared)
+    grad_state = _parameter_grad_state(getattr(engine, "model", None))
+    try:
+        predictor = ensure_predictor(engine, conf=conf)
+        predictor.batch = ([f"image{i}.jpg" for i in range(len(images_bgr))], None, None)
+        prepared = [np.ascontiguousarray(image) for image in images_bgr]
+        return predictor.postprocess(predictions, model_input, prepared)
+    finally:
+        _restore_parameter_grad_state(getattr(engine, "model", None), grad_state)

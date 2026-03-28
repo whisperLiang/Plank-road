@@ -159,6 +159,7 @@ class UniversalModelSplitter(GraphSplitRuntime):
     def __init__(self, *, device: str | torch.device = "cpu") -> None:
         super().__init__(device=device)
         self.selected_candidate_id: str | None = None
+        self._candidate_enumeration_config: tuple[int, int, int] | None = None
 
     def trace(
         self,
@@ -167,6 +168,7 @@ class UniversalModelSplitter(GraphSplitRuntime):
         sample_kwargs: Mapping[str, Any] | None = None,
     ) -> "UniversalModelSplitter":
         super().trace(model, sample_input, sample_kwargs=sample_kwargs)
+        self._candidate_enumeration_config = None
         if self.current_candidate is not None:
             self.selected_candidate_id = self.current_candidate.candidate_id
         return self
@@ -219,6 +221,11 @@ class UniversalModelSplitter(GraphSplitRuntime):
             max_candidates=max_candidates,
             max_boundary_count=max_boundary_count,
             max_payload_bytes=max_payload_bytes,
+        )
+        self._candidate_enumeration_config = (
+            int(max_candidates),
+            int(max_boundary_count),
+            int(max_payload_bytes),
         )
         return list(self.candidates)
 
