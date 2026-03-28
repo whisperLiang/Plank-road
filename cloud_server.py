@@ -25,6 +25,7 @@ from loguru import logger
 from database.database import DataBase
 from edge.info import TASK_STATE
 from grpc_server.rpc_server import MessageTransmissionServicer
+from tools.grpc_options import grpc_message_options
 
 from model_management.object_detection import Object_Detection
 from model_management.detection_dataset import TrafficDataset
@@ -306,6 +307,13 @@ class CloudContinualLearner:
                 if manifest.get("protocol_version") != CONTINUAL_LEARNING_PROTOCOL_VERSION:
                     raise RuntimeError(
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
+                    )
+                bundle_model_id = str(manifest.get("model", {}).get("model_id", "")).strip()
+                if bundle_model_id and bundle_model_id != self.edge_model_name:
+                    raise RuntimeError(
+                        "Continual learning bundle model mismatch: "
+                        f"bundle.model_id={bundle_model_id}, "
+                        f"server.edge_model_name={self.edge_model_name}"
                     )
 
                 tmp_model = self._load_edge_training_model()
@@ -633,7 +641,10 @@ class CloudServer:
 
     def start_server(self):
         logger.info("cloud server is starting")
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=4),
+            options=grpc_message_options(),
+        )
         message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
             MessageTransmissionServicer(
                 self.local_queue,
@@ -653,7 +664,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="configuration description")
     parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
     args = parser.parse_args()
-    with open(args.yaml_path, 'r') as f:
+    with open(args.yaml_path, 'r', encoding='utf-8') as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
     # provide class-like access for dict
     config = munch.munchify(config)

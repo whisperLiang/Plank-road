@@ -33,8 +33,10 @@ from model_management.fixed_split import (
     SplitPlan,
     load_or_compute_fixed_split_plan,
 )
+from model_management.model_zoo import is_wrapper_model
 from model_management.object_detection import InferenceArtifacts, Object_Detection
 from model_management.universal_model_split import UniversalModelSplitter
+from tools.grpc_options import grpc_message_options
 
 
 class EdgeWorker:
@@ -86,11 +88,25 @@ class EdgeWorker:
             )
         )
 
-        self.split_learning_enabled = True
+        sl_cfg = getattr(config, "split_learning", None)
+        self.split_learning_enabled = bool(getattr(sl_cfg, "enabled", False)) if sl_cfg else False
+        self.split_learning_disable_reason: str | None = None
         self.universal_split_enabled = False
         self.universal_splitter: UniversalModelSplitter | None = None
         self.fixed_split_plan: SplitPlan | None = None
         self._init_fixed_split_runtime()
+        if self.collect_flag and not self.split_learning_enabled:
+            self.collect_flag = False
+            if self.split_learning_disable_reason == "disabled_in_config":
+                logger.info(
+                    "Continual learning sample collection disabled because split_learning.enabled is false."
+                )
+            else:
+                logger.warning(
+                    "Continual learning sample collection disabled for edge model {}: {}",
+                    self.model_id,
+                    self.split_learning_disable_reason or "split learning unavailable",
+                )
 
         self.diff = 0.0
         self.key_task = None
@@ -104,6 +120,23 @@ class EdgeWorker:
     def _init_fixed_split_runtime(self) -> None:
         sl_cfg = getattr(self.config, "split_learning", None)
         fixed_split_cfg = getattr(sl_cfg, "fixed_split", None) if sl_cfg else None
+        if not self.split_learning_enabled:
+            self.split_learning_disable_reason = "disabled_in_config"
+            logger.info("Split learning disabled in config; skipping fixed split initialisation.")
+            return
+
+        if is_wrapper_model(self.model_id):
+            self.split_learning_enabled = False
+            self.split_learning_disable_reason = (
+                "wrapper models (YOLO/DETR/RT-DETR) do not support the current split-learning continual-learning path"
+            )
+            logger.warning(
+                "Split learning disabled for edge model {}. "
+                "The current continual-learning path only supports non-wrapper torchvision detectors.",
+                self.model_id,
+            )
+            return
+
         try:
             self.universal_splitter = UniversalModelSplitter(
                 device=next(self.small_object_detection.model.parameters()).device,
@@ -131,8 +164,16 @@ class EdgeWorker:
                 self.fixed_split_plan.split_index,
                 self.fixed_split_plan.payload_bytes,
             )
+        except RuntimeError as exc:
+            logger.warning("Fixed split plan unavailable for model {}: {}", self.model_id, exc)
+            self.split_learning_disable_reason = str(exc)
+            self.split_learning_enabled = False
+            self.universal_split_enabled = False
+            self.universal_splitter = None
+            self.fixed_split_plan = None
         except Exception as exc:
             logger.exception("Failed to initialise fixed split plan: {}", exc)
+            self.split_learning_disable_reason = str(exc)
             self.split_learning_enabled = False
             self.universal_split_enabled = False
             self.universal_splitter = None
@@ -382,7 +423,10 @@ class EdgeWorker:
 
     def start_edge_server(self):
         logger.info("edge {} server is starting".format(self.edge_id))
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=1),
+            options=grpc_message_options(),
+        )
         message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
             MessageTransmissionServicer(
                 self.local_queue,

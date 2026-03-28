@@ -7,6 +7,7 @@ from loguru import logger
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from tools.convert_tool import cv2_to_base64
+from tools.grpc_options import grpc_message_options
 import zipfile
 import io
 
@@ -111,7 +112,7 @@ def get_cloud_target(server_ip, select_index, cache_path):
             yield frame_request
 
     try:
-        channel = grpc.insecure_channel(server_ip, options=[('grpc.max_send_message_length', 1024 * 1024 * 512), ('grpc.max_receive_message_length', 1024 * 1024 * 512)])
+        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         res = stub.frame_processor(requset_stream())
         result_dict = eval(res.response)
@@ -158,7 +159,7 @@ def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_ep
         ``(success, base64_model_state_dict, message)``
     """
     try:
-        channel = grpc.insecure_channel(server_ip, options=[('grpc.max_send_message_length', 1024 * 1024 * 512), ('grpc.max_receive_message_length', 1024 * 1024 * 512)])
+        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.TrainRequest(
             edge_id=int(edge_id),
@@ -207,7 +208,7 @@ def request_cloud_split_training(
         ``(success, base64_model_state_dict, message)``
     """
     try:
-        channel = grpc.insecure_channel(server_ip, options=[('grpc.max_send_message_length', 1024 * 1024 * 512), ('grpc.max_receive_message_length', 1024 * 1024 * 512)])
+        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.SplitTrainRequest(
             edge_id=int(edge_id),
@@ -247,10 +248,7 @@ def request_continual_learning(
         )
         channel = grpc.insecure_channel(
             server_ip,
-            options=[
-                ("grpc.max_send_message_length", 1024 * 1024 * 512),
-                ("grpc.max_receive_message_length", 1024 * 1024 * 512),
-            ],
+            options=grpc_message_options(),
         )
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.ContinualLearningRequest(

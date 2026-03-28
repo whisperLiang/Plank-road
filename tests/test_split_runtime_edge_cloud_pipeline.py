@@ -31,6 +31,7 @@ from model_management.universal_model_split import (
     save_split_feature_cache,
     universal_split_retrain,
 )
+from tools.grpc_options import grpc_message_options
 
 
 REPO_ROOT = Path(r"D:\ProgramCode\Plank-road")
@@ -312,7 +313,10 @@ def _run_grpc_split_train_roundtrip(*, client_cache: Path, server_cache: Path, f
     learner = _GrpcSplitLearner(target_map)
     initial_state = {name: tensor.detach().clone() for name, tensor in learner.model.state_dict().items()}
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=1),
+        options=grpc_message_options(),
+    )
     message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
         MessageTransmissionServicer(
             local_queue=queue.Queue(),
@@ -329,10 +333,7 @@ def _run_grpc_split_train_roundtrip(*, client_cache: Path, server_cache: Path, f
     try:
         with grpc.insecure_channel(
             f"127.0.0.1:{port}",
-            options=[
-                ("grpc.max_send_message_length", 1024 * 1024 * 512),
-                ("grpc.max_receive_message_length", 1024 * 1024 * 512),
-            ],
+            options=grpc_message_options(),
         ) as channel:
             stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
             reply = stub.split_train_request(

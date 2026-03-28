@@ -7,6 +7,7 @@ from typing import Any
 import grpc
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
+from tools.grpc_options import grpc_message_options
 
 
 @dataclass
@@ -309,7 +310,7 @@ class ResourceAwareCLTrigger:
 
 
 def query_cloud_resource(server_ip: str, *, edge_id: int = 0, timeout_sec: float = 3.0) -> CloudResourceState:
-    with grpc.insecure_channel(server_ip) as channel:
+    with grpc.insecure_channel(server_ip, options=grpc_message_options()) as channel:
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         reply = stub.query_resource(
             message_transmission_pb2.ResourceRequest(edge_id=int(edge_id)),
@@ -333,7 +334,7 @@ def estimate_bandwidth(
     payload = "x" * max(1, int(probe_size_bytes))
     started = time.perf_counter()
     try:
-        with grpc.insecure_channel(server_ip) as channel:
+        with grpc.insecure_channel(server_ip, options=grpc_message_options()) as channel:
             stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
             reply = stub.bandwidth_probe(
                 message_transmission_pb2.BandwidthProbeRequest(payload=payload),

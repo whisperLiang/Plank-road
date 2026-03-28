@@ -25,7 +25,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="configuration description")
     parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
     args = parser.parse_args()
-    with open(args.yaml_path, 'r') as f:
+    with open(args.yaml_path, 'r', encoding='utf-8') as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
     #provide class-like access for dict
     config = munch.munchify(config)

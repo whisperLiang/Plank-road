@@ -1,7 +1,7 @@
 client:
  # the source video
  source:
-  video_path: ./video_data/dayroad.mp4
+  video_path: ./video_data/road.mp4
   max_count: 1000
   rtsp:
    flag: False
@@ -26,6 +26,7 @@ client:
  offloading_max_worker: 1
  frame_cache_maxsize: 100
  small_model_name: fasterrcnn_mobilenet_v3_large_fpn
+ lightweight: fasterrcnn_mobilenet_v3_large_fpn
  # Supported model names (see model_management/model_zoo.py):
  #   Faster R-CNN: fasterrcnn_resnet50_fpn, fasterrcnn_mobilenet_v3_large_fpn,
  #                 fasterrcnn_mobilenet_v3_large_320_fpn
@@ -66,7 +67,7 @@ client:
  # edge nodes
  edge_id: 1
  edge_num: 1
- destinations: {'id': [1], 'ip':[192.168.66.146]}
+ destinations: {'id': [1], 'ip':[192.168.66.136]}
  # database config
  database:
   connection: { 'user': 'liang', 'password': '123', 'host': '192.168.66.205', 'raise_on_warnings': True }
@@ -181,7 +182,7 @@ server:
  large_model_name: fasterrcnn_resnet50_fpn
  golden: fasterrcnn_resnet50_fpn
  # lightweight model used to generate fine-tuned weights for the edge
- edge_model_name: fasterrcnn_mobilenet_v3_large_fpn
+ edge_model_name: yolov8n
  #the queue maxsize
  local_queue_maxsize: 10
  # the max wait time

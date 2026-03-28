@@ -2,3 +2,5 @@ __pycache__/
 .claude/
 AGENTS.md
 .agents/
+cache/
+log/
