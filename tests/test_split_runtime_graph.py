@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as tv_models
 
+import model_management.graph_ir as graph_ir
 from model_management.candidate_generator import (
     build_candidate_from_edge_seed,
     generate_candidates_from_graph,
@@ -154,6 +155,40 @@ def test_runtime_trace_cleans_up_raw_torchlens_history(monkeypatch):
     assert cleanup_called
     assert runtime.history is None
     assert runtime.graph is fake_graph
+
+
+def test_tensor_exact_match_aligns_devices_before_comparing(monkeypatch):
+    candidate = torch.tensor([[1.0, 2.0]])
+    target = candidate.clone()
+    cpu_calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def tracking_cpu(self, *args, **kwargs):
+        nonlocal cpu_calls
+        cpu_calls += 1
+        return original_cpu(self, *args, **kwargs)
+
+    monkeypatch.setattr(graph_ir, "_tensors_need_device_alignment", lambda *_: True)
+    monkeypatch.setattr(torch.Tensor, "cpu", tracking_cpu)
+
+    assert graph_ir._tensor_exact_match(candidate, target)
+    assert cpu_calls == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for cross-device regression coverage")
+def test_tensor_exact_match_handles_cpu_and_cuda_tensors():
+    candidate = torch.tensor([[1.0, 2.0]], device="cpu")
+    target = candidate.to("cuda")
+
+    assert graph_ir._tensor_exact_match(candidate, target)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for cross-device regression coverage")
+def test_find_tensor_path_handles_cpu_and_cuda_tensors():
+    target = torch.tensor([[1.0, 2.0]], device="cpu")
+    container = {"branch": [target.to("cuda")]}
+
+    assert graph_ir._find_tensor_path(container, target) == ("branch", 0)
 
 
 def test_dag_boundary_payload_is_minimal_and_cache_independent():

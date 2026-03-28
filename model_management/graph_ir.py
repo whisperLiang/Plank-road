@@ -151,12 +151,27 @@ def _clone_tree_tensors(tree: Any, *, device: torch.device | None = None, detach
 
 
 def _tensor_exact_match(candidate: Any, target: torch.Tensor) -> bool:
-    return (
-        isinstance(candidate, torch.Tensor)
-        and candidate.shape == target.shape
-        and candidate.dtype == target.dtype
-        and torch.equal(candidate, target)
-    )
+    if not isinstance(candidate, torch.Tensor):
+        return False
+    if candidate.shape != target.shape or candidate.dtype != target.dtype:
+        return False
+    candidate_compare, target_compare = _prepare_tensors_for_exact_match(candidate, target)
+    return torch.equal(candidate_compare, target_compare)
+
+
+def _tensors_need_device_alignment(candidate: torch.Tensor, target: torch.Tensor) -> bool:
+    return candidate.device != target.device
+
+
+def _prepare_tensors_for_exact_match(
+    candidate: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    candidate_compare = candidate.detach()
+    target_compare = target.detach()
+    if _tensors_need_device_alignment(candidate_compare, target_compare):
+        return candidate_compare.cpu(), target_compare.cpu()
+    return candidate_compare, target_compare
 
 
 def _find_tensor_path(container: Any, target: torch.Tensor) -> tuple[Any, ...] | None:
