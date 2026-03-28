@@ -31,7 +31,12 @@ from model_management.object_detection import Object_Detection
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
-from model_management.model_zoo import build_model_sample_input
+from model_management.split_model_adapters import (
+    build_split_runtime_sample_input,
+    build_split_training_loss,
+    get_split_runtime_model,
+    prepare_split_runtime_input,
+)
 # Universal model splitting (optional, requires torchlens)
 try:
     from model_management.universal_model_split import (
@@ -102,15 +107,9 @@ class CloudContinualLearner:
         self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
 
     def _load_edge_training_model(self) -> torch.nn.Module:
-        from model_management.model_zoo import build_detection_model, is_wrapper_model
+        from model_management.model_zoo import build_detection_model
 
         model_name = self.edge_model_name
-        if is_wrapper_model(model_name):
-            raise NotImplementedError(
-                f"[SplitCL] {model_name} is a wrapper model (YOLO/DETR/RT-DETR) and "
-                f"does not support torchvision-style split retraining."
-            )
-
         tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
         edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
         if os.path.exists(edge_weights):
@@ -130,6 +129,7 @@ class CloudContinualLearner:
         if state is not None:
             tmp_model.load_state_dict(state)
         tmp_model.to(self.device)
+        get_split_runtime_model(tmp_model).eval()
         return tmp_model
 
     def _serialise_model_bytes(self, model: torch.nn.Module) -> bytes:
@@ -141,10 +141,18 @@ class CloudContinualLearner:
         torch.save(model.state_dict(), buf)
         return buf.getvalue()
 
-    def _prepare_split_runtime_input(self, frame) -> list[torch.Tensor]:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(self.device)
-        return [tensor]
+    def _prepare_split_runtime_input(self, model: torch.nn.Module, frame):
+        return prepare_split_runtime_input(model, frame, device=self.device)
+
+    def _infer_bundle_trace_image_size(
+        self,
+        manifest: dict[str, object],
+    ) -> tuple[int, int]:
+        for sample in manifest.get("samples", []):
+            image_size = sample.get("input_image_size")
+            if isinstance(image_size, (list, tuple)) and len(image_size) >= 2:
+                return int(image_size[0]), int(image_size[1])
+        return 224, 224
 
     def _bundle_feature_provider(
         self,
@@ -153,19 +161,21 @@ class CloudContinualLearner:
     ):
         split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
         splitter = UniversalModelSplitter(device=self.device)
-        sample_input = build_model_sample_input(
-            self.edge_model_name,
-            image_size=(224, 224),
+        split_model = get_split_runtime_model(model)
+        trace_image_size = self._infer_bundle_trace_image_size(manifest)
+        sample_input = build_split_runtime_sample_input(
+            model,
+            image_size=trace_image_size,
             device=self.device,
         )
-        splitter.trace(model, sample_input)
+        splitter.trace(split_model, sample_input)
         apply_split_plan(splitter, split_plan)
 
         def _provider(raw_path: str, sample: dict[str, object], manifest_payload: dict[str, object]):
             frame = cv2.imread(raw_path)
             if frame is None:
                 raise FileNotFoundError(raw_path)
-            return splitter.edge_forward(self._prepare_split_runtime_input(frame))
+            return splitter.edge_forward(self._prepare_split_runtime_input(model, frame))
 
         return _provider
 
@@ -344,19 +354,22 @@ class CloudContinualLearner:
                         "labels": pred_class,
                     }
 
-                sample_input = build_model_sample_input(
-                    self.edge_model_name,
-                    image_size=(224, 224),
+                split_model = get_split_runtime_model(tmp_model)
+                trace_image_size = self._infer_bundle_trace_image_size(manifest)
+                sample_input = build_split_runtime_sample_input(
+                    tmp_model,
+                    image_size=trace_image_size,
                     device=self.device,
                 )
                 universal_split_retrain(
-                    model=tmp_model,
+                    model=split_model,
                     sample_input=sample_input,
                     cache_path=working_cache,
                     all_indices=bundle_info["all_sample_ids"],
                     gt_annotations=gt_annotations,
                     device=self.device,
                     num_epoch=num_epoch,
+                    loss_fn=build_split_training_loss(tmp_model),
                     das_enabled=self.das_enabled,
                     das_bn_only=self.das_bn_only,
                     das_probe_samples=self.das_probe_samples,
@@ -392,6 +405,7 @@ class CloudContinualLearner:
         if not _HAS_UNIVERSAL_SPLIT:
             raise RuntimeError("Universal split runtime is required for split retraining.")
 
+        split_model = get_split_runtime_model(tmp_model)
         sample_input = None
         frame_dir = os.path.join(cache_path, "frames")
         for frame_index in list(all_indices):
@@ -401,9 +415,7 @@ class CloudContinualLearner:
             frame = cv2.imread(frame_path)
             if frame is None:
                 continue
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(self.device)
-            sample_input = [tensor]
+            sample_input = self._prepare_split_runtime_input(tmp_model, frame)
             break
 
         if sample_input is None:
@@ -413,6 +425,10 @@ class CloudContinualLearner:
                     record = load_split_feature_cache(cache_path, frame_index)
                 except FileNotFoundError:
                     continue
+                cached_image_size = record.get("input_image_size")
+                if isinstance(cached_image_size, (list, tuple)) and len(cached_image_size) >= 2:
+                    input_image_size = (int(cached_image_size[0]), int(cached_image_size[1]))
+                    break
                 input_tensor_shape = record.get("input_tensor_shape")
                 if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
                     input_image_size = (int(input_tensor_shape[-2]), int(input_tensor_shape[-1]))
@@ -420,19 +436,20 @@ class CloudContinualLearner:
 
             # The graph-based split runtime now infers the selected candidate
             # directly from cached SplitPayload records.
-            sample_input = build_model_sample_input(
-                model_name,
+            sample_input = build_split_runtime_sample_input(
+                tmp_model,
                 image_size=input_image_size or (224, 224),
                 device=self.device,
             )
         universal_split_retrain(
-            model=tmp_model,
+            model=split_model,
             sample_input=sample_input,
             cache_path=cache_path,
             all_indices=all_indices,
             gt_annotations=gt_annotations,
             device=self.device,
             num_epoch=num_epoch,
+            loss_fn=build_split_training_loss(tmp_model),
             das_enabled=self.das_enabled,
             das_bn_only=self.das_bn_only,
             das_probe_samples=self.das_probe_samples,

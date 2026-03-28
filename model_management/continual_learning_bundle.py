@@ -107,6 +107,7 @@ def prepare_split_training_cache(
                 "confidence_bucket": sample.get("confidence_bucket"),
                 "model_id": sample.get("model_id"),
                 "model_version": sample.get("model_version"),
+                "input_image_size": sample.get("input_image_size"),
                 "has_raw_sample": copied_raw is not None,
             },
         )
@@ -119,4 +120,3 @@ def prepare_split_training_cache(
         "all_sample_ids": all_sample_ids,
         "drift_sample_ids": drift_sample_ids,
     }
-

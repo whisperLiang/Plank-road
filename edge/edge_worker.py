@@ -33,8 +33,8 @@ from model_management.fixed_split import (
     SplitPlan,
     load_or_compute_fixed_split_plan,
 )
-from model_management.model_zoo import is_wrapper_model
 from model_management.object_detection import InferenceArtifacts, Object_Detection
+from model_management.split_model_adapters import build_split_training_loss
 from model_management.universal_model_split import UniversalModelSplitter
 from tools.grpc_options import grpc_message_options
 
@@ -94,7 +94,10 @@ class EdgeWorker:
         self.universal_split_enabled = False
         self.universal_splitter: UniversalModelSplitter | None = None
         self.fixed_split_plan: SplitPlan | None = None
-        self._init_fixed_split_runtime()
+        self._fixed_split_init_attempted = False
+        self.split_trace_image_size: tuple[int, int] | None = None
+        if not self.split_learning_enabled:
+            self.split_learning_disable_reason = "disabled_in_config"
         if self.collect_flag and not self.split_learning_enabled:
             self.collect_flag = False
             if self.split_learning_disable_reason == "disabled_in_config":
@@ -117,52 +120,48 @@ class EdgeWorker:
         self.local_processor.start()
         self.retrain_processor.start()
 
-    def _init_fixed_split_runtime(self) -> None:
+    def _init_fixed_split_runtime(self, image_size: tuple[int, int] | None = None) -> None:
         sl_cfg = getattr(self.config, "split_learning", None)
         fixed_split_cfg = getattr(sl_cfg, "fixed_split", None) if sl_cfg else None
+        self._fixed_split_init_attempted = True
         if not self.split_learning_enabled:
             self.split_learning_disable_reason = "disabled_in_config"
             logger.info("Split learning disabled in config; skipping fixed split initialisation.")
             return
 
-        if is_wrapper_model(self.model_id):
-            self.split_learning_enabled = False
-            self.split_learning_disable_reason = (
-                "wrapper models (YOLO/DETR/RT-DETR) do not support the current split-learning continual-learning path"
-            )
-            logger.warning(
-                "Split learning disabled for edge model {}. "
-                "The current continual-learning path only supports non-wrapper torchvision detectors.",
-                self.model_id,
-            )
-            return
-
         try:
+            split_model = self.small_object_detection.get_split_runtime_model()
             self.universal_splitter = UniversalModelSplitter(
-                device=next(self.small_object_detection.model.parameters()).device,
+                device=next(split_model.parameters()).device,
             )
-            sample_input = self.small_object_detection.build_split_sample_input((224, 224))
+            self.universal_splitter.trainability_loss_fn = build_split_training_loss(
+                self.small_object_detection.model
+            )
+            trace_image_size = image_size or (224, 224)
+            sample_input = self.small_object_detection.build_split_sample_input(trace_image_size)
             self.universal_splitter.trace(
-                self.small_object_detection.model,
+                split_model,
                 sample_input,
             )
             constraints = SplitConstraints.from_config(fixed_split_cfg)
             cache_path = os.path.join(self.config.retrain.cache_path, "fixed_split_plan.json")
             self.fixed_split_plan = load_or_compute_fixed_split_plan(
-                self.small_object_detection.model,
+                split_model,
                 constraints,
                 sample_input=sample_input,
-                device=next(self.small_object_detection.model.parameters()).device,
+                device=next(split_model.parameters()).device,
                 model_name=self.model_id,
                 cache_path=cache_path,
                 splitter=self.universal_splitter,
             )
             self.universal_split_enabled = True
+            self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
             logger.info(
-                "Fixed split plan ready (split_config_id={}, split_index={}, payload_bytes={})",
+                "Fixed split plan ready (split_config_id={}, split_index={}, payload_bytes={}, image_size={})",
                 self.fixed_split_plan.split_config_id,
                 self.fixed_split_plan.split_index,
                 self.fixed_split_plan.payload_bytes,
+                self.split_trace_image_size,
             )
         except RuntimeError as exc:
             logger.warning("Fixed split plan unavailable for model {}: {}", self.model_id, exc)
@@ -171,6 +170,7 @@ class EdgeWorker:
             self.universal_split_enabled = False
             self.universal_splitter = None
             self.fixed_split_plan = None
+            self.split_trace_image_size = None
         except Exception as exc:
             logger.exception("Failed to initialise fixed split plan: {}", exc)
             self.split_learning_disable_reason = str(exc)
@@ -178,6 +178,7 @@ class EdgeWorker:
             self.universal_split_enabled = False
             self.universal_splitter = None
             self.fixed_split_plan = None
+            self.split_trace_image_size = None
 
     def _next_sample_id(self, task: Task) -> str:
         return f"{task.frame_index}-{int(task.start_time * 1000)}"
@@ -302,9 +303,37 @@ class EdgeWorker:
 
             self.queue_info[f"{self.edge_id}"] = self.local_queue.qsize()
             current_frame = task.frame_edge
+            frame_image_size = tuple(int(value) for value in current_frame.shape[:2])
+            if self.split_learning_enabled and not self._fixed_split_init_attempted:
+                self._init_fixed_split_runtime(frame_image_size)
+                if self.collect_flag and not self.split_learning_enabled:
+                    self.collect_flag = False
+                    logger.warning(
+                        "Continual learning sample collection disabled for edge model {}: {}",
+                        self.model_id,
+                        self.split_learning_disable_reason or "split learning unavailable",
+                    )
+            active_splitter = self.universal_splitter if self.universal_split_enabled else None
+            if (
+                active_splitter is not None
+                and self.split_trace_image_size is not None
+                and frame_image_size != self.split_trace_image_size
+            ):
+                logger.warning(
+                    "Split runtime disabled because frame size changed from {} to {}.",
+                    self.split_trace_image_size,
+                    frame_image_size,
+                )
+                self.split_learning_enabled = False
+                self.universal_split_enabled = False
+                self.collect_flag = False
+                self.split_learning_disable_reason = (
+                    f"frame size changed from {self.split_trace_image_size} to {frame_image_size}"
+                )
+                active_splitter = None
             inference = self.small_object_detection.infer_sample(
                 current_frame,
-                splitter=self.universal_splitter if self.universal_split_enabled else None,
+                splitter=active_splitter,
             )
 
             task.add_result(
@@ -351,6 +380,7 @@ class EdgeWorker:
             intermediate=inference.intermediate,
             drift_flag=drift_detected,
             raw_frame=frame if save_raw else None,
+            input_image_size=list(frame.shape[:2]),
         )
 
         if self.retrain_flag:
@@ -407,6 +437,7 @@ class EdgeWorker:
                     with self.small_object_detection.model_lock:
                         self.small_object_detection.model.load_state_dict(state_dict)
                         self.small_object_detection.model.eval()
+                        self.small_object_detection.get_split_runtime_model().eval()
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
                     self.drift_detector.reset()

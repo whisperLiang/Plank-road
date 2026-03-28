@@ -225,7 +225,10 @@ def compute_fixed_split_for_model(
             profile is None or not profile.validation_passed
         ):
             continue
-        if not candidate.is_trainable_tail:
+        if not (
+            candidate.is_trainable_tail
+            or (profile is not None and profile.tail_trainability)
+        ):
             continue
 
         privacy_metric = _privacy_metric(candidate, max_privacy_risk)
@@ -370,4 +373,3 @@ def load_or_compute_fixed_split_plan(
     if cache_path:
         persist_split_plan(cache_path, plan)
     return plan
-

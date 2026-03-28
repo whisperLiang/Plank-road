@@ -219,6 +219,7 @@ class GraphSplitRuntime:
         self.candidates: list[SplitCandidate] = []
         self.current_candidate: SplitCandidate | None = None
         self.runtime_state: RuntimeState = RuntimeState(values=OrderedDict())
+        self.trainability_loss_fn = None
 
     def trace(
         self,
@@ -498,10 +499,11 @@ class GraphSplitRuntime:
         success, max_diff = compare_outputs(expected, replayed, atol=atol, rtol=rtol)
 
         trainability = chosen.is_trainable_tail
-        if success and trainability:
+        if success:
             trainability = self._check_tail_trainability(chosen, payload.detach(), *sample_args, **sample_kwargs)
 
         chosen.is_validated = success
+        chosen.is_trainable_tail = trainability
         chosen.validation_error = None if success else f"max_diff={max_diff}"
         return {
             "success": success,
@@ -524,15 +526,31 @@ class GraphSplitRuntime:
         params = self._candidate_parameters(candidate.cloud_nodes)
         if not params:
             return False
+        grad_state = {
+            name: parameter.requires_grad
+            for name, parameter in self.model.named_parameters()
+        }
+        self.freeze_head(candidate)
+        self.unfreeze_tail(candidate)
         self._zero_candidate_grads(candidate.cloud_nodes)
         outputs = self.cloud_forward(payload, *args, candidate=candidate, **kwargs)
-        loss = reduce_output_to_loss(outputs)
+        if self.trainability_loss_fn is not None:
+            loss = self.trainability_loss_fn(
+                outputs,
+                _make_dummy_detection_targets(args, device=self.device),
+            )
+        else:
+            loss = reduce_output_to_loss(outputs)
         try:
             loss.backward()
         except Exception:
+            for name, parameter in self.model.named_parameters():
+                parameter.requires_grad_(grad_state.get(name, parameter.requires_grad))
             self._zero_candidate_grads(candidate.cloud_nodes)
             return False
         has_grad = any(param.grad is not None and torch.count_nonzero(param.grad).item() > 0 for param in params)
+        for name, parameter in self.model.named_parameters():
+            parameter.requires_grad_(grad_state.get(name, parameter.requires_grad))
         self._zero_candidate_grads(candidate.cloud_nodes)
         return has_grad
 
@@ -611,3 +629,49 @@ class GraphSplitRuntime:
 
     def load_tail_state_dict(self, state_dict: Mapping[str, torch.Tensor]) -> None:
         self.model.load_state_dict(state_dict, strict=False)
+
+
+def _make_dummy_detection_targets(
+    args: tuple[Any, ...],
+    *,
+    device: torch.device,
+) -> dict[str, Any]:
+    input_height, input_width = _infer_input_image_size_from_args(args)
+    return {
+        "boxes": [[0.25 * input_width, 0.25 * input_height, 0.75 * input_width, 0.75 * input_height]],
+        "labels": [1],
+        "_split_meta": {
+            "input_image_size": [input_height, input_width],
+        },
+    }
+
+
+def _infer_input_image_size_from_args(args: tuple[Any, ...]) -> tuple[int, int]:
+    for arg in args:
+        tensor = _extract_first_input_tensor(arg)
+        if tensor is not None and tensor.ndim >= 3:
+            return int(tensor.shape[-2]), int(tensor.shape[-1])
+    return 224, 224
+
+
+def _extract_first_input_tensor(value: Any) -> torch.Tensor | None:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            tensor = _extract_first_input_tensor(item)
+            if tensor is not None:
+                return tensor
+        return None
+    if isinstance(value, tuple):
+        for item in value:
+            tensor = _extract_first_input_tensor(item)
+            if tensor is not None:
+                return tensor
+        return None
+    if isinstance(value, dict):
+        for item in value.values():
+            tensor = _extract_first_input_tensor(item)
+            if tensor is not None:
+                return tensor
+    return None

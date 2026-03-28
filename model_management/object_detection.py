@@ -15,6 +15,12 @@ from model_management.model_info import model_lib, COCO_INSTANCE_CATEGORY_NAMES,
 from model_management.model_zoo import (
     build_detection_model, is_wrapper_model, model_has_roi_heads, get_model_family,
 )
+from model_management.split_model_adapters import (
+    build_split_runtime_sample_input,
+    get_split_runtime_model,
+    postprocess_split_runtime_output,
+    prepare_split_runtime_input,
+)
 from PIL import Image
 from torchvision import transforms
 from mapcalc import calculate_map
@@ -75,6 +81,7 @@ class Object_Detection:
             if self.init_model_flag:
                 self.init_model()
             self.model.eval()
+            get_split_runtime_model(self.model).eval()
             return
 
         # --- Torchvision models: load from local weight file ---
@@ -95,6 +102,7 @@ class Object_Detection:
         if self.init_model_flag:
             self.init_model()
         self.model.eval()
+        get_split_runtime_model(self.model).eval()
 
     def init_model(self):
         logger.debug("init_model")
@@ -276,14 +284,13 @@ class Object_Detection:
         self.record_p.flush()
 
     def prepare_splitter_input(self, img):
-        """Split runtime traces full detection models with torchvision-style
-        ``list[Tensor]`` inputs, so replay must use the same structure.
-        """
-        return [self._prepare_image_tensor(img)]
+        return prepare_split_runtime_input(self.model, img, device=device)
 
     def build_split_sample_input(self, image_size=(224, 224)):
-        height, width = image_size
-        return [torch.rand(3, height, width, device=device)]
+        return build_split_runtime_sample_input(self.model, image_size=image_size, device=device)
+
+    def get_split_runtime_model(self):
+        return get_split_runtime_model(self.model)
 
     def infer_sample(self, img, splitter=None) -> InferenceArtifacts:
         split_payload = None
@@ -292,6 +299,12 @@ class Object_Detection:
                 splitter_input = self.prepare_splitter_input(img)
                 replayed, split_payload = splitter.replay_inference(
                     splitter_input, return_split_output=True,
+                )
+                replayed = postprocess_split_runtime_output(
+                    self.model,
+                    replayed,
+                    threshold=self.threshold_low,
+                    image_size=img.shape[:2],
                 )
                 pred_boxes, pred_class, pred_score = self._parse_prediction_output(
                     replayed, self.threshold_low,

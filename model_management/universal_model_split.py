@@ -587,6 +587,21 @@ def universal_split_retrain(
                     "labels": record.get("pseudo_labels"),
                     "scores": record.get("pseudo_scores"),
                 }
+            if isinstance(targets, dict):
+                split_meta = {
+                    "candidate_id": record.get("candidate_id"),
+                    "split_index": record.get("split_index"),
+                    "split_label": record.get("split_label"),
+                    "boundary_tensor_labels": record.get("boundary_tensor_labels"),
+                    "sample_id": record.get("sample_id"),
+                    "confidence_bucket": record.get("confidence_bucket"),
+                    "input_image_size": record.get("input_image_size"),
+                    "input_tensor_shape": record.get("input_tensor_shape"),
+                }
+                targets = {
+                    **targets,
+                    "_split_meta": split_meta,
+                }
             _, loss = splitter.cloud_train_step(
                 payload,
                 targets=targets,

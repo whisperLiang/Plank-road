@@ -24,6 +24,7 @@ def profile_candidates(
         error: str | None = None
 
         if validate:
+            trainable = True
             for _ in range(max(1, validation_runs)):
                 start = time.perf_counter()
                 report = runtime.validate_candidate(candidate)
