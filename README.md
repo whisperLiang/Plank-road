@@ -261,6 +261,16 @@ server:
     probe_samples: 10
 ```
 
+### Wrapper Fixed-Split Retraining
+
+```yaml
+server:
+  continual_learning:
+    num_epoch: 2
+    min_wrapper_fixed_split_num_epoch: 10
+    wrapper_fixed_split_learning_rate: 3.0e-5
+```
+
 ## Runtime Flow
 
 ### Edge Startup
@@ -289,9 +299,10 @@ The cloud:
 2. expands it into a working cache
 3. reconstructs low-confidence features if necessary
 4. annotates drift samples, plus raw-only low-confidence samples, with the large model
-5. runs split-tail retraining
-6. logs a before/after proxy `mAP@0.5` summary on the GT-annotated subset
-7. returns updated edge model weights
+5. detects fully-collapsed wrapper checkpoints and falls back to native pretrained weights for that retrain round
+6. runs split-tail retraining
+7. logs a before/after proxy `mAP@0.5` summary on the GT-annotated subset
+8. returns updated edge model weights
 
 ## Usage
 

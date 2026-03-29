@@ -24,6 +24,7 @@ from cloud_server import (
     CloudContinualLearner,
     _evaluate_detection_proxy_map,
     _format_proxy_map_summary,
+    _proxy_metrics_indicate_dead_detector,
     _select_fixed_split_gt_sample_ids,
 )
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
@@ -36,6 +37,7 @@ from model_management.model_zoo import (
 from model_management.object_detection import Object_Detection
 from model_management.payload import SplitPayload
 from model_management.split_model_adapters import (
+    _build_ultralytics_training_batch,
     build_split_training_loss,
     build_split_runtime_sample_input,
     get_split_runtime_model,
@@ -891,6 +893,8 @@ def test_evaluate_detection_proxy_map_reports_mean_map_and_skips_empty_gt(tmp_pa
     assert metrics["skipped_empty_gt"] == 1
     assert metrics["skipped_missing_frame"] == 0
     assert metrics["total_gt_samples"] == 2
+    assert metrics["nonempty_predictions"] == 1
+    assert metrics["total_prediction_boxes"] == 1
     assert metrics["map"] == pytest.approx(1.0)
 
 
@@ -914,6 +918,52 @@ def test_format_proxy_map_summary_includes_delta_and_counts():
         "proxy_mAP@0.5 0.2500 -> 0.4000 "
         "(delta=+0.1500, evaluated=4, skipped_empty_gt=1, skipped_missing_frame=0)"
     )
+
+
+def test_proxy_metrics_indicate_dead_detector_only_for_empty_zero_map_predictions():
+    assert _proxy_metrics_indicate_dead_detector(
+        {
+            "map": 0.0,
+            "evaluated_samples": 10,
+            "nonempty_predictions": 0,
+        }
+    ) is True
+    assert _proxy_metrics_indicate_dead_detector(
+        {
+            "map": 0.0,
+            "evaluated_samples": 10,
+            "nonempty_predictions": 1,
+        }
+    ) is False
+    assert _proxy_metrics_indicate_dead_detector(
+        {
+            "map": 0.1,
+            "evaluated_samples": 10,
+            "nonempty_predictions": 0,
+        }
+    ) is False
+
+
+def test_build_ultralytics_training_batch_projects_raw_boxes_into_letterboxed_model_space():
+    batch = _build_ultralytics_training_batch(
+        {
+            "boxes": [[250.0, 250.0, 750.0, 750.0]],
+            "labels": [1],
+            "_split_meta": {
+                "input_image_size": [1000, 1000],
+                "input_tensor_shape": [1, 3, 384, 640],
+            },
+        },
+        device=torch.device("cpu"),
+    )
+
+    assert tuple(batch["img"].shape) == (1, 3, 384, 640)
+    assert torch.allclose(
+        batch["bboxes"],
+        torch.tensor([[0.5, 0.5, 0.3, 0.5]], dtype=torch.float32),
+        atol=1e-4,
+    )
+    assert torch.equal(batch["cls"], torch.tensor([[0.0]], dtype=torch.float32))
 
 
 def test_ensure_predictor_does_not_mutate_source_model():
@@ -1029,6 +1079,88 @@ def test_universal_split_retrain_falls_back_from_boundary_and_candidate_id_to_sp
         {"boundary_tensor_labels": None, "candidate_id": "candidate-stale", "layer_index": None},
         {"boundary_tensor_labels": None, "candidate_id": None, "layer_index": 184},
     ]
+
+
+def test_universal_split_retrain_uses_configured_learning_rate(monkeypatch):
+    captured = {}
+
+    class DummyOptimizer:
+        def __init__(self, params, lr):
+            captured["lr"] = lr
+
+        def zero_grad(self, set_to_none=True):
+            return None
+
+        def step(self):
+            return None
+
+    class DummySplitter:
+        def __init__(self, device=None):
+            self.device = torch.device("cpu")
+
+        def trace(self, model, sample_input):
+            return self
+
+        def split(self, *, boundary_tensor_labels=None, candidate_id=None, layer_index=None):
+            return SimpleNamespace(
+                boundary_tensor_labels=["resolved"],
+                candidate_id="resolved",
+                legacy_layer_index=layer_index,
+                cloud_nodes=[],
+                edge_nodes=[],
+            )
+
+        def freeze_head(self, chosen):
+            return None
+
+        def unfreeze_tail(self, chosen):
+            return None
+
+        def get_tail_trainable_params(self, chosen):
+            return [nn.Parameter(torch.tensor(1.0))]
+
+        def cloud_train_step(self, payload, targets=None, loss_fn=None, optimizer=None, candidate=None):
+            loss = loss_fn(None, targets) if loss_fn is not None else torch.zeros(())
+            return None, loss
+
+    monkeypatch.setattr(
+        "model_management.universal_model_split.UniversalModelSplitter",
+        DummySplitter,
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split._infer_cached_split_choice",
+        lambda cache_path, all_indices: (None, 184, None),
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split.load_split_feature_cache",
+        lambda cache_path, frame_index: {
+            "intermediate": object(),
+            "pseudo_boxes": [],
+            "pseudo_labels": [],
+            "pseudo_scores": [],
+        },
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split._move_nested",
+        lambda value, device: value,
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split.torch.optim.Adam",
+        DummyOptimizer,
+    )
+
+    universal_split_retrain(
+        model=nn.Linear(1, 1),
+        sample_input=torch.zeros(1, 1),
+        cache_path="unused",
+        all_indices=[0],
+        gt_annotations={},
+        num_epoch=1,
+        learning_rate=3e-5,
+        loss_fn=lambda outputs, targets: torch.zeros((), requires_grad=True),
+    )
+
+    assert captured["lr"] == pytest.approx(3e-5)
 
 
 def test_original_fasterrcnn_service_split_retrain_recovers_cached_candidate_by_boundary_labels(tmp_path):

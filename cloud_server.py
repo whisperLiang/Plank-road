@@ -207,6 +207,8 @@ def _evaluate_detection_proxy_map(
     scores: list[float] = []
     skipped_empty_gt = 0
     skipped_missing_frame = 0
+    nonempty_predictions = 0
+    total_prediction_boxes = 0
 
     _set_detection_model_eval_mode(model)
     with torch.no_grad():
@@ -233,6 +235,10 @@ def _evaluate_detection_proxy_map(
                 threshold_low=threshold_low,
                 threshold_high=threshold_high,
             )
+            predicted_boxes = list(prediction.get("boxes") or [])
+            total_prediction_boxes += len(predicted_boxes)
+            if predicted_boxes:
+                nonempty_predictions += 1
             score = calculate_map(
                 {"labels": gt_labels, "boxes": gt_boxes},
                 prediction,
@@ -246,6 +252,8 @@ def _evaluate_detection_proxy_map(
         "skipped_empty_gt": skipped_empty_gt,
         "skipped_missing_frame": skipped_missing_frame,
         "total_gt_samples": len(sample_ids),
+        "nonempty_predictions": nonempty_predictions,
+        "total_prediction_boxes": total_prediction_boxes,
     }
 
 
@@ -266,6 +274,18 @@ def _format_proxy_map_summary(
         f"evaluated={int(metrics_after.get('evaluated_samples', 0))}, "
         f"skipped_empty_gt={int(metrics_after.get('skipped_empty_gt', 0))}, "
         f"skipped_missing_frame={int(metrics_after.get('skipped_missing_frame', 0))})"
+    )
+
+
+def _proxy_metrics_indicate_dead_detector(metrics: Mapping[str, object] | None) -> bool:
+    if not metrics:
+        return False
+    if metrics.get("map") is None:
+        return False
+    return (
+        float(metrics.get("map", 0.0)) <= 0.0
+        and int(metrics.get("evaluated_samples", 0)) > 0
+        and int(metrics.get("nonempty_predictions", 0)) == 0
     )
 
 
@@ -307,6 +327,18 @@ class CloudContinualLearner:
         # Default training hyper-parameters (overridable from config)
         cl_cfg = getattr(config, "continual_learning", None)
         self.default_num_epoch = int(getattr(cl_cfg, "num_epoch", 2)) if cl_cfg else 2
+        self.default_split_learning_rate = (
+            float(getattr(cl_cfg, "split_learning_rate", 1e-3))
+            if cl_cfg else 1e-3
+        )
+        self.wrapper_fixed_split_learning_rate = (
+            float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
+            if cl_cfg else 3e-5
+        )
+        self.min_wrapper_fixed_split_num_epoch = (
+            int(getattr(cl_cfg, "min_wrapper_fixed_split_num_epoch", 10))
+            if cl_cfg else 10
+        )
 
         # Dynamic Activation Sparsity (SURGEON) config
         das_cfg = getattr(config, "das", None)
@@ -552,11 +584,17 @@ class CloudContinualLearner:
                 working_cache = os.path.join(bundle_cache_path, "working_cache")
                 if os.path.isdir(working_cache):
                     shutil.rmtree(working_cache, ignore_errors=True)
-                bundle_info = prepare_split_training_cache(
-                    bundle_cache_path,
-                    working_cache,
-                    feature_provider=self._bundle_feature_provider(tmp_model, manifest),
-                )
+
+                def _prepare_working_cache(model: torch.nn.Module) -> dict[str, object]:
+                    if os.path.isdir(working_cache):
+                        shutil.rmtree(working_cache, ignore_errors=True)
+                    return prepare_split_training_cache(
+                        bundle_cache_path,
+                        working_cache,
+                        feature_provider=self._bundle_feature_provider(model, manifest),
+                    )
+
+                bundle_info = _prepare_working_cache(tmp_model)
 
                 gt_annotations: dict[str, dict] = {}
                 frame_dir = os.path.join(working_cache, "frames")
@@ -590,6 +628,58 @@ class CloudContinualLearner:
                     device=self.device,
                 )
 
+                from model_management.model_zoo import build_detection_model, is_wrapper_model
+                is_wrapper_fixed_split = bool(is_wrapper_model(self.edge_model_name))
+
+                if (
+                    gt_annotations
+                    and is_wrapper_fixed_split
+                    and _proxy_metrics_indicate_dead_detector(proxy_metrics_before)
+                ):
+                    logger.warning(
+                        "[FixedSplitCL] Cached {} weights produced no detections on {} GT samples; "
+                        "resetting to native pretrained weights for this retrain round.",
+                        self.edge_model_name,
+                        len(gt_annotations),
+                    )
+                    tmp_model = build_detection_model(
+                        self.edge_model_name,
+                        pretrained=True,
+                        device=self.device,
+                    )
+                    tmp_model.to(self.device)
+                    get_split_runtime_model(tmp_model).eval()
+                    bundle_info = _prepare_working_cache(tmp_model)
+                    frame_dir = os.path.join(working_cache, "frames")
+                    proxy_metrics_before = _evaluate_detection_proxy_map(
+                        tmp_model,
+                        frame_dir=frame_dir,
+                        gt_annotations=gt_annotations,
+                        device=self.device,
+                    )
+
+                effective_num_epoch = num_epoch
+                if (
+                    gt_annotations
+                    and is_wrapper_fixed_split
+                    and effective_num_epoch < self.min_wrapper_fixed_split_num_epoch
+                ):
+                    logger.info(
+                        "[FixedSplitCL] Promoting wrapper fixed-split retraining epochs from {} to {}.",
+                        effective_num_epoch,
+                        self.min_wrapper_fixed_split_num_epoch,
+                    )
+                    effective_num_epoch = self.min_wrapper_fixed_split_num_epoch
+                effective_learning_rate = (
+                    self.wrapper_fixed_split_learning_rate
+                    if is_wrapper_fixed_split else self.default_split_learning_rate
+                )
+                if gt_annotations and is_wrapper_fixed_split:
+                    logger.info(
+                        "[FixedSplitCL] Using wrapper fixed-split learning rate {}.",
+                        effective_learning_rate,
+                    )
+
                 split_model = get_split_runtime_model(tmp_model)
                 trace_image_size = self._infer_bundle_trace_image_size(manifest)
                 sample_input = build_split_runtime_sample_input(
@@ -604,7 +694,8 @@ class CloudContinualLearner:
                     all_indices=bundle_info["all_sample_ids"],
                     gt_annotations=gt_annotations,
                     device=self.device,
-                    num_epoch=num_epoch,
+                    num_epoch=effective_num_epoch,
+                    learning_rate=effective_learning_rate,
                     loss_fn=build_split_training_loss(tmp_model),
                     das_enabled=self.das_enabled,
                     das_bn_only=self.das_bn_only,

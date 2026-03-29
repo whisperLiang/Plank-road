@@ -529,6 +529,7 @@ def universal_split_retrain(
     candidate_id: str | None = None,
     device: str | torch.device = "cpu",
     num_epoch: int = 1,
+    learning_rate: float = 1e-3,
     loss_fn=None,
     **_: Any,
 ) -> list[float]:
@@ -559,7 +560,7 @@ def universal_split_retrain(
     splitter.freeze_head(chosen)
     splitter.unfreeze_tail(chosen)
     params = splitter.get_tail_trainable_params(chosen)
-    optimizer = torch.optim.Adam(params, lr=1e-3) if params else None
+    optimizer = torch.optim.Adam(params, lr=float(learning_rate)) if params else None
     losses: list[float] = []
     finite_steps = 0
 

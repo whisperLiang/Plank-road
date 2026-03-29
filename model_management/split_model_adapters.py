@@ -478,6 +478,31 @@ def _infer_input_image_size(targets: Any) -> tuple[int, int]:
     raise RuntimeError("Missing input image size metadata required for wrapper-model split retraining.")
 
 
+def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:
+    if not isinstance(targets, dict):
+        raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
+    split_meta = targets.get("_split_meta", {})
+
+    original_image_size = None
+    input_image_size = split_meta.get("input_image_size")
+    if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
+        original_image_size = (int(input_image_size[0]), int(input_image_size[1]))
+
+    model_input_size = None
+    input_tensor_shape = split_meta.get("input_tensor_shape")
+    if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
+        model_input_size = (int(input_tensor_shape[-2]), int(input_tensor_shape[-1]))
+
+    if original_image_size is None and model_input_size is None:
+        raise RuntimeError("Missing input image size metadata required for wrapper-model split retraining.")
+
+    if original_image_size is None:
+        original_image_size = model_input_size
+    if model_input_size is None:
+        model_input_size = original_image_size
+    return original_image_size, model_input_size
+
+
 def _as_boxes_tensor(boxes: Any, *, device: torch.device) -> torch.Tensor:
     if boxes is None:
         return torch.zeros((0, 4), dtype=torch.float32, device=device)
@@ -516,13 +541,42 @@ def _xyxy_to_normalized_cxcywh(
     ).clamp_(0.0, 1.0)
 
 
+def _project_boxes_to_model_input(
+    boxes_xyxy: torch.Tensor,
+    *,
+    original_image_size: tuple[int, int],
+    model_input_size: tuple[int, int],
+) -> torch.Tensor:
+    if boxes_xyxy.numel() == 0:
+        return boxes_xyxy.reshape(0, 4)
+
+    orig_height, orig_width = original_image_size
+    model_height, model_width = model_input_size
+    if orig_height <= 0 or orig_width <= 0 or model_height <= 0 or model_width <= 0:
+        raise RuntimeError("Image sizes must be positive for wrapper-model split retraining.")
+
+    scale = min(float(model_width) / float(orig_width), float(model_height) / float(orig_height))
+    resized_width = float(orig_width) * scale
+    resized_height = float(orig_height) * scale
+    pad_x = (float(model_width) - resized_width) * 0.5
+    pad_y = (float(model_height) - resized_height) * 0.5
+
+    projected = boxes_xyxy.clone()
+    projected[..., 0::2] = projected[..., 0::2] * scale + pad_x
+    projected[..., 1::2] = projected[..., 1::2] * scale + pad_y
+    return _clamp_xyxy_boxes(projected, model_input_size)
+
+
 def _prepare_coco80_targets(
     targets: dict[str, Any],
     *,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
-    image_size = _infer_input_image_size(targets)
-    boxes = _clamp_xyxy_boxes(_as_boxes_tensor(targets.get("boxes"), device=device), image_size)
+    original_image_size, model_input_size = _infer_ultralytics_image_sizes(targets)
+    boxes = _clamp_xyxy_boxes(
+        _as_boxes_tensor(targets.get("boxes"), device=device),
+        original_image_size,
+    )
     labels = _as_labels_tensor(targets.get("labels"), device=device)
     if boxes.shape[0] != labels.shape[0]:
         count = min(boxes.shape[0], labels.shape[0])
@@ -546,13 +600,17 @@ def _prepare_coco80_targets(
     if not keep_indices:
         empty_boxes = boxes.new_zeros((0, 4))
         empty_labels = labels.new_zeros((0,), dtype=torch.int64)
-        return empty_boxes, empty_labels, image_size
+        return empty_boxes, empty_labels, model_input_size
 
     keep_tensor = torch.as_tensor(keep_indices, dtype=torch.long, device=device)
-    boxes = boxes.index_select(0, keep_tensor)
+    boxes = _project_boxes_to_model_input(
+        boxes.index_select(0, keep_tensor),
+        original_image_size=original_image_size,
+        model_input_size=model_input_size,
+    )
     labels = torch.as_tensor(mapped_labels, dtype=torch.int64, device=device)
     valid_geometry = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-    return boxes[valid_geometry], labels[valid_geometry], image_size
+    return boxes[valid_geometry], labels[valid_geometry], model_input_size
 
 
 def _build_ultralytics_training_batch(
@@ -595,4 +653,3 @@ def _build_detr_training_labels(
         "class_labels": labels.to(dtype=torch.int64),
         "boxes": normalized_boxes.to(dtype=torch.float32),
     }]
-
