@@ -347,8 +347,10 @@ class Object_Detection:
         )
 
 
-    def large_inference(self, img):
-        pred_boxes, pred_class, pred_score = self.get_model_prediction(img, self.threshold_high)
+    def large_inference(self, img, threshold=None):
+        if threshold is None:
+            threshold = self.threshold_high
+        pred_boxes, pred_class, pred_score = self.get_model_prediction(img, float(threshold))
         return pred_boxes, pred_class, pred_score
 
     def get_model_prediction(self, img, threshold, model=None):
@@ -398,7 +400,6 @@ class Object_Detection:
         pred_class = prediction_class[:prediction_t + 1]
         pred_score = prediction_score[:prediction_t + 1]
         return pred_boxes, pred_class, pred_score
-
 
 
 

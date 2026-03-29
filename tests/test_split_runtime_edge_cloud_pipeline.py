@@ -139,6 +139,28 @@ def _build_traceable_sample_input(detector: Object_Detection):
     return detector.build_split_sample_input((96, 96))
 
 
+def test_large_inference_accepts_threshold_override():
+    detector = Object_Detection.__new__(Object_Detection)
+    captured = {}
+
+    def fake_get_model_prediction(img, threshold, model=None):
+        captured["threshold"] = threshold
+        return [[1, 2, 3, 4]], [1], [0.42]
+
+    detector.get_model_prediction = fake_get_model_prediction
+    detector.threshold_high = 0.6
+
+    boxes, labels, scores = detector.large_inference(
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        threshold=0.3,
+    )
+
+    assert captured["threshold"] == pytest.approx(0.3)
+    assert boxes == [[1, 2, 3, 4]]
+    assert labels == [1]
+    assert scores == [0.42]
+
+
 def _choose_trainable_candidate(splitter: UniversalModelSplitter):
     for candidate in splitter.candidates:
         report = splitter.validate_candidate(candidate)
@@ -786,6 +808,31 @@ def test_cloud_loader_skips_fused_cached_yolo_state_dict(tmp_path, monkeypatch):
 
     assert isinstance(model, DummyModel)
     assert calls == [("yolov8n", True, "cpu")]
+
+
+def test_cloud_teacher_inference_uses_configured_annotation_threshold():
+    calls = []
+
+    def fake_large_inference(frame, threshold=None):
+        calls.append(threshold)
+        return [[1, 2, 3, 4]], [1], [0.9]
+
+    cfg = SimpleNamespace(
+        edge_model_name="yolov8n",
+        continual_learning=SimpleNamespace(num_epoch=1, teacher_annotation_threshold=0.3),
+        das=SimpleNamespace(enabled=False, bn_only=False, probe_samples=2),
+    )
+    learner = CloudContinualLearner(
+        cfg,
+        large_object_detection=SimpleNamespace(large_inference=fake_large_inference),
+    )
+
+    boxes, labels, scores = learner._teacher_inference(np.zeros((8, 8, 3), dtype=np.uint8))
+
+    assert calls == [pytest.approx(0.3)]
+    assert boxes == [[1, 2, 3, 4]]
+    assert labels == [1]
+    assert scores == [0.9]
 
 
 def test_fixed_split_gt_selection_includes_raw_only_low_confidence_samples():

@@ -219,6 +219,8 @@ client:
 server:
   golden: yolov8x
   edge_model_name: yolov8s
+  continual_learning:
+    teacher_annotation_threshold: 0.3
 ```
 
 ### Fixed Split Planning
@@ -267,6 +269,7 @@ server:
 server:
   continual_learning:
     num_epoch: 2
+    teacher_annotation_threshold: 0.3
     min_wrapper_fixed_split_num_epoch: 10
     wrapper_fixed_split_learning_rate: 3.0e-5
 ```
@@ -299,6 +302,7 @@ The cloud:
 2. expands it into a working cache
 3. reconstructs low-confidence features if necessary
 4. annotates drift samples, plus raw-only low-confidence samples, with the large model
+   using `teacher_annotation_threshold`
 5. detects fully-collapsed wrapper checkpoints and falls back to native pretrained weights for that retrain round
 6. runs split-tail retraining
 7. logs a before/after proxy `mAP@0.5` summary on the GT-annotated subset

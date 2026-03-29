@@ -138,7 +138,7 @@ client:
 
 server:
  server_id: 0
- golden: fasterrcnn_resnet50_fpn
+ golden: yolov8x
  # lightweight model used to generate fine-tuned weights for the edge
  edge_model_name: yolov8n
  #the queue maxsize
@@ -147,7 +147,11 @@ server:
  wait_thresh: 10
  # continual learning settings
  continual_learning:
-  num_epoch: 2
+  num_epoch: 5
+  # Cloud-side teacher threshold used only for GT annotation during
+  # continual learning. Lower values recover more small/far objects but
+  # may introduce noisier pseudo-GT.
+  teacher_annotation_threshold: 0.5
  # Dynamic Activation Sparsity (SURGEON-style layer pruning)
  # Reference: SURGEON (CVPR 2025)
  # https://github.com/kadmkbl/SURGEON

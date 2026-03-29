@@ -331,6 +331,10 @@ class CloudContinualLearner:
             float(getattr(cl_cfg, "split_learning_rate", 1e-3))
             if cl_cfg else 1e-3
         )
+        self.teacher_annotation_threshold = (
+            float(getattr(cl_cfg, "teacher_annotation_threshold", 0.6))
+            if cl_cfg else 0.6
+        )
         self.wrapper_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
             if cl_cfg else 3e-5
@@ -397,6 +401,15 @@ class CloudContinualLearner:
 
     def _prepare_split_runtime_input(self, model: torch.nn.Module, frame):
         return prepare_split_runtime_input(model, frame, device=self.device)
+
+    def _teacher_inference(self, frame):
+        try:
+            return self.large_od.large_inference(
+                frame,
+                threshold=self.teacher_annotation_threshold,
+            )
+        except TypeError:
+            return self.large_od.large_inference(frame)
 
     def _infer_bundle_trace_image_size(
         self,
@@ -528,7 +541,7 @@ class CloudContinualLearner:
                     frame = cv2.imread(img_path)
                     if frame is None:
                         continue
-                    pred_boxes, pred_class, pred_score = self.large_od.large_inference(frame)
+                    pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
                     if pred_boxes is None:
                         continue
                     gt_annotations[idx] = {
@@ -613,7 +626,7 @@ class CloudContinualLearner:
                     frame = cv2.imread(img_path)
                     if frame is None:
                         continue
-                    pred_boxes, pred_class, pred_score = self.large_od.large_inference(frame)
+                    pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
                     if pred_boxes is None:
                         continue
                     gt_annotations[str(sample_id)] = {
@@ -832,7 +845,7 @@ class CloudContinualLearner:
             frame = cv2.imread(img_path)
             if frame is None:
                 continue
-            pred_boxes, pred_class, pred_score = self.large_od.large_inference(frame)
+            pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
             if pred_boxes is None:
                 pred_boxes, pred_class, pred_score = [], [], []
             for box, label, score in zip(pred_boxes, pred_class, pred_score):
