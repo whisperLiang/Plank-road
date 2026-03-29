@@ -391,6 +391,7 @@ class CompositeDriftDetector:
         K_p = _get("K_p", 1.0)
         K_d = _get("K_d", 0.5)
         adwin_delta = _get("adwin_delta", 0.02)
+        adwin_min_window = _get("adwin_min_window", 30)
         w = _get("window_w", 40)
         m = _get("window_m", 3)
         conf_thr = _get("confidence_threshold", 0.5)
@@ -404,6 +405,7 @@ class CompositeDriftDetector:
         self.adwin = ADWINDetector(
             delta=adwin_delta,
             confidence_threshold=conf_thr,
+            min_window=adwin_min_window,
         )
         self.window_det = ConservativeWindowDetector(
             w=w, m=m, pi_bar=pi_bar,

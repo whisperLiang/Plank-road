@@ -214,10 +214,10 @@ python -m grpc_tools.protoc `
 
 ```yaml
 client:
-  small_model_name: yolov8s
+  lightweight: yolov8s
 
 server:
-  large_model_name: yolov8x
+  golden: yolov8x
   edge_model_name: yolov8s
 ```
 

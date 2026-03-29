@@ -18,14 +18,9 @@ client:
  diff_thresh: 0.01
  # the queue maxsize
  local_queue_maxsize: 10
- # the queue threshold for offloading
- queue_thresh: 5
  # the max wait time
  wait_thresh: 100
- # Number of worker threads to offloading thread pool
- offloading_max_worker: 1
  frame_cache_maxsize: 100
- small_model_name: yolov8n
  lightweight: yolov8n
  # Supported model names (see model_management/model_zoo.py):
  #   Faster R-CNN: fasterrcnn_resnet50_fpn, fasterrcnn_mobilenet_v3_large_fpn,
@@ -40,42 +35,17 @@ client:
  #   YOLO12:       yolo12n, yolo12s, yolo12m, yolo12l, yolo12x
  #   DETR:         detr_resnet50, detr_resnet101, conditional_detr_resnet50
  #   RT-DETR:      rtdetr_l, rtdetr_x
- # select the offloading policy
- policy: Edge-Cloud-Assisted
- # change frame resolution using frame new height
- new_height:
-  # offload to another edge node [1080, 720], default 720
-  another: 720
-  # option to offload directly to the cloud [1080, 720, 480], default 480
-  directly_cloud: 720
-  # offload to the cloud after local inference [1080, 720, 480], default 720
-  local_cloud: 720
-  # The task from another edge node is offloaded to the cloud after local inference [720, 480], default 720
-  another_cloud: 720
- # the quality of the transmitted frame
- quality:
-  # offload to another edge node [90, 85], default 85
-  another: 90
-  # Option to offload directly to the cloud [85, 95], default 85
-  directly_cloud: 90
-  # offload to the cloud after local inference [85, 95], default 95
-  local_cloud: 90
-  # The task from another edge node is offloaded to the cloud after local inference, default 85.
-  another_cloud: 90
  # server_ip
  server_ip: '192.168.66.205:50051'
  # edge nodes
  edge_id: 1
  edge_num: 1
- destinations: {'id': [1], 'ip':[192.168.66.136]}
  # retrain
  retrain:
   flag: True
   num_epoch: 2
   cache_path: './cache'
   collect_num: 20
-  select_num: 15
-  window: 90
  # drift detection (RCCDA-inspired)
  drift_detection:
   # mode: 'rccda' | 'adwin' | 'window' | 'any' | 'majority'
@@ -99,17 +69,15 @@ client:
  #
  # When enabled, *replaces* the drift_detection trigger with a multi-queue
  # Lyapunov policy that jointly decides (1) whether to trigger CL and
- # (2) the optimal split point, considering:
+ # (2) whether low-confidence samples should also upload features, considering:
  #   - Cloud resource state (CPU / GPU / memory utilisation)
  #   - Network bandwidth to the cloud
- #   - Intermediate-feature privacy leakage
  #   - Edge-side confidence-score degradation
  #
  # Virtual queues:
  #   Q_update — bounds average retrain rate  ≤  pi_bar
  #   Q_cloud  — bounds average cloud cost    ≤  lambda_cloud
  #   Q_bw     — bounds average bandwidth     ≤  lambda_bw
- #   Q_priv   — bounds privacy leakage       ≤  lambda_priv
  resource_aware_trigger:
   enabled: True
   # --- Shared with drift_detection (RCCDA PD controller) ---
@@ -121,11 +89,9 @@ client:
   # --- Multi-queue budget constraints ---
   lambda_cloud: 0.5      # avg cloud-cost budget per round [0,1]
   lambda_bw: 0.5         # avg bandwidth budget per round [0,1]
-  lambda_priv: 0.3       # avg privacy-leakage budget per round [0,1]
   # --- Queue importance weights ---
   w_cloud: 1.0           # weight for cloud-cost queue
   w_bw: 1.0              # weight for bandwidth queue
-  w_priv: 1.0            # weight for privacy queue
   min_training_samples: 10
   drift_bonus: 0.35
   upload_time_budget_sec: 5.0
@@ -141,8 +107,6 @@ client:
   # When enabled, the edge uses torchlens to trace the model's
   # computational graph and can split at any arbitrary layer,
   # not limited to the Faster R-CNN backbone boundary.
-  universal:
-   enabled: False
    # ---- Explicit split point (highest priority, first match wins) ----
    # split_module — high-level module name, e.g. 'backbone' or 'features.12'
    # split_module: backbone
@@ -174,8 +138,6 @@ client:
 
 server:
  server_id: 0
- edge_ids: [1]
- large_model_name: fasterrcnn_resnet50_fpn
  golden: fasterrcnn_resnet50_fpn
  # lightweight model used to generate fine-tuned weights for the edge
  edge_model_name: yolov8n
