@@ -702,6 +702,43 @@ def test_original_ssd_service_split_retrain_updates_weights(tmp_path):
     assert changed
 
 
+def test_cloud_loader_uses_builder_for_official_yolo_weights(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        edge_model_name="yolov8n",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False, bn_only=False, probe_samples=2),
+    )
+    learner = CloudContinualLearner(
+        cfg,
+        large_object_detection=SimpleNamespace(large_inference=lambda frame: ([], [], [])),
+    )
+    learner.device = torch.device("cpu")
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(exist_ok=True)
+
+    calls = []
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(2, 2)
+
+    def fake_build_detection_model(name, pretrained, device, **kwargs):
+        calls.append((name, pretrained, str(device)))
+        return DummyModel().eval()
+
+    def fail_on_torch_load(*args, **kwargs):
+        raise AssertionError("Official YOLO fallback should not call torch.load directly.")
+
+    monkeypatch.setattr("model_management.model_zoo.build_detection_model", fake_build_detection_model)
+    monkeypatch.setattr("cloud_server.torch.load", fail_on_torch_load)
+
+    model = learner._load_edge_training_model()
+
+    assert isinstance(model, DummyModel)
+    assert calls == [("yolov8n", True, "cpu")]
+
+
 def test_original_fasterrcnn_service_split_retrain_recovers_cached_candidate_by_boundary_labels(tmp_path):
     if not ROAD_VIDEO.exists():
         pytest.skip(f"Missing video: {ROAD_VIDEO}")

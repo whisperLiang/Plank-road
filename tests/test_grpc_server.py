@@ -12,6 +12,7 @@ from grpc_server.rpc_server import (
     _get_cpu_utilization,
     _get_memory_utilization,
     _get_gpu_utilization,
+    _normalize_cache_path,
     MessageTransmissionServicer,
 )
 from grpc_server import message_transmission_pb2
@@ -37,6 +38,9 @@ class TestResourceHelpers:
         val = _get_gpu_utilization()
         assert isinstance(val, float)
         assert 0.0 <= val <= 1.0
+
+    def test_normalize_cache_path_accepts_windows_style_separators(self):
+        assert _normalize_cache_path(r"./cache\server_bundle") == "cache/server_bundle"
 
 
 # =====================================================================
@@ -137,6 +141,32 @@ class TestMessageTransmissionServicer:
         assert reply.success is True
         mock_learner.get_ground_truth_and_retrain.assert_called_once()
 
+    @patch("grpc_server.rpc_server.zipfile.ZipFile")
+    def test_train_model_request_normalizes_cache_path(self, mock_zipfile):
+        mock_learner = MagicMock()
+        mock_learner.get_ground_truth_and_retrain.return_value = (
+            True, "model_base64_data", "success"
+        )
+        svc = self._make_servicer(continual_learner=mock_learner)
+
+        request = MagicMock()
+        request.edge_id = "edge1"
+        request.cache_path = r"./cache\server_bundle"
+        request.num_epoch = 2
+        request.frame_indices = "[1,2,3]"
+        request.payload_zip = b"zip-bytes"
+        context = MagicMock()
+        expected_path = "cache/server_bundle"
+
+        reply = svc.train_model_request(request, context)
+        assert reply.success is True
+        mock_zipfile.return_value.__enter__.return_value.extractall.assert_called_once_with(
+            expected_path
+        )
+        mock_learner.get_ground_truth_and_retrain.assert_called_once_with(
+            "edge1", [1, 2, 3], expected_path, 2
+        )
+
     def test_split_train_request_no_learner(self):
         svc = self._make_servicer(continual_learner=None)
         request = MagicMock()
@@ -170,6 +200,33 @@ class TestMessageTransmissionServicer:
         reply = svc.split_train_request(request, context)
         assert reply.success is True
         mock_learner.get_ground_truth_and_split_retrain.assert_called_once()
+
+    @patch("grpc_server.rpc_server.zipfile.ZipFile")
+    def test_split_train_request_normalizes_cache_path(self, mock_zipfile):
+        mock_learner = MagicMock()
+        mock_learner.get_ground_truth_and_split_retrain.return_value = (
+            True, "model_data", "ok"
+        )
+        svc = self._make_servicer(continual_learner=mock_learner)
+
+        request = MagicMock()
+        request.edge_id = "edge1"
+        request.cache_path = r"./cache\server_bundle"
+        request.num_epoch = 2
+        request.all_frame_indices = "[1,2,3]"
+        request.drift_frame_indices = "[2]"
+        request.payload_zip = b"zip-bytes"
+        context = MagicMock()
+        expected_path = "cache/server_bundle"
+
+        reply = svc.split_train_request(request, context)
+        assert reply.success is True
+        mock_zipfile.return_value.__enter__.return_value.extractall.assert_called_once_with(
+            expected_path
+        )
+        mock_learner.get_ground_truth_and_split_retrain.assert_called_once_with(
+            "edge1", [1, 2, 3], [2], expected_path, 2
+        )
 
     def test_continual_learning_request_no_learner(self):
         svc = self._make_servicer(continual_learner=None)
@@ -205,3 +262,30 @@ class TestMessageTransmissionServicer:
         reply = svc.continual_learning_request(request, context)
         assert reply.success is True
         mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once()
+
+    @patch("grpc_server.rpc_server.zipfile.ZipFile")
+    def test_continual_learning_request_normalizes_cache_path(self, mock_zipfile):
+        mock_learner = MagicMock()
+        mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
+            True, "model_data", "ok"
+        )
+        svc = self._make_servicer(continual_learner=mock_learner)
+
+        request = MagicMock()
+        request.edge_id = 1
+        request.cache_path = r"./cache\server_bundle"
+        request.num_epoch = 2
+        request.send_low_conf_features = True
+        request.protocol_version = "edge-cl-bundle.v1"
+        request.payload_zip = b"zip-bytes"
+        context = MagicMock()
+        expected_path = "cache/server_bundle"
+
+        reply = svc.continual_learning_request(request, context)
+        assert reply.success is True
+        mock_zipfile.return_value.__enter__.return_value.extractall.assert_called_once_with(
+            expected_path
+        )
+        mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once_with(
+            1, expected_path, 2
+        )

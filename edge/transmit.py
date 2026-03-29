@@ -51,7 +51,13 @@ def pack_continual_learning_bundle(
     model_id: str,
     model_version: str,
 ) -> tuple[bytes, dict]:
-    records = sample_store.list_records()
+    records = [
+        record
+        for record in sample_store.list_records()
+        if record.split_config_id == split_plan.split_config_id
+        and record.model_id == str(model_id)
+        and record.model_version == str(model_version)
+    ]
     manifest = {
         "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
         "edge_id": int(edge_id),

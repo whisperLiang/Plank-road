@@ -1,6 +1,7 @@
 import io
 import json
 import zipfile
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import torch
@@ -16,6 +17,7 @@ from model_management.fixed_split import (
 from model_management.payload import SplitPayload
 from model_management.continual_learning_bundle import prepare_split_training_cache
 from model_management.split_candidate import SplitCandidate
+from model_management.universal_model_split import load_split_feature_cache
 
 
 def _dummy_plan() -> SplitPlan:
@@ -44,6 +46,18 @@ def _dummy_plan() -> SplitPlan:
 
 def _payload() -> SplitPayload:
     return SplitPayload.from_mapping({"payload": torch.ones(1, 2, 2)}, primary_label="payload")
+
+
+def _planned_payload(plan: SplitPlan | None = None) -> SplitPayload:
+    active_plan = plan or _dummy_plan()
+    return SplitPayload(
+        tensors=OrderedDict([("payload", torch.ones(1, 2, 2))]),
+        candidate_id=active_plan.candidate_id,
+        boundary_tensor_labels=list(active_plan.boundary_tensor_labels),
+        primary_label="payload",
+        split_index=active_plan.split_index,
+        split_label=active_plan.split_label,
+    )
 
 
 def test_fixed_split_is_computed_once_and_reused(tmp_path, monkeypatch):
@@ -331,8 +345,67 @@ def test_bundle_includes_low_conf_features_when_decision_requests_them(tmp_path,
     assert manifest["training_mode"]["low_confidence_mode"] == "raw+feature"
 
 
+def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path):
+    store = EdgeSampleStore(str(tmp_path))
+    keep = store.store_sample(
+        sample_id="keep-1",
+        frame_index=1,
+        confidence=0.9,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=HIGH_CONFIDENCE,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_payload(),
+        drift_flag=True,
+    )
+    store.store_sample(
+        sample_id="old-plan",
+        frame_index=2,
+        confidence=0.9,
+        split_config_id="plan-old",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=HIGH_CONFIDENCE,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_payload(),
+        drift_flag=True,
+    )
+    store.store_sample(
+        sample_id="old-model",
+        frame_index=3,
+        confidence=0.9,
+        split_config_id="plan-1",
+        model_id="model-b",
+        model_version="0",
+        confidence_bucket=HIGH_CONFIDENCE,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_payload(),
+    )
+
+    payload_zip, manifest = pack_continual_learning_bundle(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=_dummy_plan(),
+        model_id="model-a",
+        model_version="0",
+    )
+    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
+        names = set(zf.namelist())
+        bundle_manifest = json.loads(zf.read("bundle_manifest.json"))
+
+    sample_ids = [sample["sample_id"] for sample in bundle_manifest["samples"]]
+    assert sample_ids == ["keep-1"]
+    assert bundle_manifest["drift_sample_ids"] == ["keep-1"]
+    assert keep.feature_relpath in names
+    assert "features/old-plan.pt" not in names
+    assert "features/old-model.pt" not in names
+
+
 def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, sample_bgr_frame):
     store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
     store.store_sample(
         sample_id="low-1",
         frame_index=2,
@@ -342,7 +415,7 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
         model_version="0",
         confidence_bucket=LOW_CONFIDENCE,
         inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_payload(),
+        intermediate=_planned_payload(plan),
         raw_frame=sample_bgr_frame,
     )
 
@@ -356,7 +429,7 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
         store,
         edge_id=1,
         send_low_conf_features=False,
-        split_plan=_dummy_plan(),
+        split_plan=plan,
         model_id="model-a",
         model_version="0",
     )
@@ -375,7 +448,7 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
         store,
         edge_id=1,
         send_low_conf_features=True,
-        split_plan=_dummy_plan(),
+        split_plan=plan,
         model_id="model-a",
         model_version="0",
     )
@@ -388,3 +461,107 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
         feature_provider=_provider,
     )
     assert provider_calls["count"] == 0
+
+
+def test_prepare_split_training_cache_backfills_input_image_size_from_raw_sample(tmp_path, sample_bgr_frame):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    store.store_sample(
+        sample_id="low-1",
+        frame_index=2,
+        confidence=0.2,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=LOW_CONFIDENCE,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_payload(),
+        raw_frame=sample_bgr_frame,
+    )
+
+    payload_zip, _ = pack_continual_learning_bundle(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=_dummy_plan(),
+        model_id="model-a",
+        model_version="0",
+    )
+    bundle_root = tmp_path / "bundle"
+    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
+        zf.extractall(bundle_root)
+
+    manifest = json.loads((bundle_root / "bundle_manifest.json").read_text())
+    assert manifest["samples"][0]["input_image_size"] is None
+
+    cache_root = tmp_path / "prepared_cache"
+    prepare_split_training_cache(
+        str(bundle_root),
+        str(cache_root),
+        feature_provider=lambda *_: _payload(),
+    )
+
+    record = load_split_feature_cache(str(cache_root), "low-1")
+    assert record["input_image_size"] == list(sample_bgr_frame.shape[:2])
+
+
+def test_prepare_split_training_cache_skips_incompatible_feature_only_samples(tmp_path):
+    bundle_root = tmp_path / "bundle"
+    (bundle_root / "features").mkdir(parents=True)
+    (bundle_root / "results").mkdir()
+
+    payload = SplitPayload(
+        tensors=OrderedDict([("payload", torch.ones(1, 2, 2))]),
+        candidate_id="candidate-old",
+        boundary_tensor_labels=["old-boundary"],
+        primary_label="payload",
+        split_index=3,
+        split_label="payload",
+    )
+    torch.save({"intermediate": payload}, bundle_root / "features" / "old-1.pt")
+    (bundle_root / "results" / "old-1.json").write_text(
+        json.dumps({"boxes": [], "labels": [], "scores": []}),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "protocol_version": "edge-cl-bundle.v1",
+        "edge_id": 1,
+        "model": {"model_id": "model-a", "model_version": "0"},
+        "split_plan": _dummy_plan().to_dict(),
+        "drift_sample_ids": [],
+        "samples": [
+            {
+                "sample_id": "old-1",
+                "frame_index": 1,
+                "confidence": 0.9,
+                "confidence_bucket": HIGH_CONFIDENCE,
+                "drift_flag": False,
+                "feature_relpath": "features/old-1.pt",
+                "feature_bytes": (bundle_root / "features" / "old-1.pt").stat().st_size,
+                "result_relpath": "results/old-1.json",
+                "metadata_relpath": "metadata/old-1.json",
+                "raw_relpath": None,
+                "raw_bytes": 0,
+                "has_feature": True,
+                "has_raw_sample": False,
+                "split_config_id": "plan-old",
+                "model_id": "model-a",
+                "model_version": "0",
+                "input_image_size": None,
+                "input_tensor_shape": None,
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    }
+    (bundle_root / "bundle_manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+
+    info = prepare_split_training_cache(
+        str(bundle_root),
+        str(tmp_path / "prepared_cache"),
+    )
+
+    assert info["all_sample_ids"] == []
+    assert info["drift_sample_ids"] == []

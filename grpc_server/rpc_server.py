@@ -62,6 +62,14 @@ def _get_gpu_utilization() -> float:
     return 0.0
 
 
+def _normalize_cache_path(path: str) -> str:
+    """Normalize cache paths from remote clients across OS-specific separators."""
+    if not path:
+        return path
+    normalized = path.replace("\\", os.sep).replace("/", os.sep)
+    return os.path.normpath(normalized)
+
+
 class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmissionServicer):
     def __init__(self, local_queue, id, object_detection, queue_info=None, continual_learner=None):
         self.local_queue = local_queue
@@ -134,9 +142,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
     def train_model_request(self, request, context):
         """Cloud-side continual learning: label frames with the large model then
         fine-tune the lightweight edge model and return the updated weights."""
+        cache_path = _normalize_cache_path(request.cache_path)
+        if cache_path != request.cache_path:
+            logger.info("Normalized train cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
             "train_model_request from edge_id={} cache_path={} num_epoch={}",
-            request.edge_id, request.cache_path, request.num_epoch,
+            request.edge_id, cache_path, request.num_epoch,
         )
         if self.continual_learner is None:
             logger.error("train_model_request: continual_learner not configured")
@@ -149,13 +160,13 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 import io
                 buf = io.BytesIO(request.payload_zip)
                 with zipfile.ZipFile(buf, "r") as zf:
-                    zf.extractall(request.cache_path)
+                    zf.extractall(cache_path)
                     
             frame_indices = json.loads(request.frame_indices)
             success, model_data, message = self.continual_learner.get_ground_truth_and_retrain(
                 request.edge_id,
                 frame_indices,
-                request.cache_path,
+                cache_path,
                 int(request.num_epoch),
             )
         except Exception as exc:
@@ -170,9 +181,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         """Split-learning continual learning : annotate only drift
         frames with the large model, then train server-side model on all cached
         backbone features and return the updated state-dict."""
+        cache_path = _normalize_cache_path(request.cache_path)
+        if cache_path != request.cache_path:
+            logger.info("Normalized split-train cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
             "split_train_request from edge_id={} cache_path={} num_epoch={}",
-            request.edge_id, request.cache_path, request.num_epoch,
+            request.edge_id, cache_path, request.num_epoch,
         )
         if self.continual_learner is None:
             logger.error("split_train_request: continual_learner not configured")
@@ -185,7 +199,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 import io
                 buf = io.BytesIO(request.payload_zip)
                 with zipfile.ZipFile(buf, "r") as zf:
-                    zf.extractall(request.cache_path)
+                    zf.extractall(cache_path)
                     
             all_indices = json.loads(request.all_frame_indices)
             drift_indices = json.loads(request.drift_frame_indices)
@@ -194,7 +208,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                     request.edge_id,
                     all_indices,
                     drift_indices,
-                    request.cache_path,
+                    cache_path,
                     int(request.num_epoch),
                 )
         except Exception as exc:
@@ -206,10 +220,13 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         )
 
     def continual_learning_request(self, request, context):
+        cache_path = _normalize_cache_path(request.cache_path)
+        if cache_path != request.cache_path:
+            logger.info("Normalized continual-learning cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
             "continual_learning_request from edge_id={} cache_path={} num_epoch={} send_low_conf_features={}",
             request.edge_id,
-            request.cache_path,
+            cache_path,
             request.num_epoch,
             request.send_low_conf_features,
         )
@@ -225,12 +242,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             if request.payload_zip:
                 buf = io.BytesIO(request.payload_zip)
                 with zipfile.ZipFile(buf, "r") as zf:
-                    zf.extractall(request.cache_path)
+                    zf.extractall(cache_path)
 
             success, model_data, message = (
                 self.continual_learner.get_ground_truth_and_fixed_split_retrain(
                     request.edge_id,
-                    request.cache_path,
+                    cache_path,
                     int(request.num_epoch),
                 )
             )

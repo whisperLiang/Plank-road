@@ -2,6 +2,7 @@ __pycache__/
 .claude/
 AGENTS.md
 .agents/
-cache/
+cache/*
 log/
+tmp/
 model_management/models/

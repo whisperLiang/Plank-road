@@ -110,22 +110,16 @@ class CloudContinualLearner:
         from model_management.model_zoo import build_detection_model
 
         model_name = self.edge_model_name
-        tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
         edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
         if os.path.exists(edge_weights):
-            state = torch.load(edge_weights, map_location=self.device)
+            tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
+            state = torch.load(edge_weights, map_location=self.device, weights_only=False)
+            tmp_model.load_state_dict(state)
         else:
             if model_name in model_lib:
-                official_path = ensure_local_model_artifact(model_name)
-                state = (
-                    torch.load(official_path, map_location=self.device)
-                    if official_path.is_file()
-                    else None
-                )
+                tmp_model = build_detection_model(model_name, pretrained=True, device=self.device)
             else:
-                state = None
-        if state is not None:
-            tmp_model.load_state_dict(state)
+                tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
         tmp_model.to(self.device)
         get_split_runtime_model(tmp_model).eval()
         return tmp_model
@@ -496,7 +490,7 @@ class CloudContinualLearner:
         self, cache_path: str, frame_indices: list[int], num_epoch: int
     ) -> bytes:
         """Fine-tune the lightweight model; return its state-dict as bytes."""
-        from model_management.model_zoo import build_detection_model, model_has_roi_heads, is_wrapper_model
+        from model_management.model_zoo import model_has_roi_heads, is_wrapper_model
 
         model_name = self.edge_model_name
 
@@ -506,30 +500,7 @@ class CloudContinualLearner:
                 f"does not support torchvision-style retraining."
             )
 
-        # Build a fresh copy from the saved edge model weights
-        tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
-
-        # Prefer the initialised edge-model weights if they exist
-        edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
-        if os.path.exists(edge_weights):
-            state = torch.load(edge_weights, map_location=self.device)
-        else:
-            # Fall back to the model-lib path
-            if model_name in model_lib:
-                official_path = ensure_local_model_artifact(model_name)
-                if official_path.is_file():
-                    state = torch.load(official_path, map_location=self.device)
-                    logger.info(f"[CL] Loaded official weights from {official_path}")
-                else:
-                    logger.warning("[CL] No pre-trained weights; training from random init.")
-                    state = None
-            else:
-                state = None
-
-        if state is not None:
-            tmp_model.load_state_dict(state)
-
-        tmp_model.to(self.device)
+        tmp_model = self._load_edge_training_model()
 
         # Freeze backbone; fine-tune only head (model-family aware)
         for param in tmp_model.parameters():
