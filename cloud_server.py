@@ -8,6 +8,7 @@ import random
 import shutil
 import threading
 import time
+from collections.abc import Mapping
 
 import cv2
 import numpy as np
@@ -20,6 +21,7 @@ import munch
 import grpc
 from concurrent import futures
 from torch.utils.data import DataLoader
+from mapcalc import calculate_map
 
 from loguru import logger
 from edge.info import TASK_STATE
@@ -30,7 +32,7 @@ from model_management.object_detection import Object_Detection
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
-from model_management.model_zoo import ensure_local_model_artifact
+from model_management.model_zoo import ensure_local_model_artifact, invalidate_wrapper_predictor
 from model_management.split_model_adapters import (
     build_split_runtime_sample_input,
     build_split_training_loss,
@@ -59,6 +61,212 @@ from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
 def _collate_fn(batch):
     return tuple(zip(*batch))
+
+
+def _looks_like_fused_ultralytics_state_dict(state: object) -> bool:
+    """Detect BN-folded Ultralytics checkpoints saved as raw state-dicts.
+
+    Freshly built YOLO/RT-DETR wrapper models expect explicit BatchNorm
+    parameters like ``*.bn.running_mean``. A fused checkpoint instead contains
+    ``*.conv.bias`` entries and omits the BatchNorm tensors entirely, which
+    makes a direct ``load_state_dict()`` into a new model fail.
+    """
+    if not isinstance(state, Mapping):
+        return False
+
+    string_keys = [key for key in state.keys() if isinstance(key, str)]
+    if not string_keys:
+        return False
+
+    has_conv_bias = any(".conv.bias" in key for key in string_keys)
+    has_batch_norm = any(".bn." in key for key in string_keys)
+    return has_conv_bias and not has_batch_norm
+
+
+def _select_fixed_split_gt_sample_ids(
+    manifest: Mapping[str, object],
+    *,
+    prepared_sample_ids: list[str] | tuple[str, ...],
+) -> list[str]:
+    """Choose bundle samples that should receive cloud-side GT annotations.
+
+    Drift samples are always annotated. In ``raw-only`` low-confidence mode we
+    additionally annotate low-confidence samples that uploaded only raw frames
+    (no feature payload), because their pseudo-labels are often empty or
+    unreliable and otherwise dominate split-tail retraining as negatives.
+    """
+    prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
+    drift_payload = manifest.get("drift_sample_ids", [])
+    drift_lookup = {
+        str(sample_id)
+        for sample_id in drift_payload
+        if str(sample_id) in prepared_lookup
+    }
+    training_mode_payload = manifest.get("training_mode", {})
+    if isinstance(training_mode_payload, Mapping):
+        training_mode = str(
+            training_mode_payload.get("low_confidence_mode", "")
+        ).strip().lower()
+    else:
+        training_mode = ""
+
+    selected: list[str] = []
+    for sample in manifest.get("samples", []):
+        if not isinstance(sample, Mapping):
+            continue
+        sample_id = str(sample.get("sample_id", "")).strip()
+        if not sample_id or sample_id not in prepared_lookup:
+            continue
+        if sample_id in drift_lookup:
+            selected.append(sample_id)
+            continue
+        if training_mode != "raw-only":
+            continue
+        if str(sample.get("confidence_bucket", "")).strip() != "low_confidence":
+            continue
+        if sample.get("raw_relpath") is None:
+            continue
+        if sample.get("feature_relpath") is not None:
+            continue
+        selected.append(sample_id)
+    return selected
+
+
+def _set_detection_model_eval_mode(model: torch.nn.Module) -> None:
+    invalidate_wrapper_predictor(model)
+    model.eval()
+    get_split_runtime_model(model).eval()
+
+
+def _prepare_eval_image_tensor(frame: np.ndarray, *, device: torch.device) -> torch.Tensor:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    tensor = torch.from_numpy(np.ascontiguousarray(rgb))
+    return tensor.permute(2, 0, 1).float().div(255.0).to(device)
+
+
+def _prediction_from_model_output(
+    output: object,
+    *,
+    threshold_low: float = 0.2,
+    threshold_high: float = 0.6,
+) -> dict[str, list]:
+    empty = {"labels": [], "boxes": [], "scores": []}
+
+    if isinstance(output, tuple):
+        output = output[0]
+    if isinstance(output, dict):
+        output = [output]
+    if not isinstance(output, (list, tuple)) or not output:
+        return empty
+
+    first = output[0]
+    if not isinstance(first, Mapping):
+        return empty
+
+    labels_t = first.get("labels")
+    boxes_t = first.get("boxes")
+    scores_t = first.get("scores")
+    if labels_t is None or boxes_t is None or scores_t is None:
+        return empty
+
+    labels = labels_t.detach().cpu().tolist()
+    boxes = boxes_t.detach().cpu().tolist()
+    scores = scores_t.detach().cpu().tolist()
+    if not scores:
+        return empty
+
+    low_indices = [index for index, score in enumerate(scores) if score > threshold_low]
+    if not low_indices:
+        return empty
+    low_cutoff = low_indices[-1] + 1
+    labels = labels[:low_cutoff]
+    boxes = boxes[:low_cutoff]
+    scores = scores[:low_cutoff]
+
+    high_indices = [index for index, score in enumerate(scores) if score > threshold_high]
+    if not high_indices:
+        return empty
+    high_cutoff = high_indices[-1] + 1
+    return {
+        "labels": labels[:high_cutoff],
+        "boxes": boxes[:high_cutoff],
+        "scores": scores[:high_cutoff],
+    }
+
+
+def _evaluate_detection_proxy_map(
+    model: torch.nn.Module,
+    *,
+    frame_dir: str,
+    gt_annotations: Mapping[str, Mapping[str, object]],
+    device: torch.device,
+    threshold_low: float = 0.2,
+    threshold_high: float = 0.6,
+) -> dict[str, float | int | None]:
+    sample_ids = sorted(str(sample_id) for sample_id in gt_annotations.keys())
+    scores: list[float] = []
+    skipped_empty_gt = 0
+    skipped_missing_frame = 0
+
+    _set_detection_model_eval_mode(model)
+    with torch.no_grad():
+        for sample_id in sample_ids:
+            target = gt_annotations.get(sample_id) or {}
+            gt_boxes = list(target.get("boxes") or [])
+            gt_labels = list(target.get("labels") or [])
+            if not gt_boxes or not gt_labels:
+                skipped_empty_gt += 1
+                continue
+
+            frame_path = os.path.join(frame_dir, f"{sample_id}.jpg")
+            if not os.path.exists(frame_path):
+                skipped_missing_frame += 1
+                continue
+
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                skipped_missing_frame += 1
+                continue
+
+            prediction = _prediction_from_model_output(
+                model([_prepare_eval_image_tensor(frame, device=device)]),
+                threshold_low=threshold_low,
+                threshold_high=threshold_high,
+            )
+            score = calculate_map(
+                {"labels": gt_labels, "boxes": gt_boxes},
+                prediction,
+                0.5,
+            )
+            scores.append(float(score))
+
+    return {
+        "map": float(np.mean(scores)) if scores else None,
+        "evaluated_samples": len(scores),
+        "skipped_empty_gt": skipped_empty_gt,
+        "skipped_missing_frame": skipped_missing_frame,
+        "total_gt_samples": len(sample_ids),
+    }
+
+
+def _format_proxy_map_summary(
+    metrics_before: Mapping[str, object] | None,
+    metrics_after: Mapping[str, object] | None,
+) -> str | None:
+    if metrics_before is None or metrics_after is None:
+        return None
+    before_map = metrics_before.get("map")
+    after_map = metrics_after.get("map")
+    if before_map is None or after_map is None:
+        return None
+    return (
+        "proxy_mAP@0.5 "
+        f"{float(before_map):.4f} -> {float(after_map):.4f} "
+        f"(delta={float(after_map) - float(before_map):+.4f}, "
+        f"evaluated={int(metrics_after.get('evaluated_samples', 0))}, "
+        f"skipped_empty_gt={int(metrics_after.get('skipped_empty_gt', 0))}, "
+        f"skipped_missing_frame={int(metrics_after.get('skipped_missing_frame', 0))})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -107,14 +315,36 @@ class CloudContinualLearner:
         self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
 
     def _load_edge_training_model(self) -> torch.nn.Module:
-        from model_management.model_zoo import build_detection_model
+        from model_management.model_zoo import build_detection_model, is_wrapper_model
 
         model_name = self.edge_model_name
         edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
         if os.path.exists(edge_weights):
-            tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
             state = torch.load(edge_weights, map_location=self.device, weights_only=False)
-            tmp_model.load_state_dict(state)
+            if is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
+                logger.warning(
+                    "[CL] Cached wrapper weights at {} look like a fused Ultralytics state_dict; "
+                    "rebuilding {} from native pretrained weights for this retrain round.",
+                    edge_weights,
+                    model_name,
+                )
+                tmp_model = build_detection_model(model_name, pretrained=True, device=self.device)
+                torch.save(tmp_model.state_dict(), edge_weights)
+            else:
+                tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
+                try:
+                    tmp_model.load_state_dict(state)
+                except RuntimeError:
+                    if not is_wrapper_model(model_name):
+                        raise
+                    logger.warning(
+                        "[CL] Failed to load cached wrapper weights from {}; "
+                        "falling back to native pretrained {} weights.",
+                        edge_weights,
+                        model_name,
+                    )
+                    tmp_model = build_detection_model(model_name, pretrained=True, device=self.device)
+                    torch.save(tmp_model.state_dict(), edge_weights)
         else:
             if model_name in model_lib:
                 tmp_model = build_detection_model(model_name, pretrained=True, device=self.device)
@@ -330,10 +560,17 @@ class CloudContinualLearner:
 
                 gt_annotations: dict[str, dict] = {}
                 frame_dir = os.path.join(working_cache, "frames")
-                for sample_id in bundle_info["drift_sample_ids"]:
+                gt_sample_ids = _select_fixed_split_gt_sample_ids(
+                    manifest,
+                    prepared_sample_ids=bundle_info["all_sample_ids"],
+                )
+                for sample_id in gt_sample_ids:
                     img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
                     if not os.path.exists(img_path):
-                        logger.warning("[FixedSplitCL] Drift sample {} missing raw frame.", sample_id)
+                        logger.warning(
+                            "[FixedSplitCL] GT sample {} missing raw frame.",
+                            sample_id,
+                        )
                         continue
                     frame = cv2.imread(img_path)
                     if frame is None:
@@ -345,6 +582,13 @@ class CloudContinualLearner:
                         "boxes": pred_boxes,
                         "labels": pred_class,
                     }
+
+                proxy_metrics_before = _evaluate_detection_proxy_map(
+                    tmp_model,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    device=self.device,
+                )
 
                 split_model = get_split_runtime_model(tmp_model)
                 trace_image_size = self._infer_bundle_trace_image_size(manifest)
@@ -366,16 +610,43 @@ class CloudContinualLearner:
                     das_bn_only=self.das_bn_only,
                     das_probe_samples=self.das_probe_samples,
                 )
+                proxy_metrics_after = _evaluate_detection_proxy_map(
+                    tmp_model,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    device=self.device,
+                )
+                proxy_summary = _format_proxy_map_summary(
+                    proxy_metrics_before,
+                    proxy_metrics_after,
+                )
+                if proxy_summary is not None:
+                    logger.info("[FixedSplitCL] {}", proxy_summary)
+                else:
+                    logger.info(
+                        "[FixedSplitCL] Proxy mAP skipped "
+                        "(gt_samples={}, evaluated={}, empty_gt={}, missing_frame={}).",
+                        int(proxy_metrics_after.get("total_gt_samples", 0)),
+                        int(proxy_metrics_after.get("evaluated_samples", 0)),
+                        int(proxy_metrics_after.get("skipped_empty_gt", 0)),
+                        int(proxy_metrics_after.get("skipped_missing_frame", 0)),
+                    )
 
                 encoded = base64.b64encode(
                     self._serialise_model_bytes(tmp_model)
                 ).decode("utf-8")
+                success_message = (
+                    f"Fixed split retraining successful; {proxy_summary}"
+                    if proxy_summary is not None
+                    else "Fixed split retraining successful; proxy_mAP@0.5 skipped"
+                )
                 logger.success(
-                    "[FixedSplitCL] Retraining done for edge {} with {} samples.",
+                    "[FixedSplitCL] Retraining done for edge {} with {} samples ({} GT-annotated).",
                     edge_id,
                     len(bundle_info["all_sample_ids"]),
+                    len(gt_annotations),
                 )
-                return True, encoded, "Fixed split retraining successful"
+                return True, encoded, success_message
             except Exception as exc:
                 logger.exception("[FixedSplitCL] Retraining failed for edge {}: {}", edge_id, exc)
                 return False, "", str(exc)

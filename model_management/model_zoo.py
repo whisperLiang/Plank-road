@@ -79,6 +79,7 @@ from torchvision.models.detection import (
 )
 from model_management.model_info import model_lib
 from model_management.ultralytics_parity import (
+    invalidate_predictor,
     postprocess_predictions,
     preprocess_bgr_images,
     rgb_tensor_to_bgr_uint8,
@@ -221,7 +222,9 @@ class YOLODetectionModel(nn.Module):
         return self.yolo.model.state_dict(*args, **kwargs)
 
     def load_state_dict(self, state_dict, strict=True):
-        return self.yolo.model.load_state_dict(state_dict, strict=strict)
+        result = self.yolo.model.load_state_dict(state_dict, strict=strict)
+        invalidate_predictor(self.yolo)
+        return result
 
     def to(self, device):
         self._device = device
@@ -436,7 +439,9 @@ class RTDETRDetectionModel(nn.Module):
         return self.rtdetr.model.state_dict(*args, **kwargs)
 
     def load_state_dict(self, state_dict, strict=True):
-        return self.rtdetr.model.load_state_dict(state_dict, strict=strict)
+        result = self.rtdetr.model.load_state_dict(state_dict, strict=strict)
+        invalidate_predictor(self.rtdetr)
+        return result
 
     def to(self, device):
         self._device = device
@@ -786,6 +791,13 @@ def build_detection_model(
         f"Unknown detection model: '{name}'.  "
         f"Available: {list_available_models()}"
     )
+
+
+def invalidate_wrapper_predictor(model: nn.Module) -> None:
+    if isinstance(model, YOLODetectionModel):
+        invalidate_predictor(model.yolo)
+    elif isinstance(model, RTDETRDetectionModel):
+        invalidate_predictor(model.rtdetr)
 
 
 # ═══════════════════════════════════════════════════════════════════════

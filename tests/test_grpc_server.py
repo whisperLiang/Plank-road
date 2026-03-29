@@ -13,6 +13,7 @@ from grpc_server.rpc_server import (
     _get_memory_utilization,
     _get_gpu_utilization,
     _normalize_cache_path,
+    _reset_cache_dir,
     MessageTransmissionServicer,
 )
 from grpc_server import message_transmission_pb2
@@ -41,6 +42,16 @@ class TestResourceHelpers:
 
     def test_normalize_cache_path_accepts_windows_style_separators(self):
         assert _normalize_cache_path(r"./cache\server_bundle") == "cache/server_bundle"
+
+    def test_reset_cache_dir_recreates_empty_directory(self, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "stale.txt").write_text("old", encoding="utf-8")
+
+        _reset_cache_dir(str(cache_dir))
+
+        assert cache_dir.exists()
+        assert list(cache_dir.iterdir()) == []
 
 
 # =====================================================================
@@ -263,8 +274,9 @@ class TestMessageTransmissionServicer:
         assert reply.success is True
         mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once()
 
+    @patch("grpc_server.rpc_server._reset_cache_dir")
     @patch("grpc_server.rpc_server.zipfile.ZipFile")
-    def test_continual_learning_request_normalizes_cache_path(self, mock_zipfile):
+    def test_continual_learning_request_normalizes_cache_path(self, mock_zipfile, mock_reset_cache_dir):
         mock_learner = MagicMock()
         mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
             True, "model_data", "ok"
@@ -283,6 +295,7 @@ class TestMessageTransmissionServicer:
 
         reply = svc.continual_learning_request(request, context)
         assert reply.success is True
+        mock_reset_cache_dir.assert_called_once_with(expected_path)
         mock_zipfile.return_value.__enter__.return_value.extractall.assert_called_once_with(
             expected_path
         )

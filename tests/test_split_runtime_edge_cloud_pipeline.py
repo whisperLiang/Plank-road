@@ -20,7 +20,12 @@ from torchvision import transforms
 from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_320_fpn
 
 from edge.transmit import pack_training_payload
-from cloud_server import CloudContinualLearner
+from cloud_server import (
+    CloudContinualLearner,
+    _evaluate_detection_proxy_map,
+    _format_proxy_map_summary,
+    _select_fixed_split_gt_sample_ids,
+)
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from grpc_server.rpc_server import MessageTransmissionServicer
 from model_management.model_zoo import (
@@ -38,6 +43,7 @@ from model_management.split_model_adapters import (
     prepare_split_runtime_input,
 )
 from model_management.split_runtime import compare_outputs
+from model_management.ultralytics_parity import ensure_predictor
 from model_management.universal_model_split import (
     UniversalModelSplitter,
     save_split_feature_cache,
@@ -737,6 +743,292 @@ def test_cloud_loader_uses_builder_for_official_yolo_weights(tmp_path, monkeypat
 
     assert isinstance(model, DummyModel)
     assert calls == [("yolov8n", True, "cpu")]
+
+
+def test_cloud_loader_skips_fused_cached_yolo_state_dict(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        edge_model_name="yolov8n",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False, bn_only=False, probe_samples=2),
+    )
+    learner = CloudContinualLearner(
+        cfg,
+        large_object_detection=SimpleNamespace(large_inference=lambda frame: ([], [], [])),
+    )
+    learner.device = torch.device("cpu")
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(exist_ok=True)
+
+    torch.save(
+        {
+            "model.0.conv.weight": torch.zeros(1, 1, 1, 1),
+            "model.0.conv.bias": torch.zeros(1),
+        },
+        Path(learner.weight_folder) / "tmp_edge_model.pth",
+    )
+
+    calls = []
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(2, 2)
+
+    def fake_build_detection_model(name, pretrained, device, **kwargs):
+        calls.append((name, pretrained, str(device)))
+        return DummyModel().eval()
+
+    monkeypatch.setattr("model_management.model_zoo.build_detection_model", fake_build_detection_model)
+
+    model = learner._load_edge_training_model()
+
+    assert isinstance(model, DummyModel)
+    assert calls == [("yolov8n", True, "cpu")]
+
+
+def test_fixed_split_gt_selection_includes_raw_only_low_confidence_samples():
+    manifest = {
+        "training_mode": {
+            "low_confidence_mode": "raw-only",
+        },
+        "drift_sample_ids": ["drift-1"],
+        "samples": [
+            {
+                "sample_id": "drift-1",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "raw/drift-1.jpg",
+                "feature_relpath": None,
+            },
+            {
+                "sample_id": "low-raw-only",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "raw/low-raw-only.jpg",
+                "feature_relpath": None,
+            },
+            {
+                "sample_id": "low-with-feature",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "raw/low-with-feature.jpg",
+                "feature_relpath": "features/low-with-feature.pt",
+            },
+            {
+                "sample_id": "high-with-feature",
+                "confidence_bucket": "high_confidence",
+                "raw_relpath": None,
+                "feature_relpath": "features/high-with-feature.pt",
+            },
+        ],
+    }
+
+    selected = _select_fixed_split_gt_sample_ids(
+        manifest,
+        prepared_sample_ids=[
+            "drift-1",
+            "low-raw-only",
+            "low-with-feature",
+            "high-with-feature",
+        ],
+    )
+
+    assert selected == ["drift-1", "low-raw-only"]
+
+
+def test_fixed_split_gt_selection_keeps_raw_plus_feature_mode_drift_only():
+    manifest = {
+        "training_mode": {
+            "low_confidence_mode": "raw+feature",
+        },
+        "drift_sample_ids": ["drift-1"],
+        "samples": [
+            {
+                "sample_id": "drift-1",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "raw/drift-1.jpg",
+                "feature_relpath": "features/drift-1.pt",
+            },
+            {
+                "sample_id": "low-raw-only",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "raw/low-raw-only.jpg",
+                "feature_relpath": None,
+            },
+        ],
+    }
+
+    selected = _select_fixed_split_gt_sample_ids(
+        manifest,
+        prepared_sample_ids=["drift-1", "low-raw-only"],
+    )
+
+    assert selected == ["drift-1"]
+
+
+def test_evaluate_detection_proxy_map_reports_mean_map_and_skips_empty_gt(tmp_path):
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    cv2.imwrite(str(frame_dir / "match-1.jpg"), np.zeros((16, 16, 3), dtype=np.uint8))
+
+    class DummyDetector(nn.Module):
+        def forward(self, images):
+            assert len(images) == 1
+            return [{
+                "boxes": torch.tensor([[1.0, 1.0, 8.0, 8.0]], dtype=torch.float32),
+                "labels": torch.tensor([1], dtype=torch.int64),
+                "scores": torch.tensor([0.95], dtype=torch.float32),
+            }]
+
+    metrics = _evaluate_detection_proxy_map(
+        DummyDetector(),
+        frame_dir=str(frame_dir),
+        gt_annotations={
+            "match-1": {"boxes": [[1.0, 1.0, 8.0, 8.0]], "labels": [1]},
+            "empty-gt": {"boxes": [], "labels": []},
+        },
+        device=torch.device("cpu"),
+    )
+
+    assert metrics["evaluated_samples"] == 1
+    assert metrics["skipped_empty_gt"] == 1
+    assert metrics["skipped_missing_frame"] == 0
+    assert metrics["total_gt_samples"] == 2
+    assert metrics["map"] == pytest.approx(1.0)
+
+
+def test_format_proxy_map_summary_includes_delta_and_counts():
+    summary = _format_proxy_map_summary(
+        {
+            "map": 0.25,
+            "evaluated_samples": 4,
+            "skipped_empty_gt": 1,
+            "skipped_missing_frame": 0,
+        },
+        {
+            "map": 0.40,
+            "evaluated_samples": 4,
+            "skipped_empty_gt": 1,
+            "skipped_missing_frame": 0,
+        },
+    )
+
+    assert summary == (
+        "proxy_mAP@0.5 0.2500 -> 0.4000 "
+        "(delta=+0.1500, evaluated=4, skipped_empty_gt=1, skipped_missing_frame=0)"
+    )
+
+
+def test_ensure_predictor_does_not_mutate_source_model():
+    class DummyPredictor:
+        def __init__(self, overrides, _callbacks):
+            self.args = SimpleNamespace(device=None, imgsz=64)
+            self.model = SimpleNamespace(stride=torch.tensor([32]))
+
+        def setup_model(self, model, verbose=False):
+            with torch.no_grad():
+                model.weight.zero_()
+            self.model = SimpleNamespace(stride=torch.tensor([32]))
+
+    class DummyEngine:
+        def __init__(self):
+            self.model = nn.Linear(2, 2)
+            self.overrides = {}
+            self.callbacks = {}
+            self.predictor = None
+
+        def _smart_load(self, name):
+            assert name == "predictor"
+            return DummyPredictor
+
+    engine = DummyEngine()
+    before = engine.model.weight.detach().clone()
+
+    predictor = ensure_predictor(engine, conf=0.5)
+
+    assert predictor is engine.predictor
+    assert torch.equal(engine.model.weight.detach(), before)
+
+
+def test_universal_split_retrain_falls_back_from_boundary_and_candidate_id_to_split_index(monkeypatch):
+    calls = []
+
+    class DummySplitter:
+        def __init__(self, device=None):
+            self.device = torch.device("cpu")
+
+        def trace(self, model, sample_input):
+            return self
+
+        def split(self, *, boundary_tensor_labels=None, candidate_id=None, layer_index=None):
+            calls.append(
+                {
+                    "boundary_tensor_labels": boundary_tensor_labels,
+                    "candidate_id": candidate_id,
+                    "layer_index": layer_index,
+                }
+            )
+            if boundary_tensor_labels is not None or candidate_id is not None:
+                raise KeyError("fallback")
+            return SimpleNamespace(
+                boundary_tensor_labels=["resolved"],
+                candidate_id="resolved",
+                legacy_layer_index=layer_index,
+                cloud_nodes=[],
+                edge_nodes=[],
+            )
+
+        def freeze_head(self, chosen):
+            return None
+
+        def unfreeze_tail(self, chosen):
+            return None
+
+        def get_tail_trainable_params(self, chosen):
+            return []
+
+        def cloud_train_step(self, payload, targets=None, loss_fn=None, optimizer=None, candidate=None):
+            loss = loss_fn(None, targets) if loss_fn is not None else torch.zeros(())
+            return None, loss
+
+    monkeypatch.setattr(
+        "model_management.universal_model_split.UniversalModelSplitter",
+        DummySplitter,
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split._infer_cached_split_choice",
+        lambda cache_path, all_indices: ("candidate-stale", 184, ["old-boundary"]),
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split.load_split_feature_cache",
+        lambda cache_path, frame_index: {
+            "intermediate": object(),
+            "candidate_id": "candidate-stale",
+            "split_index": 184,
+            "boundary_tensor_labels": ["old-boundary"],
+            "pseudo_boxes": [],
+            "pseudo_labels": [],
+            "pseudo_scores": [],
+        },
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split._move_nested",
+        lambda value, device: value,
+    )
+
+    losses = universal_split_retrain(
+        model=nn.Linear(1, 1),
+        sample_input=torch.zeros(1, 1),
+        cache_path="unused",
+        all_indices=[0],
+        gt_annotations={},
+        num_epoch=1,
+        loss_fn=lambda outputs, targets: torch.zeros((), requires_grad=True),
+    )
+
+    assert losses == [0.0]
+    assert calls == [
+        {"boundary_tensor_labels": ["old-boundary"], "candidate_id": None, "layer_index": None},
+        {"boundary_tensor_labels": None, "candidate_id": "candidate-stale", "layer_index": None},
+        {"boundary_tensor_labels": None, "candidate_id": None, "layer_index": 184},
+    ]
 
 
 def test_original_fasterrcnn_service_split_retrain_recovers_cached_candidate_by_boundary_labels(tmp_path):

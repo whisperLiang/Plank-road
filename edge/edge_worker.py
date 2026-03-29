@@ -452,7 +452,13 @@ class EdgeWorker:
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
                     self.drift_detector.reset()
-                    logger.success("Edge model updated from cloud successfully")
+                    if msg:
+                        logger.success(
+                            "Edge model updated from cloud successfully ({})",
+                            msg,
+                        )
+                    else:
+                        logger.success("Edge model updated from cloud successfully")
                 except Exception as exc:
                     logger.exception("Failed to load cloud-returned model weights: {}", exc)
             else:

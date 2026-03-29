@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -51,7 +52,8 @@ def ensure_predictor(
 
     if predictor is None or current_device != requested_device:
         predictor = engine._smart_load("predictor")(overrides=args, _callbacks=engine.callbacks)
-        predictor.setup_model(model=engine.model, verbose=False)
+        model_for_predictor = deepcopy(engine.model) if isinstance(engine.model, torch.nn.Module) else engine.model
+        predictor.setup_model(model=model_for_predictor, verbose=False)
         engine.predictor = predictor
     else:
         predictor.args = get_cfg(predictor.args, args)
@@ -62,6 +64,11 @@ def ensure_predictor(
         min_dim=2,
     )
     return predictor
+
+
+def invalidate_predictor(engine: Any) -> None:
+    if hasattr(engine, "predictor"):
+        engine.predictor = None
 
 
 def rgb_tensor_to_bgr_uint8(image: torch.Tensor) -> np.ndarray:

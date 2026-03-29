@@ -2,6 +2,7 @@ import zipfile
 import io
 import json
 import os
+import shutil
 import threading
 
 from loguru import logger
@@ -68,6 +69,11 @@ def _normalize_cache_path(path: str) -> str:
         return path
     normalized = path.replace("\\", os.sep).replace("/", os.sep)
     return os.path.normpath(normalized)
+
+
+def _reset_cache_dir(cache_path: str) -> None:
+    shutil.rmtree(cache_path, ignore_errors=True)
+    os.makedirs(cache_path, exist_ok=True)
 
 
 class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmissionServicer):
@@ -158,6 +164,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             if hasattr(request, 'payload_zip') and request.payload_zip:
                 import zipfile
                 import io
+                _reset_cache_dir(cache_path)
                 buf = io.BytesIO(request.payload_zip)
                 with zipfile.ZipFile(buf, "r") as zf:
                     zf.extractall(cache_path)
@@ -197,6 +204,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             if hasattr(request, 'payload_zip') and request.payload_zip:
                 import zipfile
                 import io
+                _reset_cache_dir(cache_path)
                 buf = io.BytesIO(request.payload_zip)
                 with zipfile.ZipFile(buf, "r") as zf:
                     zf.extractall(cache_path)
@@ -240,6 +248,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             )
         try:
             if request.payload_zip:
+                _reset_cache_dir(cache_path)
                 buf = io.BytesIO(request.payload_zip)
                 with zipfile.ZipFile(buf, "r") as zf:
                     zf.extractall(cache_path)

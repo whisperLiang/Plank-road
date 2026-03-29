@@ -541,9 +541,21 @@ def universal_split_retrain(
         try:
             chosen = splitter.split(boundary_tensor_labels=boundary_labels)
         except KeyError:
-            chosen = splitter.split(candidate_id=candidate_id, layer_index=split_layer)
+            if candidate_id is not None:
+                try:
+                    chosen = splitter.split(candidate_id=candidate_id)
+                except KeyError:
+                    chosen = splitter.split(layer_index=split_layer)
+            else:
+                chosen = splitter.split(layer_index=split_layer)
     else:
-        chosen = splitter.split(candidate_id=candidate_id, layer_index=split_layer)
+        if candidate_id is not None:
+            try:
+                chosen = splitter.split(candidate_id=candidate_id)
+            except KeyError:
+                chosen = splitter.split(layer_index=split_layer)
+        else:
+            chosen = splitter.split(layer_index=split_layer)
     splitter.freeze_head(chosen)
     splitter.unfreeze_tail(chosen)
     params = splitter.get_tail_trainable_params(chosen)
@@ -565,10 +577,20 @@ def universal_split_retrain(
                 record_boundary = record.get("boundary_tensor_labels")
                 payload_boundary_labels = list(record_boundary) if record_boundary else None
             if payload_boundary_labels and list(chosen.boundary_tensor_labels) != payload_boundary_labels:
-                raise RuntimeError(
-                    "Cached boundary tensor labels do not match the selected candidate. "
-                    f"cached={payload_boundary_labels}, selected={chosen.boundary_tensor_labels}."
-                )
+                boundary_matches = False
+                if cached_candidate_id and cached_candidate_id == chosen.candidate_id:
+                    boundary_matches = True
+                elif (
+                    cached_split_index is not None
+                    and chosen.legacy_layer_index is not None
+                    and int(cached_split_index) == int(chosen.legacy_layer_index)
+                ):
+                    boundary_matches = True
+                if not boundary_matches:
+                    raise RuntimeError(
+                        "Cached boundary tensor labels do not match the selected candidate. "
+                        f"cached={payload_boundary_labels}, selected={chosen.boundary_tensor_labels}."
+                    )
             if (
                 payload_boundary_labels is None
                 and cached_candidate_id

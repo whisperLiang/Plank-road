@@ -12,6 +12,7 @@ from model_management.fixed_split import (
     compute_fixed_split_for_model,
     SplitConstraints,
     SplitPlan,
+    apply_split_plan,
     load_or_compute_fixed_split_plan,
 )
 from model_management.payload import SplitPayload
@@ -219,6 +220,72 @@ def test_fixed_split_validates_only_lowest_payload_group_until_success():
     assert runtime.validation_calls == [
         "candidate-low-invalid",
         "candidate-low-valid",
+    ]
+
+
+def test_apply_split_plan_falls_back_from_boundary_labels_to_candidate_and_split_index():
+    plan = SplitPlan(
+        split_config_id="plan-1",
+        model_name="dummy-model",
+        candidate_id="candidate-2",
+        split_index=7,
+        split_label="layer7",
+        boundary_tensor_labels=["missing-boundary"],
+        payload_bytes=128,
+        privacy_metric=0.4,
+        privacy_risk=0.6,
+        layer_freezing_ratio=0.5,
+        constraints={},
+        trace_signature="sig",
+    )
+
+    class CandidateRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def split(self, *, boundary_tensor_labels=None, candidate_id=None, layer_index=None):
+            self.calls.append(
+                {
+                    "boundary_tensor_labels": boundary_tensor_labels,
+                    "candidate_id": candidate_id,
+                    "layer_index": layer_index,
+                }
+            )
+            if boundary_tensor_labels is not None:
+                raise KeyError("missing boundary labels")
+            if candidate_id is not None:
+                return "candidate-match"
+            raise AssertionError("layer_index fallback should not be used here")
+
+    runtime = CandidateRuntime()
+    assert apply_split_plan(runtime, plan) == "candidate-match"
+    assert runtime.calls == [
+        {"boundary_tensor_labels": ["missing-boundary"], "candidate_id": None, "layer_index": None},
+        {"boundary_tensor_labels": None, "candidate_id": "candidate-2", "layer_index": None},
+    ]
+
+    class LayerRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def split(self, *, boundary_tensor_labels=None, candidate_id=None, layer_index=None):
+            self.calls.append(
+                {
+                    "boundary_tensor_labels": boundary_tensor_labels,
+                    "candidate_id": candidate_id,
+                    "layer_index": layer_index,
+                }
+            )
+            if boundary_tensor_labels is not None or candidate_id is not None:
+                raise KeyError("fallback")
+            return "layer-match"
+
+    runtime = LayerRuntime()
+    assert apply_split_plan(runtime, plan) == "layer-match"
+    assert runtime.calls == [
+        {"boundary_tensor_labels": ["missing-boundary"], "candidate_id": None, "layer_index": None},
+        {"boundary_tensor_labels": None, "candidate_id": "candidate-2", "layer_index": None},
+        {"boundary_tensor_labels": None, "candidate_id": None, "layer_index": 7},
     ]
 
 
@@ -463,6 +530,73 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
     assert provider_calls["count"] == 0
 
 
+def test_prepare_split_training_cache_accepts_matching_split_index_when_boundary_labels_drift(tmp_path):
+    bundle_root = tmp_path / "bundle"
+    (bundle_root / "features").mkdir(parents=True)
+    (bundle_root / "results").mkdir()
+
+    payload = SplitPayload(
+        tensors=OrderedDict([("payload", torch.ones(1, 2, 2))]),
+        candidate_id="candidate-old",
+        boundary_tensor_labels=["old-boundary"],
+        primary_label="payload",
+        split_index=3,
+        split_label="payload",
+    )
+    torch.save({"intermediate": payload}, bundle_root / "features" / "sample-1.pt")
+    (bundle_root / "results" / "sample-1.json").write_text(
+        json.dumps({"boxes": [], "labels": [], "scores": []}),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "protocol_version": "edge-cl-bundle.v1",
+        "edge_id": 1,
+        "model": {"model_id": "model-a", "model_version": "0"},
+        "split_plan": {
+            **_dummy_plan().to_dict(),
+            "candidate_id": "candidate-new",
+            "split_index": 3,
+            "boundary_tensor_labels": ["new-boundary"],
+        },
+        "drift_sample_ids": [],
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "frame_index": 1,
+                "confidence": 0.9,
+                "confidence_bucket": HIGH_CONFIDENCE,
+                "drift_flag": False,
+                "feature_relpath": "features/sample-1.pt",
+                "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
+                "result_relpath": "results/sample-1.json",
+                "metadata_relpath": "metadata/sample-1.json",
+                "raw_relpath": None,
+                "raw_bytes": 0,
+                "has_feature": True,
+                "has_raw_sample": False,
+                "split_config_id": "plan-1",
+                "model_id": "model-a",
+                "model_version": "0",
+                "input_image_size": None,
+                "input_tensor_shape": None,
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    }
+    (bundle_root / "bundle_manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+
+    info = prepare_split_training_cache(
+        str(bundle_root),
+        str(tmp_path / "prepared_cache"),
+    )
+
+    assert info["all_sample_ids"] == ["sample-1"]
+
+
 def test_prepare_split_training_cache_backfills_input_image_size_from_raw_sample(tmp_path, sample_bgr_frame):
     store = EdgeSampleStore(str(tmp_path / "store"))
     store.store_sample(
@@ -514,7 +648,7 @@ def test_prepare_split_training_cache_skips_incompatible_feature_only_samples(tm
         candidate_id="candidate-old",
         boundary_tensor_labels=["old-boundary"],
         primary_label="payload",
-        split_index=3,
+        split_index=99,
         split_label="payload",
     )
     torch.save({"intermediate": payload}, bundle_root / "features" / "old-1.pt")

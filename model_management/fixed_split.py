@@ -217,9 +217,15 @@ def _profile_from_report(
 
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
     if plan.boundary_tensor_labels:
-        return splitter.split(boundary_tensor_labels=plan.boundary_tensor_labels)
+        try:
+            return splitter.split(boundary_tensor_labels=plan.boundary_tensor_labels)
+        except KeyError:
+            pass
     if plan.candidate_id is not None:
-        return splitter.split(candidate_id=plan.candidate_id)
+        try:
+            return splitter.split(candidate_id=plan.candidate_id)
+        except KeyError:
+            pass
     return splitter.split(layer_index=plan.split_index)
 
 

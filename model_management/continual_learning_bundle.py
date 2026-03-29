@@ -85,10 +85,12 @@ def _payload_matches_split_plan(payload: Any, split_plan: dict[str, Any]) -> boo
         return True
     expected_boundary = split_plan.get("boundary_tensor_labels") or []
     if expected_boundary:
-        return list(payload.boundary_tensor_labels) == list(expected_boundary)
+        if list(payload.boundary_tensor_labels) == list(expected_boundary):
+            return True
     expected_candidate_id = split_plan.get("candidate_id")
     if expected_candidate_id and payload.candidate_id is not None:
-        return str(payload.candidate_id) == str(expected_candidate_id)
+        if str(payload.candidate_id) == str(expected_candidate_id):
+            return True
     expected_split_index = split_plan.get("split_index")
     if expected_split_index is not None and payload.split_index is not None:
         return int(payload.split_index) == int(expected_split_index)
