@@ -51,7 +51,7 @@ client:
   # mode: 'rccda' | 'adwin' | 'window' | 'any' | 'majority'
   mode: rccda
   # confidence threshold below which a detection is considered a loss
-  confidence_threshold: 0.5
+  confidence_threshold: 0.8
   # RCCDA Lyapunov virtual queue parameters
   pi_bar: 0.1
   V: 10.0
@@ -85,7 +85,7 @@ client:
   # V: 10.0              # Lyapunov trade-off coefficient
   # K_p: 1.0             # PD proportional gain
   # K_d: 0.5             # PD derivative gain
-  # confidence_threshold: 0.5
+  # confidence_threshold: 0.8
   # --- Multi-queue budget constraints ---
   lambda_cloud: 0.5      # avg cloud-cost budget per round [0,1]
   lambda_bw: 0.5         # avg bandwidth budget per round [0,1]
