@@ -21,6 +21,7 @@ from model_management.universal_model_split import UniversalModelSplitter
 
 
 NEW_DETECTORS = ("rfdetr_nano", "tinynext_s")
+YOLO_DETECTORS = ("yolo26n",)
 
 
 def _detector_kwargs(model_name: str) -> dict[str, object]:
@@ -159,6 +160,49 @@ def test_runtime_wrapper_trace_supports_new_models(model_name):
             validated.append(candidate)
             break
     assert validated, model_name
+
+
+@pytest.mark.parametrize("model_name", YOLO_DETECTORS)
+def test_yolo26_runtime_wrapper_postprocess_matches_public_model(model_name):
+    frame = _random_frame()
+    model = _build_public_detector(model_name)
+
+    expected = model(_public_input_from_frame(frame))
+    runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
+    raw_outputs = get_split_runtime_model(model).eval()(runtime_input)
+    replayed = postprocess_split_runtime_output(
+        model,
+        raw_outputs,
+        threshold=getattr(model, "confidence", 0.01),
+        model_input=runtime_input,
+        orig_image=frame,
+    )
+
+    ok, max_diff = compare_outputs(expected, replayed)
+    assert ok, (model_name, max_diff)
+
+
+@pytest.mark.parametrize("model_name", YOLO_DETECTORS)
+def test_yolo26_runtime_wrapper_loss_is_finite_and_backwardable(model_name):
+    frame = _random_frame()
+    model = _build_public_detector(model_name)
+    runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
+    runtime_model = get_split_runtime_model(model).eval()
+
+    for parameter in runtime_model.parameters():
+        if parameter.grad is not None:
+            parameter.grad.zero_()
+
+    raw_outputs = runtime_model(runtime_input)
+    loss_fn = build_split_training_loss(model)
+    loss = loss_fn(raw_outputs, _training_targets(runtime_input, frame))
+
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in runtime_model.parameters()
+    ), model_name
 
 
 @pytest.mark.parametrize(

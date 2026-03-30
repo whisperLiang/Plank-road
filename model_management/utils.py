@@ -3,6 +3,7 @@ import numpy as np
 from loguru import logger
 from mapcalc import calculate_map
 from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES
+from ultralytics.utils.plotting import Annotator, colors
 
 
 def cal_iou(a, b):
@@ -109,14 +110,30 @@ def _clip_box_to_image(box, image_shape):
     return x1, y1, x2, y2
 
 
+def _resolve_label_text(label):
+    if isinstance(label, (int, np.integer)):
+        label_index = int(label)
+        return (
+            COCO_INSTANCE_CATEGORY_NAMES[label_index]
+            if 0 <= label_index < len(COCO_INSTANCE_CATEGORY_NAMES)
+            else str(label_index)
+        )
+    return str(label)
+
+
+def _resolve_color_index(label, label_text):
+    if isinstance(label, (int, np.integer)):
+        return int(label)
+    if label_text in COCO_INSTANCE_CATEGORY_NAMES:
+        return COCO_INSTANCE_CATEGORY_NAMES.index(label_text)
+    return sum(ord(char) for char in label_text) % 20
+
+
 def draw_detection(img, pred_boxes, pred_cls, pred_score):
-    cached_img = img.copy()
-    rect_th = 1
-    text_th = 1
-    text_size = 0.6
+    cached_img = np.ascontiguousarray(img.copy())
     if pred_boxes is None or pred_cls is None:
         return cached_img
-    height, width = cached_img.shape[:2]
+    annotator = Annotator(cached_img, pil=False, example="abc")
     for i in range(len(pred_boxes)):
         if i >= len(pred_cls):
             break
@@ -124,37 +141,18 @@ def draw_detection(img, pred_boxes, pred_cls, pred_score):
         if clipped_box is None:
             continue
         label = pred_cls[i]
-        if isinstance(label, (int, np.integer)):
-            label_text = (
-                COCO_INSTANCE_CATEGORY_NAMES[int(label)]
-                if 0 <= int(label) < len(COCO_INSTANCE_CATEGORY_NAMES)
-                else str(int(label))
-            )
-        else:
-            label_text = str(label)
+        label_text = _resolve_label_text(label)
 
         score_text = ""
         if pred_score is not None and i < len(pred_score):
             score_text = f" {float(pred_score[i]):.2f}"
 
-        x1, y1, x2, y2 = clipped_box
-        cv2.rectangle(
-            cached_img,
-            (x1, y1),
-            (x2, y2),
-            color=(0, 255, 0),
-            thickness=rect_th,
-        )
-        cv2.putText(
-            cached_img,
+        annotator.box_label(
+            clipped_box,
             f"{label_text}{score_text}",
-            (min(max(x1, 0), width - 1), min(max(18, y1 - 6), height - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            text_size,
-            (0, 255, 0),
-            thickness=text_th,
+            color=colors(_resolve_color_index(label, label_text), True),
         )
-    return cached_img
+    return annotator.result()
 
 
 def cal_mAP(ground_truth, result_dict):

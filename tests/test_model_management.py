@@ -28,6 +28,7 @@ from model_management.detection_transforms import Compose, ToTensor, Resize
 from model_management.detection_metric import RetrainMetric
 from model_management.detection_dataset import DetectionDataset
 from model_management.model_zoo import (
+    build_detection_model,
     get_model_artifact_path,
     get_models_dir,
     list_available_models,
@@ -65,6 +66,9 @@ class TestModelInfo:
 
     def test_tinynext_family(self):
         assert model_lib["tinynext_s"]["family"] == "tinynext"
+
+    def test_yolo26_family(self):
+        assert model_lib["yolo26n"]["family"] == "yolo"
 
     def test_model_paths_are_local_relative_paths(self):
         for info in model_lib.values():
@@ -180,7 +184,12 @@ class TestDrawDetection:
     def test_draw_detection_clips_partial_boxes(self, sample_bgr_frame):
         blank = np.zeros_like(sample_bgr_frame)
         result = draw_detection(blank, [[-20, -20, 40, 40]], [1], [0.9])
-        assert tuple(result[0, 0]) == (0, 255, 0)
+        assert result[0:45, 0:45].sum() > 0
+
+    def test_draw_detection_renders_colored_label_banner(self, sample_bgr_frame):
+        blank = np.zeros_like(sample_bgr_frame)
+        result = draw_detection(blank, [[30, 30, 120, 120]], ["car"], [0.95])
+        assert result[24:40, 30:110].sum() > 0
 
     def test_draw_detection_skips_invalid_boxes(self, sample_bgr_frame):
         blank = np.zeros_like(sample_bgr_frame)
@@ -310,10 +319,12 @@ class TestModelZoo:
         assert len(models) > 0
         assert "rfdetr_nano" in models
         assert "tinynext_s" in models
+        assert "yolo26n" in models
 
     def test_get_model_family(self):
         assert get_model_family("rfdetr_nano") == "rfdetr"
         assert get_model_family("tinynext_s") == "tinynext"
+        assert get_model_family("yolo26n") == "yolo"
         assert get_model_family("retinanet_resnet50_fpn") == "retinanet"
         assert get_model_family("unknown_model") == "unknown"
 
@@ -324,6 +335,7 @@ class TestModelZoo:
 
     def test_is_wrapper_model_name(self):
         assert is_wrapper_model("yolov8n") is True
+        assert is_wrapper_model("yolo26n") is True
         assert is_wrapper_model("rfdetr_nano") is True
         assert is_wrapper_model("tinynext_s") is False
 
@@ -334,6 +346,11 @@ class TestModelZoo:
 
     def test_model_artifact_paths_resolve_under_models_dir(self):
         models_dir = get_models_dir().resolve()
-        for model_name in ["rfdetr_nano", "tinynext_s", "yolov8n", "detr_resnet50", "rtdetr_l"]:
+        for model_name in ["rfdetr_nano", "tinynext_s", "yolov8n", "yolo26n", "detr_resnet50", "rtdetr_l"]:
             artifact_path = get_model_artifact_path(model_name).resolve()
             assert models_dir == artifact_path.parent or models_dir in artifact_path.parents
+
+    def test_build_yolo26_detector_from_yaml_when_pretrained_false(self):
+        model = build_detection_model("yolo26n", pretrained=False, device="cpu")
+        assert is_wrapper_model(model) is True
+        assert get_model_family("yolo26n") == "yolo"

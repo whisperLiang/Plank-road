@@ -14,7 +14,7 @@ imutils
 PyYAML
 torchlens==1.0.1
 psutil
-ultralytics
+ultralytics>=8.4.0
 transformers
 rfdetr
 timm

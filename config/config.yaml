@@ -30,6 +30,7 @@ client:
  #   YOLOv10:      yolov10n, yolov10s, yolov10m, yolov10l, yolov10x
  #   YOLO11:       yolo11n, yolo11s, yolo11m, yolo11l, yolo11x
  #   YOLO12:       yolo12n, yolo12s, yolo12m, yolo12l, yolo12x
+ #   YOLO26:       yolo26n, yolo26s, yolo26m, yolo26l, yolo26x
  #   DETR:         detr_resnet50, detr_resnet101, conditional_detr_resnet50
  #   RF-DETR:      rfdetr_nano, rfdetr_small, rfdetr_medium, rfdetr_large
  #   RT-DETR:      rtdetr_l, rtdetr_x

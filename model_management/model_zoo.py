@@ -143,6 +143,8 @@ class YOLODetectionModel(nn.Module):
         from ultralytics import YOLO
         self.yolo = YOLO(model_name)
         self.yolo.to(device)
+        if isinstance(getattr(self.yolo, "model", None), torch.nn.Module):
+            self.yolo.model.eval()
         self.confidence = confidence
         self._device = device
         self.num_classes = num_classes
@@ -634,6 +636,12 @@ _YOLO_MODELS: Dict[str, str] = {
     "yolo12m": "yolo12m.pt",
     "yolo12l": "yolo12l.pt",
     "yolo12x": "yolo12x.pt",
+    # YOLO26
+    "yolo26n": "yolo26n.pt",
+    "yolo26s": "yolo26s.pt",
+    "yolo26m": "yolo26m.pt",
+    "yolo26l": "yolo26l.pt",
+    "yolo26x": "yolo26x.pt",
 }
 
 _DETR_MODELS: Dict[str, str] = {
@@ -872,16 +880,16 @@ def build_detection_model(
 
     # ── 2. YOLO ──
     if name_lower in _YOLO_MODELS:
-        if artifact_path is None:
+        if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
-        pt_name = str(artifact_path)
+        model_source = str(artifact_path) if artifact_path is not None else f"{name_lower}.yaml"
         model = YOLODetectionModel(
-            model_name=pt_name,
+            model_name=model_source,
             confidence=confidence,
             device=device,
             num_classes=num_classes,
         )
-        logger.info("[ModelZoo] Built YOLO model: {} ({})", name, pt_name)
+        logger.info("[ModelZoo] Built YOLO model: {} ({})", name, model_source)
         return model
 
     # ── 3. DETR (HuggingFace) ──

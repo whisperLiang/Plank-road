@@ -154,7 +154,7 @@ class Object_Detection:
         data_loader = DataLoader(dataset=dataset, batch_size=2, collate_fn=_collate_fn, )
         tr_metric = RetrainMetric()
 
-        # 训练设置
+        # Use a smaller learning rate for fine-tuning
         num_epoch = self.config.retrain.num_epoch
         trainable_params = [p for p in tmp_model.parameters() if p.requires_grad]
         optimizer = torch.optim.SGD(trainable_params, lr=0.005, momentum=0.9,weight_decay=0.0005)
