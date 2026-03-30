@@ -43,6 +43,14 @@ class ToyDagNet(nn.Module):
         return self.head(pooled)
 
 
+class ArangeCatNet(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = x.flatten(start_dim=1)
+        grid = torch.arange(0, base.shape[1], dtype=base.dtype)
+        grid = grid.unsqueeze(0).repeat(base.shape[0], 1)
+        return torch.cat([base, grid], dim=1)
+
+
 def _make_sequential_model() -> tuple[nn.Module, torch.Tensor]:
     model = nn.Sequential(
         nn.Linear(16, 32),
@@ -241,6 +249,35 @@ def test_dag_boundary_payload_is_minimal_and_cache_independent():
         )
         with pytest.raises(RuntimeError):
             splitter.cloud_forward(broken_payload, candidate=candidate)
+
+
+def test_runtime_injects_device_for_parentless_tensor_factories():
+    model = ArangeCatNet().eval()
+    sample = torch.randn(2, 4)
+    runtime = GraphSplitRuntime(device="cpu")
+    runtime.trace(model, sample)
+
+    arange_nodes = [
+        node
+        for node in runtime.graph.nodes.values()
+        if node.func_name == "arange" and not node.parent_labels
+    ]
+    assert arange_nodes
+
+    calls = []
+    original = arange_nodes[0].func
+
+    def tracking_arange(*args, **kwargs):
+        calls.append(kwargs.get("device"))
+        return original(*args, **kwargs)
+
+    arange_nodes[0].func = tracking_arange
+
+    replayed = runtime.full_replay(sample)
+    expected = model(sample)
+    ok, max_diff = compare_outputs(expected, replayed)
+    assert ok, max_diff
+    assert calls == [runtime.device]
 
 
 def test_payload_cache_and_universal_split_retrain(tmp_path):

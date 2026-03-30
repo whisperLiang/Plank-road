@@ -58,6 +58,42 @@ def _coerce_numeric_tensor(obj: Any, *, device: torch.device, dtype: torch.dtype
     return None
 
 
+_RUNTIME_DEVICE_FACTORY_FUNCS = {
+    "arange",
+    "as_tensor",
+    "empty",
+    "eye",
+    "full",
+    "linspace",
+    "logspace",
+    "ones",
+    "rand",
+    "randint",
+    "randn",
+    "scalar_tensor",
+    "tensor",
+    "zeros",
+}
+
+
+def _maybe_inject_runtime_device(
+    *,
+    func_name: str,
+    parent_labels: Iterable[str],
+    kwargs: Mapping[str, Any],
+    device: torch.device,
+) -> dict[str, Any]:
+    resolved_kwargs = dict(kwargs)
+    if resolved_kwargs.get("device") is not None:
+        return resolved_kwargs
+    if list(parent_labels):
+        return resolved_kwargs
+    if str(func_name).lower() not in _RUNTIME_DEVICE_FACTORY_FUNCS:
+        return resolved_kwargs
+    resolved_kwargs["device"] = device
+    return resolved_kwargs
+
+
 def _aligned_tensor_loss(output_tensor: torch.Tensor, target_tensor: torch.Tensor) -> torch.Tensor | None:
     if not output_tensor.is_floating_point():
         return None
@@ -347,6 +383,12 @@ class GraphSplitRuntime:
             device=self.device,
             clone_parent_labels=clone_parent_labels,
             clone_cache=clone_cache,
+        )
+        kwargs = _maybe_inject_runtime_device(
+            func_name=node.func_name,
+            parent_labels=node.parent_labels,
+            kwargs=kwargs,
+            device=self.device,
         )
         try:
             output = node.func(*args, **kwargs)
