@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -10,6 +11,8 @@ import torch
 from PIL import Image
 from ultralytics.models.utils.loss import RTDETRDetectionLoss
 from ultralytics.utils import ops
+from torchvision.models.detection.ssd import SSD
+from torchvision.ops import boxes as box_ops
 
 from model_management.model_zoo import (
     COCO_80_TO_91,
@@ -26,6 +29,51 @@ from model_management.ultralytics_parity import (
 COCO_91_TO_80 = {label: idx for idx, label in enumerate(COCO_80_TO_91)}
 
 
+class TorchvisionSSDReplay(torch.nn.Module):
+    """Replay-friendly SSD wrapper that excludes dynamic detection post-process."""
+
+    def __init__(self, detector: SSD) -> None:
+        super().__init__()
+        self.detector = detector
+        self.transform = detector.transform
+        self.backbone = detector.backbone
+        self.head = detector.head
+
+    def _as_image_list(self, images: Any) -> list[torch.Tensor]:
+        if isinstance(images, torch.Tensor):
+            if images.ndim == 4:
+                return [image for image in images]
+            return [images]
+        if isinstance(images, (list, tuple)):
+            tensors: list[torch.Tensor] = []
+            for image in images:
+                if not isinstance(image, torch.Tensor):
+                    raise TypeError(f"Unsupported SSD replay input type: {type(image)!r}")
+                tensors.extend(list(image) if image.ndim == 4 else [image])
+            if not tensors:
+                raise RuntimeError("SSD replay received an empty image batch.")
+            return tensors
+        raise TypeError(f"Unsupported SSD replay input type: {type(images)!r}")
+
+    def forward(self, images: Any) -> dict[str, torch.Tensor]:
+        image_list = self._as_image_list(images)
+        transformed_images, _ = self.transform(image_list, None)
+        features = self.backbone(transformed_images.tensors)
+        if isinstance(features, torch.Tensor):
+            features = OrderedDict([("0", features)])
+        if isinstance(features, dict):
+            feature_list = list(features.values())
+        elif isinstance(features, (list, tuple)):
+            feature_list = list(features)
+        else:
+            feature_list = [features]
+        outputs = self.head(feature_list)
+        return {
+            "cls_logits": outputs["cls_logits"],
+            "bbox_regression": outputs["bbox_regression"],
+        }
+
+
 def get_split_runtime_model(model: torch.nn.Module) -> torch.nn.Module:
     if isinstance(model, YOLODetectionModel):
         return model.yolo.model
@@ -33,6 +81,8 @@ def get_split_runtime_model(model: torch.nn.Module) -> torch.nn.Module:
         return model.rtdetr.model
     if isinstance(model, DETRDetectionModel):
         return model.detr
+    if isinstance(model, SSD):
+        return TorchvisionSSDReplay(model)
     return model
 
 
@@ -136,6 +186,12 @@ def postprocess_split_runtime_output(
             threshold=threshold,
             image_size=orig_image.shape[:2],
         )
+    if isinstance(model, SSD):
+        return _postprocess_ssd_output(
+            model,
+            outputs,
+            model_input=model_input,
+        )
     return outputs
 
 
@@ -206,6 +262,43 @@ def build_split_training_loss(model: torch.nn.Module):
                 None,
             )
             return loss
+
+        return _loss_fn
+
+    if isinstance(model, SSD):
+        def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
+            cls_logits, bbox_regression = _extract_ssd_outputs(outputs)
+            device = cls_logits.device
+            image_size = _infer_input_image_size(targets)
+            dummy_image = torch.zeros(
+                (3, image_size[0], image_size[1]),
+                dtype=torch.float32,
+                device=device,
+            )
+            image_targets = [
+                _build_ssd_training_target(
+                    targets,
+                    device=device,
+                    image_size=image_size,
+                )
+            ]
+            transformed_images, transformed_targets = model.transform([dummy_image], image_targets)
+            features = model.backbone(transformed_images.tensors)
+            if isinstance(features, torch.Tensor):
+                features = OrderedDict([("0", features)])
+            feature_list = list(features.values()) if isinstance(features, dict) else list(features)
+            anchors = model.anchor_generator(transformed_images, feature_list)
+            matched_idxs = _match_ssd_anchors(model, anchors, transformed_targets)
+            loss_dict = model.compute_loss(
+                transformed_targets,
+                {
+                    "cls_logits": cls_logits,
+                    "bbox_regression": bbox_regression,
+                },
+                anchors,
+                matched_idxs,
+            )
+            return sum(loss_dict.values())
 
         return _loss_fn
 
@@ -342,6 +435,47 @@ def _postprocess_detr_output(
     }]
 
 
+def _postprocess_ssd_output(
+    model: SSD,
+    outputs: Any,
+    *,
+    model_input: Any | None,
+) -> list[dict[str, torch.Tensor]]:
+    cls_logits, bbox_regression = _extract_ssd_outputs(outputs)
+    device = cls_logits.device
+
+    if isinstance(model_input, torch.Tensor):
+        images = list(model_input) if model_input.ndim == 4 else [model_input]
+    elif isinstance(model_input, (list, tuple)):
+        images = [image for image in model_input if isinstance(image, torch.Tensor)]
+    else:
+        images = []
+    if not images:
+        raise RuntimeError("SSD split postprocess requires the original image tensor input.")
+
+    images = [image.to(device) for image in images]
+    original_image_sizes = [tuple(int(dim) for dim in image.shape[-2:]) for image in images]
+    transformed_images, _ = model.transform(images, None)
+    features = model.backbone(transformed_images.tensors)
+    if isinstance(features, torch.Tensor):
+        features = OrderedDict([("0", features)])
+    feature_list = list(features.values()) if isinstance(features, dict) else list(features)
+    anchors = model.anchor_generator(transformed_images, feature_list)
+    detections = model.postprocess_detections(
+        {
+            "cls_logits": cls_logits,
+            "bbox_regression": bbox_regression,
+        },
+        anchors,
+        transformed_images.image_sizes,
+    )
+    return model.transform.postprocess(
+        detections,
+        transformed_images.image_sizes,
+        original_image_sizes,
+    )
+
+
 def _extract_detr_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
     if hasattr(outputs, "logits") and hasattr(outputs, "pred_boxes"):
         return outputs.logits, outputs.pred_boxes
@@ -356,6 +490,20 @@ def _extract_detr_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
     if logits is None or pred_boxes is None:
         raise RuntimeError("Unable to extract DETR logits/pred_boxes from split replay output.")
     return logits, pred_boxes
+
+
+def _extract_ssd_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(outputs, dict):
+        cls_logits = outputs.get("cls_logits")
+        bbox_regression = outputs.get("bbox_regression")
+        if isinstance(cls_logits, torch.Tensor) and isinstance(bbox_regression, torch.Tensor):
+            return cls_logits, bbox_regression
+    if isinstance(outputs, (list, tuple)) and len(outputs) >= 2:
+        cls_logits = outputs[0]
+        bbox_regression = outputs[1]
+        if isinstance(cls_logits, torch.Tensor) and isinstance(bbox_regression, torch.Tensor):
+            return cls_logits, bbox_regression
+    raise RuntimeError("Unable to extract SSD cls_logits/bbox_regression from split replay output.")
 
 
 def _extract_rtdetr_loss_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any]:
@@ -501,6 +649,49 @@ def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple
     if model_input_size is None:
         model_input_size = original_image_size
     return original_image_size, model_input_size
+
+
+def _build_ssd_training_target(
+    targets: dict[str, Any],
+    *,
+    device: torch.device,
+    image_size: tuple[int, int],
+) -> dict[str, torch.Tensor]:
+    boxes = _clamp_xyxy_boxes(
+        _as_boxes_tensor(targets.get("boxes"), device=device),
+        image_size,
+    )
+    labels = _as_labels_tensor(targets.get("labels"), device=device)
+    if boxes.shape[0] != labels.shape[0]:
+        count = min(int(boxes.shape[0]), int(labels.shape[0]))
+        boxes = boxes[:count]
+        labels = labels[:count]
+    return {
+        "boxes": boxes,
+        "labels": labels,
+    }
+
+
+def _match_ssd_anchors(
+    model: SSD,
+    anchors: list[torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+) -> list[torch.Tensor]:
+    matched_idxs: list[torch.Tensor] = []
+    for anchors_per_image, targets_per_image in zip(anchors, targets):
+        if targets_per_image["boxes"].numel() == 0:
+            matched_idxs.append(
+                torch.full(
+                    (anchors_per_image.size(0),),
+                    -1,
+                    dtype=torch.int64,
+                    device=anchors_per_image.device,
+                )
+            )
+            continue
+        match_quality_matrix = box_ops.box_iou(targets_per_image["boxes"], anchors_per_image)
+        matched_idxs.append(model.proposal_matcher(match_quality_matrix))
+    return matched_idxs
 
 
 def _as_boxes_tensor(boxes: Any, *, device: torch.device) -> torch.Tensor:

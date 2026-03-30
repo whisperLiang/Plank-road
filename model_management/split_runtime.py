@@ -270,6 +270,58 @@ def _maybe_retry_getitem_with_safe_indexing(func: Any, args: list[Any], kwargs: 
     return func(source, safe_index)
 
 
+def _coerce_small_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        return int(value.item())
+    return None
+
+
+def _maybe_call_safe_topk(args: list[Any], kwargs: dict[str, Any]) -> Any | None:
+    if len(args) < 2:
+        return None
+    source = args[0]
+    if not isinstance(source, torch.Tensor) or source.ndim == 0:
+        return None
+
+    k = _coerce_small_int(args[1])
+    if k is None:
+        return None
+
+    if "dim" in kwargs:
+        dim = _coerce_small_int(kwargs["dim"])
+    elif len(args) >= 3:
+        dim = _coerce_small_int(args[2])
+    else:
+        dim = -1
+    if dim is None:
+        return None
+
+    norm_dim = dim if dim >= 0 else source.ndim + dim
+    if norm_dim < 0 or norm_dim >= source.ndim:
+        return None
+
+    if "largest" in kwargs:
+        largest = bool(kwargs["largest"])
+    elif len(args) >= 4:
+        largest = bool(args[3])
+    else:
+        largest = True
+
+    if "sorted" in kwargs:
+        sorted_flag = bool(kwargs["sorted"])
+    elif len(args) >= 5:
+        sorted_flag = bool(args[4])
+    else:
+        sorted_flag = True
+
+    safe_k = max(0, min(int(k), int(source.shape[norm_dim])))
+    return source.topk(safe_k, dim=dim, largest=largest, sorted=sorted_flag)
+
+
 @dataclass
 class RuntimeState:
     values: "OrderedDict[str, Any]"
@@ -390,11 +442,14 @@ class GraphSplitRuntime:
             kwargs=kwargs,
             device=self.device,
         )
+        args_list = list(args) if isinstance(args, tuple) else list(args)
+        kwargs_dict = dict(kwargs)
         try:
-            output = node.func(*args, **kwargs)
+            safe_topk = None
+            if node.func_name.lower() == "topk":
+                safe_topk = _maybe_call_safe_topk(args_list, kwargs_dict)
+            output = safe_topk if safe_topk is not None else node.func(*args, **kwargs)
         except IndexError:
-            args_list = list(args) if isinstance(args, tuple) else list(args)
-            kwargs_dict = dict(kwargs)
             output = _maybe_retry_getitem_with_safe_indexing(node.func, args_list, kwargs_dict)
             if output is None:
                 raise

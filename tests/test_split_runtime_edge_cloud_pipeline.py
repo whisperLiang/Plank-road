@@ -732,6 +732,94 @@ def test_original_ssd_service_split_retrain_updates_weights(tmp_path):
     assert changed
 
 
+def test_ssd_runtime_wrapper_postprocess_matches_public_model():
+    model = build_detection_model(
+        "ssdlite320_mobilenet_v3_large",
+        pretrained=False,
+        device="cpu",
+    ).eval()
+    frame = _read_video_frames(count=1, size=(96, 96))[0]
+    runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
+
+    runtime_model = get_split_runtime_model(model).eval()
+    replayed_raw = runtime_model(runtime_input)
+    replayed = postprocess_split_runtime_output(
+        model,
+        replayed_raw,
+        threshold=0.2,
+        model_input=runtime_input,
+        orig_image=frame,
+    )
+    expected = model(runtime_input)
+
+    ok, max_diff = compare_outputs(expected, replayed)
+    assert ok, max_diff
+
+
+def test_ssd_runtime_wrapper_candidates_avoid_dynamic_postprocess_ops():
+    model = build_detection_model(
+        "ssdlite320_mobilenet_v3_large",
+        pretrained=False,
+        device="cpu",
+    ).eval()
+    frame = _read_video_frames(count=1, size=(96, 96))[0]
+    runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
+
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trace(get_split_runtime_model(model).eval(), runtime_input)
+    candidates = splitter.sample_candidates(
+        sample_size=2,
+        seed=11,
+        require_validated=True,
+        require_trainable=True,
+        max_candidates=12,
+    )
+
+    assert candidates
+    for candidate in candidates:
+        cloud_funcs = {
+            splitter.graph.nodes[label].func_name.lower()
+            for label in candidate.cloud_nodes
+        }
+        assert "topk" not in cloud_funcs
+        assert "unbind" not in cloud_funcs
+
+
+def test_ssd_runtime_wrapper_loss_is_finite_and_backwardable():
+    model = build_detection_model(
+        "ssdlite320_mobilenet_v3_large",
+        pretrained=False,
+        device="cpu",
+    ).eval()
+    frame = _read_video_frames(count=1, size=(96, 96))[0]
+    runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
+    runtime_model = get_split_runtime_model(model).eval()
+    outputs = runtime_model(runtime_input)
+
+    loss_fn = build_split_training_loss(model)
+    assert loss_fn is not None
+
+    model.zero_grad(set_to_none=True)
+    loss = loss_fn(
+        outputs,
+        {
+            "boxes": [[10.0, 12.0, 42.0, 48.0]],
+            "labels": [1],
+            "_split_meta": {
+                "input_image_size": [96, 96],
+                "input_tensor_shape": [3, 96, 96],
+            },
+        },
+    )
+    assert bool(torch.isfinite(loss).item())
+
+    loss.backward()
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.head.parameters()
+    )
+
+
 def test_cloud_loader_uses_builder_for_official_yolo_weights(tmp_path, monkeypatch):
     cfg = SimpleNamespace(
         edge_model_name="yolov8n",

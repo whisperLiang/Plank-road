@@ -280,6 +280,21 @@ def test_runtime_injects_device_for_parentless_tensor_factories():
     assert calls == [runtime.device]
 
 
+def test_safe_topk_clips_k_to_available_dimension():
+    tensor = torch.tensor([0.2, 0.5, 0.1], dtype=torch.float32)
+
+    result = __import__("model_management.split_runtime", fromlist=["_maybe_call_safe_topk"])._maybe_call_safe_topk(
+        [tensor, 5],
+        {},
+    )
+
+    assert result is not None
+    values, indices = result
+    assert values.shape == (3,)
+    assert indices.shape == (3,)
+    assert torch.equal(indices, torch.tensor([1, 0, 2]))
+
+
 def test_payload_cache_and_universal_split_retrain(tmp_path):
     model, sample = _make_sequential_model()
     splitter = UniversalModelSplitter(device="cpu")
