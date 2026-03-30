@@ -578,24 +578,21 @@ def universal_split_retrain(
                 record_boundary = record.get("boundary_tensor_labels")
                 payload_boundary_labels = list(record_boundary) if record_boundary else None
             if payload_boundary_labels and list(chosen.boundary_tensor_labels) != payload_boundary_labels:
-                boundary_matches = False
-                if cached_candidate_id and cached_candidate_id == chosen.candidate_id:
-                    boundary_matches = True
-                elif (
-                    cached_split_index is not None
-                    and chosen.legacy_layer_index is not None
-                    and int(cached_split_index) == int(chosen.legacy_layer_index)
-                ):
-                    boundary_matches = True
-                if not boundary_matches:
-                    raise RuntimeError(
-                        "Cached boundary tensor labels do not match the selected candidate. "
-                        f"cached={payload_boundary_labels}, selected={chosen.boundary_tensor_labels}."
-                    )
+                raise RuntimeError(
+                    "Cached boundary tensor labels do not match the selected candidate. "
+                    f"cached={payload_boundary_labels}, selected={chosen.boundary_tensor_labels}, "
+                    f"cached_candidate_id={cached_candidate_id}, selected_candidate_id={chosen.candidate_id}, "
+                    f"cached_split_index={cached_split_index}, selected_split_index={chosen.legacy_layer_index}."
+                )
             if (
                 payload_boundary_labels is None
                 and cached_candidate_id
                 and cached_candidate_id != chosen.candidate_id
+                and (
+                    cached_split_index is None
+                    or chosen.legacy_layer_index is None
+                    or cached_split_index != chosen.legacy_layer_index
+                )
             ):
                 raise RuntimeError(
                     f"Cached candidate_id={cached_candidate_id} does not match selected {chosen.candidate_id}."

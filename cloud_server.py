@@ -748,11 +748,10 @@ class CloudContinualLearner:
                     )
 
                 split_model = get_split_runtime_model(tmp_model)
-                trace_image_size = self._infer_bundle_trace_image_size(manifest)
-                sample_input = build_split_runtime_sample_input(
+                sample_input = self._build_bundle_trace_sample_input(
                     tmp_model,
-                    image_size=trace_image_size,
-                    device=self.device,
+                    bundle_cache_path,
+                    manifest,
                 )
                 universal_split_retrain(
                     model=split_model,

@@ -933,6 +933,98 @@ def test_fixed_split_bundle_trace_prefers_raw_frame_input(tmp_path, monkeypatch)
     assert "fallback_image_size" not in calls
 
 
+def test_fixed_split_cloud_retrain_passes_bundle_trace_sample_input(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        edge_model_name="fasterrcnn_mobilenet_v3_large_fpn",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False, bn_only=False, probe_samples=2),
+    )
+    learner = CloudContinualLearner(
+        cfg,
+        large_object_detection=SimpleNamespace(large_inference=lambda frame: ([], [], [])),
+    )
+    learner.device = torch.device("cpu")
+
+    manifest = {
+        "protocol_version": "edge-cl-bundle.v1",
+        "model": {
+            "model_id": "fasterrcnn_mobilenet_v3_large_fpn",
+        },
+        "samples": [
+            {
+                "sample_id": "sample-1",
+            }
+        ],
+        "split_plan": {},
+    }
+    captured = {}
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda path: manifest)
+    monkeypatch.setattr(
+        CloudContinualLearner,
+        "_load_edge_training_model",
+        lambda self, model_name=None: torch.nn.Linear(1, 1),
+    )
+    monkeypatch.setattr(
+        CloudContinualLearner,
+        "_bundle_feature_provider",
+        lambda self, model, manifest, *, bundle_root: object(),
+    )
+    monkeypatch.setattr(
+        "cloud_server.prepare_split_training_cache",
+        lambda bundle_cache_path, working_cache, feature_provider: {"all_sample_ids": ["sample-1"]},
+    )
+    monkeypatch.setattr(
+        "cloud_server._select_fixed_split_gt_sample_ids",
+        lambda manifest, prepared_sample_ids: [],
+    )
+    monkeypatch.setattr(
+        "cloud_server._evaluate_detection_proxy_map",
+        lambda *args, **kwargs: {
+            "map": None,
+            "evaluated_samples": 0,
+            "skipped_empty_gt": 0,
+            "skipped_missing_frame": 0,
+            "total_gt_samples": 0,
+            "nonempty_predictions": 0,
+            "total_prediction_boxes": 0,
+        },
+    )
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda model: "loss")
+    monkeypatch.setattr(
+        CloudContinualLearner,
+        "_build_bundle_trace_sample_input",
+        lambda self, model, bundle_root, manifest: "bundle-trace-input",
+    )
+
+    def fake_universal_split_retrain(**kwargs):
+        captured["sample_input"] = kwargs["sample_input"]
+        captured["cache_path"] = kwargs["cache_path"]
+        captured["all_indices"] = list(kwargs["all_indices"])
+        return [0.0]
+
+    monkeypatch.setattr("cloud_server.universal_split_retrain", fake_universal_split_retrain)
+    monkeypatch.setattr(
+        CloudContinualLearner,
+        "_serialise_model_bytes",
+        lambda self, model, *, model_name=None: b"updated",
+    )
+
+    success, encoded, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path),
+        num_epoch=1,
+    )
+
+    assert success is True
+    assert base64.b64decode(encoded) == b"updated"
+    assert message == "Fixed split retraining successful; proxy_mAP@0.5 skipped"
+    assert captured["sample_input"] == "bundle-trace-input"
+    assert captured["cache_path"] == str(tmp_path / "working_cache")
+    assert captured["all_indices"] == ["sample-1"]
+
+
 def test_fixed_split_model_name_prefers_bundle_manifest():
     cfg = SimpleNamespace(
         edge_model_name="fasterrcnn_mobilenet_v3_large_fpn",
@@ -1219,7 +1311,6 @@ def test_universal_split_retrain_falls_back_from_boundary_and_candidate_id_to_sp
             "intermediate": object(),
             "candidate_id": "candidate-stale",
             "split_index": 184,
-            "boundary_tensor_labels": ["old-boundary"],
             "pseudo_boxes": [],
             "pseudo_labels": [],
             "pseudo_scores": [],
@@ -1246,6 +1337,77 @@ def test_universal_split_retrain_falls_back_from_boundary_and_candidate_id_to_sp
         {"boundary_tensor_labels": None, "candidate_id": "candidate-stale", "layer_index": None},
         {"boundary_tensor_labels": None, "candidate_id": None, "layer_index": 184},
     ]
+
+
+def test_universal_split_retrain_rejects_boundary_mismatch_even_if_split_index_matches(monkeypatch):
+    class DummySplitter:
+        def __init__(self, device=None):
+            self.device = torch.device("cpu")
+
+        def trace(self, model, sample_input):
+            return self
+
+        def split(self, *, boundary_tensor_labels=None, candidate_id=None, layer_index=None):
+            if boundary_tensor_labels is not None or candidate_id is not None:
+                raise KeyError("fallback")
+            return SimpleNamespace(
+                boundary_tensor_labels=["resolved"],
+                candidate_id="resolved",
+                legacy_layer_index=184,
+                cloud_nodes=[],
+                edge_nodes=[],
+            )
+
+        def freeze_head(self, chosen):
+            return None
+
+        def unfreeze_tail(self, chosen):
+            return None
+
+        def get_tail_trainable_params(self, chosen):
+            return []
+
+        def cloud_train_step(self, payload, targets=None, loss_fn=None, optimizer=None, candidate=None):
+            raise AssertionError("boundary mismatch should fail before cloud_train_step")
+
+    monkeypatch.setattr(
+        "model_management.universal_model_split.UniversalModelSplitter",
+        DummySplitter,
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split._infer_cached_split_choice",
+        lambda cache_path, all_indices: ("candidate-stale", 184, ["old-boundary"]),
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split.load_split_feature_cache",
+        lambda cache_path, frame_index: {
+            "intermediate": SimpleNamespace(boundary_tensor_labels=["old-boundary"]),
+            "candidate_id": "candidate-stale",
+            "split_index": 184,
+            "boundary_tensor_labels": ["old-boundary"],
+            "pseudo_boxes": [],
+            "pseudo_labels": [],
+            "pseudo_scores": [],
+        },
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split._move_nested",
+        lambda value, device: value,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Cached boundary tensor labels do not match the selected candidate",
+    ):
+        universal_split_retrain(
+            model=nn.Linear(1, 1),
+            sample_input=torch.zeros(1, 1),
+            cache_path="unused",
+            all_indices=[0],
+            gt_annotations={},
+            num_epoch=1,
+            loss_fn=lambda outputs, targets: torch.zeros((), requires_grad=True),
+        )
 
 
 def test_universal_split_retrain_uses_configured_learning_rate(monkeypatch):
