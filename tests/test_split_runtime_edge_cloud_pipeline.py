@@ -810,6 +810,53 @@ def test_cloud_loader_skips_fused_cached_yolo_state_dict(tmp_path, monkeypatch):
     assert calls == [("yolov8n", True, "cpu")]
 
 
+def test_cloud_loader_recovers_from_incompatible_cached_non_wrapper_weights(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        edge_model_name="ssdlite320_mobilenet_v3_large",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False, bn_only=False, probe_samples=2),
+    )
+    learner = CloudContinualLearner(
+        cfg,
+        large_object_detection=SimpleNamespace(large_inference=lambda frame: ([], [], [])),
+    )
+    learner.device = torch.device("cpu")
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(exist_ok=True)
+
+    torch.save(
+        {"unexpected.weight": torch.zeros(1, 1)},
+        Path(learner.weight_folder) / "tmp_edge_model.pth",
+    )
+
+    calls = []
+
+    class DummyModel(nn.Module):
+        def __init__(self, *, fail_on_load=False):
+            super().__init__()
+            self.proj = nn.Linear(2, 2)
+            self.fail_on_load = fail_on_load
+
+        def load_state_dict(self, state_dict, strict=True):
+            if self.fail_on_load:
+                raise RuntimeError("incompatible checkpoint")
+            return super().load_state_dict(self.state_dict(), strict=False)
+
+    def fake_build_detection_model(name, pretrained, device, **kwargs):
+        calls.append((name, pretrained, str(device)))
+        return DummyModel(fail_on_load=not pretrained).eval()
+
+    monkeypatch.setattr("model_management.model_zoo.build_detection_model", fake_build_detection_model)
+
+    model = learner._load_edge_training_model()
+
+    assert isinstance(model, DummyModel)
+    assert calls == [
+        ("ssdlite320_mobilenet_v3_large", False, "cpu"),
+        ("ssdlite320_mobilenet_v3_large", True, "cpu"),
+    ]
+
+
 def test_cloud_teacher_inference_uses_configured_annotation_threshold():
     calls = []
 
@@ -833,6 +880,79 @@ def test_cloud_teacher_inference_uses_configured_annotation_threshold():
     assert boxes == [[1, 2, 3, 4]]
     assert labels == [1]
     assert scores == [0.9]
+
+
+def test_fixed_split_bundle_trace_prefers_raw_frame_input(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        edge_model_name="fasterrcnn_mobilenet_v3_large_fpn",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False, bn_only=False, probe_samples=2),
+    )
+    learner = CloudContinualLearner(
+        cfg,
+        large_object_detection=SimpleNamespace(large_inference=lambda frame: ([], [], [])),
+    )
+    learner.device = torch.device("cpu")
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    raw_path = raw_dir / "sample-1.jpg"
+    cv2.imwrite(str(raw_path), np.zeros((12, 16, 3), dtype=np.uint8))
+
+    calls = {}
+
+    def fake_prepare(model, frame, *, device):
+        calls["prepare_shape"] = tuple(frame.shape)
+        calls["prepare_device"] = str(device)
+        return "prepared-from-raw"
+
+    def fake_build(model, *, image_size, device):
+        calls["fallback_image_size"] = tuple(image_size)
+        calls["fallback_device"] = str(device)
+        return "synthetic-fallback"
+
+    monkeypatch.setattr("cloud_server.prepare_split_runtime_input", fake_prepare)
+    monkeypatch.setattr("cloud_server.build_split_runtime_sample_input", fake_build)
+
+    sample_input = learner._build_bundle_trace_sample_input(
+        torch.nn.Linear(1, 1),
+        str(tmp_path),
+        {
+            "samples": [
+                {
+                    "sample_id": "sample-1",
+                    "raw_relpath": "raw/sample-1.jpg",
+                    "input_image_size": [12, 16],
+                }
+            ]
+        },
+    )
+
+    assert sample_input == "prepared-from-raw"
+    assert calls["prepare_shape"] == (12, 16, 3)
+    assert "fallback_image_size" not in calls
+
+
+def test_fixed_split_model_name_prefers_bundle_manifest():
+    cfg = SimpleNamespace(
+        edge_model_name="fasterrcnn_mobilenet_v3_large_fpn",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False, bn_only=False, probe_samples=2),
+    )
+    learner = CloudContinualLearner(
+        cfg,
+        large_object_detection=SimpleNamespace(large_inference=lambda frame: ([], [], [])),
+    )
+
+    resolved = learner._resolve_fixed_split_model_name(
+        {
+            "model": {
+                "model_id": "ssdlite320_mobilenet_v3_large",
+            }
+        }
+    )
+
+    assert resolved == "ssdlite320_mobilenet_v3_large"
 
 
 def test_fixed_split_gt_selection_includes_raw_only_low_confidence_samples():

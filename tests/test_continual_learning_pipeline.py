@@ -4,6 +4,7 @@ import zipfile
 from collections import OrderedDict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
@@ -221,6 +222,91 @@ def test_fixed_split_validates_only_lowest_payload_group_until_success():
         "candidate-low-invalid",
         "candidate-low-valid",
     ]
+
+
+def test_fixed_split_failure_reports_untrainable_replay_candidates():
+    constraints = SplitConstraints()
+
+    def _candidate(candidate_id: str, *, edge_nodes: list[str], payload_bytes: int, layer_index: int) -> SplitCandidate:
+        return SplitCandidate(
+            candidate_id=candidate_id,
+            edge_nodes=edge_nodes,
+            cloud_nodes=[label for label in ["n1", "n2", "n3"] if label not in edge_nodes],
+            boundary_edges=[],
+            boundary_tensor_labels=[edge_nodes[-1]],
+            edge_input_labels=[],
+            cloud_input_labels=[],
+            cloud_output_labels=["n3"],
+            estimated_edge_flops=1.0,
+            estimated_cloud_flops=1.0,
+            estimated_payload_bytes=payload_bytes,
+            estimated_privacy_risk=1.0,
+            estimated_latency=float(layer_index),
+            is_trainable_tail=True,
+            legacy_layer_index=layer_index,
+            boundary_count=1,
+        )
+
+    candidates = [
+        _candidate("candidate-a", edge_nodes=["n1"], payload_bytes=10, layer_index=1),
+        _candidate("candidate-b", edge_nodes=["n1", "n2"], payload_bytes=10, layer_index=2),
+    ]
+
+    class DummyRuntime:
+        def __init__(self):
+            self.graph = SimpleNamespace(
+                relevant_labels=["n1", "n2", "n3"],
+                nodes={
+                    "n1": SimpleNamespace(
+                        has_trainable_params=True,
+                        tensor_shape=(1, 4, 4),
+                        containing_module="m.n1",
+                    ),
+                    "n2": SimpleNamespace(
+                        has_trainable_params=True,
+                        tensor_shape=(1, 4, 4),
+                        containing_module="m.n2",
+                    ),
+                    "n3": SimpleNamespace(
+                        has_trainable_params=True,
+                        tensor_shape=(1, 4, 4),
+                        containing_module="m.n3",
+                    ),
+                },
+            )
+            self.model = object()
+            self.candidates = candidates
+            self._candidate_enumeration_config = (
+                constraints.max_candidates,
+                constraints.max_boundary_count,
+                constraints.max_payload_bytes,
+            )
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+        def validate_candidate(self, candidate):
+            return {
+                "success": True,
+                "edge_latency": 0.1,
+                "cloud_latency": 0.1,
+                "end_to_end_latency": 0.2,
+                "tail_trainability": False,
+                "stability_score": 1.0,
+                "error": None,
+            }
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"eligible_candidates=2, replay_success_but_untrainable=2",
+    ):
+        compute_fixed_split_for_model(
+            torch.nn.Linear(1, 1),
+            constraints,
+            sample_input=[torch.rand(1)],
+            splitter=DummyRuntime(),
+            model_name="dummy-model",
+        )
 
 
 def test_apply_split_plan_falls_back_from_boundary_labels_to_candidate_and_split_index():

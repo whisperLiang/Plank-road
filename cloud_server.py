@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import re
 import random
 import shutil
 import threading
@@ -350,48 +351,77 @@ class CloudContinualLearner:
         self.das_bn_only = bool(getattr(das_cfg, "bn_only", False)) if das_cfg else False
         self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
 
-    def _load_edge_training_model(self) -> torch.nn.Module:
+    def _edge_weights_path(self, model_name: str) -> str:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(model_name).strip())
+        return os.path.join(self.weight_folder, f"tmp_edge_model_{safe_name}.pth")
+
+    def _legacy_edge_weights_path(self) -> str:
+        return os.path.join(self.weight_folder, "tmp_edge_model.pth")
+
+    def _resolve_fixed_split_model_name(self, manifest: Mapping[str, object]) -> str:
+        bundle_model_id = str(manifest.get("model", {}).get("model_id", "")).strip()
+        if bundle_model_id and bundle_model_id != self.edge_model_name:
+            logger.warning(
+                "[FixedSplitCL] Using bundle model {} instead of configured server.edge_model_name {} for this retrain round.",
+                bundle_model_id,
+                self.edge_model_name,
+            )
+            return bundle_model_id
+        return bundle_model_id or self.edge_model_name
+
+    def _load_edge_training_model(self, *, model_name: str | None = None) -> torch.nn.Module:
         from model_management.model_zoo import build_detection_model, is_wrapper_model
 
-        model_name = self.edge_model_name
-        edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
-        if os.path.exists(edge_weights):
-            state = torch.load(edge_weights, map_location=self.device, weights_only=False)
+        model_name = str(model_name or self.edge_model_name)
+        edge_weights = self._edge_weights_path(model_name)
+        legacy_weights = self._legacy_edge_weights_path()
+        candidate_weights = edge_weights if os.path.exists(edge_weights) else legacy_weights
+        prefer_pretrained = model_name in model_lib
+        if os.path.exists(candidate_weights):
+            state = torch.load(candidate_weights, map_location=self.device, weights_only=False)
             if is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
                 logger.warning(
                     "[CL] Cached wrapper weights at {} look like a fused Ultralytics state_dict; "
                     "rebuilding {} from native pretrained weights for this retrain round.",
-                    edge_weights,
+                    candidate_weights,
                     model_name,
                 )
-                tmp_model = build_detection_model(model_name, pretrained=True, device=self.device)
+                tmp_model = build_detection_model(
+                    model_name,
+                    pretrained=prefer_pretrained,
+                    device=self.device,
+                )
                 torch.save(tmp_model.state_dict(), edge_weights)
             else:
                 tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
                 try:
                     tmp_model.load_state_dict(state)
                 except RuntimeError:
-                    if not is_wrapper_model(model_name):
-                        raise
                     logger.warning(
-                        "[CL] Failed to load cached wrapper weights from {}; "
-                        "falling back to native pretrained {} weights.",
-                        edge_weights,
+                        "[CL] Failed to load cached weights from {}; "
+                        "falling back to native {} weights for {}.",
+                        candidate_weights,
+                        "pretrained" if prefer_pretrained else "randomly initialised",
                         model_name,
                     )
-                    tmp_model = build_detection_model(model_name, pretrained=True, device=self.device)
+                    tmp_model = build_detection_model(
+                        model_name,
+                        pretrained=prefer_pretrained,
+                        device=self.device,
+                    )
                     torch.save(tmp_model.state_dict(), edge_weights)
         else:
-            if model_name in model_lib:
-                tmp_model = build_detection_model(model_name, pretrained=True, device=self.device)
-            else:
-                tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
+            tmp_model = build_detection_model(
+                model_name,
+                pretrained=prefer_pretrained,
+                device=self.device,
+            )
         tmp_model.to(self.device)
         get_split_runtime_model(tmp_model).eval()
         return tmp_model
 
-    def _serialise_model_bytes(self, model: torch.nn.Module) -> bytes:
-        edge_weights = os.path.join(self.weight_folder, "tmp_edge_model.pth")
+    def _serialise_model_bytes(self, model: torch.nn.Module, *, model_name: str | None = None) -> bytes:
+        edge_weights = self._edge_weights_path(model_name or self.edge_model_name)
         torch.save(model.state_dict(), edge_weights)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -421,19 +451,45 @@ class CloudContinualLearner:
                 return int(image_size[0]), int(image_size[1])
         return 224, 224
 
+    def _build_bundle_trace_sample_input(
+        self,
+        model: torch.nn.Module,
+        bundle_root: str,
+        manifest: dict[str, object],
+    ):
+        for sample in manifest.get("samples", []):
+            raw_relpath = sample.get("raw_relpath")
+            if raw_relpath is None:
+                continue
+            raw_path = os.path.join(bundle_root, str(raw_relpath).replace("/", os.sep))
+            if not os.path.exists(raw_path):
+                continue
+            frame = cv2.imread(raw_path)
+            if frame is None:
+                continue
+            return prepare_split_runtime_input(model, frame, device=self.device)
+
+        trace_image_size = self._infer_bundle_trace_image_size(manifest)
+        return build_split_runtime_sample_input(
+            model,
+            image_size=trace_image_size,
+            device=self.device,
+        )
+
     def _bundle_feature_provider(
         self,
         model: torch.nn.Module,
         manifest: dict[str, object],
+        *,
+        bundle_root: str,
     ):
         split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
         splitter = UniversalModelSplitter(device=self.device)
         split_model = get_split_runtime_model(model)
-        trace_image_size = self._infer_bundle_trace_image_size(manifest)
-        sample_input = build_split_runtime_sample_input(
+        sample_input = self._build_bundle_trace_sample_input(
             model,
-            image_size=trace_image_size,
-            device=self.device,
+            bundle_root,
+            manifest,
         )
         splitter.trace(split_model, sample_input)
         apply_split_plan(splitter, split_plan)
@@ -585,15 +641,9 @@ class CloudContinualLearner:
                     raise RuntimeError(
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
                     )
-                bundle_model_id = str(manifest.get("model", {}).get("model_id", "")).strip()
-                if bundle_model_id and bundle_model_id != self.edge_model_name:
-                    raise RuntimeError(
-                        "Continual learning bundle model mismatch: "
-                        f"bundle.model_id={bundle_model_id}, "
-                        f"server.edge_model_name={self.edge_model_name}"
-                    )
+                current_model_name = self._resolve_fixed_split_model_name(manifest)
 
-                tmp_model = self._load_edge_training_model()
+                tmp_model = self._load_edge_training_model(model_name=current_model_name)
                 working_cache = os.path.join(bundle_cache_path, "working_cache")
                 if os.path.isdir(working_cache):
                     shutil.rmtree(working_cache, ignore_errors=True)
@@ -604,7 +654,11 @@ class CloudContinualLearner:
                     return prepare_split_training_cache(
                         bundle_cache_path,
                         working_cache,
-                        feature_provider=self._bundle_feature_provider(model, manifest),
+                        feature_provider=self._bundle_feature_provider(
+                            model,
+                            manifest,
+                            bundle_root=bundle_cache_path,
+                        ),
                     )
 
                 bundle_info = _prepare_working_cache(tmp_model)
@@ -642,7 +696,7 @@ class CloudContinualLearner:
                 )
 
                 from model_management.model_zoo import build_detection_model, is_wrapper_model
-                is_wrapper_fixed_split = bool(is_wrapper_model(self.edge_model_name))
+                is_wrapper_fixed_split = bool(is_wrapper_model(current_model_name))
 
                 if (
                     gt_annotations
@@ -652,11 +706,11 @@ class CloudContinualLearner:
                     logger.warning(
                         "[FixedSplitCL] Cached {} weights produced no detections on {} GT samples; "
                         "resetting to native pretrained weights for this retrain round.",
-                        self.edge_model_name,
+                        current_model_name,
                         len(gt_annotations),
                     )
                     tmp_model = build_detection_model(
-                        self.edge_model_name,
+                        current_model_name,
                         pretrained=True,
                         device=self.device,
                     )
@@ -737,7 +791,7 @@ class CloudContinualLearner:
                     )
 
                 encoded = base64.b64encode(
-                    self._serialise_model_bytes(tmp_model)
+                    self._serialise_model_bytes(tmp_model, model_name=current_model_name)
                 ).decode("utf-8")
                 success_message = (
                     f"Fixed split retraining successful; {proxy_summary}"
@@ -981,7 +1035,12 @@ class CloudServer:
 
 
     def start_server(self):
-        logger.info("cloud server is starting")
+        logger.info(
+            "cloud server is starting (pid={}, golden={}, edge_model_name={})",
+            os.getpid(),
+            getattr(self.config, "golden", "unknown"),
+            getattr(self.config, "edge_model_name", "unknown"),
+        )
         server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=4),
             options=grpc_message_options(),
@@ -997,7 +1056,11 @@ class CloudServer:
         )
         server.add_insecure_port('[::]:50051')
         server.start()
-        logger.info("cloud server is listening")
+        logger.info(
+            "cloud server is listening on 50051 (pid={}, edge_model_name={})",
+            os.getpid(),
+            getattr(self.config, "edge_model_name", "unknown"),
+        )
         server.wait_for_termination()
 
 

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from edge.task import Task
 from edge.info import FRAME_TYPE, TASK_STATE
@@ -101,6 +102,67 @@ class TestEdgeWorkerRouting:
         queued = worker.local_queue.get_nowait()
         assert queued is task
         assert task.edge_process is True
+
+    def test_init_fixed_split_runtime_prefers_real_frame_input(self, monkeypatch, sample_bgr_frame, tmp_path):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.config = SimpleNamespace(
+            split_learning=SimpleNamespace(fixed_split=SimpleNamespace()),
+            retrain=SimpleNamespace(cache_path=str(tmp_path)),
+        )
+        worker.split_learning_enabled = True
+        worker.split_learning_disable_reason = None
+        worker.universal_split_enabled = False
+        worker.universal_splitter = None
+        worker.fixed_split_plan = None
+        worker._fixed_split_init_attempted = False
+        worker.split_trace_image_size = None
+        worker.model_id = "dummy-model"
+
+        trace_calls = {}
+        sample_input = object()
+        split_model = torch.nn.Linear(1, 1)
+
+        class DummyDetection:
+            model = object()
+
+            def get_split_runtime_model(self):
+                return split_model
+
+            def prepare_splitter_input(self, frame):
+                trace_calls["frame"] = frame
+                return sample_input
+
+            def build_split_sample_input(self, image_size):
+                trace_calls["synthetic_image_size"] = image_size
+                return "synthetic-sample"
+
+        class DummySplitter:
+            def __init__(self, device):
+                self.device = device
+                self.trainability_loss_fn = None
+
+            def trace(self, model, runtime_input):
+                trace_calls["trace_model"] = model
+                trace_calls["trace_input"] = runtime_input
+
+        worker.small_object_detection = DummyDetection()
+
+        monkeypatch.setattr("edge.edge_worker.UniversalModelSplitter", DummySplitter)
+        monkeypatch.setattr("edge.edge_worker.build_split_training_loss", lambda model: "loss-fn")
+        monkeypatch.setattr(
+            "edge.edge_worker.load_or_compute_fixed_split_plan",
+            lambda *args, **kwargs: SimpleNamespace(
+                split_config_id="plan-1",
+                split_index=7,
+                payload_bytes=1024,
+            ),
+        )
+
+        worker._init_fixed_split_runtime(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
+
+        assert trace_calls["frame"] is sample_bgr_frame
+        assert trace_calls["trace_input"] is sample_input
+        assert "synthetic_image_size" not in trace_calls
 
 
 # =====================================================================

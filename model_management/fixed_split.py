@@ -310,6 +310,9 @@ def compute_fixed_split_for_model(
         chosen_profile: CandidateProfile | None = None
         chosen_privacy_metric = 0.0
         chosen_freezing_ratio = 0.0
+        replay_validation_failures = 0
+        replay_success_but_untrainable = 0
+        validation_error_counts: dict[str, int] = defaultdict(int)
         for payload_bytes in sorted(grouped):
             validated_group: list[tuple[CandidateProfile, SplitCandidate, float, float]] = []
             group = sorted(
@@ -325,8 +328,12 @@ def compute_fixed_split_for_model(
             for candidate, privacy_metric, freezing_ratio in group:
                 report = runtime.validate_candidate(candidate)
                 if not bool(report.get("success", False)):
+                    replay_validation_failures += 1
+                    error_text = str(report.get("error") or "unknown")
+                    validation_error_counts[error_text] += 1
                     continue
                 if not bool(report.get("tail_trainability", candidate.is_trainable_tail)):
+                    replay_success_but_untrainable += 1
                     continue
                 validated_group.append(
                     (
@@ -350,10 +357,31 @@ def compute_fixed_split_for_model(
                 break
 
         if chosen is None or chosen_profile is None:
+            diagnostics = [
+                f"privacy_metric_lower_bound={constraints.privacy_metric_lower_bound}",
+                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}",
+                f"eligible_candidates={len(eligible)}",
+            ]
+            if replay_success_but_untrainable:
+                diagnostics.append(
+                    f"replay_success_but_untrainable={replay_success_but_untrainable}"
+                )
+            if replay_validation_failures:
+                diagnostics.append(
+                    f"replay_validation_failures={replay_validation_failures}"
+                )
+                if validation_error_counts:
+                    top_errors = sorted(
+                        validation_error_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )[:3]
+                    diagnostics.append(
+                        "validation_errors="
+                        + "; ".join(f"{error} x{count}" for error, count in top_errors)
+                    )
             raise RuntimeError(
                 "No replayable split candidate satisfies the fixed split constraints. "
-                f"privacy_metric_lower_bound={constraints.privacy_metric_lower_bound}, "
-                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
+                + ", ".join(diagnostics)
             )
         profile = chosen_profile
         privacy_metric = chosen_privacy_metric

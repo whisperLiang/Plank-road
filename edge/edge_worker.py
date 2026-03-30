@@ -121,7 +121,11 @@ class EdgeWorker:
         self.local_processor.start()
         self.retrain_processor.start()
 
-    def _init_fixed_split_runtime(self, image_size: tuple[int, int] | None = None) -> None:
+    def _init_fixed_split_runtime(
+        self,
+        frame=None,
+        image_size: tuple[int, int] | None = None,
+    ) -> None:
         sl_cfg = getattr(self.config, "split_learning", None)
         fixed_split_cfg = getattr(sl_cfg, "fixed_split", None) if sl_cfg else None
         self._fixed_split_init_attempted = True
@@ -138,8 +142,12 @@ class EdgeWorker:
             self.universal_splitter.trainability_loss_fn = build_split_training_loss(
                 self.small_object_detection.model
             )
-            trace_image_size = image_size or (224, 224)
-            sample_input = self.small_object_detection.build_split_sample_input(trace_image_size)
+            if frame is not None:
+                trace_image_size = tuple(int(value) for value in frame.shape[:2])
+                sample_input = self.small_object_detection.prepare_splitter_input(frame)
+            else:
+                trace_image_size = image_size or (224, 224)
+                sample_input = self.small_object_detection.build_split_sample_input(trace_image_size)
             self.universal_splitter.trace(
                 split_model,
                 sample_input,
@@ -314,7 +322,7 @@ class EdgeWorker:
             current_frame = task.frame_edge
             frame_image_size = tuple(int(value) for value in current_frame.shape[:2])
             if self.split_learning_enabled and not self._fixed_split_init_attempted:
-                self._init_fixed_split_runtime(frame_image_size)
+                self._init_fixed_split_runtime(current_frame, frame_image_size)
                 if self.collect_flag and not self.split_learning_enabled:
                     self.collect_flag = False
                     logger.warning(
