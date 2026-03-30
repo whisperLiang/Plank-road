@@ -92,10 +92,11 @@ def _select_fixed_split_gt_sample_ids(
 ) -> list[str]:
     """Choose bundle samples that should receive cloud-side GT annotations.
 
-    Drift samples are always annotated. In ``raw-only`` low-confidence mode we
-    additionally annotate low-confidence samples that uploaded only raw frames
-    (no feature payload), because their pseudo-labels are often empty or
-    unreliable and otherwise dominate split-tail retraining as negatives.
+    Drift samples are always annotated. Low-confidence samples that uploaded a
+    raw frame are also annotated regardless of whether the bundle used
+    ``raw-only`` or ``raw+feature`` mode, because their pseudo-labels are the
+    least reliable and can otherwise dominate split-tail retraining as
+    negatives.
     """
     prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
     drift_payload = manifest.get("drift_sample_ids", [])
@@ -104,13 +105,6 @@ def _select_fixed_split_gt_sample_ids(
         for sample_id in drift_payload
         if str(sample_id) in prepared_lookup
     }
-    training_mode_payload = manifest.get("training_mode", {})
-    if isinstance(training_mode_payload, Mapping):
-        training_mode = str(
-            training_mode_payload.get("low_confidence_mode", "")
-        ).strip().lower()
-    else:
-        training_mode = ""
 
     selected: list[str] = []
     for sample in manifest.get("samples", []):
@@ -122,13 +116,9 @@ def _select_fixed_split_gt_sample_ids(
         if sample_id in drift_lookup:
             selected.append(sample_id)
             continue
-        if training_mode != "raw-only":
-            continue
         if str(sample.get("confidence_bucket", "")).strip() != "low_confidence":
             continue
         if sample.get("raw_relpath") is None:
-            continue
-        if sample.get("feature_relpath") is not None:
             continue
         selected.append(sample_id)
     return selected

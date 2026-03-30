@@ -107,7 +107,7 @@ The server supports two low-confidence modes:
 - `raw-only`
 - `raw+feature`
 
-In `raw-only` mode, the server reconstructs missing low-confidence features from uploaded raw samples before split-tail retraining, and it annotates those raw-only low-confidence samples with the large model because their pseudo-labels are often empty or unreliable.
+In `raw-only` mode, the server reconstructs missing low-confidence features from uploaded raw samples before split-tail retraining. In both `raw-only` and `raw+feature` modes, the server annotates low-confidence raw samples with the large model because their pseudo-labels are often empty or unreliable.
 
 Core files:
 - [edge/transmit.py](./edge/transmit.py)
@@ -301,7 +301,7 @@ The cloud:
 1. receives the versioned bundle
 2. expands it into a working cache
 3. reconstructs low-confidence features if necessary
-4. annotates drift samples, plus raw-only low-confidence samples, with the large model
+4. annotates drift samples, plus low-confidence raw samples in both low-confidence modes, with the large model
    using `teacher_annotation_threshold`
 5. detects fully-collapsed wrapper checkpoints and falls back to native pretrained weights for that retrain round
 6. runs split-tail retraining

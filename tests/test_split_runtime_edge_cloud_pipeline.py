@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import io
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,10 +11,14 @@ import numpy as np
 import pytest
 import torch
 
-from cloud_server import CloudContinualLearner
+from cloud_server import CloudContinualLearner, _select_fixed_split_gt_sample_ids
+from edge.sample_store import EdgeSampleStore, LOW_CONFIDENCE
+from edge.transmit import pack_continual_learning_bundle
 from model_management.continual_learning_bundle import CONTINUAL_LEARNING_PROTOCOL_VERSION
+from model_management.fixed_split import SplitPlan
 from model_management.model_zoo import build_detection_model
 from model_management.object_detection import Object_Detection
+from model_management.payload import SplitPayload
 from model_management.split_model_adapters import (
     build_split_runtime_sample_input,
     build_split_training_loss,
@@ -73,6 +80,34 @@ def _training_targets(runtime_input, frame: np.ndarray) -> dict[str, object]:
     }
 
 
+def _dummy_split_plan(model_name: str = "rfdetr_nano") -> SplitPlan:
+    return SplitPlan(
+        split_config_id="plan-1",
+        model_name=model_name,
+        candidate_id="candidate-1",
+        split_index=3,
+        split_label="layer3",
+        boundary_tensor_labels=["layer3"],
+        payload_bytes=128,
+        privacy_metric=0.4,
+        privacy_risk=0.6,
+        layer_freezing_ratio=0.5,
+        constraints={},
+        trace_signature="sig",
+    )
+
+
+def _planned_payload(plan: SplitPlan) -> SplitPayload:
+    return SplitPayload(
+        tensors={"payload": torch.ones(1, 2, 2)},
+        candidate_id=plan.candidate_id,
+        boundary_tensor_labels=list(plan.boundary_tensor_labels),
+        primary_label="payload",
+        split_index=plan.split_index,
+        split_label=plan.split_label,
+    )
+
+
 def test_large_inference_accepts_threshold_override():
     detector = Object_Detection.__new__(Object_Detection)
     captured = {}
@@ -93,6 +128,28 @@ def test_large_inference_accepts_threshold_override():
     assert boxes == [[1, 2, 3, 4]]
     assert labels == [1]
     assert scores == [0.42]
+
+
+def test_select_fixed_split_gt_sample_ids_includes_raw_plus_feature_low_conf_samples():
+    manifest = {
+        "drift_sample_ids": [],
+        "training_mode": {"low_confidence_mode": "raw+feature"},
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "raw/sample-1.jpg",
+                "feature_relpath": "features/sample-1.pt",
+            }
+        ],
+    }
+
+    selected = _select_fixed_split_gt_sample_ids(
+        manifest,
+        prepared_sample_ids=["sample-1"],
+    )
+
+    assert selected == ["sample-1"]
 
 
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)
@@ -399,3 +456,131 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
     assert "Kept cached weights" in message
     assert "proxy_mAP@0.5 regressed 0.4000 -> 0.1000" in message
     assert serialised_states == [1.0]
+
+
+def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf_samples(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+        def forward(self, images):
+            score = float(self.weight.detach().cpu().item())
+            if score <= 0.0:
+                return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
+                    "scores": torch.tensor([score], dtype=torch.float32),
+                }
+            ]
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+
+    split_plan = _dummy_split_plan()
+    sample_store = EdgeSampleStore(str(tmp_path / "sample_store"))
+    raw_frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    sample_store.store_sample(
+        sample_id="sample-1",
+        frame_index=1,
+        confidence=0.1,
+        split_config_id=split_plan.split_config_id,
+        model_id="rfdetr_nano",
+        model_version="0",
+        confidence_bucket=LOW_CONFIDENCE,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_planned_payload(split_plan),
+        drift_flag=False,
+        raw_frame=raw_frame,
+        input_image_size=[8, 8],
+        input_tensor_shape=[1, 3, 8, 8],
+    )
+    payload_zip, _ = pack_continual_learning_bundle(
+        sample_store,
+        edge_id=1,
+        send_low_conf_features=True,
+        split_plan=split_plan,
+        model_id="rfdetr_nano",
+        model_version="0",
+    )
+
+    bundle_root = tmp_path / "bundle"
+    with zipfile.ZipFile(io.BytesIO(payload_zip)) as zf:
+        zf.extractall(bundle_root)
+
+    cloud_model = DummyModel(weight=0.1)
+    edge_model = DummyModel(weight=0.1)
+
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: cloud_model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_teacher_targets",
+        lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]},
+    )
+
+    def fake_universal_split_retrain(*, model, gt_annotations, **kwargs):
+        assert kwargs["all_indices"] == ["sample-1"]
+        assert gt_annotations == {"sample-1": {"boxes": [[1, 1, 6, 6]], "labels": [1]}}
+        with torch.no_grad():
+            model.weight.fill_(0.9)
+        return [0.1]
+
+    monkeypatch.setattr("cloud_server.universal_split_retrain", fake_universal_split_retrain)
+
+    def fake_evaluate_proxy_map(model, **kwargs):
+        score = float(model.weight.detach().cpu().item())
+        return {
+            "map": score,
+            "evaluated_samples": 1,
+            "skipped_empty_gt": 0,
+            "skipped_missing_frame": 0,
+            "total_gt_samples": 1,
+            "nonempty_predictions": 1,
+            "total_prediction_boxes": 1,
+        }
+
+    monkeypatch.setattr("cloud_server._evaluate_detection_proxy_map", fake_evaluate_proxy_map)
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(bundle_root),
+        num_epoch=2,
+    )
+
+    assert success is True
+    assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message
+
+    returned_state = torch.load(
+        io.BytesIO(base64.b64decode(model_data)),
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert float(returned_state["weight"][0]) == pytest.approx(0.9)
+
+    edge_before = float(edge_model.weight.detach().cpu().item())
+    edge_model.load_state_dict(returned_state)
+    edge_after = float(edge_model.weight.detach().cpu().item())
+
+    assert edge_before == pytest.approx(0.1)
+    assert edge_after == pytest.approx(0.9)
