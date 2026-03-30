@@ -319,7 +319,7 @@ class CloudContinualLearner:
         self.lock = threading.Lock()
 
         # Name of the lightweight model to retrain (mirrors edge model)
-        self.edge_model_name = getattr(config, "edge_model_name", "fasterrcnn_mobilenet_v3_large_fpn")
+        self.edge_model_name = getattr(config, "edge_model_name", "rfdetr_nano")
         self.weight_folder = os.path.join(
             os.path.dirname(__file__), "model_management", "models"
         )

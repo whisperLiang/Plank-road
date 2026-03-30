@@ -17,6 +17,7 @@ from torchvision.ops import boxes as box_ops
 from model_management.model_zoo import (
     COCO_80_TO_91,
     DETRDetectionModel,
+    RFDETRDetectionModel,
     RTDETRDetectionModel,
     YOLODetectionModel,
 )
@@ -25,12 +26,17 @@ from model_management.ultralytics_parity import (
     preprocess_bgr_images,
 )
 
+try:
+    from rfdetr.models.lwdetr import build_criterion_and_postprocessors
+except Exception:
+    build_criterion_and_postprocessors = None
+
 
 COCO_91_TO_80 = {label: idx for idx, label in enumerate(COCO_80_TO_91)}
 
 
-class TorchvisionSSDReplay(torch.nn.Module):
-    """Replay-friendly SSD wrapper that excludes dynamic detection post-process."""
+class TorchvisionAnchorDetectorReplay(torch.nn.Module):
+    """Replay-friendly anchor-detector wrapper that excludes dynamic post-process."""
 
     def __init__(self, detector: SSD) -> None:
         super().__init__()
@@ -48,12 +54,12 @@ class TorchvisionSSDReplay(torch.nn.Module):
             tensors: list[torch.Tensor] = []
             for image in images:
                 if not isinstance(image, torch.Tensor):
-                    raise TypeError(f"Unsupported SSD replay input type: {type(image)!r}")
+                    raise TypeError(f"Unsupported anchor-detector replay input type: {type(image)!r}")
                 tensors.extend(list(image) if image.ndim == 4 else [image])
             if not tensors:
-                raise RuntimeError("SSD replay received an empty image batch.")
+                raise RuntimeError("Anchor-detector replay received an empty image batch.")
             return tensors
-        raise TypeError(f"Unsupported SSD replay input type: {type(images)!r}")
+        raise TypeError(f"Unsupported anchor-detector replay input type: {type(images)!r}")
 
     def forward(self, images: Any) -> dict[str, torch.Tensor]:
         image_list = self._as_image_list(images)
@@ -74,6 +80,41 @@ class TorchvisionSSDReplay(torch.nn.Module):
         }
 
 
+class RFDETRReplay(torch.nn.Module):
+    """Replay-friendly RF-DETR wrapper that keeps only main decoder outputs."""
+
+    def __init__(self, detector: RFDETRDetectionModel) -> None:
+        super().__init__()
+        self.detector = detector
+        self.model = detector.rfdetr.model.model
+
+    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        outputs = self.model(images)
+        if isinstance(outputs, tuple):
+            return {
+                "pred_logits": outputs[1],
+                "pred_boxes": outputs[0],
+            }
+        return {
+            "pred_logits": outputs["pred_logits"],
+            "pred_boxes": outputs["pred_boxes"],
+        }
+
+
+def _is_anchor_detector(model: torch.nn.Module) -> bool:
+    return (
+        isinstance(model, SSD)
+        or (
+            hasattr(model, "transform")
+            and hasattr(model, "backbone")
+            and hasattr(model, "head")
+            and hasattr(model, "anchor_generator")
+            and hasattr(model, "postprocess_detections")
+            and hasattr(model, "compute_loss")
+        )
+    )
+
+
 def get_split_runtime_model(model: torch.nn.Module) -> torch.nn.Module:
     if isinstance(model, YOLODetectionModel):
         return model.yolo.model
@@ -81,8 +122,10 @@ def get_split_runtime_model(model: torch.nn.Module) -> torch.nn.Module:
         return model.rtdetr.model
     if isinstance(model, DETRDetectionModel):
         return model.detr
-    if isinstance(model, SSD):
-        return TorchvisionSSDReplay(model)
+    if isinstance(model, RFDETRDetectionModel):
+        return RFDETRReplay(model)
+    if _is_anchor_detector(model):
+        return TorchvisionAnchorDetectorReplay(model)
     return model
 
 
@@ -117,6 +160,10 @@ def build_split_runtime_sample_input(
             return_tensors="pt",
         )["pixel_values"]
         return pixel_values.to(device)
+    if isinstance(model, RFDETRDetectionModel):
+        sample = torch.rand(3, height, width, device=device)
+        batch_tensor, _ = model._prepare_batch([sample])
+        return batch_tensor.to(device)
     return [torch.rand(3, height, width, device=device)]
 
 
@@ -134,6 +181,11 @@ def prepare_split_runtime_input(
             return_tensors="pt",
         )["pixel_values"]
         return pixel_values.to(device)
+    if isinstance(model, RFDETRDetectionModel):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(device)
+        batch_tensor, _ = model._prepare_batch([tensor])
+        return batch_tensor.to(device)
 
     if isinstance(model, YOLODetectionModel):
         _, tensor = preprocess_bgr_images(
@@ -186,8 +238,17 @@ def postprocess_split_runtime_output(
             threshold=threshold,
             image_size=orig_image.shape[:2],
         )
-    if isinstance(model, SSD):
-        return _postprocess_ssd_output(
+    if isinstance(model, RFDETRDetectionModel):
+        if orig_image is None:
+            raise RuntimeError("RF-DETR split postprocess requires the original image.")
+        return _postprocess_rfdetr_output(
+            model,
+            outputs,
+            threshold=threshold,
+            image_size=orig_image.shape[:2],
+        )
+    if _is_anchor_detector(model):
+        return _postprocess_anchor_detector_output(
             model,
             outputs,
             model_input=model_input,
@@ -265,9 +326,31 @@ def build_split_training_loss(model: torch.nn.Module):
 
         return _loss_fn
 
-    if isinstance(model, SSD):
+    if isinstance(model, RFDETRDetectionModel):
+        if build_criterion_and_postprocessors is None:
+            raise RuntimeError(
+                "rfdetr training extras are unavailable; cannot build RF-DETR split loss."
+            )
+        criterion, _ = build_criterion_and_postprocessors(model.rfdetr.model.args)
+        criterion.train()
+
         def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
-            cls_logits, bbox_regression = _extract_ssd_outputs(outputs)
+            predictions = _extract_rfdetr_outputs(outputs)
+            device = _first_tensor_device(predictions, fallback=next(model.parameters()).device)
+            criterion.to(device)
+            labels = _build_rfdetr_training_labels(
+                targets,
+                device=device,
+                num_classes=int(model.internal_num_classes),
+            )
+            loss_dict = criterion(predictions, labels)
+            return sum(loss_dict.values())
+
+        return _loss_fn
+
+    if _is_anchor_detector(model):
+        def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
+            cls_logits, bbox_regression = _extract_anchor_detector_outputs(outputs)
             device = cls_logits.device
             image_size = _infer_input_image_size(targets)
             dummy_image = torch.zeros(
@@ -276,7 +359,7 @@ def build_split_training_loss(model: torch.nn.Module):
                 device=device,
             )
             image_targets = [
-                _build_ssd_training_target(
+                _build_anchor_training_target(
                     targets,
                     device=device,
                     image_size=image_size,
@@ -288,7 +371,7 @@ def build_split_training_loss(model: torch.nn.Module):
                 features = OrderedDict([("0", features)])
             feature_list = list(features.values()) if isinstance(features, dict) else list(features)
             anchors = model.anchor_generator(transformed_images, feature_list)
-            matched_idxs = _match_ssd_anchors(model, anchors, transformed_targets)
+            matched_idxs = _match_anchor_targets(model, anchors, transformed_targets)
             loss_dict = model.compute_loss(
                 transformed_targets,
                 {
@@ -435,13 +518,31 @@ def _postprocess_detr_output(
     }]
 
 
-def _postprocess_ssd_output(
-    model: SSD,
+def _postprocess_rfdetr_output(
+    model: RFDETRDetectionModel,
+    outputs: Any,
+    *,
+    threshold: float,
+    image_size: tuple[int, int],
+) -> list[dict[str, torch.Tensor]]:
+    predictions = _extract_rfdetr_outputs(outputs)
+    target_sizes = torch.as_tensor([list(image_size)], dtype=torch.long, device=model._device)
+    post = model.rfdetr.model.postprocess(predictions, target_sizes=target_sizes)[0]
+    keep = post["scores"] > threshold
+    return [{
+        "boxes": post["boxes"][keep].detach().to(model._device).float(),
+        "labels": post["labels"][keep].detach().to(model._device).long() + 1,
+        "scores": post["scores"][keep].detach().to(model._device).float(),
+    }]
+
+
+def _postprocess_anchor_detector_output(
+    model: torch.nn.Module,
     outputs: Any,
     *,
     model_input: Any | None,
 ) -> list[dict[str, torch.Tensor]]:
-    cls_logits, bbox_regression = _extract_ssd_outputs(outputs)
+    cls_logits, bbox_regression = _extract_anchor_detector_outputs(outputs)
     device = cls_logits.device
 
     if isinstance(model_input, torch.Tensor):
@@ -451,7 +552,7 @@ def _postprocess_ssd_output(
     else:
         images = []
     if not images:
-        raise RuntimeError("SSD split postprocess requires the original image tensor input.")
+        raise RuntimeError("Anchor-detector split postprocess requires the original image tensor input.")
 
     images = [image.to(device) for image in images]
     original_image_sizes = [tuple(int(dim) for dim in image.shape[-2:]) for image in images]
@@ -480,7 +581,7 @@ def _extract_detr_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
     if hasattr(outputs, "logits") and hasattr(outputs, "pred_boxes"):
         return outputs.logits, outputs.pred_boxes
     if isinstance(outputs, dict):
-        logits = outputs.get("logits")
+        logits = outputs.get("logits", outputs.get("pred_logits"))
         pred_boxes = outputs.get("pred_boxes")
         if isinstance(logits, torch.Tensor) and isinstance(pred_boxes, torch.Tensor):
             return logits, pred_boxes
@@ -492,7 +593,28 @@ def _extract_detr_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
     return logits, pred_boxes
 
 
-def _extract_ssd_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+def _extract_rfdetr_outputs(outputs: Any) -> dict[str, Any]:
+    if isinstance(outputs, dict):
+        logits = outputs.get("pred_logits")
+        pred_boxes = outputs.get("pred_boxes")
+        if isinstance(logits, torch.Tensor) and isinstance(pred_boxes, torch.Tensor):
+            extracted = {
+                "pred_logits": logits,
+                "pred_boxes": pred_boxes,
+            }
+            if isinstance(outputs.get("aux_outputs"), list):
+                extracted["aux_outputs"] = outputs["aux_outputs"]
+            if isinstance(outputs.get("enc_outputs"), dict):
+                extracted["enc_outputs"] = outputs["enc_outputs"]
+            return extracted
+    logits, pred_boxes = _extract_detr_outputs(outputs)
+    return {
+        "pred_logits": logits,
+        "pred_boxes": pred_boxes,
+    }
+
+
+def _extract_anchor_detector_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
     if isinstance(outputs, dict):
         cls_logits = outputs.get("cls_logits")
         bbox_regression = outputs.get("bbox_regression")
@@ -503,7 +625,7 @@ def _extract_ssd_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         bbox_regression = outputs[1]
         if isinstance(cls_logits, torch.Tensor) and isinstance(bbox_regression, torch.Tensor):
             return cls_logits, bbox_regression
-    raise RuntimeError("Unable to extract SSD cls_logits/bbox_regression from split replay output.")
+    raise RuntimeError("Unable to extract anchor-detector cls_logits/bbox_regression from split replay output.")
 
 
 def _extract_rtdetr_loss_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any]:
@@ -651,7 +773,7 @@ def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple
     return original_image_size, model_input_size
 
 
-def _build_ssd_training_target(
+def _build_anchor_training_target(
     targets: dict[str, Any],
     *,
     device: torch.device,
@@ -672,8 +794,8 @@ def _build_ssd_training_target(
     }
 
 
-def _match_ssd_anchors(
-    model: SSD,
+def _match_anchor_targets(
+    model: torch.nn.Module,
     anchors: list[torch.Tensor],
     targets: list[dict[str, torch.Tensor]],
 ) -> list[torch.Tensor]:
@@ -842,5 +964,32 @@ def _build_detr_training_labels(
     normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=image_size)
     return [{
         "class_labels": labels.to(dtype=torch.int64),
+        "boxes": normalized_boxes.to(dtype=torch.float32),
+    }]
+
+
+def _build_rfdetr_training_labels(
+    targets: dict[str, Any],
+    *,
+    device: torch.device,
+    num_classes: int,
+) -> list[dict[str, torch.Tensor]]:
+    image_size = _infer_input_image_size(targets)
+    boxes = _clamp_xyxy_boxes(_as_boxes_tensor(targets.get("boxes"), device=device), image_size)
+    labels = _as_labels_tensor(targets.get("labels"), device=device)
+    if boxes.shape[0] != labels.shape[0]:
+        count = min(boxes.shape[0], labels.shape[0])
+        boxes = boxes[:count]
+        labels = labels[:count]
+
+    labels = labels - 1
+    valid = (labels >= 0) & (labels < int(num_classes))
+    if boxes.numel():
+        valid = valid & (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    boxes = boxes[valid]
+    labels = labels[valid]
+    normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=image_size)
+    return [{
+        "labels": labels.to(dtype=torch.int64),
         "boxes": normalized_boxes.to(dtype=torch.float32),
     }]

@@ -60,8 +60,11 @@ class TestModelInfo:
         assert "vehicle" in classes
         assert "persons" in classes
 
-    def test_fasterrcnn_family(self):
-        assert model_lib["fasterrcnn_resnet50_fpn"]["family"] == "fasterrcnn"
+    def test_rfdetr_family(self):
+        assert model_lib["rfdetr_nano"]["family"] == "rfdetr"
+
+    def test_tinynext_family(self):
+        assert model_lib["tinynext_s"]["family"] == "tinynext"
 
     def test_model_paths_are_local_relative_paths(self):
         for info in model_lib.values():
@@ -305,22 +308,24 @@ class TestModelZoo:
     def test_list_available_models(self):
         models = list_available_models()
         assert len(models) > 0
-        assert "fasterrcnn_resnet50_fpn" in models
+        assert "rfdetr_nano" in models
+        assert "tinynext_s" in models
 
     def test_get_model_family(self):
-        assert get_model_family("fasterrcnn_resnet50_fpn") == "fasterrcnn"
+        assert get_model_family("rfdetr_nano") == "rfdetr"
+        assert get_model_family("tinynext_s") == "tinynext"
         assert get_model_family("retinanet_resnet50_fpn") == "retinanet"
         assert get_model_family("unknown_model") == "unknown"
 
     def test_model_has_roi_heads(self):
-        assert model_has_roi_heads("fasterrcnn_resnet50_fpn") is True
+        assert model_has_roi_heads("rfdetr_nano") is False
+        assert model_has_roi_heads("tinynext_s") is False
         assert model_has_roi_heads("retinanet_resnet50_fpn") is False
 
     def test_is_wrapper_model_name(self):
-        # YOLO models are wrapper models
         assert is_wrapper_model("yolov8n") is True
-        # torchvision built-in are not wrappers
-        assert is_wrapper_model("fasterrcnn_resnet50_fpn") is False
+        assert is_wrapper_model("rfdetr_nano") is True
+        assert is_wrapper_model("tinynext_s") is False
 
     def test_models_dir_path(self):
         models_dir = get_models_dir()
@@ -329,6 +334,6 @@ class TestModelZoo:
 
     def test_model_artifact_paths_resolve_under_models_dir(self):
         models_dir = get_models_dir().resolve()
-        for model_name in ["fasterrcnn_resnet50_fpn", "yolov8n", "detr_resnet50", "rtdetr_l"]:
+        for model_name in ["rfdetr_nano", "tinynext_s", "yolov8n", "detr_resnet50", "rtdetr_l"]:
             artifact_path = get_model_artifact_path(model_name).resolve()
             assert models_dir == artifact_path.parent or models_dir in artifact_path.parents

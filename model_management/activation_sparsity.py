@@ -33,7 +33,7 @@ Two-phase training step
 Integration with the Plank-road pipeline
 -----------------------------------------
 ``DASTrainer`` wraps any ``nn.Module`` (typically the tail partition,
-e.g. ``rpn + roi_heads`` for Faster R-CNN) and transparently manages
+e.g. detector-tail modules such as ``head`` or ``roi_heads``) and transparently manages
 module replacement and pruning-ratio computation.  It is called from
 ``model_split.split_retrain()`` and ``universal_split_retrain()`` when
 the ``das_enabled`` flag is set in the configuration.
@@ -1007,7 +1007,7 @@ def apply_das_to_tail(
         The full model.
     tail_module_names : list[str]
         Dot-separated module names to DAS-ify, e.g.
-        ``["rpn", "roi_heads"]`` for Faster R-CNN.
+        Detector-tail module names such as ``["head"]`` or ``["roi_heads"]``.
     bn_only : bool
     device : device
 

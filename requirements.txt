@@ -16,4 +16,6 @@ torchlens==1.0.1
 psutil
 ultralytics
 transformers
+rfdetr
+timm
 pytest

@@ -21,12 +21,9 @@ client:
  # the max wait time
  wait_thresh: 100
  frame_cache_maxsize: 100
- lightweight: yolov8n
+ lightweight: rfdetr_nano
  # Supported model names (see model_management/model_zoo.py):
- #   Faster R-CNN: fasterrcnn_resnet50_fpn, fasterrcnn_mobilenet_v3_large_fpn,
- #                 fasterrcnn_mobilenet_v3_large_320_fpn
  #   RetinaNet:    retinanet_resnet50_fpn
- #   SSD/SSDLite:  ssd300_vgg16, ssdlite320_mobilenet_v3_large
  #   FCOS:         fcos_resnet50_fpn
  #   YOLOv5:       yolov5n, yolov5s, yolov5m, yolov5l, yolov5x
  #   YOLOv8:       yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
@@ -34,7 +31,9 @@ client:
  #   YOLO11:       yolo11n, yolo11s, yolo11m, yolo11l, yolo11x
  #   YOLO12:       yolo12n, yolo12s, yolo12m, yolo12l, yolo12x
  #   DETR:         detr_resnet50, detr_resnet101, conditional_detr_resnet50
+ #   RF-DETR:      rfdetr_nano, rfdetr_small, rfdetr_medium, rfdetr_large
  #   RT-DETR:      rtdetr_l, rtdetr_x
+ #   TinyNeXt:     tinynext_s, tinynext_m
  # server_ip
  server_ip: '192.168.66.205:50051'
  # edge nodes
@@ -106,7 +105,7 @@ client:
   # Universal model splitting (model-agnostic, torchlens-based).
   # When enabled, the edge uses torchlens to trace the model's
   # computational graph and can split at any arbitrary layer,
-  # not limited to the Faster R-CNN backbone boundary.
+  # not limited to a fixed backbone boundary.
    # ---- Explicit split point (highest priority, first match wins) ----
    # split_module — high-level module name, e.g. 'backbone' or 'features.12'
    # split_module: backbone
@@ -140,7 +139,7 @@ server:
  server_id: 0
  golden: yolov8x
  # lightweight model used to generate fine-tuned weights for the edge
- edge_model_name: yolov8n
+ edge_model_name: rfdetr_nano
  #the queue maxsize
  local_queue_maxsize: 10
  # the max wait time

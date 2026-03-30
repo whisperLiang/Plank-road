@@ -86,7 +86,7 @@ class Object_Detection:
             param.requires_grad = False
 
         if model_has_roi_heads(self.model_name):
-            # Faster R-CNN / legacy path: only fine-tune roi_heads
+            # ROI-head detectors: only fine-tune the roi_heads tail
             for param in self.model.roi_heads.parameters():
                 param.requires_grad = True
         elif is_wrapper_model(self.model_name):
@@ -97,7 +97,7 @@ class Object_Detection:
             for p in all_params[trainable_start:]:
                 p.requires_grad = True
         else:
-            # Other torchvision models (RetinaNet / SSD / FCOS): fine-tune head
+            # Other detector families: fine-tune the detection head
             head_attrs = ['head', 'classification_head', 'regression_head']
             found = False
             for attr in head_attrs:
