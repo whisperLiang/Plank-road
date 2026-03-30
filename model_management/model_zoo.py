@@ -668,6 +668,18 @@ _TINYNEXT_MODELS: Dict[str, str] = {
 }
 
 _MODELS_DIR = Path(__file__).resolve().parent / "models"
+_RFDETR_STRIPPABLE_KEYS = frozenset({
+    "optimizer",
+    "lr_scheduler",
+    "optimizer_states",
+    "lr_schedulers",
+    "state_dict",
+    "global_step",
+    "pytorch-lightning_version",
+    "loops",
+    "ema_model",
+    "legacy_ema_state_dict",
+})
 
 
 def _normalise_model_name(name: str) -> str:
@@ -796,6 +808,43 @@ def _ensure_tinynext_artifact(name: str) -> Path:
     return artifact_path
 
 
+def _normalize_rfdetr_artifact(artifact_path: Path) -> bool:
+    """Strip RF-DETR training state while keeping upstream-compatible weights."""
+    try:
+        checkpoint = torch.load(artifact_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        logger.debug("Skipping RF-DETR checkpoint normalization for {}: {}", artifact_path, exc)
+        return False
+
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        return True
+
+    removable_keys = sorted(key for key in checkpoint.keys() if key in _RFDETR_STRIPPABLE_KEYS)
+    if not removable_keys:
+        return True
+
+    slim_checkpoint = {"model": checkpoint["model"]}
+    if "args" in checkpoint:
+        slim_checkpoint["args"] = checkpoint["args"]
+
+    tmp_path = artifact_path.with_name(artifact_path.name + ".normalized")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    try:
+        torch.save(slim_checkpoint, tmp_path)
+        tmp_path.replace(artifact_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    logger.info(
+        "Stripped RF-DETR training state from {}: {}",
+        artifact_path,
+        ", ".join(removable_keys),
+    )
+    return True
+
+
 def _ensure_rfdetr_artifact(name: str) -> Path:
     name_lower = _normalise_model_name(name)
     artifact_path = get_model_artifact_path(name_lower)
@@ -808,7 +857,18 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
 
     from rfdetr.assets.model_weights import download_pretrain_weights
 
+    # Once we normalize a downloaded checkpoint, its MD5 no longer matches the
+    # original upstream training artifact. Reuse valid local files instead of
+    # redownloading them on every call.
+    if artifact_path.is_file():
+        if _normalize_rfdetr_artifact(artifact_path):
+            return artifact_path
+        logger.warning("Existing RF-DETR weights {} are unreadable; re-downloading.", artifact_path)
+        artifact_path.unlink()
+
     download_pretrain_weights(str(artifact_path))
+    if artifact_path.is_file():
+        _normalize_rfdetr_artifact(artifact_path)
     return artifact_path
 
 

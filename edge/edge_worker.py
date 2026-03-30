@@ -39,6 +39,19 @@ from tools.grpc_options import grpc_message_options
 
 
 class EdgeWorker:
+    @staticmethod
+    def _resolve_sample_confidence_threshold(
+        config,
+        resource_trigger: ResourceAwareCLTrigger | None = None,
+    ) -> float:
+        if resource_trigger is not None:
+            return float(resource_trigger.confidence_threshold)
+
+        drift_cfg = getattr(config, "drift_detection", None)
+        if drift_cfg is None:
+            return 0.5
+        return float(getattr(drift_cfg, "confidence_threshold", 0.5))
+
     def __init__(self, config):
         self.config = config
         self.edge_id = config.edge_id
@@ -81,12 +94,9 @@ class EdgeWorker:
         self.model_id = getattr(self.small_object_detection, "model_name", "edge-model")
         self.model_version = "0"
         self.bundle_cache_path = os.path.join(self.config.retrain.cache_path, "server_bundle")
-        self.sample_confidence_threshold = float(
-            getattr(
-                ra_cfg if ra_cfg is not None else getattr(config, "drift_detection", None),
-                "confidence_threshold",
-                0.5,
-            )
+        self.sample_confidence_threshold = self._resolve_sample_confidence_threshold(
+            config,
+            self.resource_trigger,
         )
 
         sl_cfg = getattr(config, "split_learning", None)

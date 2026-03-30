@@ -364,7 +364,13 @@ class TestModelZoo:
             calls.append(path)
             target = Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"rf-detr")
+            torch.save(
+                {
+                    "model": {"linear.weight": torch.ones(1)},
+                    "args": {"num_classes": 90},
+                },
+                target,
+            )
 
         monkeypatch.setattr(
             "rfdetr.assets.model_weights.download_pretrain_weights",
@@ -375,6 +381,46 @@ class TestModelZoo:
 
         assert artifact_path == fake_models_dir / "rf-detr-nano.pth"
         assert artifact_path.is_file()
+        assert calls == [str(artifact_path)]
+
+    def test_ensure_local_model_artifact_strips_rfdetr_training_state_once(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        fake_models_dir = tmp_path / "models"
+        monkeypatch.setattr(model_zoo_module, "_MODELS_DIR", fake_models_dir)
+
+        calls = []
+
+        def fake_download_pretrain_weights(path: str) -> None:
+            calls.append(path)
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "model": {"linear.weight": torch.arange(3)},
+                    "args": {"num_classes": 90},
+                    "optimizer": {"state": {"step": 42}},
+                    "lr_scheduler": {"last_epoch": 5},
+                },
+                target,
+            )
+
+        monkeypatch.setattr(
+            "rfdetr.assets.model_weights.download_pretrain_weights",
+            fake_download_pretrain_weights,
+        )
+
+        artifact_path = ensure_local_model_artifact("rfdetr_nano")
+        checkpoint = torch.load(artifact_path, map_location="cpu", weights_only=False)
+
+        assert set(checkpoint.keys()) == {"model", "args"}
+        assert "optimizer" not in checkpoint
+        assert "lr_scheduler" not in checkpoint
+        assert calls == [str(artifact_path)]
+
+        artifact_path_2 = ensure_local_model_artifact("rfdetr_nano")
+
+        assert artifact_path_2 == artifact_path
         assert calls == [str(artifact_path)]
 
     def test_build_rfdetr_detector_passes_local_artifact_to_wrapper(self, monkeypatch, tmp_path):

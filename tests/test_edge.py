@@ -30,6 +30,8 @@ from edge.resource_aware_trigger import (
     ResourceAwareCLTrigger,
 )
 from edge.edge_worker import EdgeWorker
+from edge.sample_store import LOW_CONFIDENCE
+from model_management.object_detection import InferenceArtifacts
 
 
 # =====================================================================
@@ -163,6 +165,68 @@ class TestEdgeWorkerRouting:
         assert trace_calls["frame"] is sample_bgr_frame
         assert trace_calls["trace_input"] is sample_input
         assert "synthetic_image_size" not in trace_calls
+
+    def test_sample_confidence_threshold_falls_back_to_drift_detection(self):
+        config = SimpleNamespace(
+            drift_detection=SimpleNamespace(confidence_threshold=0.8),
+        )
+
+        threshold = EdgeWorker._resolve_sample_confidence_threshold(
+            config,
+            resource_trigger=None,
+        )
+
+        assert threshold == pytest.approx(0.8)
+
+    def test_sample_confidence_threshold_prefers_resource_trigger_override(self):
+        config = SimpleNamespace(
+            drift_detection=SimpleNamespace(confidence_threshold=0.8),
+        )
+        trigger = SimpleNamespace(confidence_threshold=0.65)
+
+        threshold = EdgeWorker._resolve_sample_confidence_threshold(
+            config,
+            resource_trigger=trigger,
+        )
+
+        assert threshold == pytest.approx(0.65)
+
+    def test_collect_data_uses_resolved_threshold_for_bucketing(self, sample_bgr_frame):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.sample_confidence_threshold = 0.8
+        worker.drift_detector = SimpleNamespace(update=lambda confidence: False)
+        worker.fixed_split_plan = SimpleNamespace(split_config_id="plan-1")
+        worker.model_id = "yolo26n"
+        worker.model_version = "0"
+        worker.retrain_flag = True
+
+        captured = {}
+
+        def _store_sample(**kwargs):
+            captured.update(kwargs)
+
+        worker.sample_store = SimpleNamespace(store_sample=_store_sample)
+
+        task = Task(
+            edge_id=1,
+            frame_index=7,
+            frame=sample_bgr_frame,
+            start_time=time.time(),
+            raw_shape=sample_bgr_frame.shape,
+        )
+        inference = InferenceArtifacts(
+            intermediate=object(),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            confidence=0.6,
+            input_tensor_shape=[1, 3, 384, 640],
+        )
+
+        worker.collect_data(task, sample_bgr_frame, inference)
+
+        assert captured["confidence_bucket"] == LOW_CONFIDENCE
+        assert captured["raw_frame"] is sample_bgr_frame
 
 
 # =====================================================================

@@ -426,12 +426,36 @@ class CloudContinualLearner:
         candidate_weights = edge_weights if os.path.exists(edge_weights) else legacy_weights
         prefer_pretrained = model_name in model_lib
         if os.path.exists(candidate_weights):
-            state = torch.load(candidate_weights, map_location=self.device, weights_only=False)
-            if is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
+            fallback_reason = None
+            try:
+                state = torch.load(candidate_weights, map_location=self.device, weights_only=False)
+            except Exception as exc:
+                fallback_reason = (
+                    f"failed to read cached weights from {candidate_weights}: {exc}"
+                )
+            else:
+                if is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
+                    fallback_reason = (
+                        "cached wrapper weights look like a fused Ultralytics state_dict"
+                    )
+                else:
+                    tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
+                    try:
+                        tmp_model.load_state_dict(state)
+                    except Exception as exc:
+                        fallback_reason = (
+                            f"failed to load cached weights from {candidate_weights}: {exc}"
+                        )
+                    else:
+                        tmp_model.to(self.device)
+                        get_split_runtime_model(tmp_model).eval()
+                        return tmp_model
+
+            if fallback_reason is not None:
                 logger.warning(
-                    "[CL] Cached wrapper weights at {} look like a fused Ultralytics state_dict; "
-                    "rebuilding {} from native pretrained weights for this retrain round.",
-                    candidate_weights,
+                    "[CL] {}. Falling back to native {} weights for {}.",
+                    fallback_reason,
+                    "pretrained" if prefer_pretrained else "randomly initialised",
                     model_name,
                 )
                 tmp_model = build_detection_model(
@@ -440,24 +464,6 @@ class CloudContinualLearner:
                     device=self.device,
                 )
                 torch.save(tmp_model.state_dict(), edge_weights)
-            else:
-                tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
-                try:
-                    tmp_model.load_state_dict(state)
-                except RuntimeError:
-                    logger.warning(
-                        "[CL] Failed to load cached weights from {}; "
-                        "falling back to native {} weights for {}.",
-                        candidate_weights,
-                        "pretrained" if prefer_pretrained else "randomly initialised",
-                        model_name,
-                    )
-                    tmp_model = build_detection_model(
-                        model_name,
-                        pretrained=prefer_pretrained,
-                        device=self.device,
-                    )
-                    torch.save(tmp_model.state_dict(), edge_weights)
         else:
             tmp_model = build_detection_model(
                 model_name,

@@ -258,6 +258,43 @@ def test_cloud_fixed_split_resolution_prefers_bundle_model(server_model_name, bu
     assert resolved == bundle_model_name
 
 
+def test_load_edge_training_model_recovers_from_corrupted_cached_weights(tmp_path, monkeypatch):
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path)
+
+    cached_weights = tmp_path / "tmp_edge_model_yolo26n.pth"
+    cached_weights.write_text("not a torch checkpoint", encoding="utf-8")
+
+    build_calls: list[tuple[str, bool, str]] = []
+
+    def fake_build_detection_model(model_name, pretrained=False, device="cpu", **kwargs):
+        build_calls.append((model_name, bool(pretrained), str(device)))
+        return DummyModel()
+
+    monkeypatch.setattr("model_management.model_zoo.build_detection_model", fake_build_detection_model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
+
+    model = learner._load_edge_training_model(model_name="yolo26n")
+
+    assert isinstance(model, DummyModel)
+    assert build_calls == [("yolo26n", True, str(learner.device))]
+    recovered_state = torch.load(cached_weights, map_location="cpu", weights_only=False)
+    assert "weight" in recovered_state
+
+
 def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, monkeypatch):
     class DummyModel(torch.nn.Module):
         def __init__(self):
