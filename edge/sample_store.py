@@ -32,10 +32,14 @@ def _from_relpath(root_dir: str, relpath: str | None) -> str | None:
 
 def _normalise_payload(intermediate: SplitPayload | torch.Tensor | dict[str, torch.Tensor]) -> SplitPayload:
     if isinstance(intermediate, SplitPayload):
-        return intermediate.cpu()
+        return intermediate.detach().cpu()
     if isinstance(intermediate, torch.Tensor):
-        return SplitPayload.from_mapping({"payload": intermediate.cpu()}, primary_label="payload")
-    return SplitPayload.from_mapping(intermediate, primary_label=next(iter(intermediate.keys()), None)).cpu()
+        return SplitPayload.from_mapping({"payload": intermediate.detach().cpu()}, primary_label="payload")
+    detached = {
+        key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in intermediate.items()
+    }
+    return SplitPayload.from_mapping(detached, primary_label=next(iter(detached.keys()), None)).cpu()
 
 
 @dataclass

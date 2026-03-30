@@ -303,6 +303,7 @@ def test_payload_cache_and_universal_split_retrain(tmp_path):
     assert isinstance(record["intermediate"], SplitPayload)
     assert record["candidate_id"] == candidate.candidate_id
     assert record["tag"] == "graph-runtime"
+    assert all(not tensor.requires_grad for tensor in record["intermediate"].tensors.values())
 
     losses = universal_split_retrain(
         model=model,

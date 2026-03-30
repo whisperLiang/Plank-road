@@ -399,6 +399,8 @@ def test_high_confidence_sample_saves_feature_and_result_without_raw(tmp_path):
 
 def test_low_confidence_sample_saves_feature_result_and_raw(tmp_path, sample_bgr_frame):
     store = EdgeSampleStore(str(tmp_path))
+    payload = _payload()
+    payload = payload.detach(requires_grad=True)
     record = store.store_sample(
         sample_id="low-1",
         frame_index=2,
@@ -408,7 +410,7 @@ def test_low_confidence_sample_saves_feature_result_and_raw(tmp_path, sample_bgr
         model_version="0",
         confidence_bucket=LOW_CONFIDENCE,
         inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_payload(),
+        intermediate=payload,
         raw_frame=sample_bgr_frame,
     )
 
@@ -417,6 +419,8 @@ def test_low_confidence_sample_saves_feature_result_and_raw(tmp_path, sample_bgr
     assert (tmp_path / "features" / "low-1.pt").exists()
     assert (tmp_path / "results" / "low-1.json").exists()
     assert (tmp_path / "raw" / "low-1.jpg").exists()
+    stored = store.load_intermediate(record)
+    assert all(not tensor.requires_grad for tensor in stored.tensors.values())
 
 
 def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_bgr_frame):

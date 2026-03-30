@@ -1025,6 +1025,101 @@ def test_fixed_split_cloud_retrain_passes_bundle_trace_sample_input(tmp_path, mo
     assert captured["all_indices"] == ["sample-1"]
 
 
+def test_fixed_split_cloud_retrain_skips_empty_teacher_targets(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        edge_model_name="fasterrcnn_mobilenet_v3_large_fpn",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False, bn_only=False, probe_samples=2),
+    )
+    learner = CloudContinualLearner(
+        cfg,
+        large_object_detection=SimpleNamespace(large_inference=lambda frame, threshold=None: ([], [], [])),
+    )
+    learner.device = torch.device("cpu")
+
+    manifest = {
+        "protocol_version": "edge-cl-bundle.v1",
+        "model": {
+            "model_id": "fasterrcnn_mobilenet_v3_large_fpn",
+        },
+        "samples": [
+            {
+                "sample_id": "sample-1",
+            }
+        ],
+        "split_plan": {},
+        "training_mode": {
+            "low_confidence_mode": "raw-only",
+        },
+    }
+    captured = {}
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda path: manifest)
+    monkeypatch.setattr(
+        CloudContinualLearner,
+        "_load_edge_training_model",
+        lambda self, model_name=None: torch.nn.Linear(1, 1),
+    )
+    monkeypatch.setattr(
+        CloudContinualLearner,
+        "_bundle_feature_provider",
+        lambda self, model, manifest, *, bundle_root: object(),
+    )
+
+    def fake_prepare_split_training_cache(bundle_cache_path, working_cache, feature_provider):
+        frame_dir = Path(working_cache) / "frames"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(frame_dir / "sample-1.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
+        return {"all_sample_ids": ["sample-1"]}
+
+    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
+    monkeypatch.setattr(
+        "cloud_server._select_fixed_split_gt_sample_ids",
+        lambda manifest, prepared_sample_ids: ["sample-1"],
+    )
+    monkeypatch.setattr(
+        "cloud_server._evaluate_detection_proxy_map",
+        lambda *args, **kwargs: {
+            "map": None,
+            "evaluated_samples": 0,
+            "skipped_empty_gt": 0,
+            "skipped_missing_frame": 0,
+            "total_gt_samples": 0,
+            "nonempty_predictions": 0,
+            "total_prediction_boxes": 0,
+        },
+    )
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda model: "loss")
+    monkeypatch.setattr(
+        CloudContinualLearner,
+        "_build_bundle_trace_sample_input",
+        lambda self, model, bundle_root, manifest: "bundle-trace-input",
+    )
+
+    def fake_universal_split_retrain(**kwargs):
+        captured["gt_annotations"] = dict(kwargs["gt_annotations"])
+        return [0.0]
+
+    monkeypatch.setattr("cloud_server.universal_split_retrain", fake_universal_split_retrain)
+    monkeypatch.setattr(
+        CloudContinualLearner,
+        "_serialise_model_bytes",
+        lambda self, model, *, model_name=None: b"updated",
+    )
+
+    success, encoded, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path),
+        num_epoch=1,
+    )
+
+    assert success is True
+    assert base64.b64decode(encoded) == b"updated"
+    assert message == "Fixed split retraining successful; proxy_mAP@0.5 skipped"
+    assert captured["gt_annotations"] == {}
+
+
 def test_fixed_split_model_name_prefers_bundle_manifest():
     cfg = SimpleNamespace(
         edge_model_name="fasterrcnn_mobilenet_v3_large_fpn",

@@ -491,20 +491,21 @@ def save_split_feature_cache(
         SplitPayload.from_mapping(intermediate) if isinstance(intermediate, Mapping)
         else SplitPayload.from_mapping({"payload": intermediate}, primary_label="payload")
     )
+    cached_payload = payload.detach().cpu()
     record = {
-        "intermediate": payload.cpu(),
+        "intermediate": cached_payload,
         "is_drift": bool(is_drift),
         "pseudo_boxes": pseudo_boxes,
         "pseudo_labels": pseudo_labels,
         "pseudo_scores": pseudo_scores,
-        "split_index": payload.split_index,
-        "split_label": payload.split_label,
-        "candidate_id": payload.candidate_id,
+        "split_index": cached_payload.split_index,
+        "split_label": cached_payload.split_label,
+        "candidate_id": cached_payload.candidate_id,
     }
     record.update(dict(extra_metadata or {}))
     out_path = os.path.join(feature_dir, f"{frame_index}.pt")
     torch.save(record, out_path)
-    _write_split_cache_metadata(cache_path, payload, extra_metadata=extra_metadata)
+    _write_split_cache_metadata(cache_path, cached_payload, extra_metadata=extra_metadata)
     return out_path
 
 

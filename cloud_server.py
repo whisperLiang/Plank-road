@@ -441,6 +441,25 @@ class CloudContinualLearner:
         except TypeError:
             return self.large_od.large_inference(frame)
 
+    def _build_teacher_targets(self, frame) -> dict[str, object] | None:
+        pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
+        if pred_boxes is None or pred_class is None:
+            return None
+
+        boxes = list(pred_boxes)
+        labels = list(pred_class)
+        if not boxes or not labels:
+            return None
+
+        count = min(len(boxes), len(labels))
+        if count <= 0:
+            return None
+
+        return {
+            "boxes": boxes[:count],
+            "labels": labels[:count],
+        }
+
     def _infer_bundle_trace_image_size(
         self,
         manifest: dict[str, object],
@@ -597,13 +616,10 @@ class CloudContinualLearner:
                     frame = cv2.imread(img_path)
                     if frame is None:
                         continue
-                    pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
-                    if pred_boxes is None:
+                    teacher_targets = self._build_teacher_targets(frame)
+                    if teacher_targets is None:
                         continue
-                    gt_annotations[idx] = {
-                        "boxes":  pred_boxes,
-                        "labels": pred_class,
-                    }
+                    gt_annotations[idx] = teacher_targets
                 logger.info(
                     "[SplitCL] Annotated {} drift frames with large model.",
                     len(gt_annotations),
@@ -680,13 +696,10 @@ class CloudContinualLearner:
                     frame = cv2.imread(img_path)
                     if frame is None:
                         continue
-                    pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
-                    if pred_boxes is None:
+                    teacher_targets = self._build_teacher_targets(frame)
+                    if teacher_targets is None:
                         continue
-                    gt_annotations[str(sample_id)] = {
-                        "boxes": pred_boxes,
-                        "labels": pred_class,
-                    }
+                    gt_annotations[str(sample_id)] = teacher_targets
 
                 proxy_metrics_before = _evaluate_detection_proxy_map(
                     tmp_model,
