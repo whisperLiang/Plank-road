@@ -1,5 +1,6 @@
 
 import argparse
+import copy
 import base64
 import io
 import json
@@ -288,6 +289,53 @@ def _proxy_metrics_indicate_dead_detector(metrics: Mapping[str, object] | None) 
         and int(metrics.get("evaluated_samples", 0)) > 0
         and int(metrics.get("nonempty_predictions", 0)) == 0
     )
+
+
+def _snapshot_model_state(model: torch.nn.Module) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for key, value in model.state_dict().items():
+        if torch.is_tensor(value):
+            snapshot[key] = value.detach().cpu().clone()
+        else:
+            snapshot[key] = copy.deepcopy(value)
+    return snapshot
+
+
+def _fixed_split_proxy_rejection_reason(
+    metrics_before: Mapping[str, object] | None,
+    metrics_after: Mapping[str, object] | None,
+    *,
+    tolerance: float = 1e-6,
+) -> str | None:
+    if not metrics_after:
+        return None
+    if _proxy_metrics_indicate_dead_detector(metrics_after):
+        return "updated weights produced no detections on the GT-annotated proxy set"
+
+    if not metrics_before:
+        return None
+    before_map = metrics_before.get("map")
+    after_map = metrics_after.get("map")
+    if before_map is None or after_map is None:
+        return None
+
+    before_value = float(before_map)
+    after_value = float(after_map)
+    if after_value + tolerance < before_value:
+        return (
+            "proxy_mAP@0.5 regressed "
+            f"{before_value:.4f} -> {after_value:.4f}"
+        )
+
+    before_nonempty = int(metrics_before.get("nonempty_predictions", 0))
+    after_nonempty = int(metrics_after.get("nonempty_predictions", 0))
+    if abs(after_value - before_value) <= tolerance and after_nonempty < before_nonempty:
+        return (
+            "proxy_mAP@0.5 stayed flat but non-empty detections dropped "
+            f"{before_nonempty} -> {after_nonempty}"
+        )
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +706,7 @@ class CloudContinualLearner:
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
                     )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
+                baseline_source = "cached"
 
                 tmp_model = self._load_edge_training_model(model_name=current_model_name)
                 working_cache = os.path.join(bundle_cache_path, "working_cache")
@@ -727,6 +776,7 @@ class CloudContinualLearner:
                         pretrained=True,
                         device=self.device,
                     )
+                    baseline_source = "native pretrained"
                     tmp_model.to(self.device)
                     get_split_runtime_model(tmp_model).eval()
                     bundle_info = _prepare_working_cache(tmp_model)
@@ -738,6 +788,7 @@ class CloudContinualLearner:
                         device=self.device,
                     )
 
+                baseline_state = _snapshot_model_state(tmp_model)
                 effective_num_epoch = num_epoch
                 if (
                     gt_annotations
@@ -801,6 +852,31 @@ class CloudContinualLearner:
                         int(proxy_metrics_after.get("skipped_empty_gt", 0)),
                         int(proxy_metrics_after.get("skipped_missing_frame", 0)),
                     )
+
+                rejection_reason = _fixed_split_proxy_rejection_reason(
+                    proxy_metrics_before,
+                    proxy_metrics_after,
+                )
+                if rejection_reason is not None:
+                    logger.warning(
+                        "[FixedSplitCL] Rejecting retrained {} weights for edge {}: {}",
+                        current_model_name,
+                        edge_id,
+                        rejection_reason,
+                    )
+                    tmp_model.load_state_dict(baseline_state)
+                    _set_detection_model_eval_mode(tmp_model)
+                    encoded = base64.b64encode(
+                        self._serialise_model_bytes(tmp_model, model_name=current_model_name)
+                    ).decode("utf-8")
+                    fallback_message = (
+                        f"Kept {baseline_source} weights; rejected retrained weights because {rejection_reason}"
+                    )
+                    if proxy_summary is not None:
+                        fallback_message = f"{fallback_message}; {proxy_summary}"
+                    else:
+                        fallback_message = f"{fallback_message}; proxy_mAP@0.5 skipped"
+                    return True, encoded, fallback_message
 
                 encoded = base64.b64encode(
                     self._serialise_model_bytes(tmp_model, model_name=current_model_name)

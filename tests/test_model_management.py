@@ -9,6 +9,7 @@ Tests for model_management/ module:
 """
 import os
 import tempfile
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -29,6 +30,7 @@ from model_management.detection_metric import RetrainMetric
 from model_management.detection_dataset import DetectionDataset
 from model_management.model_zoo import (
     build_detection_model,
+    ensure_local_model_artifact,
     get_model_artifact_path,
     get_models_dir,
     list_available_models,
@@ -349,6 +351,53 @@ class TestModelZoo:
         for model_name in ["rfdetr_nano", "tinynext_s", "yolov8n", "yolo26n", "detr_resnet50", "rtdetr_l"]:
             artifact_path = get_model_artifact_path(model_name).resolve()
             assert models_dir == artifact_path.parent or models_dir in artifact_path.parents
+
+    def test_ensure_local_model_artifact_downloads_rfdetr_into_models_dir(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        fake_models_dir = tmp_path / "models"
+        monkeypatch.setattr(model_zoo_module, "_MODELS_DIR", fake_models_dir)
+
+        calls = []
+
+        def fake_download_pretrain_weights(path: str) -> None:
+            calls.append(path)
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"rf-detr")
+
+        monkeypatch.setattr(
+            "rfdetr.assets.model_weights.download_pretrain_weights",
+            fake_download_pretrain_weights,
+        )
+
+        artifact_path = ensure_local_model_artifact("rfdetr_nano")
+
+        assert artifact_path == fake_models_dir / "rf-detr-nano.pth"
+        assert artifact_path.is_file()
+        assert calls == [str(artifact_path)]
+
+    def test_build_rfdetr_detector_passes_local_artifact_to_wrapper(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "rf-detr-nano.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(b"rf-detr")
+        monkeypatch.setattr(model_zoo_module, "ensure_local_model_artifact", lambda name: artifact_path)
+
+        captured = {}
+
+        class DummyRFDETRDetectionModel:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr(model_zoo_module, "RFDETRDetectionModel", DummyRFDETRDetectionModel)
+
+        build_detection_model("rfdetr_nano", pretrained=True, device="cpu")
+
+        assert captured["model_name"] == "rfdetr_nano"
+        assert captured["pretrained"] is True
+        assert captured["pretrain_weights"] == str(artifact_path)
 
     def test_build_yolo26_detector_from_yaml_when_pretrained_false(self):
         model = build_detection_model("yolo26n", pretrained=False, device="cpu")

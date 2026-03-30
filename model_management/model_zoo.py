@@ -796,6 +796,22 @@ def _ensure_tinynext_artifact(name: str) -> Path:
     return artifact_path
 
 
+def _ensure_rfdetr_artifact(name: str) -> Path:
+    name_lower = _normalise_model_name(name)
+    artifact_path = get_model_artifact_path(name_lower)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    if not _HAS_RFDETR:
+        raise ImportError(
+            "rfdetr is required for RF-DETR models. "
+            "Install: pip install rfdetr"
+        )
+
+    from rfdetr.assets.model_weights import download_pretrain_weights
+
+    download_pretrain_weights(str(artifact_path))
+    return artifact_path
+
+
 def ensure_local_model_artifact(name: str) -> Path:
     name_lower = _normalise_model_name(name)
     if name_lower in _TORCHVISION_WEIGHT_DEFAULTS:
@@ -804,6 +820,8 @@ def ensure_local_model_artifact(name: str) -> Path:
         return _ensure_detr_artifact(name_lower)
     if name_lower in _YOLO_MODELS or name_lower in _RTDETR_MODELS:
         return _ensure_ultralytics_artifact(name_lower)
+    if name_lower in _RFDETR_MODELS:
+        return _ensure_rfdetr_artifact(name_lower)
     if name_lower in _TINYNEXT_MODELS:
         return _ensure_tinynext_artifact(name_lower)
     return get_model_artifact_path(name_lower)
@@ -910,15 +928,20 @@ def build_detection_model(
 
     # ── 4. RT-DETR (ultralytics) ──
     if name_lower in _RFDETR_MODELS:
+        explicit_weights_supplied = artifact_path is not None
+        rfdetr_kwargs = dict(kwargs)
+        if artifact_path is None and pretrained:
+            artifact_path = ensure_local_model_artifact(name_lower)
+            rfdetr_kwargs["pretrain_weights"] = str(artifact_path)
         model = RFDETRDetectionModel(
             model_name=name_lower,
             confidence=confidence,
             device=device,
             num_classes=num_classes,
-            pretrained=pretrained and artifact_path is None,
-            **kwargs,
+            pretrained=pretrained and not explicit_weights_supplied,
+            **rfdetr_kwargs,
         )
-        if artifact_path is not None and artifact_path.is_file():
+        if explicit_weights_supplied and artifact_path is not None and artifact_path.is_file():
             state = torch.load(artifact_path, map_location=device, weights_only=False)
             if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
                 state = state["state_dict"]

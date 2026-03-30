@@ -2,6 +2,7 @@ import zipfile
 import io
 import json
 import os
+import posixpath
 import shutil
 import threading
 
@@ -67,8 +68,8 @@ def _normalize_cache_path(path: str) -> str:
     """Normalize cache paths from remote clients across OS-specific separators."""
     if not path:
         return path
-    normalized = path.replace("\\", os.sep).replace("/", os.sep)
-    return os.path.normpath(normalized)
+    normalized = path.replace("\\", "/")
+    return posixpath.normpath(normalized)
 
 
 def _reset_cache_dir(cache_path: str) -> None:

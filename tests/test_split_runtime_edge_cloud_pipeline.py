@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 import pytest
 import torch
 
 from cloud_server import CloudContinualLearner
+from model_management.continual_learning_bundle import CONTINUAL_LEARNING_PROTOCOL_VERSION
 from model_management.model_zoo import build_detection_model
 from model_management.object_detection import Object_Detection
 from model_management.split_model_adapters import (
@@ -205,6 +208,29 @@ def test_yolo26_runtime_wrapper_loss_is_finite_and_backwardable(model_name):
     ), model_name
 
 
+@pytest.mark.parametrize("model_name", YOLO_DETECTORS)
+def test_yolo26_fixed_split_candidates_are_replayable(model_name):
+    model = _build_public_detector(model_name)
+    runtime_model = get_split_runtime_model(model).eval()
+    sample_input = build_split_runtime_sample_input(
+        model,
+        image_size=(96, 96),
+        device="cpu",
+    )
+
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trainability_loss_fn = build_split_training_loss(model)
+    splitter.trace(runtime_model, sample_input)
+
+    validated = []
+    for candidate in splitter.enumerate_candidates(max_candidates=8):
+        report = splitter.validate_candidate(candidate)
+        if report["success"]:
+            validated.append(candidate)
+            break
+    assert validated, model_name
+
+
 @pytest.mark.parametrize(
     ("server_model_name", "bundle_model_name"),
     [
@@ -230,3 +256,109 @@ def test_cloud_fixed_split_resolution_prefers_bundle_model(server_model_name, bu
 
     resolved = learner._resolve_fixed_split_model_name(manifest)
     assert resolved == bundle_model_name
+
+
+def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, monkeypatch):
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+
+        def forward(self, images):
+            return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    model = DummyModel()
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano"},
+        "drift_sample_ids": ["sample-1"],
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "frames/sample-1.jpg",
+                "feature_relpath": None,
+            }
+        ],
+    }
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda current_model: current_model)
+    monkeypatch.setattr("cloud_server.universal_split_retrain", lambda **kwargs: None)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+    )
+    monkeypatch.setattr(learner, "_bundle_feature_provider", lambda *args, **kwargs: None)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
+    monkeypatch.setattr(learner, "_build_teacher_targets", lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]})
+
+    def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, feature_provider=None):
+        frame_dir = Path(working_cache_path) / "frames"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(str(frame_dir / "sample-1.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
+        assert ok
+        return {"all_sample_ids": ["sample-1"], "drift_sample_ids": ["sample-1"]}
+
+    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
+
+    proxy_metrics = iter(
+        [
+            {
+                "map": 0.4,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
+            {
+                "map": 0.1,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        "cloud_server._evaluate_detection_proxy_map",
+        lambda *args, **kwargs: next(proxy_metrics),
+    )
+
+    serialised_states: list[float] = []
+
+    def fake_serialise_model_bytes(current_model, *, model_name=None):
+        serialised_states.append(float(current_model.state_dict()["weight"][0]))
+        return b"baseline-weights"
+
+    monkeypatch.setattr(learner, "_serialise_model_bytes", fake_serialise_model_bytes)
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(bundle_root),
+        num_epoch=2,
+    )
+
+    assert success is True
+    assert model_data
+    assert "Kept cached weights" in message
+    assert "proxy_mAP@0.5 regressed 0.4000 -> 0.1000" in message
+    assert serialised_states == [1.0]

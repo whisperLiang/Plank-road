@@ -198,6 +198,30 @@ def _find_tensor_path(container: Any, target: torch.Tensor) -> tuple[Any, ...] |
     return None
 
 
+def _match_leaf_addresses_to_labels(
+    labels: Sequence[str],
+    leaves: Mapping[str, torch.Tensor],
+    layer_lookup: Mapping[str, Any],
+) -> dict[str, str]:
+    """Infer leaf-address mappings by matching sampled leaf tensors to layer activations."""
+    matched: dict[str, str] = {}
+    used_addresses: set[str] = set()
+
+    for label in labels:
+        layer = layer_lookup.get(label)
+        activation = _get_attr(layer, "activation", default=None)
+        if not isinstance(activation, torch.Tensor):
+            continue
+        for address, tensor in leaves.items():
+            if address in used_addresses:
+                continue
+            if _tensor_exact_match(tensor, activation):
+                matched[address] = label
+                used_addresses.add(address)
+                break
+    return matched
+
+
 def _infer_parent_output_path(parent_layer: Any, child_label: str) -> tuple[Any, ...] | None:
     child_versions = _get_attr(parent_layer, "children_tensor_versions", default={}) or {}
     if child_label not in child_versions:
@@ -1095,8 +1119,18 @@ def build_graph_from_trace(
         for label, address in zip(input_labels, input_leaves.keys()):
             input_address_to_label[address] = label
     if not output_address_to_label and output_labels and output_leaves:
-        for label, address in zip(output_labels, output_leaves.keys()):
-            output_address_to_label[address] = label
+        output_address_to_label.update(
+            _match_leaf_addresses_to_labels(output_labels, output_leaves, parent_layer_lookup)
+        )
+        if len(output_address_to_label) < min(len(output_labels), len(output_leaves)):
+            assigned_labels = set(output_address_to_label.values())
+            assigned_addresses = set(output_address_to_label.keys())
+            remaining_labels = [label for label in output_labels if label not in assigned_labels]
+            remaining_addresses = [
+                address for address in output_leaves.keys() if address not in assigned_addresses
+            ]
+            for label, address in zip(remaining_labels, remaining_addresses):
+                output_address_to_label[address] = label
 
     return GraphIR(
         nodes=nodes,

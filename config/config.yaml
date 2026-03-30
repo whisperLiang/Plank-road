@@ -138,7 +138,7 @@ client:
 
 server:
  server_id: 0
- golden: yolov8x
+ golden: rfdetr_large
  # lightweight model used to generate fine-tuned weights for the edge
  edge_model_name: rfdetr_nano
  #the queue maxsize
