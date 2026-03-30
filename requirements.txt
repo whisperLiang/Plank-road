@@ -4,7 +4,8 @@ torch
 numpy==1.26.4
 opencv-python==4.11.0.86
 munch
-grpcio
+grpcio==1.78.1
+protobuf==6.31.1
 grpcio-tools
 loguru
 mapcalc
