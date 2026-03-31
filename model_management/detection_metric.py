@@ -4,31 +4,35 @@ from numpy import average as avg
 from tqdm import tqdm
 
 class RetrainMetric:
+    DEFAULT_LOSS_KEYS = (
+        'loss_classifier',
+        'loss_box_reg',
+        'loss_objectness',
+        'loss_rpn_box_reg',
+    )
 
     def __init__(self):
         self.metrics = {}
 
     def reset_metrics(self):
         self.metrics = {
-            'loss_classifier': [], 'loss_box_reg': [],
-            'loss_objectness': [], 'loss_rpn_box_reg': [],
-            'total_loss': [],
+            key: [] for key in self.DEFAULT_LOSS_KEYS
         }
+        self.metrics.update({
+            'total_loss': [],
+        })
 
     def update(self, loss_dict, total_loss):
-        self.metrics['loss_classifier'].append(loss_dict['loss_classifier'].detach().cpu().item())
-        self.metrics['loss_box_reg'].append(loss_dict['loss_box_reg'].detach().cpu().item())
-        self.metrics['loss_objectness'].append(loss_dict['loss_objectness'].detach().cpu().item())
-        self.metrics['loss_rpn_box_reg'].append(loss_dict['loss_rpn_box_reg'].detach().cpu().item())
+        for loss_name, loss_value in loss_dict.items():
+            self.metrics.setdefault(loss_name, [])
+            self.metrics[loss_name].append(loss_value.detach().cpu().item())
         self.metrics['total_loss'].append(total_loss.detach().cpu().item())
 
     def compute(self):
         return {
-            'loss_classifier': avg(self.metrics['loss_classifier']),
-            'loss_box_reg': avg(self.metrics['loss_box_reg']),
-            'loss_objectness': avg(self.metrics['loss_objectness']),
-            'loss_rpn_box_reg': avg(self.metrics['loss_rpn_box_reg']),
-            'total_loss': avg(self.metrics['total_loss']),
+            key: avg(values)
+            for key, values in self.metrics.items()
+            if values
         }
 
     def log_iter(self, epoch, num_epoch, data_loader):

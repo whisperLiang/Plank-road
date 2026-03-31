@@ -51,6 +51,16 @@ class ArangeCatNet(nn.Module):
         return torch.cat([base, grid], dim=1)
 
 
+class AliasWrappedDetector(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        detector = nn.Module()
+        detector.backbone = nn.Module()
+        detector.backbone.extra = nn.Conv2d(3, 4, kernel_size=1)
+        self.detector = detector
+        self.backbone = detector.backbone
+
+
 def _make_sequential_model() -> tuple[nn.Module, torch.Tensor]:
     model = nn.Sequential(
         nn.Linear(16, 32),
@@ -163,6 +173,31 @@ def test_runtime_trace_cleans_up_raw_torchlens_history(monkeypatch):
     assert cleanup_called
     assert runtime.history is None
     assert runtime.graph is fake_graph
+
+
+def test_node_has_trainable_params_resolves_alias_wrapped_parameter_paths():
+    model = AliasWrappedDetector()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.backbone.extra.weight.requires_grad_(True)
+
+    param_ref = graph_ir.ParameterTensorRef(
+        module_path="backbone.extra",
+        param_name="weight",
+        fq_name="backbone.extra.weight",
+    )
+    trainable_param_names = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+
+    assert "backbone.extra.weight" not in trainable_param_names
+    assert "detector.backbone.extra.weight" in trainable_param_names
+    assert graph_ir._node_has_trainable_params(
+        model,
+        [param_ref],
+        fallback=False,
+        trainable_param_names=trainable_param_names,
+    )
 
 
 def test_tensor_exact_match_aligns_devices_before_comparing(monkeypatch):

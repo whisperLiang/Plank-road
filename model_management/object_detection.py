@@ -13,7 +13,13 @@ from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import annotation_cols
 from model_management.model_zoo import (
-    build_detection_model, get_models_dir, is_wrapper_model, model_has_roi_heads, get_model_family,
+    build_detection_model,
+    get_model_detection_thresholds,
+    get_models_dir,
+    get_model_family,
+    is_wrapper_model,
+    set_detection_finetune_mode,
+    set_detection_trainable_params,
 )
 from model_management.split_model_adapters import (
     build_split_runtime_sample_input,
@@ -62,8 +68,6 @@ class Object_Detection:
             f"tmp_model_{self.model_name}.pth",
         )
         self.load_model()
-        self.threshold_low = 0.2
-        self.threshold_high = 0.6
 
     def load_model(self):
         explicit_weights_path = getattr(self.config, "weights_path", None)
@@ -79,39 +83,17 @@ class Object_Detection:
             self.init_model()
         self.model.eval()
         get_split_runtime_model(self.model).eval()
+        self.refresh_thresholds_from_model()
+
+    def refresh_thresholds_from_model(self):
+        self.threshold_low, self.threshold_high = get_model_detection_thresholds(
+            self.model,
+            self.model_name,
+        )
 
     def init_model(self):
         logger.debug("init_model")
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        if model_has_roi_heads(self.model_name):
-            # ROI-head detectors: only fine-tune the roi_heads tail
-            for param in self.model.roi_heads.parameters():
-                param.requires_grad = True
-        elif is_wrapper_model(self.model_name):
-            # YOLO / DETR / RT-DETR wrappers manage their own fine-tuning;
-            # for now unfreeze the last 20 % of parameters as a heuristic.
-            all_params = list(self.model.parameters())
-            trainable_start = int(len(all_params) * 0.8)
-            for p in all_params[trainable_start:]:
-                p.requires_grad = True
-        else:
-            # Other detector families: fine-tune the detection head
-            head_attrs = ['head', 'classification_head', 'regression_head']
-            found = False
-            for attr in head_attrs:
-                if hasattr(self.model, attr):
-                    for param in getattr(self.model, attr).parameters():
-                        param.requires_grad = True
-                    found = True
-            if not found:
-                # Fallback: unfreeze last 20 % of parameters
-                all_params = list(self.model.parameters())
-                trainable_start = int(len(all_params) * 0.8)
-                for p in all_params[trainable_start:]:
-                    p.requires_grad = True
-
+        set_detection_trainable_params(self.model, self.model_name)
         torch.save(self.model.state_dict(), self._tmp_weight_path)
 
     def retrain(self, path, select_index):
@@ -128,27 +110,11 @@ class Object_Detection:
 
         tmp_model = build_detection_model(self.model_name, pretrained=False, device=device)
         state_dict = torch.load(self._tmp_weight_path, map_location=device)
-        tmp_model.load_state_dict(state_dict)
+        tmp_model.load_state_dict(state_dict, strict=False)
         tmp_model.to(device)
 
-        # Freeze backbone, unfreeze head — model-family aware
-        for param in tmp_model.parameters():
-            param.requires_grad = False
-        if model_has_roi_heads(self.model_name):
-            for param in tmp_model.roi_heads.parameters():
-                param.requires_grad = True
-        else:
-            head_attrs = ['head', 'classification_head', 'regression_head', 'roi_heads']
-            found = False
-            for attr in head_attrs:
-                if hasattr(tmp_model, attr):
-                    for param in getattr(tmp_model, attr).parameters():
-                        param.requires_grad = True
-                    found = True
-            if not found:
-                all_params = list(tmp_model.parameters())
-                for p in all_params[int(len(all_params) * 0.8):]:
-                    p.requires_grad = True
+        # Freeze backbone, unfreeze trainable tail — model-family aware
+        set_detection_trainable_params(tmp_model, self.model_name)
 
         dataset = TrafficDataset(root=path, select_index = select_index)
         data_loader = DataLoader(dataset=dataset, batch_size=2, collate_fn=_collate_fn, )
@@ -161,7 +127,7 @@ class Object_Detection:
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
         for epoch in range(num_epoch):
-            tmp_model.train()
+            set_detection_finetune_mode(tmp_model, self.model_name)
             for images, targets in tr_metric.log_iter(epoch, num_epoch, data_loader):
                 images = list(image.to(device) for image in images)
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -179,8 +145,9 @@ class Object_Detection:
             torch.cuda.empty_cache()
         state_dict = torch.load(self._tmp_weight_path, map_location=device)
         with self.model_lock:
-            self.model.load_state_dict(state_dict)
+            self.model.load_state_dict(state_dict, strict=False)
             self.model.eval()
+            self.refresh_thresholds_from_model()
 
     def model_evaluation(self,cache_path, select_index):
         map = []
@@ -189,14 +156,15 @@ class Object_Detection:
         annotations_f = pd.read_csv(annotation_path, header=None, names=annotation_cols)
         test_model = build_detection_model(self.model_name, pretrained=False, device=device)
         state_dict = torch.load(self._tmp_weight_path, map_location=device)
-        test_model.load_state_dict(state_dict)
+        test_model.load_state_dict(state_dict, strict=False)
         test_model.to(device)
         test_model.eval()
+        _, threshold_high = get_model_detection_thresholds(test_model, self.model_name)
         for _id in select_index:
             logger.debug(_id)
             path = os.path.join(frame_path, str(_id)+'.jpg')
             frame = cv2.imread(path)
-            pred_boxes, pred_class, pred_score = self.get_model_prediction(frame, self.threshold_high, test_model)
+            pred_boxes, pred_class, pred_score = self.get_model_prediction(frame, threshold_high, test_model)
             pred = {'labels':pred_class, 'boxes': pred_boxes, 'scores':pred_score}
             annos = annotations_f[annotations_f['frame_index'] == _id]
             target_boxes = []
@@ -224,15 +192,16 @@ class Object_Detection:
         # pretrained_model
         map = []
         state_dict = torch.load("./model_management/pretrained.pth", map_location=device)
-        test_model.load_state_dict(state_dict)
+        test_model.load_state_dict(state_dict, strict=False)
         test_model.to(device)
         test_model.eval()
+        _, threshold_high = get_model_detection_thresholds(test_model, self.model_name)
         logger.debug("pretrained")
         for _id in select_index:
             logger.debug(_id)
             path = os.path.join(frame_path, str(_id)+'.jpg')
             frame = cv2.imread(path)
-            pred_boxes, pred_class, pred_score = self.get_model_prediction(frame, self.threshold_high, test_model)
+            pred_boxes, pred_class, pred_score = self.get_model_prediction(frame, threshold_high, test_model)
             pred = {'labels':pred_class, 'boxes': pred_boxes, 'scores':pred_score}
             annos = annotations_f[annotations_f['frame_index'] == _id]
             target_boxes = []
@@ -400,8 +369,3 @@ class Object_Detection:
         pred_class = prediction_class[:prediction_t + 1]
         pred_score = prediction_score[:prediction_t + 1]
         return pred_boxes, pred_class, pred_score
-
-
-
-
-

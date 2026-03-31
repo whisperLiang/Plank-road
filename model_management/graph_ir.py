@@ -976,7 +976,9 @@ def _node_has_trainable_params(
     trainable_param_names: set[str] | None = None,
 ) -> bool:
     if trainable_param_names is not None:
-        return any(ref.fq_name in trainable_param_names for ref in param_refs)
+        for ref in param_refs:
+            if ref.fq_name in trainable_param_names:
+                return True
     for ref in param_refs:
         parameter = _resolve_parameter_from_ref(model, ref)
         if parameter is not None and parameter.requires_grad:

@@ -45,13 +45,18 @@ Usage
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
+import sys
+import types
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 import torch
 import torch.nn as nn
 import torchvision.transforms.functional as F
+import numpy as np
 from huggingface_hub import hf_hub_download, snapshot_download
 from loguru import logger
 from torch.hub import download_url_to_file
@@ -441,7 +446,13 @@ class RFDETRDetectionModel(nn.Module):
             scores = result["scores"]
             keep = scores > self.confidence
             boxes = result["boxes"][keep].detach().cpu().float()
-            labels = result["labels"][keep].detach().cpu().long() + 1
+            raw_labels = result["labels"][keep].detach().cpu().long()
+            if self.num_classes >= 91:
+                # RF-DETR's COCO checkpoints already emit the repository's
+                # 91-index label IDs (for example car=3, stop sign=13).
+                labels = raw_labels
+            else:
+                labels = raw_labels + 1
             kept_scores = scores[keep].detach().cpu().float()
             detections.append({
                 "boxes": boxes,
@@ -666,6 +677,10 @@ _TINYNEXT_MODELS: Dict[str, str] = {
     "tinynext_s": "tinynext_s.pth",
     "tinynext_m": "tinynext_m.pth",
 }
+_TINYNEXT_REPO_MODELS: Dict[str, str] = {
+    "tinynext_s": "ssdlite_tinynext_s_coco.pth",
+    "tinynext_m": "ssdlite_tinynext_m_coco.pth",
+}
 
 _MODELS_DIR = Path(__file__).resolve().parent / "models"
 _RFDETR_STRIPPABLE_KEYS = frozenset({
@@ -718,6 +733,16 @@ def _matches_expected_hash(path: Path, hash_prefix: str | None) -> bool:
     return digest.hexdigest().startswith(hash_prefix)
 
 
+def _matches_md5(path: Path, expected_md5: str | None) -> bool:
+    if expected_md5 is None:
+        return True
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == expected_md5.lower()
+
+
 def _download_file(url: str, destination: Path, hash_prefix: str | None = None) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = destination.with_name(destination.name + ".download")
@@ -730,6 +755,57 @@ def _download_file(url: str, destination: Path, hash_prefix: str | None = None) 
         if tmp_path.exists():
             tmp_path.unlink()
     return destination
+
+
+def _download_http_file_with_resume(
+    url: str,
+    destination: Path,
+    *,
+    expected_md5: str | None = None,
+    max_attempts: int = 5,
+) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination.with_name(destination.name + ".download")
+    for attempt in range(1, max_attempts + 1):
+        existing_bytes = tmp_path.stat().st_size if tmp_path.exists() else 0
+        headers = {"Range": f"bytes={existing_bytes}-"} if existing_bytes else {}
+        try:
+            with requests.get(url, stream=True, timeout=60, headers=headers) as response:
+                response.raise_for_status()
+                if existing_bytes and response.status_code != 206:
+                    tmp_path.unlink(missing_ok=True)
+                    existing_bytes = 0
+                mode = "ab" if existing_bytes and response.status_code == 206 else "wb"
+                with tmp_path.open(mode) as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+
+            if not _matches_md5(tmp_path, expected_md5):
+                logger.warning(
+                    "Downloaded file {} failed MD5 validation on attempt {}/{}.",
+                    tmp_path,
+                    attempt,
+                    max_attempts,
+                )
+                tmp_path.unlink(missing_ok=True)
+                continue
+
+            tmp_path.replace(destination)
+            return destination
+        except (requests.RequestException, OSError) as exc:
+            logger.warning(
+                "Download attempt {}/{} failed for {}: {}",
+                attempt,
+                max_attempts,
+                destination.name,
+                exc,
+            )
+            if attempt == max_attempts:
+                break
+
+    tmp_path.unlink(missing_ok=True)
+    raise RuntimeError(f"Failed to download {destination.name} after {max_attempts} attempts")
 
 
 def _ensure_torchvision_artifact(name: str) -> Path:
@@ -783,22 +859,44 @@ def _ensure_ultralytics_artifact(name: str) -> Path:
     logger.info("Downloading {} weights to {}", name_lower, artifact_path)
     from ultralytics.utils.downloads import attempt_download_asset
 
-    downloaded = Path(attempt_download_asset(str(artifact_path), release="latest"))
+    # Let Ultralytics choose the correct release tag for newer families such as
+    # YOLO26. Forcing ``latest`` can point at a release that does not publish
+    # the requested asset and leaves us with a non-existent path.
+    downloaded = Path(attempt_download_asset(str(artifact_path)))
     if downloaded.resolve() != artifact_path.resolve():
         artifact_path.write_bytes(downloaded.read_bytes())
+    if not artifact_path.is_file():
+        raise FileNotFoundError(
+            f"Ultralytics download did not produce the expected artifact: {artifact_path}"
+        )
     return artifact_path
 
 
 def _ensure_tinynext_artifact(name: str) -> Path:
     name_lower = _normalise_model_name(name)
     artifact_path = get_model_artifact_path(name_lower)
+    repo_filename = _TINYNEXT_REPO_MODELS[name_lower]
     if artifact_path.is_file():
-        return artifact_path
+        try:
+            if _tinynext_checkpoint_has_detector_weights(artifact_path):
+                return artifact_path
+            logger.info(
+                "Replacing TinyNeXt backbone-only weights at {} with detector checkpoint {}.",
+                artifact_path,
+                repo_filename,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to inspect TinyNeXt artifact {} ({}); refreshing from detector checkpoint {}.",
+                artifact_path,
+                exc,
+                repo_filename,
+            )
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading {} backbone weights to {}", name_lower, artifact_path)
+    logger.info("Downloading {} detector weights to {}", name_lower, artifact_path)
     downloaded = hf_hub_download(
         repo_id="yuffeenn/TinyNeXt",
-        filename=_TINYNEXT_MODELS[name_lower],
+        filename=repo_filename,
         local_dir=artifact_path.parent,
         local_dir_use_symlinks=False,
     )
@@ -806,6 +904,234 @@ def _ensure_tinynext_artifact(name: str) -> Path:
     if downloaded_path.resolve() != artifact_path.resolve():
         artifact_path.write_bytes(downloaded_path.read_bytes())
     return artifact_path
+
+
+@contextmanager
+def _tinynext_mmengine_checkpoint_shim():
+    """Provide the minimal mmengine surface needed to unpickle TinyNeXt ckpts."""
+    previous_modules = {
+        name: sys.modules.get(name)
+        for name in (
+            "mmengine",
+            "mmengine.logging",
+            "mmengine.logging.history_buffer",
+        )
+    }
+
+    mmengine_module = types.ModuleType("mmengine")
+    logging_module = types.ModuleType("mmengine.logging")
+    history_module = types.ModuleType("mmengine.logging.history_buffer")
+
+    class HistoryBuffer:
+        max_length = 1_000_000
+
+        def __init__(self, *args, **kwargs):
+            self._log_history = []
+
+        @classmethod
+        def min(cls, *args, **kwargs):
+            return None
+
+        @classmethod
+        def max(cls, *args, **kwargs):
+            return None
+
+        @classmethod
+        def mean(cls, *args, **kwargs):
+            return None
+
+        @classmethod
+        def current(cls, *args, **kwargs):
+            return None
+
+    history_module.HistoryBuffer = HistoryBuffer
+    logging_module.history_buffer = history_module
+    mmengine_module.logging = logging_module
+
+    sys.modules["mmengine"] = mmengine_module
+    sys.modules["mmengine.logging"] = logging_module
+    sys.modules["mmengine.logging.history_buffer"] = history_module
+    try:
+        yield
+    finally:
+        for name, module in previous_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def _load_tinynext_checkpoint(path: str | Path, *, device: str | torch.device = "cpu") -> object:
+    checkpoint_path = str(path)
+    try:
+        return torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except (ModuleNotFoundError, AttributeError) as exc:
+        message = str(exc)
+        missing_mmengine = (
+            isinstance(exc, ModuleNotFoundError)
+            and str(getattr(exc, "name", "")).startswith("mmengine")
+        )
+        needs_history_buffer_shim = "HistoryBuffer" in message or "mmengine" in message
+        if not missing_mmengine and not needs_history_buffer_shim:
+            raise
+        with _tinynext_mmengine_checkpoint_shim():
+            return torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+
+def _extract_tinynext_checkpoint_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+    else:
+        state_dict = checkpoint
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"Unexpected TinyNeXt state dict type: {type(state_dict)!r}")
+    return {str(key): value for key, value in state_dict.items()}
+
+
+def _looks_like_tinynext_official_detector_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
+    return (
+        any(key.startswith("bbox_head.cls_convs.") for key in state_dict.keys())
+        and any(key.startswith("neck.extra_layers.") for key in state_dict.keys())
+        and any(key.startswith("backbone.") for key in state_dict.keys())
+    )
+
+
+def _looks_like_tinynext_internal_detector_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
+    return any(
+        key.startswith("head.")
+        or key.startswith("backbone.backbone.")
+        or key.startswith("backbone.extra.")
+        for key in state_dict.keys()
+    )
+
+
+def _tinynext_checkpoint_has_detector_weights(path: str | Path) -> bool:
+    checkpoint = _load_tinynext_checkpoint(path, device="cpu")
+    state_dict = _extract_tinynext_checkpoint_state_dict(checkpoint)
+    return (
+        _looks_like_tinynext_official_detector_state_dict(state_dict)
+        or _looks_like_tinynext_internal_detector_state_dict(state_dict)
+    )
+
+
+def _convert_tinynext_classifier_tensor(
+    tensor: torch.Tensor,
+    *,
+    target_num_classes: int,
+) -> torch.Tensor:
+    """Map TinyNeXt MMDetection SSD logits to torchvision's 91-class layout.
+
+    The upstream checkpoint stores 80 foreground classes followed by a final
+    background channel. Torchvision SSD expects background at index 0 and COCO
+    foreground labels laid out on the original 1..90 category IDs.
+    """
+    source_num_classes = 81
+    source_background_index = source_num_classes - 1
+    if tensor.shape[0] % source_num_classes != 0:
+        raise RuntimeError(
+            f"Unexpected TinyNeXt classifier tensor shape {tuple(tensor.shape)}; "
+            f"expected the leading dimension to be divisible by {source_num_classes}."
+        )
+
+    num_anchors = tensor.shape[0] // source_num_classes
+    converted_shape = (num_anchors * target_num_classes, *tensor.shape[1:])
+    converted = tensor.new_zeros(converted_shape)
+
+    for anchor_index in range(num_anchors):
+        source_start = anchor_index * source_num_classes
+        dest_start = anchor_index * target_num_classes
+        background_value = tensor[source_start + source_background_index].clone()
+        for dest_class in range(target_num_classes):
+            converted[dest_start + dest_class] = background_value
+        converted[dest_start] = background_value
+        for source_class in range(source_background_index):
+            mapped_label = COCO_80_TO_91[source_class]
+            if mapped_label >= target_num_classes:
+                continue
+            converted[dest_start + mapped_label] = tensor[source_start + source_class]
+    return converted
+
+
+def _map_tinynext_official_extra_key(key: str) -> str | None:
+    parts = key.split(".")
+    if len(parts) < 6:
+        return None
+    layer_index = parts[2]
+    block_index = parts[3]
+    if block_index == "0":
+        block_target = "0"
+        branch_kind = parts[4]
+        suffix = ".".join(parts[5:])
+        if branch_kind == "conv":
+            return f"backbone.extra.{layer_index}.{block_target}.0.{suffix}"
+        if branch_kind == "bn":
+            return f"backbone.extra.{layer_index}.{block_target}.1.{suffix}"
+        return None
+
+    if block_index != "1" or len(parts) < 7:
+        return None
+    branch_kind = parts[4]
+    op_kind = parts[5]
+    suffix = ".".join(parts[6:])
+    if branch_kind == "depthwise_conv":
+        target_block = "1"
+    elif branch_kind == "pointwise_conv":
+        target_block = "2"
+    else:
+        return None
+    if op_kind == "conv":
+        return f"backbone.extra.{layer_index}.{target_block}.0.{suffix}"
+    if op_kind == "bn":
+        return f"backbone.extra.{layer_index}.{target_block}.1.{suffix}"
+    return None
+
+
+def _map_tinynext_official_head_key(key: str, *, head_name: str) -> str | None:
+    parts = key.split(".")
+    if len(parts) < 5:
+        return None
+    layer_index = parts[2]
+    branch_index = parts[3]
+    base = f"head.{head_name}_head.module_list.{layer_index}"
+    if branch_index == "0" and len(parts) >= 6:
+        op_kind = parts[4]
+        suffix = ".".join(parts[5:])
+        if op_kind == "conv":
+            return f"{base}.0.0.{suffix}"
+        if op_kind == "bn":
+            return f"{base}.0.1.{suffix}"
+        return None
+    if branch_index == "1":
+        suffix = ".".join(parts[4:])
+        return f"{base}.1.{suffix}"
+    return None
+
+
+def _convert_tinynext_official_detector_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    target_num_classes: int,
+) -> dict[str, torch.Tensor]:
+    converted: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key: str | None = None
+        converted_value = value
+        if key.startswith("backbone."):
+            new_key = f"backbone.backbone.{key.split('backbone.', 1)[1]}"
+        elif key.startswith("neck.extra_layers."):
+            new_key = _map_tinynext_official_extra_key(key)
+        elif key.startswith("bbox_head.reg_convs."):
+            new_key = _map_tinynext_official_head_key(key, head_name="regression")
+        elif key.startswith("bbox_head.cls_convs."):
+            new_key = _map_tinynext_official_head_key(key, head_name="classification")
+            if key.endswith(".1.weight") or key.endswith(".1.bias"):
+                converted_value = _convert_tinynext_classifier_tensor(
+                    value,
+                    target_num_classes=target_num_classes,
+                )
+        if new_key is not None:
+            converted[new_key] = converted_value
+    return converted
 
 
 def _normalize_rfdetr_artifact(artifact_path: Path) -> bool:
@@ -855,7 +1181,7 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
             "Install: pip install rfdetr"
         )
 
-    from rfdetr.assets.model_weights import download_pretrain_weights
+    from rfdetr.assets.model_weights import ModelWeights, download_pretrain_weights
 
     # Once we normalize a downloaded checkpoint, its MD5 no longer matches the
     # original upstream training artifact. Reuse valid local files instead of
@@ -866,7 +1192,16 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
         logger.warning("Existing RF-DETR weights {} are unreadable; re-downloading.", artifact_path)
         artifact_path.unlink()
 
-    download_pretrain_weights(str(artifact_path))
+    asset = ModelWeights.from_filename(artifact_path.name)
+    if asset is not None:
+        logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+        _download_http_file_with_resume(
+            asset.url,
+            artifact_path,
+            expected_md5=asset.md5_hash,
+        )
+    else:
+        download_pretrain_weights(str(artifact_path))
     if artifact_path.is_file():
         _normalize_rfdetr_artifact(artifact_path)
     return artifact_path
@@ -943,12 +1278,14 @@ def build_detection_model(
             except TypeError:
                 model = build_fn(pretrained=False, pretrained_backbone=False, **kwargs)
 
+        ensure_detection_threshold_state(model, name_lower)
+
         if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
 
         if artifact_path is not None and artifact_path.is_file():
             state = torch.load(artifact_path, map_location=device, weights_only=False)
-            model.load_state_dict(state)
+            model.load_state_dict(state, strict=False)
             logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
 
         model.to(device)
@@ -1005,25 +1342,24 @@ def build_detection_model(
             state = torch.load(artifact_path, map_location=device, weights_only=False)
             if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
                 state = state["state_dict"]
+            elif isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+                state = state["model"]
             model.load_state_dict(state, strict=False)
             logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
         logger.info("[ModelZoo] Built RF-DETR model: {}", name)
         return model
 
     if name_lower in _TINYNEXT_MODELS:
+        checkpoint_state_dict: dict[str, torch.Tensor] | None = None
         backbone_weights_path = None
         if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
-            backbone_weights_path = str(artifact_path)
-        elif artifact_path is not None and artifact_path.is_file():
-            state = torch.load(artifact_path, map_location="cpu", weights_only=False)
-            state_dict = state.get("state_dict", state) if isinstance(state, dict) else state
+        if artifact_path is not None and artifact_path.is_file():
+            checkpoint = _load_tinynext_checkpoint(artifact_path, device="cpu")
+            checkpoint_state_dict = _extract_tinynext_checkpoint_state_dict(checkpoint)
             if not (
-                isinstance(state_dict, dict)
-                and any(
-                    str(key).startswith("backbone.backbone.") or str(key).startswith("head.")
-                    for key in state_dict.keys()
-                )
+                _looks_like_tinynext_official_detector_state_dict(checkpoint_state_dict)
+                or _looks_like_tinynext_internal_detector_state_dict(checkpoint_state_dict)
             ):
                 backbone_weights_path = str(artifact_path)
         model = build_tinynext_detector(
@@ -1032,11 +1368,14 @@ def build_detection_model(
             device=device,
             backbone_weights_path=backbone_weights_path,
         )
-        if artifact_path is not None and artifact_path.is_file() and backbone_weights_path is None:
-            state = torch.load(artifact_path, map_location=device, weights_only=False)
-            if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
-                state = state["state_dict"]
-            model.load_state_dict(state, strict=False)
+        ensure_detection_threshold_state(model, name_lower)
+        if checkpoint_state_dict is not None and backbone_weights_path is None:
+            if _looks_like_tinynext_official_detector_state_dict(checkpoint_state_dict):
+                checkpoint_state_dict = _convert_tinynext_official_detector_state_dict(
+                    checkpoint_state_dict,
+                    target_num_classes=num_classes,
+                )
+            model.load_state_dict(checkpoint_state_dict, strict=False)
             logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
         model.eval()
         logger.info("[ModelZoo] Built TinyNeXt detector: {}", name)
@@ -1150,3 +1489,128 @@ def get_model_family(name: str) -> str:
     if name_lower in _TINYNEXT_MODELS:
         return "tinynext"
     return "unknown"
+
+
+def get_detection_thresholds(model_name: str) -> tuple[float, float]:
+    """Return model-family-aware low/high confidence cut-offs.
+
+    The legacy 0.2/0.6 thresholds work well for YOLO-style detectors, but they
+    are too aggressive for detector families whose public scores are naturally
+    lower in this repository's wrapper pipeline, notably RF-DETR and TinyNeXt.
+    """
+    family = get_model_family(model_name)
+    if family == "rfdetr":
+        return 0.01, 0.05
+    if family == "tinynext":
+        return 0.02, 0.10
+    return 0.2, 0.6
+
+
+_DETECTION_THRESHOLD_LOW_BUFFER = "plank_threshold_low"
+_DETECTION_THRESHOLD_HIGH_BUFFER = "plank_threshold_high"
+
+
+def ensure_detection_threshold_state(model: nn.Module, model_name: str) -> None:
+    """Attach persistent threshold buffers used by serialized detector states."""
+    if not hasattr(model, "register_buffer") or not hasattr(model, "_buffers"):
+        return
+
+    default_low, default_high = get_detection_thresholds(model_name)
+
+    if _DETECTION_THRESHOLD_LOW_BUFFER not in model._buffers:
+        model.register_buffer(
+            _DETECTION_THRESHOLD_LOW_BUFFER,
+            torch.tensor(float(default_low), dtype=torch.float32),
+            persistent=True,
+        )
+    if _DETECTION_THRESHOLD_HIGH_BUFFER not in model._buffers:
+        model.register_buffer(
+            _DETECTION_THRESHOLD_HIGH_BUFFER,
+            torch.tensor(float(default_high), dtype=torch.float32),
+            persistent=True,
+        )
+
+
+def get_model_detection_thresholds(
+    model: nn.Module | None,
+    model_name: str | None = None,
+) -> tuple[float, float]:
+    """Return model-specific thresholds, preferring serialized overrides."""
+    default_low, default_high = get_detection_thresholds(str(model_name or ""))
+    if model is None:
+        return default_low, default_high
+
+    low_buffer = getattr(model, _DETECTION_THRESHOLD_LOW_BUFFER, None)
+    high_buffer = getattr(model, _DETECTION_THRESHOLD_HIGH_BUFFER, None)
+    if torch.is_tensor(low_buffer) and torch.is_tensor(high_buffer):
+        low_value = float(low_buffer.detach().cpu().item())
+        high_value = float(high_buffer.detach().cpu().item())
+        if np.isfinite(low_value) and np.isfinite(high_value) and 0.0 <= low_value <= high_value:
+            return low_value, high_value
+    return default_low, default_high
+
+
+def set_model_detection_thresholds(
+    model: nn.Module,
+    *,
+    threshold_low: float,
+    threshold_high: float,
+    model_name: str | None = None,
+) -> None:
+    """Persist calibrated detection thresholds inside the model state_dict."""
+    ensure_detection_threshold_state(model, str(model_name or ""))
+    getattr(model, _DETECTION_THRESHOLD_LOW_BUFFER).fill_(float(threshold_low))
+    getattr(model, _DETECTION_THRESHOLD_HIGH_BUFFER).fill_(float(threshold_high))
+
+
+def set_detection_trainable_params(model: nn.Module, model_name: str) -> None:
+    """Freeze a detector, then unfreeze the task-specific trainable tail."""
+    for param in model.parameters():
+        param.requires_grad = False
+
+    family = get_model_family(str(model_name))
+    if model_has_roi_heads(model):
+        for param in model.roi_heads.parameters():
+            param.requires_grad = True
+        return
+
+    if family == "tinynext":
+        if hasattr(model, "backbone") and hasattr(model.backbone, "extra"):
+            for param in model.backbone.extra.parameters():
+                param.requires_grad = True
+        if hasattr(model, "head"):
+            for param in model.head.parameters():
+                param.requires_grad = True
+        return
+
+    if is_wrapper_model(model_name):
+        all_params = list(model.parameters())
+        trainable_start = int(len(all_params) * 0.8)
+        for param in all_params[trainable_start:]:
+            param.requires_grad = True
+        return
+
+    head_attrs = ("head", "classification_head", "regression_head")
+    found = False
+    for attr in head_attrs:
+        if hasattr(model, attr):
+            for param in getattr(model, attr).parameters():
+                param.requires_grad = True
+            found = True
+    if found:
+        return
+
+    all_params = list(model.parameters())
+    trainable_start = int(len(all_params) * 0.8)
+    for param in all_params[trainable_start:]:
+        param.requires_grad = True
+
+
+def set_detection_finetune_mode(model: nn.Module, model_name: str) -> None:
+    """Enable training mode while keeping fragile normalization stats stable."""
+    model.train()
+    family = get_model_family(str(model_name))
+    if family == "tinynext":
+        for module in model.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()

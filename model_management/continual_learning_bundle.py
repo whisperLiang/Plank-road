@@ -115,6 +115,7 @@ def prepare_split_training_cache(
     target_cache_path: str,
     *,
     feature_provider: Callable[[str, dict[str, Any], dict[str, Any]], Any] | None = None,
+    prefer_feature_rebuild: bool = False,
 ) -> dict[str, Any]:
     manifest = load_training_bundle_manifest(bundle_root)
     os.makedirs(target_cache_path, exist_ok=True)
@@ -149,7 +150,7 @@ def prepare_split_training_cache(
             if raw_relpath is not None
             else None
         )
-        if bundled_feature:
+        if bundled_feature and not prefer_feature_rebuild:
             intermediate = _load_intermediate(
                 os.path.join(bundle_root, bundled_feature.replace("/", os.sep))
             )
@@ -171,6 +172,11 @@ def prepare_split_training_cache(
                 raise RuntimeError(
                     f"Sample {sample_id} requires server-side feature reconstruction, "
                     "but no feature provider is configured."
+                )
+            if bundled_feature and prefer_feature_rebuild:
+                logger.warning(
+                    "Rebuilding bundled sample {} features on the server because this model requires trace-stable payloads.",
+                    sample_id,
                 )
             intermediate = feature_provider(raw_path, sample, manifest)
 

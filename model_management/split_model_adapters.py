@@ -529,9 +529,14 @@ def _postprocess_rfdetr_output(
     target_sizes = torch.as_tensor([list(image_size)], dtype=torch.long, device=model._device)
     post = model.rfdetr.model.postprocess(predictions, target_sizes=target_sizes)[0]
     keep = post["scores"] > threshold
+    raw_labels = post["labels"][keep].detach().to(model._device).long()
+    if getattr(model, "num_classes", 0) >= 91:
+        labels = raw_labels
+    else:
+        labels = raw_labels + 1
     return [{
         "boxes": post["boxes"][keep].detach().to(model._device).float(),
-        "labels": post["labels"][keep].detach().to(model._device).long() + 1,
+        "labels": labels,
         "scores": post["scores"][keep].detach().to(model._device).float(),
     }]
 
@@ -982,8 +987,11 @@ def _build_rfdetr_training_labels(
         boxes = boxes[:count]
         labels = labels[:count]
 
-    labels = labels - 1
-    valid = (labels >= 0) & (labels < int(num_classes))
+    if int(num_classes) >= 90:
+        valid = (labels > 0) & (labels <= int(num_classes))
+    else:
+        labels = labels - 1
+        valid = (labels >= 0) & (labels < int(num_classes))
     if boxes.numel():
         valid = valid & (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
     boxes = boxes[valid]

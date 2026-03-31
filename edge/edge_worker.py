@@ -464,9 +464,10 @@ class EdgeWorker:
                     buf = io.BytesIO(base64.b64decode(model_b64))
                     state_dict = torch.load(buf, map_location="cpu", weights_only=False)
                     with self.small_object_detection.model_lock:
-                        self.small_object_detection.model.load_state_dict(state_dict)
+                        self.small_object_detection.model.load_state_dict(state_dict, strict=False)
                         self.small_object_detection.model.eval()
                         self.small_object_detection.get_split_runtime_model().eval()
+                        self.small_object_detection.refresh_thresholds_from_model()
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
                     self.drift_detector.reset()

@@ -374,8 +374,10 @@ def build_tinynext_detector(
         nms_thresh=0.45,
         detections_per_img=200,
         topk_candidates=1000,
-        image_mean=[0.5, 0.5, 0.5],
-        image_std=[0.5, 0.5, 0.5],
+        # Mirror the upstream MMDetection preprocessor:
+        # RGB tensors are in [0, 1], so mean/std need to be scaled from 0-255.
+        image_mean=[128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0],
+        image_std=[1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0],
     )
     model.to(device)
     return model

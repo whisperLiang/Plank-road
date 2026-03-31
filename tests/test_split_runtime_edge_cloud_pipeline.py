@@ -11,12 +11,21 @@ import numpy as np
 import pytest
 import torch
 
-from cloud_server import CloudContinualLearner, _select_fixed_split_gt_sample_ids
+from cloud_server import (
+    CloudContinualLearner,
+    _calibrate_tinynext_proxy_thresholds,
+    _requires_trace_stable_feature_rebuild,
+    _select_fixed_split_gt_sample_ids,
+)
 from edge.sample_store import EdgeSampleStore, LOW_CONFIDENCE
 from edge.transmit import pack_continual_learning_bundle
 from model_management.continual_learning_bundle import CONTINUAL_LEARNING_PROTOCOL_VERSION
+from model_management.detection_dataset import TrafficDataset
 from model_management.fixed_split import SplitPlan
-from model_management.model_zoo import build_detection_model
+from model_management.model_zoo import (
+    build_detection_model,
+    get_model_detection_thresholds,
+)
 from model_management.object_detection import Object_Detection
 from model_management.payload import SplitPayload
 from model_management.split_model_adapters import (
@@ -130,6 +139,32 @@ def test_large_inference_accepts_threshold_override():
     assert scores == [0.42]
 
 
+def test_wrapper_fixed_split_hparams_use_conservative_rfdetr_defaults():
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    rfdetr_epochs, rfdetr_lr = learner._resolve_wrapper_fixed_split_hparams(
+        "rfdetr_nano",
+        requested_num_epoch=2,
+    )
+    yolo_epochs, yolo_lr = learner._resolve_wrapper_fixed_split_hparams(
+        "yolov8n",
+        requested_num_epoch=2,
+    )
+
+    assert rfdetr_epochs == 2
+    assert rfdetr_lr == pytest.approx(1e-6)
+    assert yolo_epochs == 10
+    assert yolo_lr == pytest.approx(3e-5)
+
+
 def test_select_fixed_split_gt_sample_ids_includes_raw_plus_feature_low_conf_samples():
     manifest = {
         "drift_sample_ids": [],
@@ -150,6 +185,106 @@ def test_select_fixed_split_gt_sample_ids_includes_raw_plus_feature_low_conf_sam
     )
 
     assert selected == ["sample-1"]
+
+
+def test_generate_annotations_writes_teacher_rows_with_mixed_numpy_types(tmp_path, monkeypatch):
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    frame = np.full((12, 12, 3), 80, dtype=np.uint8)
+    assert cv2.imwrite(str(frame_dir / "300.jpg"), frame)
+
+    config = SimpleNamespace(
+        edge_model_name="tinynext_s",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_teacher_inference",
+        lambda _frame: (
+            np.array([[1.25, 2.5, 8.75, 10.0]], dtype=np.float32),
+            np.array([3], dtype=np.int64),
+            np.array([0.95], dtype=np.float32),
+        ),
+    )
+
+    annotation_path = learner._generate_annotations(
+        edge_id=1,
+        frame_indices=[300],
+        cache_path=str(tmp_path),
+    )
+
+    assert Path(annotation_path).is_file()
+    dataset = TrafficDataset(root=str(tmp_path), select_index=[300])
+    assert len(dataset) == 1
+    _, target = dataset[0]
+    assert target["labels"].tolist() == [3]
+    assert target["boxes"].shape == (1, 4)
+
+
+def test_calibrate_tinynext_proxy_thresholds_picks_best_near_default_threshold(monkeypatch):
+    model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
+
+    def fake_evaluate(_model, **kwargs):
+        high = round(float(kwargs["threshold_high"]), 3)
+        if high == pytest.approx(0.098):
+            return {
+                "map": 0.1905,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 42,
+            }
+        if high == pytest.approx(0.094):
+            return {
+                "map": 0.1905,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 45,
+            }
+        if high == pytest.approx(0.092):
+            return {
+                "map": 0.1905,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 48,
+            }
+        return {
+            "map": 0.1853,
+            "evaluated_samples": 1,
+            "skipped_empty_gt": 0,
+            "skipped_missing_frame": 0,
+            "total_gt_samples": 1,
+            "nonempty_predictions": 1,
+            "total_prediction_boxes": 41,
+        }
+
+    monkeypatch.setattr("cloud_server._evaluate_detection_proxy_map", fake_evaluate)
+
+    metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+        model,
+        frame_dir="/tmp/unused",
+        gt_annotations={"300": {"boxes": [[1.0, 1.0, 6.0, 6.0]], "labels": [1]}},
+        device=torch.device("cpu"),
+        model_name="tinynext_s",
+    )
+
+    assert initial_high == pytest.approx(0.10)
+    assert calibrated_high == pytest.approx(0.098)
+    assert metrics["map"] == pytest.approx(0.1905)
+    assert get_model_detection_thresholds(model, "tinynext_s") == pytest.approx((0.02, 0.098))
 
 
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)
@@ -584,3 +719,140 @@ def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf
 
     assert edge_before == pytest.approx(0.1)
     assert edge_after == pytest.approx(0.9)
+
+
+def test_tinynext_fixed_split_rebuilds_trace_stable_features_on_server(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+        def forward(self, images):
+            score = float(self.weight.detach().cpu().item())
+            if score <= 0.0:
+                return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
+                    "scores": torch.tensor([score], dtype=torch.float32),
+                }
+            ]
+
+    config = SimpleNamespace(
+        edge_model_name="tinynext_s",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+
+    split_plan = _dummy_split_plan(model_name="tinynext_s")
+    sample_store = EdgeSampleStore(str(tmp_path / "sample_store"))
+    raw_frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    sample_store.store_sample(
+        sample_id="sample-1",
+        frame_index=1,
+        confidence=0.1,
+        split_config_id=split_plan.split_config_id,
+        model_id="tinynext_s",
+        model_version="0",
+        confidence_bucket=LOW_CONFIDENCE,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_planned_payload(split_plan),
+        drift_flag=False,
+        raw_frame=raw_frame,
+        input_image_size=[8, 8],
+        input_tensor_shape=[1, 3, 8, 8],
+    )
+    payload_zip, _ = pack_continual_learning_bundle(
+        sample_store,
+        edge_id=1,
+        send_low_conf_features=True,
+        split_plan=split_plan,
+        model_id="tinynext_s",
+        model_version="0",
+    )
+
+    bundle_root = tmp_path / "bundle"
+    with zipfile.ZipFile(io.BytesIO(payload_zip)) as zf:
+        zf.extractall(bundle_root)
+
+    prepared_candidate = SimpleNamespace(
+        candidate_id="prepared-candidate",
+        legacy_layer_index=7,
+        boundary_tensor_labels=["prepared-boundary"],
+    )
+    cloud_model = DummyModel(weight=0.1)
+    captured_prepare_kwargs = {}
+
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: cloud_model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *args, **kwargs: ("prepared-splitter", prepared_candidate),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_teacher_targets",
+        lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]},
+    )
+
+    def fake_prepare_split_training_cache(bundle_root_arg, working_cache_arg, **kwargs):
+        captured_prepare_kwargs.update(kwargs)
+        frames_dir = Path(working_cache_arg) / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        assert cv2.imwrite(str(frames_dir / "sample-1.jpg"), raw_frame)
+        return {"all_sample_ids": ["sample-1"], "drift_sample_ids": []}
+
+    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
+
+    def fake_universal_split_retrain(*, model, gt_annotations, **kwargs):
+        assert kwargs["splitter"] == "prepared-splitter"
+        assert kwargs["chosen_candidate"] is prepared_candidate
+        assert kwargs["all_indices"] == ["sample-1"]
+        assert gt_annotations == {"sample-1": {"boxes": [[1, 1, 6, 6]], "labels": [1]}}
+        with torch.no_grad():
+            model.weight.fill_(0.9)
+        return [0.1]
+
+    monkeypatch.setattr("cloud_server.universal_split_retrain", fake_universal_split_retrain)
+
+    def fake_evaluate_proxy_map(model, **kwargs):
+        score = float(model.weight.detach().cpu().item())
+        return {
+            "map": score,
+            "evaluated_samples": 1,
+            "skipped_empty_gt": 0,
+            "skipped_missing_frame": 0,
+            "total_gt_samples": 1,
+            "nonempty_predictions": 1,
+            "total_prediction_boxes": 1,
+        }
+
+    monkeypatch.setattr("cloud_server._evaluate_detection_proxy_map", fake_evaluate_proxy_map)
+
+    success, _, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(bundle_root),
+        num_epoch=2,
+    )
+
+    assert _requires_trace_stable_feature_rebuild("tinynext_s") is True
+    assert captured_prepare_kwargs["prefer_feature_rebuild"] is True
+    assert success is True
+    assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message

@@ -10,11 +10,13 @@ Tests for model_management/ module:
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 from PIL import Image
 
 from model_management.model_info import model_lib, COCO_INSTANCE_CATEGORY_NAMES, classes
@@ -29,15 +31,22 @@ from model_management.detection_transforms import Compose, ToTensor, Resize
 from model_management.detection_metric import RetrainMetric
 from model_management.detection_dataset import DetectionDataset
 from model_management.model_zoo import (
+    COCO_80_TO_91,
     build_detection_model,
     ensure_local_model_artifact,
+    get_detection_thresholds,
+    get_model_detection_thresholds,
     get_model_artifact_path,
     get_models_dir,
     list_available_models,
     get_model_family,
     is_wrapper_model,
     model_has_roi_heads,
+    set_detection_finetune_mode,
+    set_detection_trainable_params,
+    set_model_detection_thresholds,
 )
+from model_management.split_model_adapters import _build_rfdetr_training_labels
 
 
 # =====================================================================
@@ -71,6 +80,11 @@ class TestModelInfo:
 
     def test_yolo26_family(self):
         assert model_lib["yolo26n"]["family"] == "yolo"
+
+    def test_model_specific_detection_thresholds(self):
+        assert get_detection_thresholds("rfdetr_nano") == (0.01, 0.05)
+        assert get_detection_thresholds("tinynext_s") == (0.02, 0.10)
+        assert get_detection_thresholds("yolov8n") == (0.2, 0.6)
 
     def test_model_paths_are_local_relative_paths(self):
         for info in model_lib.values():
@@ -280,6 +294,21 @@ class TestRetrainMetric:
         assert abs(result["loss_classifier"] - 2.0) < 1e-5  # avg(1,2,3)
         assert abs(result["total_loss"] - 8.0) < 1e-5  # avg(4,8,12)
 
+    def test_update_accepts_non_torchvision_loss_names(self):
+        metric = RetrainMetric()
+        metric.reset_metrics()
+        loss_dict = {
+            "classification": torch.tensor(1.5),
+            "bbox_regression": torch.tensor(0.7),
+        }
+
+        metric.update(loss_dict, torch.tensor(2.2))
+        result = metric.compute()
+
+        assert abs(result["classification"] - 1.5) < 1e-5
+        assert abs(result["bbox_regression"] - 0.7) < 1e-5
+        assert abs(result["total_loss"] - 2.2) < 1e-5
+
 
 # =====================================================================
 # detection_dataset
@@ -444,6 +473,217 @@ class TestModelZoo:
         assert captured["model_name"] == "rfdetr_nano"
         assert captured["pretrained"] is True
         assert captured["pretrain_weights"] == str(artifact_path)
+
+    def test_build_rfdetr_detector_unwraps_nested_model_checkpoint(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "rf-detr-large.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": {"weight": torch.tensor([3.14])}}, artifact_path)
+
+        captured: dict[str, object] = {}
+
+        class DummyRFDETRDetectionModel:
+            def __init__(self, **kwargs):
+                captured["init_kwargs"] = kwargs
+
+            def load_state_dict(self, state_dict, strict=True):
+                captured["loaded_state_dict"] = state_dict
+                captured["strict"] = strict
+                return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+        monkeypatch.setattr(model_zoo_module, "RFDETRDetectionModel", DummyRFDETRDetectionModel)
+
+        build_detection_model(
+            "rfdetr_large",
+            pretrained=False,
+            device="cpu",
+            weights_path=str(artifact_path),
+        )
+
+        assert captured["strict"] is False
+        assert captured["loaded_state_dict"] == {"weight": torch.tensor([3.14])}
+
+    def test_rfdetr_coco_labels_are_not_shifted_again(self):
+        import model_management.model_zoo as model_zoo_module
+
+        model = model_zoo_module.RFDETRDetectionModel.__new__(model_zoo_module.RFDETRDetectionModel)
+        nn.Module.__init__(model)
+        model.confidence = 0.01
+        model.num_classes = 91
+        model._device = torch.device("cpu")
+        model._prepare_batch = lambda images: (torch.zeros((1, 3, 8, 8)), [(8, 8)])
+        model.rfdetr = SimpleNamespace(
+            model=SimpleNamespace(
+                model=lambda batch: {
+                    "pred_logits": torch.zeros((1, 1, 90)),
+                    "pred_boxes": torch.zeros((1, 1, 4)),
+                },
+                postprocess=lambda predictions, target_sizes: [
+                    {
+                        "scores": torch.tensor([0.9]),
+                        "labels": torch.tensor([3]),
+                        "boxes": torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+                    }
+                ],
+            )
+        )
+
+        output = model.forward([torch.rand(3, 8, 8)])[0]
+
+        assert output["labels"].tolist() == [3]
+
+    def test_build_tinynext_detector_unwraps_nested_full_detector_checkpoint(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "tinynext_s.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": {"head.weight": torch.tensor([1.23])}}, artifact_path)
+
+        captured: dict[str, object] = {}
+
+        class DummyTinyNeXtDetector:
+            def eval(self):
+                return self
+
+            def load_state_dict(self, state_dict, strict=True):
+                captured["loaded_state_dict"] = state_dict
+                captured["strict"] = strict
+                return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+        monkeypatch.setattr(
+            model_zoo_module,
+            "build_tinynext_detector",
+            lambda *args, **kwargs: DummyTinyNeXtDetector(),
+        )
+
+        build_detection_model(
+            "tinynext_s",
+            pretrained=False,
+            device="cpu",
+            weights_path=str(artifact_path),
+        )
+
+        assert captured["strict"] is False
+        assert captured["loaded_state_dict"] == {"head.weight": torch.tensor([1.23])}
+
+    def test_build_tinynext_detector_converts_official_detector_checkpoint(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "tinynext_s.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(b"tinynext")
+
+        official_state = {
+            "backbone.embeds.0.0.0.weight": torch.tensor([1.0]),
+            "neck.extra_layers.0.0.conv.weight": torch.tensor([2.0]),
+            "bbox_head.reg_convs.0.0.conv.weight": torch.tensor([3.0]),
+            "bbox_head.cls_convs.0.0.conv.weight": torch.tensor([4.0]),
+            "bbox_head.cls_convs.0.1.weight": torch.arange(81.0).view(81, 1, 1, 1),
+            "bbox_head.cls_convs.0.1.bias": torch.arange(81.0),
+        }
+
+        captured: dict[str, object] = {}
+
+        class DummyTinyNeXtDetector:
+            def eval(self):
+                return self
+
+            def load_state_dict(self, state_dict, strict=True):
+                captured["loaded_state_dict"] = state_dict
+                captured["strict"] = strict
+                return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+        monkeypatch.setattr(
+            model_zoo_module,
+            "_load_tinynext_checkpoint",
+            lambda *args, **kwargs: {"state_dict": official_state},
+        )
+        monkeypatch.setattr(
+            model_zoo_module,
+            "build_tinynext_detector",
+            lambda *args, **kwargs: DummyTinyNeXtDetector(),
+        )
+
+        build_detection_model(
+            "tinynext_s",
+            pretrained=False,
+            device="cpu",
+            weights_path=str(artifact_path),
+        )
+
+        loaded_state = captured["loaded_state_dict"]
+        assert captured["strict"] is False
+        assert loaded_state["backbone.backbone.embeds.0.0.0.weight"].item() == pytest.approx(1.0)
+        assert loaded_state["backbone.extra.0.0.0.weight"].item() == pytest.approx(2.0)
+        assert loaded_state["head.regression_head.module_list.0.0.0.weight"].item() == pytest.approx(3.0)
+        assert loaded_state["head.classification_head.module_list.0.0.0.weight"].item() == pytest.approx(4.0)
+        cls_weight = loaded_state["head.classification_head.module_list.0.1.weight"]
+        cls_bias = loaded_state["head.classification_head.module_list.0.1.bias"]
+        assert tuple(cls_weight.shape) == (91, 1, 1, 1)
+        assert tuple(cls_bias.shape) == (91,)
+        assert cls_weight[0].item() == pytest.approx(80.0)
+        assert cls_weight[COCO_80_TO_91[0]].item() == pytest.approx(0.0)
+        assert cls_weight[12].item() == pytest.approx(80.0)
+        assert cls_weight[COCO_80_TO_91[11]].item() == pytest.approx(11.0)
+        assert cls_bias[0].item() == pytest.approx(80.0)
+        assert cls_bias[COCO_80_TO_91[0]].item() == pytest.approx(0.0)
+        assert cls_bias[12].item() == pytest.approx(80.0)
+        assert cls_bias[COCO_80_TO_91[11]].item() == pytest.approx(11.0)
+
+    def test_set_detection_trainable_params_unfreezes_tinynext_extra_and_head(self):
+        model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
+
+        set_detection_trainable_params(model, "tinynext_s")
+
+        assert any(param.requires_grad for param in model.backbone.extra.parameters())
+        assert any(param.requires_grad for param in model.head.parameters())
+        assert not any(param.requires_grad for param in model.backbone.backbone.parameters())
+
+    def test_tinynext_detection_thresholds_roundtrip_through_state_dict(self):
+        model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
+        set_model_detection_thresholds(
+            model,
+            threshold_low=0.02,
+            threshold_high=0.098,
+            model_name="tinynext_s",
+        )
+
+        reloaded = build_detection_model("tinynext_s", pretrained=False, device="cpu")
+        reloaded.load_state_dict(model.state_dict(), strict=False)
+
+        assert get_model_detection_thresholds(reloaded, "tinynext_s") == pytest.approx((0.02, 0.098))
+
+    def test_set_detection_finetune_mode_keeps_tinynext_batch_norm_in_eval(self):
+        model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
+        set_detection_trainable_params(model, "tinynext_s")
+
+        set_detection_finetune_mode(model, "tinynext_s")
+
+        assert model.training is True
+        assert model.head.training is True
+        batch_norm_layers = [
+            module for module in model.modules()
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+        ]
+        assert batch_norm_layers
+        assert all(layer.training is False for layer in batch_norm_layers)
+
+    def test_rfdetr_training_labels_keep_coco_category_ids(self):
+        labels = _build_rfdetr_training_labels(
+            {
+                "boxes": [[1.0, 2.0, 6.0, 7.0]],
+                "labels": [3],
+                "_split_meta": {
+                    "input_image_size": [8, 8],
+                    "input_tensor_shape": [1, 3, 8, 8],
+                },
+            },
+            device=torch.device("cpu"),
+            num_classes=90,
+        )
+
+        assert labels[0]["labels"].tolist() == [3]
 
     def test_build_yolo26_detector_from_yaml_when_pretrained_false(self):
         model = build_detection_model("yolo26n", pretrained=False, device="cpu")
