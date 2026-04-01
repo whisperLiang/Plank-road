@@ -45,12 +45,13 @@ Usage
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 import hashlib
 import sys
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import requests
 import torch
@@ -61,6 +62,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from loguru import logger
 from torch.hub import download_url_to_file
 from torchvision import transforms
+from torchvision.ops import batched_nms
 
 # ---------------------------------------------------------------------------
 # Required dependencies
@@ -394,6 +396,8 @@ class RFDETRDetectionModel(nn.Module):
             kwargs["pretrain_weights"] = None
         self.rfdetr = variant_cls(**kwargs)
         self.rfdetr.model.model.to(self._device)
+        ensure_detection_threshold_state(self, self.model_name)
+        ensure_rfdetr_serialization_state(self)
 
     @property
     def resolution(self) -> int:
@@ -439,27 +443,14 @@ class RFDETRDetectionModel(nn.Module):
             }
 
         target_sizes = torch.as_tensor(original_sizes, device=self._device)
-        results = self.rfdetr.model.postprocess(predictions, target_sizes=target_sizes)
-
-        detections: List[Dict[str, torch.Tensor]] = []
-        for result in results:
-            scores = result["scores"]
-            keep = scores > self.confidence
-            boxes = result["boxes"][keep].detach().cpu().float()
-            raw_labels = result["labels"][keep].detach().cpu().long()
-            if self.num_classes >= 91:
-                # RF-DETR's COCO checkpoints already emit the repository's
-                # 91-index label IDs (for example car=3, stop sign=13).
-                labels = raw_labels
-            else:
-                labels = raw_labels + 1
-            kept_scores = scores[keep].detach().cpu().float()
-            detections.append({
-                "boxes": boxes,
-                "labels": labels,
-                "scores": kept_scores,
-            })
-        return detections
+        return _postprocess_rfdetr_predictions(
+            predictions,
+            target_sizes=target_sizes,
+            threshold=float(self.confidence),
+            num_classes=self.num_classes,
+            num_select=getattr(self.rfdetr.model.postprocess, "num_select", predictions["pred_logits"].shape[1]),
+            device=self._device,
+        )
 
     def train(self, mode: bool = True):
         self.rfdetr.model.model.train(mode)
@@ -472,10 +463,25 @@ class RFDETRDetectionModel(nn.Module):
         return self.rfdetr.model.model.parameters(recurse)
 
     def state_dict(self, *args, **kwargs):
-        return self.rfdetr.model.model.state_dict(*args, **kwargs)
+        combined = OrderedDict(self.rfdetr.model.model.state_dict(*args, **kwargs))
+        wrapper_state = nn.Module.state_dict(self, *args, **kwargs)
+        for key in (
+            _DETECTION_THRESHOLD_LOW_BUFFER,
+            _DETECTION_THRESHOLD_HIGH_BUFFER,
+            _RFDETR_CACHE_VERSION_BUFFER,
+        ):
+            value = wrapper_state.get(key)
+            if torch.is_tensor(value):
+                combined[key] = value
+        return combined
 
     def load_state_dict(self, state_dict, strict=True):
-        return self.rfdetr.model.model.load_state_dict(state_dict, strict=strict)
+        if not isinstance(state_dict, Mapping):
+            return self.rfdetr.model.model.load_state_dict(state_dict, strict=strict)
+        wrapper_state, core_state = _split_rfdetr_serialized_state_dict(state_dict)
+        if wrapper_state:
+            nn.Module.load_state_dict(self, wrapper_state, strict=False)
+        return self.rfdetr.model.model.load_state_dict(core_state, strict=strict)
 
     def to(self, device):
         self._device = torch.device(device)
@@ -1474,7 +1480,7 @@ def get_detection_thresholds(model_name: str) -> tuple[float, float]:
     """
     family = get_model_family(model_name)
     if family == "rfdetr":
-        return 0.01, 0.05
+        return 0.05, 0.20
     if family == "tinynext":
         return 0.02, 0.10
     return 0.2, 0.6
@@ -1482,6 +1488,9 @@ def get_detection_thresholds(model_name: str) -> tuple[float, float]:
 
 _DETECTION_THRESHOLD_LOW_BUFFER = "plank_threshold_low"
 _DETECTION_THRESHOLD_HIGH_BUFFER = "plank_threshold_high"
+_RFDETR_CACHE_VERSION_BUFFER = "plank_rfdetr_cache_version"
+_RFDETR_CACHE_FORMAT_VERSION = 1.0
+_RFDETR_NMS_IOU_THRESHOLD = 0.85
 
 
 def ensure_detection_threshold_state(model: nn.Module, model_name: str) -> None:
@@ -1503,6 +1512,154 @@ def ensure_detection_threshold_state(model: nn.Module, model_name: str) -> None:
             torch.tensor(float(default_high), dtype=torch.float32),
             persistent=True,
         )
+
+
+def ensure_rfdetr_serialization_state(model: nn.Module) -> None:
+    """Attach RF-DETR-specific metadata buffers used to validate cached weights."""
+    if not hasattr(model, "register_buffer") or not hasattr(model, "_buffers"):
+        return
+    if _RFDETR_CACHE_VERSION_BUFFER not in model._buffers:
+        model.register_buffer(
+            _RFDETR_CACHE_VERSION_BUFFER,
+            torch.tensor(float(_RFDETR_CACHE_FORMAT_VERSION), dtype=torch.float32),
+            persistent=True,
+        )
+
+
+def has_compatible_rfdetr_cache_state(state_dict: object) -> bool:
+    if not isinstance(state_dict, dict):
+        return False
+    version_value = state_dict.get(_RFDETR_CACHE_VERSION_BUFFER)
+    if not torch.is_tensor(version_value):
+        return False
+    try:
+        version = float(version_value.detach().cpu().item())
+    except Exception:
+        return False
+    return version >= _RFDETR_CACHE_FORMAT_VERSION
+
+
+def _split_rfdetr_serialized_state_dict(
+    state_dict: Mapping[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    wrapper_keys = {
+        _DETECTION_THRESHOLD_LOW_BUFFER,
+        _DETECTION_THRESHOLD_HIGH_BUFFER,
+        _RFDETR_CACHE_VERSION_BUFFER,
+    }
+    wrapper_state: dict[str, torch.Tensor] = {}
+    core_state: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if key in wrapper_keys:
+            wrapper_state[key] = value
+        else:
+            core_state[key] = value
+    return wrapper_state, core_state
+
+
+def _postprocess_rfdetr_predictions(
+    predictions: Mapping[str, torch.Tensor],
+    *,
+    target_sizes: torch.Tensor,
+    threshold: float,
+    num_classes: int,
+    num_select: int,
+    device: torch.device,
+) -> list[dict[str, torch.Tensor]]:
+    """Decode RF-DETR outputs into one label per query plus light NMS.
+
+    The upstream ``PostProcess`` flattens ``query x class`` scores and can emit
+    multiple classes for the same query. For this repository's edge/cloud
+    pipeline we need stable, de-duplicated detections for confidence bucketing
+    and proxy-mAP evaluation, so we collapse each query to its best class first
+    and then apply a conservative per-class NMS pass.
+    """
+    pred_logits = predictions["pred_logits"]
+    pred_boxes = predictions["pred_boxes"]
+    if pred_logits.ndim != 3 or pred_boxes.ndim != 3:
+        raise RuntimeError("RF-DETR predictions must be [batch, queries, classes/4] tensors.")
+
+    probabilities = pred_logits.sigmoid()
+    if probabilities.shape[-1] > 1:
+        probabilities = probabilities[..., :-1]
+
+    scores_per_query, labels_per_query = probabilities.max(dim=-1)
+    cx, cy, width, height = pred_boxes.unbind(-1)
+    boxes_per_query = torch.stack(
+        (
+            cx - width * 0.5,
+            cy - height * 0.5,
+            cx + width * 0.5,
+            cy + height * 0.5,
+        ),
+        dim=-1,
+    )
+    image_heights = target_sizes[:, 0].to(dtype=boxes_per_query.dtype)
+    image_widths = target_sizes[:, 1].to(dtype=boxes_per_query.dtype)
+    scale = torch.stack((image_widths, image_heights, image_widths, image_heights), dim=-1)
+    boxes_per_query = boxes_per_query * scale.unsqueeze(1)
+    boxes_per_query[..., 0::2] = boxes_per_query[..., 0::2].clamp(min=0)
+    boxes_per_query[..., 1::2] = boxes_per_query[..., 1::2].clamp(min=0)
+    boxes_per_query[..., 0] = torch.minimum(boxes_per_query[..., 0], image_widths.unsqueeze(1))
+    boxes_per_query[..., 2] = torch.minimum(boxes_per_query[..., 2], image_widths.unsqueeze(1))
+    boxes_per_query[..., 1] = torch.minimum(boxes_per_query[..., 1], image_heights.unsqueeze(1))
+    boxes_per_query[..., 3] = torch.minimum(boxes_per_query[..., 3], image_heights.unsqueeze(1))
+    detections: list[dict[str, torch.Tensor]] = []
+
+    for batch_index in range(pred_logits.shape[0]):
+        scores = scores_per_query[batch_index]
+        labels = labels_per_query[batch_index]
+        boxes = boxes_per_query[batch_index]
+
+        if scores.numel():
+            topk = min(int(num_select), int(scores.numel()))
+            top_scores, top_indices = torch.topk(scores, topk, dim=0)
+            scores = top_scores
+            labels = labels.index_select(0, top_indices)
+            boxes = boxes.index_select(0, top_indices)
+
+        keep = scores > float(threshold)
+        if not torch.any(keep):
+            detections.append({
+                "boxes": boxes.new_zeros((0, 4), dtype=torch.float32).cpu(),
+                "labels": labels.new_zeros((0,), dtype=torch.int64).cpu(),
+                "scores": scores.new_zeros((0,), dtype=torch.float32).cpu(),
+            })
+            continue
+
+        boxes = boxes[keep]
+        labels = labels[keep]
+        scores = scores[keep]
+
+        boxes = boxes.float()
+        scores = scores.float()
+        labels = labels.long()
+        valid_geometry = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+        boxes = boxes[valid_geometry]
+        labels = labels[valid_geometry]
+        scores = scores[valid_geometry]
+
+        if boxes.numel():
+            nms_keep = batched_nms(boxes, scores, labels, _RFDETR_NMS_IOU_THRESHOLD)
+            boxes = boxes.index_select(0, nms_keep)
+            labels = labels.index_select(0, nms_keep)
+            scores = scores.index_select(0, nms_keep)
+
+        order = torch.argsort(scores, descending=True)
+        boxes = boxes.index_select(0, order)
+        labels = labels.index_select(0, order)
+        scores = scores.index_select(0, order)
+
+        if int(num_classes) >= 91:
+            labels = labels + 1
+
+        detections.append({
+            "boxes": boxes.detach().to(device="cpu", dtype=torch.float32),
+            "labels": labels.detach().to(device="cpu", dtype=torch.int64),
+            "scores": scores.detach().to(device="cpu", dtype=torch.float32),
+        })
+
+    return detections
 
 
 def get_model_detection_thresholds(

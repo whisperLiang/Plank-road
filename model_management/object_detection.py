@@ -278,16 +278,15 @@ class Object_Detection:
             )
 
         confidence = float(np.mean(pred_score)) if len(pred_score) else 0.0
-        try:
-            prediction_index = [pred_score.index(x) for x in pred_score if x > self.threshold_high][-1]
-        except IndexError:
+        high_keep_indices = [index for index, score in enumerate(pred_score) if score > self.threshold_high]
+        if not high_keep_indices:
             detection_boxes = []
             detection_class = []
             detection_score = []
         else:
-            detection_boxes = pred_boxes[:prediction_index + 1]
-            detection_class = pred_class[:prediction_index + 1]
-            detection_score = pred_score[:prediction_index + 1]
+            detection_boxes = [pred_boxes[index] for index in high_keep_indices]
+            detection_class = [pred_class[index] for index in high_keep_indices]
+            detection_score = [pred_score[index] for index in high_keep_indices]
 
         return InferenceArtifacts(
             intermediate=split_payload,
@@ -361,11 +360,10 @@ class Object_Detection:
         prediction_boxes = boxes_t.detach().cpu().tolist()
         prediction_score = scores_t.detach().cpu().tolist()
 
-        try:
-            prediction_t = [prediction_score.index(x) for x in prediction_score if x > threshold][-1]
-        except IndexError:
+        keep_indices = [index for index, score in enumerate(prediction_score) if score > threshold]
+        if not keep_indices:
             return None, None, None
-        pred_boxes = prediction_boxes[:prediction_t + 1]
-        pred_class = prediction_class[:prediction_t + 1]
-        pred_score = prediction_score[:prediction_t + 1]
+        pred_boxes = [prediction_boxes[index] for index in keep_indices]
+        pred_class = [prediction_class[index] for index in keep_indices]
+        pred_score = [prediction_score[index] for index in keep_indices]
         return pred_boxes, pred_class, pred_score

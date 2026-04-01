@@ -20,6 +20,7 @@ from model_management.model_zoo import (
     RFDETRDetectionModel,
     RTDETRDetectionModel,
     YOLODetectionModel,
+    _postprocess_rfdetr_predictions,
 )
 from model_management.ultralytics_parity import (
     postprocess_predictions,
@@ -534,17 +535,18 @@ def _postprocess_rfdetr_output(
 ) -> list[dict[str, torch.Tensor]]:
     predictions = _extract_rfdetr_outputs(outputs)
     target_sizes = torch.as_tensor([list(image_size)], dtype=torch.long, device=model._device)
-    post = model.rfdetr.model.postprocess(predictions, target_sizes=target_sizes)[0]
-    keep = post["scores"] > threshold
-    raw_labels = post["labels"][keep].detach().to(model._device).long()
-    if getattr(model, "num_classes", 0) >= 91:
-        labels = raw_labels
-    else:
-        labels = raw_labels + 1
+    decoded = _postprocess_rfdetr_predictions(
+        predictions,
+        target_sizes=target_sizes,
+        threshold=float(threshold),
+        num_classes=getattr(model, "num_classes", 91),
+        num_select=getattr(model.rfdetr.model.postprocess, "num_select", predictions["pred_logits"].shape[1]),
+        device=model._device,
+    )[0]
     return [{
-        "boxes": post["boxes"][keep].detach().to(model._device).float(),
-        "labels": labels,
-        "scores": post["scores"][keep].detach().to(model._device).float(),
+        "boxes": decoded["boxes"].detach().to(model._device).float(),
+        "labels": decoded["labels"].detach().to(model._device).long(),
+        "scores": decoded["scores"].detach().to(model._device).float(),
     }]
 
 

@@ -182,19 +182,17 @@ def _prediction_from_model_output(
     low_indices = [index for index, score in enumerate(scores) if score > threshold_low]
     if not low_indices:
         return empty
-    low_cutoff = low_indices[-1] + 1
-    labels = labels[:low_cutoff]
-    boxes = boxes[:low_cutoff]
-    scores = scores[:low_cutoff]
+    labels = [labels[index] for index in low_indices]
+    boxes = [boxes[index] for index in low_indices]
+    scores = [scores[index] for index in low_indices]
 
     high_indices = [index for index, score in enumerate(scores) if score > threshold_high]
     if not high_indices:
         return empty
-    high_cutoff = high_indices[-1] + 1
     return {
-        "labels": labels[:high_cutoff],
-        "boxes": boxes[:high_cutoff],
-        "scores": scores[:high_cutoff],
+        "labels": [labels[index] for index in high_indices],
+        "boxes": [boxes[index] for index in high_indices],
+        "scores": [scores[index] for index in high_indices],
     }
 
 
@@ -573,6 +571,7 @@ class CloudContinualLearner:
         from model_management.model_zoo import (
             build_detection_model,
             ensure_local_model_artifact,
+            has_compatible_rfdetr_cache_state,
             is_wrapper_model,
         )
 
@@ -610,7 +609,11 @@ class CloudContinualLearner:
                     f"failed to read cached weights from {candidate_weights}: {exc}"
                 )
             else:
-                if is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
+                if str(model_name).lower().startswith("rfdetr_") and not has_compatible_rfdetr_cache_state(state):
+                    fallback_reason = (
+                        "cached RF-DETR weights use a legacy cache format and may come from stale or broken checkpoints"
+                    )
+                elif is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
                     fallback_reason = (
                         "cached wrapper weights look like a fused Ultralytics state_dict"
                     )

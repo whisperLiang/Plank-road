@@ -487,6 +487,57 @@ def test_load_edge_training_model_recovers_from_corrupted_cached_weights(tmp_pat
     assert "weight" in recovered_state
 
 
+def test_load_edge_training_model_rejects_legacy_rfdetr_cached_weights(tmp_path, monkeypatch):
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+            self.register_buffer("plank_rfdetr_cache_version", torch.tensor(1.0, dtype=torch.float32))
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path)
+
+    cached_weights = tmp_path / "tmp_edge_model_rfdetr_nano.pth"
+    torch.save({"weight": torch.tensor([5.0], dtype=torch.float32)}, cached_weights)
+    artifact_path = tmp_path / "rf-detr-nano.pth"
+    torch.save({"model": {"weight": torch.tensor([1.0], dtype=torch.float32)}}, artifact_path)
+
+    build_calls: list[dict[str, object]] = []
+
+    def fake_build_detection_model(model_name, pretrained=False, device="cpu", **kwargs):
+        build_calls.append({
+            "model_name": model_name,
+            "pretrained": bool(pretrained),
+            "device": str(device),
+            "weights_path": kwargs.get("weights_path"),
+        })
+        return DummyModel()
+
+    monkeypatch.setattr("model_management.model_zoo.build_detection_model", fake_build_detection_model)
+    monkeypatch.setattr("model_management.model_zoo.ensure_local_model_artifact", lambda _: artifact_path)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
+
+    model = learner._load_edge_training_model(model_name="rfdetr_nano")
+
+    assert isinstance(model, DummyModel)
+    assert build_calls == [{
+        "model_name": "rfdetr_nano",
+        "pretrained": True,
+        "device": str(learner.device),
+        "weights_path": str(artifact_path),
+    }]
+    recovered_state = torch.load(cached_weights, map_location="cpu", weights_only=False)
+    assert "plank_rfdetr_cache_version" in recovered_state
+
+
 def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, monkeypatch):
     class DummyModel(torch.nn.Module):
         def __init__(self):

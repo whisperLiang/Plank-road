@@ -38,6 +38,7 @@ from model_management.model_zoo import (
     get_model_detection_thresholds,
     get_model_artifact_path,
     get_models_dir,
+    has_compatible_rfdetr_cache_state,
     list_available_models,
     get_model_family,
     is_wrapper_model,
@@ -82,7 +83,7 @@ class TestModelInfo:
         assert model_lib["yolo26n"]["family"] == "yolo"
 
     def test_model_specific_detection_thresholds(self):
-        assert get_detection_thresholds("rfdetr_nano") == (0.01, 0.05)
+        assert get_detection_thresholds("rfdetr_nano") == (0.05, 0.2)
         assert get_detection_thresholds("tinynext_s") == (0.02, 0.10)
         assert get_detection_thresholds("yolov8n") == (0.2, 0.6)
 
@@ -486,6 +487,22 @@ class TestModelZoo:
         assert captured["strict"] is False
         assert captured["loaded_state_dict"] == {"weight": torch.tensor([1.0])}
 
+    def test_rfdetr_detection_thresholds_roundtrip_through_state_dict(self):
+        model = build_detection_model("rfdetr_nano", pretrained=False, device="cpu")
+        set_model_detection_thresholds(
+            model,
+            threshold_low=0.05,
+            threshold_high=0.2,
+            model_name="rfdetr_nano",
+        )
+
+        state = model.state_dict()
+        reloaded = build_detection_model("rfdetr_nano", pretrained=False, device="cpu")
+        reloaded.load_state_dict(state, strict=False)
+
+        assert has_compatible_rfdetr_cache_state(state) is True
+        assert get_model_detection_thresholds(reloaded, "rfdetr_nano") == pytest.approx((0.05, 0.2))
+
     def test_build_rfdetr_detector_unwraps_nested_model_checkpoint(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
 
@@ -525,11 +542,13 @@ class TestModelZoo:
         model.num_classes = 91
         model._device = torch.device("cpu")
         model._prepare_batch = lambda images: (torch.zeros((1, 3, 8, 8)), [(8, 8)])
+        logits = torch.full((1, 1, 90), -10.0, dtype=torch.float32)
+        logits[0, 0, 2] = 5.0
         model.rfdetr = SimpleNamespace(
             model=SimpleNamespace(
                 model=lambda batch: {
-                    "pred_logits": torch.zeros((1, 1, 90)),
-                    "pred_boxes": torch.zeros((1, 1, 4)),
+                    "pred_logits": logits,
+                    "pred_boxes": torch.tensor([[[0.25, 0.375, 0.25, 0.25]]], dtype=torch.float32),
                 },
                 postprocess=lambda predictions, target_sizes: [
                     {
@@ -544,6 +563,46 @@ class TestModelZoo:
         output = model.forward([torch.rand(3, 8, 8)])[0]
 
         assert output["labels"].tolist() == [3]
+
+    def test_rfdetr_forward_collapses_duplicate_query_labels_and_applies_nms(self):
+        import model_management.model_zoo as model_zoo_module
+
+        model = model_zoo_module.RFDETRDetectionModel.__new__(model_zoo_module.RFDETRDetectionModel)
+        nn.Module.__init__(model)
+        model.confidence = 0.05
+        model.num_classes = 91
+        model._device = torch.device("cpu")
+        model._prepare_batch = lambda images: (torch.zeros((1, 3, 8, 8)), [(8, 8)])
+
+        logits = torch.full((1, 2, 91), -10.0, dtype=torch.float32)
+        logits[0, 0, 2] = 5.0
+        logits[0, 0, 7] = 4.9
+        logits[0, 1, 2] = 4.8
+        boxes_cxcywh = torch.tensor(
+            [[[0.4375, 0.4375, 0.625, 0.625], [0.45, 0.4375, 0.625, 0.625]]],
+            dtype=torch.float32,
+        )
+        model.rfdetr = SimpleNamespace(
+            model=SimpleNamespace(
+                model=lambda batch: {
+                    "pred_logits": logits,
+                    "pred_boxes": boxes_cxcywh,
+                },
+                postprocess=lambda predictions, target_sizes: [
+                    {
+                        "scores": torch.tensor([0.99, 0.98], dtype=torch.float32),
+                        "labels": torch.tensor([2, 7], dtype=torch.int64),
+                        "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0], [1.1, 1.0, 6.1, 6.0]], dtype=torch.float32),
+                    }
+                ],
+            )
+        )
+
+        output = model.forward([torch.rand(3, 8, 8)])[0]
+
+        assert output["labels"].tolist() == [3]
+        assert len(output["boxes"]) == 1
+        assert output["scores"][0].item() == pytest.approx(torch.sigmoid(torch.tensor(5.0)).item())
 
     def test_build_tinynext_detector_unwraps_nested_full_detector_checkpoint(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
