@@ -26,13 +26,6 @@ from model_management.payload import SplitPayload
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_runtime import GraphSplitRuntime
 
-try:
-    import torchlens as tl
-
-    _HAS_TORCHLENS = True
-except ImportError:  # pragma: no cover - import guard
-    _HAS_TORCHLENS = False
-
 
 @dataclass
 class LayerInfo:
@@ -702,7 +695,6 @@ def universal_split_retrain(
 
 
 __all__ = [
-    "_HAS_TORCHLENS",
     "CandidateProfile",
     "LayerInfo",
     "LayerProfile",

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-
 import pytest
 import torch
 import torch.nn as nn
@@ -22,6 +20,7 @@ from model_management.universal_model_split import (
     save_split_feature_cache,
     universal_split_retrain,
 )
+from tests.split_runtime_helpers import collect_valid_candidates, payload_without_boundary
 
 
 class ToyDagNet(nn.Module):
@@ -77,23 +76,6 @@ def _make_residual_model() -> tuple[nn.Module, torch.Tensor]:
     return model, sample
 
 
-def _validate_candidates(
-    splitter: UniversalModelSplitter,
-    candidates,
-    *,
-    minimum_valid: int = 2,
-):
-    valid = []
-    for candidate in candidates:
-        report = splitter.validate_candidate(candidate)
-        if report["success"]:
-            valid.append((candidate, report))
-        if len(valid) >= minimum_valid:
-            break
-    assert len(valid) >= minimum_valid
-    return valid
-
-
 @pytest.mark.parametrize(
     ("factory", "minimum_nodes"),
     [
@@ -120,7 +102,7 @@ def test_graph_build_candidate_enumeration_pruning_and_replay(factory, minimum_n
     assert len(pruned) <= len(generated)
 
     expected = model(sample)
-    valid = _validate_candidates(splitter, pruned[:6], minimum_valid=2)
+    valid = collect_valid_candidates(splitter, pruned[:6], minimum_valid=2)
 
     for candidate, _ in valid[:2]:
         splitter.split(candidate_id=candidate.candidate_id)
@@ -268,20 +250,7 @@ def test_dag_boundary_payload_is_minimal_and_cache_independent():
     assert ok, max_diff
 
     for removed_label in list(payload.boundary_tensor_labels):
-        reduced = OrderedDict(
-            (label, tensor)
-            for label, tensor in payload.tensors.items()
-            if label != removed_label
-        )
-        broken_payload = SplitPayload(
-            tensors=reduced,
-            metadata=dict(payload.metadata),
-            candidate_id=payload.candidate_id,
-            boundary_tensor_labels=list(reduced.keys()),
-            primary_label=next(reversed(reduced.keys())) if reduced else None,
-            split_index=payload.split_index,
-            split_label=payload.split_label,
-        )
+        broken_payload = payload_without_boundary(payload, removed_label)
         with pytest.raises(RuntimeError):
             splitter.cloud_forward(broken_payload, candidate=candidate)
 
@@ -335,7 +304,7 @@ def test_payload_cache_and_universal_split_retrain(tmp_path):
     splitter = UniversalModelSplitter(device="cpu")
     splitter.trace(model, sample)
     candidates = splitter.enumerate_candidates(max_candidates=4)
-    candidate, _ = _validate_candidates(splitter, candidates, minimum_valid=1)[0]
+    candidate, _ = collect_valid_candidates(splitter, candidates, minimum_valid=1)[0]
     splitter.split(candidate_id=candidate.candidate_id)
     payload = splitter.edge_forward(sample)
 

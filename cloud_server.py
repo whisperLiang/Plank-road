@@ -30,12 +30,12 @@ from edge.info import TASK_STATE
 from grpc_server.rpc_server import MessageTransmissionServicer
 from tools.grpc_options import grpc_message_options
 
+import model_management.model_zoo as model_zoo
 from model_management.object_detection import Object_Detection
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
 from model_management.model_zoo import (
-    ensure_local_model_artifact,
     get_detection_thresholds,
     get_model_detection_thresholds,
     invalidate_wrapper_predictor,
@@ -48,16 +48,11 @@ from model_management.split_model_adapters import (
     get_split_runtime_model,
     prepare_split_runtime_input,
 )
-# Universal model splitting (optional, requires torchlens)
-try:
-    from model_management.universal_model_split import (
-        UniversalModelSplitter,
-        universal_split_retrain,
-        load_split_feature_cache,
-    )
-    _HAS_UNIVERSAL_SPLIT = True
-except ImportError:
-    _HAS_UNIVERSAL_SPLIT = False
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
+    universal_split_retrain,
+    load_split_feature_cache,
+)
 from model_management.continual_learning_bundle import (
     CONTINUAL_LEARNING_PROTOCOL_VERSION,
     load_training_bundle_manifest,
@@ -567,14 +562,30 @@ class CloudContinualLearner:
             return bundle_model_id
         return bundle_model_id or self.edge_model_name
 
-    def _load_edge_training_model(self, *, model_name: str | None = None) -> torch.nn.Module:
-        from model_management.model_zoo import (
-            build_detection_model,
-            ensure_local_model_artifact,
-            has_compatible_rfdetr_cache_state,
-            is_wrapper_model,
-        )
+    def _native_training_source_label(self, model_name: str) -> str:
+        return "pretrained" if model_name in model_lib else "randomly initialised"
 
+    def _build_native_training_model(self, model_name: str) -> torch.nn.Module:
+        source_label = self._native_training_source_label(model_name)
+        build_kwargs = {
+            "pretrained": source_label == "pretrained",
+            "device": self.device,
+        }
+        if source_label == "pretrained":
+            try:
+                artifact_path = model_zoo.ensure_local_model_artifact(model_name)
+            except Exception as exc:
+                logger.warning(
+                    "[CL] Failed to resolve native weights for {}: {}",
+                    model_name,
+                    exc,
+                )
+            else:
+                if artifact_path.exists():
+                    build_kwargs["weights_path"] = str(artifact_path)
+        return model_zoo.build_detection_model(model_name, **build_kwargs)
+
+    def _load_edge_training_model(self, *, model_name: str | None = None) -> torch.nn.Module:
         model_name = str(model_name or self.edge_model_name)
         edge_weights = self._edge_weights_path(model_name)
         legacy_weights = self._legacy_edge_weights_path()
@@ -584,26 +595,7 @@ class CloudContinualLearner:
             if candidate_weights == edge_weights
             else "legacy cache"
         )
-        prefer_pretrained = model_name in model_lib
-
-        def _build_native_model() -> torch.nn.Module:
-            build_kwargs = {
-                "pretrained": prefer_pretrained,
-                "device": self.device,
-            }
-            if prefer_pretrained:
-                try:
-                    artifact_path = ensure_local_model_artifact(model_name)
-                except Exception as exc:
-                    logger.warning(
-                        "[CL] Failed to resolve native weights for {}: {}",
-                        model_name,
-                        exc,
-                    )
-                else:
-                    if artifact_path.exists():
-                        build_kwargs["weights_path"] = str(artifact_path)
-            return build_detection_model(model_name, **build_kwargs)
+        native_source_label = self._native_training_source_label(model_name)
 
         if os.path.exists(candidate_weights):
             fallback_reason = None
@@ -614,16 +606,20 @@ class CloudContinualLearner:
                     f"failed to read cached weights from {candidate_weights}: {exc}"
                 )
             else:
-                if str(model_name).lower().startswith("rfdetr_") and not has_compatible_rfdetr_cache_state(state):
+                if str(model_name).lower().startswith("rfdetr_") and not model_zoo.has_compatible_rfdetr_cache_state(state):
                     fallback_reason = (
                         "cached RF-DETR weights use a legacy cache format and may come from stale or broken checkpoints"
                     )
-                elif is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
+                elif model_zoo.is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
                     fallback_reason = (
                         "cached wrapper weights look like a fused Ultralytics state_dict"
                     )
                 else:
-                    tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
+                    tmp_model = model_zoo.build_detection_model(
+                        model_name,
+                        pretrained=False,
+                        device=self.device,
+                    )
                     try:
                         load_result = tmp_model.load_state_dict(state, strict=False)
                     except Exception as exc:
@@ -649,24 +645,24 @@ class CloudContinualLearner:
                 logger.warning(
                     "[CL] {}. Falling back to native {} weights for {}.",
                     fallback_reason,
-                    "pretrained" if prefer_pretrained else "randomly initialised",
+                    native_source_label,
                     model_name,
                 )
-                tmp_model = _build_native_model()
+                tmp_model = self._build_native_training_model(model_name)
                 torch.save(tmp_model.state_dict(), edge_weights)
                 logger.info(
                     "[CL] Refreshed {} edge cache at {} using native {} weights.",
                     model_name,
                     edge_weights,
-                    "pretrained" if prefer_pretrained else "randomly initialised",
+                    native_source_label,
                 )
         else:
             logger.info(
                 "[CL] No cached {} weights found; starting from native {} weights.",
                 model_name,
-                "pretrained" if prefer_pretrained else "randomly initialised",
+                native_source_label,
             )
-            tmp_model = _build_native_model()
+            tmp_model = self._build_native_training_model(model_name)
         tmp_model.to(self.device)
         get_split_runtime_model(tmp_model).eval()
         return tmp_model
@@ -809,6 +805,185 @@ class CloudContinualLearner:
         effective_num_epoch = max(int(requested_num_epoch), int(min_epochs))
         return effective_num_epoch, float(learning_rate)
 
+    def _prepare_fixed_split_working_cache(
+        self,
+        model: torch.nn.Module,
+        manifest: dict[str, object],
+        *,
+        bundle_cache_path: str,
+        working_cache: str,
+        requires_trace_stable_rebuild: bool,
+    ) -> tuple[dict[str, object], str, UniversalModelSplitter | None, object | None]:
+        prepared_splitter = None
+        prepared_candidate = None
+        if os.path.isdir(working_cache):
+            shutil.rmtree(working_cache, ignore_errors=True)
+
+        provider_kwargs = {}
+        if requires_trace_stable_rebuild:
+            prepared_splitter, prepared_candidate = self._build_bundle_splitter(
+                model,
+                manifest,
+                bundle_root=bundle_cache_path,
+            )
+            provider_kwargs = {
+                "splitter": prepared_splitter,
+                "candidate": prepared_candidate,
+            }
+
+        prepare_kwargs = {
+            "feature_provider": self._bundle_feature_provider(
+                model,
+                manifest,
+                bundle_root=bundle_cache_path,
+                **provider_kwargs,
+            ),
+        }
+        if requires_trace_stable_rebuild:
+            prepare_kwargs["prefer_feature_rebuild"] = True
+
+        bundle_info = prepare_split_training_cache(
+            bundle_cache_path,
+            working_cache,
+            **prepare_kwargs,
+        )
+        return bundle_info, os.path.join(working_cache, "frames"), prepared_splitter, prepared_candidate
+
+    def _collect_teacher_annotations(
+        self,
+        frame_dir: str,
+        sample_ids,
+        *,
+        missing_raw_message: str | None = None,
+        key_transform=None,
+    ) -> dict:
+        transform = key_transform or (lambda sample_id: sample_id)
+        annotations = {}
+        for sample_id in sample_ids:
+            img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
+            if not os.path.exists(img_path):
+                if missing_raw_message is not None:
+                    logger.warning(missing_raw_message, sample_id)
+                continue
+            frame = cv2.imread(img_path)
+            if frame is None:
+                continue
+            teacher_targets = self._build_teacher_targets(frame)
+            if teacher_targets is None:
+                continue
+            annotations[transform(sample_id)] = teacher_targets
+        return annotations
+
+    def _evaluate_fixed_split_proxy_map(
+        self,
+        model: torch.nn.Module,
+        *,
+        frame_dir: str,
+        gt_annotations: Mapping[str, Mapping[str, object]],
+        model_name: str,
+    ) -> dict[str, float | int | None]:
+        return _evaluate_detection_proxy_map(
+            model,
+            frame_dir=frame_dir,
+            gt_annotations=gt_annotations,
+            device=self.device,
+            model_name=model_name,
+        )
+
+    def _run_fixed_split_retrain(
+        self,
+        model: torch.nn.Module,
+        *,
+        current_model_name: str,
+        bundle_info: dict[str, object],
+        manifest: dict[str, object],
+        bundle_cache_path: str,
+        working_cache: str,
+        frame_dir: str,
+        gt_annotations: dict[str, dict],
+        num_epoch: int,
+        proxy_metrics_before: dict[str, float | int | None],
+        prepared_splitter: UniversalModelSplitter | None,
+        prepared_candidate,
+    ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
+        baseline_state = _snapshot_model_state(model)
+        effective_num_epoch = num_epoch
+        effective_learning_rate = self.default_split_learning_rate
+        if gt_annotations and model_zoo.is_wrapper_model(current_model_name):
+            tuned_num_epoch, tuned_learning_rate = self._resolve_wrapper_fixed_split_hparams(
+                current_model_name,
+                requested_num_epoch=effective_num_epoch,
+            )
+            if tuned_num_epoch != effective_num_epoch:
+                logger.info(
+                    "[FixedSplitCL] Promoting wrapper fixed-split retraining epochs from {} to {}.",
+                    effective_num_epoch,
+                    tuned_num_epoch,
+                )
+                effective_num_epoch = tuned_num_epoch
+            effective_learning_rate = tuned_learning_rate
+            logger.info(
+                "[FixedSplitCL] Using wrapper fixed-split learning rate {}.",
+                effective_learning_rate,
+            )
+
+        split_retrain_kwargs = {
+            "model": get_split_runtime_model(model),
+            "sample_input": self._build_bundle_trace_sample_input(
+                model,
+                bundle_cache_path,
+                manifest,
+            ),
+            "cache_path": working_cache,
+            "all_indices": bundle_info["all_sample_ids"],
+            "gt_annotations": gt_annotations,
+            "device": self.device,
+            "learning_rate": effective_learning_rate,
+            "loss_fn": build_split_training_loss(model),
+            "das_enabled": self.das_enabled,
+            "das_bn_only": self.das_bn_only,
+            "das_probe_samples": self.das_probe_samples,
+            "splitter": prepared_splitter,
+            "chosen_candidate": prepared_candidate,
+        }
+        if gt_annotations and str(current_model_name).lower().startswith("rfdetr_"):
+            best_state = baseline_state
+            best_metrics = dict(proxy_metrics_before)
+            for epoch_index in range(int(effective_num_epoch)):
+                universal_split_retrain(
+                    **split_retrain_kwargs,
+                    num_epoch=1,
+                )
+                candidate_metrics = self._evaluate_fixed_split_proxy_map(
+                    model,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    model_name=current_model_name,
+                )
+                if _proxy_metrics_are_better(candidate_metrics, best_metrics):
+                    best_state = _snapshot_model_state(model)
+                    best_metrics = dict(candidate_metrics)
+                    logger.info(
+                        "[FixedSplitCL] Kept RF-DETR candidate from epoch {} with proxy_mAP@0.5={:.4f}.",
+                        epoch_index + 1,
+                        float(candidate_metrics.get("map") or 0.0),
+                    )
+            model.load_state_dict(best_state)
+            _set_detection_model_eval_mode(model)
+            return dict(best_metrics), baseline_state
+
+        universal_split_retrain(
+            **split_retrain_kwargs,
+            num_epoch=effective_num_epoch,
+        )
+        proxy_metrics_after = self._evaluate_fixed_split_proxy_map(
+            model,
+            frame_dir=frame_dir,
+            gt_annotations=gt_annotations,
+            model_name=current_model_name,
+        )
+        return proxy_metrics_after, baseline_state
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -894,20 +1069,12 @@ class CloudContinualLearner:
                 )
 
                 # 1. Annotate **only** drift frames with the large model
-                gt_annotations: dict[int, dict] = {}
                 frame_dir = os.path.join(cache_path, "frames")
-                for idx in drift_frame_indices or []:
-                    img_path = os.path.join(frame_dir, f"{idx}.jpg")
-                    if not os.path.exists(img_path):
-                        logger.warning("[SplitCL] Drift frame {} not found, skipping.", idx)
-                        continue
-                    frame = cv2.imread(img_path)
-                    if frame is None:
-                        continue
-                    teacher_targets = self._build_teacher_targets(frame)
-                    if teacher_targets is None:
-                        continue
-                    gt_annotations[idx] = teacher_targets
+                gt_annotations = self._collect_teacher_annotations(
+                    frame_dir,
+                    drift_frame_indices or [],
+                    missing_raw_message="[SplitCL] Drift frame {} not found, skipping.",
+                )
                 logger.info(
                     "[SplitCL] Annotated {} drift frames with large model.",
                     len(gt_annotations),
@@ -955,80 +1122,33 @@ class CloudContinualLearner:
 
                 tmp_model = self._load_edge_training_model(model_name=current_model_name)
                 working_cache = os.path.join(bundle_cache_path, "working_cache")
-                prepared_splitter = None
-                prepared_candidate = None
-                if os.path.isdir(working_cache):
-                    shutil.rmtree(working_cache, ignore_errors=True)
-
-                def _prepare_working_cache(model: torch.nn.Module) -> dict[str, object]:
-                    nonlocal prepared_splitter, prepared_candidate
-                    if os.path.isdir(working_cache):
-                        shutil.rmtree(working_cache, ignore_errors=True)
-                    provider_kwargs = {}
-                    if requires_trace_stable_rebuild:
-                        prepared_splitter, prepared_candidate = self._build_bundle_splitter(
-                            model,
-                            manifest,
-                            bundle_root=bundle_cache_path,
-                        )
-                        provider_kwargs = {
-                            "splitter": prepared_splitter,
-                            "candidate": prepared_candidate,
-                        }
-                    prepare_kwargs = {
-                        "feature_provider": self._bundle_feature_provider(
-                            model,
-                            manifest,
-                            bundle_root=bundle_cache_path,
-                            **provider_kwargs,
-                        ),
-                    }
-                    if requires_trace_stable_rebuild:
-                        prepare_kwargs["prefer_feature_rebuild"] = True
-                    return prepare_split_training_cache(
-                        bundle_cache_path,
-                        working_cache,
-                        **prepare_kwargs,
+                bundle_info, frame_dir, prepared_splitter, prepared_candidate = (
+                    self._prepare_fixed_split_working_cache(
+                        tmp_model,
+                        manifest,
+                        bundle_cache_path=bundle_cache_path,
+                        working_cache=working_cache,
+                        requires_trace_stable_rebuild=requires_trace_stable_rebuild,
                     )
-
-                bundle_info = _prepare_working_cache(tmp_model)
-
-                gt_annotations: dict[str, dict] = {}
-                frame_dir = os.path.join(working_cache, "frames")
+                )
                 gt_sample_ids = _select_fixed_split_gt_sample_ids(
                     manifest,
                     prepared_sample_ids=bundle_info["all_sample_ids"],
                 )
-                for sample_id in gt_sample_ids:
-                    img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
-                    if not os.path.exists(img_path):
-                        logger.warning(
-                            "[FixedSplitCL] GT sample {} missing raw frame.",
-                            sample_id,
-                        )
-                        continue
-                    frame = cv2.imread(img_path)
-                    if frame is None:
-                        continue
-                    teacher_targets = self._build_teacher_targets(frame)
-                    if teacher_targets is None:
-                        continue
-                    gt_annotations[str(sample_id)] = teacher_targets
+                gt_annotations = self._collect_teacher_annotations(
+                    frame_dir,
+                    gt_sample_ids,
+                    missing_raw_message="[FixedSplitCL] GT sample {} missing raw frame.",
+                    key_transform=str,
+                )
 
-                proxy_metrics_before = _evaluate_detection_proxy_map(
+                proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
                     tmp_model,
                     frame_dir=frame_dir,
                     gt_annotations=gt_annotations,
-                    device=self.device,
                     model_name=current_model_name,
                 )
-
-                from model_management.model_zoo import (
-                    build_detection_model,
-                    ensure_local_model_artifact,
-                    is_wrapper_model,
-                )
-                is_wrapper_fixed_split = bool(is_wrapper_model(current_model_name))
+                is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
 
                 if (
                     gt_annotations
@@ -1050,122 +1170,40 @@ class CloudContinualLearner:
                             current_model_name,
                             len(gt_annotations),
                         )
-                        reset_kwargs = {
-                            "pretrained": True,
-                            "device": self.device,
-                        }
-                        try:
-                            artifact_path = ensure_local_model_artifact(current_model_name)
-                        except Exception as exc:
-                            logger.warning(
-                                "[FixedSplitCL] Failed to resolve native weights for {} during reset: {}",
-                                current_model_name,
-                                exc,
-                            )
-                        else:
-                            if artifact_path.exists():
-                                reset_kwargs["weights_path"] = str(artifact_path)
-                        tmp_model = build_detection_model(
-                            current_model_name,
-                            **reset_kwargs,
-                        )
+                        tmp_model = self._build_native_training_model(current_model_name)
                         baseline_source = "native pretrained"
                         tmp_model.to(self.device)
                         get_split_runtime_model(tmp_model).eval()
-                        bundle_info = _prepare_working_cache(tmp_model)
-                        frame_dir = os.path.join(working_cache, "frames")
-                        proxy_metrics_before = _evaluate_detection_proxy_map(
-                            tmp_model,
-                            frame_dir=frame_dir,
-                            gt_annotations=gt_annotations,
-                            device=self.device,
-                            model_name=current_model_name,
-                        )
-
-                baseline_state = _snapshot_model_state(tmp_model)
-                effective_num_epoch = num_epoch
-                effective_learning_rate = self.default_split_learning_rate
-                if gt_annotations and is_wrapper_fixed_split:
-                    tuned_num_epoch, tuned_learning_rate = self._resolve_wrapper_fixed_split_hparams(
-                        current_model_name,
-                        requested_num_epoch=effective_num_epoch,
-                    )
-                    if tuned_num_epoch != effective_num_epoch:
-                        logger.info(
-                            "[FixedSplitCL] Promoting wrapper fixed-split retraining epochs from {} to {}.",
-                            effective_num_epoch,
-                            tuned_num_epoch,
-                        )
-                        effective_num_epoch = tuned_num_epoch
-                    effective_learning_rate = tuned_learning_rate
-                    logger.info(
-                        "[FixedSplitCL] Using wrapper fixed-split learning rate {}.",
-                        effective_learning_rate,
-                    )
-
-                split_model = get_split_runtime_model(tmp_model)
-                sample_input = self._build_bundle_trace_sample_input(
-                    tmp_model,
-                    bundle_cache_path,
-                    manifest,
-                )
-                rfdetr_proxy_guided_retrain = bool(
-                    gt_annotations
-                    and str(current_model_name).lower().startswith("rfdetr_")
-                )
-                split_retrain_kwargs = {
-                    "model": split_model,
-                    "sample_input": sample_input,
-                    "cache_path": working_cache,
-                    "all_indices": bundle_info["all_sample_ids"],
-                    "gt_annotations": gt_annotations,
-                    "device": self.device,
-                    "learning_rate": effective_learning_rate,
-                    "loss_fn": build_split_training_loss(tmp_model),
-                    "das_enabled": self.das_enabled,
-                    "das_bn_only": self.das_bn_only,
-                    "das_probe_samples": self.das_probe_samples,
-                    "splitter": prepared_splitter,
-                    "chosen_candidate": prepared_candidate,
-                }
-                if rfdetr_proxy_guided_retrain:
-                    best_state = baseline_state
-                    best_metrics = dict(proxy_metrics_before)
-                    for epoch_index in range(int(effective_num_epoch)):
-                        universal_split_retrain(
-                            **split_retrain_kwargs,
-                            num_epoch=1,
-                        )
-                        candidate_metrics = _evaluate_detection_proxy_map(
-                            tmp_model,
-                            frame_dir=frame_dir,
-                            gt_annotations=gt_annotations,
-                            device=self.device,
-                            model_name=current_model_name,
-                        )
-                        if _proxy_metrics_are_better(candidate_metrics, best_metrics):
-                            best_state = _snapshot_model_state(tmp_model)
-                            best_metrics = dict(candidate_metrics)
-                            logger.info(
-                                "[FixedSplitCL] Kept RF-DETR candidate from epoch {} with proxy_mAP@0.5={:.4f}.",
-                                epoch_index + 1,
-                                float(candidate_metrics.get("map") or 0.0),
+                        bundle_info, frame_dir, prepared_splitter, prepared_candidate = (
+                            self._prepare_fixed_split_working_cache(
+                                tmp_model,
+                                manifest,
+                                bundle_cache_path=bundle_cache_path,
+                                working_cache=working_cache,
+                                requires_trace_stable_rebuild=requires_trace_stable_rebuild,
                             )
-                    tmp_model.load_state_dict(best_state)
-                    _set_detection_model_eval_mode(tmp_model)
-                    proxy_metrics_after = dict(best_metrics)
-                else:
-                    universal_split_retrain(
-                        **split_retrain_kwargs,
-                        num_epoch=effective_num_epoch,
-                    )
-                    proxy_metrics_after = _evaluate_detection_proxy_map(
-                        tmp_model,
-                        frame_dir=frame_dir,
-                        gt_annotations=gt_annotations,
-                        device=self.device,
-                        model_name=current_model_name,
-                    )
+                        )
+                        proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
+                            tmp_model,
+                            frame_dir=frame_dir,
+                            gt_annotations=gt_annotations,
+                            model_name=current_model_name,
+                        )
+
+                proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
+                    tmp_model,
+                    current_model_name=current_model_name,
+                    bundle_info=bundle_info,
+                    manifest=manifest,
+                    bundle_cache_path=bundle_cache_path,
+                    working_cache=working_cache,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    num_epoch=num_epoch,
+                    proxy_metrics_before=proxy_metrics_before,
+                    prepared_splitter=prepared_splitter,
+                    prepared_candidate=prepared_candidate,
+                )
                 proxy_summary = _format_proxy_map_summary(
                     proxy_metrics_before,
                     proxy_metrics_after,
@@ -1237,11 +1275,7 @@ class CloudContinualLearner:
 
         Requires cached features produced by the universal model splitter.
         """
-        model_name = self.edge_model_name
         tmp_model = self._load_edge_training_model()
-
-        if not _HAS_UNIVERSAL_SPLIT:
-            raise RuntimeError("Universal split runtime is required for split retraining.")
 
         split_model = get_split_runtime_model(tmp_model)
         sample_input = None

@@ -1,6 +1,6 @@
 # model_management package
 
-# Re-export universal model splitting API when torchlens is available
+# Re-export universal model splitting API
 from model_management.universal_model_split import (  # noqa: F401
     UniversalModelSplitter,
     extract_split_features,

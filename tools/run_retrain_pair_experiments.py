@@ -385,11 +385,7 @@ def _collect_edge_samples(
             model_id=model_name,
             model_version="0",
             confidence_bucket=confidence_bucket,
-            inference_result={
-                "boxes": inference.detection_boxes,
-                "labels": inference.detection_class,
-                "scores": inference.detection_score,
-            },
+            inference_result=inference.to_inference_result(),
             intermediate=inference.intermediate,
             drift_flag=False,
             raw_frame=frame if confidence_bucket == LOW_CONFIDENCE else None,

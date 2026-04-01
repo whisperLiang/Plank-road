@@ -1,11 +1,11 @@
 import os
-import pandas as pd
 import torch
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
 from loguru import logger
+from PIL import Image
+from torch.utils.data import Dataset
 
-from model_management.detection_transforms import Compose, ToTensor, Resize
+from model_management.detection_annotations import extract_boxes_and_labels, load_annotations
+from model_management.detection_transforms import Compose, ToTensor
 
 
 class DetectionDataset(Dataset):
@@ -37,16 +37,13 @@ class TrafficDataset(DetectionDataset):
 
 
 
-annotation_cols = ('frame_index', 'target_id', 'bbox_x1', 'bbox_y1',
-                   'bbox_x2', 'bbox_y2', 'score', 'object_category',)
-
 def collect_frames(root, select_index):
     frames = []
     frame_path = os.path.join(root, 'frames')
     frame_names = list(os.listdir(frame_path))
 
     annotation_path = os.path.join(root, 'annotation.txt')
-    annotations = pd.read_csv(annotation_path, header=None, names=annotation_cols)
+    annotations = load_annotations(annotation_path)
     logger.debug(frames)
     for frame_name in frame_names:
         _id = int(frame_name.split('.')[0])
@@ -55,18 +52,7 @@ def collect_frames(root, select_index):
             logger.debug(_id)
             _path = os.path.join(frame_path, frame_name)
             _labels = annotations[annotations['frame_index'] == _id]
-
-            boxes = []
-            labels = []
-            for _idx, _label in _labels.iterrows():
-                label = _label['target_id']
-                if label != 0:
-                    x_min = _label['bbox_x1']
-                    y_min = _label['bbox_y1']
-                    x_max = _label['bbox_x2']
-                    y_max = _label['bbox_y2']
-                    boxes.append([x_min, y_min, x_max, y_max])
-                    labels.append(label)
+            boxes, labels = extract_boxes_and_labels(_labels)
 
             if len(boxes) != 0 and len(labels) != 0:
                 frames.append({'path': _path, 'frame_index': _id,

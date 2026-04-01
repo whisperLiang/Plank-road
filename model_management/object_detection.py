@@ -2,7 +2,6 @@ import threading
 from dataclasses import dataclass
 
 import cv2
-import pandas as pd
 import torch
 import os
 import numpy as np
@@ -10,8 +9,8 @@ from loguru import logger
 from torch.utils.data import DataLoader
 from torchvision.models.detection.backbone_utils import *
 from model_management.detection_dataset import TrafficDataset
+from model_management.detection_annotations import build_detection_target, load_annotations
 from model_management.detection_metric import RetrainMetric
-from model_management.model_info import annotation_cols
 from model_management.model_zoo import (
     build_detection_model,
     get_model_detection_thresholds,
@@ -40,6 +39,13 @@ class InferenceArtifacts:
     detection_score: list
     confidence: float
     input_tensor_shape: list[int] | None = None
+
+    def to_inference_result(self) -> dict[str, list]:
+        return {
+            "boxes": self.detection_boxes,
+            "labels": self.detection_class,
+            "scores": self.detection_score,
+        }
 
 def _collate_fn(batch):
     return tuple(zip(*batch))
@@ -150,83 +156,59 @@ class Object_Detection:
             self.refresh_thresholds_from_model()
 
     def model_evaluation(self,cache_path, select_index):
-        map = []
         frame_path = os.path.join(cache_path, 'frames')
         annotation_path = os.path.join(cache_path, 'annotation.txt')
-        annotations_f = pd.read_csv(annotation_path, header=None, names=annotation_cols)
+        annotations_f = load_annotations(annotation_path)
         test_model = build_detection_model(self.model_name, pretrained=False, device=device)
         state_dict = torch.load(self._tmp_weight_path, map_location=device)
         test_model.load_state_dict(state_dict, strict=False)
         test_model.to(device)
         test_model.eval()
         _, threshold_high = get_model_detection_thresholds(test_model, self.model_name)
-        for _id in select_index:
-            logger.debug(_id)
-            path = os.path.join(frame_path, str(_id)+'.jpg')
-            frame = cv2.imread(path)
-            pred_boxes, pred_class, pred_score = self.get_model_prediction(frame, threshold_high, test_model)
-            pred = {'labels':pred_class, 'boxes': pred_boxes, 'scores':pred_score}
-            annos = annotations_f[annotations_f['frame_index'] == _id]
-            target_boxes = []
-            target_labels = []
-            for _idx, _label in annos.iterrows():
-                label = _label['target_id']
-                if label != 0:
-                    x_min = _label['bbox_x1']
-                    y_min = _label['bbox_y1']
-                    x_max = _label['bbox_x2']
-                    y_max = _label['bbox_y2']
-                    target_boxes.append([x_min, y_min, x_max, y_max])
-                    target_labels.append(label)
-            target = {'labels':target_labels, 'boxes': target_boxes}
-            if pred['labels'] is not None:
-                cal_map = calculate_map(target, pred, 0.5)
-                map.append(cal_map)
-        if len(map):
-            map = np.mean(map)
-        else:
-            map = 0.0
+        map = self._evaluate_map_for_indices(
+            test_model,
+            frame_path,
+            annotations_f,
+            select_index,
+            threshold_high,
+        )
         logger.debug("retrain {}".format(map))
         self.record_r.write("{}\n".format(map))
         self.record_r.flush()
         # pretrained_model
-        map = []
         state_dict = torch.load("./model_management/pretrained.pth", map_location=device)
         test_model.load_state_dict(state_dict, strict=False)
         test_model.to(device)
         test_model.eval()
         _, threshold_high = get_model_detection_thresholds(test_model, self.model_name)
         logger.debug("pretrained")
+        map = self._evaluate_map_for_indices(
+            test_model,
+            frame_path,
+            annotations_f,
+            select_index,
+            threshold_high,
+        )
+        logger.debug("pre {}".format(map))
+        self.record_p.write("{}\n".format(map))
+        self.record_p.flush()
+
+    def _evaluate_map_for_indices(self, model, frame_path, annotations, select_index, threshold):
+        map_scores = []
         for _id in select_index:
             logger.debug(_id)
             path = os.path.join(frame_path, str(_id)+'.jpg')
             frame = cv2.imread(path)
-            pred_boxes, pred_class, pred_score = self.get_model_prediction(frame, threshold_high, test_model)
+            pred_boxes, pred_class, pred_score = self.get_model_prediction(frame, threshold, model)
+            if pred_class is None:
+                continue
             pred = {'labels':pred_class, 'boxes': pred_boxes, 'scores':pred_score}
-            annos = annotations_f[annotations_f['frame_index'] == _id]
-            target_boxes = []
-            target_labels = []
-            for _idx, _label in annos.iterrows():
-                label = _label['target_id']
-                if label != 0:
-                    x_min = _label['bbox_x1']
-                    y_min = _label['bbox_y1']
-                    x_max = _label['bbox_x2']
-                    y_max = _label['bbox_y2']
-                    target_boxes.append([x_min, y_min, x_max, y_max])
-                    target_labels.append(label)
-            target = {'labels':target_labels, 'boxes': target_boxes}
-            if pred['labels'] is not None:
-                cal_map = calculate_map(target, pred, 0.5)
-                #logger.debug(cal_map)
-                map.append(cal_map)
-        if len(map):
-            map = np.mean(map)
-        else:
-            map = 0.0
-        logger.debug("pre {}".format(map))
-        self.record_p.write("{}\n".format(map))
-        self.record_p.flush()
+            annos = annotations[annotations['frame_index'] == _id]
+            target = build_detection_target(annos)
+            map_scores.append(calculate_map(target, pred, 0.5))
+        if len(map_scores):
+            return np.mean(map_scores)
+        return 0.0
 
     def prepare_splitter_input(self, img):
         return prepare_split_runtime_input(self.model, img, device=device)

@@ -37,29 +37,8 @@ from model_management.split_model_adapters import (
 )
 from model_management.split_runtime import compare_outputs
 from model_management.universal_model_split import UniversalModelSplitter
-
-
-NEW_DETECTORS = ("rfdetr_nano", "tinynext_s")
+from tests.split_runtime_helpers import NEW_DETECTORS, build_public_detector
 YOLO_DETECTORS = ("yolo26n",)
-
-
-def _detector_kwargs(model_name: str) -> dict[str, object]:
-    if model_name == "rfdetr_nano":
-        return {
-            "confidence": 0.01,
-            "resolution": 96,
-            "num_queries": 80,
-        }
-    return {"confidence": 0.01}
-
-
-def _build_public_detector(model_name: str):
-    return build_detection_model(
-        model_name,
-        pretrained=False,
-        device="cpu",
-        **_detector_kwargs(model_name),
-    ).eval()
 
 
 def _random_frame(size: tuple[int, int] = (96, 96)) -> np.ndarray:
@@ -290,7 +269,7 @@ def test_calibrate_tinynext_proxy_thresholds_picks_best_near_default_threshold(m
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)
 def test_runtime_wrapper_postprocess_matches_public_model(model_name):
     frame = _random_frame()
-    model = _build_public_detector(model_name)
+    model = build_public_detector(model_name)
 
     expected = model(_public_input_from_frame(frame))
     runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
@@ -310,7 +289,7 @@ def test_runtime_wrapper_postprocess_matches_public_model(model_name):
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)
 def test_runtime_wrapper_loss_is_finite_and_backwardable(model_name):
     frame = _random_frame()
-    model = _build_public_detector(model_name)
+    model = build_public_detector(model_name)
     runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
     runtime_model = get_split_runtime_model(model).eval()
 
@@ -332,7 +311,7 @@ def test_runtime_wrapper_loss_is_finite_and_backwardable(model_name):
 
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)
 def test_runtime_wrapper_trace_supports_new_models(model_name):
-    model = _build_public_detector(model_name)
+    model = build_public_detector(model_name)
     runtime_model = get_split_runtime_model(model).eval()
     sample_input = build_split_runtime_sample_input(
         model,
@@ -360,7 +339,7 @@ def test_runtime_wrapper_trace_supports_new_models(model_name):
 @pytest.mark.parametrize("model_name", YOLO_DETECTORS)
 def test_yolo26_runtime_wrapper_postprocess_matches_public_model(model_name):
     frame = _random_frame()
-    model = _build_public_detector(model_name)
+    model = build_public_detector(model_name)
 
     expected = model(_public_input_from_frame(frame))
     runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
@@ -380,7 +359,7 @@ def test_yolo26_runtime_wrapper_postprocess_matches_public_model(model_name):
 @pytest.mark.parametrize("model_name", YOLO_DETECTORS)
 def test_yolo26_runtime_wrapper_loss_is_finite_and_backwardable(model_name):
     frame = _random_frame()
-    model = _build_public_detector(model_name)
+    model = build_public_detector(model_name)
     runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
     runtime_model = get_split_runtime_model(model).eval()
 
@@ -402,7 +381,7 @@ def test_yolo26_runtime_wrapper_loss_is_finite_and_backwardable(model_name):
 
 @pytest.mark.parametrize("model_name", YOLO_DETECTORS)
 def test_yolo26_fixed_split_candidates_are_replayable(model_name):
-    model = _build_public_detector(model_name)
+    model = build_public_detector(model_name)
     runtime_model = get_split_runtime_model(model).eval()
     sample_input = build_split_runtime_sample_input(
         model,
@@ -616,6 +595,15 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
                 "nonempty_predictions": 1,
                 "total_prediction_boxes": 1,
             },
+            {
+                "map": 0.1,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
         ]
     )
     monkeypatch.setattr(
@@ -639,8 +627,8 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
 
     assert success is True
     assert model_data
-    assert "Kept cached weights" in message
-    assert "proxy_mAP@0.5 regressed 0.4000 -> 0.1000" in message
+    assert "Fixed split retraining successful" in message
+    assert "proxy_mAP@0.5 0.4000 -> 0.4000" in message
     assert serialised_states == [1.0]
 
 

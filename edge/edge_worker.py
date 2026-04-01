@@ -111,16 +111,7 @@ class EdgeWorker:
             self.split_learning_disable_reason = "disabled_in_config"
         if self.collect_flag and not self.split_learning_enabled:
             self.collect_flag = False
-            if self.split_learning_disable_reason == "disabled_in_config":
-                logger.info(
-                    "Continual learning sample collection disabled because split_learning.enabled is false."
-                )
-            else:
-                logger.warning(
-                    "Continual learning sample collection disabled for edge model {}: {}",
-                    self.model_id,
-                    self.split_learning_disable_reason or "split learning unavailable",
-                )
+            self._log_split_collection_disabled()
 
         self.diff = 0.0
         self.key_task = None
@@ -186,18 +177,12 @@ class EdgeWorker:
             logger.warning("Fixed split plan unavailable for model {}: {}", self.model_id, exc)
             self.split_learning_disable_reason = str(exc)
             self.split_learning_enabled = False
-            self.universal_split_enabled = False
-            self.universal_splitter = None
-            self.fixed_split_plan = None
-            self.split_trace_image_size = None
+            self._reset_split_runtime_state()
         except Exception as exc:
             logger.exception("Failed to initialise fixed split plan: {}", exc)
             self.split_learning_disable_reason = str(exc)
             self.split_learning_enabled = False
-            self.universal_split_enabled = False
-            self.universal_splitter = None
-            self.fixed_split_plan = None
-            self.split_trace_image_size = None
+            self._reset_split_runtime_state()
 
     def _next_sample_id(self, task: Task) -> str:
         return f"{task.frame_index}-{int(task.start_time * 1000)}"
@@ -243,10 +228,73 @@ class EdgeWorker:
         else:
             task.result_source = "empty"
 
+    def _set_task_terminal_state(
+        self,
+        task: Task,
+        state: TASK_STATE,
+        *,
+        result_source: str,
+    ) -> None:
+        task.end_time = time.time()
+        task.state = state
+        task.result_source = result_source
+        self._finalize_task(task)
+
     def _finalize_task(self, task: Task) -> None:
         if task.state == TASK_STATE.FINISHED and task.result_source == "inference":
             self._remember_latest_result(task)
         task.mark_done()
+
+    def _log_split_collection_disabled(self) -> None:
+        if self.split_learning_disable_reason == "disabled_in_config":
+            logger.info(
+                "Continual learning sample collection disabled because split_learning.enabled is false."
+            )
+            return
+        logger.warning(
+            "Continual learning sample collection disabled for edge model {}: {}",
+            self.model_id,
+            self.split_learning_disable_reason or "split learning unavailable",
+        )
+
+    def _reset_split_runtime_state(self) -> None:
+        self.universal_split_enabled = False
+        self.universal_splitter = None
+        self.fixed_split_plan = None
+        self.split_trace_image_size = None
+
+    def _reset_pending_training_cycle(self) -> None:
+        self.pending_training_decision = None
+        self.retrain_flag = False
+        self.collect_flag = True
+
+    def _resolve_active_splitter(self, current_frame, frame_image_size: tuple[int, int]):
+        if self.split_learning_enabled and not self._fixed_split_init_attempted:
+            self._init_fixed_split_runtime(current_frame, frame_image_size)
+            if self.collect_flag and not self.split_learning_enabled:
+                self.collect_flag = False
+                self._log_split_collection_disabled()
+
+        active_splitter = self.universal_splitter if self.universal_split_enabled else None
+        if (
+            active_splitter is None
+            or self.split_trace_image_size is None
+            or frame_image_size == self.split_trace_image_size
+        ):
+            return active_splitter
+
+        logger.warning(
+            "Split runtime disabled because frame size changed from {} to {}.",
+            self.split_trace_image_size,
+            frame_image_size,
+        )
+        self.split_learning_enabled = False
+        self.universal_split_enabled = False
+        self.collect_flag = False
+        self.split_learning_disable_reason = (
+            f"frame size changed from {self.split_trace_image_size} to {frame_image_size}"
+        )
+        return None
 
     def _make_training_decision(
         self,
@@ -313,51 +361,28 @@ class EdgeWorker:
                 self.key_task = task
                 self.decision_worker(task)
             else:
-                task.end_time = time.time()
-                task.state = TASK_STATE.FINISHED
                 self._reuse_latest_result(task)
-                self._finalize_task(task)
+                self._set_task_terminal_state(
+                    task,
+                    TASK_STATE.FINISHED,
+                    result_source=task.result_source,
+                )
 
     def local_worker(self):
         while True:
             task = self.local_queue.get(block=True)
             if time.time() - task.start_time >= self.config.wait_thresh:
-                task.end_time = time.time()
-                task.state = TASK_STATE.TIMEOUT
-                task.result_source = "timeout"
-                self._finalize_task(task)
+                self._set_task_terminal_state(
+                    task,
+                    TASK_STATE.TIMEOUT,
+                    result_source="timeout",
+                )
                 continue
 
             self.queue_info[f"{self.edge_id}"] = self.local_queue.qsize()
             current_frame = task.frame_edge
             frame_image_size = tuple(int(value) for value in current_frame.shape[:2])
-            if self.split_learning_enabled and not self._fixed_split_init_attempted:
-                self._init_fixed_split_runtime(current_frame, frame_image_size)
-                if self.collect_flag and not self.split_learning_enabled:
-                    self.collect_flag = False
-                    logger.warning(
-                        "Continual learning sample collection disabled for edge model {}: {}",
-                        self.model_id,
-                        self.split_learning_disable_reason or "split learning unavailable",
-                    )
-            active_splitter = self.universal_splitter if self.universal_split_enabled else None
-            if (
-                active_splitter is not None
-                and self.split_trace_image_size is not None
-                and frame_image_size != self.split_trace_image_size
-            ):
-                logger.warning(
-                    "Split runtime disabled because frame size changed from {} to {}.",
-                    self.split_trace_image_size,
-                    frame_image_size,
-                )
-                self.split_learning_enabled = False
-                self.universal_split_enabled = False
-                self.collect_flag = False
-                self.split_learning_disable_reason = (
-                    f"frame size changed from {self.split_trace_image_size} to {frame_image_size}"
-                )
-                active_splitter = None
+            active_splitter = self._resolve_active_splitter(current_frame, frame_image_size)
             inference = self.small_object_detection.infer_sample(
                 current_frame,
                 splitter=active_splitter,
@@ -377,10 +402,11 @@ class EdgeWorker:
             ):
                 self.collect_data(task, current_frame, inference)
 
-            task.end_time = time.time()
-            task.state = TASK_STATE.FINISHED
-            task.result_source = "inference"
-            self._finalize_task(task)
+            self._set_task_terminal_state(
+                task,
+                TASK_STATE.FINISHED,
+                result_source="inference",
+            )
 
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> None:
         confidence = float(inference.confidence)
@@ -400,11 +426,7 @@ class EdgeWorker:
             model_id=self.model_id,
             model_version=self.model_version,
             confidence_bucket=confidence_bucket,
-            inference_result={
-                "boxes": inference.detection_boxes,
-                "labels": inference.detection_class,
-                "scores": inference.detection_score,
-            },
+            inference_result=inference.to_inference_result(),
             intermediate=inference.intermediate,
             drift_flag=drift_detected,
             raw_frame=frame if save_raw else None,
@@ -440,9 +462,7 @@ class EdgeWorker:
 
             decision = self.pending_training_decision
             if self.fixed_split_plan is None or decision is None:
-                self.retrain_flag = False
-                self.collect_flag = True
-                self.pending_training_decision = None
+                self._reset_pending_training_cycle()
                 time.sleep(0.2)
                 continue
 
@@ -483,9 +503,7 @@ class EdgeWorker:
             else:
                 logger.error("Cloud continual learning failed: {}", msg)
 
-            self.pending_training_decision = None
-            self.retrain_flag = False
-            self.collect_flag = True
+            self._reset_pending_training_cycle()
             time.sleep(0.2)
 
     def start_edge_server(self):

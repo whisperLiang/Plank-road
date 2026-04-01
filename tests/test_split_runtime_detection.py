@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-
 import pytest
 import torch
 
 from model_management.candidate_profiler import profile_candidates
-from model_management.model_zoo import build_detection_model
-from model_management.payload import SplitPayload
 from model_management.split_model_adapters import (
     RFDETRReplay,
     build_split_runtime_sample_input,
@@ -16,50 +12,22 @@ from model_management.split_model_adapters import (
 )
 from model_management.split_runtime import compare_outputs, reduce_output_to_loss
 from model_management.universal_model_split import UniversalModelSplitter
-
-
-NEW_DETECTORS = ("rfdetr_nano", "tinynext_s")
-
-
-def _detector_kwargs(model_name: str) -> dict[str, object]:
-    if model_name == "rfdetr_nano":
-        return {
-            "confidence": 0.01,
-            "resolution": 96,
-            "num_queries": 80,
-        }
-    return {"confidence": 0.01}
-
-
-def _build_public_detector(model_name: str):
-    return build_detection_model(
-        model_name,
-        pretrained=False,
-        device="cpu",
-        **_detector_kwargs(model_name),
-    ).eval()
+from tests.split_runtime_helpers import (
+    NEW_DETECTORS,
+    build_public_detector,
+    collect_valid_candidates,
+    payload_without_boundary,
+)
 
 
 def _build_runtime_splitter(model_name: str):
-    model = _build_public_detector(model_name)
+    model = build_public_detector(model_name)
     runtime_model = get_split_runtime_model(model).eval()
     sample = build_split_runtime_sample_input(model, image_size=(96, 96), device="cpu")
     splitter = UniversalModelSplitter(device="cpu")
     splitter.trainability_loss_fn = build_split_training_loss(model)
     splitter.trace(runtime_model, sample)
     return model, runtime_model, sample, splitter
-
-
-def _valid_candidates(splitter: UniversalModelSplitter, *, minimum_valid: int = 1):
-    valid = []
-    for candidate in splitter.enumerate_candidates(max_candidates=8):
-        report = splitter.validate_candidate(candidate)
-        if report["success"]:
-            valid.append((candidate, report))
-        if len(valid) >= minimum_valid:
-            break
-    assert len(valid) >= minimum_valid
-    return valid
 
 
 def _sample_shape(sample) -> list[int]:
@@ -128,7 +96,11 @@ def test_rfdetr_replay_preserves_auxiliary_outputs_for_training():
 def test_new_detector_runtime_candidate_enumeration_and_profiling(model_name):
     _, runtime_model, sample, splitter = _build_runtime_splitter(model_name)
     expected = runtime_model(sample)
-    valid = _valid_candidates(splitter, minimum_valid=1)
+    valid = collect_valid_candidates(
+        splitter,
+        splitter.enumerate_candidates(max_candidates=8),
+        minimum_valid=1,
+    )
 
     candidate = valid[0][0]
     splitter.split(candidate_id=candidate.candidate_id)
@@ -163,7 +135,11 @@ def test_new_detector_runtime_candidate_enumeration_and_profiling(model_name):
 
 def test_tinynext_multibranch_boundary_payload_is_minimal():
     _, _, sample, splitter = _build_runtime_splitter("tinynext_s")
-    valid = _valid_candidates(splitter, minimum_valid=1)
+    valid = collect_valid_candidates(
+        splitter,
+        splitter.enumerate_candidates(max_candidates=8),
+        minimum_valid=1,
+    )
 
     chosen = next((candidate for candidate, _ in valid if candidate.boundary_count > 1), None)
     if chosen is None:
@@ -174,20 +150,7 @@ def test_tinynext_multibranch_boundary_payload_is_minimal():
     assert len(payload.boundary_tensor_labels) == chosen.boundary_count
 
     for removed_label in list(payload.boundary_tensor_labels):
-        reduced = OrderedDict(
-            (label, tensor)
-            for label, tensor in payload.tensors.items()
-            if label != removed_label
-        )
-        broken_payload = SplitPayload(
-            tensors=reduced,
-            metadata=dict(payload.metadata),
-            candidate_id=payload.candidate_id,
-            boundary_tensor_labels=list(reduced.keys()),
-            primary_label=next(reversed(reduced.keys())) if reduced else None,
-            split_index=payload.split_index,
-            split_label=payload.split_label,
-        )
+        broken_payload = payload_without_boundary(payload, removed_label)
         with pytest.raises(RuntimeError):
             splitter.cloud_forward(broken_payload, candidate=chosen)
 
@@ -195,7 +158,11 @@ def test_tinynext_multibranch_boundary_payload_is_minimal():
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)
 def test_new_detector_tail_backward_works(model_name):
     _, _, sample, splitter = _build_runtime_splitter(model_name)
-    valid = _valid_candidates(splitter, minimum_valid=1)
+    valid = collect_valid_candidates(
+        splitter,
+        splitter.enumerate_candidates(max_candidates=8),
+        minimum_valid=1,
+    )
 
     candidate = next((item[0] for item in valid if item[0].is_trainable_tail), valid[0][0])
     splitter.split(candidate_id=candidate.candidate_id)

@@ -8,11 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
 
 import torch
-
-try:
-    import torchlens as tl
-except ImportError:  # pragma: no cover - guarded by caller
-    tl = None
+import torchlens as tl
 
 
 SKIPPED_FUNCTION_NAMES = {"isinf", "isnan", "nantonum", "nan_to_num"}
@@ -1157,8 +1153,6 @@ def trace_model(
     sample_input: Any,
     sample_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[Any, tuple[Any, ...], dict[str, Any], Any]:
-    if tl is None:  # pragma: no cover - guarded by caller
-        raise ImportError("torchlens is required for graph tracing.")
     args, kwargs = _sample_args_kwargs(sample_input, sample_kwargs)
     with torch.no_grad():
         sample_output = model(*args, **kwargs)
