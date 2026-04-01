@@ -10,6 +10,7 @@ candidate-driven:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 from collections import OrderedDict
@@ -292,6 +293,24 @@ class UniversalModelSplitter(GraphSplitRuntime):
             raise RuntimeError(f"Could not build a valid graph partition from layer_index={layer_index}.")
         return candidate
 
+    def _candidate_from_boundary_labels(self, boundary_tensor_labels: Sequence[str]) -> SplitCandidate:
+        _, graph = self._ensure_ready()
+        boundary_list = list(boundary_tensor_labels)
+        raw = ",".join(boundary_list).encode("utf-8")
+        candidate = build_candidate_from_edge_seed(
+            graph,
+            candidate_id=f"boundary_{hashlib.sha1(raw).hexdigest()[:12]}",
+            edge_seed_nodes=boundary_list,
+            metadata={"source": "boundary_tensor_labels"},
+        )
+        if candidate is None:
+            raise KeyError(f"No candidate matches boundary tensor labels {boundary_list!r}.")
+        if set(candidate.boundary_tensor_labels) != set(boundary_list):
+            raise KeyError(f"No candidate matches boundary tensor labels {boundary_list!r}.")
+        if all(item.candidate_id != candidate.candidate_id for item in self.candidates):
+            self.candidates.append(candidate)
+        return candidate
+
     def split(
         self,
         *,
@@ -317,9 +336,7 @@ class UniversalModelSplitter(GraphSplitRuntime):
                 if item.boundary_tensor_labels == boundary_list
                 or set(item.boundary_tensor_labels) == boundary_set
             ]
-            if not matches:
-                raise KeyError(f"No candidate matches boundary tensor labels {boundary_list!r}.")
-            self.current_candidate = matches[0]
+            self.current_candidate = matches[0] if matches else self._candidate_from_boundary_labels(boundary_list)
         elif layer_label is not None:
             matches = [
                 item
@@ -540,8 +557,6 @@ def universal_split_retrain(
         boundary_labels: list[str] | None = None
         if candidate_id is None and split_layer is None:
             candidate_id, split_layer, boundary_labels = _infer_cached_split_choice(cache_path, all_indices)
-        if boundary_labels is not None or candidate_id is not None:
-            splitter.enumerate_candidates(max_candidates=512)
         if boundary_labels:
             try:
                 chosen = splitter.split(boundary_tensor_labels=boundary_labels)

@@ -353,9 +353,7 @@ class GraphSplitRuntime:
             name: parameter.requires_grad
             for name, parameter in model.named_parameters()
         }
-        trainable_param_names = {
-            name for name, is_trainable in grad_state.items() if is_trainable
-        }
+        trainable_param_names = set(grad_state)
         history, sample_args, sample_kwargs_dict, sample_output = trace_model(
             model,
             sample_input,

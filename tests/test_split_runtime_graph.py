@@ -126,6 +126,20 @@ def test_graph_build_candidate_enumeration_pruning_and_replay(factory, minimum_n
     assert isinstance(features, (torch.Tensor, SplitPayload))
 
 
+def test_trace_marks_parametric_nodes_trainable_even_when_model_is_frozen():
+    model, sample = _make_sequential_model()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trace(model, sample)
+
+    trainable_labels = [
+        label for label in splitter.graph.relevant_labels if splitter.graph.nodes[label].has_trainable_params
+    ]
+    assert trainable_labels
+
+
 def test_runtime_trace_cleans_up_raw_torchlens_history(monkeypatch):
     model, sample = _make_sequential_model()
     cleanup_called = False
