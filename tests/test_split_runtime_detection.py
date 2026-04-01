@@ -103,6 +103,7 @@ def test_new_detector_runtime_candidate_enumeration_and_profiling(model_name):
     )
 
     candidate = valid[0][0]
+    assert candidate.cloud_input_labels == []
     splitter.split(candidate_id=candidate.candidate_id)
     payload = splitter.edge_forward(sample)
     replayed = splitter.cloud_forward(payload)
@@ -165,6 +166,7 @@ def test_new_detector_tail_backward_works(model_name):
     )
 
     candidate = next((item[0] for item in valid if item[0].is_trainable_tail), valid[0][0])
+    assert candidate.cloud_input_labels == []
     splitter.split(candidate_id=candidate.candidate_id)
     splitter.freeze_head(candidate)
     splitter.unfreeze_tail(candidate)

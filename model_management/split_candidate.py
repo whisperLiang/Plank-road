@@ -24,6 +24,9 @@ class SplitCandidate:
     validation_error: str | None = None
     legacy_layer_index: int | None = None
     boundary_count: int = 0
+    edge_parameter_count: int = 0
+    total_parameter_count: int = 0
+    edge_parameter_ratio: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property

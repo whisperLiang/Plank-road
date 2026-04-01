@@ -1,3 +1,4 @@
+import inspect
 import io
 import json
 import zipfile
@@ -18,6 +19,7 @@ from model_management.fixed_split import (
 )
 from model_management.payload import SplitPayload
 from model_management.continual_learning_bundle import prepare_split_training_cache
+from model_management.graph_ir import GraphIR, GraphNode, ParameterTensorRef, TreeSpec
 from model_management.split_candidate import SplitCandidate
 from model_management.universal_model_split import load_split_feature_cache
 
@@ -307,6 +309,290 @@ def test_fixed_split_failure_reports_untrainable_replay_candidates():
             splitter=DummyRuntime(),
             model_name="dummy-model",
         )
+
+
+def test_fixed_split_exact_solver_finds_non_prefix_optimum_under_parameter_constraints():
+    constraints = SplitConstraints(
+        privacy_metric_lower_bound=0.95,
+        max_layer_freezing_ratio=1.0,
+        validate_candidates=False,
+        max_candidates=8,
+        max_boundary_count=8,
+        max_payload_bytes=32 * 1024 * 1024,
+    )
+
+    signature = inspect.signature(lambda input_1: input_1)
+    dummy_spec = TreeSpec(kind="const", value=None)
+    parameter_numels = {
+        "p_left_1": 40,
+        "p_left_2": 40,
+        "p_right_1": 1,
+        "p_right_2": 1,
+        "p_merge": 1,
+    }
+
+    def _node(
+        label: str,
+        *,
+        parents: list[str],
+        children: list[str],
+        estimated_bytes: int,
+        parameter_refs: list[ParameterTensorRef],
+        trainable: bool,
+        index: int,
+        is_input: bool = False,
+        is_output: bool = False,
+    ) -> GraphNode:
+        return GraphNode(
+            label=label,
+            node_type="input" if is_input else ("output" if is_output else "operation"),
+            func_name="none",
+            func=None,
+            parent_labels=parents,
+            child_labels=children,
+            parent_arg_locations={"args": {}, "kwargs": {}},
+            arg_template=[],
+            kwarg_template={},
+            non_tensor_args={},
+            parameter_refs=parameter_refs,
+            buffer_refs=[],
+            input_output_address=None,
+            containing_module=None,
+            containing_modules=[],
+            is_input=is_input,
+            is_output=is_output,
+            is_inplace=False,
+            is_multi_output=False,
+            multi_output_index=None,
+            aggregation_kind=None,
+            indexing_metadata=None,
+            tensor_shape=(1,),
+            tensor_dtype=torch.float32,
+            numel=1,
+            estimated_bytes=estimated_bytes,
+            estimated_flops=1.0,
+            has_trainable_params=trainable,
+            topological_index=index,
+        )
+
+    class DummyRuntime:
+        def __init__(self):
+            nodes = OrderedDict(
+                [
+                    (
+                        "input_1",
+                        _node(
+                            "input_1",
+                            parents=[],
+                            children=["left_1", "right_1"],
+                            estimated_bytes=1,
+                            parameter_refs=[],
+                            trainable=False,
+                            index=0,
+                            is_input=True,
+                        ),
+                    ),
+                    (
+                        "left_1",
+                        _node(
+                            "left_1",
+                            parents=["input_1"],
+                            children=["left_2"],
+                            estimated_bytes=1,
+                            parameter_refs=[ParameterTensorRef("", "p_left_1", "p_left_1")],
+                            trainable=True,
+                            index=1,
+                        ),
+                    ),
+                    (
+                        "right_1",
+                        _node(
+                            "right_1",
+                            parents=["input_1"],
+                            children=["right_2"],
+                            estimated_bytes=100,
+                            parameter_refs=[ParameterTensorRef("", "p_right_1", "p_right_1")],
+                            trainable=True,
+                            index=2,
+                        ),
+                    ),
+                    (
+                        "left_2",
+                        _node(
+                            "left_2",
+                            parents=["left_1"],
+                            children=["merge"],
+                            estimated_bytes=1,
+                            parameter_refs=[ParameterTensorRef("", "p_left_2", "p_left_2")],
+                            trainable=True,
+                            index=3,
+                        ),
+                    ),
+                    (
+                        "right_2",
+                        _node(
+                            "right_2",
+                            parents=["right_1"],
+                            children=["merge"],
+                            estimated_bytes=100,
+                            parameter_refs=[ParameterTensorRef("", "p_right_2", "p_right_2")],
+                            trainable=True,
+                            index=4,
+                        ),
+                    ),
+                    (
+                        "merge",
+                        _node(
+                            "merge",
+                            parents=["left_2", "right_2"],
+                            children=["output_1"],
+                            estimated_bytes=1,
+                            parameter_refs=[ParameterTensorRef("", "p_merge", "p_merge")],
+                            trainable=True,
+                            index=5,
+                        ),
+                    ),
+                    (
+                        "output_1",
+                        _node(
+                            "output_1",
+                            parents=["merge"],
+                            children=[],
+                            estimated_bytes=1,
+                            parameter_refs=[],
+                            trainable=False,
+                            index=6,
+                            is_output=True,
+                        ),
+                    ),
+                ]
+            )
+            self.graph = GraphIR(
+                nodes=nodes,
+                input_labels=["input_1"],
+                output_labels=["output_1"],
+                topological_order=list(nodes.keys()),
+                relevant_labels=list(nodes.keys()),
+                input_spec=dummy_spec,
+                output_spec=dummy_spec,
+                input_address_to_label={},
+                output_address_to_label={},
+                forward_signature=signature,
+                sample_args=(torch.tensor([0.0]),),
+                sample_kwargs={},
+                sample_input_spec=dummy_spec,
+                sample_output_spec=dummy_spec,
+                parameter_numels=parameter_numels,
+                total_parameter_numel=sum(parameter_numels.values()),
+            )
+            self.model = object()
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+    runtime = DummyRuntime()
+    plan = compute_fixed_split_for_model(
+        torch.nn.Linear(1, 1),
+        constraints,
+        sample_input=[torch.rand(1)],
+        splitter=runtime,
+        model_name="dummy-model",
+    )
+
+    chosen = runtime.candidates[0]
+    assert plan.candidate_id == chosen.candidate_id
+    assert chosen.edge_nodes == ["input_1", "left_1", "left_2"]
+    assert set(chosen.boundary_tensor_labels) == {"input_1", "left_2"}
+    assert chosen.estimated_payload_bytes == 2
+    prefix = runtime.graph.relevant_labels[: chosen.legacy_layer_index + 1]
+    assert chosen.edge_nodes != prefix
+
+
+def test_fixed_split_uses_parameter_ratio_constraints_when_available():
+    constraints = SplitConstraints(
+        privacy_metric_lower_bound=0.4,
+        max_layer_freezing_ratio=0.75,
+        validate_candidates=False,
+    )
+
+    candidates = [
+        SplitCandidate(
+            candidate_id="candidate-low-payload-but-overfrozen",
+            edge_nodes=["n1", "n2", "n3"],
+            cloud_nodes=["n4"],
+            boundary_edges=[],
+            boundary_tensor_labels=["n3"],
+            edge_input_labels=[],
+            cloud_input_labels=[],
+            cloud_output_labels=["n4"],
+            estimated_edge_flops=1.0,
+            estimated_cloud_flops=1.0,
+            estimated_payload_bytes=10,
+            estimated_privacy_risk=0.0,
+            estimated_latency=1.0,
+            is_trainable_tail=True,
+            legacy_layer_index=2,
+            boundary_count=1,
+            edge_parameter_count=90,
+            total_parameter_count=100,
+            edge_parameter_ratio=0.9,
+        ),
+        SplitCandidate(
+            candidate_id="candidate-feasible",
+            edge_nodes=["n1", "n2"],
+            cloud_nodes=["n3", "n4"],
+            boundary_edges=[],
+            boundary_tensor_labels=["n2"],
+            edge_input_labels=[],
+            cloud_input_labels=[],
+            cloud_output_labels=["n4"],
+            estimated_edge_flops=1.0,
+            estimated_cloud_flops=1.0,
+            estimated_payload_bytes=20,
+            estimated_privacy_risk=0.0,
+            estimated_latency=2.0,
+            is_trainable_tail=True,
+            legacy_layer_index=1,
+            boundary_count=1,
+            edge_parameter_count=50,
+            total_parameter_count=100,
+            edge_parameter_ratio=0.5,
+        ),
+    ]
+
+    class DummyRuntime:
+        def __init__(self):
+            self.graph = SimpleNamespace(
+                relevant_labels=["n1", "n2", "n3", "n4"],
+                nodes={
+                    "n1": SimpleNamespace(has_trainable_params=True, tensor_shape=(1, 4, 4)),
+                    "n2": SimpleNamespace(has_trainable_params=True, tensor_shape=(1, 4, 4)),
+                    "n3": SimpleNamespace(has_trainable_params=True, tensor_shape=(1, 4, 4)),
+                    "n4": SimpleNamespace(has_trainable_params=True, tensor_shape=(1, 4, 4)),
+                },
+            )
+            self.model = object()
+            self.candidates = candidates
+            self._candidate_enumeration_config = (
+                constraints.max_candidates,
+                constraints.max_boundary_count,
+                constraints.max_payload_bytes,
+            )
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+    plan = compute_fixed_split_for_model(
+        torch.nn.Linear(1, 1),
+        constraints,
+        sample_input=[torch.rand(1)],
+        splitter=DummyRuntime(),
+        model_name="dummy-model",
+    )
+
+    assert plan.candidate_id == "candidate-feasible"
+    assert plan.privacy_metric == pytest.approx(0.5)
+    assert plan.layer_freezing_ratio == pytest.approx(0.5)
 
 
 def test_apply_split_plan_falls_back_from_boundary_labels_to_candidate_and_split_index():

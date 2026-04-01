@@ -582,6 +582,8 @@ class GraphIR:
     sample_kwargs: dict[str, Any]
     sample_input_spec: TreeSpec
     sample_output_spec: TreeSpec
+    parameter_numels: dict[str, int]
+    total_parameter_numel: int
 
     @property
     def num_nodes(self) -> int:
@@ -964,6 +966,21 @@ def _resolve_parameter_from_ref(model: torch.nn.Module, ref: ParameterTensorRef)
     return parameter if isinstance(parameter, torch.nn.Parameter) else None
 
 
+def _collect_parameter_numels(
+    model: torch.nn.Module,
+    nodes: Mapping[str, GraphNode],
+) -> dict[str, int]:
+    numels: dict[str, int] = {}
+    for node in nodes.values():
+        for ref in node.parameter_refs:
+            if ref.fq_name in numels:
+                continue
+            parameter = _resolve_parameter_from_ref(model, ref)
+            if parameter is not None:
+                numels[ref.fq_name] = int(parameter.numel())
+    return numels
+
+
 def _node_has_trainable_params(
     model: torch.nn.Module,
     param_refs: Sequence[ParameterTensorRef],
@@ -1130,6 +1147,8 @@ def build_graph_from_trace(
             for label, address in zip(remaining_labels, remaining_addresses):
                 output_address_to_label[address] = label
 
+    parameter_numels = _collect_parameter_numels(model, nodes)
+
     return GraphIR(
         nodes=nodes,
         input_labels=input_labels,
@@ -1145,6 +1164,8 @@ def build_graph_from_trace(
         sample_kwargs=sample_kwargs,
         sample_input_spec=input_spec,
         sample_output_spec=output_spec,
+        parameter_numels=parameter_numels,
+        total_parameter_numel=sum(int(parameter.numel()) for parameter in model.parameters()),
     )
 
 

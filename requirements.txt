@@ -6,6 +6,7 @@ opencv-python==4.11.0.86
 munch
 grpcio==1.78.1
 protobuf==6.31.1
+ortools==9.14.6206
 grpcio-tools
 loguru
 mapcalc

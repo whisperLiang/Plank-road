@@ -9,11 +9,15 @@ from typing import Any, Mapping
 
 import torch
 
+from model_management.candidate_generator import solve_exact_candidates
+from model_management.graph_ir import GraphIR
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.universal_model_split import UniversalModelSplitter
 
 
 FIXED_SPLIT_PLAN_VERSION = "fixed-split.v1"
+EligibleCandidate = tuple[SplitCandidate, float, float]
+ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
 
 
 @dataclass(frozen=True)
@@ -99,17 +103,29 @@ class SplitPlan:
         )
 
 
+def _runtime_graph(splitter: UniversalModelSplitter) -> Any | None:
+    if hasattr(splitter, "_ensure_ready"):
+        try:
+            _, graph = splitter._ensure_ready()
+            return graph
+        except Exception:
+            return getattr(splitter, "graph", None)
+    return getattr(splitter, "graph", None)
+
+
 def _trace_signature(splitter: UniversalModelSplitter) -> str:
-    _, graph = splitter._ensure_ready()
+    graph = _runtime_graph(splitter)
+    if graph is None or not hasattr(graph, "relevant_labels") or not hasattr(graph, "nodes"):
+        return "unavailable"
     digest: list[dict[str, Any]] = []
     for label in graph.relevant_labels:
         node = graph.nodes[label]
         digest.append(
             {
                 "label": label,
-                "shape": list(node.tensor_shape) if node.tensor_shape else None,
-                "module": node.containing_module,
-                "trainable": bool(node.has_trainable_params),
+                "shape": list(getattr(node, "tensor_shape", ()) or ()) or None,
+                "module": getattr(node, "containing_module", None),
+                "trainable": bool(getattr(node, "has_trainable_params", False)),
             }
         )
     raw = json.dumps(digest, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -127,6 +143,8 @@ def _layer_freezing_ratio(
     *,
     total_trainable_layers: int,
 ) -> float:
+    if int(getattr(candidate, "total_parameter_count", 0)) > 0:
+        return max(0.0, min(1.0, float(getattr(candidate, "edge_parameter_ratio", 0.0))))
     if total_trainable_layers <= 0:
         return 0.0
     _, graph = splitter._ensure_ready()
@@ -135,6 +153,8 @@ def _layer_freezing_ratio(
 
 
 def _privacy_metric(candidate: SplitCandidate, max_privacy_risk: float) -> float:
+    if int(getattr(candidate, "total_parameter_count", 0)) > 0:
+        return max(0.0, min(1.0, float(getattr(candidate, "edge_parameter_ratio", 0.0))))
     if max_privacy_risk <= 0:
         return 1.0
     score = 1.0 - (float(candidate.estimated_privacy_risk) / float(max_privacy_risk))
@@ -161,7 +181,7 @@ def _make_plan_id(
     return hashlib.sha1(raw).hexdigest()
 
 
-def _ensure_candidate_pool(
+def _fallback_candidate_pool(
     runtime: UniversalModelSplitter,
     constraints: SplitConstraints,
 ) -> list[SplitCandidate]:
@@ -174,16 +194,223 @@ def _ensure_candidate_pool(
     if (
         not current_candidates
         or getattr(runtime, "_candidate_enumeration_config", None) != expected
-    ):
-        enumerated = runtime.enumerate_candidates(
+    ) and hasattr(runtime, "enumerate_candidates"):
+        enumerated = list(
+            runtime.enumerate_candidates(
+                max_candidates=constraints.max_candidates,
+                max_boundary_count=constraints.max_boundary_count,
+                max_payload_bytes=constraints.max_payload_bytes,
+            )
+        )
+        setattr(runtime, "candidates", list(enumerated))
+        setattr(runtime, "_candidate_enumeration_config", expected)
+        current_candidates = enumerated
+    return list(current_candidates or [])
+
+
+def _enumerate_feasible_candidates(
+    runtime: UniversalModelSplitter,
+    constraints: SplitConstraints,
+) -> list[EligibleCandidate]:
+    graph = _runtime_graph(runtime)
+    if isinstance(graph, GraphIR):
+        candidates = solve_exact_candidates(
+            graph,
             max_candidates=constraints.max_candidates,
             max_boundary_count=constraints.max_boundary_count,
             max_payload_bytes=constraints.max_payload_bytes,
+            privacy_metric_lower_bound=constraints.privacy_metric_lower_bound,
+            max_layer_freezing_ratio=constraints.max_layer_freezing_ratio,
+            require_trainable_tail=True,
         )
-        if current_candidates is None:
-            setattr(runtime, "candidates", list(enumerated))
-        current_candidates = getattr(runtime, "candidates", enumerated)
-    return list(current_candidates or [])
+        setattr(runtime, "candidates", list(candidates))
+        setattr(
+            runtime,
+            "_candidate_enumeration_config",
+            (
+                "cp_sat_exact_fixed",
+                int(constraints.max_candidates),
+                int(constraints.max_boundary_count),
+                int(constraints.max_payload_bytes),
+                float(constraints.privacy_metric_lower_bound),
+                float(constraints.max_layer_freezing_ratio),
+            ),
+        )
+    else:
+        candidates = _fallback_candidate_pool(runtime, constraints)
+
+    if not candidates:
+        return []
+
+    max_privacy_risk = max(float(candidate.estimated_privacy_risk) for candidate in candidates)
+    total_trainable_layers = _total_trainable_layers(runtime)
+    eligible: list[EligibleCandidate] = []
+    for candidate in candidates:
+        if not candidate.is_trainable_tail:
+            continue
+        privacy_metric = _privacy_metric(candidate, max_privacy_risk)
+        freezing_ratio = _layer_freezing_ratio(
+            runtime,
+            candidate,
+            total_trainable_layers=total_trainable_layers,
+        )
+        if privacy_metric < constraints.privacy_metric_lower_bound:
+            continue
+        if freezing_ratio > constraints.max_layer_freezing_ratio:
+            continue
+        eligible.append((candidate, privacy_metric, freezing_ratio))
+    return eligible
+
+
+def _candidate_runtime_key(candidate: SplitCandidate) -> tuple[int, float, int, str]:
+    return (
+        int(candidate.boundary_count),
+        float(candidate.estimated_latency),
+        candidate.legacy_layer_index if candidate.legacy_layer_index is not None else 10**9,
+        candidate.candidate_id,
+    )
+
+
+def _eligible_candidate_key(item: EligibleCandidate) -> tuple[int, int, float, int, str]:
+    candidate = item[0]
+    return (int(candidate.estimated_payload_bytes), *_candidate_runtime_key(candidate))
+
+
+def _validated_candidate_key(item: ValidatedCandidate) -> tuple[float, int, str]:
+    profile, candidate, _, _ = item
+    return (
+        float(profile.measured_end_to_end_latency),
+        candidate.legacy_layer_index if candidate.legacy_layer_index is not None else 10**9,
+        candidate.candidate_id,
+    )
+
+
+def _validate_payload_group(
+    runtime: UniversalModelSplitter,
+    group: list[EligibleCandidate],
+) -> tuple[list[ValidatedCandidate], int, int, dict[str, int]]:
+    validated_group: list[ValidatedCandidate] = []
+    replay_validation_failures = 0
+    replay_success_but_untrainable = 0
+    validation_error_counts: dict[str, int] = defaultdict(int)
+
+    for candidate, privacy_metric, freezing_ratio in sorted(
+        group,
+        key=lambda item: _candidate_runtime_key(item[0]),
+    ):
+        report = runtime.validate_candidate(candidate)
+        if not bool(report.get("success", False)):
+            replay_validation_failures += 1
+            error_text = str(report.get("error") or "unknown")
+            validation_error_counts[error_text] += 1
+            continue
+        if not bool(report.get("tail_trainability", candidate.is_trainable_tail)):
+            replay_success_but_untrainable += 1
+            continue
+        validated_group.append(
+            (
+                _profile_from_report(runtime, candidate, report),
+                candidate,
+                privacy_metric,
+                freezing_ratio,
+            )
+        )
+
+    return (
+        validated_group,
+        replay_validation_failures,
+        replay_success_but_untrainable,
+        validation_error_counts,
+    )
+
+
+def _raise_no_replayable_candidate(
+    constraints: SplitConstraints,
+    *,
+    eligible_count: int,
+    replay_validation_failures: int,
+    replay_success_but_untrainable: int,
+    validation_error_counts: Mapping[str, int],
+) -> None:
+    diagnostics = [
+        f"privacy_metric_lower_bound={constraints.privacy_metric_lower_bound}",
+        f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}",
+        f"eligible_candidates={eligible_count}",
+    ]
+    if replay_success_but_untrainable:
+        diagnostics.append(
+            f"replay_success_but_untrainable={replay_success_but_untrainable}"
+        )
+    if replay_validation_failures:
+        diagnostics.append(f"replay_validation_failures={replay_validation_failures}")
+        if validation_error_counts:
+            top_errors = sorted(
+                validation_error_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:3]
+            diagnostics.append(
+                "validation_errors="
+                + "; ".join(f"{error} x{count}" for error, count in top_errors)
+            )
+    raise RuntimeError(
+        "No replayable split candidate satisfies the fixed split constraints. "
+        + ", ".join(diagnostics)
+    )
+
+
+def _select_validated_candidate(
+    runtime: UniversalModelSplitter,
+    eligible: list[EligibleCandidate],
+    constraints: SplitConstraints,
+) -> ValidatedCandidate:
+    grouped: dict[int, list[EligibleCandidate]] = defaultdict(list)
+    for item in eligible:
+        grouped[int(item[0].estimated_payload_bytes)].append(item)
+
+    replay_validation_failures = 0
+    replay_success_but_untrainable = 0
+    validation_error_counts: dict[str, int] = defaultdict(int)
+
+    for payload_bytes in sorted(grouped):
+        validated_group, failures, untrainable, error_counts = _validate_payload_group(
+            runtime,
+            grouped[payload_bytes],
+        )
+        replay_validation_failures += failures
+        replay_success_but_untrainable += untrainable
+        for error_text, count in error_counts.items():
+            validation_error_counts[error_text] += count
+        if validated_group:
+            return min(validated_group, key=_validated_candidate_key)
+
+    _raise_no_replayable_candidate(
+        constraints,
+        eligible_count=len(eligible),
+        replay_validation_failures=replay_validation_failures,
+        replay_success_but_untrainable=replay_success_but_untrainable,
+        validation_error_counts=validation_error_counts,
+    )
+
+
+def _build_validation_payload(
+    chosen: SplitCandidate,
+    profile: CandidateProfile | None,
+) -> dict[str, Any]:
+    validation = {
+        "validation_passed": bool(profile.validation_passed) if profile is not None else True,
+        "tail_trainability": bool(profile.tail_trainability)
+        if profile is not None
+        else bool(chosen.is_trainable_tail),
+        "replay_success_rate": float(profile.replay_success_rate) if profile is not None else 1.0,
+        "stability_score": float(profile.stability_score) if profile is not None else 1.0,
+    }
+    if profile is not None:
+        validation["measured_end_to_end_latency"] = float(profile.measured_end_to_end_latency)
+        validation["measured_edge_latency"] = float(profile.measured_edge_latency)
+        validation["measured_cloud_latency"] = float(profile.measured_cloud_latency)
+        if profile.metadata:
+            validation["profile_metadata"] = dict(profile.metadata)
+    return validation
 
 
 def _profile_from_report(
@@ -253,32 +480,8 @@ def compute_fixed_split_for_model(
     runtime = splitter or UniversalModelSplitter(device=device)
     if runtime.graph is None or runtime.model is None:
         runtime.trace(model, sample_input, sample_kwargs=sample_kwargs)
-    _ensure_candidate_pool(runtime, constraints)
-    if not runtime.candidates:
-        raise RuntimeError("No split candidates were generated for the model.")
 
-    max_privacy_risk = max(
-        float(candidate.estimated_privacy_risk) for candidate in runtime.candidates
-    )
-    total_trainable_layers = _total_trainable_layers(runtime)
-
-    eligible: list[tuple[SplitCandidate, float, float]] = []
-    for candidate in runtime.candidates:
-        if not candidate.is_trainable_tail:
-            continue
-
-        privacy_metric = _privacy_metric(candidate, max_privacy_risk)
-        freezing_ratio = _layer_freezing_ratio(
-            runtime,
-            candidate,
-            total_trainable_layers=total_trainable_layers,
-        )
-        if privacy_metric < constraints.privacy_metric_lower_bound:
-            continue
-        if freezing_ratio > constraints.max_layer_freezing_ratio:
-            continue
-        eligible.append((candidate, privacy_metric, freezing_ratio))
-
+    eligible = _enumerate_feasible_candidates(runtime, constraints)
     if not eligible:
         raise RuntimeError(
             "No split candidate satisfies the fixed split constraints. "
@@ -287,118 +490,16 @@ def compute_fixed_split_for_model(
         )
 
     if not constraints.validate_candidates:
-        chosen, privacy_metric, freezing_ratio = min(
-            eligible,
-            key=lambda item: (
-                int(item[0].estimated_payload_bytes),
-                float(item[0].estimated_latency),
-                item[0].legacy_layer_index
-                if item[0].legacy_layer_index is not None
-                else 10**9,
-                item[0].candidate_id,
-            ),
-        )
+        chosen, privacy_metric, freezing_ratio = min(eligible, key=_eligible_candidate_key)
         profile = None
     else:
-        grouped: dict[int, list[tuple[SplitCandidate, float, float]]] = defaultdict(list)
-        for candidate, privacy_metric, freezing_ratio in eligible:
-            grouped[int(candidate.estimated_payload_bytes)].append(
-                (candidate, privacy_metric, freezing_ratio)
-            )
+        profile, chosen, privacy_metric, freezing_ratio = _select_validated_candidate(
+            runtime,
+            eligible,
+            constraints,
+        )
 
-        chosen: SplitCandidate | None = None
-        chosen_profile: CandidateProfile | None = None
-        chosen_privacy_metric = 0.0
-        chosen_freezing_ratio = 0.0
-        replay_validation_failures = 0
-        replay_success_but_untrainable = 0
-        validation_error_counts: dict[str, int] = defaultdict(int)
-        for payload_bytes in sorted(grouped):
-            validated_group: list[tuple[CandidateProfile, SplitCandidate, float, float]] = []
-            group = sorted(
-                grouped[payload_bytes],
-                key=lambda item: (
-                    float(item[0].estimated_latency),
-                    item[0].legacy_layer_index
-                    if item[0].legacy_layer_index is not None
-                    else 10**9,
-                    item[0].candidate_id,
-                ),
-            )
-            for candidate, privacy_metric, freezing_ratio in group:
-                report = runtime.validate_candidate(candidate)
-                if not bool(report.get("success", False)):
-                    replay_validation_failures += 1
-                    error_text = str(report.get("error") or "unknown")
-                    validation_error_counts[error_text] += 1
-                    continue
-                if not bool(report.get("tail_trainability", candidate.is_trainable_tail)):
-                    replay_success_but_untrainable += 1
-                    continue
-                validated_group.append(
-                    (
-                        _profile_from_report(runtime, candidate, report),
-                        candidate,
-                        privacy_metric,
-                        freezing_ratio,
-                    )
-                )
-            if validated_group:
-                chosen_profile, chosen, chosen_privacy_metric, chosen_freezing_ratio = min(
-                    validated_group,
-                    key=lambda item: (
-                        float(item[0].measured_end_to_end_latency),
-                        item[1].legacy_layer_index
-                        if item[1].legacy_layer_index is not None
-                        else 10**9,
-                        item[1].candidate_id,
-                    ),
-                )
-                break
-
-        if chosen is None or chosen_profile is None:
-            diagnostics = [
-                f"privacy_metric_lower_bound={constraints.privacy_metric_lower_bound}",
-                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}",
-                f"eligible_candidates={len(eligible)}",
-            ]
-            if replay_success_but_untrainable:
-                diagnostics.append(
-                    f"replay_success_but_untrainable={replay_success_but_untrainable}"
-                )
-            if replay_validation_failures:
-                diagnostics.append(
-                    f"replay_validation_failures={replay_validation_failures}"
-                )
-                if validation_error_counts:
-                    top_errors = sorted(
-                        validation_error_counts.items(),
-                        key=lambda item: (-item[1], item[0]),
-                    )[:3]
-                    diagnostics.append(
-                        "validation_errors="
-                        + "; ".join(f"{error} x{count}" for error, count in top_errors)
-                    )
-            raise RuntimeError(
-                "No replayable split candidate satisfies the fixed split constraints. "
-                + ", ".join(diagnostics)
-            )
-        profile = chosen_profile
-        privacy_metric = chosen_privacy_metric
-        freezing_ratio = chosen_freezing_ratio
-
-    validation = {
-        "validation_passed": bool(profile.validation_passed) if profile is not None else True,
-        "tail_trainability": bool(profile.tail_trainability) if profile is not None else bool(chosen.is_trainable_tail),
-        "replay_success_rate": float(profile.replay_success_rate) if profile is not None else 1.0,
-        "stability_score": float(profile.stability_score) if profile is not None else 1.0,
-    }
-    if profile is not None:
-        validation["measured_end_to_end_latency"] = float(profile.measured_end_to_end_latency)
-        validation["measured_edge_latency"] = float(profile.measured_edge_latency)
-        validation["measured_cloud_latency"] = float(profile.measured_cloud_latency)
-        if profile.metadata:
-            validation["profile_metadata"] = dict(profile.metadata)
+    validation = _build_validation_payload(chosen, profile)
 
     return SplitPlan(
         split_config_id=_make_plan_id(
@@ -462,7 +563,6 @@ def load_or_compute_fixed_split_plan(
             constraints=constraints,
             trace_signature=trace_signature,
         ):
-            _ensure_candidate_pool(runtime, constraints)
             if validate_cached_plan:
                 report = validate_split_plan(runtime, cached)
                 cached.validation = {**cached.validation, **report}
@@ -470,7 +570,6 @@ def load_or_compute_fixed_split_plan(
                 apply_split_plan(runtime, cached)
             return cached
 
-    _ensure_candidate_pool(runtime, constraints)
     plan = compute_fixed_split_for_model(
         model,
         constraints,
