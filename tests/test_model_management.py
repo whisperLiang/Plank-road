@@ -542,8 +542,8 @@ class TestModelZoo:
         model.num_classes = 91
         model._device = torch.device("cpu")
         model._prepare_batch = lambda images: (torch.zeros((1, 3, 8, 8)), [(8, 8)])
-        logits = torch.full((1, 1, 90), -10.0, dtype=torch.float32)
-        logits[0, 0, 2] = 5.0
+        logits = torch.full((1, 1, 91), -10.0, dtype=torch.float32)
+        logits[0, 0, 13] = 5.0
         model.rfdetr = SimpleNamespace(
             model=SimpleNamespace(
                 model=lambda batch: {
@@ -562,7 +562,38 @@ class TestModelZoo:
 
         output = model.forward([torch.rand(3, 8, 8)])[0]
 
-        assert output["labels"].tolist() == [3]
+        assert output["labels"].tolist() == [13]
+
+    def test_rfdetr_forward_keeps_last_coco_category_id(self):
+        import model_management.model_zoo as model_zoo_module
+
+        model = model_zoo_module.RFDETRDetectionModel.__new__(model_zoo_module.RFDETRDetectionModel)
+        nn.Module.__init__(model)
+        model.confidence = 0.01
+        model.num_classes = 91
+        model._device = torch.device("cpu")
+        model._prepare_batch = lambda images: (torch.zeros((1, 3, 8, 8)), [(8, 8)])
+        logits = torch.full((1, 1, 91), -10.0, dtype=torch.float32)
+        logits[0, 0, 90] = 5.0
+        model.rfdetr = SimpleNamespace(
+            model=SimpleNamespace(
+                model=lambda batch: {
+                    "pred_logits": logits,
+                    "pred_boxes": torch.tensor([[[0.25, 0.375, 0.25, 0.25]]], dtype=torch.float32),
+                },
+                postprocess=lambda predictions, target_sizes: [
+                    {
+                        "scores": torch.tensor([0.9]),
+                        "labels": torch.tensor([90]),
+                        "boxes": torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+                    }
+                ],
+            )
+        )
+
+        output = model.forward([torch.rand(3, 8, 8)])[0]
+
+        assert output["labels"].tolist() == [90]
 
     def test_rfdetr_forward_collapses_duplicate_query_labels_and_applies_nms(self):
         import model_management.model_zoo as model_zoo_module
@@ -575,9 +606,9 @@ class TestModelZoo:
         model._prepare_batch = lambda images: (torch.zeros((1, 3, 8, 8)), [(8, 8)])
 
         logits = torch.full((1, 2, 91), -10.0, dtype=torch.float32)
-        logits[0, 0, 2] = 5.0
-        logits[0, 0, 7] = 4.9
-        logits[0, 1, 2] = 4.8
+        logits[0, 0, 13] = 5.0
+        logits[0, 0, 27] = 4.9
+        logits[0, 1, 13] = 4.8
         boxes_cxcywh = torch.tensor(
             [[[0.4375, 0.4375, 0.625, 0.625], [0.45, 0.4375, 0.625, 0.625]]],
             dtype=torch.float32,
@@ -600,7 +631,7 @@ class TestModelZoo:
 
         output = model.forward([torch.rand(3, 8, 8)])[0]
 
-        assert output["labels"].tolist() == [3]
+        assert output["labels"].tolist() == [13]
         assert len(output["boxes"]) == 1
         assert output["scores"][0].item() == pytest.approx(torch.sigmoid(torch.tensor(5.0)).item())
 
@@ -773,18 +804,18 @@ class TestModelZoo:
     def test_rfdetr_training_labels_keep_coco_category_ids(self):
         labels = _build_rfdetr_training_labels(
             {
-                "boxes": [[1.0, 2.0, 6.0, 7.0]],
-                "labels": [3],
+                "boxes": [[1.0, 2.0, 6.0, 7.0], [1.0, 2.0, 5.0, 6.0]],
+                "labels": [13, 90],
                 "_split_meta": {
                     "input_image_size": [8, 8],
                     "input_tensor_shape": [1, 3, 8, 8],
                 },
             },
             device=torch.device("cpu"),
-            num_classes=90,
+            num_classes=91,
         )
 
-        assert labels[0]["labels"].tolist() == [3]
+        assert labels[0]["labels"].tolist() == [13, 90]
 
     def test_build_yolo26_detector_from_yaml_when_pretrained_false(self):
         model = build_detection_model("yolo26n", pretrained=False, device="cpu")

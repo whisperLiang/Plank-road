@@ -261,6 +261,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                     int(request.num_epoch),
                 )
             )
+            logger.info(
+                "continual_learning_request finished for edge_id={} success={} message={}",
+                request.edge_id,
+                success,
+                message,
+            )
         except Exception as exc:
             logger.exception("continual_learning_request error: {}", exc)
             success, model_data, message = False, "", str(exc)

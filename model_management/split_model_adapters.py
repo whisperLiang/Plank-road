@@ -349,7 +349,7 @@ def build_split_training_loss(model: torch.nn.Module):
             labels = _build_rfdetr_training_labels(
                 targets,
                 device=device,
-                num_classes=int(model.internal_num_classes),
+                num_classes=int(getattr(model, "num_classes", 0)),
             )
             loss_dict = criterion(predictions, labels)
             return sum(loss_dict.values())
@@ -996,11 +996,9 @@ def _build_rfdetr_training_labels(
         boxes = boxes[:count]
         labels = labels[:count]
 
-    if int(num_classes) >= 90:
-        valid = (labels > 0) & (labels <= int(num_classes))
-    else:
-        labels = labels - 1
-        valid = (labels >= 0) & (labels < int(num_classes))
+    # RF-DETR keeps the public 1-based label IDs and reserves 0 as the
+    # background/dummy slot.
+    valid = (labels > 0) & (labels < int(num_classes))
     if boxes.numel():
         valid = valid & (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
     boxes = boxes[valid]

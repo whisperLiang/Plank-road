@@ -1568,11 +1568,11 @@ def _postprocess_rfdetr_predictions(
 ) -> list[dict[str, torch.Tensor]]:
     """Decode RF-DETR outputs into one label per query plus light NMS.
 
-    The upstream ``PostProcess`` flattens ``query x class`` scores and can emit
-    multiple classes for the same query. For this repository's edge/cloud
-    pipeline we need stable, de-duplicated detections for confidence bucketing
-    and proxy-mAP evaluation, so we collapse each query to its best class first
-    and then apply a conservative per-class NMS pass.
+    RF-DETR uses DETR's ``max_obj_id + 1`` label layout: channel ``0`` is an
+    unused background/dummy slot and real object labels live on channels
+    ``1..max_obj_id``. We therefore collapse each query to its best
+    non-background class and then apply a conservative per-class NMS pass to
+    keep split-runtime replay stable.
     """
     pred_logits = predictions["pred_logits"]
     pred_boxes = predictions["pred_boxes"]
@@ -1580,8 +1580,10 @@ def _postprocess_rfdetr_predictions(
         raise RuntimeError("RF-DETR predictions must be [batch, queries, classes/4] tensors.")
 
     probabilities = pred_logits.sigmoid()
+    label_offset = 0
     if probabilities.shape[-1] > 1:
-        probabilities = probabilities[..., :-1]
+        probabilities = probabilities[..., 1:]
+        label_offset = 1
 
     scores_per_query, labels_per_query = probabilities.max(dim=-1)
     cx, cy, width, height = pred_boxes.unbind(-1)
@@ -1650,8 +1652,8 @@ def _postprocess_rfdetr_predictions(
         labels = labels.index_select(0, order)
         scores = scores.index_select(0, order)
 
-        if int(num_classes) >= 91:
-            labels = labels + 1
+        if label_offset:
+            labels = labels + int(label_offset)
 
         detections.append({
             "boxes": boxes.detach().to(device="cpu", dtype=torch.float32),

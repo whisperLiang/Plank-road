@@ -579,6 +579,11 @@ class CloudContinualLearner:
         edge_weights = self._edge_weights_path(model_name)
         legacy_weights = self._legacy_edge_weights_path()
         candidate_weights = edge_weights if os.path.exists(edge_weights) else legacy_weights
+        cache_source = (
+            "model-specific cache"
+            if candidate_weights == edge_weights
+            else "legacy cache"
+        )
         prefer_pretrained = model_name in model_lib
 
         def _build_native_model() -> torch.nn.Module:
@@ -620,12 +625,22 @@ class CloudContinualLearner:
                 else:
                     tmp_model = build_detection_model(model_name, pretrained=False, device=self.device)
                     try:
-                        tmp_model.load_state_dict(state, strict=False)
+                        load_result = tmp_model.load_state_dict(state, strict=False)
                     except Exception as exc:
                         fallback_reason = (
                             f"failed to load cached weights from {candidate_weights}: {exc}"
                         )
                     else:
+                        missing_keys = list(getattr(load_result, "missing_keys", ()) or ())
+                        unexpected_keys = list(getattr(load_result, "unexpected_keys", ()) or ())
+                        logger.info(
+                            "[CL] Loaded cached {} weights from {} ({}, missing_keys={}, unexpected_keys={}).",
+                            model_name,
+                            candidate_weights,
+                            cache_source,
+                            len(missing_keys),
+                            len(unexpected_keys),
+                        )
                         tmp_model.to(self.device)
                         get_split_runtime_model(tmp_model).eval()
                         return tmp_model
@@ -639,7 +654,18 @@ class CloudContinualLearner:
                 )
                 tmp_model = _build_native_model()
                 torch.save(tmp_model.state_dict(), edge_weights)
+                logger.info(
+                    "[CL] Refreshed {} edge cache at {} using native {} weights.",
+                    model_name,
+                    edge_weights,
+                    "pretrained" if prefer_pretrained else "randomly initialised",
+                )
         else:
+            logger.info(
+                "[CL] No cached {} weights found; starting from native {} weights.",
+                model_name,
+                "pretrained" if prefer_pretrained else "randomly initialised",
+            )
             tmp_model = _build_native_model()
         tmp_model.to(self.device)
         get_split_runtime_model(tmp_model).eval()
