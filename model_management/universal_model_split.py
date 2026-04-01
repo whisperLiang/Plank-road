@@ -74,6 +74,35 @@ def _split_meta_path(cache_path: str) -> str:
     return os.path.join(_cache_feature_dir(cache_path), "split_meta.json")
 
 
+def _format_boundary_labels(
+    boundary_tensor_labels: Sequence[str] | None,
+    *,
+    max_items: int = 4,
+) -> str:
+    labels = [str(label) for label in (boundary_tensor_labels or ())]
+    if not labels:
+        return "[]"
+    if len(labels) <= max_items:
+        return "[" + ", ".join(labels) + "]"
+    shown = ", ".join(labels[:max_items])
+    return f"[{shown}, ... (+{len(labels) - max_items} more)]"
+
+
+def _describe_split_identity(
+    *,
+    candidate_id: str | None,
+    boundary_tensor_labels: Sequence[str] | None,
+    legacy_split_index: int | None,
+) -> str:
+    labels = list(boundary_tensor_labels or [])
+    return (
+        f"candidate_id={candidate_id}, "
+        f"boundary_count={len(labels)}, "
+        f"boundary_tensor_labels={_format_boundary_labels(labels)}, "
+        f"legacy_split_index={legacy_split_index}"
+    )
+
+
 def _write_split_cache_metadata(
     cache_path: str,
     payload: SplitPayload,
@@ -602,15 +631,18 @@ def universal_split_retrain(
                     and len(payload.tensors) == len(chosen.boundary_tensor_labels)
                 ):
                     logger.warning(
-                        "Relabelling cached boundary tensors to match the selected candidate. "
-                        "cached={} selected={} cached_candidate_id={} selected_candidate_id={} "
-                        "cached_split_index={} selected_split_index={}.",
-                        payload_boundary_labels,
-                        chosen.boundary_tensor_labels,
-                        cached_candidate_id,
-                        chosen.candidate_id,
-                        cached_split_index,
-                        chosen.legacy_layer_index,
+                        "Relabelling cached boundary tensors to match the selected split combination. "
+                        "cached=({}) selected=({}).",
+                        _describe_split_identity(
+                            candidate_id=cached_candidate_id,
+                            boundary_tensor_labels=payload_boundary_labels,
+                            legacy_split_index=cached_split_index,
+                        ),
+                        _describe_split_identity(
+                            candidate_id=chosen.candidate_id,
+                            boundary_tensor_labels=chosen.boundary_tensor_labels,
+                            legacy_split_index=chosen.legacy_layer_index,
+                        ),
                     )
                     payload = SplitPayload(
                         tensors=OrderedDict(
@@ -637,10 +669,9 @@ def universal_split_retrain(
                     )
                 else:
                     raise RuntimeError(
-                        "Cached boundary tensor labels do not match the selected candidate. "
-                        f"cached={payload_boundary_labels}, selected={chosen.boundary_tensor_labels}, "
-                        f"cached_candidate_id={cached_candidate_id}, selected_candidate_id={chosen.candidate_id}, "
-                        f"cached_split_index={cached_split_index}, selected_split_index={chosen.legacy_layer_index}."
+                        "Cached boundary tensor labels do not match the selected split combination. "
+                        f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=payload_boundary_labels, legacy_split_index=cached_split_index)}), "
+                        f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=chosen.boundary_tensor_labels, legacy_split_index=chosen.legacy_layer_index)})."
                     )
             if (
                 payload_boundary_labels is None
@@ -653,7 +684,9 @@ def universal_split_retrain(
                 )
             ):
                 raise RuntimeError(
-                    f"Cached candidate_id={cached_candidate_id} does not match selected {chosen.candidate_id}."
+                    "Cached split identity does not match the selected split combination. "
+                    f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=None, legacy_split_index=cached_split_index)}), "
+                    f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=chosen.boundary_tensor_labels, legacy_split_index=chosen.legacy_layer_index)})."
                 )
             if (
                 payload_boundary_labels is None
@@ -662,7 +695,9 @@ def universal_split_retrain(
                 and cached_split_index != chosen.legacy_layer_index
             ):
                 raise RuntimeError(
-                    f"Cached split_index={cached_split_index} does not match selected {chosen.legacy_layer_index}."
+                    "Cached legacy split index does not match the selected split combination. "
+                    f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=None, legacy_split_index=cached_split_index)}), "
+                    f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=chosen.boundary_tensor_labels, legacy_split_index=chosen.legacy_layer_index)})."
                 )
 
             targets = gt_annotations.get(frame_index)

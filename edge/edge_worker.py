@@ -167,10 +167,9 @@ class EdgeWorker:
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
             logger.info(
-                "Fixed split plan ready (split_config_id={}, split_index={}, payload_bytes={}, image_size={})",
+                "Fixed split plan ready (split_config_id={}, {}, image_size={})",
                 self.fixed_split_plan.split_config_id,
-                self.fixed_split_plan.split_index,
-                self.fixed_split_plan.payload_bytes,
+                self.fixed_split_plan.describe(),
                 self.split_trace_image_size,
             )
         except RuntimeError as exc:

@@ -20,6 +20,20 @@ EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
 
 
+def _format_boundary_labels(
+    boundary_tensor_labels: list[str],
+    *,
+    max_items: int = 4,
+) -> str:
+    labels = [str(label) for label in boundary_tensor_labels]
+    if not labels:
+        return "[]"
+    if len(labels) <= max_items:
+        return "[" + ", ".join(labels) + "]"
+    shown = ", ".join(labels[:max_items])
+    return f"[{shown}, ... (+{len(labels) - max_items} more)]"
+
+
 @dataclass(frozen=True)
 class SplitConstraints:
     privacy_metric_lower_bound: float = 0.0
@@ -65,6 +79,19 @@ class SplitPlan:
     constraints: dict[str, Any] = field(default_factory=dict)
     trace_signature: str | None = None
     plan_version: str = FIXED_SPLIT_PLAN_VERSION
+
+    @property
+    def boundary_count(self) -> int:
+        return len(self.boundary_tensor_labels)
+
+    def describe(self, *, max_boundary_labels: int = 4) -> str:
+        return (
+            f"candidate_id={self.candidate_id}, "
+            f"boundary_count={self.boundary_count}, "
+            f"boundary_tensor_labels={_format_boundary_labels(self.boundary_tensor_labels, max_items=max_boundary_labels)}, "
+            f"legacy_split_index={self.split_index}, "
+            f"payload_bytes={self.payload_bytes}"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
