@@ -389,9 +389,9 @@ class TestModelZoo:
 
         calls = []
 
-        def fake_download_pretrain_weights(path: str) -> None:
-            calls.append(path)
-            target = Path(path)
+        def fake_download_http_file_with_resume(url: str, destination: Path, *, expected_md5: str | None = None) -> Path:
+            calls.append((url, destination.name, expected_md5))
+            target = Path(destination)
             target.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
@@ -400,79 +400,91 @@ class TestModelZoo:
                 },
                 target,
             )
+            return target
 
         monkeypatch.setattr(
-            "rfdetr.assets.model_weights.download_pretrain_weights",
-            fake_download_pretrain_weights,
+            model_zoo_module,
+            "_download_http_file_with_resume",
+            fake_download_http_file_with_resume,
         )
 
         artifact_path = ensure_local_model_artifact("rfdetr_nano")
 
         assert artifact_path == fake_models_dir / "rf-detr-nano.pth"
         assert artifact_path.is_file()
-        assert calls == [str(artifact_path)]
+        assert calls == [
+            (
+                "https://storage.googleapis.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+                "rf-detr-nano.pth",
+                "fb6504cce7fbdc783f7a46991f07639f",
+            )
+        ]
 
-    def test_ensure_local_model_artifact_strips_rfdetr_training_state_once(self, monkeypatch, tmp_path):
+    def test_ensure_local_model_artifact_reuses_readable_rfdetr_weights_despite_md5_mismatch(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
 
         fake_models_dir = tmp_path / "models"
         monkeypatch.setattr(model_zoo_module, "_MODELS_DIR", fake_models_dir)
 
-        calls = []
-
-        def fake_download_pretrain_weights(path: str) -> None:
-            calls.append(path)
-            target = Path(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "model": {"linear.weight": torch.arange(3)},
-                    "args": {"num_classes": 90},
-                    "optimizer": {"state": {"step": 42}},
-                    "lr_scheduler": {"last_epoch": 5},
-                },
-                target,
-            )
-
-        monkeypatch.setattr(
-            "rfdetr.assets.model_weights.download_pretrain_weights",
-            fake_download_pretrain_weights,
+        artifact_path = fake_models_dir / "rf-detr-nano.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model": {"linear.weight": torch.arange(3)},
+                "args": {"num_classes": 90},
+                "optimizer": {"state": {"step": 42}},
+                "lr_scheduler": {"last_epoch": 5},
+            },
+            artifact_path,
         )
 
-        artifact_path = ensure_local_model_artifact("rfdetr_nano")
+        calls = []
+
+        monkeypatch.setattr(model_zoo_module, "_matches_md5", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(
+            model_zoo_module,
+            "_download_http_file_with_resume",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+
+        artifact_path_1 = ensure_local_model_artifact("rfdetr_nano")
+        artifact_path_2 = ensure_local_model_artifact("rfdetr_nano")
         checkpoint = torch.load(artifact_path, map_location="cpu", weights_only=False)
 
-        assert set(checkpoint.keys()) == {"model", "args"}
-        assert "optimizer" not in checkpoint
-        assert "lr_scheduler" not in checkpoint
-        assert calls == [str(artifact_path)]
-
-        artifact_path_2 = ensure_local_model_artifact("rfdetr_nano")
-
+        assert artifact_path_1 == artifact_path
         assert artifact_path_2 == artifact_path
-        assert calls == [str(artifact_path)]
+        assert checkpoint["optimizer"] == {"state": {"step": 42}}
+        assert checkpoint["lr_scheduler"] == {"last_epoch": 5}
+        assert calls == []
 
     def test_build_rfdetr_detector_passes_local_artifact_to_wrapper(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
 
         artifact_path = tmp_path / "models" / "rf-detr-nano.pth"
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_bytes(b"rf-detr")
+        torch.save({"model": {"weight": torch.tensor([1.0])}}, artifact_path)
         monkeypatch.setattr(model_zoo_module, "ensure_local_model_artifact", lambda name: artifact_path)
 
         captured = {}
 
         class DummyRFDETRDetectionModel:
             def __init__(self, **kwargs):
-                captured.update(kwargs)
+                captured["init_kwargs"] = kwargs
+
+            def load_state_dict(self, state_dict, strict=True):
+                captured["loaded_state_dict"] = state_dict
+                captured["strict"] = strict
+                return SimpleNamespace(missing_keys=[], unexpected_keys=[])
 
         monkeypatch.setattr(model_zoo_module, "RFDETRDetectionModel", DummyRFDETRDetectionModel)
 
         build_detection_model("rfdetr_nano", pretrained=True, device="cpu")
 
-        assert captured["model_name"] == "rfdetr_nano"
-        assert captured["pretrained"] is True
-        assert captured["pretrain_weights"] == str(artifact_path)
+        assert captured["init_kwargs"]["model_name"] == "rfdetr_nano"
+        assert captured["init_kwargs"]["pretrained"] is False
+        assert "pretrain_weights" not in captured["init_kwargs"]
+        assert captured["strict"] is False
+        assert captured["loaded_state_dict"] == {"weight": torch.tensor([1.0])}
 
     def test_build_rfdetr_detector_unwraps_nested_model_checkpoint(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module

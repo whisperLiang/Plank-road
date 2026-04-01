@@ -683,18 +683,6 @@ _TINYNEXT_REPO_MODELS: Dict[str, str] = {
 }
 
 _MODELS_DIR = Path(__file__).resolve().parent / "models"
-_RFDETR_STRIPPABLE_KEYS = frozenset({
-    "optimizer",
-    "lr_scheduler",
-    "optimizer_states",
-    "lr_schedulers",
-    "state_dict",
-    "global_step",
-    "pytorch-lightning_version",
-    "loops",
-    "ema_model",
-    "legacy_ema_state_dict",
-})
 
 
 def _normalise_model_name(name: str) -> str:
@@ -1134,41 +1122,25 @@ def _convert_tinynext_official_detector_state_dict(
     return converted
 
 
-def _normalize_rfdetr_artifact(artifact_path: Path) -> bool:
-    """Strip RF-DETR training state while keeping upstream-compatible weights."""
-    try:
-        checkpoint = torch.load(artifact_path, map_location="cpu", weights_only=False)
-    except Exception as exc:
-        logger.debug("Skipping RF-DETR checkpoint normalization for {}: {}", artifact_path, exc)
-        return False
+def _load_rfdetr_checkpoint(artifact_path: Path, *, device: str | torch.device = "cpu") -> object:
+    return torch.load(artifact_path, map_location=device, weights_only=False)
 
-    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
-        return True
 
-    removable_keys = sorted(key for key in checkpoint.keys() if key in _RFDETR_STRIPPABLE_KEYS)
-    if not removable_keys:
-        return True
+def _extract_rfdetr_checkpoint_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
+    if isinstance(checkpoint, dict):
+        nested_state = checkpoint.get("state_dict")
+        if isinstance(nested_state, dict):
+            return nested_state
 
-    slim_checkpoint = {"model": checkpoint["model"]}
-    if "args" in checkpoint:
-        slim_checkpoint["args"] = checkpoint["args"]
+        nested_model = checkpoint.get("model")
+        if isinstance(nested_model, dict):
+            return nested_model
 
-    tmp_path = artifact_path.with_name(artifact_path.name + ".normalized")
-    if tmp_path.exists():
-        tmp_path.unlink()
-    try:
-        torch.save(slim_checkpoint, tmp_path)
-        tmp_path.replace(artifact_path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+        if checkpoint and all(isinstance(key, str) for key in checkpoint.keys()):
+            if any(torch.is_tensor(value) for value in checkpoint.values()):
+                return checkpoint
 
-    logger.info(
-        "Stripped RF-DETR training state from {}: {}",
-        artifact_path,
-        ", ".join(removable_keys),
-    )
-    return True
+    raise ValueError("RF-DETR checkpoint does not contain a readable model state_dict.")
 
 
 def _ensure_rfdetr_artifact(name: str) -> Path:
@@ -1181,29 +1153,35 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
             "Install: pip install rfdetr"
         )
 
-    from rfdetr.assets.model_weights import ModelWeights, download_pretrain_weights
-
-    # Once we normalize a downloaded checkpoint, its MD5 no longer matches the
-    # original upstream training artifact. Reuse valid local files instead of
-    # redownloading them on every call.
-    if artifact_path.is_file():
-        if _normalize_rfdetr_artifact(artifact_path):
-            return artifact_path
-        logger.warning("Existing RF-DETR weights {} are unreadable; re-downloading.", artifact_path)
-        artifact_path.unlink()
-
+    from rfdetr.assets.model_weights import ModelWeights
     asset = ModelWeights.from_filename(artifact_path.name)
-    if asset is not None:
-        logger.info("Downloading {} weights to {}", name_lower, artifact_path)
-        _download_http_file_with_resume(
-            asset.url,
-            artifact_path,
-            expected_md5=asset.md5_hash,
-        )
-    else:
-        download_pretrain_weights(str(artifact_path))
+    if asset is None:
+        raise RuntimeError(f"No upstream RF-DETR asset metadata found for {artifact_path.name}")
+
     if artifact_path.is_file():
-        _normalize_rfdetr_artifact(artifact_path)
+        if _matches_md5(artifact_path, asset.md5_hash):
+            return artifact_path
+        try:
+            _extract_rfdetr_checkpoint_state_dict(_load_rfdetr_checkpoint(artifact_path))
+            logger.info(
+                "Reusing readable RF-DETR weights at {} despite MD5 mismatch.",
+                artifact_path,
+            )
+            return artifact_path
+        except Exception as exc:
+            logger.warning(
+                "Existing RF-DETR weights {} are unreadable ({}); re-downloading.",
+                artifact_path,
+                exc,
+            )
+            artifact_path.unlink(missing_ok=True)
+
+    logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+    _download_http_file_with_resume(
+        asset.url,
+        artifact_path,
+        expected_md5=asset.md5_hash,
+    )
     return artifact_path
 
 
@@ -1325,25 +1303,21 @@ def build_detection_model(
 
     # ── 4. RT-DETR (ultralytics) ──
     if name_lower in _RFDETR_MODELS:
-        explicit_weights_supplied = artifact_path is not None
-        rfdetr_kwargs = dict(kwargs)
         if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
-            rfdetr_kwargs["pretrain_weights"] = str(artifact_path)
+        should_load_local_weights = artifact_path is not None and artifact_path.is_file()
         model = RFDETRDetectionModel(
             model_name=name_lower,
             confidence=confidence,
             device=device,
             num_classes=num_classes,
-            pretrained=pretrained and not explicit_weights_supplied,
-            **rfdetr_kwargs,
+            pretrained=pretrained and not should_load_local_weights,
+            **kwargs,
         )
-        if explicit_weights_supplied and artifact_path is not None and artifact_path.is_file():
-            state = torch.load(artifact_path, map_location=device, weights_only=False)
-            if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
-                state = state["state_dict"]
-            elif isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
-                state = state["model"]
+        if should_load_local_weights:
+            state = _extract_rfdetr_checkpoint_state_dict(
+                _load_rfdetr_checkpoint(artifact_path, device=device)
+            )
             model.load_state_dict(state, strict=False)
             logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
         logger.info("[ModelZoo] Built RF-DETR model: {}", name)
