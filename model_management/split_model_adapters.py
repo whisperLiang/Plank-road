@@ -81,7 +81,7 @@ class TorchvisionAnchorDetectorReplay(torch.nn.Module):
 
 
 class RFDETRReplay(torch.nn.Module):
-    """Replay-friendly RF-DETR wrapper that keeps only main decoder outputs."""
+    """Replay-friendly RF-DETR wrapper that preserves training-time auxiliaries."""
 
     def __init__(self, detector: RFDETRDetectionModel) -> None:
         super().__init__()
@@ -95,10 +95,17 @@ class RFDETRReplay(torch.nn.Module):
                 "pred_logits": outputs[1],
                 "pred_boxes": outputs[0],
             }
-        return {
+        replayed = {
             "pred_logits": outputs["pred_logits"],
             "pred_boxes": outputs["pred_boxes"],
         }
+        aux_outputs = outputs.get("aux_outputs")
+        enc_outputs = outputs.get("enc_outputs")
+        if isinstance(aux_outputs, list):
+            replayed["aux_outputs"] = aux_outputs
+        if isinstance(enc_outputs, dict):
+            replayed["enc_outputs"] = enc_outputs
+        return replayed
 
 
 def _is_anchor_detector(model: torch.nn.Module) -> bool:

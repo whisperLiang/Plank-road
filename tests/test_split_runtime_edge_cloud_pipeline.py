@@ -721,6 +721,137 @@ def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf
     assert edge_after == pytest.approx(0.9)
 
 
+def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+        def forward(self, images):
+            score = float(self.weight.detach().cpu().item())
+            if score <= 0.0:
+                return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
+                    "scores": torch.tensor([score], dtype=torch.float32),
+                }
+            ]
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+
+    split_plan = _dummy_split_plan()
+    sample_store = EdgeSampleStore(str(tmp_path / "sample_store"))
+    raw_frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    sample_store.store_sample(
+        sample_id="sample-1",
+        frame_index=1,
+        confidence=0.1,
+        split_config_id=split_plan.split_config_id,
+        model_id="rfdetr_nano",
+        model_version="0",
+        confidence_bucket=LOW_CONFIDENCE,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_planned_payload(split_plan),
+        drift_flag=False,
+        raw_frame=raw_frame,
+        input_image_size=[8, 8],
+        input_tensor_shape=[1, 3, 8, 8],
+    )
+    payload_zip, _ = pack_continual_learning_bundle(
+        sample_store,
+        edge_id=1,
+        send_low_conf_features=True,
+        split_plan=split_plan,
+        model_id="rfdetr_nano",
+        model_version="0",
+    )
+
+    bundle_root = tmp_path / "bundle"
+    with zipfile.ZipFile(io.BytesIO(payload_zip)) as zf:
+        zf.extractall(bundle_root)
+
+    cloud_model = DummyModel(weight=0.1)
+
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: cloud_model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_teacher_targets",
+        lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]},
+    )
+
+    def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, feature_provider=None, **kwargs):
+        frame_dir = Path(working_cache_path) / "frames"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(str(frame_dir / "sample-1.jpg"), raw_frame)
+        assert ok
+        return {"all_sample_ids": ["sample-1"], "drift_sample_ids": []}
+
+    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
+
+    epoch_weights = iter([0.9, 0.2])
+    retrain_calls = []
+
+    def fake_universal_split_retrain(*, model, num_epoch, **kwargs):
+        retrain_calls.append(num_epoch)
+        with torch.no_grad():
+            model.weight.fill_(next(epoch_weights))
+        return [0.1]
+
+    monkeypatch.setattr("cloud_server.universal_split_retrain", fake_universal_split_retrain)
+
+    def fake_evaluate_proxy_map(model, **kwargs):
+        score = float(model.weight.detach().cpu().item())
+        return {
+            "map": score,
+            "evaluated_samples": 1,
+            "skipped_empty_gt": 0,
+            "skipped_missing_frame": 0,
+            "total_gt_samples": 1,
+            "nonempty_predictions": 1,
+            "total_prediction_boxes": 1,
+        }
+
+    monkeypatch.setattr("cloud_server._evaluate_detection_proxy_map", fake_evaluate_proxy_map)
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(bundle_root),
+        num_epoch=2,
+    )
+
+    assert retrain_calls == [1, 1]
+    assert success is True
+    assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message
+    returned_state = torch.load(
+        io.BytesIO(base64.b64decode(model_data)),
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert float(returned_state["weight"][0]) == pytest.approx(0.9)
+
+
 def test_tinynext_fixed_split_rebuilds_trace_stable_features_on_server(
     tmp_path,
     monkeypatch,

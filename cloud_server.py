@@ -1080,29 +1080,63 @@ class CloudContinualLearner:
                     bundle_cache_path,
                     manifest,
                 )
-                universal_split_retrain(
-                    model=split_model,
-                    sample_input=sample_input,
-                    cache_path=working_cache,
-                    all_indices=bundle_info["all_sample_ids"],
-                    gt_annotations=gt_annotations,
-                    device=self.device,
-                    num_epoch=effective_num_epoch,
-                    learning_rate=effective_learning_rate,
-                    loss_fn=build_split_training_loss(tmp_model),
-                    das_enabled=self.das_enabled,
-                    das_bn_only=self.das_bn_only,
-                    das_probe_samples=self.das_probe_samples,
-                    splitter=prepared_splitter,
-                    chosen_candidate=prepared_candidate,
+                rfdetr_proxy_guided_retrain = bool(
+                    gt_annotations
+                    and str(current_model_name).lower().startswith("rfdetr_")
                 )
-                proxy_metrics_after = _evaluate_detection_proxy_map(
-                    tmp_model,
-                    frame_dir=frame_dir,
-                    gt_annotations=gt_annotations,
-                    device=self.device,
-                    model_name=current_model_name,
-                )
+                split_retrain_kwargs = {
+                    "model": split_model,
+                    "sample_input": sample_input,
+                    "cache_path": working_cache,
+                    "all_indices": bundle_info["all_sample_ids"],
+                    "gt_annotations": gt_annotations,
+                    "device": self.device,
+                    "learning_rate": effective_learning_rate,
+                    "loss_fn": build_split_training_loss(tmp_model),
+                    "das_enabled": self.das_enabled,
+                    "das_bn_only": self.das_bn_only,
+                    "das_probe_samples": self.das_probe_samples,
+                    "splitter": prepared_splitter,
+                    "chosen_candidate": prepared_candidate,
+                }
+                if rfdetr_proxy_guided_retrain:
+                    best_state = baseline_state
+                    best_metrics = dict(proxy_metrics_before)
+                    for epoch_index in range(int(effective_num_epoch)):
+                        universal_split_retrain(
+                            **split_retrain_kwargs,
+                            num_epoch=1,
+                        )
+                        candidate_metrics = _evaluate_detection_proxy_map(
+                            tmp_model,
+                            frame_dir=frame_dir,
+                            gt_annotations=gt_annotations,
+                            device=self.device,
+                            model_name=current_model_name,
+                        )
+                        if _proxy_metrics_are_better(candidate_metrics, best_metrics):
+                            best_state = _snapshot_model_state(tmp_model)
+                            best_metrics = dict(candidate_metrics)
+                            logger.info(
+                                "[FixedSplitCL] Kept RF-DETR candidate from epoch {} with proxy_mAP@0.5={:.4f}.",
+                                epoch_index + 1,
+                                float(candidate_metrics.get("map") or 0.0),
+                            )
+                    tmp_model.load_state_dict(best_state)
+                    _set_detection_model_eval_mode(tmp_model)
+                    proxy_metrics_after = dict(best_metrics)
+                else:
+                    universal_split_retrain(
+                        **split_retrain_kwargs,
+                        num_epoch=effective_num_epoch,
+                    )
+                    proxy_metrics_after = _evaluate_detection_proxy_map(
+                        tmp_model,
+                        frame_dir=frame_dir,
+                        gt_annotations=gt_annotations,
+                        device=self.device,
+                        model_name=current_model_name,
+                    )
                 proxy_summary = _format_proxy_map_summary(
                     proxy_metrics_before,
                     proxy_metrics_after,

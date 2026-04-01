@@ -669,6 +669,36 @@ class TestModelZoo:
         assert batch_norm_layers
         assert all(layer.training is False for layer in batch_norm_layers)
 
+    def test_set_detection_trainable_params_targets_rfdetr_transformer_tail(self):
+        class DummyCore(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = nn.Module()
+                self.backbone.projector = nn.Linear(4, 4)
+                self.transformer = nn.Module()
+                self.transformer.decoder = nn.Linear(4, 4)
+                self.transformer.enc_output = nn.Linear(4, 4)
+                self.transformer.enc_out_class_embed = nn.Linear(4, 4)
+
+        class DummyWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._core = DummyCore()
+                self.rfdetr = SimpleNamespace(
+                    model=SimpleNamespace(model=self._core)
+                )
+
+            def parameters(self, recurse: bool = True):
+                return self._core.parameters(recurse=recurse)
+
+        model = DummyWrapper()
+        set_detection_trainable_params(model, "rfdetr_nano")
+
+        assert model._core.transformer.decoder.weight.requires_grad is True
+        assert model._core.transformer.enc_output.weight.requires_grad is True
+        assert model._core.transformer.enc_out_class_embed.weight.requires_grad is True
+        assert model._core.backbone.projector.weight.requires_grad is False
+
     def test_rfdetr_training_labels_keep_coco_category_ids(self):
         labels = _build_rfdetr_training_labels(
             {

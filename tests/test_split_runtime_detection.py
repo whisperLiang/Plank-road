@@ -9,6 +9,7 @@ from model_management.candidate_profiler import profile_candidates
 from model_management.model_zoo import build_detection_model
 from model_management.payload import SplitPayload
 from model_management.split_model_adapters import (
+    RFDETRReplay,
     build_split_runtime_sample_input,
     build_split_training_loss,
     get_split_runtime_model,
@@ -81,6 +82,46 @@ def _training_targets(sample) -> dict[str, object]:
             "input_tensor_shape": shape,
         },
     }
+
+
+def test_rfdetr_replay_preserves_auxiliary_outputs_for_training():
+    class DummyInner(torch.nn.Module):
+        def forward(self, images):
+            return {
+                "pred_logits": torch.zeros((1, 4, 91), dtype=torch.float32),
+                "pred_boxes": torch.zeros((1, 4, 4), dtype=torch.float32),
+                "aux_outputs": [
+                    {
+                        "pred_logits": torch.ones((1, 4, 91), dtype=torch.float32),
+                        "pred_boxes": torch.ones((1, 4, 4), dtype=torch.float32),
+                    }
+                ],
+                "enc_outputs": {
+                    "pred_logits": torch.full((1, 4, 91), 2.0, dtype=torch.float32),
+                    "pred_boxes": torch.full((1, 4, 4), 2.0, dtype=torch.float32),
+                },
+            }
+
+    detector = type(
+        "DummyDetector",
+        (),
+        {
+            "rfdetr": type(
+                "DummyRFDETR",
+                (),
+                {
+                    "model": type("DummyModel", (), {"model": DummyInner()})(),
+                },
+            )(),
+        },
+    )()
+
+    outputs = RFDETRReplay(detector)(torch.zeros((1, 3, 8, 8), dtype=torch.float32))
+
+    assert "aux_outputs" in outputs
+    assert "enc_outputs" in outputs
+    assert outputs["aux_outputs"][0]["pred_logits"].shape == (1, 4, 91)
+    assert outputs["enc_outputs"]["pred_boxes"].shape == (1, 4, 4)
 
 
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)

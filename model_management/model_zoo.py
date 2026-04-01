@@ -1583,6 +1583,41 @@ def set_detection_trainable_params(model: nn.Module, model_name: str) -> None:
                 param.requires_grad = True
         return
 
+    if family == "rfdetr":
+        core_model = getattr(getattr(getattr(model, "rfdetr", None), "model", None), "model", None)
+        named_core_params = (
+            list(core_model.named_parameters())
+            if isinstance(core_model, nn.Module)
+            else []
+        )
+        trainable_patterns = (
+            "transformer.decoder",
+            "transformer.enc_output",
+            "transformer.enc_output_norm",
+            "transformer.enc_out_bbox_embed",
+            "transformer.enc_out_class_embed",
+            "bbox_embed",
+            "class_embed",
+            "ref_point_head",
+            "input_proj",
+            "query_pos_head",
+            "query_embed",
+            "tgt_embed",
+            "enc_score_head",
+        )
+        matched = False
+        for name, param in named_core_params:
+            if any(pattern in name for pattern in trainable_patterns):
+                param.requires_grad = True
+                matched = True
+        if matched:
+            return
+        all_params = list(model.parameters())
+        trainable_start = int(len(all_params) * 0.8)
+        for param in all_params[trainable_start:]:
+            param.requires_grad = True
+        return
+
     if is_wrapper_model(model_name):
         all_params = list(model.parameters())
         trainable_start = int(len(all_params) * 0.8)
