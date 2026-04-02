@@ -138,6 +138,107 @@ def test_runtime_resize_restores_boxes_to_original_coordinates():
     assert restored[0] == pytest.approx([64.0, 96.0, 320.0, 384.0])
 
 
+def test_cloud_bundle_trace_input_uses_runtime_tensor_shape_for_resize(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    bundle_root = tmp_path / "bundle"
+    raw_dir = bundle_root / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_frame = np.zeros((512, 960, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(raw_dir / "sample-1.jpg"), raw_frame)
+
+    manifest = {
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "raw_relpath": "raw/sample-1.jpg",
+                "input_image_size": [512, 960],
+                "input_tensor_shape": [1, 3, 640, 640],
+            }
+        ]
+    }
+    captured: dict[str, tuple[int, int]] = {}
+
+    def fake_prepare(model_arg, frame_arg, *, device):
+        captured["frame_shape"] = tuple(int(value) for value in frame_arg.shape[:2])
+        return torch.zeros((1, 3, frame_arg.shape[0], frame_arg.shape[1]), dtype=torch.float32)
+
+    monkeypatch.setattr("cloud_server.prepare_split_runtime_input", fake_prepare)
+
+    sample_input = learner._build_bundle_trace_sample_input(
+        object(),
+        str(bundle_root),
+        manifest,
+    )
+
+    assert learner._infer_bundle_trace_image_size(manifest) == (640, 640)
+    assert captured["frame_shape"] == (640, 640)
+    assert tuple(sample_input.shape) == (1, 3, 640, 640)
+
+
+def test_cloud_bundle_feature_provider_uses_runtime_tensor_shape_for_resize(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    bundle_root = tmp_path / "bundle"
+    raw_dir = bundle_root / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_frame = np.zeros((512, 960, 3), dtype=np.uint8)
+    raw_path = raw_dir / "sample-1.jpg"
+    assert cv2.imwrite(str(raw_path), raw_frame)
+
+    manifest = {
+        "split_plan": _dummy_split_plan(model_name="yolo26n").to_dict(),
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "raw_relpath": "raw/sample-1.jpg",
+                "input_image_size": [512, 960],
+                "input_tensor_shape": [1, 3, 640, 640],
+            }
+        ],
+    }
+    captured: dict[str, tuple[int, int]] = {}
+
+    def fake_prepare(model_arg, frame_arg, *, device):
+        captured["frame_shape"] = tuple(int(value) for value in frame_arg.shape[:2])
+        return torch.zeros((1, 3, frame_arg.shape[0], frame_arg.shape[1]), dtype=torch.float32)
+
+    monkeypatch.setattr("cloud_server.prepare_split_runtime_input", fake_prepare)
+
+    class DummySplitter:
+        def edge_forward(self, runtime_input, *, candidate=None):
+            captured["runtime_tensor_shape"] = tuple(int(value) for value in runtime_input.shape[-2:])
+            return runtime_input
+
+    provider = learner._bundle_feature_provider(
+        object(),
+        manifest,
+        bundle_root=str(bundle_root),
+        splitter=DummySplitter(),
+        candidate=SimpleNamespace(candidate_id="candidate-1"),
+    )
+
+    runtime_input = provider(str(raw_path), manifest["samples"][0], manifest)
+
+    assert captured["frame_shape"] == (640, 640)
+    assert captured["runtime_tensor_shape"] == (640, 640)
+    assert tuple(runtime_input.shape) == (1, 3, 640, 640)
+
+
 def test_cloud_learner_edge_scoped_cache_paths_are_isolated(tmp_path):
     config = SimpleNamespace(
         edge_model_name="yolo26n",

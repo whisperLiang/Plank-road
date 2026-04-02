@@ -705,8 +705,56 @@ class CloudContinualLearner:
         torch.save(model.state_dict(), buf)
         return buf.getvalue()
 
-    def _prepare_split_runtime_input(self, model: torch.nn.Module, frame):
-        return prepare_split_runtime_input(model, frame, device=self.device)
+    @staticmethod
+    def _runtime_image_size_from_metadata(
+        metadata: Mapping[str, object] | None,
+    ) -> tuple[int, int] | None:
+        if not isinstance(metadata, Mapping):
+            return None
+        input_tensor_shape = metadata.get("input_tensor_shape")
+        if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
+            height = int(input_tensor_shape[-2])
+            width = int(input_tensor_shape[-1])
+            if height > 0 and width > 0:
+                return height, width
+        input_image_size = metadata.get("input_image_size")
+        if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
+            height = int(input_image_size[0])
+            width = int(input_image_size[1])
+            if height > 0 and width > 0:
+                return height, width
+        return None
+
+    @staticmethod
+    def _resize_frame_for_runtime_input(
+        frame,
+        runtime_image_size: tuple[int, int] | None,
+    ):
+        if runtime_image_size is None:
+            return frame
+        current_image_size = tuple(int(value) for value in frame.shape[:2])
+        if current_image_size == tuple(runtime_image_size):
+            return frame
+        target_height, target_width = (int(runtime_image_size[0]), int(runtime_image_size[1]))
+        interpolation = cv2.INTER_AREA
+        if target_height > current_image_size[0] or target_width > current_image_size[1]:
+            interpolation = cv2.INTER_LINEAR
+        return cv2.resize(
+            frame,
+            (target_width, target_height),
+            interpolation=interpolation,
+        )
+
+    def _prepare_split_runtime_input(
+        self,
+        model: torch.nn.Module,
+        frame,
+        *,
+        sample_metadata: Mapping[str, object] | None = None,
+    ):
+        runtime_image_size = self._runtime_image_size_from_metadata(sample_metadata)
+        runtime_frame = self._resize_frame_for_runtime_input(frame, runtime_image_size)
+        return prepare_split_runtime_input(model, runtime_frame, device=self.device)
 
     def _teacher_inference(self, frame):
         try:
@@ -741,9 +789,9 @@ class CloudContinualLearner:
         manifest: dict[str, object],
     ) -> tuple[int, int]:
         for sample in manifest.get("samples", []):
-            image_size = sample.get("input_image_size")
-            if isinstance(image_size, (list, tuple)) and len(image_size) >= 2:
-                return int(image_size[0]), int(image_size[1])
+            runtime_image_size = self._runtime_image_size_from_metadata(sample)
+            if runtime_image_size is not None:
+                return runtime_image_size
         return 224, 224
 
     def _build_bundle_trace_sample_input(
@@ -762,7 +810,11 @@ class CloudContinualLearner:
             frame = cv2.imread(raw_path)
             if frame is None:
                 continue
-            return prepare_split_runtime_input(model, frame, device=self.device)
+            return self._prepare_split_runtime_input(
+                model,
+                frame,
+                sample_metadata=sample,
+            )
 
         trace_image_size = self._infer_bundle_trace_image_size(manifest)
         return build_split_runtime_sample_input(
@@ -792,7 +844,11 @@ class CloudContinualLearner:
             if frame is None:
                 raise FileNotFoundError(raw_path)
             return splitter.edge_forward(
-                self._prepare_split_runtime_input(model, frame),
+                self._prepare_split_runtime_input(
+                    model,
+                    frame,
+                    sample_metadata=sample,
+                ),
                 candidate=candidate,
             )
 
@@ -1336,30 +1392,33 @@ class CloudContinualLearner:
             frame = cv2.imread(frame_path)
             if frame is None:
                 continue
-            sample_input = self._prepare_split_runtime_input(tmp_model, frame)
+            try:
+                sample_record = load_split_feature_cache(cache_path, frame_index)
+            except FileNotFoundError:
+                sample_record = None
+            sample_input = self._prepare_split_runtime_input(
+                tmp_model,
+                frame,
+                sample_metadata=sample_record,
+            )
             break
 
         if sample_input is None:
-            input_image_size = None
+            runtime_image_size = None
             for frame_index in list(all_indices):
                 try:
                     record = load_split_feature_cache(cache_path, frame_index)
                 except FileNotFoundError:
                     continue
-                cached_image_size = record.get("input_image_size")
-                if isinstance(cached_image_size, (list, tuple)) and len(cached_image_size) >= 2:
-                    input_image_size = (int(cached_image_size[0]), int(cached_image_size[1]))
-                    break
-                input_tensor_shape = record.get("input_tensor_shape")
-                if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
-                    input_image_size = (int(input_tensor_shape[-2]), int(input_tensor_shape[-1]))
+                runtime_image_size = self._runtime_image_size_from_metadata(record)
+                if runtime_image_size is not None:
                     break
 
             # The graph-based split runtime now infers the selected candidate
             # directly from cached SplitPayload records.
             sample_input = build_split_runtime_sample_input(
                 tmp_model,
-                image_size=input_image_size or (224, 224),
+                image_size=runtime_image_size or (224, 224),
                 device=self.device,
             )
         universal_split_retrain(
