@@ -30,7 +30,7 @@ from tools.grpc_options import grpc_message_options
 import model_management.model_zoo as model_zoo
 from model_management.object_detection import Object_Detection
 from model_management.detection_annotations import load_annotation_targets
-from model_management.detection_dataset import TrafficDataset
+from model_management.detection_dataset import DetectionDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
 from model_management.model_zoo import (
@@ -1059,6 +1059,148 @@ class CloudContinualLearner:
             sample_metadata_by_id=sample_metadata_by_id,
         )
 
+    @staticmethod
+    def _build_training_frames(
+        *,
+        frame_dir: str,
+        frame_ids,
+        gt_annotations: Mapping[str, Mapping[str, object]],
+    ) -> list[dict[str, object]]:
+        frames: list[dict[str, object]] = []
+        for frame_id in frame_ids:
+            frame_key = str(frame_id)
+            target = gt_annotations.get(frame_key) or {}
+            boxes = list(target.get("boxes") or [])
+            labels = list(target.get("labels") or [])
+            if not boxes or not labels:
+                continue
+            frame_path = os.path.join(frame_dir, f"{frame_key}.jpg")
+            if not os.path.exists(frame_path):
+                logger.warning("[CL] Raw retrain frame {} not found at {}, skipping.", frame_key, frame_path)
+                continue
+            frames.append(
+                {
+                    "path": frame_path,
+                    "frame_index": frame_key,
+                    "boxes": boxes,
+                    "labels": labels,
+                }
+            )
+        return frames
+
+    def _retrain_edge_model_with_targets(
+        self,
+        *,
+        frame_dir: str,
+        frame_ids,
+        gt_annotations: Mapping[str, Mapping[str, object]],
+        num_epoch: int,
+        model_name: str | None = None,
+        edge_id: int | str | None = None,
+    ) -> bytes:
+        from model_management.model_zoo import (
+            get_model_family,
+            is_wrapper_model,
+            set_detection_trainable_params,
+        )
+
+        model_name = str(model_name or self.edge_model_name)
+        edge_weights = self._edge_weights_path(model_name, edge_id=edge_id)
+        model_family = get_model_family(model_name)
+
+        if is_wrapper_model(model_name):
+            raise NotImplementedError(
+                f"[CL] {model_name} is a wrapper model (YOLO/DETR/RT-DETR) and "
+                f"does not support torchvision-style retraining."
+            )
+
+        tmp_model = self._load_edge_training_model(model_name=model_name, edge_id=edge_id)
+        set_detection_trainable_params(tmp_model, model_name)
+
+        frames = self._build_training_frames(
+            frame_dir=frame_dir,
+            frame_ids=frame_ids,
+            gt_annotations=gt_annotations,
+        )
+        if not frames:
+            raise ValueError("No annotated raw frames were available for retraining.")
+
+        dataset = DetectionDataset(frames)
+        data_loader = DataLoader(dataset=dataset, batch_size=2, collate_fn=_collate_fn)
+        tr_metric = RetrainMetric()
+
+        roi_params = [p for p in tmp_model.parameters() if p.requires_grad]
+        if model_family == "tinynext":
+            optimizer = torch.optim.AdamW(roi_params, lr=5e-5, weight_decay=1e-4)
+            lr_scheduler = None
+        else:
+            optimizer = torch.optim.SGD(roi_params, lr=0.005, momentum=0.9, weight_decay=5e-4)
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
+        best_state = _snapshot_model_state(tmp_model)
+        best_metrics = None
+        if model_family == "tinynext" and gt_annotations:
+            best_metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                tmp_model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                device=self.device,
+                model_name=model_name,
+            )
+            best_state = _snapshot_model_state(tmp_model)
+            if abs(calibrated_high - initial_high) > 1e-6:
+                logger.info(
+                    "[CL] Calibrated {} threshold_high {} -> {} on proxy set (proxy_mAP@0.5={:.4f}).",
+                    model_name,
+                    initial_high,
+                    calibrated_high,
+                    float(best_metrics.get("map") or 0.0),
+                )
+
+        for epoch in range(num_epoch):
+            set_detection_finetune_mode(tmp_model, model_name)
+            for images, targets in tr_metric.log_iter(epoch, num_epoch, data_loader):
+                images = [img.to(self.device) for img in images]
+                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+                loss_dict = tmp_model(images, targets)
+                losses = sum(loss_dict.values())
+                optimizer.zero_grad()
+                losses.backward()
+                if model_family == "tinynext":
+                    torch.nn.utils.clip_grad_norm_(roi_params, 1.0)
+                optimizer.step()
+                tr_metric.update(loss_dict, losses)
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+            if model_family == "tinynext" and gt_annotations:
+                candidate_metrics, _, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                    tmp_model,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    device=self.device,
+                    model_name=model_name,
+                )
+                if _proxy_metrics_are_better(candidate_metrics, best_metrics):
+                    best_metrics = candidate_metrics
+                    best_state = _snapshot_model_state(tmp_model)
+                    logger.info(
+                        "[CL] Kept TinyNeXt candidate from epoch {} with proxy_mAP@0.5={:.4f} and threshold_high={}.",
+                        epoch + 1,
+                        float(candidate_metrics.get("map") or 0.0),
+                        calibrated_high,
+                    )
+
+        if best_metrics is not None:
+            tmp_model.load_state_dict(best_state, strict=False)
+
+        torch.save(tmp_model.state_dict(), edge_weights)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        buf = io.BytesIO()
+        torch.save(tmp_model.state_dict(), buf)
+        return buf.getvalue()
+
     def _run_fixed_split_retrain(
         self,
         model: torch.nn.Module,
@@ -1378,21 +1520,63 @@ class CloudContinualLearner:
                             sample_metadata_by_id=sample_metadata_by_id,
                         )
 
-                proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
-                    tmp_model,
-                    current_model_name=current_model_name,
-                    bundle_info=bundle_info,
-                    manifest=manifest,
-                    bundle_cache_path=bundle_cache_path,
-                    working_cache=working_cache,
-                    frame_dir=frame_dir,
-                    gt_annotations=gt_annotations,
-                    num_epoch=num_epoch,
-                    proxy_metrics_before=proxy_metrics_before,
-                    prepared_splitter=prepared_splitter,
-                    prepared_candidate=prepared_candidate,
-                    sample_metadata_by_id=sample_metadata_by_id,
-                )
+                retrain_mode = "fixed_split"
+                retrain_failure_reason = ""
+                returned_model_bytes: bytes | None = None
+                try:
+                    proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
+                        tmp_model,
+                        current_model_name=current_model_name,
+                        bundle_info=bundle_info,
+                        manifest=manifest,
+                        bundle_cache_path=bundle_cache_path,
+                        working_cache=working_cache,
+                        frame_dir=frame_dir,
+                        gt_annotations=gt_annotations,
+                        num_epoch=num_epoch,
+                        proxy_metrics_before=proxy_metrics_before,
+                        prepared_splitter=prepared_splitter,
+                        prepared_candidate=prepared_candidate,
+                        sample_metadata_by_id=sample_metadata_by_id,
+                    )
+                except RuntimeError as exc:
+                    if not self._should_fallback_from_fixed_split_error(exc):
+                        raise
+                    retrain_mode = "raw_fallback"
+                    retrain_failure_reason = str(exc)
+                    baseline_state = _snapshot_model_state(tmp_model)
+                    fallback_frame_ids = list(gt_annotations.keys())
+                    if not fallback_frame_ids:
+                        raise RuntimeError(
+                            "Fixed split retraining failed and no GT-annotated raw samples were available for full-image fallback."
+                        ) from exc
+                    logger.warning(
+                        "[FixedSplitCL] Falling back to full-image retraining for edge {} because fixed split failed: {}",
+                        edge_id,
+                        exc,
+                    )
+                    returned_model_bytes = self._retrain_edge_model_with_targets(
+                        frame_dir=frame_dir,
+                        frame_ids=fallback_frame_ids,
+                        gt_annotations=gt_annotations,
+                        num_epoch=num_epoch,
+                        model_name=current_model_name,
+                        edge_id=edge_id,
+                    )
+                    returned_state = torch.load(
+                        io.BytesIO(returned_model_bytes),
+                        map_location=self.device,
+                        weights_only=False,
+                    )
+                    tmp_model.load_state_dict(returned_state, strict=False)
+                    _set_detection_model_eval_mode(tmp_model)
+                    proxy_metrics_after = self._evaluate_fixed_split_proxy_map(
+                        tmp_model,
+                        frame_dir=frame_dir,
+                        gt_annotations=gt_annotations,
+                        model_name=current_model_name,
+                        sample_metadata_by_id=sample_metadata_by_id,
+                    )
                 proxy_summary = _format_proxy_map_summary(
                     proxy_metrics_before,
                     proxy_metrics_after,
@@ -1429,29 +1613,59 @@ class CloudContinualLearner:
                             edge_id=edge_id,
                         )
                     ).decode("utf-8")
-                    fallback_message = (
-                        f"Kept {baseline_source} weights; rejected retrained weights because {rejection_reason}"
-                    )
+                    if retrain_mode == "raw_fallback":
+                        fallback_message = (
+                            "Kept "
+                            f"{baseline_source} weights; rejected full-image fallback retraining because {rejection_reason}"
+                        )
+                    else:
+                        fallback_message = (
+                            f"Kept {baseline_source} weights; rejected retrained weights because {rejection_reason}"
+                        )
                     if proxy_summary is not None:
                         fallback_message = f"{fallback_message}; {proxy_summary}"
                     else:
                         fallback_message = f"{fallback_message}; proxy_mAP@0.5 skipped"
+                    if retrain_mode == "raw_fallback":
+                        fallback_message = (
+                            "Fell back to full-image retraining because fixed split failed: "
+                            f"{retrain_failure_reason}; {fallback_message}"
+                        )
                     return True, encoded, fallback_message
 
-                encoded = base64.b64encode(
-                    self._serialise_model_bytes(
-                        tmp_model,
-                        model_name=current_model_name,
-                        edge_id=edge_id,
+                if returned_model_bytes is not None:
+                    encoded = base64.b64encode(returned_model_bytes).decode("utf-8")
+                else:
+                    encoded = base64.b64encode(
+                        self._serialise_model_bytes(
+                            tmp_model,
+                            model_name=current_model_name,
+                            edge_id=edge_id,
+                        )
+                    ).decode("utf-8")
+                if retrain_mode == "raw_fallback":
+                    success_message = (
+                        "Fell back to full-image retraining because fixed split failed: "
+                        f"{retrain_failure_reason}; "
+                        + (
+                            f"proxy_mAP@0.5 {float(proxy_metrics_before.get('map') or 0.0):.4f} -> {float(proxy_metrics_after.get('map') or 0.0):.4f} "
+                            f"(delta={float((proxy_metrics_after.get('map') or 0.0)) - float((proxy_metrics_before.get('map') or 0.0)):+.4f}, "
+                            f"evaluated={int(proxy_metrics_after.get('evaluated_samples', 0))}, "
+                            f"skipped_empty_gt={int(proxy_metrics_after.get('skipped_empty_gt', 0))}, "
+                            f"skipped_missing_frame={int(proxy_metrics_after.get('skipped_missing_frame', 0))})"
+                            if proxy_summary is not None
+                            else "proxy_mAP@0.5 skipped"
+                        )
                     )
-                ).decode("utf-8")
-                success_message = (
-                    f"Fixed split retraining successful; {proxy_summary}"
-                    if proxy_summary is not None
-                    else "Fixed split retraining successful; proxy_mAP@0.5 skipped"
-                )
+                else:
+                    success_message = (
+                        f"Fixed split retraining successful; {proxy_summary}"
+                        if proxy_summary is not None
+                        else "Fixed split retraining successful; proxy_mAP@0.5 skipped"
+                    )
                 logger.success(
-                    "[FixedSplitCL] Retraining done for edge {} with {} samples ({} GT-annotated).",
+                    "[FixedSplitCL] {} done for edge {} with {} samples ({} GT-annotated).",
+                    "Fallback full-image retraining" if retrain_mode == "raw_fallback" else "Retraining",
                     edge_id,
                     len(bundle_info["all_sample_ids"]),
                     len(gt_annotations),
@@ -1531,6 +1745,14 @@ class CloudContinualLearner:
 
         return self._serialise_model_bytes(tmp_model, edge_id=edge_id)
 
+    @staticmethod
+    def _should_fallback_from_fixed_split_error(exc: Exception) -> bool:
+        message = str(exc)
+        return (
+            "Split retraining did not produce any finite optimization step" in message
+            or "empty/non-differentiable detector outputs" in message
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers (original full-image retraining)
     # ------------------------------------------------------------------
@@ -1574,119 +1796,25 @@ class CloudContinualLearner:
     def _retrain_edge_model(
         self,
         cache_path: str,
-        frame_indices: list[int],
+        frame_indices,
         num_epoch: int,
         *,
         model_name: str | None = None,
         edge_id: int | str | None = None,
     ) -> bytes:
         """Fine-tune the lightweight model; return its state-dict as bytes."""
-        from model_management.model_zoo import (
-            get_model_family,
-            is_wrapper_model,
-            set_detection_trainable_params,
-        )
-
         model_name = str(model_name or self.edge_model_name)
-        edge_weights = self._edge_weights_path(model_name, edge_id=edge_id)
-        model_family = get_model_family(model_name)
-
-        if is_wrapper_model(model_name):
-            raise NotImplementedError(
-                f"[CL] {model_name} is a wrapper model (YOLO/DETR/RT-DETR) and "
-                f"does not support torchvision-style retraining."
-            )
-
-        tmp_model = self._load_edge_training_model(model_name=model_name, edge_id=edge_id)
-
-        # Freeze backbone; fine-tune only the detector tail (model-family aware)
-        set_detection_trainable_params(tmp_model, model_name)
-
         annotation_path = os.path.join(cache_path, "annotation.txt")
         frame_dir = os.path.join(cache_path, "frames")
         gt_annotations = _load_annotation_targets(annotation_path)
-
-        dataset = TrafficDataset(root=cache_path, select_index=frame_indices)
-        if len(dataset) == 0:
-            raise ValueError("TrafficDataset is empty - no annotated frames found.")
-
-        data_loader = DataLoader(dataset=dataset, batch_size=2, collate_fn=_collate_fn)
-        tr_metric = RetrainMetric()
-
-        roi_params = [p for p in tmp_model.parameters() if p.requires_grad]
-        if model_family == "tinynext":
-            optimizer = torch.optim.AdamW(roi_params, lr=5e-5, weight_decay=1e-4)
-            lr_scheduler = None
-        else:
-            optimizer = torch.optim.SGD(roi_params, lr=0.005, momentum=0.9, weight_decay=5e-4)
-            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
-
-        best_state = _snapshot_model_state(tmp_model)
-        best_metrics = None
-        if model_family == "tinynext" and gt_annotations:
-            best_metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
-                tmp_model,
-                frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
-                device=self.device,
-                model_name=model_name,
-            )
-            best_state = _snapshot_model_state(tmp_model)
-            if abs(calibrated_high - initial_high) > 1e-6:
-                logger.info(
-                    "[CL] Calibrated {} threshold_high {} -> {} on proxy set (proxy_mAP@0.5={:.4f}).",
-                    model_name,
-                    initial_high,
-                    calibrated_high,
-                    float(best_metrics.get("map") or 0.0),
-                )
-
-        for epoch in range(num_epoch):
-            set_detection_finetune_mode(tmp_model, model_name)
-            for images, targets in tr_metric.log_iter(epoch, num_epoch, data_loader):
-                images = [img.to(self.device) for img in images]
-                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
-                loss_dict = tmp_model(images, targets)
-                losses = sum(loss_dict.values())
-                optimizer.zero_grad()
-                losses.backward()
-                if model_family == "tinynext":
-                    torch.nn.utils.clip_grad_norm_(roi_params, 1.0)
-                optimizer.step()
-                tr_metric.update(loss_dict, losses)
-            if lr_scheduler is not None:
-                lr_scheduler.step()
-            if model_family == "tinynext" and gt_annotations:
-                candidate_metrics, _, calibrated_high = _calibrate_tinynext_proxy_thresholds(
-                    tmp_model,
-                    frame_dir=frame_dir,
-                    gt_annotations=gt_annotations,
-                    device=self.device,
-                    model_name=model_name,
-                )
-                if _proxy_metrics_are_better(candidate_metrics, best_metrics):
-                    best_metrics = candidate_metrics
-                    best_state = _snapshot_model_state(tmp_model)
-                    logger.info(
-                        "[CL] Kept TinyNeXt candidate from epoch {} with proxy_mAP@0.5={:.4f} and threshold_high={}.",
-                        epoch + 1,
-                        float(candidate_metrics.get("map") or 0.0),
-                        calibrated_high,
-                    )
-
-        if best_metrics is not None:
-            tmp_model.load_state_dict(best_state, strict=False)
-
-        # Persist to cloud-side tmp so future retraining can fine-tune further
-        torch.save(tmp_model.state_dict(), edge_weights)
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Serialise state-dict to bytes
-        buf = io.BytesIO()
-        torch.save(tmp_model.state_dict(), buf)
-        return buf.getvalue()
+        return self._retrain_edge_model_with_targets(
+            frame_dir=frame_dir,
+            frame_ids=frame_indices,
+            gt_annotations=gt_annotations,
+            num_epoch=num_epoch,
+            model_name=model_name,
+            edge_id=edge_id,
+        )
 
 
 class CloudServer:
