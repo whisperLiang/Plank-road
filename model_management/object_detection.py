@@ -40,6 +40,7 @@ class InferenceArtifacts:
     detection_score: list
     confidence: float
     input_tensor_shape: list[int] | None = None
+    input_resize_mode: str | None = None
 
     def to_inference_result(self) -> dict[str, list]:
         return {
@@ -250,6 +251,7 @@ class Object_Detection:
         input_tensor_shape = None
         runtime_frame, original_image_size, resized = self._prepare_runtime_frame(img)
         runtime_image_size = tuple(int(value) for value in runtime_frame.shape[:2])
+        input_resize_mode = "direct_resize" if self.uses_runtime_resize() else "model_preprocess"
         with self.model_lock:
             if splitter is not None:
                 splitter_input = prepare_split_runtime_input(self.model, runtime_frame, device=device)
@@ -295,6 +297,7 @@ class Object_Detection:
                 detection_score=[],
                 confidence=0.0,
                 input_tensor_shape=input_tensor_shape,
+                input_resize_mode=input_resize_mode,
             )
 
         confidence = float(np.mean(pred_score)) if len(pred_score) else 0.0
@@ -315,6 +318,7 @@ class Object_Detection:
             detection_score=detection_score,
             confidence=confidence,
             input_tensor_shape=input_tensor_shape,
+            input_resize_mode=input_resize_mode,
         )
 
     def small_inference(self, img, splitter=None, return_split_payload=False):

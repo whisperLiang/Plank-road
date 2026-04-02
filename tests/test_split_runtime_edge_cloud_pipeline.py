@@ -15,6 +15,7 @@ import torch
 from cloud_server import (
     CloudContinualLearner,
     _calibrate_tinynext_proxy_thresholds,
+    _evaluate_detection_proxy_map,
     _requires_trace_stable_feature_rebuild,
     _select_fixed_split_gt_sample_ids,
 )
@@ -237,6 +238,38 @@ def test_cloud_bundle_feature_provider_uses_runtime_tensor_shape_for_resize(tmp_
     assert captured["frame_shape"] == (640, 640)
     assert captured["runtime_tensor_shape"] == (640, 640)
     assert tuple(runtime_input.shape) == (1, 3, 640, 640)
+
+
+def test_proxy_eval_restores_boxes_for_direct_resize_metadata(tmp_path):
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(frame_dir / "sample-1.jpg"), frame)
+
+    class DummyModel(torch.nn.Module):
+        def forward(self, images):
+            return [{
+                "labels": torch.tensor([1], dtype=torch.int64),
+                "boxes": torch.tensor([[64.0, 128.0, 320.0, 512.0]], dtype=torch.float32),
+                "scores": torch.tensor([0.95], dtype=torch.float32),
+            }]
+
+    metrics = _evaluate_detection_proxy_map(
+        DummyModel(),
+        frame_dir=str(frame_dir),
+        gt_annotations={"sample-1": {"boxes": [[64.0, 96.0, 320.0, 384.0]], "labels": [1]}},
+        device=torch.device("cpu"),
+        sample_metadata_by_id={
+            "sample-1": {
+                "input_image_size": [480, 640],
+                "input_tensor_shape": [1, 3, 640, 640],
+                "input_resize_mode": "direct_resize",
+            }
+        },
+    )
+
+    assert metrics["map"] == pytest.approx(1.0)
+    assert metrics["evaluated_samples"] == 1
 
 
 def test_cloud_learner_edge_scoped_cache_paths_are_isolated(tmp_path):

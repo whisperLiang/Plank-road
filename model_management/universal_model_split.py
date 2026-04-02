@@ -717,6 +717,7 @@ def universal_split_retrain(
                     "confidence_bucket": record.get("confidence_bucket"),
                     "input_image_size": record.get("input_image_size"),
                     "input_tensor_shape": record.get("input_tensor_shape"),
+                    "input_resize_mode": record.get("input_resize_mode"),
                 }
                 targets = {
                     **targets,

@@ -47,7 +47,10 @@ from model_management.model_zoo import (
     set_detection_trainable_params,
     set_model_detection_thresholds,
 )
-from model_management.split_model_adapters import _build_rfdetr_training_labels
+from model_management.split_model_adapters import (
+    _build_rfdetr_training_labels,
+    _build_ultralytics_training_batch,
+)
 
 
 # =====================================================================
@@ -816,6 +819,41 @@ class TestModelZoo:
         )
 
         assert labels[0]["labels"].tolist() == [13, 90]
+
+    def test_ultralytics_training_batch_projects_boxes_for_direct_resize(self):
+        batch = _build_ultralytics_training_batch(
+            {
+                "boxes": [[64.0, 96.0, 320.0, 384.0]],
+                "labels": [3],
+                "_split_meta": {
+                    "input_image_size": [480, 640],
+                    "input_tensor_shape": [1, 3, 640, 640],
+                    "input_resize_mode": "direct_resize",
+                },
+            },
+            device=torch.device("cpu"),
+        )
+
+        assert tuple(batch["img"].shape) == (1, 3, 640, 640)
+        assert batch["bboxes"].shape == (1, 4)
+        assert batch["bboxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.6])
+
+    def test_ultralytics_training_batch_keeps_legacy_letterbox_projection_without_resize_mode(self):
+        batch = _build_ultralytics_training_batch(
+            {
+                "boxes": [[64.0, 96.0, 320.0, 384.0]],
+                "labels": [3],
+                "_split_meta": {
+                    "input_image_size": [480, 640],
+                    "input_tensor_shape": [1, 3, 640, 640],
+                },
+            },
+            device=torch.device("cpu"),
+        )
+
+        assert tuple(batch["img"].shape) == (1, 3, 640, 640)
+        assert batch["bboxes"].shape == (1, 4)
+        assert batch["bboxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.45])
 
     def test_build_yolo26_detector_from_yaml_when_pretrained_false(self):
         model = build_detection_model("yolo26n", pretrained=False, device="cpu")

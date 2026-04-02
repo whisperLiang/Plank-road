@@ -310,12 +310,14 @@ class TestEdgeWorkerRouting:
             detection_score=[],
             confidence=0.6,
             input_tensor_shape=[1, 3, 384, 640],
+            input_resize_mode="direct_resize",
         )
 
         worker.collect_data(task, sample_bgr_frame, inference)
 
         assert captured["confidence_bucket"] == LOW_CONFIDENCE
         assert captured["raw_frame"] is sample_bgr_frame
+        assert captured["input_resize_mode"] == "direct_resize"
 
 
 # =====================================================================

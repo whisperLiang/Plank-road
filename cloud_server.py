@@ -141,6 +141,84 @@ def _prepare_eval_image_tensor(frame: np.ndarray, *, device: torch.device) -> to
     return tensor.permute(2, 0, 1).float().div(255.0).to(device)
 
 
+def _runtime_image_size_from_metadata(
+    metadata: Mapping[str, object] | None,
+) -> tuple[int, int] | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    input_tensor_shape = metadata.get("input_tensor_shape")
+    if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
+        height = int(input_tensor_shape[-2])
+        width = int(input_tensor_shape[-1])
+        if height > 0 and width > 0:
+            return height, width
+    input_image_size = metadata.get("input_image_size")
+    if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
+        height = int(input_image_size[0])
+        width = int(input_image_size[1])
+        if height > 0 and width > 0:
+            return height, width
+    return None
+
+
+def _input_resize_mode_from_metadata(
+    metadata: Mapping[str, object] | None,
+) -> str | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    resize_mode = metadata.get("input_resize_mode")
+    if resize_mode is None:
+        return None
+    value = str(resize_mode).strip()
+    return value or None
+
+
+def _resize_frame_for_runtime_input(
+    frame: np.ndarray,
+    runtime_image_size: tuple[int, int] | None,
+) -> np.ndarray:
+    if runtime_image_size is None:
+        return frame
+    current_image_size = tuple(int(value) for value in frame.shape[:2])
+    if current_image_size == tuple(runtime_image_size):
+        return frame
+    target_height, target_width = (int(runtime_image_size[0]), int(runtime_image_size[1]))
+    interpolation = cv2.INTER_AREA
+    if target_height > current_image_size[0] or target_width > current_image_size[1]:
+        interpolation = cv2.INTER_LINEAR
+    return cv2.resize(
+        frame,
+        (target_width, target_height),
+        interpolation=interpolation,
+    )
+
+
+def _restore_boxes_to_original_coordinates(
+    boxes: list[list[float]],
+    *,
+    original_image_size: tuple[int, int],
+    runtime_image_size: tuple[int, int],
+) -> list[list[float]]:
+    if not boxes:
+        return []
+    orig_height, orig_width = original_image_size
+    runtime_height, runtime_width = runtime_image_size
+    if runtime_height <= 0 or runtime_width <= 0:
+        return [list(box) for box in boxes]
+    scale_x = float(orig_width) / float(runtime_width)
+    scale_y = float(orig_height) / float(runtime_height)
+    restored: list[list[float]] = []
+    for box in boxes:
+        x1, y1, x2, y2 = [float(value) for value in box]
+        restored.append([
+            max(0.0, min(float(orig_width), x1 * scale_x)),
+            max(0.0, min(float(orig_height), y1 * scale_y)),
+            max(0.0, min(float(orig_width), x2 * scale_x)),
+            max(0.0, min(float(orig_height), y2 * scale_y)),
+        ])
+    return restored
+
+
 def _prediction_from_model_output(
     output: object,
     *,
@@ -198,6 +276,7 @@ def _evaluate_detection_proxy_map(
     threshold_low: float | None = None,
     threshold_high: float | None = None,
     model_name: str | None = None,
+    sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, float | int | None]:
     sample_ids = sorted(str(sample_id) for sample_id in gt_annotations.keys())
     scores: list[float] = []
@@ -232,11 +311,26 @@ def _evaluate_detection_proxy_map(
                 skipped_missing_frame += 1
                 continue
 
+            sample_metadata = None
+            if sample_metadata_by_id is not None:
+                sample_metadata = sample_metadata_by_id.get(sample_id)
+            runtime_image_size = _runtime_image_size_from_metadata(sample_metadata)
+            resize_mode = _input_resize_mode_from_metadata(sample_metadata)
+            eval_frame = frame
+            if resize_mode == "direct_resize" and runtime_image_size is not None:
+                eval_frame = _resize_frame_for_runtime_input(frame, runtime_image_size)
+
             prediction = _prediction_from_model_output(
-                model([_prepare_eval_image_tensor(frame, device=device)]),
+                model([_prepare_eval_image_tensor(eval_frame, device=device)]),
                 threshold_low=threshold_low,
                 threshold_high=threshold_high,
             )
+            if resize_mode == "direct_resize" and runtime_image_size is not None:
+                prediction["boxes"] = _restore_boxes_to_original_coordinates(
+                    list(prediction.get("boxes") or []),
+                    original_image_size=tuple(int(value) for value in frame.shape[:2]),
+                    runtime_image_size=runtime_image_size,
+                )
             predicted_boxes = list(prediction.get("boxes") or [])
             total_prediction_boxes += len(predicted_boxes)
             if predicted_boxes:
@@ -709,41 +803,14 @@ class CloudContinualLearner:
     def _runtime_image_size_from_metadata(
         metadata: Mapping[str, object] | None,
     ) -> tuple[int, int] | None:
-        if not isinstance(metadata, Mapping):
-            return None
-        input_tensor_shape = metadata.get("input_tensor_shape")
-        if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
-            height = int(input_tensor_shape[-2])
-            width = int(input_tensor_shape[-1])
-            if height > 0 and width > 0:
-                return height, width
-        input_image_size = metadata.get("input_image_size")
-        if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
-            height = int(input_image_size[0])
-            width = int(input_image_size[1])
-            if height > 0 and width > 0:
-                return height, width
-        return None
+        return _runtime_image_size_from_metadata(metadata)
 
     @staticmethod
     def _resize_frame_for_runtime_input(
         frame,
         runtime_image_size: tuple[int, int] | None,
     ):
-        if runtime_image_size is None:
-            return frame
-        current_image_size = tuple(int(value) for value in frame.shape[:2])
-        if current_image_size == tuple(runtime_image_size):
-            return frame
-        target_height, target_width = (int(runtime_image_size[0]), int(runtime_image_size[1]))
-        interpolation = cv2.INTER_AREA
-        if target_height > current_image_size[0] or target_width > current_image_size[1]:
-            interpolation = cv2.INTER_LINEAR
-        return cv2.resize(
-            frame,
-            (target_width, target_height),
-            interpolation=interpolation,
-        )
+        return _resize_frame_for_runtime_input(frame, runtime_image_size)
 
     def _prepare_split_runtime_input(
         self,
@@ -959,6 +1026,21 @@ class CloudContinualLearner:
             annotations[transform(sample_id)] = teacher_targets
         return annotations
 
+    @staticmethod
+    def _load_cached_sample_metadata(
+        cache_path: str,
+        sample_ids,
+    ) -> dict[str, dict[str, object]]:
+        metadata: dict[str, dict[str, object]] = {}
+        for sample_id in sample_ids:
+            try:
+                record = load_split_feature_cache(cache_path, sample_id)
+            except FileNotFoundError:
+                continue
+            if isinstance(record, dict):
+                metadata[str(sample_id)] = record
+        return metadata
+
     def _evaluate_fixed_split_proxy_map(
         self,
         model: torch.nn.Module,
@@ -966,6 +1048,7 @@ class CloudContinualLearner:
         frame_dir: str,
         gt_annotations: Mapping[str, Mapping[str, object]],
         model_name: str,
+        sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
     ) -> dict[str, float | int | None]:
         return _evaluate_detection_proxy_map(
             model,
@@ -973,6 +1056,7 @@ class CloudContinualLearner:
             gt_annotations=gt_annotations,
             device=self.device,
             model_name=model_name,
+            sample_metadata_by_id=sample_metadata_by_id,
         )
 
     def _run_fixed_split_retrain(
@@ -990,6 +1074,7 @@ class CloudContinualLearner:
         proxy_metrics_before: dict[str, float | int | None],
         prepared_splitter: UniversalModelSplitter | None,
         prepared_candidate,
+        sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
         baseline_state = _snapshot_model_state(model)
         effective_num_epoch = num_epoch
@@ -1044,6 +1129,7 @@ class CloudContinualLearner:
                     frame_dir=frame_dir,
                     gt_annotations=gt_annotations,
                     model_name=current_model_name,
+                    sample_metadata_by_id=sample_metadata_by_id,
                 )
                 if _proxy_metrics_are_better(candidate_metrics, best_metrics):
                     best_state = _snapshot_model_state(model)
@@ -1066,6 +1152,7 @@ class CloudContinualLearner:
             frame_dir=frame_dir,
             gt_annotations=gt_annotations,
             model_name=current_model_name,
+            sample_metadata_by_id=sample_metadata_by_id,
         )
         return proxy_metrics_after, baseline_state
 
@@ -1236,12 +1323,17 @@ class CloudContinualLearner:
                     missing_raw_message="[FixedSplitCL] GT sample {} missing raw frame.",
                     key_transform=str,
                 )
+                sample_metadata_by_id = self._load_cached_sample_metadata(
+                    working_cache,
+                    bundle_info["all_sample_ids"],
+                )
 
                 proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
                     tmp_model,
                     frame_dir=frame_dir,
                     gt_annotations=gt_annotations,
                     model_name=current_model_name,
+                    sample_metadata_by_id=sample_metadata_by_id,
                 )
                 is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
 
@@ -1283,6 +1375,7 @@ class CloudContinualLearner:
                             frame_dir=frame_dir,
                             gt_annotations=gt_annotations,
                             model_name=current_model_name,
+                            sample_metadata_by_id=sample_metadata_by_id,
                         )
 
                 proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
@@ -1298,6 +1391,7 @@ class CloudContinualLearner:
                     proxy_metrics_before=proxy_metrics_before,
                     prepared_splitter=prepared_splitter,
                     prepared_candidate=prepared_candidate,
+                    sample_metadata_by_id=sample_metadata_by_id,
                 )
                 proxy_summary = _format_proxy_map_summary(
                     proxy_metrics_before,

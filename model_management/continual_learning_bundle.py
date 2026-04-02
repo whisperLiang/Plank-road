@@ -210,6 +210,7 @@ def prepare_split_training_cache(
                 "model_version": sample.get("model_version"),
                 "input_image_size": input_image_size,
                 "input_tensor_shape": sample.get("input_tensor_shape"),
+                "input_resize_mode": sample.get("input_resize_mode"),
                 "has_raw_sample": copied_raw is not None,
             },
         )
