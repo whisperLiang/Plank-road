@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import zipfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -116,6 +117,87 @@ def test_large_inference_accepts_threshold_override():
     assert boxes == [[1, 2, 3, 4]]
     assert labels == [1]
     assert scores == [0.42]
+
+
+def test_runtime_resize_restores_boxes_to_original_coordinates():
+    detector = Object_Detection.__new__(Object_Detection)
+    detector.runtime_resize_enabled = True
+    detector.runtime_image_size = (320, 320)
+
+    resized_frame, original_size, resized = detector._prepare_runtime_frame(
+        np.zeros((480, 640, 3), dtype=np.uint8)
+    )
+    restored = detector._restore_boxes_to_original(
+        [[32.0, 64.0, 160.0, 256.0]],
+        original_image_size=original_size,
+        runtime_image_size=tuple(resized_frame.shape[:2]),
+    )
+
+    assert resized is True
+    assert tuple(resized_frame.shape[:2]) == (320, 320)
+    assert restored[0] == pytest.approx([64.0, 96.0, 320.0, 384.0])
+
+
+def test_cloud_learner_edge_scoped_cache_paths_are_isolated(tmp_path):
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(max_concurrent_jobs=2),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path)
+
+    edge_one = learner._edge_weights_path("yolo26n", edge_id=1)
+    edge_two = learner._edge_weights_path("yolo26n", edge_id=2)
+    legacy = learner._edge_weights_path("yolo26n")
+
+    assert edge_one != edge_two
+    assert edge_one.endswith("tmp_edge_model_yolo26n_edge_1.pth")
+    assert edge_two.endswith("tmp_edge_model_yolo26n_edge_2.pth")
+    assert legacy.endswith("tmp_edge_model_yolo26n.pth")
+
+
+def test_cloud_learner_training_scope_serializes_same_edge_but_allows_other_edges():
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(max_concurrent_jobs=2),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    release = threading.Event()
+    first_edge_entered = threading.Event()
+    same_edge_entered = threading.Event()
+    other_edge_entered = threading.Event()
+
+    def run(edge_id, entered_event):
+        with learner._training_job_scope(edge_id):
+            entered_event.set()
+            release.wait(2.0)
+
+    thread_a = threading.Thread(target=run, args=(1, first_edge_entered))
+    thread_b = threading.Thread(target=run, args=(1, same_edge_entered))
+    thread_c = threading.Thread(target=run, args=(2, other_edge_entered))
+    thread_a.start()
+    assert first_edge_entered.wait(1.0) is True
+    thread_b.start()
+    thread_c.start()
+
+    assert other_edge_entered.wait(1.0) is True
+    assert same_edge_entered.wait(0.2) is False
+    assert learner.training_queue_state() == (3, 2)
+
+    release.set()
+    thread_a.join(1.0)
+    thread_b.join(1.0)
+    thread_c.join(1.0)
+    assert learner.training_queue_state() == (0, 2)
 
 
 def test_wrapper_fixed_split_hparams_use_conservative_rfdetr_defaults():
@@ -613,7 +695,7 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
 
     serialised_states: list[float] = []
 
-    def fake_serialise_model_bytes(current_model, *, model_name=None):
+    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None):
         serialised_states.append(float(current_model.state_dict()["weight"][0]))
         return b"baseline-weights"
 

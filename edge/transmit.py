@@ -1,12 +1,10 @@
 import json
 import os
 
-import cv2
 import grpc
 from loguru import logger
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
-from tools.convert_tool import cv2_to_base64
 from tools.grpc_options import grpc_message_options
 import zipfile
 import io
@@ -16,6 +14,10 @@ from model_management.fixed_split import SplitPlan
 from model_management.continual_learning_bundle import (
     CONTINUAL_LEARNING_PROTOCOL_VERSION,
 )
+
+
+def _server_workspace_hint(edge_id: int, request_kind: str) -> str:
+    return f"edge_{int(edge_id)}/{request_kind}"
 
 def pack_training_payload(cache_path, all_frame_indices, drift_frame_indices=None):
     buf = io.BytesIO()
@@ -99,37 +101,6 @@ def pack_continual_learning_bundle(
         )
     return buf.getvalue(), manifest
 
-
-
-# send to cloud, get ground truth
-def get_cloud_target(server_ip, select_index, cache_path):
-
-    def requset_stream():
-        for index in select_index:
-            path = os.path.join(cache_path, 'frames', '{}.jpg'.format(index))
-            logger.debug(path)
-            frame = cv2.imread(path)
-            encoded_image = cv2_to_base64(frame)
-            frame_request = message_transmission_pb2.FrameRequest(
-                frame=encoded_image,
-                frame_shape=str(frame.shape),
-                frame_index= index,
-            )
-            yield frame_request
-
-    try:
-        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
-        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
-        res = stub.frame_processor(requset_stream())
-        result_dict = eval(res.response)
-    except Exception as e:
-        logger.exception("the cloud can not reply, {}".format(e))
-    else:
-        logger.debug("res{}".format(result_dict))
-    return result_dict
-
-
-
 import socket
 
 def is_network_connected(address):
@@ -169,8 +140,8 @@ def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_ep
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.TrainRequest(
             edge_id=int(edge_id),
-            frame_indices=json.dumps(frame_indices),
-            cache_path=cache_path,
+            frame_indices=[int(index) for index in frame_indices],
+            cache_path=_server_workspace_hint(edge_id, "train_model"),
             num_epoch=int(num_epoch),
             payload_zip=pack_training_payload(cache_path, frame_indices),
         )
@@ -218,9 +189,9 @@ def request_cloud_split_training(
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.SplitTrainRequest(
             edge_id=int(edge_id),
-            all_frame_indices=json.dumps(all_frame_indices),
-            drift_frame_indices=json.dumps(drift_frame_indices or []),
-            cache_path=cache_path,
+            all_frame_indices=[int(index) for index in all_frame_indices],
+            drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
+            cache_path=_server_workspace_hint(edge_id, "split_train"),
             num_epoch=int(num_epoch),
             payload_zip=pack_training_payload(cache_path, all_frame_indices, drift_frame_indices),
         )
@@ -260,10 +231,9 @@ def request_continual_learning(
         req = message_transmission_pb2.ContinualLearningRequest(
             protocol_version=manifest["protocol_version"],
             edge_id=int(edge_id),
-            cache_path=str(cache_path),
+            cache_path=_server_workspace_hint(edge_id, "continual_learning"),
             num_epoch=int(num_epoch),
             send_low_conf_features=bool(send_low_conf_features),
-            bundle_manifest_json=json.dumps(manifest),
             payload_zip=payload_zip,
         )
         reply = stub.continual_learning_request(req)

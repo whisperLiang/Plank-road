@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from grpc_server.protos import message_transmission_pb2 as grpc__server_dot_protos_dot_message__transmission__pb2
+from grpc_server.protos import message_transmission_pb2 as message__transmission__pb2
 
-GRPC_GENERATED_VERSION = '1.78.0'
+GRPC_GENERATED_VERSION = '1.78.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in grpc_server/protos/message_transmission_pb2_grpc.py depends on'
+        + ' but the generated code in message_transmission_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -34,63 +34,35 @@ class MessageTransmissionStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.task_processor = channel.unary_unary(
-                '/MessageTransmission/task_processor',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.MessageRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.MessageReply.FromString,
-                _registered_method=True)
-        self.get_queue_info = channel.unary_unary(
-                '/MessageTransmission/get_queue_info',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.InfoRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.InfoReply.FromString,
-                _registered_method=True)
-        self.frame_processor = channel.stream_unary(
-                '/MessageTransmission/frame_processor',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.FrameRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.FrameReply.FromString,
-                _registered_method=True)
         self.train_model_request = channel.unary_unary(
                 '/MessageTransmission/train_model_request',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.FromString,
+                request_serializer=message__transmission__pb2.TrainRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.TrainReply.FromString,
                 _registered_method=True)
         self.split_train_request = channel.unary_unary(
                 '/MessageTransmission/split_train_request',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainReply.FromString,
+                request_serializer=message__transmission__pb2.SplitTrainRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.SplitTrainReply.FromString,
+                _registered_method=True)
+        self.continual_learning_request = channel.unary_unary(
+                '/MessageTransmission/continual_learning_request',
+                request_serializer=message__transmission__pb2.ContinualLearningRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.ContinualLearningReply.FromString,
                 _registered_method=True)
         self.query_resource = channel.unary_unary(
                 '/MessageTransmission/query_resource',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.FromString,
+                request_serializer=message__transmission__pb2.ResourceRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.ResourceReply.FromString,
                 _registered_method=True)
         self.bandwidth_probe = channel.unary_unary(
                 '/MessageTransmission/bandwidth_probe',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.FromString,
+                request_serializer=message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BandwidthProbeReply.FromString,
                 _registered_method=True)
 
 
 class MessageTransmissionServicer(object):
     """Missing associated documentation comment in .proto file."""
-
-    def task_processor(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def get_queue_info(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def frame_processor(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
 
     def train_model_request(self, request, context):
         """Cloud-side continual learning: edge sends collected frame indices,
@@ -104,6 +76,13 @@ class MessageTransmissionServicer(object):
         """Split-learning continual learning: edge sends intermediate features
         (cached on shared filesystem), cloud annotates drift frames only,
         then trains server-side model (rpn + roi_heads) on all features.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def continual_learning_request(self, request, context):
+        """Versioned continual-learning bundle upload for the fixed-split pipeline.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -126,40 +105,30 @@ class MessageTransmissionServicer(object):
 
 def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'task_processor': grpc.unary_unary_rpc_method_handler(
-                    servicer.task_processor,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.MessageRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.MessageReply.SerializeToString,
-            ),
-            'get_queue_info': grpc.unary_unary_rpc_method_handler(
-                    servicer.get_queue_info,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.InfoRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.InfoReply.SerializeToString,
-            ),
-            'frame_processor': grpc.stream_unary_rpc_method_handler(
-                    servicer.frame_processor,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.FrameRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.FrameReply.SerializeToString,
-            ),
             'train_model_request': grpc.unary_unary_rpc_method_handler(
                     servicer.train_model_request,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.TrainRequest.FromString,
+                    response_serializer=message__transmission__pb2.TrainReply.SerializeToString,
             ),
             'split_train_request': grpc.unary_unary_rpc_method_handler(
                     servicer.split_train_request,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.SplitTrainRequest.FromString,
+                    response_serializer=message__transmission__pb2.SplitTrainReply.SerializeToString,
+            ),
+            'continual_learning_request': grpc.unary_unary_rpc_method_handler(
+                    servicer.continual_learning_request,
+                    request_deserializer=message__transmission__pb2.ContinualLearningRequest.FromString,
+                    response_serializer=message__transmission__pb2.ContinualLearningReply.SerializeToString,
             ),
             'query_resource': grpc.unary_unary_rpc_method_handler(
                     servicer.query_resource,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.ResourceRequest.FromString,
+                    response_serializer=message__transmission__pb2.ResourceReply.SerializeToString,
             ),
             'bandwidth_probe': grpc.unary_unary_rpc_method_handler(
                     servicer.bandwidth_probe,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BandwidthProbeRequest.FromString,
+                    response_serializer=message__transmission__pb2.BandwidthProbeReply.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -171,87 +140,6 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class MessageTransmission(object):
     """Missing associated documentation comment in .proto file."""
-
-    @staticmethod
-    def task_processor(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/MessageTransmission/task_processor',
-            grpc__server_dot_protos_dot_message__transmission__pb2.MessageRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.MessageReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def get_queue_info(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/MessageTransmission/get_queue_info',
-            grpc__server_dot_protos_dot_message__transmission__pb2.InfoRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.InfoReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def frame_processor(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
-            target,
-            '/MessageTransmission/frame_processor',
-            grpc__server_dot_protos_dot_message__transmission__pb2.FrameRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.FrameReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
 
     @staticmethod
     def train_model_request(request,
@@ -268,8 +156,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/train_model_request',
-            grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.FromString,
+            message__transmission__pb2.TrainRequest.SerializeToString,
+            message__transmission__pb2.TrainReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -295,8 +183,35 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/split_train_request',
-            grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainReply.FromString,
+            message__transmission__pb2.SplitTrainRequest.SerializeToString,
+            message__transmission__pb2.SplitTrainReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def continual_learning_request(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/continual_learning_request',
+            message__transmission__pb2.ContinualLearningRequest.SerializeToString,
+            message__transmission__pb2.ContinualLearningReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -322,8 +237,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/query_resource',
-            grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.FromString,
+            message__transmission__pb2.ResourceRequest.SerializeToString,
+            message__transmission__pb2.ResourceReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -349,8 +264,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/bandwidth_probe',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.FromString,
+            message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
+            message__transmission__pb2.BandwidthProbeReply.FromString,
             options,
             channel_credentials,
             insecure,

@@ -24,45 +24,33 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1amessage_transmission.proto\"\xbb\x01\n\x0eMessageRequest\x12\x16\n\x0esource_edge_id\x18\x01 \x01(\x03\x12\x13\n\x0b\x66rame_index\x18\x02 \x01(\x03\x12\x12\n\nstart_time\x18\x03 \x01(\t\x12\r\n\x05\x66rame\x18\x04 \x01(\t\x12\x13\n\x0bpart_result\x18\x05 \x01(\t\x12\x11\n\traw_shape\x18\x06 \x01(\t\x12\x11\n\tnew_shape\x18\x07 \x01(\t\x12\x10\n\x08ref_list\x18\x08 \x01(\t\x12\x0c\n\x04note\x18\t \x01(\t\"N\n\x0cMessageReply\x12\x16\n\x0e\x64\x65stination_id\x18\x01 \x01(\x03\x12\x14\n\x0clocal_length\x18\x02 \x01(\x03\x12\x10\n\x08response\x18\x03 \x01(\t\"G\n\x0c\x46rameRequest\x12\r\n\x05\x66rame\x18\x01 \x01(\t\x12\x13\n\x0b\x66rame_shape\x18\x02 \x01(\t\x12\x13\n\x0b\x66rame_index\x18\x03 \x01(\x03\"3\n\nFrameReply\x12\x10\n\x08response\x18\x01 \x01(\t\x12\x13\n\x0b\x66rame_shape\x18\x02 \x01(\t\";\n\x0bInfoRequest\x12\x16\n\x0esource_edge_id\x18\x01 \x01(\x03\x12\x14\n\x0clocal_length\x18\x02 \x01(\x03\"9\n\tInfoReply\x12\x16\n\x0e\x64\x65stination_id\x18\x01 \x01(\x03\x12\x14\n\x0clocal_length\x18\x02 \x01(\x03\"r\n\x0cTrainRequest\x12\x0f\n\x07\x65\x64ge_id\x18\x01 \x01(\x03\x12\x15\n\rframe_indices\x18\x02 \x01(\t\x12\x12\n\ncache_path\x18\x03 \x01(\t\x12\x11\n\tnum_epoch\x18\x04 \x01(\x03\x12\x13\n\x0bpayload_zip\x18\x05 \x01(\x0c\"B\n\nTrainReply\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x12\n\nmodel_data\x18\x02 \x01(\t\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x98\x01\n\x11SplitTrainRequest\x12\x0f\n\x07\x65\x64ge_id\x18\x01 \x01(\x03\x12\x19\n\x11\x61ll_frame_indices\x18\x02 \x01(\t\x12\x1b\n\x13\x64rift_frame_indices\x18\x03 \x01(\t\x12\x12\n\ncache_path\x18\x04 \x01(\t\x12\x11\n\tnum_epoch\x18\x05 \x01(\x03\x12\x13\n\x0bpayload_zip\x18\x06 \x01(\x0c\"G\n\x0fSplitTrainReply\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x12\n\nmodel_data\x18\x02 \x01(\t\x12\x0f\n\x07message\x18\x03 \x01(\t\"\xbf\x01\n\x18\x43ontinualLearningRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\t\x12\x0f\n\x07\x65\x64ge_id\x18\x02 \x01(\x03\x12\x12\n\ncache_path\x18\x03 \x01(\t\x12\x11\n\tnum_epoch\x18\x04 \x01(\x03\x12\x1e\n\x16send_low_conf_features\x18\x05 \x01(\x08\x12\x1c\n\x14\x62undle_manifest_json\x18\x06 \x01(\t\x12\x13\n\x0bpayload_zip\x18\x07 \x01(\x0c\"h\n\x16\x43ontinualLearningReply\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x12\n\nmodel_data\x18\x02 \x01(\t\x12\x0f\n\x07message\x18\x03 \x01(\t\x12\x18\n\x10protocol_version\x18\x04 \x01(\t\"\"\n\x0fResourceRequest\x12\x0f\n\x07\x65\x64ge_id\x18\x01 \x01(\x03\"\x8f\x01\n\rResourceReply\x12\x17\n\x0f\x63pu_utilization\x18\x01 \x01(\x01\x12\x17\n\x0fgpu_utilization\x18\x02 \x01(\x01\x12\x1a\n\x12memory_utilization\x18\x03 \x01(\x01\x12\x18\n\x10train_queue_size\x18\x04 \x01(\x03\x12\x16\n\x0emax_queue_size\x18\x05 \x01(\x03\"(\n\x15\x42\x61ndwidthProbeRequest\x12\x0f\n\x07payload\x18\x01 \x01(\t\"&\n\x13\x42\x61ndwidthProbeReply\x12\x0f\n\x07payload\x18\x01 \x01(\t2\xeb\x03\n\x13MessageTransmission\x12\x32\n\x0etask_processor\x12\x0f.MessageRequest\x1a\r.MessageReply\"\x00\x12,\n\x0eget_queue_info\x12\x0c.InfoRequest\x1a\n.InfoReply\"\x00\x12\x31\n\x0f\x66rame_processor\x12\r.FrameRequest\x1a\x0b.FrameReply\"\x00(\x01\x12\x33\n\x13train_model_request\x12\r.TrainRequest\x1a\x0b.TrainReply\"\x00\x12=\n\x13split_train_request\x12\x12.SplitTrainRequest\x1a\x10.SplitTrainReply\"\x00\x12R\n\x1a\x63ontinual_learning_request\x12\x19.ContinualLearningRequest\x1a\x17.ContinualLearningReply\"\x00\x12\x34\n\x0equery_resource\x12\x10.ResourceRequest\x1a\x0e.ResourceReply\"\x00\x12\x41\n\x0f\x62\x61ndwidth_probe\x12\x16.BandwidthProbeRequest\x1a\x14.BandwidthProbeReply\"\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1amessage_transmission.proto\"r\n\x0cTrainRequest\x12\x0f\n\x07\x65\x64ge_id\x18\x01 \x01(\x03\x12\x15\n\rframe_indices\x18\x02 \x03(\x03\x12\x12\n\ncache_path\x18\x03 \x01(\t\x12\x11\n\tnum_epoch\x18\x04 \x01(\x03\x12\x13\n\x0bpayload_zip\x18\x05 \x01(\x0c\"B\n\nTrainReply\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x12\n\nmodel_data\x18\x02 \x01(\t\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x98\x01\n\x11SplitTrainRequest\x12\x0f\n\x07\x65\x64ge_id\x18\x01 \x01(\x03\x12\x19\n\x11\x61ll_frame_indices\x18\x02 \x03(\x03\x12\x1b\n\x13\x64rift_frame_indices\x18\x03 \x03(\x03\x12\x12\n\ncache_path\x18\x04 \x01(\t\x12\x11\n\tnum_epoch\x18\x05 \x01(\x03\x12\x13\n\x0bpayload_zip\x18\x06 \x01(\x0c\"G\n\x0fSplitTrainReply\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x12\n\nmodel_data\x18\x02 \x01(\t\x12\x0f\n\x07message\x18\x03 \x01(\t\"\xa1\x01\n\x18\x43ontinualLearningRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\t\x12\x0f\n\x07\x65\x64ge_id\x18\x02 \x01(\x03\x12\x12\n\ncache_path\x18\x03 \x01(\t\x12\x11\n\tnum_epoch\x18\x04 \x01(\x03\x12\x1e\n\x16send_low_conf_features\x18\x05 \x01(\x08\x12\x13\n\x0bpayload_zip\x18\x06 \x01(\x0c\"h\n\x16\x43ontinualLearningReply\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x12\n\nmodel_data\x18\x02 \x01(\t\x12\x0f\n\x07message\x18\x03 \x01(\t\x12\x18\n\x10protocol_version\x18\x04 \x01(\t\"\"\n\x0fResourceRequest\x12\x0f\n\x07\x65\x64ge_id\x18\x01 \x01(\x03\"\x8f\x01\n\rResourceReply\x12\x17\n\x0f\x63pu_utilization\x18\x01 \x01(\x01\x12\x17\n\x0fgpu_utilization\x18\x02 \x01(\x01\x12\x1a\n\x12memory_utilization\x18\x03 \x01(\x01\x12\x18\n\x10train_queue_size\x18\x04 \x01(\x03\x12\x16\n\x0emax_queue_size\x18\x05 \x01(\x03\"(\n\x15\x42\x61ndwidthProbeRequest\x12\x0f\n\x07payload\x18\x01 \x01(\t\"&\n\x13\x42\x61ndwidthProbeReply\x12\x0f\n\x07payload\x18\x01 \x01(\t2\xd6\x02\n\x13MessageTransmission\x12\x33\n\x13train_model_request\x12\r.TrainRequest\x1a\x0b.TrainReply\"\x00\x12=\n\x13split_train_request\x12\x12.SplitTrainRequest\x1a\x10.SplitTrainReply\"\x00\x12R\n\x1a\x63ontinual_learning_request\x12\x19.ContinualLearningRequest\x1a\x17.ContinualLearningReply\"\x00\x12\x34\n\x0equery_resource\x12\x10.ResourceRequest\x1a\x0e.ResourceReply\"\x00\x12\x41\n\x0f\x62\x61ndwidth_probe\x12\x16.BandwidthProbeRequest\x1a\x14.BandwidthProbeReply\"\x00\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'message_transmission_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_MESSAGEREQUEST']._serialized_start=31
-  _globals['_MESSAGEREQUEST']._serialized_end=218
-  _globals['_MESSAGEREPLY']._serialized_start=220
-  _globals['_MESSAGEREPLY']._serialized_end=298
-  _globals['_FRAMEREQUEST']._serialized_start=300
-  _globals['_FRAMEREQUEST']._serialized_end=371
-  _globals['_FRAMEREPLY']._serialized_start=373
-  _globals['_FRAMEREPLY']._serialized_end=424
-  _globals['_INFOREQUEST']._serialized_start=426
-  _globals['_INFOREQUEST']._serialized_end=485
-  _globals['_INFOREPLY']._serialized_start=487
-  _globals['_INFOREPLY']._serialized_end=544
-  _globals['_TRAINREQUEST']._serialized_start=546
-  _globals['_TRAINREQUEST']._serialized_end=660
-  _globals['_TRAINREPLY']._serialized_start=662
-  _globals['_TRAINREPLY']._serialized_end=728
-  _globals['_SPLITTRAINREQUEST']._serialized_start=731
-  _globals['_SPLITTRAINREQUEST']._serialized_end=883
-  _globals['_SPLITTRAINREPLY']._serialized_start=885
-  _globals['_SPLITTRAINREPLY']._serialized_end=956
-  _globals['_CONTINUALLEARNINGREQUEST']._serialized_start=959
-  _globals['_CONTINUALLEARNINGREQUEST']._serialized_end=1150
-  _globals['_CONTINUALLEARNINGREPLY']._serialized_start=1152
-  _globals['_CONTINUALLEARNINGREPLY']._serialized_end=1256
-  _globals['_RESOURCEREQUEST']._serialized_start=1258
-  _globals['_RESOURCEREQUEST']._serialized_end=1292
-  _globals['_RESOURCEREPLY']._serialized_start=1295
-  _globals['_RESOURCEREPLY']._serialized_end=1438
-  _globals['_BANDWIDTHPROBEREQUEST']._serialized_start=1440
-  _globals['_BANDWIDTHPROBEREQUEST']._serialized_end=1480
-  _globals['_BANDWIDTHPROBEREPLY']._serialized_start=1482
-  _globals['_BANDWIDTHPROBEREPLY']._serialized_end=1520
-  _globals['_MESSAGETRANSMISSION']._serialized_start=1523
-  _globals['_MESSAGETRANSMISSION']._serialized_end=2014
+  _globals['_TRAINREQUEST']._serialized_start=30
+  _globals['_TRAINREQUEST']._serialized_end=144
+  _globals['_TRAINREPLY']._serialized_start=146
+  _globals['_TRAINREPLY']._serialized_end=212
+  _globals['_SPLITTRAINREQUEST']._serialized_start=215
+  _globals['_SPLITTRAINREQUEST']._serialized_end=367
+  _globals['_SPLITTRAINREPLY']._serialized_start=369
+  _globals['_SPLITTRAINREPLY']._serialized_end=440
+  _globals['_CONTINUALLEARNINGREQUEST']._serialized_start=443
+  _globals['_CONTINUALLEARNINGREQUEST']._serialized_end=604
+  _globals['_CONTINUALLEARNINGREPLY']._serialized_start=606
+  _globals['_CONTINUALLEARNINGREPLY']._serialized_end=710
+  _globals['_RESOURCEREQUEST']._serialized_start=712
+  _globals['_RESOURCEREQUEST']._serialized_end=746
+  _globals['_RESOURCEREPLY']._serialized_start=749
+  _globals['_RESOURCEREPLY']._serialized_end=892
+  _globals['_BANDWIDTHPROBEREQUEST']._serialized_start=894
+  _globals['_BANDWIDTHPROBEREQUEST']._serialized_end=934
+  _globals['_BANDWIDTHPROBEREPLY']._serialized_start=936
+  _globals['_BANDWIDTHPROBEREPLY']._serialized_end=974
+  _globals['_MESSAGETRANSMISSION']._serialized_start=977
+  _globals['_MESSAGETRANSMISSION']._serialized_end=1319
 # @@protoc_insertion_point(module_scope)

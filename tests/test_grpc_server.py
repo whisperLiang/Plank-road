@@ -2,43 +2,47 @@
 Tests for grpc_server/ module:
   - rpc_server.py (MessageTransmissionServicer, resource helpers)
 """
-import json
-import queue
-from unittest.mock import MagicMock, patch
+from __future__ import annotations
 
-import pytest
+import io
+import zipfile
+from pathlib import Path
+from unittest.mock import MagicMock
 
+from grpc_server import message_transmission_pb2
 from grpc_server.rpc_server import (
+    MessageTransmissionServicer,
     _get_cpu_utilization,
-    _get_memory_utilization,
     _get_gpu_utilization,
+    _get_memory_utilization,
     _normalize_cache_path,
     _reset_cache_dir,
-    MessageTransmissionServicer,
 )
-from grpc_server import message_transmission_pb2
 
 
-# =====================================================================
-# Resource monitoring helpers
-# =====================================================================
+def _zip_bytes(entries: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for relative_path, payload in entries.items():
+            archive.writestr(relative_path, payload)
+    return buffer.getvalue()
+
 
 class TestResourceHelpers:
-
     def test_cpu_utilization_returns_float(self):
-        val = _get_cpu_utilization()
-        assert isinstance(val, float)
-        assert 0.0 <= val <= 1.0
+        value = _get_cpu_utilization()
+        assert isinstance(value, float)
+        assert 0.0 <= value <= 1.0
 
     def test_memory_utilization_returns_float(self):
-        val = _get_memory_utilization()
-        assert isinstance(val, float)
-        assert 0.0 <= val <= 1.0
+        value = _get_memory_utilization()
+        assert isinstance(value, float)
+        assert 0.0 <= value <= 1.0
 
     def test_gpu_utilization_returns_float(self):
-        val = _get_gpu_utilization()
-        assert isinstance(val, float)
-        assert 0.0 <= val <= 1.0
+        value = _get_gpu_utilization()
+        assert isinstance(value, float)
+        assert 0.0 <= value <= 1.0
 
     def test_normalize_cache_path_accepts_windows_style_separators(self):
         assert _normalize_cache_path(r"./cache\server_bundle") == "cache/server_bundle"
@@ -54,251 +58,168 @@ class TestResourceHelpers:
         assert list(cache_dir.iterdir()) == []
 
 
-# =====================================================================
-# MessageTransmissionServicer
-# =====================================================================
-
 class TestMessageTransmissionServicer:
-
     @staticmethod
-    def _make_servicer(queue_size=10, continual_learner=None):
-        local_queue = queue.Queue(maxsize=queue_size)
-        mock_od = MagicMock()
-        mock_od.large_inference.return_value = (
-            [[10, 20, 100, 200]], ["car"], [0.9]
-        )
+    def _make_servicer(tmp_path, *, continual_learner=None):
         return MessageTransmissionServicer(
-            local_queue=local_queue,
-            id="edge1",
-            object_detection=mock_od,
-            queue_info={},
+            id=1,
             continual_learner=continual_learner,
+            workspace_root=str(tmp_path / "workspace"),
         )
 
-    def test_init(self):
-        svc = self._make_servicer()
-        assert svc.id == "edge1"
-        assert svc.local_queue.maxsize == 10
+    def test_init(self, tmp_path):
+        svc = self._make_servicer(tmp_path)
+        assert svc.id == 1
 
-    def test_get_queue_info(self):
-        local_queue = queue.Queue(maxsize=10)
-        mock_od = MagicMock()
-        svc = MessageTransmissionServicer(
-            local_queue=local_queue,
-            id=1,  # protobuf expects int
-            object_detection=mock_od,
-            queue_info={},
-            continual_learner=None,
-        )
-        request = MagicMock()
-        request.source_edge_id = 2
-        request.local_length = 5
-        context = MagicMock()
-
-        reply = svc.get_queue_info(request, context)
-        assert reply.destination_id == 1
-        assert reply.local_length == 0  # queue empty
-
-    def test_query_resource(self):
-        svc = self._make_servicer()
-        request = MagicMock()
-        context = MagicMock()
-
-        reply = svc.query_resource(request, context)
-        assert hasattr(reply, "cpu_utilization")
-        assert hasattr(reply, "gpu_utilization")
-        assert hasattr(reply, "memory_utilization")
+    def test_query_resource(self, tmp_path):
+        svc = self._make_servicer(tmp_path)
+        svc.continual_learner = MagicMock()
+        svc.continual_learner.training_queue_state.return_value = (3, 7)
+        reply = svc.query_resource(MagicMock(), MagicMock())
         assert 0.0 <= reply.cpu_utilization <= 1.0
+        assert 0.0 <= reply.memory_utilization <= 1.0
+        assert 0.0 <= reply.gpu_utilization <= 1.0
+        assert reply.train_queue_size == 3
+        assert reply.max_queue_size == 7
 
-    def test_bandwidth_probe(self):
-        svc = self._make_servicer()
+    def test_bandwidth_probe(self, tmp_path):
+        svc = self._make_servicer(tmp_path)
         request = MagicMock()
         request.payload = "test_payload_1234"
-        context = MagicMock()
 
-        reply = svc.bandwidth_probe(request, context)
-        assert "test_payload_1234" in str(reply.payload)
+        reply = svc.bandwidth_probe(request, MagicMock())
 
-    def test_train_model_request_no_learner(self):
-        svc = self._make_servicer(continual_learner=None)
-        request = MagicMock()
-        request.edge_id = "edge1"
-        request.cache_path = "/tmp/cache"
-        request.num_epoch = 2
-        request.frame_indices = "[1,2,3]"
-        request.payload_zip = b""
-        context = MagicMock()
+        assert reply.payload == "test_payload_1234"
 
-        reply = svc.train_model_request(request, context)
+    def test_train_model_request_no_learner(self, tmp_path):
+        svc = self._make_servicer(tmp_path, continual_learner=None)
+        request = message_transmission_pb2.TrainRequest(
+            edge_id=1,
+            cache_path="edge_1/train_model",
+            num_epoch=2,
+            frame_indices=[1, 2, 3],
+        )
+
+        reply = svc.train_model_request(request, MagicMock())
+
         assert reply.success is False
         assert "not configured" in reply.message
 
-    def test_train_model_request_with_learner(self):
+    def test_train_model_request_uses_uploaded_workspace_and_structured_indices(self, tmp_path):
         mock_learner = MagicMock()
         mock_learner.get_ground_truth_and_retrain.return_value = (
-            True, "model_base64_data", "success"
+            True,
+            "model_base64_data",
+            "success",
         )
-        svc = self._make_servicer(continual_learner=mock_learner)
+        svc = self._make_servicer(tmp_path, continual_learner=mock_learner)
+        payload_zip = _zip_bytes({"frames/1.jpg": b"frame-bytes"})
+        request = message_transmission_pb2.TrainRequest(
+            edge_id=7,
+            cache_path=r"..\ignored",
+            num_epoch=2,
+            frame_indices=[4, 5],
+            payload_zip=payload_zip,
+        )
 
-        request = MagicMock()
-        request.edge_id = "edge1"
-        request.cache_path = "/tmp/cache"
-        request.num_epoch = 2
-        request.frame_indices = "[1,2,3]"
-        request.payload_zip = b""
-        context = MagicMock()
+        reply = svc.train_model_request(request, MagicMock())
 
-        reply = svc.train_model_request(request, context)
         assert reply.success is True
         mock_learner.get_ground_truth_and_retrain.assert_called_once()
+        _, frame_indices, workspace, epochs = mock_learner.get_ground_truth_and_retrain.call_args.args
+        workspace_path = Path(workspace)
+        assert frame_indices == [4, 5]
+        assert epochs == 2
+        assert workspace_path.is_relative_to((tmp_path / "workspace").resolve())
+        assert (workspace_path / "frames" / "1.jpg").read_bytes() == b"frame-bytes"
 
-    @patch("grpc_server.rpc_server.zipfile.ZipFile")
-    def test_train_model_request_normalizes_cache_path(self, mock_zipfile):
+    def test_train_model_request_rejects_cache_path_escape_without_payload(self, tmp_path):
         mock_learner = MagicMock()
-        mock_learner.get_ground_truth_and_retrain.return_value = (
-            True, "model_base64_data", "success"
-        )
-        svc = self._make_servicer(continual_learner=mock_learner)
-
-        request = MagicMock()
-        request.edge_id = "edge1"
-        request.cache_path = r"./cache\server_bundle"
-        request.num_epoch = 2
-        request.frame_indices = "[1,2,3]"
-        request.payload_zip = b"zip-bytes"
-        context = MagicMock()
-        expected_path = "cache/server_bundle"
-
-        reply = svc.train_model_request(request, context)
-        assert reply.success is True
-        mock_zipfile.return_value.__enter__.return_value.extractall.assert_called_once_with(
-            expected_path
-        )
-        mock_learner.get_ground_truth_and_retrain.assert_called_once_with(
-            "edge1", [1, 2, 3], expected_path, 2
+        svc = self._make_servicer(tmp_path, continual_learner=mock_learner)
+        request = message_transmission_pb2.TrainRequest(
+            edge_id=3,
+            cache_path="../outside",
+            num_epoch=2,
+            frame_indices=[1, 2, 3],
         )
 
-    def test_split_train_request_no_learner(self):
-        svc = self._make_servicer(continual_learner=None)
-        request = MagicMock()
-        request.edge_id = "edge1"
-        request.cache_path = "/tmp/cache"
-        request.num_epoch = 2
-        request.all_frame_indices = "[1,2,3]"
-        request.drift_frame_indices = "[2]"
-        request.payload_zip = b""
-        context = MagicMock()
+        reply = svc.train_model_request(request, MagicMock())
 
-        reply = svc.split_train_request(request, context)
         assert reply.success is False
+        assert "relative_to" in reply.message or "cache" in reply.message.lower()
+        mock_learner.get_ground_truth_and_retrain.assert_not_called()
 
-    def test_split_train_request_with_learner(self):
+    def test_train_model_request_rejects_unsafe_zip_entries(self, tmp_path):
+        mock_learner = MagicMock()
+        svc = self._make_servicer(tmp_path, continual_learner=mock_learner)
+        payload_zip = _zip_bytes({"../escape.txt": b"nope"})
+        request = message_transmission_pb2.TrainRequest(
+            edge_id=3,
+            cache_path="edge_3/train_model",
+            num_epoch=2,
+            frame_indices=[1],
+            payload_zip=payload_zip,
+        )
+
+        reply = svc.train_model_request(request, MagicMock())
+
+        assert reply.success is False
+        assert "unsafe" in reply.message.lower()
+        mock_learner.get_ground_truth_and_retrain.assert_not_called()
+
+    def test_split_train_request_uses_structured_indices(self, tmp_path):
         mock_learner = MagicMock()
         mock_learner.get_ground_truth_and_split_retrain.return_value = (
-            True, "model_data", "ok"
+            True,
+            "model_data",
+            "ok",
         )
-        svc = self._make_servicer(continual_learner=mock_learner)
+        svc = self._make_servicer(tmp_path, continual_learner=mock_learner)
+        payload_zip = _zip_bytes({"features/4.pt": b"feature"})
+        request = message_transmission_pb2.SplitTrainRequest(
+            edge_id=5,
+            cache_path="edge_5/split_train",
+            num_epoch=2,
+            all_frame_indices=[4, 5, 6],
+            drift_frame_indices=[5],
+            payload_zip=payload_zip,
+        )
 
-        request = MagicMock()
-        request.edge_id = "edge1"
-        request.cache_path = "/tmp/cache"
-        request.num_epoch = 2
-        request.all_frame_indices = "[1,2,3]"
-        request.drift_frame_indices = "[2]"
-        request.payload_zip = b""
-        context = MagicMock()
+        reply = svc.split_train_request(request, MagicMock())
 
-        reply = svc.split_train_request(request, context)
         assert reply.success is True
         mock_learner.get_ground_truth_and_split_retrain.assert_called_once()
-
-    @patch("grpc_server.rpc_server.zipfile.ZipFile")
-    def test_split_train_request_normalizes_cache_path(self, mock_zipfile):
-        mock_learner = MagicMock()
-        mock_learner.get_ground_truth_and_split_retrain.return_value = (
-            True, "model_data", "ok"
+        _, all_indices, drift_indices, workspace, epochs = (
+            mock_learner.get_ground_truth_and_split_retrain.call_args.args
         )
-        svc = self._make_servicer(continual_learner=mock_learner)
+        assert all_indices == [4, 5, 6]
+        assert drift_indices == [5]
+        assert epochs == 2
+        assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
 
-        request = MagicMock()
-        request.edge_id = "edge1"
-        request.cache_path = r"./cache\server_bundle"
-        request.num_epoch = 2
-        request.all_frame_indices = "[1,2,3]"
-        request.drift_frame_indices = "[2]"
-        request.payload_zip = b"zip-bytes"
-        context = MagicMock()
-        expected_path = "cache/server_bundle"
-
-        reply = svc.split_train_request(request, context)
-        assert reply.success is True
-        mock_zipfile.return_value.__enter__.return_value.extractall.assert_called_once_with(
-            expected_path
-        )
-        mock_learner.get_ground_truth_and_split_retrain.assert_called_once_with(
-            "edge1", [1, 2, 3], [2], expected_path, 2
-        )
-
-    def test_continual_learning_request_no_learner(self):
-        svc = self._make_servicer(continual_learner=None)
-        request = MagicMock()
-        request.edge_id = 1
-        request.cache_path = "/tmp/cache"
-        request.num_epoch = 2
-        request.send_low_conf_features = False
-        request.protocol_version = "edge-cl-bundle.v1"
-        request.payload_zip = b""
-        context = MagicMock()
-
-        reply = svc.continual_learning_request(request, context)
-        assert reply.success is False
-        assert "not configured" in reply.message
-
-    def test_continual_learning_request_with_learner(self):
+    def test_continual_learning_request_uses_uploaded_bundle_workspace(self, tmp_path):
         mock_learner = MagicMock()
         mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
-            True, "model_data", "ok"
+            True,
+            "model_data",
+            "ok",
         )
-        svc = self._make_servicer(continual_learner=mock_learner)
+        svc = self._make_servicer(tmp_path, continual_learner=mock_learner)
+        payload_zip = _zip_bytes({"bundle_manifest.json": b"{}"})
+        request = message_transmission_pb2.ContinualLearningRequest(
+            edge_id=1,
+            cache_path="edge_1/continual_learning",
+            num_epoch=2,
+            send_low_conf_features=True,
+            protocol_version="edge-cl-bundle.v1",
+            payload_zip=payload_zip,
+        )
 
-        request = MagicMock()
-        request.edge_id = 1
-        request.cache_path = "/tmp/cache"
-        request.num_epoch = 2
-        request.send_low_conf_features = True
-        request.protocol_version = "edge-cl-bundle.v1"
-        request.payload_zip = b""
-        context = MagicMock()
+        reply = svc.continual_learning_request(request, MagicMock())
 
-        reply = svc.continual_learning_request(request, context)
         assert reply.success is True
         mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once()
-
-    @patch("grpc_server.rpc_server._reset_cache_dir")
-    @patch("grpc_server.rpc_server.zipfile.ZipFile")
-    def test_continual_learning_request_normalizes_cache_path(self, mock_zipfile, mock_reset_cache_dir):
-        mock_learner = MagicMock()
-        mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
-            True, "model_data", "ok"
-        )
-        svc = self._make_servicer(continual_learner=mock_learner)
-
-        request = MagicMock()
-        request.edge_id = 1
-        request.cache_path = r"./cache\server_bundle"
-        request.num_epoch = 2
-        request.send_low_conf_features = True
-        request.protocol_version = "edge-cl-bundle.v1"
-        request.payload_zip = b"zip-bytes"
-        context = MagicMock()
-        expected_path = "cache/server_bundle"
-
-        reply = svc.continual_learning_request(request, context)
-        assert reply.success is True
-        mock_reset_cache_dir.assert_called_once_with(expected_path)
-        mock_zipfile.return_value.__enter__.return_value.extractall.assert_called_once_with(
-            expected_path
-        )
-        mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once_with(
-            1, expected_path, 2
-        )
+        _, workspace, epochs = mock_learner.get_ground_truth_and_fixed_split_retrain.call_args.args
+        assert epochs == 2
+        assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
+        assert (Path(workspace) / "bundle_manifest.json").read_text(encoding="utf-8") == "{}"

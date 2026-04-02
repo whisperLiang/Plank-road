@@ -1,16 +1,11 @@
-import zipfile
-import io
-import json
-import os
-import posixpath
-import shutil
-import threading
-
 from loguru import logger
 
-from edge.task import Task
-from tools.convert_tool import base64_to_cv2
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
+from grpc_server.workspace import (
+    normalize_client_cache_path,
+    prepare_request_workspace,
+    reset_workspace_dir,
+)
 
 
 import psutil
@@ -66,95 +61,33 @@ def _get_gpu_utilization() -> float:
 
 def _normalize_cache_path(path: str) -> str:
     """Normalize cache paths from remote clients across OS-specific separators."""
-    if not path:
-        return path
-    normalized = path.replace("\\", "/")
-    return posixpath.normpath(normalized)
+    return normalize_client_cache_path(path)
 
 
 def _reset_cache_dir(cache_path: str) -> None:
-    shutil.rmtree(cache_path, ignore_errors=True)
-    os.makedirs(cache_path, exist_ok=True)
+    reset_workspace_dir(cache_path)
 
 
 class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmissionServicer):
-    def __init__(self, local_queue, id, object_detection, queue_info=None, continual_learner=None):
-        self.local_queue = local_queue
+    def __init__(
+        self,
+        id,
+        continual_learner=None,
+        workspace_root=None,
+    ):
         self.id = id
-        self.queue_info = queue_info
-        self.object_detection = object_detection
-        # CloudContinualLearner instance; None on edge-side servicers
         self.continual_learner = continual_learner
-
-    def task_processor(self, request, context):
-        logger.debug("task_processor")
-        base64_frame = request.frame
-        frame_shape = tuple(int(s) for s in request.new_shape[1:-1].split(","))
-        frame = base64_to_cv2(base64_frame).reshape(frame_shape)
-        raw_shape = tuple(int(s) for s in request.raw_shape[1:-1].split(","))
-
-        task = Task(request.source_edge_id, request.frame_index, frame, float(request.start_time), raw_shape)
-        task.other = True
-
-        if request.part_result != "":
-            part_result = eval(request.part_result)
-            if len(part_result['boxes']) != 0:
-                task.add_result(part_result['boxes'], part_result['labels'], part_result['scores'])
-
-        if request.note == "edge process":
-            task.edge_process = True
-
-
-        self.local_queue.put(task, block=True)
-
-        reply = message_transmission_pb2.MessageReply(
-            destination_id=self.id,
-            local_length=self.local_queue.qsize(),
-            response='offload to {} successfully'.format(self.id)
-        )
-
-        return reply
-
-    def frame_processor(self, request_iterator, context):
-        res_list = []
-        for request in request_iterator:
-            base64_frame = request.frame
-            frame_shape = tuple(int(s) for s in request.frame_shape[1:-1].split(","))
-            frame = base64_to_cv2(base64_frame).reshape(frame_shape)
-            index = request.frame_index
-            pred_boxes, pred_class, pred_score = self.object_detection.large_inference(frame)
-            res = {
-                'index': index,
-                'boxes': pred_boxes,
-                'labels': pred_class,
-                'scores': pred_score
-            }
-            res_list.append(res)
-        reply = message_transmission_pb2.FrameReply(
-            response=str(res_list),
-            frame_shape=str(frame_shape),
-        )
-        logger.debug(reply)
-        return reply
-
-
-    def get_queue_info(self, request, context):
-        self.queue_info['{}'.format(request.source_edge_id)] = request.local_length
-        reply = message_transmission_pb2.InfoReply(
-            destination_id=self.id,
-            local_length=self.local_queue.qsize(),
-        )
-        return reply
+        self.workspace_root = workspace_root or "./cache/server_workspace"
 
     def train_model_request(self, request, context):
         """Cloud-side continual learning: label frames with the large model then
         fine-tune the lightweight edge model and return the updated weights."""
         cache_path = _normalize_cache_path(request.cache_path)
-        if cache_path != request.cache_path:
+        if cache_path and cache_path != request.cache_path:
             logger.info("Normalized train cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
-            "train_model_request from edge_id={} cache_path={} num_epoch={}",
-            request.edge_id, cache_path, request.num_epoch,
+            "train_model_request from edge_id={} client_cache_path={} num_epoch={}",
+            request.edge_id, cache_path or "<uploaded-bundle>", request.num_epoch,
         )
         if self.continual_learner is None:
             logger.error("train_model_request: continual_learner not configured")
@@ -162,19 +95,17 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 success=False, model_data="", message="continual_learner not configured"
             )
         try:
-            if hasattr(request, 'payload_zip') and request.payload_zip:
-                import zipfile
-                import io
-                _reset_cache_dir(cache_path)
-                buf = io.BytesIO(request.payload_zip)
-                with zipfile.ZipFile(buf, "r") as zf:
-                    zf.extractall(cache_path)
-                    
-            frame_indices = json.loads(request.frame_indices)
+            workspace = prepare_request_workspace(
+                self.workspace_root,
+                edge_id=request.edge_id,
+                request_kind="train_model",
+                payload_zip=getattr(request, "payload_zip", b""),
+                client_cache_path=request.cache_path,
+            )
             success, model_data, message = self.continual_learner.get_ground_truth_and_retrain(
                 request.edge_id,
-                frame_indices,
-                cache_path,
+                [int(index) for index in request.frame_indices],
+                str(workspace),
                 int(request.num_epoch),
             )
         except Exception as exc:
@@ -190,11 +121,11 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         frames with the large model, then train server-side model on all cached
         backbone features and return the updated state-dict."""
         cache_path = _normalize_cache_path(request.cache_path)
-        if cache_path != request.cache_path:
+        if cache_path and cache_path != request.cache_path:
             logger.info("Normalized split-train cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
-            "split_train_request from edge_id={} cache_path={} num_epoch={}",
-            request.edge_id, cache_path, request.num_epoch,
+            "split_train_request from edge_id={} client_cache_path={} num_epoch={}",
+            request.edge_id, cache_path or "<uploaded-bundle>", request.num_epoch,
         )
         if self.continual_learner is None:
             logger.error("split_train_request: continual_learner not configured")
@@ -202,22 +133,19 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 success=False, model_data="", message="continual_learner not configured"
             )
         try:
-            if hasattr(request, 'payload_zip') and request.payload_zip:
-                import zipfile
-                import io
-                _reset_cache_dir(cache_path)
-                buf = io.BytesIO(request.payload_zip)
-                with zipfile.ZipFile(buf, "r") as zf:
-                    zf.extractall(cache_path)
-                    
-            all_indices = json.loads(request.all_frame_indices)
-            drift_indices = json.loads(request.drift_frame_indices)
+            workspace = prepare_request_workspace(
+                self.workspace_root,
+                edge_id=request.edge_id,
+                request_kind="split_train",
+                payload_zip=getattr(request, "payload_zip", b""),
+                client_cache_path=request.cache_path,
+            )
             success, model_data, message = \
                 self.continual_learner.get_ground_truth_and_split_retrain(
                     request.edge_id,
-                    all_indices,
-                    drift_indices,
-                    cache_path,
+                    [int(index) for index in request.all_frame_indices],
+                    [int(index) for index in request.drift_frame_indices],
+                    str(workspace),
                     int(request.num_epoch),
                 )
         except Exception as exc:
@@ -230,12 +158,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
     def continual_learning_request(self, request, context):
         cache_path = _normalize_cache_path(request.cache_path)
-        if cache_path != request.cache_path:
+        if cache_path and cache_path != request.cache_path:
             logger.info("Normalized continual-learning cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
-            "continual_learning_request from edge_id={} cache_path={} num_epoch={} send_low_conf_features={}",
+            "continual_learning_request from edge_id={} client_cache_path={} num_epoch={} send_low_conf_features={}",
             request.edge_id,
-            cache_path,
+            cache_path or "<uploaded-bundle>",
             request.num_epoch,
             request.send_low_conf_features,
         )
@@ -248,23 +176,26 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 protocol_version=request.protocol_version,
             )
         try:
-            if request.payload_zip:
-                _reset_cache_dir(cache_path)
-                buf = io.BytesIO(request.payload_zip)
-                with zipfile.ZipFile(buf, "r") as zf:
-                    zf.extractall(cache_path)
+            workspace = prepare_request_workspace(
+                self.workspace_root,
+                edge_id=request.edge_id,
+                request_kind="continual_learning",
+                payload_zip=request.payload_zip,
+                client_cache_path=request.cache_path,
+            )
 
             success, model_data, message = (
                 self.continual_learner.get_ground_truth_and_fixed_split_retrain(
                     request.edge_id,
-                    cache_path,
+                    str(workspace),
                     int(request.num_epoch),
                 )
             )
             logger.info(
-                "continual_learning_request finished for edge_id={} success={} message={}",
+                "continual_learning_request finished for edge_id={} success={} workspace={} message={}",
                 request.edge_id,
                 success,
+                workspace,
                 message,
             )
         except Exception as exc:
@@ -293,8 +224,8 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         train_q = 0
         max_q = 10
         if self.continual_learner is not None:
-            if hasattr(self.continual_learner, 'lock'):
-                train_q = 1 if self.continual_learner.lock.locked() else 0
+            if hasattr(self.continual_learner, "training_queue_state"):
+                train_q, max_q = self.continual_learner.training_queue_state()
 
         return message_transmission_pb2.ResourceReply(
             cpu_utilization=cpu,

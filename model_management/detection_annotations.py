@@ -27,3 +27,17 @@ def build_detection_target(rows: pd.DataFrame) -> dict[str, list[object]]:
         "boxes": boxes,
         "labels": labels,
     }
+
+
+def load_annotation_targets(annotation_path: str) -> dict[str, dict[str, object]]:
+    targets: dict[str, dict[str, object]] = {}
+    try:
+        annotations = load_annotations(annotation_path)
+    except FileNotFoundError:
+        return targets
+
+    for frame_index, rows in annotations.groupby("frame_index"):
+        target = build_detection_target(rows)
+        if target["boxes"] and target["labels"]:
+            targets[str(int(frame_index))] = target
+    return targets

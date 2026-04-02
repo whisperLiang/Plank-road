@@ -34,21 +34,6 @@ class MessageTransmissionStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.task_processor = channel.unary_unary(
-                '/MessageTransmission/task_processor',
-                request_serializer=message__transmission__pb2.MessageRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.MessageReply.FromString,
-                _registered_method=True)
-        self.get_queue_info = channel.unary_unary(
-                '/MessageTransmission/get_queue_info',
-                request_serializer=message__transmission__pb2.InfoRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.InfoReply.FromString,
-                _registered_method=True)
-        self.frame_processor = channel.stream_unary(
-                '/MessageTransmission/frame_processor',
-                request_serializer=message__transmission__pb2.FrameRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.FrameReply.FromString,
-                _registered_method=True)
         self.train_model_request = channel.unary_unary(
                 '/MessageTransmission/train_model_request',
                 request_serializer=message__transmission__pb2.TrainRequest.SerializeToString,
@@ -78,24 +63,6 @@ class MessageTransmissionStub(object):
 
 class MessageTransmissionServicer(object):
     """Missing associated documentation comment in .proto file."""
-
-    def task_processor(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def get_queue_info(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def frame_processor(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
 
     def train_model_request(self, request, context):
         """Cloud-side continual learning: edge sends collected frame indices,
@@ -138,21 +105,6 @@ class MessageTransmissionServicer(object):
 
 def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'task_processor': grpc.unary_unary_rpc_method_handler(
-                    servicer.task_processor,
-                    request_deserializer=message__transmission__pb2.MessageRequest.FromString,
-                    response_serializer=message__transmission__pb2.MessageReply.SerializeToString,
-            ),
-            'get_queue_info': grpc.unary_unary_rpc_method_handler(
-                    servicer.get_queue_info,
-                    request_deserializer=message__transmission__pb2.InfoRequest.FromString,
-                    response_serializer=message__transmission__pb2.InfoReply.SerializeToString,
-            ),
-            'frame_processor': grpc.stream_unary_rpc_method_handler(
-                    servicer.frame_processor,
-                    request_deserializer=message__transmission__pb2.FrameRequest.FromString,
-                    response_serializer=message__transmission__pb2.FrameReply.SerializeToString,
-            ),
             'train_model_request': grpc.unary_unary_rpc_method_handler(
                     servicer.train_model_request,
                     request_deserializer=message__transmission__pb2.TrainRequest.FromString,
@@ -188,87 +140,6 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class MessageTransmission(object):
     """Missing associated documentation comment in .proto file."""
-
-    @staticmethod
-    def task_processor(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/MessageTransmission/task_processor',
-            message__transmission__pb2.MessageRequest.SerializeToString,
-            message__transmission__pb2.MessageReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def get_queue_info(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/MessageTransmission/get_queue_info',
-            message__transmission__pb2.InfoRequest.SerializeToString,
-            message__transmission__pb2.InfoReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def frame_processor(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
-            target,
-            '/MessageTransmission/frame_processor',
-            message__transmission__pb2.FrameRequest.SerializeToString,
-            message__transmission__pb2.FrameReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
 
     @staticmethod
     def train_model_request(request,

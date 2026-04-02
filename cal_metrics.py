@@ -2,12 +2,11 @@ import argparse
 import json
 from pathlib import Path
 
-import munch
 import numpy as np
-import yaml
 from loguru import logger
 from mapcalc import calculate_map
 
+from config import load_runtime_config
 from model_management.object_detection import Object_Detection
 from tools.video_processor import VideoProcessor
 
@@ -132,10 +131,7 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    with open(args.yaml_path, "r", encoding="utf-8") as f:
-        config = yaml.load(f, Loader=yaml.SafeLoader)
-
-    config = munch.munchify(config)
+    config = load_runtime_config(args.yaml_path)
     cal = CalMetrics(config, args.result_path)
     if args.cal_truth:
         cal.cal_ground_truth()

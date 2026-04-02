@@ -1,9 +1,6 @@
 syntax = "proto3";
 
 service MessageTransmission {
-  rpc task_processor (MessageRequest) returns (MessageReply) {}
-  rpc get_queue_info (InfoRequest) returns (InfoReply) {}
-  rpc frame_processor (stream FrameRequest) returns (FrameReply) {}
   // Cloud-side continual learning: edge sends collected frame indices,
   // cloud retrains the lightweight model and returns updated weights.
   rpc train_model_request (TrainRequest) returns (TrainReply) {}
@@ -19,53 +16,11 @@ service MessageTransmission {
   rpc bandwidth_probe (BandwidthProbeRequest) returns (BandwidthProbeReply) {}
 }
 
-message MessageRequest {
-  int64 source_edge_id = 1;
-  int64 frame_index = 2;
-  string start_time = 3;
-  string frame = 4;
-  string part_result = 5;
-  string raw_shape = 6;
-  string new_shape = 7;
-  string ref_list = 8;
-  string note = 9;
-}
-
-message MessageReply {
-  int64 destination_id = 1;
-  int64 local_length = 2;
-  string response = 3;
-}
-
-
-message FrameRequest{
-    string frame = 1;
-    string frame_shape = 2;
-    int64 frame_index = 3;
-}
-
-message FrameReply{
-    string response = 1;
-    string frame_shape = 2;
-}
-
-
-message InfoRequest {
-  int64 source_edge_id = 1;
-  int64 local_length = 2;
-}
-
-message InfoReply {
-  int64 destination_id = 1;
-  int64 local_length = 2;
-}
-
 // Continual learning messages
 message TrainRequest {
   int64 edge_id = 1;
-  // JSON-serialised list of integer frame indices to use for retraining
-  string frame_indices = 2;
-  // Absolute path (on cloud) of the frame cache directory
+  repeated int64 frame_indices = 2;
+  // Cloud-owned working directory hint; server resolves it inside workspace_root.
   string cache_path = 3;
   // Number of training epochs (0 = use cloud default)
   int64 num_epoch = 4;
@@ -82,11 +37,9 @@ message TrainReply {
 // Split-learning continual learning messages 
 message SplitTrainRequest {
   int64 edge_id = 1;
-  // JSON list of ALL frame indices (features cached on shared filesystem)
-  string all_frame_indices = 2;
-  // JSON list of drift frame indices (subset) for ground-truth annotation
-  string drift_frame_indices = 3;
-  // Absolute path to cache directory (contains features/ and frames/ dirs)
+  repeated int64 all_frame_indices = 2;
+  repeated int64 drift_frame_indices = 3;
+  // Cloud-owned working directory hint; server resolves it inside workspace_root.
   string cache_path = 4;
   // Number of training epochs (0 = use cloud default)
   int64 num_epoch = 5;
@@ -106,8 +59,7 @@ message ContinualLearningRequest {
   string cache_path = 3;
   int64 num_epoch = 4;
   bool send_low_conf_features = 5;
-  string bundle_manifest_json = 6;
-  bytes payload_zip = 7;
+  bytes payload_zip = 6;
 }
 
 message ContinualLearningReply {

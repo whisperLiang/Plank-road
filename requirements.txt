@@ -1,22 +1,25 @@
 torch
+torchvision
 # TorchLens 1.0.1 emits large NumPy 2.x deprecation warning floods during tracing.
 # OpenCV 4.13+ requires NumPy 2.x, so keep the trio pinned together.
 numpy==1.26.4
 opencv-python==4.11.0.86
-munch
+pandas==2.3.3
+requests==2.32.5
+huggingface_hub==1.5.0
 grpcio==1.78.1
 protobuf==6.31.1
 ortools==9.14.6206
-grpcio-tools
-loguru
+grpcio-tools==1.78.1
+loguru==0.7.3
 mapcalc
 APScheduler
 imutils
-PyYAML
+PyYAML==6.0.3
 torchlens==1.0.1
-psutil
+psutil==7.2.2
 ultralytics>=8.4.0
 transformers
 rfdetr
 timm
-pytest
+pytest==9.0.2

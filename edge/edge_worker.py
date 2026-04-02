@@ -3,10 +3,7 @@ import io
 import os
 import threading
 import time
-from concurrent import futures
-from queue import Queue
-
-import grpc
+from queue import Empty, Full, Queue
 import torch
 from loguru import logger
 
@@ -25,8 +22,6 @@ from edge.resource_aware_trigger import (
 from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
 from edge.task import Task
 from edge.transmit import request_continual_learning
-from grpc_server import message_transmission_pb2_grpc
-from grpc_server.rpc_server import MessageTransmissionServicer
 from model_management.fixed_split import (
     SplitConstraints,
     SplitPlan,
@@ -35,7 +30,9 @@ from model_management.fixed_split import (
 from model_management.object_detection import InferenceArtifacts, Object_Detection
 from model_management.split_model_adapters import build_split_training_loss
 from model_management.universal_model_split import UniversalModelSplitter
-from tools.grpc_options import grpc_message_options
+
+
+_QUEUE_STOP = object()
 
 
 class EdgeWorker:
@@ -115,9 +112,20 @@ class EdgeWorker:
 
         self.diff = 0.0
         self.key_task = None
-        self.diff_processor = threading.Thread(target=self.diff_worker, daemon=True)
-        self.local_processor = threading.Thread(target=self.local_worker, daemon=True)
-        self.retrain_processor = threading.Thread(target=self.retrain_worker, daemon=True)
+        self._stop_event = threading.Event()
+        self._retrain_requested = threading.Event()
+        self._closed = False
+
+        if self.split_learning_enabled and self.small_object_detection.uses_runtime_resize():
+            prewarm_image_size = self.small_object_detection.get_runtime_image_size((224, 224))
+            self._init_fixed_split_runtime(image_size=prewarm_image_size)
+            if self.collect_flag and not self.split_learning_enabled:
+                self.collect_flag = False
+                self._log_split_collection_disabled()
+
+        self.diff_processor = threading.Thread(target=self.diff_worker, daemon=False)
+        self.local_processor = threading.Thread(target=self.local_worker, daemon=False)
+        self.retrain_processor = threading.Thread(target=self.retrain_worker, daemon=False)
         self.diff_processor.start()
         self.local_processor.start()
         self.retrain_processor.start()
@@ -136,6 +144,11 @@ class EdgeWorker:
             return
 
         try:
+            runtime_image_size_getter = getattr(
+                self.small_object_detection,
+                "get_runtime_image_size",
+                None,
+            )
             split_model = self.small_object_detection.get_split_runtime_model()
             self.universal_splitter = UniversalModelSplitter(
                 device=next(split_model.parameters()).device,
@@ -144,10 +157,18 @@ class EdgeWorker:
                 self.small_object_detection.model
             )
             if frame is not None:
-                trace_image_size = tuple(int(value) for value in frame.shape[:2])
+                trace_image_size = (
+                    runtime_image_size_getter(tuple(frame.shape[:2]))
+                    if callable(runtime_image_size_getter)
+                    else None
+                ) or tuple(int(value) for value in frame.shape[:2])
                 sample_input = self.small_object_detection.prepare_splitter_input(frame)
             else:
-                trace_image_size = image_size or (224, 224)
+                trace_image_size = image_size or (
+                    runtime_image_size_getter((224, 224))
+                    if callable(runtime_image_size_getter)
+                    else None
+                ) or (224, 224)
                 sample_input = self.small_object_detection.build_split_sample_input(trace_image_size)
             self.universal_splitter.trace(
                 split_model,
@@ -266,6 +287,7 @@ class EdgeWorker:
         self.pending_training_decision = None
         self.retrain_flag = False
         self.collect_flag = True
+        self._retrain_requested.clear()
 
     def _resolve_active_splitter(self, current_frame, frame_image_size: tuple[int, int]):
         if self.split_learning_enabled and not self._fixed_split_init_attempted:
@@ -275,23 +297,26 @@ class EdgeWorker:
                 self._log_split_collection_disabled()
 
         active_splitter = self.universal_splitter if self.universal_split_enabled else None
+        effective_image_size = self.small_object_detection.get_runtime_image_size(
+            frame_image_size
+        ) or frame_image_size
         if (
             active_splitter is None
             or self.split_trace_image_size is None
-            or frame_image_size == self.split_trace_image_size
+            or effective_image_size == self.split_trace_image_size
         ):
             return active_splitter
 
         logger.warning(
             "Split runtime disabled because frame size changed from {} to {}.",
             self.split_trace_image_size,
-            frame_image_size,
+            effective_image_size,
         )
         self.split_learning_enabled = False
         self.universal_split_enabled = False
         self.collect_flag = False
         self.split_learning_disable_reason = (
-            f"frame size changed from {self.split_trace_image_size} to {frame_image_size}"
+            f"frame size changed from {self.split_trace_image_size} to {effective_image_size}"
         )
         return None
 
@@ -334,79 +359,6 @@ class EdgeWorker:
             reason="Fallback trigger without low-confidence feature upload.",
         )
 
-    def diff_worker(self):
-        if not self.config.diff_flag:
-            while True:
-                task = self.frame_cache.get(block=True)
-                self.decision_worker(task)
-
-        task = self.frame_cache.get(block=True)
-        frame = task.frame_edge
-        self.pre_frame_feature = self.edge_processor.get_frame_feature(frame)
-        self.key_task = task
-        self.decision_worker(task)
-
-        while True:
-            task = self.frame_cache.get(block=True)
-            frame = task.frame_edge
-            self.frame_feature = self.edge_processor.get_frame_feature(frame)
-            self.diff += self.edge_processor.cal_frame_diff(
-                self.frame_feature,
-                self.pre_frame_feature,
-            )
-            self.pre_frame_feature = self.frame_feature
-            if self.diff >= self.config.diff_thresh:
-                self.diff = 0.0
-                self.key_task = task
-                self.decision_worker(task)
-            else:
-                self._reuse_latest_result(task)
-                self._set_task_terminal_state(
-                    task,
-                    TASK_STATE.FINISHED,
-                    result_source=task.result_source,
-                )
-
-    def local_worker(self):
-        while True:
-            task = self.local_queue.get(block=True)
-            if time.time() - task.start_time >= self.config.wait_thresh:
-                self._set_task_terminal_state(
-                    task,
-                    TASK_STATE.TIMEOUT,
-                    result_source="timeout",
-                )
-                continue
-
-            self.queue_info[f"{self.edge_id}"] = self.local_queue.qsize()
-            current_frame = task.frame_edge
-            frame_image_size = tuple(int(value) for value in current_frame.shape[:2])
-            active_splitter = self._resolve_active_splitter(current_frame, frame_image_size)
-            inference = self.small_object_detection.infer_sample(
-                current_frame,
-                splitter=active_splitter,
-            )
-
-            task.add_result(
-                inference.detection_boxes or None,
-                inference.detection_class or None,
-                inference.detection_score or None,
-            )
-
-            if (
-                self.collect_flag
-                and self.split_learning_enabled
-                and inference.intermediate is not None
-                and self.fixed_split_plan is not None
-            ):
-                self.collect_data(task, current_frame, inference)
-
-            self._set_task_terminal_state(
-                task,
-                TASK_STATE.FINISHED,
-                result_source="inference",
-            )
-
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> None:
         confidence = float(inference.confidence)
         drift_detected = self.drift_detector.update(confidence)
@@ -446,6 +398,7 @@ class EdgeWorker:
             self.pending_training_decision = decision
             self.retrain_flag = True
             self.collect_flag = False
+            self._retrain_requested.set()
             logger.info(
                 "Continual learning triggered (samples={}, send_low_conf_features={}, reason={})",
                 stats.total_samples,
@@ -454,15 +407,18 @@ class EdgeWorker:
             )
 
     def retrain_worker(self):
-        while True:
+        while not self._stop_event.is_set():
+            self._retrain_requested.wait()
+            if self._stop_event.is_set():
+                return
+            self._retrain_requested.clear()
+
             if not self.retrain_flag:
-                time.sleep(0.2)
                 continue
 
             decision = self.pending_training_decision
             if self.fixed_split_plan is None or decision is None:
                 self._reset_pending_training_cycle()
-                time.sleep(0.2)
                 continue
 
             num_epoch = int(getattr(self.config.retrain, "num_epoch", 0))
@@ -503,27 +459,120 @@ class EdgeWorker:
                 logger.error("Cloud continual learning failed: {}", msg)
 
             self._reset_pending_training_cycle()
-            time.sleep(0.2)
-
-    def start_edge_server(self):
-        logger.info("edge {} server is starting".format(self.edge_id))
-        server = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=1),
-            options=grpc_message_options(),
-        )
-        message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
-            MessageTransmissionServicer(
-                self.local_queue,
-                self.edge_id,
-                self.small_object_detection,
-            ),
-            server,
-        )
-        server.add_insecure_port("[::]:50050")
-        server.start()
-        logger.success("edge {} server is listening".format(self.edge_id))
-        server.wait_for_termination()
 
     def decision_worker(self, task):
+        stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not None and stop_event.is_set():
+            self._set_task_terminal_state(
+                task,
+                TASK_STATE.TIMEOUT,
+                result_source="shutdown",
+            )
+            return
         task.edge_process = True
         self.local_queue.put(task, block=True)
+
+    def close(self, *, timeout: float = 5.0) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_event.set()
+        self._retrain_requested.set()
+        for queue_obj in (self.frame_cache, self.local_queue):
+            inserted = False
+            while not inserted:
+                try:
+                    queue_obj.put_nowait(_QUEUE_STOP)
+                    inserted = True
+                except Full:
+                    try:
+                        queue_obj.get_nowait()
+                    except Empty:
+                        inserted = True
+                except Exception:
+                    inserted = True
+        for thread in (self.diff_processor, self.local_processor, self.retrain_processor):
+            if thread.is_alive():
+                thread.join(timeout=timeout)
+
+    def diff_worker(self):
+        if not self.config.diff_flag:
+            while not self._stop_event.is_set():
+                task = self.frame_cache.get(block=True)
+                if task is _QUEUE_STOP:
+                    return
+                self.decision_worker(task)
+            return
+
+        task = self.frame_cache.get(block=True)
+        if task is _QUEUE_STOP:
+            return
+        frame = task.frame_edge
+        self.pre_frame_feature = self.edge_processor.get_frame_feature(frame)
+        self.key_task = task
+        self.decision_worker(task)
+
+        while not self._stop_event.is_set():
+            task = self.frame_cache.get(block=True)
+            if task is _QUEUE_STOP:
+                return
+            frame = task.frame_edge
+            self.frame_feature = self.edge_processor.get_frame_feature(frame)
+            self.diff += self.edge_processor.cal_frame_diff(
+                self.frame_feature,
+                self.pre_frame_feature,
+            )
+            self.pre_frame_feature = self.frame_feature
+            if self.diff >= self.config.diff_thresh:
+                self.diff = 0.0
+                self.key_task = task
+                self.decision_worker(task)
+            else:
+                self._reuse_latest_result(task)
+                self._set_task_terminal_state(
+                    task,
+                    TASK_STATE.FINISHED,
+                    result_source=task.result_source,
+                )
+
+    def local_worker(self):
+        while not self._stop_event.is_set():
+            task = self.local_queue.get(block=True)
+            if task is _QUEUE_STOP:
+                return
+            if time.time() - task.start_time >= self.config.wait_thresh:
+                self._set_task_terminal_state(
+                    task,
+                    TASK_STATE.TIMEOUT,
+                    result_source="timeout",
+                )
+                continue
+
+            self.queue_info[f"{self.edge_id}"] = self.local_queue.qsize()
+            current_frame = task.frame_edge
+            frame_image_size = tuple(int(value) for value in current_frame.shape[:2])
+            active_splitter = self._resolve_active_splitter(current_frame, frame_image_size)
+            inference = self.small_object_detection.infer_sample(
+                current_frame,
+                splitter=active_splitter,
+            )
+
+            task.add_result(
+                inference.detection_boxes or None,
+                inference.detection_class or None,
+                inference.detection_score or None,
+            )
+
+            if (
+                self.collect_flag
+                and self.split_learning_enabled
+                and inference.intermediate is not None
+                and self.fixed_split_plan is not None
+            ):
+                self.collect_data(task, current_frame, inference)
+
+            self._set_task_terminal_state(
+                task,
+                TASK_STATE.FINISHED,
+                result_source="inference",
+            )

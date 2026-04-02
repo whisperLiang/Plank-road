@@ -1,8 +1,14 @@
-__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .claude/
-AGENTS.md
 .agents/
+AGENTS.md
+**/__pycache__/
+*.py[cod]
 cache/*
 log/
 tmp/
+record_*.txt
 model_management/models/

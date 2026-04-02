@@ -46,6 +46,11 @@ client:
   num_epoch: 2
   cache_path: './cache'
   collect_num: 20
+ # Unified runtime resize for fixed-split tracing/inference.
+ runtime_resize:
+  enabled: True
+  height: 640
+  width: 640
  # drift detection (RCCDA-inspired)
  drift_detection:
   # mode: 'rccda' | 'adwin' | 'window' | 'any' | 'majority'
@@ -141,6 +146,10 @@ server:
  golden: rtdetr_x
  # lightweight model used to generate fine-tuned weights for the edge
  edge_model_name: yolo26n
+ # gRPC listen address for the cloud server
+ listen_address: "[::]:50051"
+ # cloud-owned workspace used for uploaded retraining bundles
+ workspace_root: "./cache/server_workspace"
  #the queue maxsize
  local_queue_maxsize: 10
  # the max wait time
@@ -148,6 +157,7 @@ server:
  # continual learning settings
  continual_learning:
   num_epoch: 5
+  max_concurrent_jobs: 2
   # Cloud-side teacher threshold used only for GT annotation during
   # continual learning. Lower values recover more small/far objects but
   # may introduce noisier pseudo-GT.

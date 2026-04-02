@@ -6,6 +6,7 @@ Tests for edge/ module:
   - resample.py     (history_sample, annotion_process)
   - resource_aware_trigger.py (helper functions, CloudResourceState, ResourceAwareCLTrigger)
 """
+import threading
 import time
 from queue import Queue
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from edge.resource_aware_trigger import (
     CloudResourceState,
     PendingTrainingStats,
     ResourceAwareCLTrigger,
+    TrainingDecision,
 )
 from edge.edge_worker import EdgeWorker
 from edge.sample_store import LOW_CONFIDENCE
@@ -165,6 +167,93 @@ class TestEdgeWorkerRouting:
         assert trace_calls["frame"] is sample_bgr_frame
         assert trace_calls["trace_input"] is sample_input
         assert "synthetic_image_size" not in trace_calls
+
+    def test_resolve_active_splitter_keeps_runtime_when_resize_normalizes_shape(self, sample_bgr_frame):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.split_learning_enabled = True
+        worker._fixed_split_init_attempted = True
+        worker.collect_flag = True
+        worker.universal_split_enabled = True
+        worker.universal_splitter = object()
+        worker.split_trace_image_size = (640, 640)
+        worker.small_object_detection = SimpleNamespace(
+            get_runtime_image_size=lambda _frame_size: (640, 640),
+        )
+
+        active = worker._resolve_active_splitter(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
+
+        assert active is worker.universal_splitter
+        assert worker.split_learning_enabled is True
+
+    def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.sample_confidence_threshold = 0.8
+        worker.drift_detector = SimpleNamespace(update=lambda confidence: False)
+        worker.fixed_split_plan = SimpleNamespace(split_config_id="plan-1")
+        worker.model_id = "yolo26n"
+        worker.model_version = "0"
+        worker.retrain_flag = False
+        worker.collect_flag = True
+        worker.sample_store = SimpleNamespace(
+            store_sample=lambda **kwargs: None,
+            stats=lambda: {"total_samples": 1},
+        )
+        worker.pending_training_decision = None
+        worker._retrain_requested = threading.Event()
+        worker._next_sample_id = lambda task: "sample-1"
+        worker._make_training_decision = lambda **kwargs: TrainingDecision(
+            train_now=True,
+            send_low_conf_features=True,
+            urgency=1.0,
+            compute_pressure=0.0,
+            bandwidth_pressure=0.0,
+            reason="test",
+        )
+
+        task = Task(
+            edge_id=1,
+            frame_index=7,
+            frame=sample_bgr_frame,
+            start_time=time.time(),
+            raw_shape=sample_bgr_frame.shape,
+        )
+        inference = InferenceArtifacts(
+            intermediate=object(),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            confidence=0.6,
+            input_tensor_shape=[1, 3, 384, 640],
+        )
+
+        worker.collect_data(task, sample_bgr_frame, inference)
+
+        assert worker.retrain_flag is True
+        assert worker.collect_flag is False
+        assert worker.pending_training_decision is not None
+        assert worker._retrain_requested.is_set() is True
+
+    def test_close_sets_shutdown_events_and_joins_threads(self):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker._closed = False
+        worker._stop_event = threading.Event()
+        worker._retrain_requested = threading.Event()
+        worker.frame_cache = Queue()
+        worker.local_queue = Queue()
+        worker.diff_processor = threading.Thread(target=lambda: worker._stop_event.wait(1.0))
+        worker.local_processor = threading.Thread(target=lambda: worker._stop_event.wait(1.0))
+        worker.retrain_processor = threading.Thread(target=lambda: worker._stop_event.wait(1.0))
+        worker.diff_processor.start()
+        worker.local_processor.start()
+        worker.retrain_processor.start()
+
+        worker.close(timeout=1.0)
+
+        assert worker._stop_event.is_set() is True
+        assert worker._retrain_requested.is_set() is True
+        assert worker.diff_processor.is_alive() is False
+        assert worker.local_processor.is_alive() is False
+        assert worker.retrain_processor.is_alive() is False
 
     def test_sample_confidence_threshold_falls_back_to_drift_detection(self):
         config = SimpleNamespace(

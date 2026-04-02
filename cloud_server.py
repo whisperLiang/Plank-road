@@ -10,28 +10,26 @@ import random
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from collections.abc import Mapping
 
 import cv2
 import numpy as np
-import pandas as pd
 import torch
-from queue import Queue
 from datetime import datetime
-import yaml
-import munch
 import grpc
 from concurrent import futures
 from torch.utils.data import DataLoader
 from mapcalc import calculate_map
 
+from config import load_runtime_config
 from loguru import logger
-from edge.info import TASK_STATE
 from grpc_server.rpc_server import MessageTransmissionServicer
 from tools.grpc_options import grpc_message_options
 
 import model_management.model_zoo as model_zoo
 from model_management.object_detection import Object_Detection
+from model_management.detection_annotations import load_annotation_targets
 from model_management.detection_dataset import TrafficDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
@@ -303,49 +301,6 @@ def _snapshot_model_state(model: torch.nn.Module) -> dict[str, object]:
     return snapshot
 
 
-def _load_annotation_targets(annotation_path: str) -> dict[str, dict[str, object]]:
-    if not os.path.exists(annotation_path):
-        return {}
-
-    annotations = pd.read_csv(
-        annotation_path,
-        header=None,
-        names=(
-            "frame_index",
-            "target_id",
-            "bbox_x1",
-            "bbox_y1",
-            "bbox_x2",
-            "bbox_y2",
-            "score",
-            "object_category",
-        ),
-    )
-    targets: dict[str, dict[str, object]] = {}
-    for frame_index, group in annotations.groupby("frame_index"):
-        boxes: list[list[float]] = []
-        labels: list[int] = []
-        for _, row in group.iterrows():
-            label = int(row["target_id"])
-            if label == 0:
-                continue
-            boxes.append(
-                [
-                    float(row["bbox_x1"]),
-                    float(row["bbox_y1"]),
-                    float(row["bbox_x2"]),
-                    float(row["bbox_y2"]),
-                ]
-            )
-            labels.append(label)
-        if boxes and labels:
-            targets[str(int(frame_index))] = {
-                "boxes": boxes,
-                "labels": labels,
-            }
-    return targets
-
-
 def _proxy_metrics_are_better(
     candidate_metrics: Mapping[str, object] | None,
     incumbent_metrics: Mapping[str, object] | None,
@@ -492,27 +447,25 @@ class CloudContinualLearner:
     The edge model weights are kept separately from the cloud inference model.
     """
 
-    annotation_cols = (
-        "frame_index", "target_id",
-        "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-        "score", "object_category",
-    )
-
     def __init__(self, config, large_object_detection: Object_Detection):
         self.config = config
         self.large_od = large_object_detection
-        self.lock = threading.Lock()
 
         # Name of the lightweight model to retrain (mirrors edge model)
         self.edge_model_name = getattr(config, "edge_model_name", "rfdetr_nano")
         self.weight_folder = os.path.join(
             os.path.dirname(__file__), "model_management", "models"
         )
+        os.makedirs(self.weight_folder, exist_ok=True)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Default training hyper-parameters (overridable from config)
         cl_cfg = getattr(config, "continual_learning", None)
         self.default_num_epoch = int(getattr(cl_cfg, "num_epoch", 2)) if cl_cfg else 2
+        self.max_concurrent_jobs = (
+            int(getattr(cl_cfg, "max_concurrent_jobs", 2))
+            if cl_cfg else 2
+        )
         self.default_split_learning_rate = (
             float(getattr(cl_cfg, "split_learning_rate", 1e-3))
             if cl_cfg else 1e-3
@@ -544,9 +497,59 @@ class CloudContinualLearner:
         self.das_bn_only = bool(getattr(das_cfg, "bn_only", False)) if das_cfg else False
         self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
 
-    def _edge_weights_path(self, model_name: str) -> str:
+        self._edge_locks_guard = threading.Lock()
+        self._edge_locks: dict[str, threading.Lock] = {}
+        self._job_state_lock = threading.Lock()
+        self._queued_jobs = 0
+        self._active_jobs = 0
+        self._training_slots = threading.BoundedSemaphore(self.max_concurrent_jobs)
+
+    def _edge_lock(self, edge_id: int | str) -> threading.Lock:
+        edge_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(edge_id).strip()) or "unknown"
+        with self._edge_locks_guard:
+            lock = self._edge_locks.get(edge_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._edge_locks[edge_key] = lock
+            return lock
+
+    @contextmanager
+    def _training_job_scope(self, edge_id: int | str):
+        edge_lock = self._edge_lock(edge_id)
+        with self._job_state_lock:
+            self._queued_jobs += 1
+
+        acquired_slot = False
+        with edge_lock:
+            try:
+                self._training_slots.acquire()
+                acquired_slot = True
+                with self._job_state_lock:
+                    self._queued_jobs = max(0, self._queued_jobs - 1)
+                    self._active_jobs += 1
+                yield
+            finally:
+                if acquired_slot:
+                    with self._job_state_lock:
+                        self._active_jobs = max(0, self._active_jobs - 1)
+                    self._training_slots.release()
+                else:
+                    with self._job_state_lock:
+                        self._queued_jobs = max(0, self._queued_jobs - 1)
+
+    def training_queue_state(self) -> tuple[int, int]:
+        with self._job_state_lock:
+            return self._queued_jobs + self._active_jobs, self.max_concurrent_jobs
+
+    def _edge_weights_path(self, model_name: str, *, edge_id: int | str | None = None) -> str:
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(model_name).strip())
-        return os.path.join(self.weight_folder, f"tmp_edge_model_{safe_name}.pth")
+        if edge_id is None:
+            return os.path.join(self.weight_folder, f"tmp_edge_model_{safe_name}.pth")
+        safe_edge = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(edge_id).strip()) or "unknown"
+        return os.path.join(
+            self.weight_folder,
+            f"tmp_edge_model_{safe_name}_edge_{safe_edge}.pth",
+        )
 
     def _legacy_edge_weights_path(self) -> str:
         return os.path.join(self.weight_folder, "tmp_edge_model.pth")
@@ -585,19 +588,36 @@ class CloudContinualLearner:
                     build_kwargs["weights_path"] = str(artifact_path)
         return model_zoo.build_detection_model(model_name, **build_kwargs)
 
-    def _load_edge_training_model(self, *, model_name: str | None = None) -> torch.nn.Module:
+    def _load_edge_training_model(
+        self,
+        *,
+        model_name: str | None = None,
+        edge_id: int | str | None = None,
+    ) -> torch.nn.Module:
         model_name = str(model_name or self.edge_model_name)
-        edge_weights = self._edge_weights_path(model_name)
-        legacy_weights = self._legacy_edge_weights_path()
-        candidate_weights = edge_weights if os.path.exists(edge_weights) else legacy_weights
-        cache_source = (
-            "model-specific cache"
-            if candidate_weights == edge_weights
-            else "legacy cache"
-        )
+        edge_weights = self._edge_weights_path(model_name, edge_id=edge_id)
+        legacy_candidates = [
+            self._edge_weights_path(model_name),
+            self._legacy_edge_weights_path(),
+        ]
+        candidate_weights = None
+        cache_source = "native weights"
+        if os.path.exists(edge_weights):
+            candidate_weights = edge_weights
+            cache_source = "edge-scoped cache"
+        else:
+            for legacy_weights in legacy_candidates:
+                if os.path.exists(legacy_weights):
+                    candidate_weights = legacy_weights
+                    cache_source = (
+                        "model-specific legacy cache"
+                        if legacy_weights.endswith(f"tmp_edge_model_{model_name}.pth")
+                        else "global legacy cache"
+                    )
+                    break
         native_source_label = self._native_training_source_label(model_name)
 
-        if os.path.exists(candidate_weights):
+        if candidate_weights is not None and os.path.exists(candidate_weights):
             fallback_reason = None
             try:
                 state = torch.load(candidate_weights, map_location=self.device, weights_only=False)
@@ -667,8 +687,17 @@ class CloudContinualLearner:
         get_split_runtime_model(tmp_model).eval()
         return tmp_model
 
-    def _serialise_model_bytes(self, model: torch.nn.Module, *, model_name: str | None = None) -> bytes:
-        edge_weights = self._edge_weights_path(model_name or self.edge_model_name)
+    def _serialise_model_bytes(
+        self,
+        model: torch.nn.Module,
+        *,
+        model_name: str | None = None,
+        edge_id: int | str | None = None,
+    ) -> bytes:
+        edge_weights = self._edge_weights_path(
+            model_name or self.edge_model_name,
+            edge_id=edge_id,
+        )
         torch.save(model.state_dict(), edge_weights)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1007,7 +1036,7 @@ class CloudContinualLearner:
         if not frame_indices:
             return False, "", "No frame indices provided."
 
-        with self.lock:
+        with self._training_job_scope(edge_id):
             try:
                 logger.info(
                     f"[CL] Starting cloud retraining for edge {edge_id}: "
@@ -1017,7 +1046,10 @@ class CloudContinualLearner:
                     edge_id, frame_indices, cache_path
                 )
                 model_bytes = self._retrain_edge_model(
-                    cache_path, frame_indices, num_epoch
+                    cache_path,
+                    frame_indices,
+                    num_epoch,
+                    edge_id=edge_id,
                 )
                 encoded = base64.b64encode(model_bytes).decode("utf-8")
                 logger.success(
@@ -1059,7 +1091,7 @@ class CloudContinualLearner:
         if not all_frame_indices:
             return False, "", "No frame indices provided."
 
-        with self.lock:
+        with self._training_job_scope(edge_id):
             try:
                 drift_set = set(drift_frame_indices or [])
                 logger.info(
@@ -1082,7 +1114,11 @@ class CloudContinualLearner:
 
                 # 2. Build the lightweight model for split training
                 model_bytes = self._split_retrain_edge_model(
-                    cache_path, all_frame_indices, gt_annotations, num_epoch
+                    cache_path,
+                    all_frame_indices,
+                    gt_annotations,
+                    num_epoch,
+                    edge_id=edge_id,
                 )
 
                 encoded = base64.b64encode(model_bytes).decode("utf-8")
@@ -1105,7 +1141,7 @@ class CloudContinualLearner:
         if num_epoch <= 0:
             num_epoch = self.default_num_epoch
 
-        with self.lock:
+        with self._training_job_scope(edge_id):
             try:
                 manifest = load_training_bundle_manifest(bundle_cache_path)
                 if manifest.get("protocol_version") != CONTINUAL_LEARNING_PROTOCOL_VERSION:
@@ -1120,7 +1156,10 @@ class CloudContinualLearner:
                     and _requires_trace_stable_feature_rebuild(current_model_name)
                 )
 
-                tmp_model = self._load_edge_training_model(model_name=current_model_name)
+                tmp_model = self._load_edge_training_model(
+                    model_name=current_model_name,
+                    edge_id=edge_id,
+                )
                 working_cache = os.path.join(bundle_cache_path, "working_cache")
                 bundle_info, frame_dir, prepared_splitter, prepared_candidate = (
                     self._prepare_fixed_split_working_cache(
@@ -1234,7 +1273,11 @@ class CloudContinualLearner:
                     tmp_model.load_state_dict(baseline_state)
                     _set_detection_model_eval_mode(tmp_model)
                     encoded = base64.b64encode(
-                        self._serialise_model_bytes(tmp_model, model_name=current_model_name)
+                        self._serialise_model_bytes(
+                            tmp_model,
+                            model_name=current_model_name,
+                            edge_id=edge_id,
+                        )
                     ).decode("utf-8")
                     fallback_message = (
                         f"Kept {baseline_source} weights; rejected retrained weights because {rejection_reason}"
@@ -1246,7 +1289,11 @@ class CloudContinualLearner:
                     return True, encoded, fallback_message
 
                 encoded = base64.b64encode(
-                    self._serialise_model_bytes(tmp_model, model_name=current_model_name)
+                    self._serialise_model_bytes(
+                        tmp_model,
+                        model_name=current_model_name,
+                        edge_id=edge_id,
+                    )
                 ).decode("utf-8")
                 success_message = (
                     f"Fixed split retraining successful; {proxy_summary}"
@@ -1270,12 +1317,14 @@ class CloudContinualLearner:
         all_indices: list[int],
         gt_annotations: dict[int, dict],
         num_epoch: int,
+        *,
+        edge_id: int | str | None = None,
     ) -> bytes:
         """Fine-tune the lightweight model via split learning; return state-dict bytes.
 
         Requires cached features produced by the universal model splitter.
         """
-        tmp_model = self._load_edge_training_model()
+        tmp_model = self._load_edge_training_model(edge_id=edge_id)
 
         split_model = get_split_runtime_model(tmp_model)
         sample_input = None
@@ -1327,7 +1376,7 @@ class CloudContinualLearner:
             das_probe_samples=self.das_probe_samples,
         )
 
-        return self._serialise_model_bytes(tmp_model)
+        return self._serialise_model_bytes(tmp_model, edge_id=edge_id)
 
     # ------------------------------------------------------------------
     # Internal helpers (original full-image retraining)
@@ -1376,6 +1425,7 @@ class CloudContinualLearner:
         num_epoch: int,
         *,
         model_name: str | None = None,
+        edge_id: int | str | None = None,
     ) -> bytes:
         """Fine-tune the lightweight model; return its state-dict as bytes."""
         from model_management.model_zoo import (
@@ -1385,7 +1435,7 @@ class CloudContinualLearner:
         )
 
         model_name = str(model_name or self.edge_model_name)
-        edge_weights = self._edge_weights_path(model_name)
+        edge_weights = self._edge_weights_path(model_name, edge_id=edge_id)
         model_family = get_model_family(model_name)
 
         if is_wrapper_model(model_name):
@@ -1394,7 +1444,7 @@ class CloudContinualLearner:
                 f"does not support torchvision-style retraining."
             )
 
-        tmp_model = self._load_edge_training_model(model_name=model_name)
+        tmp_model = self._load_edge_training_model(model_name=model_name, edge_id=edge_id)
 
         # Freeze backbone; fine-tune only the detector tail (model-family aware)
         set_detection_trainable_params(tmp_model, model_name)
@@ -1495,51 +1545,14 @@ class CloudServer:
         # Cloud-side continual learner (retrains the edge lightweight model)
         self.continual_learner = CloudContinualLearner(config, self.large_object_detection)
 
-        # start the thread for local process
-        self.local_queue = Queue(config.local_queue_maxsize)
-        self.local_processor = threading.Thread(target=self.cloud_local, daemon=True)
-        self.local_processor.start()
-
-
-    def cloud_local(self):
-        while True:
-            task = self.local_queue.get(block=True)
-            if time.time() - task.start_time >= self.config.wait_thresh:
-                end_time = time.time()
-                task.end_time = end_time
-                task.state = TASK_STATE.TIMEOUT
-                self._log_task(task)
-                continue
-            task.frame_cloud = task.frame_edge
-            frame = task.frame_cloud
-            high_boxes, high_class, high_score = self.large_object_detection.large_inference(frame)
-            # scale the small result
-            scale = task.raw_shape[0] / frame.shape[0]
-            if high_boxes:
-                high_boxes = (np.array(high_boxes) * scale).tolist()
-                task.add_result(high_boxes, high_class, high_score)
-            end_time = time.time()
-            task.end_time = end_time
-            task.state = TASK_STATE.FINISHED
-            self._log_task(task)
-
-    def _log_task(self, task):
-        detection_boxes, _, _ = task.get_result()
-        logger.info(
-            "Cloud task edge={} frame={} state={} detections={}",
-            task.edge_id,
-            task.frame_index,
-            task.state.name if task.state else "UNKNOWN",
-            len(detection_boxes),
-        )
-
-
     def start_server(self):
+        listen_address = str(getattr(self.config, "listen_address", "[::]:50051")).strip()
         logger.info(
-            "cloud server is starting (pid={}, golden={}, edge_model_name={})",
+            "cloud server is starting (pid={}, golden={}, edge_model_name={}, listen_address={})",
             os.getpid(),
             getattr(self.config, "golden", "unknown"),
             getattr(self.config, "edge_model_name", "unknown"),
+            listen_address,
         )
         server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=4),
@@ -1547,17 +1560,17 @@ class CloudServer:
         )
         message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
             MessageTransmissionServicer(
-                self.local_queue,
-                self.server_id,
-                self.large_object_detection,
+                id=self.server_id,
                 continual_learner=self.continual_learner,
+                workspace_root=getattr(self.config, "workspace_root", "./cache/server_workspace"),
             ),
             server,
         )
-        server.add_insecure_port('[::]:50051')
+        server.add_insecure_port(listen_address)
         server.start()
         logger.info(
-            "cloud server is listening on 50051 (pid={}, edge_model_name={})",
+            "cloud server is listening on {} (pid={}, edge_model_name={})",
+            listen_address,
             os.getpid(),
             getattr(self.config, "edge_model_name", "unknown"),
         )
@@ -1568,10 +1581,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="configuration description")
     parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
     args = parser.parse_args()
-    with open(args.yaml_path, 'r', encoding='utf-8') as f:
-        config = yaml.load(f, Loader=yaml.SafeLoader)
-    # provide class-like access for dict
-    config = munch.munchify(config)
+    config = load_runtime_config(args.yaml_path)
     server_config = config.server
     cloud_server = CloudServer(server_config)
     cloud_server.start_server()

@@ -4,10 +4,9 @@ import time
 from pathlib import Path
 
 import cv2
-import munch
-import yaml
 from loguru import logger
 
+from config import load_runtime_config
 from edge.edge_worker import EdgeWorker
 from edge.info import TASK_STATE
 from edge.task import Task
@@ -216,10 +215,7 @@ if __name__ == '__main__':
     parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
     args = parser.parse_args()
 
-    with open(args.yaml_path, "r", encoding="utf-8") as f:
-        config = yaml.load(f, Loader=yaml.SafeLoader)
-
-    config = munch.munchify(config).client
+    config = load_runtime_config(args.yaml_path).client
     logger.add("log/client/client_{time}.log", level="INFO", rotation="500 MB")
 
     clear_folder(config.retrain.cache_path)
@@ -230,4 +226,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
     finally:
+        edge.close()
         cv2.destroyAllWindows()

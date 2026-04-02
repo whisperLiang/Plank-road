@@ -194,6 +194,7 @@ uv pip install grpcio-tools
 python -m grpc_tools.protoc \
     -I ./grpc_server/protos \
     --python_out=./grpc_server \
+    --pyi_out=./grpc_server \
     --grpc_python_out=./grpc_server \
     ./grpc_server/protos/message_transmission.proto
 ```
@@ -204,6 +205,7 @@ Windows PowerShell:
 python -m grpc_tools.protoc `
     -I ./grpc_server/protos `
     --python_out=./grpc_server `
+    --pyi_out=./grpc_server `
     --grpc_python_out=./grpc_server `
     ./grpc_server/protos/message_transmission.proto
 ```
@@ -218,6 +220,7 @@ client:
 
 server:
   golden: yolov8x
+  workspace_root: ./cache/server_workspace
   edge_model_name: yolov8s
   continual_learning:
     teacher_annotation_threshold: 0.3

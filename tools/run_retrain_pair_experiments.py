@@ -15,15 +15,14 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import munch
 import torch
-import yaml
 from loguru import logger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from config import load_runtime_config
 from cloud_server import (
     CloudContinualLearner,
     _evaluate_detection_proxy_map,
@@ -124,8 +123,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _load_base_config(yaml_path: Path):
-    with yaml_path.open("r", encoding="utf-8") as handle:
-        return munch.munchify(yaml.safe_load(handle))
+    return load_runtime_config(yaml_path)
 
 
 def _resolve_local_weights_path(model_name: str, *, refresh: bool = False) -> str:
