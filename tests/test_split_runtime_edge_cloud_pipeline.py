@@ -120,26 +120,19 @@ def test_large_inference_accepts_threshold_override():
     assert scores == [0.42]
 
 
-def test_runtime_resize_restores_boxes_to_original_coordinates():
+def test_prepare_runtime_frame_preserves_original_geometry():
     detector = Object_Detection.__new__(Object_Detection)
-    detector.runtime_resize_enabled = True
-    detector.runtime_image_size = (320, 320)
 
-    resized_frame, original_size, resized = detector._prepare_runtime_frame(
+    prepared_frame, original_size, resized = detector._prepare_runtime_frame(
         np.zeros((480, 640, 3), dtype=np.uint8)
     )
-    restored = detector._restore_boxes_to_original(
-        [[32.0, 64.0, 160.0, 256.0]],
-        original_image_size=original_size,
-        runtime_image_size=tuple(resized_frame.shape[:2]),
-    )
 
-    assert resized is True
-    assert tuple(resized_frame.shape[:2]) == (320, 320)
-    assert restored[0] == pytest.approx([64.0, 96.0, 320.0, 384.0])
+    assert resized is False
+    assert tuple(prepared_frame.shape[:2]) == (480, 640)
+    assert original_size == (480, 640)
 
 
-def test_cloud_bundle_trace_input_uses_runtime_tensor_shape_for_resize(tmp_path, monkeypatch):
+def test_cloud_bundle_trace_input_uses_raw_frame_geometry(tmp_path, monkeypatch):
     config = SimpleNamespace(
         edge_model_name="yolo26n",
         continual_learning=SimpleNamespace(),
@@ -179,12 +172,11 @@ def test_cloud_bundle_trace_input_uses_runtime_tensor_shape_for_resize(tmp_path,
         manifest,
     )
 
-    assert learner._infer_bundle_trace_image_size(manifest) == (640, 640)
-    assert captured["frame_shape"] == (640, 640)
-    assert tuple(sample_input.shape) == (1, 3, 640, 640)
+    assert captured["frame_shape"] == (512, 960)
+    assert tuple(sample_input.shape) == (1, 3, 512, 960)
 
 
-def test_cloud_bundle_feature_provider_uses_runtime_tensor_shape_for_resize(tmp_path, monkeypatch):
+def test_cloud_bundle_feature_provider_uses_raw_frame_geometry(tmp_path, monkeypatch):
     config = SimpleNamespace(
         edge_model_name="yolo26n",
         continual_learning=SimpleNamespace(),
@@ -235,12 +227,12 @@ def test_cloud_bundle_feature_provider_uses_runtime_tensor_shape_for_resize(tmp_
 
     runtime_input = provider(str(raw_path), manifest["samples"][0], manifest)
 
-    assert captured["frame_shape"] == (640, 640)
-    assert captured["runtime_tensor_shape"] == (640, 640)
-    assert tuple(runtime_input.shape) == (1, 3, 640, 640)
+    assert captured["frame_shape"] == (512, 960)
+    assert captured["runtime_tensor_shape"] == (512, 960)
+    assert tuple(runtime_input.shape) == (1, 3, 512, 960)
 
 
-def test_proxy_eval_restores_boxes_for_direct_resize_metadata(tmp_path):
+def test_proxy_eval_ignores_resize_metadata_and_uses_raw_frame_coordinates(tmp_path):
     frame_dir = tmp_path / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -250,7 +242,7 @@ def test_proxy_eval_restores_boxes_for_direct_resize_metadata(tmp_path):
         def forward(self, images):
             return [{
                 "labels": torch.tensor([1], dtype=torch.int64),
-                "boxes": torch.tensor([[64.0, 128.0, 320.0, 512.0]], dtype=torch.float32),
+                "boxes": torch.tensor([[64.0, 96.0, 320.0, 384.0]], dtype=torch.float32),
                 "scores": torch.tensor([0.95], dtype=torch.float32),
             }]
 

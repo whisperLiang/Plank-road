@@ -168,7 +168,7 @@ class TestEdgeWorkerRouting:
         assert trace_calls["trace_input"] is sample_input
         assert "synthetic_image_size" not in trace_calls
 
-    def test_resolve_active_splitter_keeps_runtime_when_resize_normalizes_shape(self, sample_bgr_frame):
+    def test_resolve_active_splitter_disables_runtime_when_frame_size_changes(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
         worker.split_learning_enabled = True
         worker._fixed_split_init_attempted = True
@@ -176,14 +176,12 @@ class TestEdgeWorkerRouting:
         worker.universal_split_enabled = True
         worker.universal_splitter = object()
         worker.split_trace_image_size = (640, 640)
-        worker.small_object_detection = SimpleNamespace(
-            get_runtime_image_size=lambda _frame_size: (640, 640),
-        )
+        worker.small_object_detection = SimpleNamespace()
 
         active = worker._resolve_active_splitter(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
 
-        assert active is worker.universal_splitter
-        assert worker.split_learning_enabled is True
+        assert active is None
+        assert worker.split_learning_enabled is False
 
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
@@ -310,14 +308,13 @@ class TestEdgeWorkerRouting:
             detection_score=[],
             confidence=0.6,
             input_tensor_shape=[1, 3, 384, 640],
-            input_resize_mode="direct_resize",
         )
 
         worker.collect_data(task, sample_bgr_frame, inference)
 
         assert captured["confidence_bucket"] == LOW_CONFIDENCE
         assert captured["raw_frame"] is sample_bgr_frame
-        assert captured["input_resize_mode"] == "direct_resize"
+        assert "input_resize_mode" not in captured
 
 
 # =====================================================================

@@ -161,64 +161,6 @@ def _runtime_image_size_from_metadata(
     return None
 
 
-def _input_resize_mode_from_metadata(
-    metadata: Mapping[str, object] | None,
-) -> str | None:
-    if not isinstance(metadata, Mapping):
-        return None
-    resize_mode = metadata.get("input_resize_mode")
-    if resize_mode is None:
-        return None
-    value = str(resize_mode).strip()
-    return value or None
-
-
-def _resize_frame_for_runtime_input(
-    frame: np.ndarray,
-    runtime_image_size: tuple[int, int] | None,
-) -> np.ndarray:
-    if runtime_image_size is None:
-        return frame
-    current_image_size = tuple(int(value) for value in frame.shape[:2])
-    if current_image_size == tuple(runtime_image_size):
-        return frame
-    target_height, target_width = (int(runtime_image_size[0]), int(runtime_image_size[1]))
-    interpolation = cv2.INTER_AREA
-    if target_height > current_image_size[0] or target_width > current_image_size[1]:
-        interpolation = cv2.INTER_LINEAR
-    return cv2.resize(
-        frame,
-        (target_width, target_height),
-        interpolation=interpolation,
-    )
-
-
-def _restore_boxes_to_original_coordinates(
-    boxes: list[list[float]],
-    *,
-    original_image_size: tuple[int, int],
-    runtime_image_size: tuple[int, int],
-) -> list[list[float]]:
-    if not boxes:
-        return []
-    orig_height, orig_width = original_image_size
-    runtime_height, runtime_width = runtime_image_size
-    if runtime_height <= 0 or runtime_width <= 0:
-        return [list(box) for box in boxes]
-    scale_x = float(orig_width) / float(runtime_width)
-    scale_y = float(orig_height) / float(runtime_height)
-    restored: list[list[float]] = []
-    for box in boxes:
-        x1, y1, x2, y2 = [float(value) for value in box]
-        restored.append([
-            max(0.0, min(float(orig_width), x1 * scale_x)),
-            max(0.0, min(float(orig_height), y1 * scale_y)),
-            max(0.0, min(float(orig_width), x2 * scale_x)),
-            max(0.0, min(float(orig_height), y2 * scale_y)),
-        ])
-    return restored
-
-
 def _prediction_from_model_output(
     output: object,
     *,
@@ -311,26 +253,11 @@ def _evaluate_detection_proxy_map(
                 skipped_missing_frame += 1
                 continue
 
-            sample_metadata = None
-            if sample_metadata_by_id is not None:
-                sample_metadata = sample_metadata_by_id.get(sample_id)
-            runtime_image_size = _runtime_image_size_from_metadata(sample_metadata)
-            resize_mode = _input_resize_mode_from_metadata(sample_metadata)
-            eval_frame = frame
-            if resize_mode == "direct_resize" and runtime_image_size is not None:
-                eval_frame = _resize_frame_for_runtime_input(frame, runtime_image_size)
-
             prediction = _prediction_from_model_output(
-                model([_prepare_eval_image_tensor(eval_frame, device=device)]),
+                model([_prepare_eval_image_tensor(frame, device=device)]),
                 threshold_low=threshold_low,
                 threshold_high=threshold_high,
             )
-            if resize_mode == "direct_resize" and runtime_image_size is not None:
-                prediction["boxes"] = _restore_boxes_to_original_coordinates(
-                    list(prediction.get("boxes") or []),
-                    original_image_size=tuple(int(value) for value in frame.shape[:2]),
-                    runtime_image_size=runtime_image_size,
-                )
             predicted_boxes = list(prediction.get("boxes") or [])
             total_prediction_boxes += len(predicted_boxes)
             if predicted_boxes:
@@ -805,13 +732,6 @@ class CloudContinualLearner:
     ) -> tuple[int, int] | None:
         return _runtime_image_size_from_metadata(metadata)
 
-    @staticmethod
-    def _resize_frame_for_runtime_input(
-        frame,
-        runtime_image_size: tuple[int, int] | None,
-    ):
-        return _resize_frame_for_runtime_input(frame, runtime_image_size)
-
     def _prepare_split_runtime_input(
         self,
         model: torch.nn.Module,
@@ -819,9 +739,7 @@ class CloudContinualLearner:
         *,
         sample_metadata: Mapping[str, object] | None = None,
     ):
-        runtime_image_size = self._runtime_image_size_from_metadata(sample_metadata)
-        runtime_frame = self._resize_frame_for_runtime_input(frame, runtime_image_size)
-        return prepare_split_runtime_input(model, runtime_frame, device=self.device)
+        return prepare_split_runtime_input(model, frame, device=self.device)
 
     def _teacher_inference(self, frame):
         try:
@@ -877,11 +795,7 @@ class CloudContinualLearner:
             frame = cv2.imread(raw_path)
             if frame is None:
                 continue
-            return self._prepare_split_runtime_input(
-                model,
-                frame,
-                sample_metadata=sample,
-            )
+            return self._prepare_split_runtime_input(model, frame)
 
         trace_image_size = self._infer_bundle_trace_image_size(manifest)
         return build_split_runtime_sample_input(
@@ -911,11 +825,7 @@ class CloudContinualLearner:
             if frame is None:
                 raise FileNotFoundError(raw_path)
             return splitter.edge_forward(
-                self._prepare_split_runtime_input(
-                    model,
-                    frame,
-                    sample_metadata=sample,
-                ),
+                self._prepare_split_runtime_input(model, frame),
                 candidate=candidate,
             )
 
@@ -1700,15 +1610,7 @@ class CloudContinualLearner:
             frame = cv2.imread(frame_path)
             if frame is None:
                 continue
-            try:
-                sample_record = load_split_feature_cache(cache_path, frame_index)
-            except FileNotFoundError:
-                sample_record = None
-            sample_input = self._prepare_split_runtime_input(
-                tmp_model,
-                frame,
-                sample_metadata=sample_record,
-            )
+            sample_input = self._prepare_split_runtime_input(tmp_model, frame)
             break
 
         if sample_input is None:

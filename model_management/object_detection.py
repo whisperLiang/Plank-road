@@ -61,14 +61,6 @@ class Object_Detection:
         self.config = config
         self.init_model_flag = False
         self.model_lock = threading.Lock()
-        runtime_resize = getattr(config, "runtime_resize", None)
-        self.runtime_resize_enabled = bool(getattr(runtime_resize, "enabled", False))
-        self.runtime_image_size = None
-        if self.runtime_resize_enabled:
-            self.runtime_image_size = (
-                int(getattr(runtime_resize, "height", 640)),
-                int(getattr(runtime_resize, "width", 640)),
-            )
 
         if type == 'small inference':
             self.model_name = config.lightweight
@@ -222,39 +214,23 @@ class Object_Detection:
         return 0.0
 
     def prepare_splitter_input(self, img):
-        runtime_frame, _, _ = self._prepare_runtime_frame(img)
-        return prepare_split_runtime_input(self.model, runtime_frame, device=device)
+        return prepare_split_runtime_input(self.model, img, device=device)
 
     def build_split_sample_input(self, image_size=None):
         if image_size is None:
-            image_size = self.get_runtime_image_size((224, 224))
+            image_size = (224, 224)
         return build_split_runtime_sample_input(self.model, image_size=image_size, device=device)
 
     def get_split_runtime_model(self):
         return get_split_runtime_model(self.model)
 
-    def uses_runtime_resize(self) -> bool:
-        return bool(
-            getattr(self, "runtime_resize_enabled", False)
-            and getattr(self, "runtime_image_size", None)
-        )
-
-    def get_runtime_image_size(self, fallback: tuple[int, int] | None = None) -> tuple[int, int] | None:
-        if self.uses_runtime_resize():
-            return tuple(int(value) for value in self.runtime_image_size)
-        if fallback is None:
-            return None
-        return tuple(int(value) for value in fallback)
-
     def infer_sample(self, img, splitter=None) -> InferenceArtifacts:
         split_payload = None
         input_tensor_shape = None
-        runtime_frame, original_image_size, resized = self._prepare_runtime_frame(img)
-        runtime_image_size = tuple(int(value) for value in runtime_frame.shape[:2])
-        input_resize_mode = "direct_resize" if self.uses_runtime_resize() else "model_preprocess"
+        input_resize_mode = None
         with self.model_lock:
             if splitter is not None:
-                splitter_input = prepare_split_runtime_input(self.model, runtime_frame, device=device)
+                splitter_input = prepare_split_runtime_input(self.model, img, device=device)
                 if isinstance(splitter_input, torch.Tensor):
                     input_tensor_shape = [int(dim) for dim in splitter_input.shape]
                 elif (
@@ -271,23 +247,16 @@ class Object_Detection:
                     replayed,
                     threshold=self.threshold_low,
                     model_input=splitter_input,
-                    orig_image=runtime_frame,
+                    orig_image=img,
                 )
                 pred_boxes, pred_class, pred_score = self._parse_prediction_output(
                     replayed, self.threshold_low,
                 )
             else:
                 pred_boxes, pred_class, pred_score = self.get_model_prediction(
-                    runtime_frame,
+                    img,
                     self.threshold_low,
                 )
-
-        if resized and pred_boxes is not None:
-            pred_boxes = self._restore_boxes_to_original(
-                pred_boxes,
-                original_image_size=original_image_size,
-                runtime_image_size=runtime_image_size,
-            )
 
         if pred_boxes is None or pred_score is None:
             return InferenceArtifacts(
@@ -342,17 +311,10 @@ class Object_Detection:
     def large_inference(self, img, threshold=None):
         if threshold is None:
             threshold = self.threshold_high
-        runtime_frame, original_image_size, resized = self._prepare_runtime_frame(img)
         pred_boxes, pred_class, pred_score = self.get_model_prediction(
-            runtime_frame,
+            img,
             float(threshold),
         )
-        if resized and pred_boxes is not None:
-            pred_boxes = self._restore_boxes_to_original(
-                pred_boxes,
-                original_image_size=original_image_size,
-                runtime_image_size=tuple(int(value) for value in runtime_frame.shape[:2]),
-            )
         return pred_boxes, pred_class, pred_score
 
     def get_model_prediction(self, img, threshold, model=None):
@@ -377,45 +339,7 @@ class Object_Detection:
         img,
     ) -> tuple[np.ndarray, tuple[int, int], bool]:
         original_image_size = tuple(int(value) for value in img.shape[:2])
-        target_size = self.get_runtime_image_size(original_image_size)
-        if target_size is None or target_size == original_image_size:
-            return img, original_image_size, False
-        target_height, target_width = target_size
-        interpolation = cv2.INTER_AREA
-        if target_height > original_image_size[0] or target_width > original_image_size[1]:
-            interpolation = cv2.INTER_LINEAR
-        resized = cv2.resize(
-            img,
-            (int(target_width), int(target_height)),
-            interpolation=interpolation,
-        )
-        return resized, original_image_size, True
-
-    def _restore_boxes_to_original(
-        self,
-        boxes,
-        *,
-        original_image_size: tuple[int, int],
-        runtime_image_size: tuple[int, int],
-    ) -> list[list[float]]:
-        if not boxes:
-            return []
-        orig_height, orig_width = original_image_size
-        runtime_height, runtime_width = runtime_image_size
-        if runtime_height <= 0 or runtime_width <= 0:
-            return [list(box) for box in boxes]
-        scale_x = float(orig_width) / float(runtime_width)
-        scale_y = float(orig_height) / float(runtime_height)
-        restored: list[list[float]] = []
-        for box in boxes:
-            x1, y1, x2, y2 = [float(value) for value in box]
-            restored.append([
-                max(0.0, min(float(orig_width), x1 * scale_x)),
-                max(0.0, min(float(orig_height), y1 * scale_y)),
-                max(0.0, min(float(orig_width), x2 * scale_x)),
-                max(0.0, min(float(orig_height), y2 * scale_y)),
-            ])
-        return restored
+        return img, original_image_size, False
 
     def _parse_prediction_output(self, res, threshold):
         if isinstance(res, tuple):

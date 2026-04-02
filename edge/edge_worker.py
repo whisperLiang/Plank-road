@@ -116,13 +116,6 @@ class EdgeWorker:
         self._retrain_requested = threading.Event()
         self._closed = False
 
-        if self.split_learning_enabled and self.small_object_detection.uses_runtime_resize():
-            prewarm_image_size = self.small_object_detection.get_runtime_image_size((224, 224))
-            self._init_fixed_split_runtime(image_size=prewarm_image_size)
-            if self.collect_flag and not self.split_learning_enabled:
-                self.collect_flag = False
-                self._log_split_collection_disabled()
-
         self.diff_processor = threading.Thread(target=self.diff_worker, daemon=False)
         self.local_processor = threading.Thread(target=self.local_worker, daemon=False)
         self.retrain_processor = threading.Thread(target=self.retrain_worker, daemon=False)
@@ -144,11 +137,6 @@ class EdgeWorker:
             return
 
         try:
-            runtime_image_size_getter = getattr(
-                self.small_object_detection,
-                "get_runtime_image_size",
-                None,
-            )
             split_model = self.small_object_detection.get_split_runtime_model()
             self.universal_splitter = UniversalModelSplitter(
                 device=next(split_model.parameters()).device,
@@ -157,18 +145,10 @@ class EdgeWorker:
                 self.small_object_detection.model
             )
             if frame is not None:
-                trace_image_size = (
-                    runtime_image_size_getter(tuple(frame.shape[:2]))
-                    if callable(runtime_image_size_getter)
-                    else None
-                ) or tuple(int(value) for value in frame.shape[:2])
+                trace_image_size = tuple(int(value) for value in frame.shape[:2])
                 sample_input = self.small_object_detection.prepare_splitter_input(frame)
             else:
-                trace_image_size = image_size or (
-                    runtime_image_size_getter((224, 224))
-                    if callable(runtime_image_size_getter)
-                    else None
-                ) or (224, 224)
+                trace_image_size = image_size or (224, 224)
                 sample_input = self.small_object_detection.build_split_sample_input(trace_image_size)
             self.universal_splitter.trace(
                 split_model,
@@ -297,9 +277,7 @@ class EdgeWorker:
                 self._log_split_collection_disabled()
 
         active_splitter = self.universal_splitter if self.universal_split_enabled else None
-        effective_image_size = self.small_object_detection.get_runtime_image_size(
-            frame_image_size
-        ) or frame_image_size
+        effective_image_size = tuple(int(value) for value in frame_image_size)
         if (
             active_splitter is None
             or self.split_trace_image_size is None
@@ -383,7 +361,6 @@ class EdgeWorker:
             raw_frame=frame if save_raw else None,
             input_image_size=list(frame.shape[:2]),
             input_tensor_shape=inference.input_tensor_shape,
-            input_resize_mode=inference.input_resize_mode,
         )
 
         if self.retrain_flag:

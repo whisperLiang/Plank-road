@@ -46,11 +46,6 @@ client:
   num_epoch: 2
   cache_path: './cache'
   collect_num: 20
- # Unified runtime resize for fixed-split tracing/inference.
- runtime_resize:
-  enabled: True
-  height: 640
-  width: 640
  # drift detection (RCCDA-inspired)
  drift_detection:
   # mode: 'rccda' | 'adwin' | 'window' | 'any' | 'majority'

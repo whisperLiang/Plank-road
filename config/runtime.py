@@ -44,13 +44,6 @@ class RetrainConfig(ConfigSection):
 
 
 @dataclass
-class ResizeConfig(ConfigSection):
-    enabled: bool = False
-    height: int = 640
-    width: int = 640
-
-
-@dataclass
 class DriftDetectionConfig(ConfigSection):
     mode: str = "rccda"
     confidence_threshold: float = 0.8
@@ -126,7 +119,6 @@ class ClientConfig(ConfigSection):
     edge_id: int = 1
     edge_num: int = 1
     retrain: RetrainConfig = field(default_factory=RetrainConfig)
-    runtime_resize: ResizeConfig = field(default_factory=ResizeConfig)
     drift_detection: DriftDetectionConfig = field(default_factory=DriftDetectionConfig)
     resource_aware_trigger: ResourceAwareTriggerConfig = field(
         default_factory=ResourceAwareTriggerConfig
@@ -171,10 +163,6 @@ def _section(section_cls, value: Mapping[str, Any] | None):
     elif section_cls is ClientConfig:
         known["source"] = _section(SourceConfig, known.get("source"))
         known["retrain"] = _section(RetrainConfig, known.get("retrain"))
-        known["runtime_resize"] = _section(
-            ResizeConfig,
-            known.get("runtime_resize"),
-        )
         known["drift_detection"] = _section(
             DriftDetectionConfig,
             known.get("drift_detection"),
@@ -260,10 +248,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.continual_learning.max_concurrent_jobs",
         int(config.server.continual_learning.max_concurrent_jobs),
     )
-
-    if config.client.runtime_resize.enabled:
-        _validate_positive("client.runtime_resize.height", int(config.client.runtime_resize.height))
-        _validate_positive("client.runtime_resize.width", int(config.client.runtime_resize.width))
 
     if not str(config.client.server_ip).strip():
         raise ValueError("client.server_ip must be a non-empty host:port string")

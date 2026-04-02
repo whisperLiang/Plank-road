@@ -389,7 +389,6 @@ def _collect_edge_samples(
             raw_frame=frame if confidence_bucket == LOW_CONFIDENCE else None,
             input_image_size=list(frame.shape[:2]),
             input_tensor_shape=inference.input_tensor_shape,
-            input_resize_mode=inference.input_resize_mode,
         )
     return sample_store.stats()
 

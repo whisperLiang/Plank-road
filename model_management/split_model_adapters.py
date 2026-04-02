@@ -762,17 +762,6 @@ def _infer_input_image_size(targets: Any) -> tuple[int, int]:
     raise RuntimeError("Missing input image size metadata required for wrapper-model split retraining.")
 
 
-def _infer_input_resize_mode(targets: Any) -> str | None:
-    if not isinstance(targets, dict):
-        raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
-    split_meta = targets.get("_split_meta", {})
-    resize_mode = split_meta.get("input_resize_mode")
-    if resize_mode is None:
-        return None
-    value = str(resize_mode).strip()
-    return value or None
-
-
 def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:
     if not isinstance(targets, dict):
         raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
@@ -796,26 +785,6 @@ def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple
     if model_input_size is None:
         model_input_size = original_image_size
     return original_image_size, model_input_size
-
-
-def _project_boxes_for_direct_resize(
-    boxes_xyxy: torch.Tensor,
-    *,
-    original_image_size: tuple[int, int],
-    model_input_size: tuple[int, int],
-) -> torch.Tensor:
-    if boxes_xyxy.numel() == 0:
-        return boxes_xyxy.reshape(0, 4)
-
-    orig_height, orig_width = original_image_size
-    model_height, model_width = model_input_size
-    if orig_height <= 0 or orig_width <= 0 or model_height <= 0 or model_width <= 0:
-        raise RuntimeError("Image sizes must be positive for wrapper-model split retraining.")
-
-    projected = boxes_xyxy.clone()
-    projected[..., 0::2] = projected[..., 0::2] * (float(model_width) / float(orig_width))
-    projected[..., 1::2] = projected[..., 1::2] * (float(model_height) / float(orig_height))
-    return _clamp_xyxy_boxes(projected, model_input_size)
 
 
 def _build_anchor_training_target(
@@ -904,17 +873,9 @@ def _project_boxes_to_model_input(
     *,
     original_image_size: tuple[int, int],
     model_input_size: tuple[int, int],
-    resize_mode: str | None = None,
 ) -> torch.Tensor:
     if boxes_xyxy.numel() == 0:
         return boxes_xyxy.reshape(0, 4)
-
-    if resize_mode == "direct_resize":
-        return _project_boxes_for_direct_resize(
-            boxes_xyxy,
-            original_image_size=original_image_size,
-            model_input_size=model_input_size,
-        )
 
     orig_height, orig_width = original_image_size
     model_height, model_width = model_input_size
@@ -939,7 +900,6 @@ def _prepare_coco80_targets(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
     original_image_size, model_input_size = _infer_ultralytics_image_sizes(targets)
-    resize_mode = _infer_input_resize_mode(targets)
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
         original_image_size,
@@ -974,7 +934,6 @@ def _prepare_coco80_targets(
         boxes.index_select(0, keep_tensor),
         original_image_size=original_image_size,
         model_input_size=model_input_size,
-        resize_mode=resize_mode,
     )
     labels = torch.as_tensor(mapped_labels, dtype=torch.int64, device=device)
     valid_geometry = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
@@ -1004,7 +963,6 @@ def _build_detr_training_labels(
     num_labels: int,
 ) -> list[dict[str, torch.Tensor]]:
     image_size = _infer_input_image_size(targets)
-    resize_mode = _infer_input_resize_mode(targets)
     split_meta = targets.get("_split_meta", {}) if isinstance(targets, dict) else {}
     original_image_size = split_meta.get("input_image_size")
     if isinstance(original_image_size, (list, tuple)) and len(original_image_size) >= 2:
@@ -1013,16 +971,9 @@ def _build_detr_training_labels(
         original_image_size = image_size
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
-        original_image_size,
+        image_size if original_image_size != image_size else original_image_size,
     )
-    if resize_mode == "direct_resize" and original_image_size != image_size:
-        boxes = _project_boxes_for_direct_resize(
-            boxes,
-            original_image_size=original_image_size,
-            model_input_size=image_size,
-        )
-    else:
-        boxes = _clamp_xyxy_boxes(boxes, image_size)
+    boxes = _clamp_xyxy_boxes(boxes, image_size)
     labels = _as_labels_tensor(targets.get("labels"), device=device)
     if boxes.shape[0] != labels.shape[0]:
         count = min(boxes.shape[0], labels.shape[0])
@@ -1048,7 +999,6 @@ def _build_rfdetr_training_labels(
     num_classes: int,
 ) -> list[dict[str, torch.Tensor]]:
     image_size = _infer_input_image_size(targets)
-    resize_mode = _infer_input_resize_mode(targets)
     split_meta = targets.get("_split_meta", {}) if isinstance(targets, dict) else {}
     original_image_size = split_meta.get("input_image_size")
     if isinstance(original_image_size, (list, tuple)) and len(original_image_size) >= 2:
@@ -1057,16 +1007,9 @@ def _build_rfdetr_training_labels(
         original_image_size = image_size
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
-        original_image_size,
+        image_size if original_image_size != image_size else original_image_size,
     )
-    if resize_mode == "direct_resize" and original_image_size != image_size:
-        boxes = _project_boxes_for_direct_resize(
-            boxes,
-            original_image_size=original_image_size,
-            model_input_size=image_size,
-        )
-    else:
-        boxes = _clamp_xyxy_boxes(boxes, image_size)
+    boxes = _clamp_xyxy_boxes(boxes, image_size)
     labels = _as_labels_tensor(targets.get("labels"), device=device)
     if boxes.shape[0] != labels.shape[0]:
         count = min(boxes.shape[0], labels.shape[0])

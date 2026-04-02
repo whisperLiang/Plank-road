@@ -698,7 +698,6 @@ def test_low_confidence_sample_saves_feature_result_and_raw(tmp_path, sample_bgr
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=payload,
         raw_frame=sample_bgr_frame,
-        input_resize_mode="direct_resize",
     )
 
     assert record.has_feature is True
@@ -706,7 +705,7 @@ def test_low_confidence_sample_saves_feature_result_and_raw(tmp_path, sample_bgr
     assert (tmp_path / "features" / "low-1.pt").exists()
     assert (tmp_path / "results" / "low-1.json").exists()
     assert (tmp_path / "raw" / "low-1.jpg").exists()
-    assert store.load_record("low-1").input_resize_mode == "direct_resize"
+    assert store.load_record("low-1").input_resize_mode is None
     stored = store.load_intermediate(record)
     assert all(not tensor.requires_grad for tensor in stored.tensors.values())
 

@@ -820,7 +820,7 @@ class TestModelZoo:
 
         assert labels[0]["labels"].tolist() == [13, 90]
 
-    def test_ultralytics_training_batch_projects_boxes_for_direct_resize(self):
+    def test_ultralytics_training_batch_ignores_stale_resize_metadata(self):
         batch = _build_ultralytics_training_batch(
             {
                 "boxes": [[64.0, 96.0, 320.0, 384.0]],
@@ -836,7 +836,7 @@ class TestModelZoo:
 
         assert tuple(batch["img"].shape) == (1, 3, 640, 640)
         assert batch["bboxes"].shape == (1, 4)
-        assert batch["bboxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.6])
+        assert batch["bboxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.45])
 
     def test_ultralytics_training_batch_keeps_legacy_letterbox_projection_without_resize_mode(self):
         batch = _build_ultralytics_training_batch(
