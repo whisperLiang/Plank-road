@@ -10,18 +10,18 @@ client:
    ip_address: you camera ip
    channel: 1
  # the frame interval
- interval: 2
+ interval: 1
  # the difference feature (pixel, edge, area, corner).
  feature: edge
  # the difference flag and thresh
  diff_flag: True
- diff_thresh: 0.01
+ diff_thresh: 0.0004
  # the queue maxsize
  local_queue_maxsize: 10
  # the max wait time
  wait_thresh: 100
  frame_cache_maxsize: 100
- lightweight: rfdetr_nano
+ lightweight: yolo26n
  # Supported model names (see model_management/model_zoo.py):
  #   RetinaNet:    retinanet_resnet50_fpn
  #   FCOS:         fcos_resnet50_fpn
@@ -140,7 +140,7 @@ server:
  server_id: 0
  golden: rtdetr_x
  # lightweight model used to generate fine-tuned weights for the edge
- edge_model_name: rfdetr_nano
+ edge_model_name: yolo26n
  #the queue maxsize
  local_queue_maxsize: 10
  # the max wait time
