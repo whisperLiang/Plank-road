@@ -11,6 +11,9 @@ import torch
 from PIL import Image
 from ultralytics.models.utils.loss import RTDETRDetectionLoss
 from ultralytics.utils import ops
+from torchvision.models.detection.fcos import FCOS
+from torchvision.models.detection.image_list import ImageList
+from torchvision.models.detection.retinanet import RetinaNet
 from torchvision.models.detection.ssd import SSD
 from torchvision.ops import boxes as box_ops
 
@@ -37,35 +40,46 @@ COCO_91_TO_80 = {label: idx for idx, label in enumerate(COCO_80_TO_91)}
 
 
 class TorchvisionAnchorDetectorReplay(torch.nn.Module):
-    """Replay-friendly anchor-detector wrapper that excludes dynamic post-process."""
+    """Replay-friendly anchor-detector core that operates on transformed tensors."""
 
     def __init__(self, detector: SSD) -> None:
         super().__init__()
         self.detector = detector
-        self.transform = detector.transform
         self.backbone = detector.backbone
         self.head = detector.head
 
-    def _as_image_list(self, images: Any) -> list[torch.Tensor]:
+    def _as_transformed_batch(self, images: Any) -> torch.Tensor:
         if isinstance(images, torch.Tensor):
             if images.ndim == 4:
-                return [image for image in images]
-            return [images]
+                return images
+            if images.ndim == 3:
+                return images.unsqueeze(0)
+            raise TypeError(
+                f"Unsupported anchor-detector replay tensor shape: {tuple(images.shape)!r}"
+            )
         if isinstance(images, (list, tuple)):
             tensors: list[torch.Tensor] = []
             for image in images:
                 if not isinstance(image, torch.Tensor):
-                    raise TypeError(f"Unsupported anchor-detector replay input type: {type(image)!r}")
-                tensors.extend(list(image) if image.ndim == 4 else [image])
+                    raise TypeError(
+                        f"Unsupported anchor-detector replay input type: {type(image)!r}"
+                    )
+                if image.ndim == 4:
+                    tensors.extend(list(image))
+                elif image.ndim == 3:
+                    tensors.append(image)
+                else:
+                    raise TypeError(
+                        f"Unsupported anchor-detector replay tensor shape: {tuple(image.shape)!r}"
+                    )
             if not tensors:
                 raise RuntimeError("Anchor-detector replay received an empty image batch.")
-            return tensors
+            return torch.stack(tensors, dim=0)
         raise TypeError(f"Unsupported anchor-detector replay input type: {type(images)!r}")
 
     def forward(self, images: Any) -> dict[str, torch.Tensor]:
-        image_list = self._as_image_list(images)
-        transformed_images, _ = self.transform(image_list, None)
-        features = self.backbone(transformed_images.tensors)
+        transformed_batch = self._as_transformed_batch(images)
+        features = self.backbone(transformed_batch)
         if isinstance(features, torch.Tensor):
             features = OrderedDict([("0", features)])
         if isinstance(features, dict):
@@ -75,10 +89,23 @@ class TorchvisionAnchorDetectorReplay(torch.nn.Module):
         else:
             feature_list = [features]
         outputs = self.head(feature_list)
-        return {
-            "cls_logits": outputs["cls_logits"],
-            "bbox_regression": outputs["bbox_regression"],
-        }
+        if isinstance(outputs, dict):
+            return {
+                str(key): value
+                for key, value in outputs.items()
+                if isinstance(value, torch.Tensor)
+            }
+        if isinstance(outputs, (list, tuple)):
+            extracted = {}
+            if len(outputs) >= 1 and isinstance(outputs[0], torch.Tensor):
+                extracted["cls_logits"] = outputs[0]
+            if len(outputs) >= 2 and isinstance(outputs[1], torch.Tensor):
+                extracted["bbox_regression"] = outputs[1]
+            if len(outputs) >= 3 and isinstance(outputs[2], torch.Tensor):
+                extracted["bbox_ctrness"] = outputs[2]
+            if extracted:
+                return extracted
+        raise RuntimeError("Anchor-detector replay head did not return tensor outputs.")
 
 
 class RFDETRReplay(torch.nn.Module):
@@ -172,6 +199,10 @@ def build_split_runtime_sample_input(
         sample = torch.rand(3, height, width, device=device)
         batch_tensor, _ = model._prepare_batch([sample])
         return batch_tensor.to(device)
+    if _is_anchor_detector(model):
+        sample = torch.rand(3, height, width, device=device)
+        transformed_images, _ = model.transform([sample], None)
+        return transformed_images.tensors.to(device)
     return [torch.rand(3, height, width, device=device)]
 
 
@@ -194,6 +225,11 @@ def prepare_split_runtime_input(
         tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(device)
         batch_tensor, _ = model._prepare_batch([tensor])
         return batch_tensor.to(device)
+    if _is_anchor_detector(model):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(device)
+        transformed_images, _ = model.transform([tensor], None)
+        return transformed_images.tensors.to(device)
 
     if isinstance(model, YOLODetectionModel):
         _, tensor = preprocess_bgr_images(
@@ -260,6 +296,7 @@ def postprocess_split_runtime_output(
             model,
             outputs,
             model_input=model_input,
+            orig_image=orig_image,
         )
     return outputs
 
@@ -358,8 +395,8 @@ def build_split_training_loss(model: torch.nn.Module):
 
     if _is_anchor_detector(model):
         def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
-            cls_logits, bbox_regression = _extract_anchor_detector_outputs(outputs)
-            device = cls_logits.device
+            head_outputs = _extract_anchor_detector_outputs(outputs)
+            device = next(iter(head_outputs.values())).device
             image_size = _infer_input_image_size(targets)
             dummy_image = torch.zeros(
                 (3, image_size[0], image_size[1]),
@@ -379,16 +416,28 @@ def build_split_training_loss(model: torch.nn.Module):
                 features = OrderedDict([("0", features)])
             feature_list = list(features.values()) if isinstance(features, dict) else list(features)
             anchors = model.anchor_generator(transformed_images, feature_list)
-            matched_idxs = _match_anchor_targets(model, anchors, transformed_targets)
-            loss_dict = model.compute_loss(
-                transformed_targets,
-                {
-                    "cls_logits": cls_logits,
-                    "bbox_regression": bbox_regression,
-                },
-                anchors,
-                matched_idxs,
-            )
+            if isinstance(model, SSD):
+                matched_idxs = _match_anchor_targets(model, anchors, transformed_targets)
+                loss_dict = model.compute_loss(
+                    transformed_targets,
+                    head_outputs,
+                    anchors,
+                    matched_idxs,
+                )
+            elif isinstance(model, FCOS):
+                num_anchors_per_level = [int(x.size(2) * x.size(3)) for x in feature_list]
+                loss_dict = model.compute_loss(
+                    transformed_targets,
+                    head_outputs,
+                    anchors,
+                    num_anchors_per_level,
+                )
+            else:
+                loss_dict = model.compute_loss(
+                    transformed_targets,
+                    head_outputs,
+                    anchors,
+                )
             return sum(loss_dict.values())
 
         return _loss_fn
@@ -555,35 +604,64 @@ def _postprocess_anchor_detector_output(
     outputs: Any,
     *,
     model_input: Any | None,
+    orig_image: np.ndarray | None = None,
 ) -> list[dict[str, torch.Tensor]]:
-    cls_logits, bbox_regression = _extract_anchor_detector_outputs(outputs)
-    device = cls_logits.device
+    head_outputs = _extract_anchor_detector_outputs(outputs)
+    device = next(iter(head_outputs.values())).device
 
     if isinstance(model_input, torch.Tensor):
-        images = list(model_input) if model_input.ndim == 4 else [model_input]
+        if model_input.ndim == 3:
+            transformed_batch = model_input.unsqueeze(0).to(device)
+        elif model_input.ndim == 4:
+            transformed_batch = model_input.to(device)
+        else:
+            raise RuntimeError(
+                "Anchor-detector split postprocess received an unsupported tensor input shape."
+            )
+        transformed_sizes = [
+            (int(transformed_batch.shape[-2]), int(transformed_batch.shape[-1]))
+            for _ in range(int(transformed_batch.shape[0]))
+        ]
+        transformed_images = ImageList(transformed_batch, transformed_sizes)
+        if orig_image is not None:
+            original_image_sizes = [tuple(int(value) for value in orig_image.shape[:2])]
+        else:
+            original_image_sizes = list(transformed_sizes)
     elif isinstance(model_input, (list, tuple)):
         images = [image for image in model_input if isinstance(image, torch.Tensor)]
+        if not images:
+            raise RuntimeError(
+                "Anchor-detector split postprocess requires the original image tensor input."
+            )
+        images = [image.to(device) for image in images]
+        original_image_sizes = [tuple(int(dim) for dim in image.shape[-2:]) for image in images]
+        transformed_images, _ = model.transform(images, None)
     else:
-        images = []
-    if not images:
-        raise RuntimeError("Anchor-detector split postprocess requires the original image tensor input.")
+        raise RuntimeError("Anchor-detector split postprocess requires the runtime model input.")
 
-    images = [image.to(device) for image in images]
-    original_image_sizes = [tuple(int(dim) for dim in image.shape[-2:]) for image in images]
-    transformed_images, _ = model.transform(images, None)
     features = model.backbone(transformed_images.tensors)
     if isinstance(features, torch.Tensor):
         features = OrderedDict([("0", features)])
     feature_list = list(features.values()) if isinstance(features, dict) else list(features)
     anchors = model.anchor_generator(transformed_images, feature_list)
-    detections = model.postprocess_detections(
-        {
-            "cls_logits": cls_logits,
-            "bbox_regression": bbox_regression,
-        },
-        anchors,
-        transformed_images.image_sizes,
-    )
+    if isinstance(model, (RetinaNet, FCOS)):
+        num_anchors_per_level = [int(x.size(2) * x.size(3)) for x in feature_list]
+        split_head_outputs = {
+            key: list(value.split(num_anchors_per_level, dim=1))
+            for key, value in head_outputs.items()
+        }
+        split_anchors = [list(anchor_set.split(num_anchors_per_level)) for anchor_set in anchors]
+        detections = model.postprocess_detections(
+            split_head_outputs,
+            split_anchors,
+            transformed_images.image_sizes,
+        )
+    else:
+        detections = model.postprocess_detections(
+            head_outputs,
+            anchors,
+            transformed_images.image_sizes,
+        )
     return model.transform.postprocess(
         detections,
         transformed_images.image_sizes,
@@ -628,17 +706,28 @@ def _extract_rfdetr_outputs(outputs: Any) -> dict[str, Any]:
     }
 
 
-def _extract_anchor_detector_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+def _extract_anchor_detector_outputs(outputs: Any) -> dict[str, torch.Tensor]:
     if isinstance(outputs, dict):
-        cls_logits = outputs.get("cls_logits")
-        bbox_regression = outputs.get("bbox_regression")
+        extracted = {
+            str(key): value
+            for key, value in outputs.items()
+            if isinstance(value, torch.Tensor)
+        }
+        cls_logits = extracted.get("cls_logits")
+        bbox_regression = extracted.get("bbox_regression")
         if isinstance(cls_logits, torch.Tensor) and isinstance(bbox_regression, torch.Tensor):
-            return cls_logits, bbox_regression
+            return extracted
     if isinstance(outputs, (list, tuple)) and len(outputs) >= 2:
         cls_logits = outputs[0]
         bbox_regression = outputs[1]
         if isinstance(cls_logits, torch.Tensor) and isinstance(bbox_regression, torch.Tensor):
-            return cls_logits, bbox_regression
+            extracted = {
+                "cls_logits": cls_logits,
+                "bbox_regression": bbox_regression,
+            }
+            if len(outputs) >= 3 and isinstance(outputs[2], torch.Tensor):
+                extracted["bbox_ctrness"] = outputs[2]
+            return extracted
     raise RuntimeError("Unable to extract anchor-detector cls_logits/bbox_regression from split replay output.")
 
 

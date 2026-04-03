@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
 from model_management.candidate_profiler import profile_candidates
+from model_management.model_zoo import build_detection_model
 from model_management.split_model_adapters import (
     RFDETRReplay,
     build_split_runtime_sample_input,
     build_split_training_loss,
     get_split_runtime_model,
+    prepare_split_runtime_input,
 )
 from model_management.split_runtime import compare_outputs, reduce_output_to_loss
 from model_management.universal_model_split import UniversalModelSplitter
@@ -154,6 +157,96 @@ def test_tinynext_multibranch_boundary_payload_is_minimal():
         broken_payload = payload_without_boundary(payload, removed_label)
         with pytest.raises(RuntimeError):
             splitter.cloud_forward(broken_payload, candidate=chosen)
+
+
+def test_tinynext_full_replay_tracks_runtime_frame_changes():
+    model = build_detection_model("tinynext_s", pretrained=True, device="cpu").eval()
+    runtime_model = get_split_runtime_model(model).eval()
+
+    frame_a = np.arange(96 * 96 * 3, dtype=np.uint8).reshape(96, 96, 3)
+    frame_b = np.roll(frame_a, shift=7, axis=1)
+    sample = prepare_split_runtime_input(model, frame_a, device="cpu")
+    changed = prepare_split_runtime_input(model, frame_b, device="cpu")
+
+    assert isinstance(sample, torch.Tensor)
+    assert isinstance(changed, torch.Tensor)
+    assert tuple(sample.shape) == (1, 3, 320, 320)
+    assert tuple(changed.shape) == (1, 3, 320, 320)
+
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trainability_loss_fn = build_split_training_loss(model)
+    splitter.trace(runtime_model, sample)
+
+    replay_black = splitter.full_replay(sample)
+    replay_white = splitter.full_replay(changed)
+    same, _ = compare_outputs(replay_black, replay_white)
+
+    assert same is False
+
+
+def test_rfdetr_full_replay_tracks_runtime_frame_changes():
+    model = build_public_detector("rfdetr_nano")
+    runtime_model = get_split_runtime_model(model).eval()
+
+    frame_a = np.arange(96 * 96 * 3, dtype=np.uint8).reshape(96, 96, 3)
+    frame_b = np.roll(frame_a, shift=9, axis=1)
+    sample = prepare_split_runtime_input(model, frame_a, device="cpu")
+    changed = prepare_split_runtime_input(model, frame_b, device="cpu")
+
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trainability_loss_fn = build_split_training_loss(model)
+    splitter.trace(runtime_model, sample)
+
+    direct_a = runtime_model(sample)
+    replay_a = splitter.full_replay(sample)
+    direct_b = runtime_model(changed)
+    replay_b = splitter.full_replay(changed)
+
+    same_a, _ = compare_outputs(direct_a, replay_a)
+    same_b, _ = compare_outputs(direct_b, replay_b)
+    changed_same, _ = compare_outputs(replay_a, replay_b)
+
+    assert same_a is True
+    assert same_b is True
+    assert changed_same is False
+
+
+@pytest.mark.parametrize("model_name", ("retinanet_resnet50_fpn", "fcos_resnet50_fpn"))
+def test_torchvision_anchor_detector_replay_tracks_runtime_frame_changes(model_name):
+    model = build_public_detector(model_name)
+    runtime_model = get_split_runtime_model(model).eval()
+
+    frame_a = np.arange(96 * 96 * 3, dtype=np.uint8).reshape(96, 96, 3)
+    frame_b = np.roll(frame_a, shift=11, axis=0)
+    sample = prepare_split_runtime_input(model, frame_a, device="cpu")
+    changed = prepare_split_runtime_input(model, frame_b, device="cpu")
+
+    assert isinstance(sample, torch.Tensor)
+    assert isinstance(changed, torch.Tensor)
+
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trainability_loss_fn = build_split_training_loss(model)
+    splitter.trace(runtime_model, sample)
+
+    replay_a = splitter.full_replay(sample)
+    replay_b = splitter.full_replay(changed)
+    same, _ = compare_outputs(replay_a, replay_b)
+
+    assert same is False
+
+
+@pytest.mark.parametrize("model_name", ("retinanet_resnet50_fpn", "fcos_resnet50_fpn"))
+def test_torchvision_anchor_detector_split_loss_supports_family(model_name):
+    model = build_public_detector(model_name)
+    runtime_model = get_split_runtime_model(model).eval()
+    sample = build_split_runtime_sample_input(model, image_size=(96, 96), device="cpu")
+    outputs = runtime_model(sample)
+
+    loss_fn = build_split_training_loss(model)
+    loss = loss_fn(outputs, _training_targets(sample))
+
+    assert torch.isfinite(loss)
+    assert loss.requires_grad
 
 
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)

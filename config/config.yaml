@@ -21,7 +21,7 @@ client:
  # the max wait time
  wait_thresh: 100
  frame_cache_maxsize: 100
- lightweight: tinynext_s
+ lightweight: yolo26n
  # Supported model names (see model_management/model_zoo.py):
  #   RetinaNet:    retinanet_resnet50_fpn
  #   FCOS:         fcos_resnet50_fpn

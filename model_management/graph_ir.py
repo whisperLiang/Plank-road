@@ -253,6 +253,24 @@ def _infer_child_specific_frozen_value(
     return _clone_tree_tensors(child_saved_value.detach().cpu(), detach=True)
 
 
+def _find_parent_activation_ref(
+    target: torch.Tensor,
+    *,
+    previous_layers: Sequence[Any],
+    exclude_labels: set[str] | None = None,
+) -> ParentTensorRef | None:
+    exclude_labels = exclude_labels or set()
+    for parent_layer in reversed(list(previous_layers)):
+        parent_label = _get_attr(parent_layer, "layer_label", default=None)
+        if parent_label is None or parent_label in exclude_labels:
+            continue
+        parent_activation = _get_attr(parent_layer, "activation", default=None)
+        path = _find_tensor_path(parent_activation, target)
+        if path is not None:
+            return ParentTensorRef(parent_label=parent_label, path=path)
+    return None
+
+
 def _infer_func_name(layer: Any) -> str:
     name = _get_attr(layer, "func_applied_name", "func_name", default=None)
     if isinstance(name, str) and name:
@@ -685,6 +703,12 @@ def _find_matching_parent_ref(
     current_label: str,
     previous_layers: Sequence[Any],
 ) -> ParentTensorRef | None:
+    activation_match = _find_parent_activation_ref(
+        target,
+        previous_layers=previous_layers,
+    )
+    if activation_match is not None:
+        return activation_match
     for parent_layer in reversed(list(previous_layers)):
         parent_label = _get_attr(parent_layer, "layer_label", default=None)
         if parent_label is None:
@@ -755,20 +779,44 @@ def _build_arg_templates(
             parent_label = parent_arg_locations[location_kind].get(prefix)
             if parent_label is not None:
                 parent_layer = parent_layer_lookup.get(parent_label)
+                explicit_activation_match = _find_parent_activation_ref(
+                    obj,
+                    previous_layers=previous_layers,
+                    exclude_labels=set(),
+                )
+                if explicit_activation_match is not None:
+                    inferred_parent_labels.append(explicit_activation_match.parent_label)
+                    return explicit_activation_match
+
+                explicit_path = (
+                    _infer_parent_output_path(parent_layer, current_label)
+                    if parent_layer is not None
+                    else None
+                )
+                frozen_value = (
+                    _infer_child_specific_frozen_value(
+                        parent_layer=parent_layer,
+                        child_label=current_label,
+                        captured_container=creation_args if location_kind == "args" else creation_kwargs,
+                        location=prefix,
+                    )
+                    if parent_layer is not None
+                    else None
+                )
+                if frozen_value is not None:
+                    better_ref = _find_parent_activation_ref(
+                        obj,
+                        previous_layers=previous_layers,
+                        exclude_labels={parent_label},
+                    )
+                    if better_ref is not None:
+                        inferred_parent_labels.append(better_ref.parent_label)
+                        return better_ref
                 inferred_parent_labels.append(parent_label)
                 return ParentTensorRef(
                     parent_label=parent_label,
-                    path=_infer_parent_output_path(parent_layer, current_label) if parent_layer is not None else None,
-                    frozen_value=(
-                        _infer_child_specific_frozen_value(
-                            parent_layer=parent_layer,
-                            child_label=current_label,
-                            captured_container=creation_args if location_kind == "args" else creation_kwargs,
-                            location=prefix,
-                        )
-                        if parent_layer is not None
-                        else None
-                    ),
+                    path=explicit_path,
+                    frozen_value=frozen_value,
                 )
             if param_queue:
                 return param_queue.pop(0)
