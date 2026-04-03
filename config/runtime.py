@@ -127,6 +127,7 @@ class ClientConfig(ConfigSection):
     wait_thresh: int = 100
     frame_cache_maxsize: int = 100
     lightweight: str = "yolo26n"
+    final_detection_threshold: float = 0.5
     server_ip: str = "192.168.66.205:50051"
     edge_id: int = 1
     edge_num: int = 1
@@ -244,6 +245,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive("client.frame_cache_maxsize", int(config.client.frame_cache_maxsize))
     _validate_positive("client.edge_num", int(config.client.edge_num))
     _validate_positive("client.retrain.collect_num", int(config.client.retrain.collect_num))
+    if not 0.0 <= float(config.client.final_detection_threshold) <= 1.0:
+        raise ValueError(
+            "client.final_detection_threshold must be within [0, 1], "
+            f"got {config.client.final_detection_threshold!r}"
+        )
     _validate_positive(
         "client.retrain.num_epoch",
         int(config.client.retrain.num_epoch),

@@ -303,7 +303,11 @@ class Object_Detection:
             )
 
         confidence = self._summarize_detection_confidence(pred_score)
-        high_keep_indices = [index for index, score in enumerate(pred_score) if score > self.threshold_high]
+        final_detection_threshold = self._resolve_final_detection_threshold()
+        high_keep_indices = [
+            index for index, score in enumerate(pred_score)
+            if score > final_detection_threshold
+        ]
         if not high_keep_indices:
             detection_boxes = []
             detection_class = []
@@ -316,7 +320,7 @@ class Object_Detection:
                 detection_boxes,
                 detection_class,
                 detection_score,
-                threshold=float(self.threshold_high),
+                threshold=float(final_detection_threshold),
             )
 
         return InferenceArtifacts(
@@ -395,6 +399,14 @@ class Object_Detection:
         if not top_scores:
             return 0.0
         return float(np.clip(np.mean(top_scores), 0.0, 1.0))
+
+    def _resolve_final_detection_threshold(self) -> float:
+        configured_floor = 0.5
+        config_obj = getattr(self, "config", None)
+        if config_obj is not None:
+            configured_floor = float(getattr(config_obj, "final_detection_threshold", configured_floor))
+        threshold_high = float(getattr(self, "threshold_high", configured_floor))
+        return max(threshold_high, configured_floor)
 
     def _resolve_final_dedup_thresholds(
         self,
