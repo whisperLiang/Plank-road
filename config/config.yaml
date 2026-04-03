@@ -21,7 +21,7 @@ client:
  # the max wait time
  wait_thresh: 100
  frame_cache_maxsize: 100
- lightweight: yolo26n
+ lightweight: tinynext_s
  # Supported model names (see model_management/model_zoo.py):
  #   RetinaNet:    retinanet_resnet50_fpn
  #   FCOS:         fcos_resnet50_fpn
@@ -46,24 +46,62 @@ client:
   num_epoch: 2
   cache_path: './cache'
   collect_num: 20
- # drift detection (RCCDA-inspired)
+ # drift detection
  drift_detection:
-  # mode: 'rccda' | 'adwin' | 'window' | 'any' | 'majority'
-  mode: rccda
-  # confidence threshold below which a detection is considered a loss
+  # Fallback confidence threshold for edge-side sample bucketing when full quality signals are unavailable
   confidence_threshold: 0.8
-  # RCCDA Lyapunov virtual queue parameters
+  # Token budget for adaptive drift triggering; lower is more conservative, higher allows more frequent triggers
   pi_bar: 0.1
-  V: 10.0
-  K_p: 1.0
-  K_d: 0.5
-  # ADWIN parameters
-  adwin_delta: 0.02
-  adwin_min_window: 30
-  # Conservative Window parameters
-  window_w: 40
-  window_m: 3
- # Resource-aware CL trigger (RCCDA multi-queue Lyapunov)
+
+  # -------------------------
+  # Frequently tuned parameters
+  # -------------------------
+  # Warmup frames before relative-drift detection becomes active; shorten for very short clips
+  adaptive_warmup_steps: 30
+  # Relative-drift anomaly threshold; lower is more sensitive, higher is more conservative
+  adaptive_anomaly_threshold: 0.35
+  # Number of consecutive anomalous frames required for relative-drift; larger values are more noise-tolerant
+  adaptive_persistence: 3
+  # Blind-spot score threshold; lower values make persistent misses easier to classify as blind spots
+  adaptive_blind_spot_score_threshold: 0.6
+  # Number of consecutive blind-spot frames required before drift is triggered
+  adaptive_blind_spot_persistence: 4
+  # Low-quality threshold for per-frame quality_score; higher values label more frames as low_quality
+  adaptive_quality_low_threshold: 0.50
+  # Sliding-window size used by low-quality accumulation drift
+  adaptive_low_quality_window: 20
+  # Number of low-quality samples inside the window required to declare drift
+  adaptive_low_quality_trigger_count: 8
+
+  # -------------------------
+  # Usually keep at defaults: internal scaling parameters
+  # -------------------------
+  # EMA smoothing factor controlling how quickly historical baselines adapt
+  adaptive_ema_alpha: 0.05
+  # Proposal-count lower bound for considering a frame "proposal rich" in blind-spot scoring
+  adaptive_blind_spot_min_proposals: 32
+  # Reference upper bound for retained/proposal ratio; lower ratios look more like persistent misses
+  adaptive_blind_spot_max_retained_ratio: 0.08
+  # Denominator for the low-confidence pressure term inside blind-spot scoring
+  adaptive_blind_spot_confidence_ceiling: 0.45
+  # Normalization scale for feature spectral-entropy shifts used in representation-shift anomaly scoring
+  adaptive_feature_entropy_scale: 0.2
+  # Normalization scale for logit-entropy increases; smaller values amplify uncertainty rises
+  adaptive_logit_entropy_scale: 0.2
+  # Normalization scale for logit-energy drops across frames
+  adaptive_logit_energy_scale: 2.0
+  # Minimum reference value for logit margin to avoid unstable ratio-drop amplification near zero
+  adaptive_quality_margin_floor: 0.10
+  # Tolerance band for logit entropy; small variations within this range are not treated as meaningful degradation
+  adaptive_quality_entropy_tolerance: 0.08
+  # Minimum number of quality samples required before percentile-based low-quality checks are enabled
+  adaptive_quality_min_history: 20
+  # Minimum drop below the sample-quality EMA before the current frame is considered meaningfully worse than baseline
+  adaptive_quality_relative_low_delta: 0.02
+  # Saturation ceiling for retained_count in over-detection scoring; penalties stop increasing beyond this value
+  adaptive_over_detection_retained_ceiling: 32
+
+ # Resource-aware CL trigger (multi-queue Lyapunov scheduler)
  # Reference: RCCDA (NeurIPS 2025) — Lyapunov drift-plus-penalty
  # https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code
  #
@@ -103,31 +141,6 @@ client:
  # on the intermediate features, reducing annotation cost.
  split_learning:
   enabled: True
-  # Universal model splitting (model-agnostic, torchlens-based).
-  # When enabled, the edge uses torchlens to trace the model's
-  # computational graph and can split at any arbitrary layer,
-  # not limited to a fixed backbone boundary.
-   # ---- Explicit split point (highest priority, first match wins) ----
-   # split_module — high-level module name, e.g. 'backbone' or 'features.12'
-   # split_module: backbone
-   # split_layer  — layer index (int) or torchlens layer label (str)
-   # split_layer: 15
-   #
-   # ---- strategy-based split-point selection ----
-   # Activated when neither split_module nor split_layer is set.
-   # strategy options :
-   #   flops_ratio  — split where cumulative FLOPs ≈ target_flops_ratio
-   #   privacy      — deepest split with leakage ≤ max_privacy_leakage
-   #   midpoint     — split at ~50 % FLOPs (default)
-   #   min_smashed  — minimise intermediate tensor size (bandwidth)
-   #   linucb       — adaptive LinUCB contextual bandit (balances
-   #                   latency and privacy; updates each round)
-   # strategy: midpoint
-   # target_flops_ratio: 0.5      # for 'flops_ratio' strategy
-   # max_privacy_leakage: 0.1     # for 'privacy' strategy
-   # latency_weight: 1.0          # LinUCB: 1.0=pure latency, 0.0=pure privacy
-   # ucb_alpha: 0.25              # LinUCB exploration coefficient
-   # only_parametric: False       # consider only Conv/Linear/BN layers
   fixed_split:
    privacy_metric_lower_bound: 0.15
    max_layer_freezing_ratio: 0.75

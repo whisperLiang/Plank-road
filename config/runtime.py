@@ -45,16 +45,28 @@ class RetrainConfig(ConfigSection):
 
 @dataclass
 class DriftDetectionConfig(ConfigSection):
-    mode: str = "rccda"
     confidence_threshold: float = 0.8
     pi_bar: float = 0.1
-    V: float = 10.0
-    K_p: float = 1.0
-    K_d: float = 0.5
-    adwin_delta: float = 0.02
-    adwin_min_window: int = 30
-    window_w: int = 40
-    window_m: int = 3
+    adaptive_warmup_steps: int = 30
+    adaptive_ema_alpha: float = 0.05
+    adaptive_anomaly_threshold: float = 0.35
+    adaptive_persistence: int = 3
+    adaptive_blind_spot_min_proposals: float = 32.0
+    adaptive_blind_spot_max_retained_ratio: float = 0.08
+    adaptive_blind_spot_confidence_ceiling: float = 0.45
+    adaptive_blind_spot_score_threshold: float = 0.6
+    adaptive_blind_spot_persistence: int = 4
+    adaptive_feature_entropy_scale: float = 0.2
+    adaptive_logit_entropy_scale: float = 0.2
+    adaptive_logit_energy_scale: float = 2.0
+    adaptive_quality_low_threshold: float = 0.50
+    adaptive_quality_margin_floor: float = 0.10
+    adaptive_quality_entropy_tolerance: float = 0.08
+    adaptive_quality_min_history: int = 20
+    adaptive_quality_relative_low_delta: float = 0.02
+    adaptive_over_detection_retained_ceiling: float = 32.0
+    adaptive_low_quality_window: int = 20
+    adaptive_low_quality_trigger_count: int = 8
 
 
 @dataclass

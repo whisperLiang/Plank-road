@@ -8,6 +8,7 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from ultralytics.models.utils.loss import RTDETRDetectionLoss
 from ultralytics.utils import ops
@@ -29,6 +30,7 @@ from model_management.ultralytics_parity import (
     postprocess_predictions,
     preprocess_bgr_images,
 )
+from model_management.payload import SplitPayload
 
 try:
     from rfdetr.models.lwdetr import build_criterion_and_postprocessors
@@ -311,6 +313,28 @@ def postprocess_split_runtime_output(
             orig_image=orig_image,
         )
     return outputs
+
+
+def summarize_split_runtime_observables(
+    model: torch.nn.Module,
+    outputs: Any,
+    split_payload: SplitPayload | torch.Tensor | dict[str, torch.Tensor] | None = None,
+) -> dict[str, float | None]:
+    observables: dict[str, float | None] = {
+        "feature_spectral_entropy": _summarize_payload_spectral_entropy(split_payload),
+        "logit_entropy": None,
+        "logit_margin": None,
+        "logit_energy": None,
+    }
+    if observables["feature_spectral_entropy"] is None:
+        observables["feature_spectral_entropy"] = _summarize_runtime_output_spectral_entropy(
+            model,
+            outputs,
+        )
+    logits_tensor, logits_mode = _extract_runtime_logits(model, outputs)
+    if isinstance(logits_tensor, torch.Tensor):
+        observables.update(_summarize_logits_statistics(logits_tensor, mode=logits_mode))
+    return observables
 
 
 def build_split_training_loss(model: torch.nn.Module):
@@ -682,6 +706,298 @@ def _postprocess_anchor_detector_output(
         transformed_images.image_sizes,
         original_image_sizes,
     )
+
+
+def _iter_payload_tensors(
+    split_payload: SplitPayload | torch.Tensor | dict[str, torch.Tensor] | None,
+):
+    if split_payload is None:
+        return
+    if isinstance(split_payload, SplitPayload):
+        primary_label = split_payload.primary_label
+        if primary_label and primary_label in split_payload.tensors:
+            yield split_payload.tensors[primary_label]
+        for label, tensor in split_payload.tensors.items():
+            if label == primary_label:
+                continue
+            yield tensor
+        return
+    if isinstance(split_payload, torch.Tensor):
+        yield split_payload
+        return
+    if isinstance(split_payload, dict):
+        for value in split_payload.values():
+            if isinstance(value, torch.Tensor):
+                yield value
+
+
+def _feature_matrix_from_tensor(
+    tensor: torch.Tensor,
+    *,
+    max_spatial_size: int = 16,
+    max_feature_dims: int = 128,
+) -> torch.Tensor | None:
+    if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point() or tensor.numel() == 0:
+        return None
+
+    x = tensor.detach().float()
+    if x.ndim == 4:
+        height = min(max_spatial_size, int(x.shape[-2]))
+        width = min(max_spatial_size, int(x.shape[-1]))
+        x = F.adaptive_avg_pool2d(x, output_size=(height, width))
+        matrix = x.permute(1, 0, 2, 3).reshape(x.shape[1], -1)
+    elif x.ndim == 3:
+        if x.shape[0] <= 8 and x.shape[-1] >= 8:
+            matrix = x.reshape(-1, x.shape[-1]).transpose(0, 1)
+        else:
+            matrix = x.reshape(x.shape[0], -1)
+    elif x.ndim == 2:
+        if x.shape[0] <= 8 and x.shape[1] >= 8:
+            matrix = x.reshape(-1, x.shape[-1]).transpose(0, 1)
+        else:
+            matrix = x if x.shape[0] <= x.shape[1] else x.transpose(0, 1)
+    elif x.ndim == 1:
+        matrix = x.unsqueeze(0)
+    else:
+        flattened = x.reshape(x.shape[0], -1) if x.shape[0] <= 64 else x.reshape(-1, x.shape[-1]).transpose(0, 1)
+        matrix = flattened
+
+    if matrix is None or matrix.numel() == 0:
+        return None
+
+    if matrix.shape[0] > max_feature_dims:
+        energy = matrix.square().mean(dim=1)
+        topk = min(max_feature_dims, int(energy.numel()))
+        indices = torch.topk(energy, k=topk).indices
+        matrix = matrix.index_select(0, indices)
+    return matrix
+
+
+def _spectral_entropy_from_matrix(matrix: torch.Tensor) -> float | None:
+    if not isinstance(matrix, torch.Tensor) or matrix.numel() == 0:
+        return None
+    if matrix.shape[0] <= 1 or matrix.shape[1] <= 1:
+        return 0.0
+
+    centered = matrix - matrix.mean(dim=1, keepdim=True)
+    covariance = centered @ centered.transpose(0, 1)
+    covariance = covariance / float(max(1, centered.shape[1] - 1))
+    eigvals = torch.linalg.eigvalsh(covariance).real.clamp_min_(0.0)
+    total = eigvals.sum()
+    if not torch.isfinite(total) or float(total.item()) <= 0.0:
+        return 0.0
+
+    probs = eigvals / total
+    nonzero = probs[probs > 0]
+    if nonzero.numel() == 0:
+        return 0.0
+    entropy = -(nonzero * torch.log(nonzero)).sum()
+    normaliser = torch.log(torch.tensor(float(nonzero.numel()), device=entropy.device))
+    if float(normaliser.item()) <= 0.0:
+        return 0.0
+    return float((entropy / normaliser).clamp(0.0, 1.0).item())
+
+
+def _summarize_payload_spectral_entropy(
+    split_payload: SplitPayload | torch.Tensor | dict[str, torch.Tensor] | None,
+) -> float | None:
+    for tensor in _iter_payload_tensors(split_payload):
+        matrix = _feature_matrix_from_tensor(tensor)
+        if matrix is None:
+            continue
+        try:
+            return _spectral_entropy_from_matrix(matrix)
+        except Exception:
+            continue
+    return None
+
+
+def _summarize_runtime_output_spectral_entropy(
+    model: torch.nn.Module,
+    outputs: Any,
+) -> float | None:
+    if isinstance(model, YOLODetectionModel):
+        feats = _extract_yolo_runtime_feats(outputs)
+        for tensor in feats:
+            matrix = _feature_matrix_from_tensor(tensor)
+            if matrix is None:
+                continue
+            try:
+                return _spectral_entropy_from_matrix(matrix)
+            except Exception:
+                continue
+    return None
+
+
+def _reshape_logits_rows(logits: torch.Tensor) -> torch.Tensor | None:
+    if not isinstance(logits, torch.Tensor) or logits.numel() == 0:
+        return None
+    if logits.ndim == 2:
+        return logits.detach().float()
+    if logits.ndim == 3:
+        if logits.shape[-1] > 4 and logits.shape[-1] <= 512:
+            return logits.detach().float().reshape(-1, logits.shape[-1])
+        if logits.shape[1] > 4 and logits.shape[1] <= 512 and logits.shape[2] > logits.shape[1]:
+            permuted = logits.detach().float().permute(0, 2, 1)
+            return permuted.reshape(-1, logits.shape[1])
+        return logits.detach().float().reshape(-1, logits.shape[-1])
+    if logits.ndim == 4:
+        if logits.shape[-1] > 4 and logits.shape[-1] <= 512:
+            return logits.detach().float().reshape(-1, logits.shape[-1])
+        if logits.shape[1] > 4 and logits.shape[1] <= 512:
+            permuted = logits.detach().float().permute(0, 2, 3, 1)
+            return permuted.reshape(-1, logits.shape[1])
+    return None
+
+
+def _summarize_logits_statistics(
+    logits: torch.Tensor,
+    *,
+    mode: str = "sigmoid",
+    max_rows: int = 256,
+) -> dict[str, float | None]:
+    rows = _reshape_logits_rows(logits)
+    if rows is None or rows.numel() == 0 or rows.shape[-1] <= 0:
+        return {
+            "logit_entropy": None,
+            "logit_margin": None,
+            "logit_energy": None,
+        }
+
+    work_rows = rows
+    if mode == "softmax_bg_last" and work_rows.shape[-1] > 1:
+        work_rows = work_rows[:, :-1]
+    if work_rows.shape[-1] <= 0:
+        return {
+            "logit_entropy": None,
+            "logit_margin": None,
+            "logit_energy": None,
+        }
+
+    if mode.startswith("softmax"):
+        row_priority = torch.softmax(work_rows, dim=-1).max(dim=-1).values
+    else:
+        row_priority = torch.sigmoid(work_rows).max(dim=-1).values
+    if row_priority.numel() > max_rows:
+        top_indices = torch.topk(row_priority, k=max_rows).indices
+        work_rows = work_rows.index_select(0, top_indices)
+
+    if mode.startswith("softmax"):
+        probs = torch.softmax(work_rows, dim=-1)
+        top2 = torch.topk(probs, k=min(2, probs.shape[-1]), dim=-1).values
+        if top2.shape[-1] >= 2:
+            margin = (top2[:, 0] - top2[:, 1]).mean()
+        else:
+            margin = top2[:, 0].mean()
+        entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1)
+        entropy = entropy / max(float(np.log(max(2, probs.shape[-1]))), 1.0)
+    else:
+        probs = torch.sigmoid(work_rows)
+        top2 = torch.topk(probs, k=min(2, probs.shape[-1]), dim=-1).values
+        if top2.shape[-1] >= 2:
+            margin = (top2[:, 0] - top2[:, 1]).mean()
+        else:
+            margin = top2[:, 0].mean()
+        p = top2[:, 0].clamp(1e-6, 1.0 - 1e-6)
+        entropy = -((p * torch.log(p)) + ((1.0 - p) * torch.log(1.0 - p)))
+        entropy = entropy / float(np.log(2.0))
+
+    energy = torch.logsumexp(work_rows, dim=-1).mean()
+    return {
+        "logit_entropy": float(entropy.mean().clamp(0.0, 1.0).item()),
+        "logit_margin": float(margin.clamp(0.0, 1.0).item()),
+        "logit_energy": float(energy.item()),
+    }
+
+
+def _extract_runtime_logits(
+    model: torch.nn.Module,
+    outputs: Any,
+) -> tuple[torch.Tensor | None, str]:
+    if isinstance(model, YOLODetectionModel):
+        try:
+            logits = _extract_yolo_runtime_scores(outputs)
+            if isinstance(logits, torch.Tensor):
+                return logits, "sigmoid"
+        except Exception:
+            pass
+
+    if isinstance(model, RTDETRDetectionModel):
+        try:
+            _, dec_scores, _, enc_scores, _ = _extract_rtdetr_loss_outputs(outputs)
+            if isinstance(dec_scores, torch.Tensor):
+                return (dec_scores[-1] if dec_scores.ndim >= 4 else dec_scores), "softmax"
+            if isinstance(enc_scores, torch.Tensor):
+                return enc_scores, "softmax"
+        except Exception:
+            pass
+
+    if isinstance(model, (DETRDetectionModel, RFDETRDetectionModel)):
+        try:
+            if isinstance(model, RFDETRDetectionModel):
+                extracted = _extract_rfdetr_outputs(outputs)
+                logits = extracted.get("pred_logits")
+            else:
+                logits, _ = _extract_detr_outputs(outputs)
+            if isinstance(logits, torch.Tensor):
+                return logits, "softmax_bg_last"
+        except Exception:
+            pass
+
+    if _is_anchor_detector(model):
+        try:
+            head_outputs = _extract_anchor_detector_outputs(outputs)
+            logits = head_outputs.get("cls_logits")
+            if isinstance(logits, torch.Tensor):
+                return logits, "sigmoid"
+        except Exception:
+            pass
+
+    if isinstance(outputs, dict):
+        if isinstance(outputs.get("cls_logits"), torch.Tensor):
+            return outputs["cls_logits"], "sigmoid"
+        if isinstance(outputs.get("pred_logits"), torch.Tensor):
+            return outputs["pred_logits"], "softmax_bg_last"
+        if isinstance(outputs.get("logits"), torch.Tensor):
+            return outputs["logits"], "softmax_bg_last"
+
+    return None, "sigmoid"
+
+
+def _extract_yolo_runtime_aux(outputs: Any) -> dict[str, Any] | None:
+    if isinstance(outputs, tuple) and len(outputs) >= 2 and isinstance(outputs[1], dict):
+        return outputs[1]
+    if isinstance(outputs, dict):
+        if any(isinstance(outputs.get(branch), dict) for branch in ("one2many", "one2one")):
+            return outputs
+    return None
+
+
+def _extract_yolo_runtime_scores(outputs: Any) -> torch.Tensor | None:
+    aux = _extract_yolo_runtime_aux(outputs)
+    if aux is None:
+        return None
+    for branch_name in ("one2many", "one2one"):
+        branch = aux.get(branch_name)
+        if isinstance(branch, dict) and isinstance(branch.get("scores"), torch.Tensor):
+            return branch["scores"]
+    return None
+
+
+def _extract_yolo_runtime_feats(outputs: Any) -> list[torch.Tensor]:
+    aux = _extract_yolo_runtime_aux(outputs)
+    if aux is None:
+        return []
+    for branch_name in ("one2many", "one2one"):
+        branch = aux.get(branch_name)
+        if not isinstance(branch, dict):
+            continue
+        feats = branch.get("feats")
+        if isinstance(feats, torch.Tensor):
+            return [feats]
+        if isinstance(feats, (list, tuple)):
+            return [tensor for tensor in feats if isinstance(tensor, torch.Tensor)]
+    return []
 
 
 def _extract_detr_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:

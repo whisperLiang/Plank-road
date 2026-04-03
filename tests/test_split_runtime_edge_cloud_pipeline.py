@@ -25,6 +25,7 @@ from model_management.continual_learning_bundle import CONTINUAL_LEARNING_PROTOC
 from model_management.detection_dataset import TrafficDataset
 from model_management.fixed_split import SplitPlan
 from model_management.model_zoo import (
+    YOLODetectionModel,
     build_detection_model,
     get_model_detection_thresholds,
 )
@@ -36,6 +37,7 @@ from model_management.split_model_adapters import (
     get_split_runtime_model,
     postprocess_split_runtime_output,
     prepare_split_runtime_input,
+    summarize_split_runtime_observables,
 )
 from model_management.split_runtime import compare_outputs
 from model_management.universal_model_split import UniversalModelSplitter
@@ -120,12 +122,102 @@ def test_large_inference_accepts_threshold_override():
     assert scores == [0.42]
 
 
-def test_detection_confidence_uses_top_scores_and_model_threshold():
+def test_detection_confidence_uses_top5_raw_mean():
     detector = Object_Detection.__new__(Object_Detection)
-    detector.threshold_high = 0.15
 
-    assert detector._summarize_detection_confidence([0.62, 0.18, 0.15, 0.09]) == pytest.approx(1.0)
-    assert detector._summarize_detection_confidence([0.09, 0.08, 0.07]) == pytest.approx((0.09 + 0.08 + 0.07) / 3.0 / 0.15)
+    assert detector._summarize_detection_confidence([0.62, 0.18, 0.15, 0.09]) == pytest.approx(
+        (0.62 + 0.18 + 0.15 + 0.09) / 4.0
+    )
+    assert detector._summarize_detection_confidence([0.88, 0.87, 0.79, 0.29, 0.25, 0.24]) == pytest.approx(
+        (0.88 + 0.87 + 0.79 + 0.29 + 0.25) / 5.0
+    )
+
+
+def test_summarize_split_runtime_observables_extracts_feature_and_anchor_logit_stats():
+    payload = SplitPayload(
+        tensors={
+            "feat": torch.tensor(
+                [[[[1.0, 0.0], [0.0, 1.0]], [[0.5, 0.5], [0.5, 0.5]]]],
+                dtype=torch.float32,
+            )
+        },
+        primary_label="feat",
+    )
+    outputs = {
+        "cls_logits": torch.tensor(
+            [[[4.0, 1.0, -2.0], [3.0, 0.5, -1.0], [0.2, 0.1, -0.1]]],
+            dtype=torch.float32,
+        )
+    }
+
+    stats = summarize_split_runtime_observables(object(), outputs, payload)
+
+    assert stats["feature_spectral_entropy"] is not None
+    assert 0.0 <= stats["feature_spectral_entropy"] <= 1.0
+    assert stats["logit_entropy"] is not None
+    assert 0.0 <= stats["logit_entropy"] <= 1.0
+    assert stats["logit_margin"] is not None
+    assert 0.0 <= stats["logit_margin"] <= 1.0
+    assert stats["logit_energy"] is not None
+
+
+def test_summarize_split_runtime_observables_extracts_detr_like_logit_stats():
+    outputs = {
+        "pred_logits": torch.tensor(
+            [[[0.2, 2.5, -1.0], [0.1, 0.2, 2.8], [0.3, 2.0, -0.5]]],
+            dtype=torch.float32,
+        )
+    }
+
+    stats = summarize_split_runtime_observables(object(), outputs, split_payload=None)
+
+    assert stats["feature_spectral_entropy"] is None
+    assert stats["logit_entropy"] is not None
+    assert 0.0 <= stats["logit_entropy"] <= 1.0
+    assert stats["logit_margin"] is not None
+    assert stats["logit_margin"] >= 0.0
+
+
+def test_summarize_split_runtime_observables_extracts_yolo_like_stats():
+    outputs = (
+        torch.zeros((1, 300, 6), dtype=torch.float32),
+        {
+            "one2many": {
+                "scores": torch.tensor(
+                    [
+                        [
+                            [5.0, 4.5, -1.0, -2.0],
+                            [0.1, 0.2, 0.0, -0.1],
+                            [-1.0, -0.5, -2.5, -3.0],
+                        ]
+                    ],
+                    dtype=torch.float32,
+                ),
+                "feats": [
+                    torch.tensor(
+                        [[[[1.0, 0.0], [0.0, 1.0]], [[0.5, 0.5], [0.5, 0.5]]]],
+                        dtype=torch.float32,
+                    )
+                ],
+            },
+            "one2one": {
+                "scores": torch.tensor(
+                    [[[4.0, 3.0, -2.0, -2.0], [0.1, 0.0, -0.1, -0.2], [-2.0, -1.5, -3.0, -3.5]]],
+                    dtype=torch.float32,
+                ),
+            },
+        },
+    )
+
+    stats = summarize_split_runtime_observables(YOLODetectionModel.__new__(YOLODetectionModel), outputs)
+
+    assert stats["feature_spectral_entropy"] is not None
+    assert 0.0 <= stats["feature_spectral_entropy"] <= 1.0
+    assert stats["logit_entropy"] is not None
+    assert 0.0 <= stats["logit_entropy"] <= 1.0
+    assert stats["logit_margin"] is not None
+    assert 0.0 <= stats["logit_margin"] <= 1.0
+    assert stats["logit_energy"] is not None
 
 
 def test_prepare_runtime_frame_preserves_original_geometry():

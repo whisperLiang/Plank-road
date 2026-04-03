@@ -52,6 +52,8 @@ class StoredSampleRecord:
     model_id: str
     model_version: str
     confidence_bucket: str
+    quality_score: float | None
+    quality_bucket: str | None
     has_raw_sample: bool
     has_feature: bool
     drift_flag: bool
@@ -75,6 +77,8 @@ class StoredSampleRecord:
             "model_id": self.model_id,
             "model_version": self.model_version,
             "confidence_bucket": self.confidence_bucket,
+            "quality_score": self.quality_score,
+            "quality_bucket": self.quality_bucket,
             "has_raw_sample": self.has_raw_sample,
             "has_feature": self.has_feature,
             "drift_flag": self.drift_flag,
@@ -100,6 +104,16 @@ class StoredSampleRecord:
             model_id=str(payload.get("model_id", "")),
             model_version=str(payload.get("model_version", "")),
             confidence_bucket=str(payload.get("confidence_bucket", LOW_CONFIDENCE)),
+            quality_score=(
+                None
+                if payload.get("quality_score") is None
+                else float(payload.get("quality_score"))
+            ),
+            quality_bucket=(
+                str(payload["quality_bucket"])
+                if payload.get("quality_bucket") is not None
+                else None
+            ),
             has_raw_sample=bool(payload.get("has_raw_sample", False)),
             has_feature=bool(payload.get("has_feature", False)),
             drift_flag=bool(payload.get("drift_flag", False)),
@@ -171,6 +185,8 @@ class EdgeSampleStore:
         model_id: str,
         model_version: str,
         confidence_bucket: str,
+        quality_score: float | None = None,
+        quality_bucket: str | None = None,
         inference_result: dict[str, Any],
         intermediate: SplitPayload | torch.Tensor | dict[str, torch.Tensor],
         drift_flag: bool = False,
@@ -208,6 +224,16 @@ class EdgeSampleStore:
             model_id=str(model_id),
             model_version=str(model_version),
             confidence_bucket=confidence_bucket,
+            quality_score=(
+                None
+                if quality_score is None
+                else float(quality_score)
+            ),
+            quality_bucket=(
+                None
+                if quality_bucket is None
+                else str(quality_bucket)
+            ),
             has_raw_sample=raw_path is not None,
             has_feature=True,
             drift_flag=bool(drift_flag),

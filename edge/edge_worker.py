@@ -339,11 +339,21 @@ class EdgeWorker:
 
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> None:
         confidence = float(inference.confidence)
-        drift_detected = self.drift_detector.update(confidence)
+        observation = {
+            "confidence": confidence,
+            "proposal_count": int(getattr(inference, "proposal_count", 0) or 0),
+            "retained_count": int(getattr(inference, "retained_count", 0) or 0),
+            "feature_spectral_entropy": getattr(inference, "feature_spectral_entropy", None),
+            "logit_entropy": getattr(inference, "logit_entropy", None),
+            "logit_margin": getattr(inference, "logit_margin", None),
+            "logit_energy": getattr(inference, "logit_energy", None),
+        }
+        quality = self.drift_detector.assess_sample_quality(observation)
+        drift_detected = self.drift_detector.update(observation)
         confidence_bucket = (
-            HIGH_CONFIDENCE
-            if confidence >= self.sample_confidence_threshold
-            else LOW_CONFIDENCE
+            LOW_CONFIDENCE
+            if quality["quality_bucket"] == "low_quality"
+            else HIGH_CONFIDENCE
         )
         save_raw = confidence_bucket == LOW_CONFIDENCE or drift_detected
         sample_id = self._next_sample_id(task)
@@ -355,6 +365,8 @@ class EdgeWorker:
             model_id=self.model_id,
             model_version=self.model_version,
             confidence_bucket=confidence_bucket,
+            quality_score=float(quality["quality_score"]),
+            quality_bucket=str(quality["quality_bucket"]),
             inference_result=inference.to_inference_result(),
             intermediate=inference.intermediate,
             drift_flag=drift_detected,

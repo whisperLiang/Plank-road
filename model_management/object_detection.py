@@ -27,6 +27,7 @@ from model_management.split_model_adapters import (
     get_split_runtime_model,
     postprocess_split_runtime_output,
     prepare_split_runtime_input,
+    summarize_split_runtime_observables,
 )
 from PIL import Image
 from torchvision import transforms
@@ -42,6 +43,12 @@ class InferenceArtifacts:
     confidence: float
     input_tensor_shape: list[int] | None = None
     input_resize_mode: str | None = None
+    proposal_count: int = 0
+    retained_count: int = 0
+    feature_spectral_entropy: float | None = None
+    logit_entropy: float | None = None
+    logit_margin: float | None = None
+    logit_energy: float | None = None
 
     def to_inference_result(self) -> dict[str, list]:
         return {
@@ -229,6 +236,7 @@ class Object_Detection:
         split_payload = None
         input_tensor_shape = None
         input_resize_mode = None
+        observables: dict[str, float | None] = {}
         with self.model_lock:
             if splitter is not None:
                 splitter_input = prepare_split_runtime_input(self.model, img, device=device)
@@ -243,6 +251,11 @@ class Object_Detection:
                     input_tensor_shape = [int(dim) for dim in splitter_input[0].shape]
                 replayed, split_payload = splitter.replay_inference(
                     splitter_input, return_split_output=True,
+                )
+                observables = summarize_split_runtime_observables(
+                    self.model,
+                    replayed,
+                    split_payload,
                 )
                 replayed = postprocess_split_runtime_output(
                     self.model,
@@ -269,6 +282,12 @@ class Object_Detection:
                 confidence=0.0,
                 input_tensor_shape=input_tensor_shape,
                 input_resize_mode=input_resize_mode,
+                proposal_count=0,
+                retained_count=0,
+                feature_spectral_entropy=observables.get("feature_spectral_entropy"),
+                logit_entropy=observables.get("logit_entropy"),
+                logit_margin=observables.get("logit_margin"),
+                logit_energy=observables.get("logit_energy"),
             )
 
         confidence = self._summarize_detection_confidence(pred_score)
@@ -290,6 +309,12 @@ class Object_Detection:
             confidence=confidence,
             input_tensor_shape=input_tensor_shape,
             input_resize_mode=input_resize_mode,
+            proposal_count=len(pred_score),
+            retained_count=len(detection_score),
+            feature_spectral_entropy=observables.get("feature_spectral_entropy"),
+            logit_entropy=observables.get("logit_entropy"),
+            logit_margin=observables.get("logit_margin"),
+            logit_energy=observables.get("logit_energy"),
         )
 
     def small_inference(self, img, splitter=None, return_split_payload=False):
@@ -346,14 +371,12 @@ class Object_Detection:
     def _summarize_detection_confidence(self, scores: list[float] | None) -> float:
         if not scores:
             return 0.0
-        top_scores = sorted((float(score) for score in scores), reverse=True)[:3]
+        # Use a small top-k mean to dampen long low-score tails without
+        # saturating high-confidence detectors like YOLO/RF-DETR to 1.0.
+        top_scores = sorted((float(score) for score in scores), reverse=True)[:5]
         if not top_scores:
             return 0.0
-        summary = float(np.mean(top_scores))
-        threshold_high = float(getattr(self, "threshold_high", 0.0) or 0.0)
-        if threshold_high > 0.0:
-            summary = summary / threshold_high
-        return float(np.clip(summary, 0.0, 1.0))
+        return float(np.clip(np.mean(top_scores), 0.0, 1.0))
 
     def _parse_prediction_output(self, res, threshold):
         if isinstance(res, tuple):
