@@ -31,12 +31,16 @@ from model_management.split_model_adapters import (
 )
 from PIL import Image
 from torchvision import transforms
-from torchvision.ops import nms
+from torchvision.ops import box_iou
 from mapcalc import calculate_map
 
 _FINAL_CLASS_AGNOSTIC_NMS_IOU_THRESHOLDS = {
     "tinynext": 0.75,
     "rfdetr": 0.75,
+}
+_FINAL_DUPLICATE_CONTAINMENT_THRESHOLDS = {
+    "tinynext": 0.9,
+    "rfdetr": 0.9,
 }
 
 
@@ -390,15 +394,46 @@ class Object_Detection:
             return 0.0
         return float(np.clip(np.mean(top_scores), 0.0, 1.0))
 
-    def _resolve_final_dedup_iou_threshold(self, threshold: float) -> float | None:
+    def _resolve_final_dedup_thresholds(self, threshold: float) -> tuple[float, float] | None:
         family = get_model_family(self.model_name)
         iou_threshold = _FINAL_CLASS_AGNOSTIC_NMS_IOU_THRESHOLDS.get(family)
-        if iou_threshold is None:
+        containment_threshold = _FINAL_DUPLICATE_CONTAINMENT_THRESHOLDS.get(family)
+        if iou_threshold is None or containment_threshold is None:
             return None
         threshold_high = float(getattr(self, "threshold_high", threshold))
         if float(threshold) < threshold_high - 1e-6:
             return None
-        return float(iou_threshold)
+        return float(iou_threshold), float(containment_threshold)
+
+    @staticmethod
+    def _compute_intersection_over_min_area(
+        candidate_box: torch.Tensor,
+        reference_boxes: torch.Tensor,
+    ) -> torch.Tensor:
+        if reference_boxes.numel() == 0:
+            return reference_boxes.new_zeros((0,), dtype=torch.float32)
+
+        inter_x1 = torch.maximum(candidate_box[0], reference_boxes[:, 0])
+        inter_y1 = torch.maximum(candidate_box[1], reference_boxes[:, 1])
+        inter_x2 = torch.minimum(candidate_box[2], reference_boxes[:, 2])
+        inter_y2 = torch.minimum(candidate_box[3], reference_boxes[:, 3])
+        inter_w = (inter_x2 - inter_x1).clamp_min(0.0)
+        inter_h = (inter_y2 - inter_y1).clamp_min(0.0)
+        intersection = inter_w * inter_h
+
+        candidate_area = (
+            (candidate_box[2] - candidate_box[0]).clamp_min(0.0)
+            * (candidate_box[3] - candidate_box[1]).clamp_min(0.0)
+        )
+        reference_areas = (
+            (reference_boxes[:, 2] - reference_boxes[:, 0]).clamp_min(0.0)
+            * (reference_boxes[:, 3] - reference_boxes[:, 1]).clamp_min(0.0)
+        )
+        min_area = torch.minimum(
+            reference_areas,
+            reference_areas.new_full(reference_areas.shape, float(candidate_area.item())),
+        ).clamp_min(1e-6)
+        return intersection / min_area
 
     def _deduplicate_final_predictions(
         self,
@@ -408,9 +443,10 @@ class Object_Detection:
         *,
         threshold: float,
     ) -> tuple[list[list[float]], list[int], list[float]]:
-        iou_threshold = self._resolve_final_dedup_iou_threshold(float(threshold))
-        if iou_threshold is None or len(scores) <= 1:
+        resolved_thresholds = self._resolve_final_dedup_thresholds(float(threshold))
+        if resolved_thresholds is None or len(scores) <= 1:
             return boxes, labels, scores
+        iou_threshold, containment_threshold = resolved_thresholds
 
         boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32)
         labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
@@ -427,16 +463,24 @@ class Object_Detection:
         labels_tensor = labels_tensor[valid_geometry]
         scores_tensor = scores_tensor[valid_geometry]
 
-        keep = nms(
-            boxes_tensor,
-            scores_tensor,
-            iou_threshold,
-        )
-        if keep.numel() == 0:
+        score_order = torch.argsort(scores_tensor, descending=True)
+        keep_indices: list[int] = []
+        for index in score_order.tolist():
+            candidate_box = boxes_tensor[index]
+            if keep_indices:
+                kept_boxes = boxes_tensor[keep_indices]
+                candidate_iou = box_iou(candidate_box.unsqueeze(0), kept_boxes).squeeze(0)
+                suppressed_by_iou = bool(torch.any(candidate_iou >= iou_threshold))
+                containment = self._compute_intersection_over_min_area(candidate_box, kept_boxes)
+                suppressed_by_containment = bool(torch.any(containment >= containment_threshold))
+                if suppressed_by_iou or suppressed_by_containment:
+                    continue
+            keep_indices.append(index)
+
+        if not keep_indices:
             return [], [], []
 
-        kept_scores = scores_tensor.index_select(0, keep)
-        keep = keep.index_select(0, torch.argsort(kept_scores, descending=True))
+        keep = torch.as_tensor(keep_indices, dtype=torch.int64)
         return (
             boxes_tensor.index_select(0, keep).tolist(),
             labels_tensor.index_select(0, keep).tolist(),

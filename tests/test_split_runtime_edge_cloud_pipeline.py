@@ -141,7 +141,7 @@ def test_tinynext_final_parse_deduplicates_heavily_overlapping_boxes():
     boxes, labels, scores = detector._parse_prediction_output(
         [{
             "boxes": torch.tensor(
-                [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0], [60.0, 60.0, 90.0, 90.0]],
+                [[10.0, 10.0, 50.0, 50.0], [14.0, 14.0, 46.0, 46.0], [60.0, 60.0, 90.0, 90.0]],
                 dtype=torch.float32,
             ),
             "labels": torch.tensor([1, 2, 3], dtype=torch.int64),
@@ -185,7 +185,7 @@ def test_rfdetr_final_parse_deduplicates_cross_class_overlaps():
     boxes, labels, scores = detector._parse_prediction_output(
         [{
             "boxes": torch.tensor(
-                [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0], [60.0, 60.0, 90.0, 90.0]],
+                [[10.0, 10.0, 50.0, 50.0], [14.0, 14.0, 46.0, 46.0], [60.0, 60.0, 90.0, 90.0]],
                 dtype=torch.float32,
             ),
             "labels": torch.tensor([2, 7, 9], dtype=torch.int64),
@@ -209,7 +209,7 @@ def test_rfdetr_infer_sample_deduplicates_final_high_confidence_boxes():
     def fake_get_model_prediction(img, threshold, model=None):
         assert threshold == pytest.approx(0.05)
         return (
-            [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0], [70.0, 70.0, 95.0, 95.0]],
+            [[10.0, 10.0, 50.0, 50.0], [14.0, 14.0, 46.0, 46.0], [70.0, 70.0, 95.0, 95.0]],
             [2, 7, 9],
             [0.91, 0.88, 0.12],
         )
