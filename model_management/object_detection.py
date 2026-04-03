@@ -31,7 +31,10 @@ from model_management.split_model_adapters import (
 )
 from PIL import Image
 from torchvision import transforms
+from torchvision.ops import nms
 from mapcalc import calculate_map
+
+_TINYNEXT_FINAL_NMS_IOU_THRESHOLD = 0.75
 
 
 @dataclass
@@ -378,6 +381,54 @@ class Object_Detection:
             return 0.0
         return float(np.clip(np.mean(top_scores), 0.0, 1.0))
 
+    def _should_apply_final_dedup(self, threshold: float) -> bool:
+        if get_model_family(self.model_name) != "tinynext":
+            return False
+        threshold_high = float(getattr(self, "threshold_high", threshold))
+        return float(threshold) >= threshold_high - 1e-6
+
+    def _deduplicate_tinynext_final_predictions(
+        self,
+        boxes: list[list[float]],
+        labels: list[int],
+        scores: list[float],
+        *,
+        threshold: float,
+    ) -> tuple[list[list[float]], list[int], list[float]]:
+        if not self._should_apply_final_dedup(float(threshold)) or len(scores) <= 1:
+            return boxes, labels, scores
+
+        boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32)
+        labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
+        scores_tensor = torch.as_tensor(scores, dtype=torch.float32)
+
+        valid_geometry = (
+            (boxes_tensor[:, 2] > boxes_tensor[:, 0])
+            & (boxes_tensor[:, 3] > boxes_tensor[:, 1])
+        )
+        if not torch.any(valid_geometry):
+            return [], [], []
+
+        boxes_tensor = boxes_tensor[valid_geometry]
+        labels_tensor = labels_tensor[valid_geometry]
+        scores_tensor = scores_tensor[valid_geometry]
+
+        keep = nms(
+            boxes_tensor,
+            scores_tensor,
+            _TINYNEXT_FINAL_NMS_IOU_THRESHOLD,
+        )
+        if keep.numel() == 0:
+            return [], [], []
+
+        kept_scores = scores_tensor.index_select(0, keep)
+        keep = keep.index_select(0, torch.argsort(kept_scores, descending=True))
+        return (
+            boxes_tensor.index_select(0, keep).tolist(),
+            labels_tensor.index_select(0, keep).tolist(),
+            scores_tensor.index_select(0, keep).tolist(),
+        )
+
     def _parse_prediction_output(self, res, threshold):
         if isinstance(res, tuple):
             res = res[0]
@@ -406,4 +457,12 @@ class Object_Detection:
         pred_boxes = [prediction_boxes[index] for index in keep_indices]
         pred_class = [prediction_class[index] for index in keep_indices]
         pred_score = [prediction_score[index] for index in keep_indices]
+        pred_boxes, pred_class, pred_score = self._deduplicate_tinynext_final_predictions(
+            pred_boxes,
+            pred_class,
+            pred_score,
+            threshold=float(threshold),
+        )
+        if not pred_score:
+            return None, None, None
         return pred_boxes, pred_class, pred_score

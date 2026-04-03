@@ -133,6 +133,50 @@ def test_detection_confidence_uses_top5_raw_mean():
     )
 
 
+def test_tinynext_final_parse_deduplicates_heavily_overlapping_boxes():
+    detector = Object_Detection.__new__(Object_Detection)
+    detector.model_name = "tinynext_s"
+    detector.threshold_high = 0.15
+
+    boxes, labels, scores = detector._parse_prediction_output(
+        [{
+            "boxes": torch.tensor(
+                [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0], [60.0, 60.0, 90.0, 90.0]],
+                dtype=torch.float32,
+            ),
+            "labels": torch.tensor([1, 2, 3], dtype=torch.int64),
+            "scores": torch.tensor([0.91, 0.88, 0.54], dtype=torch.float32),
+        }],
+        threshold=0.15,
+    )
+
+    assert boxes == [[10.0, 10.0, 50.0, 50.0], [60.0, 60.0, 90.0, 90.0]]
+    assert labels == [1, 3]
+    assert scores == pytest.approx([0.91, 0.54])
+
+
+def test_tinynext_low_threshold_parse_keeps_overlapping_proposals_for_observables():
+    detector = Object_Detection.__new__(Object_Detection)
+    detector.model_name = "tinynext_s"
+    detector.threshold_high = 0.15
+
+    boxes, labels, scores = detector._parse_prediction_output(
+        [{
+            "boxes": torch.tensor(
+                [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0]],
+                dtype=torch.float32,
+            ),
+            "labels": torch.tensor([1, 2], dtype=torch.int64),
+            "scores": torch.tensor([0.91, 0.88], dtype=torch.float32),
+        }],
+        threshold=0.02,
+    )
+
+    assert boxes == [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0]]
+    assert labels == [1, 2]
+    assert scores == pytest.approx([0.91, 0.88])
+
+
 def test_summarize_split_runtime_observables_extracts_feature_and_anchor_logit_stats():
     payload = SplitPayload(
         tensors={

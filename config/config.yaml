@@ -153,7 +153,7 @@ server:
  server_id: 0
  golden: rtdetr_x
  # lightweight model used to generate fine-tuned weights for the edge
- edge_model_name: yolo26n
+ edge_model_name: tinynext_s
  # gRPC listen address for the cloud server
  listen_address: "[::]:50051"
  # cloud-owned workspace used for uploaded retraining bundles
