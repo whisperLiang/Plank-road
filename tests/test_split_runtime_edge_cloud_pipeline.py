@@ -177,6 +177,55 @@ def test_tinynext_low_threshold_parse_keeps_overlapping_proposals_for_observable
     assert scores == pytest.approx([0.91, 0.88])
 
 
+def test_rfdetr_final_parse_deduplicates_cross_class_overlaps():
+    detector = Object_Detection.__new__(Object_Detection)
+    detector.model_name = "rfdetr_nano"
+    detector.threshold_high = 0.2
+
+    boxes, labels, scores = detector._parse_prediction_output(
+        [{
+            "boxes": torch.tensor(
+                [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0], [60.0, 60.0, 90.0, 90.0]],
+                dtype=torch.float32,
+            ),
+            "labels": torch.tensor([2, 7, 9], dtype=torch.int64),
+            "scores": torch.tensor([0.91, 0.88, 0.51], dtype=torch.float32),
+        }],
+        threshold=0.2,
+    )
+
+    assert boxes == [[10.0, 10.0, 50.0, 50.0], [60.0, 60.0, 90.0, 90.0]]
+    assert labels == [2, 9]
+    assert scores == pytest.approx([0.91, 0.51])
+
+
+def test_rfdetr_infer_sample_deduplicates_final_high_confidence_boxes():
+    detector = Object_Detection.__new__(Object_Detection)
+    detector.model_name = "rfdetr_nano"
+    detector.threshold_low = 0.05
+    detector.threshold_high = 0.2
+    detector.model_lock = threading.Lock()
+
+    def fake_get_model_prediction(img, threshold, model=None):
+        assert threshold == pytest.approx(0.05)
+        return (
+            [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0], [70.0, 70.0, 95.0, 95.0]],
+            [2, 7, 9],
+            [0.91, 0.88, 0.12],
+        )
+
+    detector.get_model_prediction = fake_get_model_prediction
+
+    artifacts = detector.infer_sample(np.zeros((8, 8, 3), dtype=np.uint8))
+
+    assert artifacts.proposal_count == 3
+    assert artifacts.retained_count == 1
+    assert artifacts.detection_boxes == [[10.0, 10.0, 50.0, 50.0]]
+    assert artifacts.detection_class == [2]
+    assert artifacts.detection_score == pytest.approx([0.91])
+    assert artifacts.confidence == pytest.approx((0.91 + 0.88 + 0.12) / 3.0)
+
+
 def test_summarize_split_runtime_observables_extracts_feature_and_anchor_logit_stats():
     payload = SplitPayload(
         tensors={

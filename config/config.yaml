@@ -21,7 +21,7 @@ client:
  # the max wait time
  wait_thresh: 100
  frame_cache_maxsize: 100
- lightweight: tinynext_s
+ lightweight: rfdetr_nano
  # Supported model names (see model_management/model_zoo.py):
  #   RetinaNet:    retinanet_resnet50_fpn
  #   FCOS:         fcos_resnet50_fpn
@@ -153,7 +153,7 @@ server:
  server_id: 0
  golden: rtdetr_x
  # lightweight model used to generate fine-tuned weights for the edge
- edge_model_name: tinynext_s
+ edge_model_name: rfdetr_nano
  # gRPC listen address for the cloud server
  listen_address: "[::]:50051"
  # cloud-owned workspace used for uploaded retraining bundles

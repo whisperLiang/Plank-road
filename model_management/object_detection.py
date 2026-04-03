@@ -34,7 +34,10 @@ from torchvision import transforms
 from torchvision.ops import nms
 from mapcalc import calculate_map
 
-_TINYNEXT_FINAL_NMS_IOU_THRESHOLD = 0.75
+_FINAL_CLASS_AGNOSTIC_NMS_IOU_THRESHOLDS = {
+    "tinynext": 0.75,
+    "rfdetr": 0.75,
+}
 
 
 @dataclass
@@ -303,6 +306,12 @@ class Object_Detection:
             detection_boxes = [pred_boxes[index] for index in high_keep_indices]
             detection_class = [pred_class[index] for index in high_keep_indices]
             detection_score = [pred_score[index] for index in high_keep_indices]
+            detection_boxes, detection_class, detection_score = self._deduplicate_final_predictions(
+                detection_boxes,
+                detection_class,
+                detection_score,
+                threshold=float(self.threshold_high),
+            )
 
         return InferenceArtifacts(
             intermediate=split_payload,
@@ -381,13 +390,17 @@ class Object_Detection:
             return 0.0
         return float(np.clip(np.mean(top_scores), 0.0, 1.0))
 
-    def _should_apply_final_dedup(self, threshold: float) -> bool:
-        if get_model_family(self.model_name) != "tinynext":
-            return False
+    def _resolve_final_dedup_iou_threshold(self, threshold: float) -> float | None:
+        family = get_model_family(self.model_name)
+        iou_threshold = _FINAL_CLASS_AGNOSTIC_NMS_IOU_THRESHOLDS.get(family)
+        if iou_threshold is None:
+            return None
         threshold_high = float(getattr(self, "threshold_high", threshold))
-        return float(threshold) >= threshold_high - 1e-6
+        if float(threshold) < threshold_high - 1e-6:
+            return None
+        return float(iou_threshold)
 
-    def _deduplicate_tinynext_final_predictions(
+    def _deduplicate_final_predictions(
         self,
         boxes: list[list[float]],
         labels: list[int],
@@ -395,7 +408,8 @@ class Object_Detection:
         *,
         threshold: float,
     ) -> tuple[list[list[float]], list[int], list[float]]:
-        if not self._should_apply_final_dedup(float(threshold)) or len(scores) <= 1:
+        iou_threshold = self._resolve_final_dedup_iou_threshold(float(threshold))
+        if iou_threshold is None or len(scores) <= 1:
             return boxes, labels, scores
 
         boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32)
@@ -416,7 +430,7 @@ class Object_Detection:
         keep = nms(
             boxes_tensor,
             scores_tensor,
-            _TINYNEXT_FINAL_NMS_IOU_THRESHOLD,
+            iou_threshold,
         )
         if keep.numel() == 0:
             return [], [], []
@@ -457,7 +471,7 @@ class Object_Detection:
         pred_boxes = [prediction_boxes[index] for index in keep_indices]
         pred_class = [prediction_class[index] for index in keep_indices]
         pred_score = [prediction_score[index] for index in keep_indices]
-        pred_boxes, pred_class, pred_score = self._deduplicate_tinynext_final_predictions(
+        pred_boxes, pred_class, pred_score = self._deduplicate_final_predictions(
             pred_boxes,
             pred_class,
             pred_score,
