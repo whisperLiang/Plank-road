@@ -1015,6 +1015,70 @@ def test_prepare_split_training_cache_backfills_input_image_size_from_raw_sample
     assert record["input_image_size"] == list(sample_bgr_frame.shape[:2])
 
 
+def test_prepare_split_training_cache_reuses_feature_only_sample_when_trace_stable_rebuild_requested(tmp_path):
+    bundle_root = tmp_path / "bundle"
+    (bundle_root / "features").mkdir(parents=True)
+    (bundle_root / "results").mkdir()
+
+    payload = _planned_payload()
+    torch.save({"intermediate": payload}, bundle_root / "features" / "sample-1.pt")
+    (bundle_root / "results" / "sample-1.json").write_text(
+        json.dumps({"boxes": [], "labels": [], "scores": []}),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "protocol_version": "edge-cl-bundle.v1",
+        "edge_id": 1,
+        "model": {"model_id": "model-a", "model_version": "0"},
+        "split_plan": _dummy_plan().to_dict(),
+        "drift_sample_ids": [],
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "frame_index": 1,
+                "confidence": 0.9,
+                "confidence_bucket": HIGH_CONFIDENCE,
+                "drift_flag": False,
+                "feature_relpath": "features/sample-1.pt",
+                "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
+                "result_relpath": "results/sample-1.json",
+                "metadata_relpath": "metadata/sample-1.json",
+                "raw_relpath": None,
+                "raw_bytes": 0,
+                "has_feature": True,
+                "has_raw_sample": False,
+                "split_config_id": "plan-1",
+                "model_id": "model-a",
+                "model_version": "0",
+                "input_image_size": [8, 8],
+                "input_tensor_shape": [1, 3, 8, 8],
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    }
+    (bundle_root / "bundle_manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+
+    def _provider(*_args, **_kwargs):
+        raise AssertionError("feature_provider should not be called for feature-only samples without raw input")
+
+    cache_root = tmp_path / "prepared_cache"
+    info = prepare_split_training_cache(
+        str(bundle_root),
+        str(cache_root),
+        feature_provider=_provider,
+        prefer_feature_rebuild=True,
+    )
+
+    assert info["all_sample_ids"] == ["sample-1"]
+    record = load_split_feature_cache(str(cache_root), "sample-1")
+    assert record["candidate_id"] == payload.candidate_id
+    assert record["boundary_tensor_labels"] == list(payload.boundary_tensor_labels)
+
+
 def test_prepare_split_training_cache_skips_incompatible_feature_only_samples(tmp_path):
     bundle_root = tmp_path / "bundle"
     (bundle_root / "features").mkdir(parents=True)

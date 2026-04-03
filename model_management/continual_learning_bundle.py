@@ -168,17 +168,31 @@ def prepare_split_training_cache(
                     )
                     continue
         else:
-            if raw_relpath is None or feature_provider is None:
-                raise RuntimeError(
-                    f"Sample {sample_id} requires server-side feature reconstruction, "
-                    "but no feature provider is configured."
+            if bundled_feature and raw_relpath is None:
+                intermediate = _load_intermediate(
+                    os.path.join(bundle_root, bundled_feature.replace("/", os.sep))
                 )
-            if bundled_feature and prefer_feature_rebuild:
+                if not _payload_matches_split_plan(intermediate, split_plan):
+                    raise RuntimeError(
+                        f"Sample {sample_id} requires server-side feature reconstruction, "
+                        "but only a split-incompatible bundled feature is available."
+                    )
                 logger.warning(
-                    "Rebuilding bundled sample {} features on the server because this model requires trace-stable payloads.",
+                    "Reusing bundled feature for sample {} because trace-stable reconstruction was requested but no raw sample is available.",
                     sample_id,
                 )
-            intermediate = feature_provider(raw_path, sample, manifest)
+            else:
+                if raw_relpath is None or feature_provider is None:
+                    raise RuntimeError(
+                        f"Sample {sample_id} requires server-side feature reconstruction, "
+                        "but no feature provider is configured."
+                    )
+                if bundled_feature and prefer_feature_rebuild:
+                    logger.warning(
+                        "Rebuilding bundled sample {} features on the server because this model requires trace-stable payloads.",
+                        sample_id,
+                    )
+                intermediate = feature_provider(raw_path, sample, manifest)
 
         copied_raw = _copy_raw_sample(
             bundle_root,
