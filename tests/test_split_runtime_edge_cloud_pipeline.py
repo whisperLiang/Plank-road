@@ -968,7 +968,7 @@ def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf
     assert edge_after == pytest.approx(0.9)
 
 
-def test_fixed_split_retrain_falls_back_to_full_image_retraining_when_no_finite_step(
+def test_fixed_split_retrain_returns_failure_when_no_finite_step(
     tmp_path,
     monkeypatch,
 ):
@@ -1066,208 +1066,42 @@ def test_fixed_split_retrain_falls_back_to_full_image_retraining_when_no_finite_
         ),
     )
 
-    fallback_calls = {}
-
-    def fake_retrain_edge_model_with_targets(*, frame_dir, frame_ids, gt_annotations, **kwargs):
-        fallback_calls["frame_dir"] = frame_dir
-        fallback_calls["frame_ids"] = list(frame_ids)
-        fallback_calls["gt_annotations"] = gt_annotations
-        model = DummyModel(weight=0.9)
-        buffer = io.BytesIO()
-        torch.save(model.state_dict(), buffer)
-        return buffer.getvalue()
-
-    monkeypatch.setattr(learner, "_retrain_edge_model_with_targets", fake_retrain_edge_model_with_targets)
-
-    proxy_metrics = iter(
-        [
-            {
-                "map": 0.1,
-                "evaluated_samples": 1,
-                "skipped_empty_gt": 0,
-                "skipped_missing_frame": 0,
-                "total_gt_samples": 1,
-                "nonempty_predictions": 1,
-                "total_prediction_boxes": 1,
-            },
-            {
-                "map": 0.9,
-                "evaluated_samples": 1,
-                "skipped_empty_gt": 0,
-                "skipped_missing_frame": 0,
-                "total_gt_samples": 1,
-                "nonempty_predictions": 1,
-                "total_prediction_boxes": 1,
-            },
-        ]
-    )
-    monkeypatch.setattr("cloud_server._evaluate_detection_proxy_map", lambda *args, **kwargs: next(proxy_metrics))
-
     success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
         edge_id=1,
         bundle_cache_path=str(bundle_root),
         num_epoch=2,
     )
 
-    assert success is True
-    assert fallback_calls["frame_ids"] == ["sample-1"]
-    assert fallback_calls["gt_annotations"] == {"sample-1": {"boxes": [[1, 1, 6, 6]], "labels": [1]}}
-    assert "Fell back to full-image retraining because fixed split failed" in message
-    assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message
-    returned_state = torch.load(
-        io.BytesIO(base64.b64decode(model_data)),
-        map_location="cpu",
-        weights_only=False,
-    )
-    assert float(returned_state["weight"][0]) == pytest.approx(0.9)
+    assert success is False
+    assert model_data == ""
+    assert "Split retraining did not produce any finite optimization step" in message
 
 
-def test_run_fixed_split_retrain_retries_alternative_candidate_before_raw_fallback(
-    tmp_path,
-    monkeypatch,
-):
-    class DummyModel(torch.nn.Module):
-        def __init__(self, weight: float):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+def test_tinynext_split_loss_projects_original_boxes_into_model_input_space():
+    model = build_detection_model("tinynext_s", pretrained=False, device="cpu").eval()
+    runtime_model = get_split_runtime_model(model)
+    frame = _random_frame((1080, 1920))
+    runtime_input = prepare_split_runtime_input(model, frame, device="cpu")
+    outputs = runtime_model(runtime_input)
+    loss_fn = build_split_training_loss(model)
 
-        def forward(self, images):
-            score = float(self.weight.detach().cpu().item())
-            if score <= 0.0:
-                return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
-            return [
-                {
-                    "labels": torch.tensor([1], dtype=torch.int64),
-                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
-                    "scores": torch.tensor([score], dtype=torch.float32),
-                }
-            ]
-
-    config = SimpleNamespace(
-        edge_model_name="tinynext_s",
-        continual_learning=SimpleNamespace(),
-        das=SimpleNamespace(enabled=False),
-    )
-    learner = CloudContinualLearner(
-        config=config,
-        large_object_detection=SimpleNamespace(),
-    )
-
-    model = DummyModel(weight=0.1)
-    manifest = {"split_plan": _dummy_split_plan(model_name="tinynext_s").to_dict()}
-    frame_dir = tmp_path / "frames"
-    frame_dir.mkdir(parents=True, exist_ok=True)
-
-    primary_candidate = SimpleNamespace(
-        candidate_id="candidate-a",
-        boundary_tensor_labels=["layer_a"],
-        legacy_layer_index=3,
-        estimated_payload_bytes=128,
-    )
-    alternative_candidate = SimpleNamespace(
-        candidate_id="candidate-b",
-        boundary_tensor_labels=["layer_b"],
-        legacy_layer_index=7,
-        estimated_payload_bytes=256,
-    )
-    prepared_splitter = SimpleNamespace()
-    sample_metadata = {"sample-1": {"sample_id": "sample-1"}}
-    retrain_calls: list[tuple[str, tuple[str, ...]]] = []
-
-    monkeypatch.setattr(
-        learner,
-        "_build_bundle_trace_sample_input",
-        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
-    )
-    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda active_model: active_model)
-    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
-    monkeypatch.setattr(
-        "cloud_server.list_fixed_split_candidates",
-        lambda splitter, constraints: [primary_candidate, alternative_candidate],
-    )
-
-    def fake_prepare_fixed_split_working_cache(
-        model,
-        manifest,
-        *,
-        bundle_cache_path,
-        working_cache,
-        requires_trace_stable_rebuild,
-        split_plan_override=None,
-        skip_incompatible_feature_only_samples=False,
-        prepared_splitter=None,
-        prepared_candidate=None,
-    ):
-        Path(working_cache).mkdir(parents=True, exist_ok=True)
-        return (
-            {"all_sample_ids": ["sample-1"], "drift_sample_ids": []},
-            str(frame_dir),
-            prepared_splitter,
-            prepared_candidate,
-        )
-
-    monkeypatch.setattr(
-        learner,
-        "_prepare_fixed_split_working_cache",
-        fake_prepare_fixed_split_working_cache,
-    )
-
-    def fake_universal_split_retrain(*, model, chosen_candidate, all_indices, **kwargs):
-        retrain_calls.append((chosen_candidate.candidate_id, tuple(str(idx) for idx in all_indices)))
-        if chosen_candidate.candidate_id == "candidate-a":
-            raise RuntimeError(
-                "Split retraining did not produce any finite optimization step. "
-                "The selected candidate may replay empty/non-differentiable detector outputs."
-            )
-        with torch.no_grad():
-            model.weight.fill_(0.8)
-        return [0.1]
-
-    monkeypatch.setattr("cloud_server.universal_split_retrain", fake_universal_split_retrain)
-    monkeypatch.setattr(
-        "cloud_server._evaluate_detection_proxy_map",
-        lambda model, **kwargs: {
-            "map": float(model.weight.detach().cpu().item()),
-            "evaluated_samples": 1,
-            "skipped_empty_gt": 0,
-            "skipped_missing_frame": 0,
-            "total_gt_samples": 1,
-            "nonempty_predictions": 1,
-            "total_prediction_boxes": 1,
+    targets = {
+        "boxes": [
+            [3.8, 921.5, 314.3, 1080.0],
+            [250.8, 736.7, 593.0, 910.2],
+            [1569.0, 694.0, 1648.9, 773.0],
+            [465.0, 678.9, 724.4, 815.0],
+        ],
+        "labels": [3, 3, 13, 3],
+        "_split_meta": {
+            "input_image_size": [1080, 1920],
+            "input_tensor_shape": list(runtime_input.shape),
         },
-    )
+    }
 
-    metrics, baseline_state = learner._run_fixed_split_retrain(
-        model,
-        current_model_name="tinynext_s",
-        bundle_info={"all_sample_ids": ["sample-1"], "drift_sample_ids": []},
-        manifest=manifest,
-        bundle_cache_path=str(tmp_path / "bundle"),
-        working_cache=str(tmp_path / "working_cache"),
-        frame_dir=str(frame_dir),
-        gt_annotations={"sample-1": {"boxes": [[1, 1, 6, 6]], "labels": [1]}},
-        num_epoch=1,
-        proxy_metrics_before={
-            "map": 0.1,
-            "evaluated_samples": 1,
-            "skipped_empty_gt": 0,
-            "skipped_missing_frame": 0,
-            "total_gt_samples": 1,
-            "nonempty_predictions": 1,
-            "total_prediction_boxes": 1,
-        },
-        prepared_splitter=prepared_splitter,
-        prepared_candidate=primary_candidate,
-        sample_metadata_by_id=sample_metadata,
-        requires_trace_stable_rebuild=True,
-    )
+    loss = loss_fn(outputs, targets)
 
-    assert retrain_calls == [
-        ("candidate-a", ("sample-1",)),
-        ("candidate-b", ("sample-1",)),
-    ]
-    assert metrics["map"] == pytest.approx(0.8)
-    assert float(baseline_state["weight"][0]) == pytest.approx(0.1)
+    assert bool(torch.isfinite(loss).item()) is True
 
 
 def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(

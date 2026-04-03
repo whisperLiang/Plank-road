@@ -419,32 +419,6 @@ def _select_validated_candidate(
     )
 
 
-def list_fixed_split_candidates(
-    runtime: UniversalModelSplitter,
-    constraints: SplitConstraints,
-) -> list[SplitCandidate]:
-    eligible = _enumerate_feasible_candidates(runtime, constraints)
-    if not eligible:
-        return []
-
-    if not constraints.validate_candidates:
-        return [candidate for candidate, _, _ in sorted(eligible, key=_eligible_candidate_key)]
-
-    grouped: dict[int, list[EligibleCandidate]] = defaultdict(list)
-    for item in eligible:
-        grouped[int(item[0].estimated_payload_bytes)].append(item)
-
-    ordered: list[SplitCandidate] = []
-    for payload_bytes in sorted(grouped):
-        validated_group, _, _, _ = _validate_payload_group(
-            runtime,
-            grouped[payload_bytes],
-        )
-        for _, candidate, _, _ in sorted(validated_group, key=_validated_candidate_key):
-            ordered.append(candidate)
-    return ordered
-
-
 def _build_validation_payload(
     chosen: SplitCandidate,
     profile: CandidateProfile | None,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import copy
 import io
 import json
@@ -26,7 +25,6 @@ from config import load_runtime_config
 from cloud_server import (
     CloudContinualLearner,
     _evaluate_detection_proxy_map,
-    _fixed_split_proxy_rejection_reason,
 )
 from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
 from edge.transmit import pack_continual_learning_bundle
@@ -212,146 +210,6 @@ def _build_split_runtime(
         splitter=splitter,
     )
     return splitter, plan
-
-
-def _write_raw_training_cache(
-    *,
-    cache_root: Path,
-    frame_indices: list[int],
-    frames: list[Any],
-) -> Path:
-    if cache_root.exists():
-        shutil.rmtree(cache_root)
-    frames_dir = cache_root / "frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    for frame_index, frame in zip(frame_indices, frames):
-        frame_path = frames_dir / f"{int(frame_index)}.jpg"
-        if not cv2.imwrite(str(frame_path), frame):
-            raise RuntimeError(f"Failed to write frame cache image: {frame_path}")
-    return cache_root
-
-
-def _build_teacher_annotations(
-    *,
-    learner: CloudContinualLearner,
-    frame_indices: list[int],
-    frames: list[Any],
-) -> dict[str, dict[str, object]]:
-    annotations: dict[str, dict[str, object]] = {}
-    for frame_index, frame in zip(frame_indices, frames):
-        teacher_targets = learner._build_teacher_targets(frame)
-        if teacher_targets is None:
-            continue
-        annotations[str(int(frame_index))] = teacher_targets
-    return annotations
-
-
-def _run_raw_retrain_fallback(
-    *,
-    learner: CloudContinualLearner,
-    pair_root: Path,
-    frame_indices: list[int],
-    frames: list[Any],
-    edge_model: str,
-    epochs: int,
-    failure_reason: str,
-) -> tuple[bool, bool, float | None, float | None, float | None, float | None, dict[str, Any], str]:
-    raw_cache = _write_raw_training_cache(
-        cache_root=pair_root / "raw_cache",
-        frame_indices=frame_indices,
-        frames=frames,
-    )
-    gt_annotations = _build_teacher_annotations(
-        learner=learner,
-        frame_indices=frame_indices,
-        frames=frames,
-    )
-    frame_dir = str(raw_cache / "frames")
-    before_model = learner._load_edge_training_model(model_name=edge_model)
-    before_metrics = _evaluate_detection_proxy_map(
-        before_model,
-        frame_dir=frame_dir,
-        gt_annotations=gt_annotations,
-        device=learner.device,
-        model_name=edge_model,
-    )
-
-    success, model_b64, raw_message = learner.get_ground_truth_and_retrain(
-        edge_id=1,
-        frame_indices=[int(index) for index in frame_indices],
-        cache_path=str(raw_cache),
-        num_epoch=int(epochs),
-    )
-
-    after_metrics = before_metrics
-    if success and model_b64:
-        state_dict = torch.load(
-            io.BytesIO(base64.b64decode(model_b64)),
-            map_location=learner.device,
-            weights_only=False,
-        )
-        after_model = learner._load_edge_training_model(model_name=edge_model)
-        after_model.load_state_dict(state_dict)
-        after_model.to(learner.device)
-        after_model.eval()
-        after_metrics = _evaluate_detection_proxy_map(
-            after_model,
-            frame_dir=frame_dir,
-            gt_annotations=gt_annotations,
-            device=learner.device,
-            model_name=edge_model,
-        )
-
-    rejection_reason = _fixed_split_proxy_rejection_reason(
-        before_metrics,
-        after_metrics,
-    )
-
-    before_map = before_metrics.get("map")
-    after_map = after_metrics.get("map")
-    absolute_delta = None
-    relative_delta_percent = None
-    if before_map is not None and after_map is not None:
-        absolute_delta = float(after_map) - float(before_map)
-        if float(before_map) > 0:
-            relative_delta_percent = (absolute_delta / float(before_map)) * 100.0
-    proxy_summary = None
-    if before_map is not None and after_map is not None:
-        proxy_summary = (
-            f"proxy_mAP@0.5 {float(before_map):.4f} -> {float(after_map):.4f} "
-            f"(delta={absolute_delta:+.4f}, evaluated={int(after_metrics.get('evaluated_samples', 0))}, "
-            f"skipped_empty_gt={int(after_metrics.get('skipped_empty_gt', 0))}, "
-            f"skipped_missing_frame={int(after_metrics.get('skipped_missing_frame', 0))})"
-        )
-
-    message_parts = [
-        f"Fell back to full-image retraining because fixed split was unavailable: {failure_reason}",
-    ]
-    if raw_message:
-        message_parts.append(raw_message)
-    if rejection_reason is not None:
-        message_parts.append(
-            f"Experiment rejected the updated weights because {rejection_reason}"
-        )
-    if proxy_summary is not None:
-        message_parts.append(proxy_summary)
-
-    return (
-        bool(success),
-        bool(success and model_b64 and rejection_reason is None),
-        None if before_map is None else float(before_map),
-        None if after_map is None else float(after_map),
-        absolute_delta,
-        relative_delta_percent,
-        {
-            "total_samples": len(frame_indices),
-            "raw_fallback": True,
-            "gt_annotation_count": len(gt_annotations),
-        },
-        "; ".join(message_parts),
-    )
-
-
 def _collect_edge_samples(
     *,
     small_detector: Object_Detection,
@@ -511,29 +369,18 @@ def _run_pair_experiment(
     except RuntimeError as exc:
         split_runtime_failure = str(exc)
         logger.warning(
-            "Falling back to full-image retraining for edge={} golden={} because fixed split is unavailable: {}",
+            "Fixed split retraining failed for edge={} golden={}: {}",
             edge_model,
             golden_model,
             split_runtime_failure,
         )
-        (
-            success,
-            accepted_updated_weights,
-            before_map,
-            after_map,
-            absolute_delta,
-            relative_delta_percent,
-            sample_stats,
-            message,
-        ) = _run_raw_retrain_fallback(
-            learner=learner,
-            pair_root=pair_root,
-            frame_indices=frame_indices,
-            frames=frames,
-            edge_model=edge_model,
-            epochs=int(epochs),
-            failure_reason=split_runtime_failure,
-        )
+        success = False
+        accepted_updated_weights = False
+        before_map = None
+        after_map = None
+        absolute_delta = None
+        relative_delta_percent = None
+        message = split_runtime_failure
 
     result = ExperimentResult(
         edge_model=edge_model,

@@ -56,12 +56,7 @@ from model_management.continual_learning_bundle import (
     load_training_bundle_manifest,
     prepare_split_training_cache,
 )
-from model_management.fixed_split import (
-    SplitConstraints,
-    SplitPlan,
-    apply_split_plan,
-    list_fixed_split_candidates,
-)
+from model_management.fixed_split import SplitPlan, apply_split_plan
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
@@ -842,9 +837,8 @@ class CloudContinualLearner:
         manifest: dict[str, object],
         *,
         bundle_root: str,
-        split_plan: SplitPlan | None = None,
     ):
-        split_plan = split_plan or SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
+        split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
         splitter = UniversalModelSplitter(device=self.device)
         split_model = get_split_runtime_model(model)
         sample_input = self._build_bundle_trace_sample_input(
@@ -855,71 +849,6 @@ class CloudContinualLearner:
         splitter.trace(split_model, sample_input)
         candidate = apply_split_plan(splitter, split_plan)
         return splitter, candidate
-
-    @staticmethod
-    def _split_constraints_from_manifest(
-        manifest: Mapping[str, object],
-    ) -> SplitConstraints:
-        payload = dict(manifest.get("split_plan", {})).get("constraints")
-        if not isinstance(payload, Mapping):
-            return SplitConstraints()
-        return SplitConstraints(
-            privacy_metric_lower_bound=float(payload.get("privacy_metric_lower_bound", 0.0)),
-            max_layer_freezing_ratio=float(payload.get("max_layer_freezing_ratio", 1.0)),
-            validate_candidates=bool(payload.get("validate_candidates", True)),
-            max_candidates=int(payload.get("max_candidates", 24)),
-            max_boundary_count=int(payload.get("max_boundary_count", 8)),
-            max_payload_bytes=int(payload.get("max_payload_bytes", 32 * 1024 * 1024)),
-        )
-
-    @staticmethod
-    def _plan_override_for_candidate(
-        manifest: Mapping[str, object],
-        candidate,
-    ) -> dict[str, object]:
-        payload = dict(manifest.get("split_plan", {}))
-        boundary_tensor_labels = list(getattr(candidate, "boundary_tensor_labels", []) or [])
-        payload.update(
-            {
-                "candidate_id": getattr(candidate, "candidate_id", None),
-                "split_index": getattr(candidate, "legacy_layer_index", None),
-                "split_label": boundary_tensor_labels[-1] if boundary_tensor_labels else None,
-                "boundary_tensor_labels": boundary_tensor_labels,
-                "payload_bytes": int(
-                    getattr(
-                        candidate,
-                        "estimated_payload_bytes",
-                        payload.get("payload_bytes", 0) or 0,
-                    )
-                ),
-            }
-        )
-        return payload
-
-    def _list_fixed_split_retry_candidates(
-        self,
-        manifest: Mapping[str, object],
-        splitter: UniversalModelSplitter,
-        current_candidate,
-    ) -> list[object]:
-        constraints = self._split_constraints_from_manifest(manifest)
-        candidates = list_fixed_split_candidates(splitter, constraints)
-        current_id = getattr(current_candidate, "candidate_id", None)
-        current_boundary = tuple(getattr(current_candidate, "boundary_tensor_labels", []) or [])
-        ordered: list[object] = []
-        seen: set[tuple[object, tuple[str, ...]]] = set()
-        for candidate in candidates:
-            key = (
-                getattr(candidate, "candidate_id", None),
-                tuple(getattr(candidate, "boundary_tensor_labels", []) or []),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            if key == (current_id, current_boundary):
-                continue
-            ordered.append(candidate)
-        return ordered
 
     def _resolve_wrapper_fixed_split_hparams(
         self,
@@ -946,34 +875,19 @@ class CloudContinualLearner:
         bundle_cache_path: str,
         working_cache: str,
         requires_trace_stable_rebuild: bool,
-        split_plan_override: dict[str, object] | None = None,
-        skip_incompatible_feature_only_samples: bool = False,
-        prepared_splitter: UniversalModelSplitter | None = None,
-        prepared_candidate=None,
     ) -> tuple[dict[str, object], str, UniversalModelSplitter | None, object | None]:
+        prepared_splitter = None
+        prepared_candidate = None
         if os.path.isdir(working_cache):
             shutil.rmtree(working_cache, ignore_errors=True)
 
-        split_plan_payload = dict(split_plan_override or manifest.get("split_plan", {}))
-        resolved_plan = (
-            SplitPlan.from_dict(split_plan_payload)
-            if split_plan_payload.get("split_config_id")
-            else None
-        )
         provider_kwargs = {}
-        if (
-            requires_trace_stable_rebuild
-            or resolved_plan is not None
-            or prepared_splitter is not None
-            or prepared_candidate is not None
-        ):
-            if prepared_splitter is None or prepared_candidate is None:
-                prepared_splitter, prepared_candidate = self._build_bundle_splitter(
-                    model,
-                    manifest,
-                    bundle_root=bundle_cache_path,
-                    split_plan=resolved_plan,
-                )
+        if requires_trace_stable_rebuild:
+            prepared_splitter, prepared_candidate = self._build_bundle_splitter(
+                model,
+                manifest,
+                bundle_root=bundle_cache_path,
+            )
             provider_kwargs = {
                 "splitter": prepared_splitter,
                 "candidate": prepared_candidate,
@@ -987,12 +901,8 @@ class CloudContinualLearner:
                 **provider_kwargs,
             ),
         }
-        if resolved_plan is not None:
-            prepare_kwargs["split_plan_override"] = resolved_plan.to_dict()
         if requires_trace_stable_rebuild:
             prepare_kwargs["prefer_feature_rebuild"] = True
-        if skip_incompatible_feature_only_samples:
-            prepare_kwargs["skip_incompatible_feature_only_samples"] = True
 
         bundle_info = prepare_split_training_cache(
             bundle_cache_path,
@@ -1217,7 +1127,6 @@ class CloudContinualLearner:
         prepared_splitter: UniversalModelSplitter | None,
         prepared_candidate,
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
-        requires_trace_stable_rebuild: bool,
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
         baseline_state = _snapshot_model_state(model)
         effective_num_epoch = num_epoch
@@ -1240,194 +1149,64 @@ class CloudContinualLearner:
                 effective_learning_rate,
             )
 
-        split_trace_input = self._build_bundle_trace_sample_input(
-            model,
-            bundle_cache_path,
-            manifest,
-        )
-
-        def _run_candidate_retrain(
-            *,
-            active_bundle_info: Mapping[str, object],
-            active_working_cache: str,
-            active_candidate,
-            active_sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
-        ) -> dict[str, float | int | None]:
-            active_sample_ids = [str(sample_id) for sample_id in active_bundle_info["all_sample_ids"]]
-            active_gt_annotations = {
-                sample_id: annotation
-                for sample_id, annotation in gt_annotations.items()
-                if str(sample_id) in set(active_sample_ids)
-            }
-            current_metadata = active_sample_metadata_by_id or self._load_cached_sample_metadata(
-                active_working_cache,
-                active_sample_ids,
-            )
-            split_retrain_kwargs = {
-                "model": get_split_runtime_model(model),
-                "sample_input": split_trace_input,
-                "cache_path": active_working_cache,
-                "all_indices": active_sample_ids,
-                "gt_annotations": active_gt_annotations,
-                "device": self.device,
-                "learning_rate": effective_learning_rate,
-                "loss_fn": build_split_training_loss(model),
-                "das_enabled": self.das_enabled,
-                "das_bn_only": self.das_bn_only,
-                "das_probe_samples": self.das_probe_samples,
-                "splitter": prepared_splitter,
-                "chosen_candidate": active_candidate,
-            }
-            if active_gt_annotations and str(current_model_name).lower().startswith("rfdetr_"):
-                best_state = baseline_state
-                best_metrics = dict(proxy_metrics_before)
-                for epoch_index in range(int(effective_num_epoch)):
-                    universal_split_retrain(
-                        **split_retrain_kwargs,
-                        num_epoch=1,
-                    )
-                    candidate_metrics = self._evaluate_fixed_split_proxy_map(
-                        model,
-                        frame_dir=frame_dir,
-                        gt_annotations=gt_annotations,
-                        model_name=current_model_name,
-                        sample_metadata_by_id=current_metadata,
-                    )
-                    if _proxy_metrics_are_better(candidate_metrics, best_metrics):
-                        best_state = _snapshot_model_state(model)
-                        best_metrics = dict(candidate_metrics)
-                        logger.info(
-                            "[FixedSplitCL] Kept RF-DETR candidate from epoch {} with proxy_mAP@0.5={:.4f}.",
-                            epoch_index + 1,
-                            float(candidate_metrics.get("map") or 0.0),
-                        )
-                model.load_state_dict(best_state)
-                _set_detection_model_eval_mode(model)
-                return dict(best_metrics)
-
-            universal_split_retrain(
-                **split_retrain_kwargs,
-                num_epoch=effective_num_epoch,
-            )
-            return self._evaluate_fixed_split_proxy_map(
+        split_retrain_kwargs = {
+            "model": get_split_runtime_model(model),
+            "sample_input": self._build_bundle_trace_sample_input(
                 model,
-                frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
-                model_name=current_model_name,
-                sample_metadata_by_id=current_metadata,
-            )
-
-        try:
-            return (
-                _run_candidate_retrain(
-                    active_bundle_info=bundle_info,
-                    active_working_cache=working_cache,
-                    active_candidate=prepared_candidate,
-                    active_sample_metadata_by_id=sample_metadata_by_id,
-                ),
-                baseline_state,
-            )
-        except RuntimeError as exc:
-            if not self._should_fallback_from_fixed_split_error(exc):
-                raise
-
-            retry_splitter = prepared_splitter
-            retry_candidate = prepared_candidate
-            model.load_state_dict(baseline_state, strict=False)
-            _set_detection_model_eval_mode(model)
-            if retry_splitter is None or retry_candidate is None:
-                retry_splitter, retry_candidate = self._build_bundle_splitter(
-                    model,
-                    manifest,
-                    bundle_root=bundle_cache_path,
-                )
-
-            alternative_candidates = self._list_fixed_split_retry_candidates(
+                bundle_cache_path,
                 manifest,
-                retry_splitter,
-                retry_candidate,
-            )
-            if not alternative_candidates:
-                raise
-
-            logger.warning(
-                "[FixedSplitCL] Candidate {} produced no finite optimization step on the prepared bundle; retrying {} alternative fixed split candidates.",
-                getattr(retry_candidate, "candidate_id", None),
-                len(alternative_candidates),
-            )
-            retry_failures: list[str] = []
-            for alternative_candidate in alternative_candidates:
-                retry_cache = os.path.join(
-                    bundle_cache_path,
-                    f"working_cache_retry_{getattr(alternative_candidate, 'candidate_id', 'unknown')}",
+            ),
+            "cache_path": working_cache,
+            "all_indices": bundle_info["all_sample_ids"],
+            "gt_annotations": gt_annotations,
+            "device": self.device,
+            "learning_rate": effective_learning_rate,
+            "loss_fn": build_split_training_loss(model),
+            "das_enabled": self.das_enabled,
+            "das_bn_only": self.das_bn_only,
+            "das_probe_samples": self.das_probe_samples,
+            "splitter": prepared_splitter,
+            "chosen_candidate": prepared_candidate,
+        }
+        if gt_annotations and str(current_model_name).lower().startswith("rfdetr_"):
+            best_state = baseline_state
+            best_metrics = dict(proxy_metrics_before)
+            for epoch_index in range(int(effective_num_epoch)):
+                universal_split_retrain(
+                    **split_retrain_kwargs,
+                    num_epoch=1,
                 )
-                plan_override = self._plan_override_for_candidate(
-                    manifest,
-                    alternative_candidate,
+                candidate_metrics = self._evaluate_fixed_split_proxy_map(
+                    model,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    model_name=current_model_name,
+                    sample_metadata_by_id=sample_metadata_by_id,
                 )
-                model.load_state_dict(baseline_state, strict=False)
-                _set_detection_model_eval_mode(model)
-                try:
-                    retry_bundle_info, _, prepared_splitter, _ = self._prepare_fixed_split_working_cache(
-                        model,
-                        manifest,
-                        bundle_cache_path=bundle_cache_path,
-                        working_cache=retry_cache,
-                        requires_trace_stable_rebuild=requires_trace_stable_rebuild,
-                        split_plan_override=plan_override,
-                        skip_incompatible_feature_only_samples=True,
-                        prepared_splitter=retry_splitter,
-                        prepared_candidate=alternative_candidate,
-                    )
-                    retry_sample_ids = list(retry_bundle_info["all_sample_ids"])
-                    if not retry_sample_ids:
-                        logger.warning(
-                            "[FixedSplitCL] Skipping alternative candidate {} because no compatible samples remained after rebuilding the working cache.",
-                            getattr(alternative_candidate, "candidate_id", None),
-                        )
-                        continue
-                    retry_metadata = self._load_cached_sample_metadata(
-                        retry_cache,
-                        retry_sample_ids,
-                    )
-                    proxy_metrics_after = _run_candidate_retrain(
-                        active_bundle_info=retry_bundle_info,
-                        active_working_cache=retry_cache,
-                        active_candidate=alternative_candidate,
-                        active_sample_metadata_by_id=retry_metadata,
-                    )
+                if _proxy_metrics_are_better(candidate_metrics, best_metrics):
+                    best_state = _snapshot_model_state(model)
+                    best_metrics = dict(candidate_metrics)
                     logger.info(
-                        "[FixedSplitCL] Recovered fixed split retraining with alternative candidate {} (boundary_count={}, payload_bytes={}).",
-                        getattr(alternative_candidate, "candidate_id", None),
-                        len(getattr(alternative_candidate, "boundary_tensor_labels", []) or []),
-                        int(getattr(alternative_candidate, "estimated_payload_bytes", 0)),
+                        "[FixedSplitCL] Kept RF-DETR candidate from epoch {} with proxy_mAP@0.5={:.4f}.",
+                        epoch_index + 1,
+                        float(candidate_metrics.get("map") or 0.0),
                     )
-                    return proxy_metrics_after, baseline_state
-                except RuntimeError as retry_exc:
-                    if self._should_fallback_from_fixed_split_error(retry_exc):
-                        logger.warning(
-                            "[FixedSplitCL] Alternative candidate {} still produced no finite optimization step.",
-                            getattr(alternative_candidate, "candidate_id", None),
-                        )
-                    else:
-                        logger.warning(
-                            "[FixedSplitCL] Alternative candidate {} failed during fixed split retry: {}",
-                            getattr(alternative_candidate, "candidate_id", None),
-                            retry_exc,
-                        )
-                    retry_failures.append(
-                        f"{getattr(alternative_candidate, 'candidate_id', None)}: {retry_exc}"
-                    )
-                    continue
+            model.load_state_dict(best_state)
+            _set_detection_model_eval_mode(model)
+            return dict(best_metrics), baseline_state
 
-            if retry_failures:
-                raise RuntimeError(
-                    "Split retraining did not produce any finite optimization step. "
-                    "The selected candidate may replay empty/non-differentiable detector outputs. "
-                    "Alternative fixed split candidates also failed: "
-                    + "; ".join(retry_failures[:3])
-                ) from exc
-            raise
+        universal_split_retrain(
+            **split_retrain_kwargs,
+            num_epoch=effective_num_epoch,
+        )
+        proxy_metrics_after = self._evaluate_fixed_split_proxy_map(
+            model,
+            frame_dir=frame_dir,
+            gt_annotations=gt_annotations,
+            model_name=current_model_name,
+            sample_metadata_by_id=sample_metadata_by_id,
+        )
+        return proxy_metrics_after, baseline_state
 
     # ------------------------------------------------------------------
     # Public API
@@ -1651,64 +1430,21 @@ class CloudContinualLearner:
                             sample_metadata_by_id=sample_metadata_by_id,
                         )
 
-                retrain_mode = "fixed_split"
-                retrain_failure_reason = ""
-                returned_model_bytes: bytes | None = None
-                try:
-                    proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
-                        tmp_model,
-                        current_model_name=current_model_name,
-                        bundle_info=bundle_info,
-                        manifest=manifest,
-                        bundle_cache_path=bundle_cache_path,
-                        working_cache=working_cache,
-                        frame_dir=frame_dir,
-                        gt_annotations=gt_annotations,
-                        num_epoch=num_epoch,
-                        proxy_metrics_before=proxy_metrics_before,
-                        prepared_splitter=prepared_splitter,
-                        prepared_candidate=prepared_candidate,
-                        sample_metadata_by_id=sample_metadata_by_id,
-                        requires_trace_stable_rebuild=requires_trace_stable_rebuild,
-                    )
-                except RuntimeError as exc:
-                    if not self._should_fallback_from_fixed_split_error(exc):
-                        raise
-                    retrain_mode = "raw_fallback"
-                    retrain_failure_reason = str(exc)
-                    baseline_state = _snapshot_model_state(tmp_model)
-                    fallback_frame_ids = list(gt_annotations.keys())
-                    if not fallback_frame_ids:
-                        raise RuntimeError(
-                            "Fixed split retraining failed and no GT-annotated raw samples were available for full-image fallback."
-                        ) from exc
-                    logger.warning(
-                        "[FixedSplitCL] Falling back to full-image retraining for edge {} because fixed split failed: {}",
-                        edge_id,
-                        exc,
-                    )
-                    returned_model_bytes = self._retrain_edge_model_with_targets(
-                        frame_dir=frame_dir,
-                        frame_ids=fallback_frame_ids,
-                        gt_annotations=gt_annotations,
-                        num_epoch=num_epoch,
-                        model_name=current_model_name,
-                        edge_id=edge_id,
-                    )
-                    returned_state = torch.load(
-                        io.BytesIO(returned_model_bytes),
-                        map_location=self.device,
-                        weights_only=False,
-                    )
-                    tmp_model.load_state_dict(returned_state, strict=False)
-                    _set_detection_model_eval_mode(tmp_model)
-                    proxy_metrics_after = self._evaluate_fixed_split_proxy_map(
-                        tmp_model,
-                        frame_dir=frame_dir,
-                        gt_annotations=gt_annotations,
-                        model_name=current_model_name,
-                        sample_metadata_by_id=sample_metadata_by_id,
-                    )
+                proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
+                    tmp_model,
+                    current_model_name=current_model_name,
+                    bundle_info=bundle_info,
+                    manifest=manifest,
+                    bundle_cache_path=bundle_cache_path,
+                    working_cache=working_cache,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    num_epoch=num_epoch,
+                    proxy_metrics_before=proxy_metrics_before,
+                    prepared_splitter=prepared_splitter,
+                    prepared_candidate=prepared_candidate,
+                    sample_metadata_by_id=sample_metadata_by_id,
+                )
                 proxy_summary = _format_proxy_map_summary(
                     proxy_metrics_before,
                     proxy_metrics_after,
@@ -1745,59 +1481,30 @@ class CloudContinualLearner:
                             edge_id=edge_id,
                         )
                     ).decode("utf-8")
-                    if retrain_mode == "raw_fallback":
-                        fallback_message = (
-                            "Kept "
-                            f"{baseline_source} weights; rejected full-image fallback retraining because {rejection_reason}"
-                        )
-                    else:
-                        fallback_message = (
-                            f"Kept {baseline_source} weights; rejected retrained weights because {rejection_reason}"
-                        )
+                    fallback_message = (
+                        f"Kept {baseline_source} weights; rejected retrained weights because {rejection_reason}"
+                    )
                     if proxy_summary is not None:
                         fallback_message = f"{fallback_message}; {proxy_summary}"
                     else:
                         fallback_message = f"{fallback_message}; proxy_mAP@0.5 skipped"
-                    if retrain_mode == "raw_fallback":
-                        fallback_message = (
-                            "Fell back to full-image retraining because fixed split failed: "
-                            f"{retrain_failure_reason}; {fallback_message}"
-                        )
                     return True, encoded, fallback_message
 
-                if returned_model_bytes is not None:
-                    encoded = base64.b64encode(returned_model_bytes).decode("utf-8")
-                else:
-                    encoded = base64.b64encode(
-                        self._serialise_model_bytes(
-                            tmp_model,
-                            model_name=current_model_name,
-                            edge_id=edge_id,
-                        )
-                    ).decode("utf-8")
-                if retrain_mode == "raw_fallback":
-                    success_message = (
-                        "Fell back to full-image retraining because fixed split failed: "
-                        f"{retrain_failure_reason}; "
-                        + (
-                            f"proxy_mAP@0.5 {float(proxy_metrics_before.get('map') or 0.0):.4f} -> {float(proxy_metrics_after.get('map') or 0.0):.4f} "
-                            f"(delta={float((proxy_metrics_after.get('map') or 0.0)) - float((proxy_metrics_before.get('map') or 0.0)):+.4f}, "
-                            f"evaluated={int(proxy_metrics_after.get('evaluated_samples', 0))}, "
-                            f"skipped_empty_gt={int(proxy_metrics_after.get('skipped_empty_gt', 0))}, "
-                            f"skipped_missing_frame={int(proxy_metrics_after.get('skipped_missing_frame', 0))})"
-                            if proxy_summary is not None
-                            else "proxy_mAP@0.5 skipped"
-                        )
+                encoded = base64.b64encode(
+                    self._serialise_model_bytes(
+                        tmp_model,
+                        model_name=current_model_name,
+                        edge_id=edge_id,
                     )
-                else:
-                    success_message = (
-                        f"Fixed split retraining successful; {proxy_summary}"
-                        if proxy_summary is not None
-                        else "Fixed split retraining successful; proxy_mAP@0.5 skipped"
-                    )
+                ).decode("utf-8")
+                success_message = (
+                    f"Fixed split retraining successful; {proxy_summary}"
+                    if proxy_summary is not None
+                    else "Fixed split retraining successful; proxy_mAP@0.5 skipped"
+                )
                 logger.success(
                     "[FixedSplitCL] {} done for edge {} with {} samples ({} GT-annotated).",
-                    "Fallback full-image retraining" if retrain_mode == "raw_fallback" else "Retraining",
+                    "Retraining",
                     edge_id,
                     len(bundle_info["all_sample_ids"]),
                     len(gt_annotations),
@@ -1868,14 +1575,6 @@ class CloudContinualLearner:
         )
 
         return self._serialise_model_bytes(tmp_model, edge_id=edge_id)
-
-    @staticmethod
-    def _should_fallback_from_fixed_split_error(exc: Exception) -> bool:
-        message = str(exc)
-        return (
-            "Split retraining did not produce any finite optimization step" in message
-            or "empty/non-differentiable detector outputs" in message
-        )
 
     # ------------------------------------------------------------------
     # Internal helpers (original full-image retraining)

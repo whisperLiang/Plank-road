@@ -116,15 +116,13 @@ def prepare_split_training_cache(
     *,
     feature_provider: Callable[[str, dict[str, Any], dict[str, Any]], Any] | None = None,
     prefer_feature_rebuild: bool = False,
-    split_plan_override: dict[str, Any] | None = None,
-    skip_incompatible_feature_only_samples: bool = False,
 ) -> dict[str, Any]:
     manifest = load_training_bundle_manifest(bundle_root)
     os.makedirs(target_cache_path, exist_ok=True)
 
     all_sample_ids: list[str] = []
     drift_sample_ids: list[str] = []
-    split_plan = dict(split_plan_override or manifest.get("split_plan", {}))
+    split_plan = dict(manifest.get("split_plan", {}))
 
     for sample in manifest.get("samples", []):
         sample_id = str(sample["sample_id"])
@@ -175,12 +173,6 @@ def prepare_split_training_cache(
                     os.path.join(bundle_root, bundled_feature.replace("/", os.sep))
                 )
                 if not _payload_matches_split_plan(intermediate, split_plan):
-                    if skip_incompatible_feature_only_samples:
-                        logger.warning(
-                            "Skipping bundled sample {} because it only has a cached feature for a different split candidate and no raw sample is available for reconstruction.",
-                            sample_id,
-                        )
-                        continue
                     raise RuntimeError(
                         f"Sample {sample_id} requires server-side feature reconstruction, "
                         "but only a split-incompatible bundled feature is available."

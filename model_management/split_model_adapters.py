@@ -397,9 +397,9 @@ def build_split_training_loss(model: torch.nn.Module):
         def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
             head_outputs = _extract_anchor_detector_outputs(outputs)
             device = next(iter(head_outputs.values())).device
-            image_size = _infer_input_image_size(targets)
+            original_image_size, model_input_size = _infer_original_and_model_input_image_sizes(targets)
             dummy_image = torch.zeros(
-                (3, image_size[0], image_size[1]),
+                (3, model_input_size[0], model_input_size[1]),
                 dtype=torch.float32,
                 device=device,
             )
@@ -407,7 +407,8 @@ def build_split_training_loss(model: torch.nn.Module):
                 _build_anchor_training_target(
                     targets,
                     device=device,
-                    image_size=image_size,
+                    original_image_size=original_image_size,
+                    model_input_size=model_input_size,
                 )
             ]
             transformed_images, transformed_targets = model.transform([dummy_image], image_targets)
@@ -851,7 +852,7 @@ def _infer_input_image_size(targets: Any) -> tuple[int, int]:
     raise RuntimeError("Missing input image size metadata required for wrapper-model split retraining.")
 
 
-def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:
+def _infer_original_and_model_input_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:
     if not isinstance(targets, dict):
         raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
     split_meta = targets.get("_split_meta", {})
@@ -868,7 +869,6 @@ def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple
 
     if original_image_size is None and model_input_size is None:
         raise RuntimeError("Missing input image size metadata required for wrapper-model split retraining.")
-
     if original_image_size is None:
         original_image_size = model_input_size
     if model_input_size is None:
@@ -876,21 +876,37 @@ def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple
     return original_image_size, model_input_size
 
 
+def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:
+    return _infer_original_and_model_input_image_sizes(targets)
+
+
 def _build_anchor_training_target(
     targets: dict[str, Any],
     *,
     device: torch.device,
-    image_size: tuple[int, int],
+    original_image_size: tuple[int, int],
+    model_input_size: tuple[int, int],
 ) -> dict[str, torch.Tensor]:
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
-        image_size,
+        original_image_size,
     )
+    if original_image_size != model_input_size:
+        boxes = _project_boxes_to_model_input(
+            boxes,
+            original_image_size=original_image_size,
+            model_input_size=model_input_size,
+        )
+    boxes = _clamp_xyxy_boxes(boxes, model_input_size)
     labels = _as_labels_tensor(targets.get("labels"), device=device)
     if boxes.shape[0] != labels.shape[0]:
         count = min(int(boxes.shape[0]), int(labels.shape[0]))
         boxes = boxes[:count]
         labels = labels[:count]
+    if boxes.numel():
+        valid_geometry = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+        boxes = boxes[valid_geometry]
+        labels = labels[valid_geometry]
     return {
         "boxes": boxes,
         "labels": labels,
