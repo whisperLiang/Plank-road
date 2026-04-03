@@ -1140,3 +1140,68 @@ def test_prepare_split_training_cache_skips_incompatible_feature_only_samples(tm
 
     assert info["all_sample_ids"] == []
     assert info["drift_sample_ids"] == []
+
+
+def test_prepare_split_training_cache_skips_incompatible_feature_only_samples_during_candidate_retry(tmp_path):
+    bundle_root = tmp_path / "bundle"
+    (bundle_root / "features").mkdir(parents=True)
+    (bundle_root / "results").mkdir()
+
+    payload = _planned_payload()
+    torch.save({"intermediate": payload}, bundle_root / "features" / "sample-1.pt")
+    (bundle_root / "results" / "sample-1.json").write_text(
+        json.dumps({"boxes": [], "labels": [], "scores": []}),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "protocol_version": "edge-cl-bundle.v1",
+        "edge_id": 1,
+        "model": {"model_id": "model-a", "model_version": "0"},
+        "split_plan": _dummy_plan().to_dict(),
+        "drift_sample_ids": [],
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "frame_index": 1,
+                "confidence": 0.9,
+                "confidence_bucket": HIGH_CONFIDENCE,
+                "drift_flag": False,
+                "feature_relpath": "features/sample-1.pt",
+                "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
+                "result_relpath": "results/sample-1.json",
+                "metadata_relpath": "metadata/sample-1.json",
+                "raw_relpath": None,
+                "raw_bytes": 0,
+                "has_feature": True,
+                "has_raw_sample": False,
+                "split_config_id": "plan-1",
+                "model_id": "model-a",
+                "model_version": "0",
+                "input_image_size": [8, 8],
+                "input_tensor_shape": [1, 3, 8, 8],
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    }
+    (bundle_root / "bundle_manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+
+    retry_plan = _dummy_plan().to_dict()
+    retry_plan["candidate_id"] = "candidate-2"
+    retry_plan["split_index"] = 9
+    retry_plan["split_label"] = "layer9"
+    retry_plan["boundary_tensor_labels"] = ["layer9"]
+
+    info = prepare_split_training_cache(
+        str(bundle_root),
+        str(tmp_path / "prepared_cache"),
+        prefer_feature_rebuild=True,
+        split_plan_override=retry_plan,
+        skip_incompatible_feature_only_samples=True,
+    )
+
+    assert info["all_sample_ids"] == []
+    assert info["drift_sample_ids"] == []
