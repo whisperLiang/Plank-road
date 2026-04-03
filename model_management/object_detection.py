@@ -34,13 +34,15 @@ from torchvision import transforms
 from torchvision.ops import box_iou
 from mapcalc import calculate_map
 
-_FINAL_CLASS_AGNOSTIC_NMS_IOU_THRESHOLDS = {
-    "tinynext": 0.75,
-    "rfdetr": 0.75,
-}
-_FINAL_DUPLICATE_CONTAINMENT_THRESHOLDS = {
-    "tinynext": 0.9,
-    "rfdetr": 0.9,
+_FINAL_DUPLICATE_SUPPRESSION_THRESHOLDS = {
+    "tinynext": {
+        "same_label": (0.75, 0.9),
+        "cross_label": (0.75, 0.9),
+    },
+    "rfdetr": {
+        "same_label": (0.35, 0.75),
+        "cross_label": (0.5, 0.8),
+    },
 }
 
 
@@ -394,16 +396,21 @@ class Object_Detection:
             return 0.0
         return float(np.clip(np.mean(top_scores), 0.0, 1.0))
 
-    def _resolve_final_dedup_thresholds(self, threshold: float) -> tuple[float, float] | None:
+    def _resolve_final_dedup_thresholds(
+        self,
+        threshold: float,
+    ) -> dict[str, tuple[float, float]] | None:
         family = get_model_family(self.model_name)
-        iou_threshold = _FINAL_CLASS_AGNOSTIC_NMS_IOU_THRESHOLDS.get(family)
-        containment_threshold = _FINAL_DUPLICATE_CONTAINMENT_THRESHOLDS.get(family)
-        if iou_threshold is None or containment_threshold is None:
+        thresholds = _FINAL_DUPLICATE_SUPPRESSION_THRESHOLDS.get(family)
+        if thresholds is None:
             return None
         threshold_high = float(getattr(self, "threshold_high", threshold))
         if float(threshold) < threshold_high - 1e-6:
             return None
-        return float(iou_threshold), float(containment_threshold)
+        return {
+            str(key): (float(value[0]), float(value[1]))
+            for key, value in thresholds.items()
+        }
 
     @staticmethod
     def _compute_intersection_over_min_area(
@@ -446,7 +453,8 @@ class Object_Detection:
         resolved_thresholds = self._resolve_final_dedup_thresholds(float(threshold))
         if resolved_thresholds is None or len(scores) <= 1:
             return boxes, labels, scores
-        iou_threshold, containment_threshold = resolved_thresholds
+        same_label_thresholds = resolved_thresholds["same_label"]
+        cross_label_thresholds = resolved_thresholds["cross_label"]
 
         boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32)
         labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
@@ -469,10 +477,29 @@ class Object_Detection:
             candidate_box = boxes_tensor[index]
             if keep_indices:
                 kept_boxes = boxes_tensor[keep_indices]
+                kept_labels = labels_tensor[keep_indices]
                 candidate_iou = box_iou(candidate_box.unsqueeze(0), kept_boxes).squeeze(0)
-                suppressed_by_iou = bool(torch.any(candidate_iou >= iou_threshold))
                 containment = self._compute_intersection_over_min_area(candidate_box, kept_boxes)
-                suppressed_by_containment = bool(torch.any(containment >= containment_threshold))
+                same_label_mask = kept_labels == labels_tensor[index]
+                cross_label_mask = ~same_label_mask
+                suppressed_by_iou = False
+                suppressed_by_containment = False
+                if bool(torch.any(same_label_mask)):
+                    same_label_iou, same_label_containment = same_label_thresholds
+                    suppressed_by_iou = suppressed_by_iou or bool(
+                        torch.any(candidate_iou[same_label_mask] >= same_label_iou)
+                    )
+                    suppressed_by_containment = suppressed_by_containment or bool(
+                        torch.any(containment[same_label_mask] >= same_label_containment)
+                    )
+                if bool(torch.any(cross_label_mask)):
+                    cross_label_iou, cross_label_containment = cross_label_thresholds
+                    suppressed_by_iou = suppressed_by_iou or bool(
+                        torch.any(candidate_iou[cross_label_mask] >= cross_label_iou)
+                    )
+                    suppressed_by_containment = suppressed_by_containment or bool(
+                        torch.any(containment[cross_label_mask] >= cross_label_containment)
+                    )
                 if suppressed_by_iou or suppressed_by_containment:
                     continue
             keep_indices.append(index)

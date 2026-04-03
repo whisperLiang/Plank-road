@@ -199,6 +199,32 @@ def test_rfdetr_final_parse_deduplicates_cross_class_overlaps():
     assert scores == pytest.approx([0.91, 0.51])
 
 
+def test_rfdetr_final_parse_deduplicates_real_overlap_profile():
+    detector = Object_Detection.__new__(Object_Detection)
+    detector.model_name = "rfdetr_nano"
+    detector.threshold_high = 0.2
+
+    boxes, labels, scores = detector._parse_prediction_output(
+        [{
+            "boxes": torch.tensor(
+                [
+                    [1657.2, 548.8, 1693.3, 601.8],
+                    [1666.5, 555.2, 1698.0, 602.5],
+                    [1282.1, 334.3, 1304.7, 379.5],
+                ],
+                dtype=torch.float32,
+            ),
+            "labels": torch.tensor([10, 10, 1], dtype=torch.int64),
+            "scores": torch.tensor([0.2982, 0.2104, 0.2016], dtype=torch.float32),
+        }],
+        threshold=0.2,
+    )
+
+    assert boxes == [[1657.199951171875, 548.7999877929688, 1693.300048828125, 601.7999877929688], [1282.0999755859375, 334.29998779296875, 1304.699951171875, 379.5]]
+    assert labels == [10, 1]
+    assert scores == pytest.approx([0.2982, 0.2016])
+
+
 def test_rfdetr_infer_sample_deduplicates_final_high_confidence_boxes():
     detector = Object_Detection.__new__(Object_Detection)
     detector.model_name = "rfdetr_nano"
