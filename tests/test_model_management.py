@@ -22,6 +22,7 @@ from PIL import Image
 from model_management.model_info import model_lib, COCO_INSTANCE_CATEGORY_NAMES, classes
 from model_management.utils import (
     _clip_box_to_image,
+    _resolve_annotation_line_width,
     cal_iou,
     get_offloading_region,
     get_offloading_image,
@@ -212,6 +213,28 @@ class TestDrawDetection:
         blank = np.zeros_like(sample_bgr_frame)
         result = draw_detection(blank, [[30, 30, 120, 120]], ["car"], [0.95])
         assert result[24:40, 30:110].sum() > 0
+
+    def test_draw_detection_uses_compact_annotation_line_width(self, sample_bgr_frame, monkeypatch):
+        captured = {}
+
+        class DummyAnnotator:
+            def __init__(self, im, line_width=None, font_size=None, font="Arial.ttf", pil=False, example="abc"):
+                captured["line_width"] = line_width
+                self._im = im
+
+            def box_label(self, box, label="", color=(128, 128, 128), txt_color=(255, 255, 255)):
+                return None
+
+            def result(self):
+                return self._im
+
+        monkeypatch.setattr("model_management.utils.Annotator", DummyAnnotator)
+
+        result = draw_detection(sample_bgr_frame, [[30, 30, 120, 120]], ["car"], [0.95])
+
+        assert result.shape == sample_bgr_frame.shape
+        assert captured["line_width"] == _resolve_annotation_line_width(sample_bgr_frame.shape)
+        assert captured["line_width"] == 1
 
     def test_draw_detection_skips_invalid_boxes(self, sample_bgr_frame):
         blank = np.zeros_like(sample_bgr_frame)

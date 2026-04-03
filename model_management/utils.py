@@ -129,11 +129,23 @@ def _resolve_color_index(label, label_text):
     return sum(ord(char) for char in label_text) % 20
 
 
+def _resolve_annotation_line_width(image_shape):
+    if image_shape is None or len(image_shape) < 2:
+        return 1
+    min_dim = min(int(image_shape[0]), int(image_shape[1]))
+    return max(1, min(2, int(round(min_dim / 1400.0))))
+
+
 def draw_detection(img, pred_boxes, pred_cls, pred_score):
     cached_img = np.ascontiguousarray(img.copy())
     if pred_boxes is None or pred_cls is None:
         return cached_img
-    annotator = Annotator(cached_img, pil=False, example="abc")
+    annotator = Annotator(
+        cached_img,
+        pil=False,
+        example="abc",
+        line_width=_resolve_annotation_line_width(cached_img.shape),
+    )
     for i in range(len(pred_boxes)):
         if i >= len(pred_cls):
             break
