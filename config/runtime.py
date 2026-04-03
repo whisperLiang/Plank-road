@@ -92,8 +92,8 @@ class ContinualLearningConfig(ConfigSection):
     split_learning_rate: float = 1e-3
     wrapper_fixed_split_learning_rate: float = 3e-5
     min_wrapper_fixed_split_num_epoch: int = 10
-    rfdetr_fixed_split_learning_rate: float = 1e-6
-    min_rfdetr_fixed_split_num_epoch: int = 2
+    rfdetr_fixed_split_learning_rate: float = 1e-4
+    min_rfdetr_fixed_split_num_epoch: int = 5
     max_concurrent_jobs: int = 2
 
 

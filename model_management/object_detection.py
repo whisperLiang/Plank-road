@@ -23,6 +23,7 @@ from model_management.model_zoo import (
 )
 from model_management.split_model_adapters import (
     build_split_runtime_sample_input,
+    get_split_runtime_input_resize_mode,
     get_split_runtime_model,
     postprocess_split_runtime_output,
     prepare_split_runtime_input,
@@ -231,6 +232,7 @@ class Object_Detection:
         with self.model_lock:
             if splitter is not None:
                 splitter_input = prepare_split_runtime_input(self.model, img, device=device)
+                input_resize_mode = get_split_runtime_input_resize_mode(self.model)
                 if isinstance(splitter_input, torch.Tensor):
                     input_tensor_shape = [int(dim) for dim in splitter_input.shape]
                 elif (
@@ -269,7 +271,7 @@ class Object_Detection:
                 input_resize_mode=input_resize_mode,
             )
 
-        confidence = float(np.mean(pred_score)) if len(pred_score) else 0.0
+        confidence = self._summarize_detection_confidence(pred_score)
         high_keep_indices = [index for index, score in enumerate(pred_score) if score > self.threshold_high]
         if not high_keep_indices:
             detection_boxes = []
@@ -340,6 +342,18 @@ class Object_Detection:
     ) -> tuple[np.ndarray, tuple[int, int], bool]:
         original_image_size = tuple(int(value) for value in img.shape[:2])
         return img, original_image_size, False
+
+    def _summarize_detection_confidence(self, scores: list[float] | None) -> float:
+        if not scores:
+            return 0.0
+        top_scores = sorted((float(score) for score in scores), reverse=True)[:3]
+        if not top_scores:
+            return 0.0
+        summary = float(np.mean(top_scores))
+        threshold_high = float(getattr(self, "threshold_high", 0.0) or 0.0)
+        if threshold_high > 0.0:
+            summary = summary / threshold_high
+        return float(np.clip(summary, 0.0, 1.0))
 
     def _parse_prediction_output(self, res, threshold):
         if isinstance(res, tuple):

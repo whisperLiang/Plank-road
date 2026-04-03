@@ -206,6 +206,18 @@ def build_split_runtime_sample_input(
     return [torch.rand(3, height, width, device=device)]
 
 
+def get_split_runtime_input_resize_mode(model: torch.nn.Module) -> str | None:
+    if isinstance(model, (YOLODetectionModel, RTDETRDetectionModel)):
+        return "letterbox"
+    if isinstance(model, RFDETRDetectionModel):
+        return "direct_resize"
+    if _is_anchor_detector(model):
+        fixed_size = getattr(getattr(model, "transform", None), "fixed_size", None)
+        if isinstance(fixed_size, (list, tuple)) and len(fixed_size) >= 2:
+            return "direct_resize"
+    return None
+
+
 def prepare_split_runtime_input(
     model: torch.nn.Module,
     frame: np.ndarray,
@@ -398,6 +410,7 @@ def build_split_training_loss(model: torch.nn.Module):
             head_outputs = _extract_anchor_detector_outputs(outputs)
             device = next(iter(head_outputs.values())).device
             original_image_size, model_input_size = _infer_original_and_model_input_image_sizes(targets)
+            resize_mode = _resolve_anchor_resize_mode(model, targets)
             dummy_image = torch.zeros(
                 (3, model_input_size[0], model_input_size[1]),
                 dtype=torch.float32,
@@ -409,6 +422,7 @@ def build_split_training_loss(model: torch.nn.Module):
                     device=device,
                     original_image_size=original_image_size,
                     model_input_size=model_input_size,
+                    resize_mode=resize_mode,
                 )
             ]
             transformed_images, transformed_targets = model.transform([dummy_image], image_targets)
@@ -886,6 +900,7 @@ def _build_anchor_training_target(
     device: torch.device,
     original_image_size: tuple[int, int],
     model_input_size: tuple[int, int],
+    resize_mode: str = "letterbox",
 ) -> dict[str, torch.Tensor]:
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
@@ -896,6 +911,7 @@ def _build_anchor_training_target(
             boxes,
             original_image_size=original_image_size,
             model_input_size=model_input_size,
+            resize_mode=resize_mode,
         )
     boxes = _clamp_xyxy_boxes(boxes, model_input_size)
     labels = _as_labels_tensor(targets.get("labels"), device=device)
@@ -978,6 +994,7 @@ def _project_boxes_to_model_input(
     *,
     original_image_size: tuple[int, int],
     model_input_size: tuple[int, int],
+    resize_mode: str = "letterbox",
 ) -> torch.Tensor:
     if boxes_xyxy.numel() == 0:
         return boxes_xyxy.reshape(0, 4)
@@ -986,6 +1003,12 @@ def _project_boxes_to_model_input(
     model_height, model_width = model_input_size
     if orig_height <= 0 or orig_width <= 0 or model_height <= 0 or model_width <= 0:
         raise RuntimeError("Image sizes must be positive for wrapper-model split retraining.")
+
+    if str(resize_mode).strip().lower() == "direct_resize":
+        projected = boxes_xyxy.clone()
+        projected[..., 0::2] = projected[..., 0::2] * (float(model_width) / float(orig_width))
+        projected[..., 1::2] = projected[..., 1::2] * (float(model_height) / float(orig_height))
+        return _clamp_xyxy_boxes(projected, model_input_size)
 
     scale = min(float(model_width) / float(orig_width), float(model_height) / float(orig_height))
     resized_width = float(orig_width) * scale
@@ -997,6 +1020,14 @@ def _project_boxes_to_model_input(
     projected[..., 0::2] = projected[..., 0::2] * scale + pad_x
     projected[..., 1::2] = projected[..., 1::2] * scale + pad_y
     return _clamp_xyxy_boxes(projected, model_input_size)
+
+
+def _resolve_anchor_resize_mode(model: torch.nn.Module, targets: Any) -> str:
+    split_meta = targets.get("_split_meta", {}) if isinstance(targets, dict) else {}
+    metadata_mode = str(split_meta.get("input_resize_mode", "")).strip().lower()
+    if metadata_mode in {"direct_resize", "letterbox"}:
+        return metadata_mode
+    return get_split_runtime_input_resize_mode(model) or "letterbox"
 
 
 def _prepare_coco80_targets(
@@ -1112,8 +1143,18 @@ def _build_rfdetr_training_labels(
         original_image_size = image_size
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
-        image_size if original_image_size != image_size else original_image_size,
+        original_image_size,
     )
+    resize_mode = str(split_meta.get("input_resize_mode", "")).strip().lower()
+    if resize_mode not in {"direct_resize", "letterbox"}:
+        resize_mode = "direct_resize"
+    if original_image_size != image_size:
+        boxes = _project_boxes_to_model_input(
+            boxes,
+            original_image_size=original_image_size,
+            model_input_size=image_size,
+            resize_mode=resize_mode,
+        )
     boxes = _clamp_xyxy_boxes(boxes, image_size)
     labels = _as_labels_tensor(targets.get("labels"), device=device)
     if boxes.shape[0] != labels.shape[0]:

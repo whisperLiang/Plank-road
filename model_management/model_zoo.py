@@ -1482,7 +1482,7 @@ def get_detection_thresholds(model_name: str) -> tuple[float, float]:
     if family == "rfdetr":
         return 0.05, 0.20
     if family == "tinynext":
-        return 0.02, 0.10
+        return 0.02, 0.15
     return 0.2, 0.6
 
 

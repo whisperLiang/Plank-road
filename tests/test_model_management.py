@@ -48,8 +48,10 @@ from model_management.model_zoo import (
     set_model_detection_thresholds,
 )
 from model_management.split_model_adapters import (
+    _build_anchor_training_target,
     _build_rfdetr_training_labels,
     _build_ultralytics_training_batch,
+    get_split_runtime_input_resize_mode,
 )
 
 
@@ -87,7 +89,7 @@ class TestModelInfo:
 
     def test_model_specific_detection_thresholds(self):
         assert get_detection_thresholds("rfdetr_nano") == (0.05, 0.2)
-        assert get_detection_thresholds("tinynext_s") == (0.02, 0.10)
+        assert get_detection_thresholds("tinynext_s") == (0.02, 0.15)
         assert get_detection_thresholds("yolov8n") == (0.2, 0.6)
 
     def test_model_paths_are_local_relative_paths(self):
@@ -820,6 +822,30 @@ class TestModelZoo:
 
         assert labels[0]["labels"].tolist() == [13, 90]
 
+    def test_rfdetr_training_labels_project_direct_resize_geometry(self):
+        labels = _build_rfdetr_training_labels(
+            {
+                "boxes": [[192.0, 270.0, 960.0, 810.0]],
+                "labels": [3],
+                "_split_meta": {
+                    "input_image_size": [1080, 1920],
+                    "input_tensor_shape": [1, 3, 384, 384],
+                    "input_resize_mode": "direct_resize",
+                },
+            },
+            device=torch.device("cpu"),
+            num_classes=91,
+        )
+
+        assert labels[0]["labels"].tolist() == [3]
+        assert labels[0]["boxes"].shape == (1, 4)
+        assert labels[0]["boxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.5])
+
+    def test_rfdetr_split_runtime_resize_mode_is_direct_resize(self):
+        model = build_detection_model("rfdetr_nano", pretrained=False, device="cpu")
+
+        assert get_split_runtime_input_resize_mode(model) == "direct_resize"
+
     def test_ultralytics_training_batch_ignores_stale_resize_metadata(self):
         batch = _build_ultralytics_training_batch(
             {
@@ -854,6 +880,21 @@ class TestModelZoo:
         assert tuple(batch["img"].shape) == (1, 3, 640, 640)
         assert batch["bboxes"].shape == (1, 4)
         assert batch["bboxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.45])
+
+    def test_anchor_training_target_uses_direct_resize_for_fixed_size_anchor_detectors(self):
+        target = _build_anchor_training_target(
+            {
+                "boxes": [[64.0, 96.0, 320.0, 384.0]],
+                "labels": [3],
+            },
+            device=torch.device("cpu"),
+            original_image_size=(480, 640),
+            model_input_size=(320, 320),
+            resize_mode="direct_resize",
+        )
+
+        assert target["boxes"].shape == (1, 4)
+        assert target["boxes"][0].tolist() == pytest.approx([32.0, 64.0, 160.0, 256.0])
 
     def test_build_yolo26_detector_from_yaml_when_pretrained_false(self):
         model = build_detection_model("yolo26n", pretrained=False, device="cpu")

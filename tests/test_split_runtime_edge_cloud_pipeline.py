@@ -120,6 +120,14 @@ def test_large_inference_accepts_threshold_override():
     assert scores == [0.42]
 
 
+def test_detection_confidence_uses_top_scores_and_model_threshold():
+    detector = Object_Detection.__new__(Object_Detection)
+    detector.threshold_high = 0.15
+
+    assert detector._summarize_detection_confidence([0.62, 0.18, 0.15, 0.09]) == pytest.approx(1.0)
+    assert detector._summarize_detection_confidence([0.09, 0.08, 0.07]) == pytest.approx((0.09 + 0.08 + 0.07) / 3.0 / 0.15)
+
+
 def test_prepare_runtime_frame_preserves_original_geometry():
     detector = Object_Detection.__new__(Object_Detection)
 
@@ -326,7 +334,7 @@ def test_cloud_learner_training_scope_serializes_same_edge_but_allows_other_edge
     assert learner.training_queue_state() == (0, 2)
 
 
-def test_wrapper_fixed_split_hparams_use_conservative_rfdetr_defaults():
+def test_wrapper_fixed_split_hparams_use_official_scale_rfdetr_defaults():
     config = SimpleNamespace(
         edge_model_name="rfdetr_nano",
         continual_learning=SimpleNamespace(),
@@ -346,8 +354,8 @@ def test_wrapper_fixed_split_hparams_use_conservative_rfdetr_defaults():
         requested_num_epoch=2,
     )
 
-    assert rfdetr_epochs == 2
-    assert rfdetr_lr == pytest.approx(1e-6)
+    assert rfdetr_epochs == 5
+    assert rfdetr_lr == pytest.approx(1e-4)
     assert yolo_epochs == 10
     assert yolo_lr == pytest.approx(3e-5)
 
@@ -418,7 +426,7 @@ def test_calibrate_tinynext_proxy_thresholds_picks_best_near_default_threshold(m
 
     def fake_evaluate(_model, **kwargs):
         high = round(float(kwargs["threshold_high"]), 3)
-        if high == pytest.approx(0.098):
+        if high == pytest.approx(0.148):
             return {
                 "map": 0.1905,
                 "evaluated_samples": 1,
@@ -428,7 +436,7 @@ def test_calibrate_tinynext_proxy_thresholds_picks_best_near_default_threshold(m
                 "nonempty_predictions": 1,
                 "total_prediction_boxes": 42,
             }
-        if high == pytest.approx(0.094):
+        if high == pytest.approx(0.144):
             return {
                 "map": 0.1905,
                 "evaluated_samples": 1,
@@ -438,7 +446,7 @@ def test_calibrate_tinynext_proxy_thresholds_picks_best_near_default_threshold(m
                 "nonempty_predictions": 1,
                 "total_prediction_boxes": 45,
             }
-        if high == pytest.approx(0.092):
+        if high == pytest.approx(0.142):
             return {
                 "map": 0.1905,
                 "evaluated_samples": 1,
@@ -468,10 +476,10 @@ def test_calibrate_tinynext_proxy_thresholds_picks_best_near_default_threshold(m
         model_name="tinynext_s",
     )
 
-    assert initial_high == pytest.approx(0.10)
-    assert calibrated_high == pytest.approx(0.098)
+    assert initial_high == pytest.approx(0.15)
+    assert calibrated_high == pytest.approx(0.148)
     assert metrics["map"] == pytest.approx(0.1905)
-    assert get_model_detection_thresholds(model, "tinynext_s") == pytest.approx((0.02, 0.098))
+    assert get_model_detection_thresholds(model, "tinynext_s") == pytest.approx((0.02, 0.148))
 
 
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)
@@ -787,6 +795,33 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
         [
             {
                 "map": 0.4,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
+            {
+                "map": 0.1,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
+            {
+                "map": 0.1,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
+            {
+                "map": 0.1,
                 "evaluated_samples": 1,
                 "skipped_empty_gt": 0,
                 "skipped_missing_frame": 0,
@@ -1193,7 +1228,7 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
 
     monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
 
-    epoch_weights = iter([0.9, 0.2])
+    epoch_weights = iter([0.9, 0.2, 0.15, 0.1, 0.05])
     retrain_calls = []
 
     def fake_universal_split_retrain(*, model, num_epoch, **kwargs):
@@ -1224,7 +1259,7 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
         num_epoch=2,
     )
 
-    assert retrain_calls == [1, 1]
+    assert retrain_calls == [1, 1, 1, 1, 1]
     assert success is True
     assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message
     returned_state = torch.load(

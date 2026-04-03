@@ -363,10 +363,22 @@ def _calibrate_tinynext_proxy_thresholds(
     current_low, current_high = get_model_detection_thresholds(model, model_name)
     _, default_high = get_detection_thresholds(model_name)
     candidate_highs = sorted(
-        {
-            round(max(float(current_low), float(current_high) + delta), 3)
-            for delta in (-0.02, -0.01, -0.008, -0.006, -0.004, -0.002, 0.0, 0.002, 0.004, 0.006, 0.008, 0.01, 0.02)
-        }
+        set(
+            round(max(float(current_low), candidate), 3)
+            for candidate in (
+                float(default_high),
+                0.08,
+                0.10,
+                0.12,
+                0.14,
+                0.15,
+                0.16,
+                0.18,
+                0.20,
+                0.22,
+                *(float(current_high) + delta for delta in (-0.03, -0.02, -0.015, -0.01, -0.005, -0.004, -0.002, 0.0, 0.002, 0.004, 0.005, 0.01, 0.015, 0.02, 0.03)),
+            )
+        )
     )
 
     best_high = float(current_high)
@@ -504,12 +516,12 @@ class CloudContinualLearner:
             if cl_cfg else 10
         )
         self.rfdetr_fixed_split_learning_rate = (
-            float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-6))
-            if cl_cfg else 1e-6
+            float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
+            if cl_cfg else 1e-4
         )
         self.min_rfdetr_fixed_split_num_epoch = (
-            int(getattr(cl_cfg, "min_rfdetr_fixed_split_num_epoch", 2))
-            if cl_cfg else 2
+            int(getattr(cl_cfg, "min_rfdetr_fixed_split_num_epoch", 5))
+            if cl_cfg else 5
         )
 
         # Dynamic Activation Sparsity (SURGEON) config
@@ -1199,13 +1211,29 @@ class CloudContinualLearner:
             **split_retrain_kwargs,
             num_epoch=effective_num_epoch,
         )
-        proxy_metrics_after = self._evaluate_fixed_split_proxy_map(
-            model,
-            frame_dir=frame_dir,
-            gt_annotations=gt_annotations,
-            model_name=current_model_name,
-            sample_metadata_by_id=sample_metadata_by_id,
-        )
+        if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
+            proxy_metrics_after, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                device=self.device,
+                model_name=current_model_name,
+            )
+            if abs(calibrated_high - initial_high) > 1e-6:
+                logger.info(
+                    "[FixedSplitCL] Calibrated {} threshold_high {} -> {} after split retrain.",
+                    current_model_name,
+                    initial_high,
+                    calibrated_high,
+                )
+        else:
+            proxy_metrics_after = self._evaluate_fixed_split_proxy_map(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                model_name=current_model_name,
+                sample_metadata_by_id=sample_metadata_by_id,
+            )
         return proxy_metrics_after, baseline_state
 
     # ------------------------------------------------------------------
@@ -1380,13 +1408,29 @@ class CloudContinualLearner:
                     bundle_info["all_sample_ids"],
                 )
 
-                proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
-                    tmp_model,
-                    frame_dir=frame_dir,
-                    gt_annotations=gt_annotations,
-                    model_name=current_model_name,
-                    sample_metadata_by_id=sample_metadata_by_id,
-                )
+                if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
+                    proxy_metrics_before, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                        tmp_model,
+                        frame_dir=frame_dir,
+                        gt_annotations=gt_annotations,
+                        device=self.device,
+                        model_name=current_model_name,
+                    )
+                    if abs(calibrated_high - initial_high) > 1e-6:
+                        logger.info(
+                            "[FixedSplitCL] Calibrated {} threshold_high {} -> {} before split retrain.",
+                            current_model_name,
+                            initial_high,
+                            calibrated_high,
+                        )
+                else:
+                    proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
+                        tmp_model,
+                        frame_dir=frame_dir,
+                        gt_annotations=gt_annotations,
+                        model_name=current_model_name,
+                        sample_metadata_by_id=sample_metadata_by_id,
+                    )
                 is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
 
                 if (
@@ -1422,13 +1466,29 @@ class CloudContinualLearner:
                                 requires_trace_stable_rebuild=requires_trace_stable_rebuild,
                             )
                         )
-                        proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
-                            tmp_model,
-                            frame_dir=frame_dir,
-                            gt_annotations=gt_annotations,
-                            model_name=current_model_name,
-                            sample_metadata_by_id=sample_metadata_by_id,
-                        )
+                        if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
+                            proxy_metrics_before, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                                tmp_model,
+                                frame_dir=frame_dir,
+                                gt_annotations=gt_annotations,
+                                device=self.device,
+                                model_name=current_model_name,
+                            )
+                            if abs(calibrated_high - initial_high) > 1e-6:
+                                logger.info(
+                                    "[FixedSplitCL] Calibrated {} threshold_high {} -> {} after resetting to native pretrained weights.",
+                                    current_model_name,
+                                    initial_high,
+                                    calibrated_high,
+                                )
+                        else:
+                            proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
+                                tmp_model,
+                                frame_dir=frame_dir,
+                                gt_annotations=gt_annotations,
+                                model_name=current_model_name,
+                                sample_metadata_by_id=sample_metadata_by_id,
+                            )
 
                 proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
                     tmp_model,
