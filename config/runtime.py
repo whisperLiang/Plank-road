@@ -114,6 +114,8 @@ class DASConfig(ConfigSection):
     enabled: bool = False
     bn_only: bool = False
     probe_samples: int = 10
+    strategy: str = "tgi"
+    use_spectral_entropy: bool = False
 
 
 @dataclass
@@ -266,6 +268,16 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.continual_learning.max_concurrent_jobs",
         int(config.server.continual_learning.max_concurrent_jobs),
     )
+    _validate_positive(
+        "server.das.probe_samples",
+        int(config.server.das.probe_samples),
+    )
+    das_strategy = str(config.server.das.strategy).strip().lower()
+    if das_strategy not in {"tgi", "entropy"}:
+        raise ValueError(
+            "server.das.strategy must be one of {'tgi', 'entropy'}, "
+            f"got {config.server.das.strategy!r}"
+        )
 
     if not str(config.client.server_ip).strip():
         raise ValueError("client.server_ip must be a non-empty host:port string")

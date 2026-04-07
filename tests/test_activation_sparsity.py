@@ -394,6 +394,24 @@ class TestDASTrainer:
         assert isinstance(mem_dict, dict)
         assert mem_sum > 0
 
+    def test_entropy_strategy_enables_entropy_tracking(self):
+        trainer = DASTrainer(_small_cnn(), strategy="entropy", device="cpu")
+        assert trainer.strategy == "entropy"
+        assert trainer.use_spectral_entropy is True
+        assert all(mod.track_spectral_entropy for mod in trainer._das_modules().values())
+
+    def test_refresh_pruning_ratios_from_entropy(self):
+        trainer = DASTrainer(_small_cnn(), strategy="entropy", device="cpu")
+        x = torch.randn(2, 3, 8, 8)
+        trainer.model(x)
+
+        ratios = trainer.refresh_pruning_ratios_from_entropy()
+
+        assert isinstance(ratios, dict)
+        assert ratios
+        for value in ratios.values():
+            assert 0.0 <= value <= 1.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 7.  apply_das_to_model / apply_das_to_tail
@@ -406,6 +424,12 @@ class TestApplyDAS:
         trainer = apply_das_to_model(model, device="cpu")
         assert isinstance(trainer, DASTrainer)
         assert trainer._n_conv >= 1
+
+    def test_apply_das_to_model_entropy_strategy(self):
+        model = _small_cnn()
+        trainer = apply_das_to_model(model, strategy="entropy", device="cpu")
+        assert trainer.strategy == "entropy"
+        assert trainer.use_spectral_entropy is True
 
     def test_apply_das_to_tail(self):
         """Apply DAS only to a sub-module."""

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from config import load_runtime_config
 
 
@@ -67,3 +69,44 @@ server:
     config = load_runtime_config(config_path)
 
     assert config.client.final_detection_threshold == 0.65
+
+
+def test_load_runtime_config_reads_das_strategy(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  das:
+    enabled: true
+    strategy: entropy
+    probe_samples: 4
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.das.enabled is True
+    assert config.server.das.strategy == "entropy"
+    assert config.server.das.probe_samples == 4
+
+
+def test_load_runtime_config_rejects_invalid_das_strategy(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  das:
+    strategy: invalid
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="server.das.strategy"):
+        load_runtime_config(config_path)

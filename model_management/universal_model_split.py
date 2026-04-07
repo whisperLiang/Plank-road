@@ -578,6 +578,7 @@ def universal_split_retrain(
     das_enabled: bool = False,
     das_bn_only: bool = False,
     das_probe_samples: int = 10,
+    das_strategy: str = "tgi",
     das_use_spectral_entropy: bool = False,
     **_: Any,
 ) -> list[float]:
@@ -612,6 +613,12 @@ def universal_split_retrain(
                 chosen = splitter.split(layer_index=split_layer)
     splitter.freeze_head(chosen)
     splitter.unfreeze_tail(chosen)
+    das_strategy = str(das_strategy).strip().lower()
+    if das_use_spectral_entropy:
+        das_strategy = "entropy"
+    if das_strategy not in {"tgi", "entropy"}:
+        raise ValueError(f"Unsupported DAS strategy: {das_strategy!r}")
+    das_use_entropy = das_strategy == "entropy"
 
     def _infer_das_tail_modules() -> list[str]:
         _, graph = splitter._ensure_ready()
@@ -641,7 +648,8 @@ def universal_split_retrain(
                 model,
                 tail_modules,
                 bn_only=das_bn_only,
-                use_spectral_entropy=das_use_spectral_entropy,
+                strategy=das_strategy,
+                use_spectral_entropy=das_use_entropy,
                 device=device,
             )
         else:
@@ -649,7 +657,8 @@ def universal_split_retrain(
                 model,
                 bn_only=das_bn_only,
                 probe_samples=das_probe_samples,
-                use_spectral_entropy=das_use_spectral_entropy,
+                strategy=das_strategy,
+                use_spectral_entropy=das_use_entropy,
                 device=device,
             )
         das_trainer.probe_samples = max(1, int(das_probe_samples))
@@ -661,7 +670,7 @@ def universal_split_retrain(
 
     for _ in range(num_epoch):
         epoch_loss = 0.0
-        if das_trainer is not None and not das_use_spectral_entropy:
+        if das_trainer is not None and not das_use_entropy:
             probe_count = min(len(all_indices), int(das_trainer.probe_samples))
             probe_indices = (
                 random.sample(list(all_indices), probe_count)
@@ -718,7 +727,7 @@ def universal_split_retrain(
             else:
                 averaged = {}
             das_trainer.activate_sparsity(averaged)
-        elif das_trainer is not None and das_use_spectral_entropy:
+        elif das_trainer is not None and das_use_entropy:
             # Start dense; update ratios from each batch's forward pass.
             das_trainer.deactivate_sparsity()
 
@@ -838,8 +847,8 @@ def universal_split_retrain(
                 optimizer=optimizer,
                 candidate=chosen,
             )
-            if das_trainer is not None and das_use_spectral_entropy:
-                ratios = das_trainer.refresh_pruning_ratios_from_spectral_entropy()
+            if das_trainer is not None and das_use_entropy:
+                ratios = das_trainer.refresh_pruning_ratios_from_entropy()
                 das_trainer.activate_sparsity(ratios)
             if not bool(torch.isfinite(loss).item()):
                 if optimizer is not None:

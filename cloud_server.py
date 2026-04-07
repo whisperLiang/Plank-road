@@ -529,6 +529,9 @@ class CloudContinualLearner:
         self.das_enabled = bool(getattr(das_cfg, "enabled", False)) if das_cfg else False
         self.das_bn_only = bool(getattr(das_cfg, "bn_only", False)) if das_cfg else False
         self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
+        self.das_strategy = str(getattr(das_cfg, "strategy", "tgi")) if das_cfg else "tgi"
+        if das_cfg and bool(getattr(das_cfg, "use_spectral_entropy", False)):
+            self.das_strategy = "entropy"
 
         self._edge_locks_guard = threading.Lock()
         self._edge_locks: dict[str, threading.Lock] = {}
@@ -1177,6 +1180,7 @@ class CloudContinualLearner:
             "das_enabled": self.das_enabled,
             "das_bn_only": self.das_bn_only,
             "das_probe_samples": self.das_probe_samples,
+            "das_strategy": self.das_strategy,
             "splitter": prepared_splitter,
             "chosen_candidate": prepared_candidate,
         }
@@ -1632,6 +1636,7 @@ class CloudContinualLearner:
             das_enabled=self.das_enabled,
             das_bn_only=self.das_bn_only,
             das_probe_samples=self.das_probe_samples,
+            das_strategy=self.das_strategy,
         )
 
         return self._serialise_model_bytes(tmp_model, edge_id=edge_id)

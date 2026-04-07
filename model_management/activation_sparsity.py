@@ -665,6 +665,7 @@ class DASTrainer:
         bn_only: bool = False,
         tau: float = 0.5,
         probe_samples: int = 10,
+        strategy: str = "tgi",
         use_spectral_entropy: bool = False,
         device: str | torch.device = "cpu",
     ):
@@ -674,7 +675,12 @@ class DASTrainer:
         self.probe_samples = probe_samples
         self.device = torch.device(device)
         self._pruning_ratios: dict[str, float] = {}
-        self.use_spectral_entropy = use_spectral_entropy
+        self.strategy = str(strategy).strip().lower()
+        if use_spectral_entropy:
+            self.strategy = "entropy"
+        if self.strategy not in {"tgi", "entropy"}:
+            raise ValueError(f"Unsupported DAS strategy: {strategy!r}")
+        self.use_spectral_entropy = self.strategy == "entropy"
 
         # Replace modules with AutoFreeze versions
         self._n_conv = self._replace_conv(model, model.__class__.__name__)
@@ -781,17 +787,24 @@ class DASTrainer:
             scores[key] = float(entropy) * float(mi)
         return scores
 
-    def refresh_pruning_ratios_from_spectral_entropy(self) -> dict[str, float]:
-        """Compute pruning ratios from spectral entropy (no gradients)."""
-        scores = self._spectral_entropy_scores()
+    def _importance_scores_to_pruning_ratios(self, scores: dict[str, float]) -> dict[str, float]:
         if not scores:
             self._pruning_ratios = {}
             return {}
         max_score = max(scores.values()) or 1.0
-        pruning_ratios = {k: max(0.0, 1.0 - v / max_score) for k, v in scores.items()}
+        pruning_ratios = {key: max(0.0, 1.0 - value / max_score) for key, value in scores.items()}
         self._pruning_ratios = pruning_ratios
-        logger.debug("[DAS] Computed pruning ratios from spectral entropy for {} layers.", len(pruning_ratios))
         return pruning_ratios
+
+    def refresh_pruning_ratios_from_entropy(self) -> dict[str, float]:
+        """Compute pruning ratios from entropy-based importance (no gradients)."""
+        pruning_ratios = self._importance_scores_to_pruning_ratios(self._spectral_entropy_scores())
+        logger.debug("[DAS] Computed pruning ratios from entropy for {} layers.", len(pruning_ratios))
+        return pruning_ratios
+
+    def refresh_pruning_ratios_from_spectral_entropy(self) -> dict[str, float]:
+        """Backward-compatible alias for entropy-based DAS ratios."""
+        return self.refresh_pruning_ratios_from_entropy()
 
     # ------------------------------------------------------------------
     # Activation-size profiling (for TGI memory importance)
@@ -898,14 +911,9 @@ class DASTrainer:
         tgi = compute_tgi(params, grads, layer_names, layer_mems, mem_sum)
 
         # Normalise → pruning ratios
-        if tgi:
-            max_tgi = max(tgi.values()) or 1.0
-            pruning_ratios = {k: max(0.0, 1.0 - v / max_tgi) for k, v in tgi.items()}
-        else:
-            pruning_ratios = {}
+        pruning_ratios = self._importance_scores_to_pruning_ratios(tgi)
 
         self.model.zero_grad()
-        self._pruning_ratios = pruning_ratios
 
         logger.debug("[DAS] Computed pruning ratios for {} layers.", len(pruning_ratios))
         return pruning_ratios
@@ -960,14 +968,9 @@ class DASTrainer:
         layer_mems = [mem_dict.get(n, 1.0) for n in layer_names]
         tgi = compute_tgi(params, grads, layer_names, layer_mems, mem_sum)
 
-        if tgi:
-            max_tgi = max(tgi.values()) or 1.0
-            pruning_ratios = {k: max(0.0, 1.0 - v / max_tgi) for k, v in tgi.items()}
-        else:
-            pruning_ratios = {}
+        pruning_ratios = self._importance_scores_to_pruning_ratios(tgi)
 
         self.model.zero_grad()
-        self._pruning_ratios = pruning_ratios
         logger.debug("[DAS] Computed pruning ratios (probe_with_targets) for {} layers.",
                      len(pruning_ratios))
         return pruning_ratios
@@ -1057,6 +1060,7 @@ def apply_das_to_model(
     *,
     bn_only: bool = False,
     probe_samples: int = 10,
+    strategy: str = "tgi",
     use_spectral_entropy: bool = False,
     device: str | torch.device = "cpu",
 ) -> DASTrainer:
@@ -1068,6 +1072,7 @@ def apply_das_to_model(
         model,
         bn_only=bn_only,
         probe_samples=probe_samples,
+        strategy=strategy,
         use_spectral_entropy=use_spectral_entropy,
         device=device,
     )
@@ -1078,6 +1083,7 @@ def apply_das_to_tail(
     tail_module_names: list[str],
     *,
     bn_only: bool = False,
+    strategy: str = "tgi",
     use_spectral_entropy: bool = False,
     device: str | torch.device = "cpu",
 ) -> DASTrainer:
@@ -1103,7 +1109,12 @@ def apply_das_to_tail(
     trainer.bn_only = bn_only
     trainer.tau = 0.5
     trainer.probe_samples = 10
-    trainer.use_spectral_entropy = use_spectral_entropy
+    trainer.strategy = str(strategy).strip().lower()
+    if use_spectral_entropy:
+        trainer.strategy = "entropy"
+    if trainer.strategy not in {"tgi", "entropy"}:
+        raise ValueError(f"Unsupported DAS strategy: {strategy!r}")
+    trainer.use_spectral_entropy = trainer.strategy == "entropy"
     trainer.device = torch.device(device)
     trainer._pruning_ratios = {}
 
