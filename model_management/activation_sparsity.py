@@ -119,6 +119,31 @@ def _pair(x):
     return (x, x)
 
 
+def _spectral_entropy_1d(x: torch.Tensor, *, max_samples: int = 2048, eps: float = 1e-12) -> float | None:
+    """Compute normalised spectral entropy of a 1D signal.
+
+    Returns a value in [0, 1] (higher => more complex spectrum).
+    """
+    if x.numel() == 0:
+        return None
+    flat = x.reshape(-1)
+    if flat.numel() > max_samples:
+        idx = torch.randperm(flat.numel(), device=flat.device)[:max_samples]
+        flat = flat[idx]
+    flat = flat.float()
+    spectrum = torch.fft.rfft(flat)
+    power = spectrum.abs().pow(2)
+    total = power.sum()
+    if total.item() <= 0:
+        return 0.0
+    probs = power / total
+    entropy = -(probs * (probs + eps).log()).sum()
+    norm = math.log(max(int(probs.numel()), 1))
+    if norm <= 0:
+        return 0.0
+    return float((entropy / norm).clamp(0.0, 1.0).item())
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 2.  AutoFreezeConv2d — Conv2d with Dynamic Activation Sparsity
 # ═══════════════════════════════════════════════════════════════════════════
@@ -177,6 +202,8 @@ class AutoFreezeConv2d(nn.Conv2d):
         self.back_cache_size: int = 0
         self.activation_size: int = 0
         self.bn_only: bool = bn_only
+        self.track_spectral_entropy: bool = False
+        self.last_spectral_entropy: float | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         return _AutoFreezeConv2dFn.apply(self, x, self.weight, self.bias)
@@ -215,6 +242,8 @@ class _AutoFreezeConv2dFn(torch.autograd.Function):
 
             # Track activation size for TGI memory importance
             module.activation_size = int(x.numel())
+            if module.track_spectral_entropy:
+                module.last_spectral_entropy = _spectral_entropy_1d(x.detach())
 
             # Dynamic Activation Sparsity
             if module.sparsity_signal and module.clip_ratio > 0:
@@ -313,9 +342,13 @@ class DASBatchNorm2d(nn.BatchNorm2d):
         self.back_cache_size: int = 0
         self.activation_size: int = 0
         self.bn_only: bool = bn_only
+        self.track_spectral_entropy: bool = False
+        self.last_spectral_entropy: float | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self.activation_size = int(x.numel())
+        if self.track_spectral_entropy:
+            self.last_spectral_entropy = _spectral_entropy_1d(x.detach())
         if self.sparsity_signal and self.clip_ratio > 0:
             return _DASBatchNorm2dFn.apply(self, x, self.weight, self.bias)
         # Fast path: standard BN (no sparsity)
@@ -472,6 +505,8 @@ class AutoFreezeFC(nn.Linear):
         self.back_cache_size: int = 0
         self.activation_size: int = 0
         self.bn_only: bool = bn_only
+        self.track_spectral_entropy: bool = False
+        self.last_spectral_entropy: float | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         return _AutoFreezeFCFn.apply(self, x, self.weight, self.bias)
@@ -497,6 +532,8 @@ class _AutoFreezeFCFn(torch.autograd.Function):
             y = module.fc_forward(x, weight, bias)
 
             module.activation_size = int(x.numel())
+            if module.track_spectral_entropy:
+                module.last_spectral_entropy = _spectral_entropy_1d(x.detach())
 
             if module.sparsity_signal and module.clip_ratio > 0:
                 clipper = ActivationClipper(module.clip_ratio)
@@ -628,6 +665,7 @@ class DASTrainer:
         bn_only: bool = False,
         tau: float = 0.5,
         probe_samples: int = 10,
+        use_spectral_entropy: bool = False,
         device: str | torch.device = "cpu",
     ):
         self.model = model
@@ -636,6 +674,7 @@ class DASTrainer:
         self.probe_samples = probe_samples
         self.device = torch.device(device)
         self._pruning_ratios: dict[str, float] = {}
+        self.use_spectral_entropy = use_spectral_entropy
 
         # Replace modules with AutoFreeze versions
         self._n_conv = self._replace_conv(model, model.__class__.__name__)
@@ -645,6 +684,8 @@ class DASTrainer:
             "[DAS] Replaced {} Conv + {} BN + {} FC layers with AutoFreeze versions.",
             self._n_conv, self._n_bn, self._n_fc,
         )
+        if self.use_spectral_entropy:
+            self.enable_spectral_entropy_tracking(True)
 
     # ------------------------------------------------------------------
     # Module replacement (Conv → AutoFreezeConv2d, BN → DASBatchNorm2d,
@@ -718,6 +759,39 @@ class DASTrainer:
             if isinstance(mod, (AutoFreezeConv2d, DASBatchNorm2d, AutoFreezeFC)):
                 modules[name] = mod
         return modules
+
+    def enable_spectral_entropy_tracking(self, enabled: bool = True) -> None:
+        """Enable/disable spectral entropy tracking on DAS modules."""
+        for _, mod in self._das_modules().items():
+            mod.track_spectral_entropy = bool(enabled)
+
+    def _spectral_entropy_scores(self) -> dict[str, float]:
+        """Return per-layer spectral-entropy scores keyed by param name."""
+        scores: dict[str, float] = {}
+        mem_dict, mem_sum = self._get_layer_memories()
+        for name, mod in self.model.named_modules():
+            if not isinstance(mod, (AutoFreezeConv2d, DASBatchNorm2d, AutoFreezeFC)):
+                continue
+            entropy = getattr(mod, "last_spectral_entropy", None)
+            if entropy is None:
+                continue
+            key = name + ".weight"
+            mem = mem_dict.get(key, 1.0)
+            mi = math.log(max(mem_sum, 1.0) / max(mem, 1.0))
+            scores[key] = float(entropy) * float(mi)
+        return scores
+
+    def refresh_pruning_ratios_from_spectral_entropy(self) -> dict[str, float]:
+        """Compute pruning ratios from spectral entropy (no gradients)."""
+        scores = self._spectral_entropy_scores()
+        if not scores:
+            self._pruning_ratios = {}
+            return {}
+        max_score = max(scores.values()) or 1.0
+        pruning_ratios = {k: max(0.0, 1.0 - v / max_score) for k, v in scores.items()}
+        self._pruning_ratios = pruning_ratios
+        logger.debug("[DAS] Computed pruning ratios from spectral entropy for {} layers.", len(pruning_ratios))
+        return pruning_ratios
 
     # ------------------------------------------------------------------
     # Activation-size profiling (for TGI memory importance)
@@ -983,13 +1057,20 @@ def apply_das_to_model(
     *,
     bn_only: bool = False,
     probe_samples: int = 10,
+    use_spectral_entropy: bool = False,
     device: str | torch.device = "cpu",
 ) -> DASTrainer:
     """Convenience wrapper — apply DAS to *model* and return a ``DASTrainer``.
 
     This is the recommended entry point for enabling activation sparsity.
     """
-    return DASTrainer(model, bn_only=bn_only, probe_samples=probe_samples, device=device)
+    return DASTrainer(
+        model,
+        bn_only=bn_only,
+        probe_samples=probe_samples,
+        use_spectral_entropy=use_spectral_entropy,
+        device=device,
+    )
 
 
 def apply_das_to_tail(
@@ -997,6 +1078,7 @@ def apply_das_to_tail(
     tail_module_names: list[str],
     *,
     bn_only: bool = False,
+    use_spectral_entropy: bool = False,
     device: str | torch.device = "cpu",
 ) -> DASTrainer:
     """Apply DAS only to specific sub-modules (the *tail* partition).
@@ -1021,6 +1103,7 @@ def apply_das_to_tail(
     trainer.bn_only = bn_only
     trainer.tau = 0.5
     trainer.probe_samples = 10
+    trainer.use_spectral_entropy = use_spectral_entropy
     trainer.device = torch.device(device)
     trainer._pruning_ratios = {}
 
@@ -1045,4 +1128,6 @@ def apply_das_to_tail(
         "[DAS] Applied to tail modules {}: {} Conv + {} BN + {} FC replaced.",
         tail_module_names, n_conv, n_bn, n_fc,
     )
+    if trainer.use_spectral_entropy:
+        trainer.enable_spectral_entropy_tracking(True)
     return trainer

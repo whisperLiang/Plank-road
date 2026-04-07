@@ -25,7 +25,8 @@ from model_management.candidate_profiler import profile_candidates
 from model_management.candidate_selector import SplitCandidateSelector, SplitPointSelector
 from model_management.payload import SplitPayload
 from model_management.split_candidate import CandidateProfile, SplitCandidate
-from model_management.split_runtime import GraphSplitRuntime
+from model_management.split_runtime import GraphSplitRuntime, _call_loss_fn
+from model_management.activation_sparsity import apply_das_to_model, apply_das_to_tail
 
 
 @dataclass
@@ -574,6 +575,10 @@ def universal_split_retrain(
     loss_fn=None,
     splitter: UniversalModelSplitter | None = None,
     chosen_candidate: SplitCandidate | None = None,
+    das_enabled: bool = False,
+    das_bn_only: bool = False,
+    das_probe_samples: int = 10,
+    das_use_spectral_entropy: bool = False,
     **_: Any,
 ) -> list[float]:
     splitter = splitter or UniversalModelSplitter(device=device)
@@ -607,6 +612,48 @@ def universal_split_retrain(
                 chosen = splitter.split(layer_index=split_layer)
     splitter.freeze_head(chosen)
     splitter.unfreeze_tail(chosen)
+
+    def _infer_das_tail_modules() -> list[str]:
+        _, graph = splitter._ensure_ready()
+        module_names: set[str] = set()
+        for label in chosen.cloud_nodes:
+            node = graph.nodes.get(label)
+            if node is None:
+                continue
+            if node.containing_module:
+                parent = node.containing_module.rsplit(".", 1)[0] if "." in node.containing_module else node.containing_module
+                if parent:
+                    module_names.add(parent)
+            for ref in node.parameter_refs:
+                fq_name = getattr(ref, "fq_name", "")
+                module_path = fq_name.rsplit(".", 1)[0] if "." in fq_name else ""
+                if module_path:
+                    parent = module_path.rsplit(".", 1)[0] if "." in module_path else module_path
+                    if parent:
+                        module_names.add(parent)
+        return sorted(module_names)
+
+    das_trainer = None
+    if das_enabled:
+        tail_modules = _infer_das_tail_modules()
+        if tail_modules:
+            das_trainer = apply_das_to_tail(
+                model,
+                tail_modules,
+                bn_only=das_bn_only,
+                use_spectral_entropy=das_use_spectral_entropy,
+                device=device,
+            )
+        else:
+            das_trainer = apply_das_to_model(
+                model,
+                bn_only=das_bn_only,
+                probe_samples=das_probe_samples,
+                use_spectral_entropy=das_use_spectral_entropy,
+                device=device,
+            )
+        das_trainer.probe_samples = max(1, int(das_probe_samples))
+
     params = splitter.get_tail_trainable_params(chosen)
     optimizer = torch.optim.Adam(params, lr=float(learning_rate)) if params else None
     losses: list[float] = []
@@ -614,6 +661,67 @@ def universal_split_retrain(
 
     for _ in range(num_epoch):
         epoch_loss = 0.0
+        if das_trainer is not None and not das_use_spectral_entropy:
+            probe_count = min(len(all_indices), int(das_trainer.probe_samples))
+            probe_indices = (
+                random.sample(list(all_indices), probe_count)
+                if probe_count and len(all_indices) > probe_count
+                else list(all_indices)[:probe_count]
+            )
+            aggregated: dict[str, float] = {}
+            counts: dict[str, int] = {}
+            for probe_index in probe_indices:
+                record = load_split_feature_cache(cache_path, probe_index)
+                payload = record["intermediate"]
+                targets = gt_annotations.get(probe_index)
+                if targets is None:
+                    targets = {
+                        "boxes": record.get("pseudo_boxes"),
+                        "labels": record.get("pseudo_labels"),
+                        "scores": record.get("pseudo_scores"),
+                    }
+                if isinstance(targets, dict):
+                    split_meta = {
+                        "candidate_id": record.get("candidate_id"),
+                        "split_index": record.get("split_index"),
+                        "split_label": record.get("split_label"),
+                        "boundary_tensor_labels": record.get("boundary_tensor_labels"),
+                        "sample_id": record.get("sample_id"),
+                        "confidence_bucket": record.get("confidence_bucket"),
+                        "input_image_size": record.get("input_image_size"),
+                        "input_tensor_shape": record.get("input_tensor_shape"),
+                    }
+                    targets = {
+                        **targets,
+                        "_split_meta": split_meta,
+                    }
+
+                def _probe_forward():
+                    outputs = splitter.cloud_forward(payload, candidate=chosen)
+                    effective_loss_fn = loss_fn if loss_fn is not None else splitter.trainability_loss_fn
+                    loss = _call_loss_fn(
+                        effective_loss_fn,
+                        outputs,
+                        targets,
+                        runtime=splitter,
+                        candidate=chosen,
+                    )
+                    return {"loss": loss}
+
+                ratios = das_trainer.probe_with_targets(_probe_forward)
+                for key, value in ratios.items():
+                    aggregated[key] = aggregated.get(key, 0.0) + float(value)
+                    counts[key] = counts.get(key, 0) + 1
+
+            if counts:
+                averaged = {key: aggregated[key] / counts[key] for key in aggregated}
+            else:
+                averaged = {}
+            das_trainer.activate_sparsity(averaged)
+        elif das_trainer is not None and das_use_spectral_entropy:
+            # Start dense; update ratios from each batch's forward pass.
+            das_trainer.deactivate_sparsity()
+
         for frame_index in list(all_indices):
             record = load_split_feature_cache(cache_path, frame_index)
             payload = record["intermediate"]
@@ -730,6 +838,9 @@ def universal_split_retrain(
                 optimizer=optimizer,
                 candidate=chosen,
             )
+            if das_trainer is not None and das_use_spectral_entropy:
+                ratios = das_trainer.refresh_pruning_ratios_from_spectral_entropy()
+                das_trainer.activate_sparsity(ratios)
             if not bool(torch.isfinite(loss).item()):
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
