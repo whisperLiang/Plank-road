@@ -6,6 +6,7 @@ from grpc_server.workspace import (
     prepare_request_workspace,
     reset_workspace_dir,
 )
+from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED
 
 
 import psutil
@@ -74,10 +75,24 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         id,
         continual_learner=None,
         workspace_root=None,
+        training_job_manager=None,
+        edge_registry=None,
     ):
         self.id = id
         self.continual_learner = continual_learner
         self.workspace_root = workspace_root or "./cache/server_workspace"
+        self.training_job_manager = training_job_manager
+        self.edge_registry = edge_registry
+
+    @staticmethod
+    def _request_kind_for_job_type(job_type: int) -> str:
+        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
+            return "train_model"
+        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_SPLIT:
+            return "split_train"
+        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
+            return "continual_learning"
+        raise ValueError(f"Unsupported training job type: {job_type!r}")
 
     def train_model_request(self, request, context):
         """Cloud-side continual learning: label frames with the large model then
@@ -209,12 +224,202 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             protocol_version=request.protocol_version,
         )
 
+    def submit_training_job(self, request, context):
+        logger.info(
+            "submit_training_job edge_id={} request_id={} job_type={} num_epoch={}",
+            request.edge_id,
+            request.request_id,
+            request.job_type,
+            request.num_epoch,
+        )
+
+        # Track edge in registry
+        if self.edge_registry is not None:
+            self.edge_registry.touch(int(request.edge_id))
+
+        if self.continual_learner is None or self.training_job_manager is None:
+            logger.error("submit_training_job: async training is not configured")
+            return message_transmission_pb2.SubmitTrainingJobReply(
+                accepted=False,
+                job_id="",
+                status="",
+                queue_position=-1,
+                message="async training is not configured",
+            )
+
+        try:
+            request_kind = self._request_kind_for_job_type(int(request.job_type))
+            workspace = prepare_request_workspace(
+                self.workspace_root,
+                edge_id=request.edge_id,
+                request_kind=request_kind,
+                payload_zip=getattr(request, "payload_zip", b""),
+                client_cache_path=request.cache_path,
+            )
+
+            # Extract base_model_version from the bundle manifest if available
+            base_model_version = "0"
+            try:
+                from model_management.continual_learning_bundle import load_training_bundle_manifest
+                manifest = load_training_bundle_manifest(str(workspace))
+                if manifest is not None:
+                    model_info = manifest.get("model", {})
+                    base_model_version = str(model_info.get("model_version", "0"))
+                    # Also update edge registry with current model info
+                    if self.edge_registry is not None:
+                        self.edge_registry.touch(
+                            int(request.edge_id),
+                            model_id=str(model_info.get("model_id", "")),
+                            model_version=base_model_version,
+                        )
+            except Exception:
+                pass
+
+            job, created = self.training_job_manager.submit(
+                edge_id=int(request.edge_id),
+                request_id=str(request.request_id or ""),
+                job_type=int(request.job_type),
+                workspace=str(workspace),
+                protocol_version=str(request.protocol_version or ""),
+                num_epoch=int(request.num_epoch),
+                send_low_conf_features=bool(request.send_low_conf_features),
+                frame_indices=[int(index) for index in request.frame_indices],
+                all_frame_indices=[int(index) for index in request.all_frame_indices],
+                drift_frame_indices=[int(index) for index in request.drift_frame_indices],
+                base_model_version=base_model_version,
+            )
+
+            # Notify edge registry of job submission
+            if self.edge_registry is not None and created:
+                self.edge_registry.record_job_submitted(
+                    int(request.edge_id),
+                    job.job_id,
+                )
+
+            queue_position = self.training_job_manager.queue_position(job.job_id)
+            message = (
+                "Training job accepted."
+                if created else "Training job already exists for this request_id."
+            )
+            return message_transmission_pb2.SubmitTrainingJobReply(
+                accepted=True,
+                job_id=job.job_id,
+                status=job.status,
+                queue_position=queue_position,
+                message=message,
+            )
+        except Exception as exc:
+            logger.exception("submit_training_job error: {}", exc)
+            return message_transmission_pb2.SubmitTrainingJobReply(
+                accepted=False,
+                job_id="",
+                status="",
+                queue_position=-1,
+                message=str(exc),
+            )
+
+    def get_training_job_status(self, request, context):
+        if self.training_job_manager is None:
+            return message_transmission_pb2.TrainingJobStatusReply(
+                found=False,
+                job_id=str(request.job_id or ""),
+                edge_id=int(request.edge_id),
+                status="",
+                queue_position=-1,
+                message="async training is not configured",
+            )
+
+        job = self.training_job_manager.get_job(
+            edge_id=int(request.edge_id),
+            job_id=str(request.job_id or ""),
+        )
+        if job is None:
+            return message_transmission_pb2.TrainingJobStatusReply(
+                found=False,
+                job_id=str(request.job_id or ""),
+                edge_id=int(request.edge_id),
+                status="",
+                queue_position=-1,
+                message="Training job not found.",
+            )
+
+        queue_position = self.training_job_manager.queue_position(job.job_id)
+        return message_transmission_pb2.TrainingJobStatusReply(
+            found=True,
+            job_id=job.job_id,
+            edge_id=job.edge_id,
+            status=job.status,
+            queue_position=queue_position,
+            message=job.message,
+            request_id=job.request_id,
+            job_type=job.job_type,
+            result_available=(
+                job.status == JOB_STATUS_SUCCEEDED and bool(job.model_data)
+            ),
+            submitted_at_ms=job.submitted_at_ms,
+            started_at_ms=job.started_at_ms,
+            finished_at_ms=job.finished_at_ms,
+            protocol_version=job.protocol_version,
+        )
+
+    def download_trained_model(self, request, context):
+        if self.training_job_manager is None:
+            return message_transmission_pb2.DownloadTrainedModelReply(
+                success=False,
+                job_id=str(request.job_id or ""),
+                status="",
+                model_data="",
+                message="async training is not configured",
+                protocol_version="",
+            )
+
+        success, job, message = self.training_job_manager.download_result(
+            edge_id=int(request.edge_id),
+            job_id=str(request.job_id or ""),
+        )
+        return message_transmission_pb2.DownloadTrainedModelReply(
+            success=success,
+            job_id=job.job_id if job is not None else str(request.job_id or ""),
+            status=job.status if job is not None else "",
+            model_data=job.model_data if success and job is not None else "",
+            message=message,
+            protocol_version=job.protocol_version if job is not None else "",
+        )
+
+    def cancel_training_job(self, request, context):
+        """Cancel a queued training job by edge_id and job_id."""
+        if self.training_job_manager is None:
+            return message_transmission_pb2.CancelTrainingJobReply(
+                cancelled=False,
+                message="async training is not configured",
+            )
+
+        cancelled, message = self.training_job_manager.cancel_job(
+            edge_id=int(request.edge_id),
+            job_id=str(request.job_id or ""),
+        )
+        logger.info(
+            "cancel_training_job edge_id={} job_id={} cancelled={} message={}",
+            request.edge_id,
+            request.job_id,
+            cancelled,
+            message,
+        )
+        return message_transmission_pb2.CancelTrainingJobReply(
+            cancelled=cancelled,
+            message=message,
+        )
+
     # ---- Resource-aware CL trigger: cloud resource query ----
 
     def query_resource(self, request, context):
         """Return current cloud resource utilisation for the edge's
         Lyapunov-based CL trigger decision.
         """
+        # Track edge heartbeat in registry
+        if self.edge_registry is not None:
+            self.edge_registry.touch(int(request.edge_id))
+
         cpu = _get_cpu_utilization()
         gpu = _get_gpu_utilization()
         mem = _get_memory_utilization()
@@ -222,10 +427,16 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         # Approximate train-queue depth: if the continual_learner lock is
         # held, there is 1 active job; max capacity is treated as 10.
         train_q = 0
-        max_q = 10
+        max_q = 0
+        if self.training_job_manager is not None:
+            train_q, max_q = self.training_job_manager.training_queue_state()
         if self.continual_learner is not None:
             if hasattr(self.continual_learner, "training_queue_state"):
-                train_q, max_q = self.continual_learner.training_queue_state()
+                learner_q, learner_max_q = self.continual_learner.training_queue_state()
+                train_q = max(train_q, learner_q)
+                max_q = max(max_q, learner_max_q)
+        if max_q <= 0:
+            max_q = 10
 
         return message_transmission_pb2.ResourceReply(
             cpu_utilization=cpu,

@@ -120,9 +120,12 @@ Core files:
 
 ```text
 Plank-road/
-├── edge_client.py
-├── cloud_server.py
+├── edge_client.py            # Edge client entry (supports --edge_id override)
+├── cloud_server.py            # Cloud server entry
+├── launch_multi_edge.py       # Multi-edge launcher (start N edges at once)
 ├── config/
+├── cloud/
+│   └── edge_registry.py       # Cloud-side edge node registry
 ├── edge/
 │   ├── edge_worker.py
 │   ├── resource_aware_trigger.py
@@ -133,7 +136,8 @@ Plank-road/
 │   │   └── message_transmission.proto
 │   ├── message_transmission_pb2.py
 │   ├── message_transmission_pb2_grpc.py
-│   └── rpc_server.py
+│   ├── rpc_server.py
+│   └── training_jobs.py       # Async job queue with round-robin scheduling
 ├── difference/
 ├── tools/
 ├── model_management/
@@ -313,17 +317,97 @@ The cloud:
 
 ## Usage
 
-### Start The Cloud Server
+### Single Edge (Default)
+
+Single-edge usage is unchanged. No extra arguments or configuration needed:
 
 ```bash
+# Terminal 1: Start the cloud server
 python cloud_server.py
-```
 
-### Start The Edge Client
-
-```bash
+# Terminal 2: Start the edge client
 python edge_client.py
 ```
+
+This uses `edge_id: 1` and `cache_path: ./cache` from `config/config.yaml` by default.
+
+### Multi-Edge Deployment
+
+Multiple edge nodes can run concurrently against the same cloud server. Each edge must have a **unique `edge_id`** and **separate `cache_path`** to avoid data conflicts.
+
+#### Option A: One-Command Launcher
+
+Use `launch_multi_edge.py` to start N edge processes at once:
+
+```bash
+# Start 3 edges (edge_id=1,2,3) all using the same video source
+python launch_multi_edge.py --num_edges 3
+
+# Start 3 edges with different video sources
+python launch_multi_edge.py --num_edges 3 \
+    --video_paths video_data/road1.mp4 video_data/road2.mp4 video_data/road3.mp4
+
+# Start edges with custom IDs (e.g., 10,11,12)
+python launch_multi_edge.py --num_edges 3 --start_edge_id 10
+
+# Override the cloud server address for all edges
+python launch_multi_edge.py --num_edges 4 --server_ip 10.0.0.5:50051
+```
+
+The launcher automatically:
+- Assigns unique `edge_id` to each process
+- Isolates cache directories to `./cache/edge_{id}/`
+- Writes per-edge logs to `log/client/edge_{id}_*.log`
+- Handles graceful shutdown on Ctrl+C
+
+#### Option B: Manual Per-Edge Start
+
+Start each edge in a separate terminal with `--edge_id`:
+
+```bash
+# Terminal 2: Edge 1
+python edge_client.py --edge_id 1
+
+# Terminal 3: Edge 2
+python edge_client.py --edge_id 2 --video_path video_data/road2.mp4
+
+# Terminal 4: Edge 3 (custom cache and server)
+python edge_client.py --edge_id 3 --cache_path ./cache/edge_3 --server_ip 10.0.0.5:50051
+```
+
+When only `--edge_id` is specified, the cache path is automatically set to `./cache/edge_{id}` to ensure isolation.
+
+Available CLI overrides:
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--edge_id` | Unique edge node ID | from config (`1`) |
+| `--cache_path` | Per-edge cache directory | `./cache/edge_{id}` |
+| `--video_path` | Video source for this edge | from config |
+| `--server_ip` | Cloud server address | from config |
+
+### Multi-Edge Cloud Configuration
+
+For multi-edge deployments, the cloud server should be configured with sufficient concurrency:
+
+```yaml
+server:
+  continual_learning:
+    # Set to the number of edges for full parallelism,
+    # or lower to share GPU across edges
+    max_concurrent_jobs: 4
+  # gRPC workers should exceed max_concurrent_jobs to avoid
+  # status queries being blocked by training threads
+  grpc_max_workers: 16
+```
+
+### Multi-Edge Behavior
+
+- **Scheduling**: Different edges' training jobs run in parallel (up to `max_concurrent_jobs`). Jobs from the same edge are serialized to prevent model version conflicts.
+- **Fairness**: Round-robin scheduling ensures all edges get equal training opportunities.
+- **Version safety**: The system tracks `base_model_version` → `result_model_version`. If an edge's model advances while a training job is still running, the result is marked **STALE** and discarded automatically.
+- **Resource awareness**: Each edge independently queries cloud resource utilization before submitting training jobs, providing natural load balancing via the Lyapunov-based trigger.
+- **Backward compatibility**: All multi-edge features are additive. Single-edge deployments work exactly as before with no configuration changes.
 
 ## Testing
 

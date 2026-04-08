@@ -49,6 +49,21 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.ContinualLearningRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.ContinualLearningReply.FromString,
                 _registered_method=True)
+        self.submit_training_job = channel.unary_unary(
+                '/MessageTransmission/submit_training_job',
+                request_serializer=message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.SubmitTrainingJobReply.FromString,
+                _registered_method=True)
+        self.get_training_job_status = channel.unary_unary(
+                '/MessageTransmission/get_training_job_status',
+                request_serializer=message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.TrainingJobStatusReply.FromString,
+                _registered_method=True)
+        self.download_trained_model = channel.unary_unary(
+                '/MessageTransmission/download_trained_model',
+                request_serializer=message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.DownloadTrainedModelReply.FromString,
+                _registered_method=True)
         self.query_resource = channel.unary_unary(
                 '/MessageTransmission/query_resource',
                 request_serializer=message__transmission__pb2.ResourceRequest.SerializeToString,
@@ -88,6 +103,27 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def submit_training_job(self, request, context):
+        """Async training job submission for edge-triggered continual learning.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def get_training_job_status(self, request, context):
+        """Poll async training job status by job_id.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def download_trained_model(self, request, context):
+        """Download trained model for a completed async training job.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def query_resource(self, request, context):
         """Resource-aware CL trigger: edge queries cloud resource utilisation.
         """
@@ -119,6 +155,21 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.continual_learning_request,
                     request_deserializer=message__transmission__pb2.ContinualLearningRequest.FromString,
                     response_serializer=message__transmission__pb2.ContinualLearningReply.SerializeToString,
+            ),
+            'submit_training_job': grpc.unary_unary_rpc_method_handler(
+                    servicer.submit_training_job,
+                    request_deserializer=message__transmission__pb2.SubmitTrainingJobRequest.FromString,
+                    response_serializer=message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
+            ),
+            'get_training_job_status': grpc.unary_unary_rpc_method_handler(
+                    servicer.get_training_job_status,
+                    request_deserializer=message__transmission__pb2.TrainingJobStatusRequest.FromString,
+                    response_serializer=message__transmission__pb2.TrainingJobStatusReply.SerializeToString,
+            ),
+            'download_trained_model': grpc.unary_unary_rpc_method_handler(
+                    servicer.download_trained_model,
+                    request_deserializer=message__transmission__pb2.DownloadTrainedModelRequest.FromString,
+                    response_serializer=message__transmission__pb2.DownloadTrainedModelReply.SerializeToString,
             ),
             'query_resource': grpc.unary_unary_rpc_method_handler(
                     servicer.query_resource,
@@ -212,6 +263,87 @@ class MessageTransmission(object):
             '/MessageTransmission/continual_learning_request',
             message__transmission__pb2.ContinualLearningRequest.SerializeToString,
             message__transmission__pb2.ContinualLearningReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def submit_training_job(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/submit_training_job',
+            message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
+            message__transmission__pb2.SubmitTrainingJobReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def get_training_job_status(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/get_training_job_status',
+            message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
+            message__transmission__pb2.TrainingJobStatusReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def download_trained_model(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/download_trained_model',
+            message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
+            message__transmission__pb2.DownloadTrainedModelReply.FromString,
             options,
             channel_credentials,
             insecure,

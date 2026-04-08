@@ -10,10 +10,25 @@ service MessageTransmission {
   rpc split_train_request (SplitTrainRequest) returns (SplitTrainReply) {}
   // Versioned continual-learning bundle upload for the fixed-split pipeline.
   rpc continual_learning_request (ContinualLearningRequest) returns (ContinualLearningReply) {}
+  // Async training job submission for edge-triggered continual learning.
+  rpc submit_training_job (SubmitTrainingJobRequest) returns (SubmitTrainingJobReply) {}
+  // Poll async training job status by job_id.
+  rpc get_training_job_status (TrainingJobStatusRequest) returns (TrainingJobStatusReply) {}
+  // Download trained model for a completed async training job.
+  rpc download_trained_model (DownloadTrainedModelRequest) returns (DownloadTrainedModelReply) {}
+  // Cancel a queued or running training job.
+  rpc cancel_training_job (CancelTrainingJobRequest) returns (CancelTrainingJobReply) {}
   // Resource-aware CL trigger: edge queries cloud resource utilisation.
   rpc query_resource (ResourceRequest) returns (ResourceReply) {}
   // Bandwidth estimation: edge sends a small payload, cloud echoes it.
   rpc bandwidth_probe (BandwidthProbeRequest) returns (BandwidthProbeReply) {}
+}
+
+enum TrainingJobType {
+  TRAINING_JOB_TYPE_UNSPECIFIED = 0;
+  TRAINING_JOB_TYPE_FULL_FRAME = 1;
+  TRAINING_JOB_TYPE_SPLIT = 2;
+  TRAINING_JOB_TYPE_CONTINUAL_LEARNING = 3;
 }
 
 // Continual learning messages
@@ -67,6 +82,79 @@ message ContinualLearningReply {
   string model_data = 2;
   string message = 3;
   string protocol_version = 4;
+}
+
+message SubmitTrainingJobRequest {
+  string protocol_version = 1;
+  int64 edge_id = 2;
+  string request_id = 3;
+  TrainingJobType job_type = 4;
+  string cache_path = 5;
+  int64 num_epoch = 6;
+  bool send_low_conf_features = 7;
+  repeated int64 frame_indices = 8;
+  repeated int64 all_frame_indices = 9;
+  repeated int64 drift_frame_indices = 10;
+  bytes payload_zip = 11;
+  // Model version at the time of submission (for stale detection)
+  string base_model_version = 12;
+}
+
+message SubmitTrainingJobReply {
+  bool accepted = 1;
+  string job_id = 2;
+  string status = 3;
+  int64 queue_position = 4;
+  string message = 5;
+}
+
+message TrainingJobStatusRequest {
+  int64 edge_id = 1;
+  string job_id = 2;
+}
+
+message TrainingJobStatusReply {
+  bool found = 1;
+  string job_id = 2;
+  int64 edge_id = 3;
+  string status = 4;
+  int64 queue_position = 5;
+  string message = 6;
+  string request_id = 7;
+  TrainingJobType job_type = 8;
+  bool result_available = 9;
+  int64 submitted_at_ms = 10;
+  int64 started_at_ms = 11;
+  int64 finished_at_ms = 12;
+  string protocol_version = 13;
+  string base_model_version = 14;
+  string result_model_version = 15;
+}
+
+message DownloadTrainedModelRequest {
+  int64 edge_id = 1;
+  string job_id = 2;
+}
+
+message DownloadTrainedModelReply {
+  bool success = 1;
+  string job_id = 2;
+  string status = 3;
+  string model_data = 4;
+  string message = 5;
+  string protocol_version = 6;
+  string result_model_version = 7;
+}
+
+// Cancel a queued or running training job
+message CancelTrainingJobRequest {
+  int64 edge_id = 1;
+  string job_id = 2;
+}
+
+message CancelTrainingJobReply {
+  bool cancelled = 1;
+  string message = 2;
 }
 
 // Resource-aware CL trigger: cloud resource query

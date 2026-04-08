@@ -5,6 +5,7 @@ Tests for grpc_server/ module:
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -18,6 +19,7 @@ from grpc_server.rpc_server import (
     _normalize_cache_path,
     _reset_cache_dir,
 )
+from grpc_server.training_jobs import TrainingJobManager
 
 
 def _zip_bytes(entries: dict[str, bytes]) -> bytes:
@@ -60,12 +62,30 @@ class TestResourceHelpers:
 
 class TestMessageTransmissionServicer:
     @staticmethod
-    def _make_servicer(tmp_path, *, continual_learner=None):
+    def _make_servicer(tmp_path, *, continual_learner=None, training_job_manager=None):
         return MessageTransmissionServicer(
             id=1,
             continual_learner=continual_learner,
             workspace_root=str(tmp_path / "workspace"),
+            training_job_manager=training_job_manager,
         )
+
+    @staticmethod
+    def _wait_for_job(svc, *, edge_id: int, job_id: str, timeout_sec: float = 2.0):
+        deadline = time.time() + timeout_sec
+        last_reply = None
+        while time.time() < deadline:
+            last_reply = svc.get_training_job_status(
+                message_transmission_pb2.TrainingJobStatusRequest(
+                    edge_id=edge_id,
+                    job_id=job_id,
+                ),
+                MagicMock(),
+            )
+            if last_reply.found and last_reply.status not in {"", "QUEUED", "RUNNING"}:
+                return last_reply
+            time.sleep(0.02)
+        return last_reply
 
     def test_init(self, tmp_path):
         svc = self._make_servicer(tmp_path)
@@ -223,3 +243,99 @@ class TestMessageTransmissionServicer:
         assert epochs == 2
         assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
         assert (Path(workspace) / "bundle_manifest.json").read_text(encoding="utf-8") == "{}"
+
+    def test_submit_training_job_for_continual_learning_and_download_model(self, tmp_path):
+        mock_learner = MagicMock()
+        mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
+            True,
+            "model_data",
+            "ok",
+        )
+        manager = TrainingJobManager(
+            continual_learner=mock_learner,
+            max_concurrent_jobs=1,
+        )
+        try:
+            svc = self._make_servicer(
+                tmp_path,
+                continual_learner=mock_learner,
+                training_job_manager=manager,
+            )
+            payload_zip = _zip_bytes({"bundle_manifest.json": b"{}"})
+            submit_reply = svc.submit_training_job(
+                message_transmission_pb2.SubmitTrainingJobRequest(
+                    edge_id=1,
+                    request_id="req-1",
+                    job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+                    cache_path="edge_1/continual_learning",
+                    num_epoch=2,
+                    send_low_conf_features=True,
+                    protocol_version="edge-cl-bundle.v1",
+                    payload_zip=payload_zip,
+                ),
+                MagicMock(),
+            )
+
+            assert submit_reply.accepted is True
+            assert submit_reply.job_id
+
+            status_reply = self._wait_for_job(
+                svc,
+                edge_id=1,
+                job_id=submit_reply.job_id,
+            )
+            assert status_reply is not None
+            assert status_reply.found is True
+            assert status_reply.status == "SUCCEEDED"
+            assert status_reply.result_available is True
+
+            download_reply = svc.download_trained_model(
+                message_transmission_pb2.DownloadTrainedModelRequest(
+                    edge_id=1,
+                    job_id=submit_reply.job_id,
+                ),
+                MagicMock(),
+            )
+            assert download_reply.success is True
+            assert download_reply.model_data == "model_data"
+            assert download_reply.protocol_version == "edge-cl-bundle.v1"
+        finally:
+            manager.close()
+
+    def test_submit_training_job_reuses_request_id(self, tmp_path):
+        mock_learner = MagicMock()
+        mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
+            True,
+            "model_data",
+            "ok",
+        )
+        manager = TrainingJobManager(
+            continual_learner=mock_learner,
+            max_concurrent_jobs=1,
+        )
+        try:
+            svc = self._make_servicer(
+                tmp_path,
+                continual_learner=mock_learner,
+                training_job_manager=manager,
+            )
+            payload_zip = _zip_bytes({"bundle_manifest.json": b"{}"})
+            request = message_transmission_pb2.SubmitTrainingJobRequest(
+                edge_id=4,
+                request_id="same-request",
+                job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+                cache_path="edge_4/continual_learning",
+                num_epoch=2,
+                protocol_version="edge-cl-bundle.v1",
+                payload_zip=payload_zip,
+            )
+
+            first = svc.submit_training_job(request, MagicMock())
+            second = svc.submit_training_job(request, MagicMock())
+
+            assert first.accepted is True
+            assert second.accepted is True
+            assert first.job_id == second.job_id
+            assert "already exists" in second.message
+        finally:
+            manager.close()

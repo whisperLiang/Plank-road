@@ -21,7 +21,11 @@ from edge.resource_aware_trigger import (
 )
 from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
 from edge.task import Task
-from edge.transmit import request_continual_learning
+from edge.transmit import (
+    download_trained_model,
+    get_training_job_status,
+    submit_continual_learning_job,
+)
 from model_management.fixed_split import (
     SplitConstraints,
     SplitPlan,
@@ -48,6 +52,16 @@ class EdgeWorker:
         if drift_cfg is None:
             return 0.5
         return float(getattr(drift_cfg, "confidence_threshold", 0.5))
+
+    @staticmethod
+    def _resolve_training_poll_interval(config) -> float:
+        retrain_cfg = getattr(config, "retrain", None)
+        if retrain_cfg is None:
+            return 5.0
+        try:
+            return max(0.5, float(getattr(retrain_cfg, "poll_interval_sec", 5.0)))
+        except Exception:
+            return 5.0
 
     def __init__(self, config):
         self.config = config
@@ -95,6 +109,7 @@ class EdgeWorker:
             config,
             self.resource_trigger,
         )
+        self.training_poll_interval_sec = self._resolve_training_poll_interval(config)
 
         sl_cfg = getattr(config, "split_learning", None)
         self.split_learning_enabled = bool(getattr(sl_cfg, "enabled", False)) if sl_cfg else False
@@ -413,10 +428,10 @@ class EdgeWorker:
                 continue
 
             num_epoch = int(getattr(self.config.retrain, "num_epoch", 0))
-            success, model_b64, msg = request_continual_learning(
+            submitted_model_version = str(self.model_version)
+            accepted, job_id, msg = submit_continual_learning_job(
                 self.config.server_ip,
                 edge_id=self.edge_id,
-                cache_path=self.bundle_cache_path,
                 sample_store=self.sample_store,
                 split_plan=self.fixed_split_plan,
                 model_id=self.model_id,
@@ -424,8 +439,95 @@ class EdgeWorker:
                 send_low_conf_features=decision.send_low_conf_features,
                 num_epoch=num_epoch,
             )
+            if not accepted or not job_id:
+                logger.error("Cloud continual learning submission failed: {}", msg)
+                self._reset_pending_training_cycle()
+                continue
+
+            logger.info(
+                "Submitted continual learning job {} for edge {}.",
+                job_id,
+                self.edge_id,
+            )
+
+            success = False
+            model_b64 = ""
+            terminal_message = msg
+            last_status = ""
+            while not self._stop_event.is_set():
+                reply = get_training_job_status(
+                    self.config.server_ip,
+                    edge_id=self.edge_id,
+                    job_id=job_id,
+                )
+                if reply is None:
+                    if self._stop_event.wait(self.training_poll_interval_sec):
+                        break
+                    continue
+
+                if not bool(reply.found):
+                    terminal_message = "Training job not found on cloud."
+                    logger.error(
+                        "Cloud continual learning failed for job {}: {}",
+                        job_id,
+                        terminal_message,
+                    )
+                    break
+
+                status = str(reply.status or "")
+                if status != last_status:
+                    queue_position = int(getattr(reply, "queue_position", -1))
+                    logger.info(
+                        "Continual learning job {} status={} queue_position={}",
+                        job_id,
+                        status,
+                        queue_position,
+                    )
+                    last_status = status
+
+                if status in {"QUEUED", "RUNNING"}:
+                    if self._stop_event.wait(self.training_poll_interval_sec):
+                        break
+                    continue
+
+                if status == "SUCCEEDED":
+                    success, model_b64, terminal_message = download_trained_model(
+                        self.config.server_ip,
+                        edge_id=self.edge_id,
+                        job_id=job_id,
+                    )
+                    if not success:
+                        logger.error(
+                            "Cloud continual learning download failed for job {}: {}",
+                            job_id,
+                            terminal_message,
+                        )
+                    break
+
+                terminal_message = str(reply.message or f"Training job ended with status {status}")
+                logger.error(
+                    "Cloud continual learning failed for job {}: {}",
+                    job_id,
+                    terminal_message,
+                )
+                break
 
             if success and model_b64:
+                # Stale detection: if our model version has advanced since
+                # we submitted this job, the result is based on an older model
+                # and should not be applied.
+                current_version = str(self.model_version)
+                if current_version != submitted_model_version:
+                    logger.warning(
+                        "Discarding training result for job {}: "
+                        "submitted at model_version={} but current is {} (stale).",
+                        job_id,
+                        submitted_model_version,
+                        current_version,
+                    )
+                    self._reset_pending_training_cycle()
+                    continue
+
                 try:
                     buf = io.BytesIO(base64.b64decode(model_b64))
                     state_dict = torch.load(buf, map_location="cpu", weights_only=False)
@@ -437,17 +539,25 @@ class EdgeWorker:
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
                     self.drift_detector.reset()
-                    if msg:
+                    if terminal_message:
                         logger.success(
-                            "Edge model updated from cloud successfully ({})",
-                            msg,
+                            "Edge model updated from cloud successfully "
+                            "(v{} -> v{}, {})",
+                            submitted_model_version,
+                            self.model_version,
+                            terminal_message,
                         )
                     else:
-                        logger.success("Edge model updated from cloud successfully")
+                        logger.success(
+                            "Edge model updated from cloud successfully "
+                            "(v{} -> v{})",
+                            submitted_model_version,
+                            self.model_version,
+                        )
                 except Exception as exc:
                     logger.exception("Failed to load cloud-returned model weights: {}", exc)
-            else:
-                logger.error("Cloud continual learning failed: {}", msg)
+            elif not self._stop_event.is_set():
+                logger.error("Cloud continual learning failed: {}", terminal_message)
 
             self._reset_pending_training_cycle()
 

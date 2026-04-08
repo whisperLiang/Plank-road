@@ -213,10 +213,32 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="configuration description")
     parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
+    parser.add_argument("--edge_id", type=int, default=None, help="override client.edge_id for multi-edge deployment")
+    parser.add_argument("--cache_path", type=str, default=None, help="override client.retrain.cache_path (must be unique per edge)")
+    parser.add_argument("--video_path", type=str, default=None, help="override client.source.video_path")
+    parser.add_argument("--server_ip", type=str, default=None, help="override client.server_ip")
     args = parser.parse_args()
 
     config = load_runtime_config(args.yaml_path).client
-    logger.add("log/client/client_{time}.log", level="INFO", rotation="500 MB")
+
+    # Apply per-edge CLI overrides for multi-edge deployment
+    if args.edge_id is not None:
+        config.edge_id = args.edge_id
+    if args.cache_path is not None:
+        config.retrain.cache_path = args.cache_path
+    elif args.edge_id is not None:
+        # Auto-isolate cache per edge_id when only --edge_id is specified
+        config.retrain.cache_path = f"./cache/edge_{args.edge_id}"
+    if args.video_path is not None:
+        config.source.video_path = args.video_path
+    if args.server_ip is not None:
+        config.server_ip = args.server_ip
+
+    logger.add(
+        f"log/client/edge_{config.edge_id}_{{time}}.log",
+        level="INFO",
+        rotation="500 MB",
+    )
 
     clear_folder(config.retrain.cache_path)
     edge = EdgeWorker(config)

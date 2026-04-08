@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 
 import grpc
 from loguru import logger
@@ -240,4 +241,120 @@ def request_continual_learning(
         return reply.success, reply.model_data, reply.message
     except Exception as exc:
         logger.exception("request_continual_learning failed: {}", exc)
+        return False, "", str(exc)
+
+
+def submit_training_job(
+    server_ip: str,
+    *,
+    edge_id: int,
+    request_id: str,
+    job_type: int,
+    cache_path: str,
+    num_epoch: int = 0,
+    protocol_version: str = "",
+    send_low_conf_features: bool = False,
+    frame_indices: list[int] | None = None,
+    all_frame_indices: list[int] | None = None,
+    drift_frame_indices: list[int] | None = None,
+    payload_zip: bytes = b"",
+):
+    try:
+        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        req = message_transmission_pb2.SubmitTrainingJobRequest(
+            protocol_version=str(protocol_version or ""),
+            edge_id=int(edge_id),
+            request_id=str(request_id or ""),
+            job_type=int(job_type),
+            cache_path=str(cache_path or ""),
+            num_epoch=int(num_epoch),
+            send_low_conf_features=bool(send_low_conf_features),
+            frame_indices=[int(index) for index in (frame_indices or [])],
+            all_frame_indices=[int(index) for index in (all_frame_indices or [])],
+            drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
+            payload_zip=payload_zip,
+        )
+        return stub.submit_training_job(req)
+    except Exception as exc:
+        logger.exception("submit_training_job failed: {}", exc)
+        return None
+
+
+def get_training_job_status(
+    server_ip: str,
+    *,
+    edge_id: int,
+    job_id: str,
+):
+    try:
+        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        req = message_transmission_pb2.TrainingJobStatusRequest(
+            edge_id=int(edge_id),
+            job_id=str(job_id or ""),
+        )
+        return stub.get_training_job_status(req)
+    except Exception as exc:
+        logger.exception("get_training_job_status failed: {}", exc)
+        return None
+
+
+def download_trained_model(
+    server_ip: str,
+    *,
+    edge_id: int,
+    job_id: str,
+):
+    try:
+        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        req = message_transmission_pb2.DownloadTrainedModelRequest(
+            edge_id=int(edge_id),
+            job_id=str(job_id or ""),
+        )
+        reply = stub.download_trained_model(req)
+        return reply.success, reply.model_data, reply.message
+    except Exception as exc:
+        logger.exception("download_trained_model failed: {}", exc)
+        return False, "", str(exc)
+
+
+def submit_continual_learning_job(
+    server_ip: str,
+    *,
+    edge_id: int,
+    sample_store: EdgeSampleStore,
+    split_plan: SplitPlan,
+    model_id: str,
+    model_version: str,
+    send_low_conf_features: bool,
+    num_epoch: int = 0,
+    request_id: str | None = None,
+):
+    try:
+        payload_zip, manifest = pack_continual_learning_bundle(
+            sample_store,
+            edge_id=edge_id,
+            send_low_conf_features=send_low_conf_features,
+            split_plan=split_plan,
+            model_id=model_id,
+            model_version=model_version,
+        )
+        reply = submit_training_job(
+            server_ip,
+            edge_id=edge_id,
+            request_id=str(request_id or uuid.uuid4().hex),
+            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+            cache_path=_server_workspace_hint(edge_id, "continual_learning"),
+            num_epoch=num_epoch,
+            protocol_version=manifest["protocol_version"],
+            send_low_conf_features=bool(send_low_conf_features),
+            payload_zip=payload_zip,
+        )
+        if reply is None:
+            return False, "", "submit_training_job failed"
+        return bool(reply.accepted), str(reply.job_id), str(reply.message)
+    except Exception as exc:
+        logger.exception("submit_continual_learning_job failed: {}", exc)
         return False, "", str(exc)

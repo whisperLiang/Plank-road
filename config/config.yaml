@@ -158,6 +158,9 @@ server:
  edge_model_name: rfdetr_nano
  # gRPC listen address for the cloud server
  listen_address: "[::]:50051"
+ # Number of gRPC worker threads; should be > max_concurrent_jobs to avoid
+ # status queries being blocked by training submissions
+ grpc_max_workers: 16
  # cloud-owned workspace used for uploaded retraining bundles
  workspace_root: "./cache/server_workspace"
  #the queue maxsize
@@ -167,7 +170,7 @@ server:
  # continual learning settings
  continual_learning:
   num_epoch: 5
-  max_concurrent_jobs: 2
+  max_concurrent_jobs: 4
   # Cloud-side teacher threshold used only for GT annotation during
   # continual learning. Lower values recover more small/far objects but
   # may introduce noisier pseudo-GT.
