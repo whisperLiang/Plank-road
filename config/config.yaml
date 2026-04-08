@@ -23,7 +23,7 @@ client:
  frame_cache_maxsize: 100
  lightweight: rfdetr_nano
  # edge-side final display threshold; boxes below this score are not returned
- final_detection_threshold: 0.5
+ final_detection_threshold: 0.6
  # Supported model names (see model_management/model_zoo.py):
  #   RetinaNet:    retinanet_resnet50_fpn
  #   FCOS:         fcos_resnet50_fpn
