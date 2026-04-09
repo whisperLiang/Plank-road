@@ -1,0 +1,40 @@
+# ── Multi-device experiment configuration ──────────────────────────
+# This file extends the Plank-road runtime config with experiment-level
+# settings. Load with: load_experiment_config("config/experiment.yaml")
+
+experiment:
+  method: plank_road_multi_device   # plank_road_multi_device | ekya_style_centralized_scheduling | accuracy_trigger_cloud_retraining | pure_edge_local_updating
+  num_devices: 4
+  total_frames: 300
+  results_dir: results
+
+baselines:
+  plank_road_multi_device:
+    upload_mode_default: raw_only
+    allow_resource_aware_feature_upload: true
+
+  ekya_style_centralized_scheduling:
+    inference_reserved_ratio: 0.6
+    retraining_window_size: 32
+    retraining_trigger_min_samples: 16
+    queue_policy: fifo
+    retraining_steps_per_round: 5
+
+  accuracy_trigger_cloud_retraining:
+    trigger_window_size: 32
+    confidence_drop_threshold: 0.15
+    low_conf_ratio_threshold: 0.30
+    drift_ratio_threshold: 0.20
+    upload_mode: raw_only
+
+  pure_edge_local_updating:
+    trigger_min_samples: 16
+    low_conf_ratio_threshold: 0.30
+    local_num_epoch: 1
+    retrain_target: full_model
+
+scenario:
+  num_devices_candidates: [1, 2, 4, 8]
+  drift_profiles: [low, medium, high]
+  bandwidth_profiles: [low, medium, high]
+  local_train_budget_profiles: [low, medium, high]

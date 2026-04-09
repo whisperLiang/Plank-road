@@ -13,3 +13,4 @@ log/
 tmp/
 record_*.txt
 model_management/models/
+results/
