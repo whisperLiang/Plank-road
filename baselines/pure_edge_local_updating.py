@@ -9,6 +9,11 @@ This simulation approximates short retraining rounds controlled by
 ``local_num_epoch`` and ``retrain_target``. On real deployment, if
 full-model retraining is too heavy, only the classifier head or last
 few layers would be updated (documented limitation).
+
+For fairness against Plank-road, even when only part of the model is
+updated, local retraining still replays raw inputs through the frozen
+prefix. In other words, freezing reduces suffix backward cost but does
+not grant a split-tail training shortcut.
 """
 
 from __future__ import annotations
@@ -42,6 +47,9 @@ class PureEdgeLocalUpdating(BaseMethod):
         self.low_conf_ratio_threshold = getattr(cfg, "low_conf_ratio_threshold", 0.30)
         self.local_num_epoch = getattr(cfg, "local_num_epoch", 1)
         self.retrain_target = getattr(cfg, "retrain_target", "full_model")
+        self.full_forward_epoch_ratio = float(
+            getattr(cfg, "full_forward_epoch_ratio", 0.45)
+        )
 
         # Per-device state
         self._windows: dict[int, SlidingWindowStats] = {}
@@ -106,7 +114,26 @@ class PureEdgeLocalUpdating(BaseMethod):
 
         epochs = plan.metadata.get("local_num_epoch", self.local_num_epoch)
         sec_per_epoch = self._local_budgets.get(plan.device_id, 1.0)
-        training_time = epochs * sec_per_epoch
+        retrain_target = str(plan.metadata.get("retrain_target", self.retrain_target))
+        backward_ratio = {
+            "full_model": 0.40,
+            "full": 0.40,
+            "partial": 0.25,
+            "last_block": 0.25,
+            "head_only": 0.10,
+            "classifier_head": 0.10,
+        }.get(retrain_target, 0.25)
+        optimizer_ratio = {
+            "full_model": 0.15,
+            "full": 0.15,
+            "partial": 0.08,
+            "last_block": 0.08,
+            "head_only": 0.03,
+            "classifier_head": 0.03,
+        }.get(retrain_target, 0.08)
+        effective_epoch_ratio = self.full_forward_epoch_ratio + backward_ratio + optimizer_ratio
+        sample_scale = max(1.0, plan.num_samples / max(1, self.trigger_min_samples))
+        training_time = epochs * sec_per_epoch * effective_epoch_ratio * sample_scale
 
         dev.record_update(
             wait_time_sec=0.0,

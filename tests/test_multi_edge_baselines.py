@@ -27,7 +27,12 @@ from baselines.method_factory import create_method
 from baselines.metrics import MetricsCollector, DeviceMetrics, OverallMetrics
 from baselines.plank_road_multi_device import PlankRoadMultiDevice
 from baselines.ekya_style_centralized_scheduling import EkyaStyleCentralizedScheduling
-from baselines.accuracy_trigger_cloud_retraining import AccuracyTriggerCloudRetraining
+from baselines.accuracy_trigger_cloud_retraining import (
+    AccuracyTriggerCloudRetraining,
+    BufferedFrame,
+    RetrainingCandidate,
+    WindowSnapshot,
+)
 from baselines.pure_edge_local_updating import PureEdgeLocalUpdating
 from baselines.trigger_utils import SlidingWindowStats
 from config.experiment import ExperimentConfig, ScenarioConfig, load_experiment_config
@@ -292,6 +297,337 @@ class TestAccuracyTriggerNoResourceAware:
         assert not hasattr(method, "_cloud_state")
 
 
+class TestEkyaRestoredSemantics:
+    def test_trigger_waits_for_retraining_window(self):
+        cfg = _make_config("ekya_style_centralized_scheduling")
+        cfg.ekya_style_centralized_scheduling.retraining_window_size = 8
+        cfg.ekya_style_centralized_scheduling.retraining_trigger_min_samples = 4
+        cfg.ekya_style_centralized_scheduling.signal_threshold = 0.0
+        method = create_method(cfg)
+
+        for i in range(7):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.35,
+                latency_ms=10.0,
+                drift_flag=True,
+            ))
+        assert not method.should_trigger(1)
+
+        method.on_inference_result(InferenceResult(
+            device_id=1,
+            frame_index=7,
+            confidence=0.35,
+            latency_ms=10.0,
+            drift_flag=True,
+        ))
+        assert method.should_trigger(1)
+
+    def test_busy_server_inflates_inference_latency(self):
+        cfg = _make_config("ekya_style_centralized_scheduling")
+        cfg.ekya_style_centralized_scheduling.retraining_window_size = 4
+        cfg.ekya_style_centralized_scheduling.retraining_trigger_min_samples = 4
+        cfg.ekya_style_centralized_scheduling.signal_threshold = 0.0
+        method = create_method(cfg)
+
+        for i in range(4):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.25,
+                latency_ms=10.0,
+                drift_flag=True,
+            ))
+        assert method.should_trigger(1)
+        plan = method.build_update_plan(1)
+        method.execute_update(plan)
+
+        method.on_inference_result(InferenceResult(
+            device_id=1,
+            frame_index=4,
+            confidence=0.8,
+            latency_ms=10.0,
+            drift_flag=False,
+        ))
+        dev = method.metrics.get_device(1)
+        assert dev.inference_latencies_ms[-1] > 10.0
+
+    def test_training_metadata_marks_raw_retraining_only(self):
+        cfg = _make_config("ekya_style_centralized_scheduling")
+        cfg.ekya_style_centralized_scheduling.retraining_window_size = 4
+        cfg.ekya_style_centralized_scheduling.retraining_trigger_min_samples = 4
+        cfg.ekya_style_centralized_scheduling.signal_threshold = 0.0
+        method = create_method(cfg)
+
+        for i in range(4):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.3,
+                latency_ms=10.0,
+                drift_flag=True,
+            ))
+        plan = method.build_update_plan(1)
+        assert plan.metadata["raw_retraining_only"] is True
+
+    def test_thief_queue_does_not_overlap_serial_retrains(self):
+        cfg = _make_config("ekya_style_centralized_scheduling", num_devices=2)
+        method = create_method(cfg)
+
+        method.execute_update(
+            UpdatePlan(
+                device_id=1,
+                trigger_reason="test_a",
+                upload_mode="centralized",
+                num_samples=10,
+                estimated_upload_bytes=0,
+                is_central=True,
+                metadata={
+                    "estimated_training_time_sec": 5.0,
+                    "utility": 2.0,
+                },
+            )
+        )
+        method.execute_update(
+            UpdatePlan(
+                device_id=2,
+                trigger_reason="test_b",
+                upload_mode="centralized",
+                num_samples=10,
+                estimated_upload_bytes=0,
+                is_central=True,
+                metadata={
+                    "estimated_training_time_sec": 5.0,
+                    "utility": 2.0,
+                },
+            )
+        )
+
+        dev2 = method.metrics.get_device(2)
+        assert dev2.central_wait_time_sec == pytest.approx(5.0)
+        assert method._server_retrain_busy_until == pytest.approx(10.0)
+
+
+class TestAccuracyTriggerRestoredSemantics:
+    def test_cooldown_skips_the_next_completed_window(self):
+        cfg = _make_config("accuracy_trigger_cloud_retraining")
+        cfg.accuracy_trigger_cloud_retraining.trigger_window_size = 4
+        cfg.accuracy_trigger_cloud_retraining.trigger_cooldown_windows = 1
+        method = create_method(cfg)
+
+        for i in range(4):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.2,
+                proxy_map=0.18,
+                latency_ms=10.0,
+                drift_flag=True,
+            ))
+        assert method.should_trigger(1)
+        plan = method.build_update_plan(1)
+        method.execute_update(plan)
+
+        for i in range(4, 8):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.2,
+                proxy_map=0.18,
+                latency_ms=10.0,
+                drift_flag=True,
+            ))
+        assert not method.should_trigger(1)
+
+        for i in range(8, 12):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.2,
+                proxy_map=0.18,
+                latency_ms=10.0,
+                drift_flag=True,
+            ))
+        assert method.should_trigger(1)
+
+    def test_non_trigger_windows_are_buffered_for_next_retrain(self):
+        cfg = _make_config("accuracy_trigger_cloud_retraining")
+        cfg.accuracy_trigger_cloud_retraining.trigger_window_size = 4
+        cfg.accuracy_trigger_cloud_retraining.max_buffered_windows = 2
+        method = create_method(cfg)
+
+        for i in range(4):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.8,
+                proxy_map=0.75,
+                latency_ms=10.0,
+                drift_flag=False,
+            ))
+        assert not method.should_trigger(1)
+
+        for i in range(4, 8):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.2,
+                proxy_map=0.18,
+                latency_ms=10.0,
+                drift_flag=True,
+            ))
+        assert method.should_trigger(1)
+        plan = method.build_update_plan(1)
+
+        assert plan.metadata["buffered_frame_count"] > 0
+        assert plan.num_samples > plan.metadata["current_window_frame_count"]
+        assert plan.estimated_upload_bytes == (
+            plan.num_samples * method.frame_bytes_raw
+        )
+
+    def test_trigger_uses_history_band_not_only_fixed_thresholds(self):
+        cfg = _make_config("accuracy_trigger_cloud_retraining")
+        cfg.accuracy_trigger_cloud_retraining.trigger_window_size = 4
+        cfg.accuracy_trigger_cloud_retraining.confidence_drop_threshold = 0.9
+        cfg.accuracy_trigger_cloud_retraining.low_conf_ratio_threshold = 1.1
+        cfg.accuracy_trigger_cloud_retraining.drift_ratio_threshold = 1.1
+        method = create_method(cfg)
+
+        for i in range(4):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.85,
+                proxy_map=0.84,
+                latency_ms=10.0,
+                drift_flag=False,
+            ))
+        assert not method.should_trigger(1)
+
+        for i in range(4, 8):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.72,
+                proxy_map=0.50,
+                latency_ms=10.0,
+                drift_flag=False,
+            ))
+        assert method.should_trigger(1)
+
+    def test_accuracy_trigger_forces_raw_only_retraining(self):
+        cfg = _make_config("accuracy_trigger_cloud_retraining")
+        cfg.accuracy_trigger_cloud_retraining.trigger_window_size = 4
+        cfg.accuracy_trigger_cloud_retraining.upload_mode = "raw+feature"
+        method = create_method(cfg)
+
+        for i in range(4):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=0.2,
+                proxy_map=0.15,
+                latency_ms=10.0,
+                drift_flag=True,
+            ))
+        assert method.should_trigger(1)
+        plan = method.build_update_plan(1)
+
+        assert plan.upload_mode == "raw_only"
+        assert plan.metadata["raw_retraining_only"] is True
+        assert plan.metadata["configured_upload_mode"] == "raw+feature"
+
+    def test_retraining_pool_keeps_highest_scoring_key_frames(self):
+        cfg = _make_config("accuracy_trigger_cloud_retraining")
+        cfg.accuracy_trigger_cloud_retraining.trigger_window_size = 8
+        cfg.accuracy_trigger_cloud_retraining.max_selected_frames_per_window = 8
+        cfg.accuracy_trigger_cloud_retraining.retraining_time_budget_sec = 0.3
+        method = create_method(cfg)
+        method.set_upload_bandwidth(1, 50_000_000)
+
+        confidences = [0.05, 0.49, 0.48, 0.47, 0.46, 0.45, 0.44, 0.43]
+        for i, confidence in enumerate(confidences):
+            method.on_inference_result(InferenceResult(
+                device_id=1,
+                frame_index=i,
+                confidence=confidence,
+                proxy_map=max(0.0, confidence - 0.1),
+                latency_ms=10.0,
+                drift_flag=False,
+            ))
+        assert method.should_trigger(1)
+
+        ranked_selected = method._pending_snapshots[1].selected_frames
+        plan = method.build_update_plan(1)
+
+        assert plan.num_samples < len(ranked_selected)
+        assert set(plan.metadata["selected_frame_indices"]) == {0, 1, 6, 7}
+
+    def test_candidate_time_accounts_for_buffered_frame_annotation(self):
+        cfg = _make_config("accuracy_trigger_cloud_retraining")
+        method = create_method(cfg)
+
+        snapshot = WindowSnapshot(
+            device_id=1,
+            window_size=1,
+            mean_confidence=0.2,
+            low_conf_ratio=1.0,
+            drift_ratio=0.0,
+            confidence_drop=0.3,
+            selected_frames=[
+                BufferedFrame(
+                    frame_index=10,
+                    confidence=0.2,
+                    proxy_map=0.18,
+                    drift_flag=False,
+                    latency_ms=10.0,
+                    selection_score=0.8,
+                    selected_by="low_conf+difference",
+                )
+            ],
+            selected_accuracy=0.18,
+            urgency=0.5,
+            historical_accuracy=0.7,
+            historical_std=0.1,
+            completed_frame_index=10,
+        )
+        candidate = RetrainingCandidate(
+            epochs=2,
+            frame_limit=4,
+            teacher="yolov5s",
+            teacher_speed=1.0,
+            teacher_quality=0.86,
+            trainable_scope="head_only",
+            annotation_threshold=0.25,
+        )
+
+        _, meta = method._score_candidate(
+            device_id=1,
+            snapshot=snapshot,
+            candidate=candidate,
+            total_available_frames=4,
+        )
+
+        chosen_total = 4
+        backward_scope_ratio = 0.25
+        expected_total_time = (
+            (chosen_total * method.frame_bytes_raw) / (5 * 1024 * 1024)
+            + chosen_total * (0.018 + (1.0 - candidate.teacher_quality) * 0.01)
+            + (
+                candidate.epochs * chosen_total * method.raw_forward_cost_per_frame_sec
+                + candidate.epochs * chosen_total * method.suffix_backward_cost_per_frame_sec * backward_scope_ratio
+                + candidate.epochs * chosen_total * method.optimizer_step_cost_per_frame_sec * backward_scope_ratio
+            ) * candidate.teacher_speed * (1.0 + 0.35 * snapshot.urgency)
+            + max(0.05, 0.12 * candidate.teacher_speed)
+            + (chosen_total - len(snapshot.selected_frames)) * 0.004
+        )
+        assert meta["predicted_total_time"] == pytest.approx(
+            round(expected_total_time, 4),
+            abs=1e-4,
+        )
+
+
 # ── Test 7: Pure-edge never calls central retraining ──────────────────
 
 
@@ -324,6 +660,42 @@ class TestPureEdgeNoCentral:
             assert plan.is_central is False
             assert plan.estimated_upload_bytes == 0
             assert plan.upload_mode == "none"
+
+
+class TestPureEdgeRawRetrainingCosts:
+    def _run_local_update(self, retrain_target: str, num_samples: int = 16) -> float:
+        cfg = _make_config("pure_edge_local_updating")
+        cfg.pure_edge_local_updating.retrain_target = retrain_target
+        method = create_method(cfg)
+        method.set_local_train_budget(1, 1.0)
+        method.execute_update(
+            UpdatePlan(
+                device_id=1,
+                trigger_reason="test",
+                upload_mode="none",
+                num_samples=num_samples,
+                estimated_upload_bytes=0,
+                is_central=False,
+                metadata={
+                    "local_num_epoch": 1,
+                    "retrain_target": retrain_target,
+                },
+            )
+        )
+        dev = method.metrics.get_device(1)
+        dev.finalize()
+        return dev.local_training_time_sec
+
+    def test_head_only_still_pays_frozen_prefix_forward_cost(self):
+        head_only = self._run_local_update("head_only", num_samples=16)
+        full_model = self._run_local_update("full_model", num_samples=16)
+        assert head_only < full_model
+        assert head_only > full_model * 0.5
+
+    def test_local_raw_retraining_scales_with_sample_count(self):
+        few = self._run_local_update("head_only", num_samples=16)
+        many = self._run_local_update("head_only", num_samples=32)
+        assert many > few
 
 
 # ── Test 8: Metrics schema consistent across all methods ──────────────

@@ -38,8 +38,12 @@ class EkyaStyleConfig:
     inference_reserved_ratio: float = 0.6
     retraining_window_size: int = 32
     retraining_trigger_min_samples: int = 16
-    queue_policy: str = "fifo"
+    queue_policy: str = "thief"
     retraining_steps_per_round: int = 5
+    frame_duration_sec: float = 0.05
+    signal_threshold: float = 0.18
+    base_train_init_sec: float = 0.22
+    base_train_epoch_sec: float = 0.14
 
 
 @dataclass
@@ -50,6 +54,13 @@ class AccuracyTriggerConfig:
     low_conf_ratio_threshold: float = 0.30
     drift_ratio_threshold: float = 0.20
     upload_mode: str = "raw_only"
+    low_confidence_threshold: float = 0.50
+    trigger_cooldown_windows: int = 1
+    max_buffered_windows: int = 4
+    max_selected_frames_per_window: int = 12
+    retraining_time_budget_sec: float = 8.0
+    frame_bytes_raw: int = 160000
+    frame_bytes_feature: int = 260000
 
 
 @dataclass
@@ -59,6 +70,7 @@ class PureEdgeConfig:
     low_conf_ratio_threshold: float = 0.30
     local_num_epoch: int = 1
     retrain_target: str = "full_model"
+    full_forward_epoch_ratio: float = 0.45
 
 
 # ── Scenario config ──────────────────────────────────────────────────
