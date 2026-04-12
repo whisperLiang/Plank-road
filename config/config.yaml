@@ -191,5 +191,10 @@ server:
   # bn_only: True → only BN parameters are updated; Conv/FC weight
   #   gradients are blocked.  Useful for conservative adaptation.
   bn_only: False
+  # DAS strategy:
+  #   tgi     -> probe gradients and compute TGI-based pruning ratios
+  #   entropy -> use per-layer feature spectral entropy online without probing
+  strategy: entropy
   # Number of samples used for gradient-importance probing each epoch.
+  # Ignored when strategy=entropy.
   probe_samples: 10

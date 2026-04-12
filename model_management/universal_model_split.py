@@ -661,7 +661,7 @@ def universal_split_retrain(
                 use_spectral_entropy=das_use_entropy,
                 device=device,
             )
-        das_trainer.probe_samples = max(1, int(das_probe_samples))
+        das_trainer.probe_samples = max(0, int(das_probe_samples)) if das_use_entropy else max(1, int(das_probe_samples))
 
     params = splitter.get_tail_trainable_params(chosen)
     optimizer = torch.optim.Adam(params, lr=float(learning_rate)) if params else None
@@ -728,8 +728,31 @@ def universal_split_retrain(
                 averaged = {}
             das_trainer.activate_sparsity(averaged)
         elif das_trainer is not None and das_use_entropy:
-            # Start dense; update ratios from each batch's forward pass.
-            das_trainer.deactivate_sparsity()
+            # Mirror the gradient-based flow: probe first, then keep ratios fixed
+            # for the remainder of the epoch.
+            probe_count = min(len(all_indices), int(getattr(das_trainer, "probe_samples", 0) or 0))
+            if probe_count <= 0:
+                das_trainer.activate_sparsity({})
+            else:
+                probe_indices = (
+                    random.sample(list(all_indices), probe_count)
+                    if probe_count and len(all_indices) > probe_count
+                    else list(all_indices)[:probe_count]
+                )
+                das_trainer.deactivate_sparsity()
+                aggregated: dict[str, float] = {}
+                counts: dict[str, int] = {}
+                with torch.no_grad():
+                    for probe_index in probe_indices:
+                        record = load_split_feature_cache(cache_path, probe_index)
+                        payload = record["intermediate"]
+                        splitter.cloud_forward(payload, candidate=chosen)
+                        ratios = das_trainer.refresh_pruning_ratios_from_entropy()
+                        for key, value in ratios.items():
+                            aggregated[key] = aggregated.get(key, 0.0) + float(value)
+                            counts[key] = counts.get(key, 0) + 1
+                averaged = {key: aggregated[key] / counts[key] for key in aggregated} if counts else {}
+                das_trainer.activate_sparsity(averaged)
 
         for frame_index in list(all_indices):
             record = load_split_feature_cache(cache_path, frame_index)
@@ -847,9 +870,6 @@ def universal_split_retrain(
                 optimizer=optimizer,
                 candidate=chosen,
             )
-            if das_trainer is not None and das_use_entropy:
-                ratios = das_trainer.refresh_pruning_ratios_from_entropy()
-                das_trainer.activate_sparsity(ratios)
             if not bool(torch.isfinite(loss).item()):
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
