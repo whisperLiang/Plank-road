@@ -126,13 +126,13 @@ client:
   # --- Shared with drift_detection (PD urgency controller) ---
   # Conservative profile: delay CL until enough evidence accumulates and let
   # the Q_cloud/Q_bw penalties suppress repeated training decisions.
-  V: 2.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
+  V: 10.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
   K_p: 0.6              # PD proportional gain
   K_d: 0.2              # PD derivative gain
   # confidence_threshold: 0.8
   # --- Two-queue budget constraints ---
-  lambda_cloud: 0.25     # avg cloud-cost budget per round [0,1]
-  lambda_bw: 0.25        # avg bandwidth budget per round [0,1]
+  lambda_cloud: 0.5     # avg cloud-cost budget per round [0,1]
+  lambda_bw: 0.5        # avg bandwidth budget per round [0,1]
   # --- Queue importance weights ---
   w_cloud: 1.0           # weight for cloud-cost queue
   w_bw: 1.0              # weight for bandwidth queue
