@@ -78,8 +78,7 @@ class EdgeWorker:
         if self.resource_trigger_enabled:
             self.resource_trigger = create_resource_aware_trigger(config)
             logger.info(
-                "Resource-aware CL trigger enabled (pi_bar={}, V={}, lambda_cloud={}, lambda_bw={})",
-                self.resource_trigger.pi_bar,
+                "Resource-aware CL trigger enabled (V={}, lambda_cloud={}, lambda_bw={})",
                 self.resource_trigger.V,
                 self.resource_trigger.lambda_cloud,
                 self.resource_trigger.lambda_bw,

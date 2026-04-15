@@ -28,7 +28,6 @@ plt.rcParams.update(
 # Parameters aligned with current trigger implementation
 # =========================================================
 V = 10.0
-pi_bar = 0.1
 w_cloud = 1.0
 w_bw = 1.0
 lambda_cloud = 0.5
@@ -44,7 +43,7 @@ payload_scale = raw_plus_feature_payload / raw_only_payload
 # =========================================================
 # Decision score functions
 # =========================================================
-def compute_scores(U, C, W_raw, Q_u, Q_c, Q_b):
+def compute_scores(U, C, W_raw, Q_c, Q_b):
     W_raw_feat = min(1.0, payload_scale * W_raw)
 
     # a0: skip training
@@ -52,20 +51,14 @@ def compute_scores(U, C, W_raw, Q_u, Q_c, Q_b):
 
     # a1: train with raw-only
     J_raw = (
-        Q_u
-        + 1.0
-        - pi_bar
-        + w_cloud * (Q_c + C) * (1.0 + C)
+        w_cloud * (Q_c + C) * (1.0 + C)
         + w_bw * (Q_b + W_raw) * (1.0 + W_raw)
         + C * low_conf_feature_ratio
     )
 
     # a2: train with raw+feature
     J_feat = (
-        Q_u
-        + 1.0
-        - pi_bar
-        + w_cloud * (Q_c + C) * (1.0 + 0.5 * C)
+        w_cloud * (Q_c + C) * (1.0 + 0.5 * C)
         + w_bw * (Q_b + W_raw_feat) * (1.0 + W_raw_feat)
         + (1.0 + W_raw_feat) * low_conf_feature_ratio
     )
@@ -73,8 +66,8 @@ def compute_scores(U, C, W_raw, Q_u, Q_c, Q_b):
     return J_skip, J_raw, J_feat, W_raw_feat
 
 
-def select_action(U, C, W_raw, Q_u, Q_c, Q_b):
-    J_skip, J_raw, J_feat, W_raw_feat = compute_scores(U, C, W_raw, Q_u, Q_c, Q_b)
+def select_action(U, C, W_raw, Q_c, Q_b):
+    J_skip, J_raw, J_feat, W_raw_feat = compute_scores(U, C, W_raw, Q_c, Q_b)
     scores = [J_skip, J_raw, J_feat]
     action = int(np.argmin(scores))  # 0,1,2
     return action, scores, W_raw_feat
@@ -86,13 +79,12 @@ def select_action(U, C, W_raw, Q_u, Q_c, Q_b):
 def simulate_trigger(T=120, seed=1):
     rng = np.random.default_rng(seed)
 
-    Q_u, Q_c, Q_b = 0.0, 0.0, 0.0
+    Q_c, Q_b = 0.0, 0.0
 
     actions = []
     U_list = []
     C_list = []
     W_list = []
-    Qu_list = [Q_u]
     Qc_list = [Q_c]
     Qb_list = [Q_b]
 
@@ -134,28 +126,24 @@ def simulate_trigger(T=120, seed=1):
         W_raw += rng.normal(0.0, 0.03)
         W_raw = float(np.clip(W_raw, 0.0, 1.0))
 
-        action, scores, W_raw_feat = select_action(U, C, W_raw, Q_u, Q_c, Q_b)
+        action, scores, W_raw_feat = select_action(U, C, W_raw, Q_c, Q_b)
 
         # ---------------------------
         # Selected costs
         # ---------------------------
         if action == 0:
-            train_now = 0.0
             selected_cloud_cost = 0.0
             selected_bw_cost = 0.0
         elif action == 1:
-            train_now = 1.0
-            selected_cloud_cost = 1.0 + C
+            selected_cloud_cost = C
             selected_bw_cost = W_raw
         else:
-            train_now = 1.0
-            selected_cloud_cost = 1.0 + C
+            selected_cloud_cost = C
             selected_bw_cost = W_raw_feat
 
         # ---------------------------
         # Queue updates
         # ---------------------------
-        Q_u = max(0.0, Q_u + train_now - pi_bar)
         Q_c = max(0.0, Q_c + selected_cloud_cost - lambda_cloud)
         Q_b = max(0.0, Q_b + selected_bw_cost - lambda_bw)
 
@@ -164,7 +152,6 @@ def simulate_trigger(T=120, seed=1):
         U_list.append(U)
         C_list.append(C)
         W_list.append(W_raw)
-        Qu_list.append(Q_u)
         Qc_list.append(Q_c)
         Qb_list.append(Q_b)
 
@@ -173,7 +160,6 @@ def simulate_trigger(T=120, seed=1):
         "U": np.array(U_list),
         "C": np.array(C_list),
         "W_raw": np.array(W_list),
-        "Q_u": np.array(Qu_list),
         "Q_c": np.array(Qc_list),
         "Q_b": np.array(Qb_list),
     }
@@ -220,7 +206,6 @@ def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
     # Bottom panel: queue evolution
     # ---------------------------
     ax2 = axes[2]
-    ax2.plot(tq, data["Q_u"], linewidth=2.0, label=r"$Q_u$ (update queue)")
     ax2.plot(tq, data["Q_c"], linewidth=2.0, label=r"$Q_c$ (cloud queue)")
     ax2.plot(tq, data["Q_b"], linewidth=2.0, label=r"$Q_b$ (bandwidth queue)")
     ax2.set_xlabel("Time step $t$")

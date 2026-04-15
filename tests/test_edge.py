@@ -776,6 +776,27 @@ class TestResourceAwareCLTrigger:
         assert decision.train_now is True
         assert decision.send_low_conf_features is True
 
+    def test_trigger_maintains_only_cloud_and_bandwidth_queues(self):
+        trigger = ResourceAwareCLTrigger(
+            min_training_samples=1,
+            V=10.0,
+            lambda_cloud=0.5,
+            lambda_bw=0.0,
+        )
+
+        decision = trigger.decide(
+            avg_confidence=0.2,
+            drift_detected=True,
+            cloud_state=self._cloud_state(0.95),
+            bandwidth_mbps=100.0,
+            sample_stats=self._stats(),
+        )
+
+        assert decision.train_now is True
+        assert set(trigger.queue_snapshot) == {"Q_cloud", "Q_bw"}
+        assert not hasattr(trigger, "Q_update")
+        assert trigger.queue_snapshot["Q_cloud"] == pytest.approx(0.45)
+
     def test_trigger_can_skip_training_when_urgency_is_low(self):
         trigger = ResourceAwareCLTrigger(min_training_samples=1, V=1.0)
         decision = trigger.decide(

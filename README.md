@@ -92,6 +92,10 @@ Preferences encoded in the trigger:
 - tight bandwidth:
   avoid training, but if training happens prefer `raw only`
 
+The controller maintains two virtual queues:
+- `Q_cloud` for cloud resource pressure against `lambda_cloud`
+- `Q_bw` for bandwidth pressure against `lambda_bw`
+
 Core file:
 - [edge/resource_aware_trigger.py](./edge/resource_aware_trigger.py)
 

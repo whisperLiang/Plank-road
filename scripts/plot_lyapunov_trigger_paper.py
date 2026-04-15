@@ -31,11 +31,9 @@ plt.rcParams.update(
 # You can replace these with your actual experimental values
 # =========================================================
 V = 10.0
-pi_bar = 0.1
 w_cloud = 1.0
 w_bw = 1.0
 
-Q_u = 0.0
 Q_c = 0.0
 Q_bw = 0.0
 
@@ -67,20 +65,14 @@ def compute_scores(C, W_raw, U):
 
     # train with raw-only
     J_raw = (
-        Q_u
-        + 1.0
-        - pi_bar
-        + w_cloud * (Q_c + C) * (1.0 + C)
+        w_cloud * (Q_c + C) * (1.0 + C)
         + w_bw * (Q_bw + W_raw) * (1.0 + W_raw)
         + C * low_conf_feature_ratio
     )
 
     # train with raw+feature
     J_feat = (
-        Q_u
-        + 1.0
-        - pi_bar
-        + w_cloud * (Q_c + C) * (1.0 + 0.5 * C)
+        w_cloud * (Q_c + C) * (1.0 + 0.5 * C)
         + w_bw * (Q_bw + W_raw_feat) * (1.0 + W_raw_feat)
         + (1.0 + W_raw_feat) * low_conf_feature_ratio
     )
@@ -150,8 +142,7 @@ def plot_3d_decision_space(stem="lyapunov_trigger_3d_decision_space"):
     fig.text(
         0.02,
         0.01,
-        f"$V={V}$, $\\bar{{\\pi}}={pi_bar}$, "
-        f"feature ratio={low_conf_feature_ratio:.2f}, "
+        f"$V={V}$, feature ratio={low_conf_feature_ratio:.2f}, "
         f"payload scale={payload_scale:.2f}",
         fontsize=10,
     )

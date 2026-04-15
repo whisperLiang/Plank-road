@@ -16,7 +16,7 @@
 | 边缘节点注册表 | ✅ 已实现 | `cloud/edge_registry.py` |
 | CLI 多边缘覆写 | ✅ 已实现 | `--edge_id`, `--cache_path`, `--video_path` |
 | 请求去重 | ✅ 已实现 | `request_id` 幂等提交 |
-| 资源感知触发 | ✅ 已实现 | Lyapunov multi-queue scheduler |
+| 资源感知触发 | ✅ 已实现 | Lyapunov two-queue scheduler |
 | 任务持久化（SQLite） | ⬜ 阶段二 | 当前为内存队列 |
 | 失败自动重试 | ⬜ 阶段二 | |
 | 任务优先级 / 合并 | ⬜ 阶段三 | |

@@ -103,11 +103,11 @@ client:
   # Saturation ceiling for retained_count in over-detection scoring; penalties stop increasing beyond this value
   adaptive_over_detection_retained_ceiling: 32
 
- # Resource-aware CL trigger (multi-queue Lyapunov scheduler)
+ # Resource-aware CL trigger (two-queue Lyapunov scheduler)
  # Reference: RCCDA (NeurIPS 2025) — Lyapunov drift-plus-penalty
  # https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code
  #
- # When enabled, *replaces* the drift_detection trigger with a multi-queue
+ # When enabled, *replaces* the drift_detection trigger with a two-queue
  # Lyapunov policy that jointly decides (1) whether to trigger CL and
  # (2) whether low-confidence samples should also upload features, considering:
  #   - Cloud resource state (CPU / GPU / memory utilisation)
@@ -115,18 +115,16 @@ client:
  #   - Edge-side confidence-score degradation
  #
  # Virtual queues:
- #   Q_update — bounds average retrain rate  ≤  pi_bar
  #   Q_cloud  — bounds average cloud cost    ≤  lambda_cloud
  #   Q_bw     — bounds average bandwidth     ≤  lambda_bw
  resource_aware_trigger:
   enabled: True
-  # --- Shared with drift_detection (RCCDA PD controller) ---
-  # pi_bar: 0.1          # max avg CL trigger rate
+  # --- Shared with drift_detection (PD urgency controller) ---
   # V: 10.0              # Lyapunov trade-off coefficient
   # K_p: 1.0             # PD proportional gain
   # K_d: 0.5             # PD derivative gain
   # confidence_threshold: 0.8
-  # --- Multi-queue budget constraints ---
+  # --- Two-queue budget constraints ---
   lambda_cloud: 0.5      # avg cloud-cost budget per round [0,1]
   lambda_bw: 0.5         # avg bandwidth budget per round [0,1]
   # --- Queue importance weights ---
