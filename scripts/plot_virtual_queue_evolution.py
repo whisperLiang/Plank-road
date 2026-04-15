@@ -27,11 +27,11 @@ plt.rcParams.update(
 # =========================================================
 # Parameters aligned with current trigger implementation
 # =========================================================
-V = 10.0
+V = 5.0
 w_cloud = 1.0
 w_bw = 1.0
-lambda_cloud = 0.5
-lambda_bw = 0.2  # 修正：降低带宽预算，保证 Q_b 可累积
+lambda_cloud = 0.25
+lambda_bw = 0.25  # 修正：降低带宽预算，保证 Q_b 可累积
 
 # Representative payload statistics
 raw_only_payload = 20.0
@@ -113,11 +113,7 @@ def simulate_trigger(T=120, seed=1):
         # 3) bandwidth pressure W_raw
         # 修正：增加高带宽压力区间
         # ---------------------------
-        W_raw = 0.5 + 0.1 * np.sin(2 * np.pi * t / 18.0 + 1.2)
-
-        # # 中度拥塞区间
-        # if 55 <= t <= 70:
-        #     W_raw -= 0.2
+        W_raw = 0.3 + 0.25 * np.sin(2 * np.pi * t / 18.0 + 1.2)
 
         # 强拥塞区间：确保 Q_b 明显上升
         if 100 <= t <= 105:
@@ -176,9 +172,9 @@ def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
     fig, axes = plt.subplots(
         3,
         1,
-        figsize=(10, 8.0),
+        figsize=(10, 6.0),
         sharex=True,
-        gridspec_kw={"height_ratios": [1, 1, 2]},
+        gridspec_kw={"height_ratios": [1, 1, 1]},
         constrained_layout=True,
     )
 
@@ -188,17 +184,21 @@ def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
     ax0 = axes[0]
     ax0.step(t, data["actions"], where="post", linewidth=1.8)
     ax0.set_yticks([0, 1, 2])
-    ax0.set_yticklabels([r"$a_0$: skip", r"$a_1$: raw-only", r"$a_2$: raw+feature"])
+    ax0.set_yticklabels([r"$a_0$", r"$a_1$", r"$a_2$"])
     ax0.set_ylabel("Action")
     ax0.set_title("Lyapunov trigger actions and virtual queue evolution")
+
+    c_cloud = "#1f77b4"
+    c_bw = "#ff7f0e"
+    c_urgency = "#2ca02c"
 
     # ---------------------------
     # Middle panel: environment inputs
     # ---------------------------
     ax1 = axes[1]
-    ax1.plot(t, data["U"], linewidth=1.5, label=r"Urgency $U$")
-    ax1.plot(t, data["C"], linewidth=1.5, label=r"Cloud pressure $C$")
-    ax1.plot(t, data["W_raw"], linewidth=1.5, label=r"Bandwidth pressure $W_{raw}$")
+    ax1.plot(t, data["U"], linewidth=1.5, color=c_urgency, label=r"Urgency $U$")
+    ax1.plot(t, data["C"], linewidth=1.5, color=c_cloud, label=r"Cloud pressure $C$")
+    ax1.plot(t, data["W_raw"], linewidth=1.5, color=c_bw, label=r"Bandwidth pressure $W_{raw}$")
     ax1.set_ylabel("Input value")
     ax1.legend(loc="upper left", ncol=3, frameon=True)
 
@@ -206,8 +206,8 @@ def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
     # Bottom panel: queue evolution
     # ---------------------------
     ax2 = axes[2]
-    ax2.plot(tq, data["Q_c"], linewidth=2.0, label=r"$Q_c$ (cloud queue)")
-    ax2.plot(tq, data["Q_b"], linewidth=2.0, label=r"$Q_b$ (bandwidth queue)")
+    ax2.plot(tq, data["Q_c"], linewidth=2.0, color=c_cloud, label=r"$Q_c$ (cloud queue)")
+    ax2.plot(tq, data["Q_b"], linewidth=2.0, color=c_bw, label=r"$Q_b$ (bandwidth queue)")
     ax2.set_xlabel("Time step $t$")
     ax2.set_ylabel("Queue value")
     ax2.legend(loc="upper left", frameon=True)

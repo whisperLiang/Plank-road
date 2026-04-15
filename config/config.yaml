@@ -126,7 +126,7 @@ client:
   # --- Shared with drift_detection (PD urgency controller) ---
   # Conservative profile: delay CL until enough evidence accumulates and let
   # the Q_cloud/Q_bw penalties suppress repeated training decisions.
-  V: 10.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
+  V: 5.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
   K_p: 0.6              # PD proportional gain
   K_d: 0.2              # PD derivative gain
   # confidence_threshold: 0.8
