@@ -96,7 +96,6 @@ class ResourceAwareCLTrigger:
     def __init__(
         self,
         *,
-        pi_bar: float | None = None,
         V: float = 10.0,
         K_p: float = 1.0,
         K_d: float = 0.5,
@@ -109,9 +108,6 @@ class ResourceAwareCLTrigger:
         drift_bonus: float = 0.35,
         upload_time_budget_sec: float = 5.0,
     ) -> None:
-        # Accepted for older configs; the current controller only maintains
-        # cloud and bandwidth virtual queues.
-        _ = pi_bar
         self.V = float(V)
         self.K_p = float(K_p)
         self.K_d = float(K_d)
