@@ -83,12 +83,13 @@ class ResourceAwareTriggerConfig(ConfigSection):
 
 @dataclass
 class FixedSplitConfig(ConfigSection):
-    privacy_metric_lower_bound: float = 0.15
+    privacy_leakage_upper_bound: float = 0.15
     max_layer_freezing_ratio: float = 0.75
     validate_candidates: bool = True
     max_candidates: int = 24
     max_boundary_count: int = 8
     max_payload_bytes: int = 33554432
+    privacy_leakage_epsilon: float = 1e-12
 
 
 @dataclass

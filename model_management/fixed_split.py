@@ -9,7 +9,12 @@ from typing import Any, Mapping
 
 import torch
 
-from model_management.candidate_generator import solve_exact_candidates
+from model_management.candidate_generator import (
+    PRIVACY_LEAKAGE_EPSILON,
+    estimate_privacy_leakage_from_edge_params,
+    min_edge_parameters_for_privacy,
+    solve_exact_candidates,
+)
 from model_management.graph_ir import GraphIR
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.universal_model_split import UniversalModelSplitter
@@ -36,21 +41,56 @@ def _format_boundary_labels(
 
 @dataclass(frozen=True)
 class SplitConstraints:
-    privacy_metric_lower_bound: float = 0.0
+    privacy_leakage_upper_bound: float = 0.0
     max_layer_freezing_ratio: float = 1.0
     validate_candidates: bool = True
     max_candidates: int = 24
     max_boundary_count: int = 8
     max_payload_bytes: int = 32 * 1024 * 1024
+    privacy_leakage_epsilon: float = PRIVACY_LEAKAGE_EPSILON
+    privacy_metric_lower_bound: float | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self.privacy_metric_lower_bound is not None
+            and float(self.privacy_leakage_upper_bound) <= 0.0
+        ):
+            object.__setattr__(
+                self,
+                "privacy_leakage_upper_bound",
+                float(self.privacy_metric_lower_bound),
+            )
+        object.__setattr__(self, "privacy_metric_lower_bound", None)
 
     @classmethod
     def from_config(cls, config: Any | None) -> "SplitConstraints":
         if config is None:
             return cls()
+        extras = getattr(config, "_extras", {}) or {}
+        legacy_privacy_bound = getattr(config, "privacy_metric_lower_bound", None)
+        privacy_leakage_upper_bound = getattr(config, "privacy_leakage_upper_bound", None)
+        default_privacy_bound = getattr(
+            type(config),
+            "privacy_leakage_upper_bound",
+            None,
+        )
+        if (
+            "privacy_metric_lower_bound" in extras
+            and (
+                privacy_leakage_upper_bound is None
+                or (
+                    default_privacy_bound is not None
+                    and float(privacy_leakage_upper_bound) == float(default_privacy_bound)
+                )
+            )
+        ):
+            privacy_leakage_upper_bound = legacy_privacy_bound
+        if privacy_leakage_upper_bound is None:
+            privacy_leakage_upper_bound = (
+                legacy_privacy_bound if legacy_privacy_bound is not None else 0.0
+            )
         return cls(
-            privacy_metric_lower_bound=float(
-                getattr(config, "privacy_metric_lower_bound", 0.0)
-            ),
+            privacy_leakage_upper_bound=float(privacy_leakage_upper_bound),
             max_layer_freezing_ratio=float(
                 getattr(config, "max_layer_freezing_ratio", 1.0)
             ),
@@ -60,7 +100,32 @@ class SplitConstraints:
             max_payload_bytes=int(
                 getattr(config, "max_payload_bytes", 32 * 1024 * 1024)
             ),
+            privacy_leakage_epsilon=float(
+                getattr(config, "privacy_leakage_epsilon", PRIVACY_LEAKAGE_EPSILON)
+            ),
         )
+
+
+def _privacy_min_edge_parameter_count(constraints: SplitConstraints) -> int:
+    return min_edge_parameters_for_privacy(
+        constraints.privacy_leakage_upper_bound,
+        epsilon=constraints.privacy_leakage_epsilon,
+    )
+
+
+def _constraints_payload(constraints: SplitConstraints) -> dict[str, Any]:
+    return {
+        "privacy_leakage_upper_bound": float(constraints.privacy_leakage_upper_bound),
+        "privacy_leakage_epsilon": float(constraints.privacy_leakage_epsilon),
+        "privacy_min_edge_parameter_count": _privacy_min_edge_parameter_count(
+            constraints
+        ),
+        "max_layer_freezing_ratio": float(constraints.max_layer_freezing_ratio),
+        "validate_candidates": bool(constraints.validate_candidates),
+        "max_candidates": int(constraints.max_candidates),
+        "max_boundary_count": int(constraints.max_boundary_count),
+        "max_payload_bytes": int(constraints.max_payload_bytes),
+    }
 
 
 @dataclass
@@ -75,6 +140,9 @@ class SplitPlan:
     privacy_metric: float
     privacy_risk: float
     layer_freezing_ratio: float
+    privacy_leakage: float = 0.0
+    edge_parameter_count: int = 0
+    total_parameter_count: int = 0
     validation: dict[str, Any] = field(default_factory=dict)
     constraints: dict[str, Any] = field(default_factory=dict)
     trace_signature: str | None = None
@@ -85,12 +153,18 @@ class SplitPlan:
         return len(self.boundary_tensor_labels)
 
     def describe(self, *, max_boundary_labels: int = 4) -> str:
+        boundary_labels = _format_boundary_labels(
+            self.boundary_tensor_labels,
+            max_items=max_boundary_labels,
+        )
         return (
             f"candidate_id={self.candidate_id}, "
             f"boundary_count={self.boundary_count}, "
-            f"boundary_tensor_labels={_format_boundary_labels(self.boundary_tensor_labels, max_items=max_boundary_labels)}, "
+            f"boundary_tensor_labels={boundary_labels}, "
             f"legacy_split_index={self.split_index}, "
-            f"payload_bytes={self.payload_bytes}"
+            f"payload_bytes={self.payload_bytes}, "
+            f"privacy_leakage={self.privacy_leakage:.6g}, "
+            f"edge_parameters={self.edge_parameter_count}/{self.total_parameter_count}"
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -109,6 +183,14 @@ class SplitPlan:
             privacy_metric=float(payload.get("privacy_metric", 0.0)),
             privacy_risk=float(payload.get("privacy_risk", 0.0)),
             layer_freezing_ratio=float(payload.get("layer_freezing_ratio", 0.0)),
+            privacy_leakage=float(
+                payload.get(
+                    "privacy_leakage",
+                    payload.get("privacy_risk", payload.get("privacy_metric", 0.0)),
+                )
+            ),
+            edge_parameter_count=int(payload.get("edge_parameter_count", 0)),
+            total_parameter_count=int(payload.get("total_parameter_count", 0)),
             validation=dict(payload.get("validation", {})),
             constraints=dict(payload.get("constraints", {})),
             trace_signature=payload.get("trace_signature"),
@@ -125,7 +207,7 @@ class SplitPlan:
         return (
             self.plan_version == FIXED_SPLIT_PLAN_VERSION
             and self.model_name == model_name
-            and self.constraints == asdict(constraints)
+            and self.constraints == _constraints_payload(constraints)
             and self.trace_signature == trace_signature
         )
 
@@ -179,13 +261,34 @@ def _layer_freezing_ratio(
     return frozen / float(total_trainable_layers)
 
 
-def _privacy_metric(candidate: SplitCandidate, max_privacy_risk: float) -> float:
-    if int(getattr(candidate, "total_parameter_count", 0)) > 0:
-        return max(0.0, min(1.0, float(getattr(candidate, "edge_parameter_ratio", 0.0))))
-    if max_privacy_risk <= 0:
-        return 1.0
-    score = 1.0 - (float(candidate.estimated_privacy_risk) / float(max_privacy_risk))
-    return max(0.0, min(1.0, score))
+def _privacy_leakage(
+    candidate: SplitCandidate,
+    constraints: SplitConstraints,
+) -> float:
+    if (
+        int(getattr(candidate, "total_parameter_count", 0)) > 0
+        or int(getattr(candidate, "edge_parameter_count", 0)) > 0
+    ):
+        return estimate_privacy_leakage_from_edge_params(
+            int(getattr(candidate, "edge_parameter_count", 0)),
+            epsilon=constraints.privacy_leakage_epsilon,
+        )
+    return float(getattr(candidate, "estimated_privacy_risk", 0.0))
+
+
+def _satisfies_privacy_constraint(
+    candidate: SplitCandidate,
+    constraints: SplitConstraints,
+    privacy_leakage: float,
+) -> bool:
+    if float(constraints.privacy_leakage_upper_bound) <= 0.0:
+        return True
+    total_parameter_count = int(getattr(candidate, "total_parameter_count", 0))
+    if total_parameter_count <= 0:
+        return privacy_leakage <= float(constraints.privacy_leakage_upper_bound)
+    return int(getattr(candidate, "edge_parameter_count", 0)) >= (
+        _privacy_min_edge_parameter_count(constraints)
+    )
 
 
 def _make_plan_id(
@@ -200,7 +303,7 @@ def _make_plan_id(
             "candidate_id": candidate.candidate_id,
             "split_index": candidate.legacy_layer_index,
             "boundary_tensor_labels": list(candidate.boundary_tensor_labels),
-            "constraints": asdict(constraints),
+            "constraints": _constraints_payload(constraints),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -246,7 +349,8 @@ def _enumerate_feasible_candidates(
             max_candidates=constraints.max_candidates,
             max_boundary_count=constraints.max_boundary_count,
             max_payload_bytes=constraints.max_payload_bytes,
-            privacy_metric_lower_bound=constraints.privacy_metric_lower_bound,
+            privacy_leakage_upper_bound=constraints.privacy_leakage_upper_bound,
+            privacy_leakage_epsilon=constraints.privacy_leakage_epsilon,
             max_layer_freezing_ratio=constraints.max_layer_freezing_ratio,
             require_trainable_tail=True,
         )
@@ -259,7 +363,8 @@ def _enumerate_feasible_candidates(
                 int(constraints.max_candidates),
                 int(constraints.max_boundary_count),
                 int(constraints.max_payload_bytes),
-                float(constraints.privacy_metric_lower_bound),
+                float(constraints.privacy_leakage_upper_bound),
+                float(constraints.privacy_leakage_epsilon),
                 float(constraints.max_layer_freezing_ratio),
             ),
         )
@@ -269,23 +374,22 @@ def _enumerate_feasible_candidates(
     if not candidates:
         return []
 
-    max_privacy_risk = max(float(candidate.estimated_privacy_risk) for candidate in candidates)
     total_trainable_layers = _total_trainable_layers(runtime)
     eligible: list[EligibleCandidate] = []
     for candidate in candidates:
         if not candidate.is_trainable_tail:
             continue
-        privacy_metric = _privacy_metric(candidate, max_privacy_risk)
+        privacy_leakage = _privacy_leakage(candidate, constraints)
         freezing_ratio = _layer_freezing_ratio(
             runtime,
             candidate,
             total_trainable_layers=total_trainable_layers,
         )
-        if privacy_metric < constraints.privacy_metric_lower_bound:
+        if not _satisfies_privacy_constraint(candidate, constraints, privacy_leakage):
             continue
         if freezing_ratio > constraints.max_layer_freezing_ratio:
             continue
-        eligible.append((candidate, privacy_metric, freezing_ratio))
+        eligible.append((candidate, privacy_leakage, freezing_ratio))
     return eligible
 
 
@@ -321,7 +425,7 @@ def _validate_payload_group(
     replay_success_but_untrainable = 0
     validation_error_counts: dict[str, int] = defaultdict(int)
 
-    for candidate, privacy_metric, freezing_ratio in sorted(
+    for candidate, privacy_leakage, freezing_ratio in sorted(
         group,
         key=lambda item: _candidate_runtime_key(item[0]),
     ):
@@ -338,7 +442,7 @@ def _validate_payload_group(
             (
                 _profile_from_report(runtime, candidate, report),
                 candidate,
-                privacy_metric,
+                privacy_leakage,
                 freezing_ratio,
             )
         )
@@ -360,7 +464,8 @@ def _raise_no_replayable_candidate(
     validation_error_counts: Mapping[str, int],
 ) -> None:
     diagnostics = [
-        f"privacy_metric_lower_bound={constraints.privacy_metric_lower_bound}",
+        f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}",
+        f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}",
         f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}",
         f"eligible_candidates={eligible_count}",
     ]
@@ -512,15 +617,16 @@ def compute_fixed_split_for_model(
     if not eligible:
         raise RuntimeError(
             "No split candidate satisfies the fixed split constraints. "
-            f"privacy_metric_lower_bound={constraints.privacy_metric_lower_bound}, "
+            f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
+            f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
             f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
         )
 
     if not constraints.validate_candidates:
-        chosen, privacy_metric, freezing_ratio = min(eligible, key=_eligible_candidate_key)
+        chosen, privacy_leakage, freezing_ratio = min(eligible, key=_eligible_candidate_key)
         profile = None
     else:
-        profile, chosen, privacy_metric, freezing_ratio = _select_validated_candidate(
+        profile, chosen, privacy_leakage, freezing_ratio = _select_validated_candidate(
             runtime,
             eligible,
             constraints,
@@ -542,11 +648,14 @@ def compute_fixed_split_for_model(
         else None,
         boundary_tensor_labels=list(chosen.boundary_tensor_labels),
         payload_bytes=int(chosen.estimated_payload_bytes),
-        privacy_metric=float(privacy_metric),
-        privacy_risk=float(chosen.estimated_privacy_risk),
+        privacy_metric=float(privacy_leakage),
+        privacy_risk=float(privacy_leakage),
         layer_freezing_ratio=float(freezing_ratio),
+        privacy_leakage=float(privacy_leakage),
+        edge_parameter_count=int(getattr(chosen, "edge_parameter_count", 0)),
+        total_parameter_count=int(getattr(chosen, "total_parameter_count", 0)),
         validation=validation,
-        constraints=asdict(constraints),
+        constraints=_constraints_payload(constraints),
         trace_signature=_trace_signature(runtime),
     )
 

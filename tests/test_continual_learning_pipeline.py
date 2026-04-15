@@ -36,8 +36,13 @@ def _dummy_plan() -> SplitPlan:
         privacy_metric=0.4,
         privacy_risk=0.6,
         layer_freezing_ratio=0.5,
+        privacy_leakage=0.6,
+        edge_parameter_count=50,
+        total_parameter_count=100,
         constraints={
-            "privacy_metric_lower_bound": 0.0,
+            "privacy_leakage_upper_bound": 0.0,
+            "privacy_leakage_epsilon": 1e-12,
+            "privacy_min_edge_parameter_count": 0,
             "max_layer_freezing_ratio": 1.0,
             "validate_candidates": True,
             "max_candidates": 24,
@@ -313,7 +318,7 @@ def test_fixed_split_failure_reports_untrainable_replay_candidates():
 
 def test_fixed_split_exact_solver_finds_non_prefix_optimum_under_parameter_constraints():
     constraints = SplitConstraints(
-        privacy_metric_lower_bound=0.95,
+        privacy_leakage_upper_bound=1.0 / 80.0,
         max_layer_freezing_ratio=1.0,
         validate_candidates=False,
         max_candidates=8,
@@ -508,9 +513,9 @@ def test_fixed_split_exact_solver_finds_non_prefix_optimum_under_parameter_const
     assert chosen.edge_nodes != prefix
 
 
-def test_fixed_split_uses_parameter_ratio_constraints_when_available():
+def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_available():
     constraints = SplitConstraints(
-        privacy_metric_lower_bound=0.4,
+        privacy_leakage_upper_bound=1.0 / 40.0,
         max_layer_freezing_ratio=0.75,
         validate_candidates=False,
     )
@@ -591,8 +596,11 @@ def test_fixed_split_uses_parameter_ratio_constraints_when_available():
     )
 
     assert plan.candidate_id == "candidate-feasible"
-    assert plan.privacy_metric == pytest.approx(0.5)
+    assert plan.privacy_leakage == pytest.approx(1.0 / 50.0)
+    assert plan.privacy_metric == pytest.approx(1.0 / 50.0)
     assert plan.layer_freezing_ratio == pytest.approx(0.5)
+    assert plan.edge_parameter_count == 50
+    assert plan.total_parameter_count == 100
 
 
 def test_apply_split_plan_falls_back_from_boundary_labels_to_candidate_and_split_index():
@@ -1140,4 +1148,3 @@ def test_prepare_split_training_cache_skips_incompatible_feature_only_samples(tm
 
     assert info["all_sample_ids"] == []
     assert info["drift_sample_ids"] == []
-

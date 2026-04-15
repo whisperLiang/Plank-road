@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import os
-import hashlib
 from collections import OrderedDict
 from typing import Iterable, Mapping, Sequence
 
@@ -13,6 +13,37 @@ except ImportError:  # pragma: no cover - enforced by requirements in production
 
 from model_management.graph_ir import GraphIR
 from model_management.split_candidate import SplitCandidate
+
+
+PRIVACY_LEAKAGE_EPSILON = 1e-12
+
+
+def estimate_privacy_leakage_from_edge_params(
+    edge_parameter_count: int | float,
+    *,
+    epsilon: float = PRIVACY_LEAKAGE_EPSILON,
+) -> float:
+    """Proxy PrivLeak(c) = 1 / (Theta_e(c) + epsilon)."""
+
+    safe_epsilon = max(0.0, float(epsilon))
+    denominator = max(0.0, float(edge_parameter_count)) + safe_epsilon
+    if denominator <= 0.0:
+        return float("inf")
+    return 1.0 / denominator
+
+
+def min_edge_parameters_for_privacy(
+    privacy_leakage_upper_bound: float,
+    *,
+    epsilon: float = PRIVACY_LEAKAGE_EPSILON,
+) -> int:
+    """Return ceil(1 / Lp - epsilon) for the privacy constraint."""
+
+    upper_bound = float(privacy_leakage_upper_bound)
+    if upper_bound <= 0.0 or math.isinf(upper_bound):
+        return 0
+    theta_min = (1.0 / upper_bound) - max(0.0, float(epsilon))
+    return max(0, int(math.ceil(theta_min - 1e-9)))
 
 
 def _ancestor_closure(labels: Iterable[str], graph: GraphIR) -> set[str]:
@@ -144,14 +175,10 @@ def _candidate_sort_key(candidate: SplitCandidate) -> tuple[int, int, float, int
     return (
         int(candidate.estimated_payload_bytes),
         int(candidate.boundary_count),
-        -float(candidate.edge_parameter_ratio),
+        float(candidate.estimated_privacy_risk),
         candidate.legacy_layer_index if candidate.legacy_layer_index is not None else 10**9,
         candidate.candidate_id,
     )
-
-
-def _ratio_lower_bound(value: float, total: int) -> int:
-    return int(math.ceil(float(value) * float(total) - 1e-9))
 
 
 def _ratio_upper_bound(value: float, total: int) -> int:
@@ -161,13 +188,23 @@ def _ratio_upper_bound(value: float, total: int) -> int:
 def _candidate_is_within_parameter_bounds(
     candidate: SplitCandidate,
     *,
-    privacy_metric_lower_bound: float,
+    privacy_leakage_upper_bound: float,
+    privacy_leakage_epsilon: float,
     max_layer_freezing_ratio: float,
 ) -> bool:
-    if int(getattr(candidate, "total_parameter_count", 0)) <= 0:
-        return privacy_metric_lower_bound <= 0.0
-    ratio = float(getattr(candidate, "edge_parameter_ratio", 0.0))
-    return ratio >= float(privacy_metric_lower_bound) and ratio <= float(max_layer_freezing_ratio)
+    total_parameter_count = int(getattr(candidate, "total_parameter_count", 0))
+    if total_parameter_count <= 0:
+        return float(privacy_leakage_upper_bound) <= 0.0
+    edge_parameter_count = int(getattr(candidate, "edge_parameter_count", 0))
+    min_edge_parameter_count = min_edge_parameters_for_privacy(
+        privacy_leakage_upper_bound,
+        epsilon=privacy_leakage_epsilon,
+    )
+    ratio = float(edge_parameter_count) / float(total_parameter_count)
+    return (
+        edge_parameter_count >= min_edge_parameter_count
+        and ratio <= float(max_layer_freezing_ratio)
+    )
 
 
 def build_candidate_from_edge_seed(
@@ -227,7 +264,9 @@ def build_candidate_from_edge_seed(
         estimated_edge_flops=edge_flops,
         estimated_cloud_flops=cloud_flops,
         estimated_payload_bytes=payload_bytes,
-        estimated_privacy_risk=max(0.0, 1.0 - edge_parameter_ratio),
+        estimated_privacy_risk=estimate_privacy_leakage_from_edge_params(
+            edge_parameter_count
+        ),
         estimated_latency=latency,
         is_trainable_tail=trainable_tail,
         legacy_layer_index=legacy_layer_index,
@@ -269,7 +308,8 @@ def _best_prefix_warm_start(
     *,
     max_boundary_count: int,
     max_payload_bytes: int,
-    privacy_metric_lower_bound: float,
+    privacy_leakage_upper_bound: float,
+    privacy_leakage_epsilon: float,
     max_layer_freezing_ratio: float,
     require_trainable_tail: bool,
 ) -> SplitCandidate | None:
@@ -294,6 +334,10 @@ def _best_prefix_warm_start(
     total_parameter_count = int(
         getattr(graph, "total_parameter_numel", 0)
         or sum(int(value) for value in getattr(graph, "parameter_numels", {}).values())
+    )
+    min_edge_parameter_count = min_edge_parameters_for_privacy(
+        privacy_leakage_upper_bound,
+        epsilon=privacy_leakage_epsilon,
     )
 
     edge_nodes: list[str] = []
@@ -350,11 +394,11 @@ def _best_prefix_warm_start(
             else 0.0
         )
         if total_parameter_count > 0:
-            if edge_parameter_ratio < float(privacy_metric_lower_bound):
+            if prefix_parameter_count < min_edge_parameter_count:
                 continue
             if edge_parameter_ratio > float(max_layer_freezing_ratio):
                 continue
-        elif privacy_metric_lower_bound > 0.0:
+        elif min_edge_parameter_count > 0:
             continue
 
         boundary_tensor_labels = list(boundary_labels.keys())
@@ -376,7 +420,10 @@ def _best_prefix_warm_start(
             estimated_edge_flops=prefix_flops,
             estimated_cloud_flops=max(0.0, total_flops - prefix_flops),
             estimated_payload_bytes=int(payload_bytes),
-            estimated_privacy_risk=max(0.0, 1.0 - edge_parameter_ratio),
+            estimated_privacy_risk=estimate_privacy_leakage_from_edge_params(
+                prefix_parameter_count,
+                epsilon=privacy_leakage_epsilon,
+            ),
             estimated_latency=_candidate_latency(
                 prefix_flops,
                 max(0.0, total_flops - prefix_flops),
@@ -411,14 +458,18 @@ def _parameter_owner_labels(graph: GraphIR) -> tuple[dict[str, int], dict[str, l
 def _parameter_budget_bounds(
     graph: GraphIR,
     *,
-    privacy_metric_lower_bound: float,
+    privacy_leakage_upper_bound: float,
+    privacy_leakage_epsilon: float,
     max_layer_freezing_ratio: float,
 ) -> tuple[int, int, int] | None:
     total_parameter_count = _total_parameter_count(graph)
+    lower_bound = min_edge_parameters_for_privacy(
+        privacy_leakage_upper_bound,
+        epsilon=privacy_leakage_epsilon,
+    )
     if total_parameter_count <= 0:
-        return (0, 0, 0) if privacy_metric_lower_bound <= 0.0 else None
+        return (0, 0, 0) if lower_bound <= 0 else None
 
-    lower_bound = _ratio_lower_bound(privacy_metric_lower_bound, total_parameter_count)
     upper_bound = _ratio_upper_bound(max_layer_freezing_ratio, total_parameter_count)
     if lower_bound > upper_bound:
         return None
@@ -569,10 +620,18 @@ def solve_exact_candidates(
     max_candidates: int,
     max_boundary_count: int,
     max_payload_bytes: int,
-    privacy_metric_lower_bound: float = 0.0,
+    privacy_leakage_upper_bound: float = 0.0,
+    privacy_leakage_epsilon: float = PRIVACY_LEAKAGE_EPSILON,
+    privacy_metric_lower_bound: float | None = None,
     max_layer_freezing_ratio: float = 1.0,
     require_trainable_tail: bool = True,
 ) -> list[SplitCandidate]:
+    if (
+        privacy_metric_lower_bound is not None
+        and float(privacy_leakage_upper_bound) <= 0.0
+    ):
+        privacy_leakage_upper_bound = float(privacy_metric_lower_bound)
+
     if max_candidates <= 0:
         return []
     if cp_model is None:
@@ -589,7 +648,8 @@ def solve_exact_candidates(
 
     parameter_bounds = _parameter_budget_bounds(
         graph,
-        privacy_metric_lower_bound=privacy_metric_lower_bound,
+        privacy_leakage_upper_bound=privacy_leakage_upper_bound,
+        privacy_leakage_epsilon=privacy_leakage_epsilon,
         max_layer_freezing_ratio=max_layer_freezing_ratio,
     )
     if parameter_bounds is None:
@@ -659,7 +719,8 @@ def solve_exact_candidates(
         graph,
         max_boundary_count=max_boundary_count,
         max_payload_bytes=max_payload_bytes,
-        privacy_metric_lower_bound=privacy_metric_lower_bound,
+        privacy_leakage_upper_bound=privacy_leakage_upper_bound,
+        privacy_leakage_epsilon=privacy_leakage_epsilon,
         max_layer_freezing_ratio=max_layer_freezing_ratio,
         require_trainable_tail=require_trainable_tail,
     )
@@ -699,7 +760,8 @@ def solve_exact_candidates(
             continue
         if not _candidate_is_within_parameter_bounds(
             candidate,
-            privacy_metric_lower_bound=privacy_metric_lower_bound,
+            privacy_leakage_upper_bound=privacy_leakage_upper_bound,
+            privacy_leakage_epsilon=privacy_leakage_epsilon,
             max_layer_freezing_ratio=max_layer_freezing_ratio,
         ):
             continue
@@ -722,7 +784,7 @@ def generate_candidates_from_graph(
         max_candidates=max_candidates,
         max_boundary_count=max_boundary_count,
         max_payload_bytes=max_payload_bytes,
-        privacy_metric_lower_bound=0.0,
+        privacy_leakage_upper_bound=0.0,
         max_layer_freezing_ratio=1.0,
         require_trainable_tail=True,
     )

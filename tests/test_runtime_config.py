@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from config import load_runtime_config
+from model_management.fixed_split import SplitConstraints
 
 
 def test_load_runtime_config_builds_typed_sections(tmp_path):
@@ -92,6 +93,50 @@ server:
     assert config.server.das.enabled is True
     assert config.server.das.strategy == "entropy"
     assert config.server.das.probe_samples == 4
+
+
+def test_load_runtime_config_reads_fixed_split_privacy_leakage_bound(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+  split_learning:
+    fixed_split:
+      privacy_leakage_upper_bound: 0.02
+      privacy_leakage_epsilon: 1.0e-9
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+    constraints = SplitConstraints.from_config(config.client.split_learning.fixed_split)
+
+    assert constraints.privacy_leakage_upper_bound == 0.02
+    assert constraints.privacy_leakage_epsilon == 1.0e-9
+
+
+def test_fixed_split_constraints_accept_legacy_privacy_metric_name(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+  split_learning:
+    fixed_split:
+      privacy_metric_lower_bound: 0.03
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+    constraints = SplitConstraints.from_config(config.client.split_learning.fixed_split)
+
+    assert constraints.privacy_leakage_upper_bound == 0.03
 
 
 def test_load_runtime_config_rejects_invalid_das_strategy(tmp_path):

@@ -20,13 +20,17 @@ from typing import Any, Mapping, Sequence
 import torch
 from loguru import logger
 
-from model_management.candidate_generator import build_candidate_from_edge_seed, enumerate_candidates
+from model_management.activation_sparsity import apply_das_to_model, apply_das_to_tail
+from model_management.candidate_generator import (
+    build_candidate_from_edge_seed,
+    enumerate_candidates,
+    estimate_privacy_leakage_from_edge_params,
+)
 from model_management.candidate_profiler import profile_candidates
 from model_management.candidate_selector import SplitCandidateSelector, SplitPointSelector
 from model_management.payload import SplitPayload
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_runtime import GraphSplitRuntime, _call_loss_fn
-from model_management.activation_sparsity import apply_das_to_model, apply_das_to_tail
 
 
 @dataclass
@@ -426,10 +430,18 @@ class UniversalModelSplitter(GraphSplitRuntime):
         _, graph = self._ensure_ready()
         profiles: list[LayerProfile] = []
         cumulative_flops = 0.0
+        cumulative_params = 0
+        seen_parameters: set[str] = set()
+        parameter_numels = dict(getattr(graph, "parameter_numels", {}) or {})
         for index, label in enumerate(graph.relevant_labels):
             node = graph.nodes[label]
             cumulative_flops += node.estimated_flops
-            privacy = (node.estimated_bytes / 1024.0) / max(1, node.depth_from_input + 1)
+            for ref in node.parameter_refs:
+                if ref.fq_name in seen_parameters:
+                    continue
+                seen_parameters.add(ref.fq_name)
+                cumulative_params += int(parameter_numels.get(ref.fq_name, 0))
+            privacy = estimate_privacy_leakage_from_edge_params(cumulative_params)
             profiles.append(
                 LayerProfile(
                     index=index,

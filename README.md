@@ -37,7 +37,7 @@ At startup, the edge:
 - validates replayability
 - selects the candidate that minimizes intermediate feature size
 - enforces:
-  - privacy metric lower bound
+  - privacy leakage upper bound
   - maximum layer freezing ratio upper bound
 - persists the result to `fixed_split_plan.json`
 
@@ -237,12 +237,13 @@ client:
   split_learning:
     enabled: True
     fixed_split:
-      privacy_metric_lower_bound: 0.15
+      privacy_leakage_upper_bound: 0.15
       max_layer_freezing_ratio: 0.75
       validate_candidates: True
       max_candidates: 24
       max_boundary_count: 8
       max_payload_bytes: 33554432
+      privacy_leakage_epsilon: 1.0e-12
 ```
 
 ### Resource-Aware Trigger
