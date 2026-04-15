@@ -46,8 +46,12 @@ client:
  retrain:
   flag: True
   num_epoch: 2
+  # Grace window for async cloud job status polling. A submitted job can be
+  # briefly invisible if the cloud endpoint reconnects or routes to a different
+  # worker; the edge keeps polling within this window before treating it as lost.
+  status_not_found_grace_sec: 60
   cache_path: './cache'
-  collect_num: 20
+  collect_num: 80
  # drift detection
  drift_detection:
   # Fallback confidence threshold for edge-side sample bucketing when full quality signals are unavailable
@@ -120,18 +124,20 @@ client:
  resource_aware_trigger:
   enabled: True
   # --- Shared with drift_detection (PD urgency controller) ---
-  # V: 10.0              # Lyapunov trade-off coefficient
-  # K_p: 1.0             # PD proportional gain
-  # K_d: 0.5             # PD derivative gain
+  # Conservative profile: delay CL until enough evidence accumulates and let
+  # the Q_cloud/Q_bw penalties suppress repeated training decisions.
+  V: 2.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
+  K_p: 0.6              # PD proportional gain
+  K_d: 0.2              # PD derivative gain
   # confidence_threshold: 0.8
   # --- Two-queue budget constraints ---
-  lambda_cloud: 0.5      # avg cloud-cost budget per round [0,1]
-  lambda_bw: 0.5         # avg bandwidth budget per round [0,1]
+  lambda_cloud: 0.25     # avg cloud-cost budget per round [0,1]
+  lambda_bw: 0.25        # avg bandwidth budget per round [0,1]
   # --- Queue importance weights ---
   w_cloud: 1.0           # weight for cloud-cost queue
   w_bw: 1.0              # weight for bandwidth queue
-  min_training_samples: 10
-  drift_bonus: 0.35
+  min_training_samples: 80
+  drift_bonus: 0.20
   upload_time_budget_sec: 5.0
  # Split learning for continual learning 
  # When enabled, backbone features are extracted and cached on the edge.

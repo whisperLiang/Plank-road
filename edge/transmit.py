@@ -258,9 +258,12 @@ def submit_training_job(
     all_frame_indices: list[int] | None = None,
     drift_frame_indices: list[int] | None = None,
     payload_zip: bytes = b"",
+    channel=None,
 ):
+    owned_channel = channel is None
     try:
-        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
+        if channel is None:
+            channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.SubmitTrainingJobRequest(
             protocol_version=str(protocol_version or ""),
@@ -279,6 +282,9 @@ def submit_training_job(
     except Exception as exc:
         logger.exception("submit_training_job failed: {}", exc)
         return None
+    finally:
+        if owned_channel and channel is not None:
+            channel.close()
 
 
 def get_training_job_status(
@@ -286,9 +292,12 @@ def get_training_job_status(
     *,
     edge_id: int,
     job_id: str,
+    channel=None,
 ):
+    owned_channel = channel is None
     try:
-        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
+        if channel is None:
+            channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.TrainingJobStatusRequest(
             edge_id=int(edge_id),
@@ -298,6 +307,9 @@ def get_training_job_status(
     except Exception as exc:
         logger.exception("get_training_job_status failed: {}", exc)
         return None
+    finally:
+        if owned_channel and channel is not None:
+            channel.close()
 
 
 def download_trained_model(
@@ -305,9 +317,12 @@ def download_trained_model(
     *,
     edge_id: int,
     job_id: str,
+    channel=None,
 ):
+    owned_channel = channel is None
     try:
-        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
+        if channel is None:
+            channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         req = message_transmission_pb2.DownloadTrainedModelRequest(
             edge_id=int(edge_id),
@@ -318,6 +333,9 @@ def download_trained_model(
     except Exception as exc:
         logger.exception("download_trained_model failed: {}", exc)
         return False, "", str(exc)
+    finally:
+        if owned_channel and channel is not None:
+            channel.close()
 
 
 def submit_continual_learning_job(
@@ -331,6 +349,7 @@ def submit_continual_learning_job(
     send_low_conf_features: bool,
     num_epoch: int = 0,
     request_id: str | None = None,
+    channel=None,
 ):
     try:
         payload_zip, manifest = pack_continual_learning_bundle(
@@ -351,6 +370,7 @@ def submit_continual_learning_job(
             protocol_version=manifest["protocol_version"],
             send_low_conf_features=bool(send_low_conf_features),
             payload_zip=payload_zip,
+            channel=channel,
         )
         if reply is None:
             return False, "", "submit_training_job failed"

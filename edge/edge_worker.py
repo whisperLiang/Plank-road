@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from queue import Empty, Full, Queue
+import grpc
 import torch
 from loguru import logger
 
@@ -34,6 +35,7 @@ from model_management.fixed_split import (
 from model_management.object_detection import InferenceArtifacts, Object_Detection
 from model_management.split_model_adapters import build_split_training_loss
 from model_management.universal_model_split import UniversalModelSplitter
+from tools.grpc_options import grpc_message_options
 
 
 _QUEUE_STOP = object()
@@ -62,6 +64,16 @@ class EdgeWorker:
             return max(0.5, float(getattr(retrain_cfg, "poll_interval_sec", 5.0)))
         except Exception:
             return 5.0
+
+    @staticmethod
+    def _resolve_training_not_found_grace(config) -> float:
+        retrain_cfg = getattr(config, "retrain", None)
+        if retrain_cfg is None:
+            return 60.0
+        try:
+            return max(0.0, float(getattr(retrain_cfg, "status_not_found_grace_sec", 60.0)))
+        except Exception:
+            return 60.0
 
     def __init__(self, config):
         self.config = config
@@ -109,6 +121,7 @@ class EdgeWorker:
             self.resource_trigger,
         )
         self.training_poll_interval_sec = self._resolve_training_poll_interval(config)
+        self.training_not_found_grace_sec = self._resolve_training_not_found_grace(config)
 
         sl_cfg = getattr(config, "split_learning", None)
         self.split_learning_enabled = bool(getattr(sl_cfg, "enabled", False)) if sl_cfg else False
@@ -428,88 +441,127 @@ class EdgeWorker:
 
             num_epoch = int(getattr(self.config.retrain, "num_epoch", 0))
             submitted_model_version = str(self.model_version)
-            accepted, job_id, msg = submit_continual_learning_job(
-                self.config.server_ip,
-                edge_id=self.edge_id,
-                sample_store=self.sample_store,
-                split_plan=self.fixed_split_plan,
-                model_id=self.model_id,
-                model_version=self.model_version,
-                send_low_conf_features=decision.send_low_conf_features,
-                num_epoch=num_epoch,
-            )
-            if not accepted or not job_id:
-                logger.error("Cloud continual learning submission failed: {}", msg)
-                self._reset_pending_training_cycle()
-                continue
-
-            logger.info(
-                "Submitted continual learning job {} for edge {}.",
-                job_id,
-                self.edge_id,
-            )
-
             success = False
             model_b64 = ""
-            terminal_message = msg
+            terminal_message = ""
             last_status = ""
-            while not self._stop_event.is_set():
-                reply = get_training_job_status(
+            training_channel = grpc.insecure_channel(
+                self.config.server_ip,
+                options=grpc_message_options(),
+            )
+            try:
+                accepted, job_id, msg = submit_continual_learning_job(
                     self.config.server_ip,
                     edge_id=self.edge_id,
-                    job_id=job_id,
+                    sample_store=self.sample_store,
+                    split_plan=self.fixed_split_plan,
+                    model_id=self.model_id,
+                    model_version=self.model_version,
+                    send_low_conf_features=decision.send_low_conf_features,
+                    num_epoch=num_epoch,
+                    channel=training_channel,
                 )
-                if reply is None:
-                    if self._stop_event.wait(self.training_poll_interval_sec):
-                        break
+                if not accepted or not job_id:
+                    logger.error("Cloud continual learning submission failed: {}", msg)
+                    self._reset_pending_training_cycle()
                     continue
 
-                if not bool(reply.found):
-                    terminal_message = "Training job not found on cloud."
+                logger.info(
+                    "Submitted continual learning job {} for edge {}.",
+                    job_id,
+                    self.edge_id,
+                )
+
+                terminal_message = msg
+                not_found_since = None
+                not_found_count = 0
+                while not self._stop_event.is_set():
+                    reply = get_training_job_status(
+                        self.config.server_ip,
+                        edge_id=self.edge_id,
+                        job_id=job_id,
+                        channel=training_channel,
+                    )
+                    if reply is None:
+                        if self._stop_event.wait(self.training_poll_interval_sec):
+                            break
+                        continue
+
+                    if not bool(reply.found):
+                        now = time.monotonic()
+                        if not_found_since is None:
+                            not_found_since = now
+                        not_found_count += 1
+                        elapsed = now - not_found_since
+                        if (
+                            self.training_not_found_grace_sec > 0.0
+                            and elapsed <= self.training_not_found_grace_sec
+                        ):
+                            logger.warning(
+                                "Continual learning job {} temporarily not visible "
+                                "on cloud poll {} ({:.1f}/{:.1f}s); retrying.",
+                                job_id,
+                                not_found_count,
+                                elapsed,
+                                self.training_not_found_grace_sec,
+                            )
+                            if self._stop_event.wait(self.training_poll_interval_sec):
+                                break
+                            continue
+
+                        terminal_message = (
+                            "Training job not found on cloud after "
+                            f"{elapsed:.1f}s."
+                        )
+                        logger.error(
+                            "Cloud continual learning failed for job {}: {}",
+                            job_id,
+                            terminal_message,
+                        )
+                        break
+
+                    not_found_since = None
+                    not_found_count = 0
+                    status = str(reply.status or "")
+                    if status != last_status:
+                        queue_position = int(getattr(reply, "queue_position", -1))
+                        logger.info(
+                            "Continual learning job {} status={} queue_position={}",
+                            job_id,
+                            status,
+                            queue_position,
+                        )
+                        last_status = status
+
+                    if status in {"QUEUED", "RUNNING"}:
+                        if self._stop_event.wait(self.training_poll_interval_sec):
+                            break
+                        continue
+
+                    if status == "SUCCEEDED":
+                        success, model_b64, terminal_message = download_trained_model(
+                            self.config.server_ip,
+                            edge_id=self.edge_id,
+                            job_id=job_id,
+                            channel=training_channel,
+                        )
+                        if not success:
+                            logger.error(
+                                "Cloud continual learning download failed for job {}: {}",
+                                job_id,
+                                terminal_message,
+                            )
+                        break
+
+                    terminal_message = str(reply.message or f"Training job ended with status {status}")
                     logger.error(
                         "Cloud continual learning failed for job {}: {}",
                         job_id,
                         terminal_message,
                     )
                     break
-
-                status = str(reply.status or "")
-                if status != last_status:
-                    queue_position = int(getattr(reply, "queue_position", -1))
-                    logger.info(
-                        "Continual learning job {} status={} queue_position={}",
-                        job_id,
-                        status,
-                        queue_position,
-                    )
-                    last_status = status
-
-                if status in {"QUEUED", "RUNNING"}:
-                    if self._stop_event.wait(self.training_poll_interval_sec):
-                        break
-                    continue
-
-                if status == "SUCCEEDED":
-                    success, model_b64, terminal_message = download_trained_model(
-                        self.config.server_ip,
-                        edge_id=self.edge_id,
-                        job_id=job_id,
-                    )
-                    if not success:
-                        logger.error(
-                            "Cloud continual learning download failed for job {}: {}",
-                            job_id,
-                            terminal_message,
-                        )
-                    break
-
-                terminal_message = str(reply.message or f"Training job ended with status {status}")
-                logger.error(
-                    "Cloud continual learning failed for job {}: {}",
-                    job_id,
-                    terminal_message,
-                )
-                break
+            finally:
+                training_channel.close()
 
             if success and model_b64:
                 # Stale detection: if our model version has advanced since

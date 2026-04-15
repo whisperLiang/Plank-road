@@ -263,6 +263,76 @@ class TestEdgeWorkerRouting:
         assert worker.local_processor.is_alive() is False
         assert worker.retrain_processor.is_alive() is False
 
+    def test_retrain_worker_retries_transient_not_found_status(self, monkeypatch):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker._stop_event = threading.Event()
+        worker._retrain_requested = threading.Event()
+        worker.retrain_flag = True
+        worker.collect_flag = False
+        worker.pending_training_decision = TrainingDecision(
+            train_now=True,
+            send_low_conf_features=False,
+            urgency=1.0,
+            compute_pressure=0.0,
+            bandwidth_pressure=0.0,
+            reason="test",
+        )
+        worker.fixed_split_plan = SimpleNamespace(split_config_id="plan-1")
+        worker.config = SimpleNamespace(
+            server_ip="cloud:50051",
+            retrain=SimpleNamespace(num_epoch=1),
+        )
+        worker.edge_id = 1
+        worker.sample_store = object()
+        worker.model_id = "edge-model"
+        worker.model_version = "0"
+        worker.training_poll_interval_sec = 0.01
+        worker.training_not_found_grace_sec = 1.0
+
+        class DummyChannel:
+            def close(self):
+                pass
+
+        status_calls = []
+        status_replies = [
+            SimpleNamespace(found=False, status="", queue_position=-1, message="missing"),
+            SimpleNamespace(found=True, status="RUNNING", queue_position=0, message=""),
+            SimpleNamespace(found=True, status="FAILED", queue_position=-1, message="boom"),
+        ]
+        resets = []
+
+        def _reset():
+            resets.append(True)
+            worker.pending_training_decision = None
+            worker.retrain_flag = False
+            worker.collect_flag = True
+            worker._retrain_requested.clear()
+            worker._stop_event.set()
+
+        def _status(*args, **kwargs):
+            status_calls.append(kwargs.get("job_id"))
+            return status_replies.pop(0)
+
+        monkeypatch.setattr(
+            "edge.edge_worker.grpc.insecure_channel",
+            lambda *args, **kwargs: DummyChannel(),
+        )
+        monkeypatch.setattr(
+            "edge.edge_worker.submit_continual_learning_job",
+            lambda *args, **kwargs: (True, "job-1", "accepted"),
+        )
+        monkeypatch.setattr("edge.edge_worker.get_training_job_status", _status)
+        worker._reset_pending_training_cycle = _reset
+
+        worker._retrain_requested.set()
+        thread = threading.Thread(target=worker.retrain_worker)
+        thread.start()
+        thread.join(timeout=2.0)
+
+        assert thread.is_alive() is False
+        assert status_calls == ["job-1", "job-1", "job-1"]
+        assert resets == [True]
+
     def test_sample_confidence_threshold_falls_back_to_drift_detection(self):
         config = SimpleNamespace(
             drift_detection=SimpleNamespace(confidence_threshold=0.8),
