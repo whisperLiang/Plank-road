@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as tv_models
 
+from model_management.activation_sparsity import apply_das_to_model
 import model_management.graph_ir as graph_ir
 from model_management.candidate_generator import (
     build_candidate_from_edge_seed,
@@ -351,3 +352,28 @@ def test_payload_cache_and_universal_split_retrain(tmp_path):
     )
     assert len(losses) == 1
     assert torch.isfinite(torch.tensor(losses[0]))
+
+
+def test_graph_replay_uses_das_modules_for_entropy_and_sparse_cache():
+    model, sample = _make_sequential_model()
+    runtime = GraphSplitRuntime(device="cpu")
+    runtime.trace(model, sample)
+
+    trainer = apply_das_to_model(model, strategy="entropy", device="cpu")
+    runtime.full_replay(sample)
+
+    ratios = trainer.refresh_pruning_ratios_from_entropy()
+
+    assert ratios
+    assert any(value > 0.0 for value in ratios.values())
+
+    trainer.activate_sparsity(ratios)
+    runtime.full_replay(sample)
+
+    das_modules = list(trainer._das_modules().values())
+    assert das_modules
+    assert any(
+        getattr(module, "clip_ratio", 0.0) > 0.0
+        and getattr(module, "back_cache_size", 0) < getattr(module, "activation_size", 0)
+        for module in das_modules
+    )

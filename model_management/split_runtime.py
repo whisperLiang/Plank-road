@@ -8,7 +8,15 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 import torch
+import torch.nn as nn
 
+from model_management.activation_sparsity import (
+    AutoFreezeConv2d,
+    AutoFreezeFC,
+    DASBatchNorm2d,
+    DASGroupNorm,
+    DASLayerNorm,
+)
 from model_management.candidate_generator import enumerate_candidates
 from model_management.graph_ir import (
     GraphIR,
@@ -21,6 +29,15 @@ from model_management.graph_ir import (
 )
 from model_management.payload import SplitPayload
 from model_management.split_candidate import SplitCandidate
+
+
+_DAS_RUNTIME_MODULE_TYPES = (
+    AutoFreezeConv2d,
+    DASBatchNorm2d,
+    DASGroupNorm,
+    DASLayerNorm,
+    AutoFreezeFC,
+)
 
 
 def _flatten_tensors(obj: Any) -> list[torch.Tensor]:
@@ -92,6 +109,63 @@ def _maybe_inject_runtime_device(
         return resolved_kwargs
     resolved_kwargs["device"] = device
     return resolved_kwargs
+
+
+def _resolve_das_runtime_module(model: torch.nn.Module, node: Any) -> nn.Module | None:
+    candidate_paths: list[str] = []
+    containing_module = getattr(node, "containing_module", None)
+    if containing_module:
+        candidate_paths.append(str(containing_module))
+    for ref in getattr(node, "parameter_refs", ()) or ():
+        module_path = getattr(ref, "module_path", "")
+        if module_path:
+            candidate_paths.append(str(module_path))
+    for ref in getattr(node, "buffer_refs", ()) or ():
+        module_path = getattr(ref, "module_path", "")
+        if module_path:
+            candidate_paths.append(str(module_path))
+
+    seen: set[str] = set()
+    for module_path in candidate_paths:
+        if not module_path or module_path in seen:
+            continue
+        seen.add(module_path)
+        try:
+            module = _resolve_attr_path(model, module_path)
+        except Exception:
+            continue
+        if isinstance(module, _DAS_RUNTIME_MODULE_TYPES):
+            return module
+    return None
+
+
+def _maybe_call_das_runtime_module(
+    model: torch.nn.Module,
+    node: Any,
+    args: tuple[Any, ...],
+) -> Any | None:
+    if not args:
+        return None
+    input_tensor = args[0]
+    if not isinstance(input_tensor, torch.Tensor):
+        return None
+
+    module = _resolve_das_runtime_module(model, node)
+    if module is None:
+        return None
+
+    func_name = str(getattr(node, "func_name", "") or "").lower()
+    if isinstance(module, AutoFreezeConv2d) and "conv" in func_name:
+        return module(input_tensor)
+    if isinstance(module, AutoFreezeFC) and func_name in {"linear", "addmm"}:
+        return module(input_tensor)
+    if isinstance(module, DASBatchNorm2d) and "batch" in func_name and "norm" in func_name:
+        return module(input_tensor)
+    if isinstance(module, DASGroupNorm) and "group" in func_name and "norm" in func_name:
+        return module(input_tensor)
+    if isinstance(module, DASLayerNorm) and "layer" in func_name and "norm" in func_name:
+        return module(input_tensor)
+    return None
 
 
 def _aligned_tensor_loss(output_tensor: torch.Tensor, target_tensor: torch.Tensor) -> torch.Tensor | None:
@@ -440,6 +514,9 @@ class GraphSplitRuntime:
             kwargs=kwargs,
             device=self.device,
         )
+        das_output = _maybe_call_das_runtime_module(model, node, args)
+        if das_output is not None:
+            return das_output
         args_list = list(args) if isinstance(args, tuple) else list(args)
         kwargs_dict = dict(kwargs)
         try:
