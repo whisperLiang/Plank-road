@@ -192,7 +192,7 @@ server:
  # Importance = gradient_norm / sqrt(numel) × log(M_total / M_layer)).
  # Layers with higher TGI keep more activations.
  das:
-  enabled: False
+  enabled: True
   # bn_only: True → only BN parameters are updated; Conv/FC weight
   #   gradients are blocked.  Useful for conservative adaptation.
   bn_only: False

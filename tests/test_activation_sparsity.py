@@ -567,6 +567,27 @@ class TestDASTrainerNormVariants:
         assert DASLayerNorm in types
         assert AutoFreezeFC in types
 
+    def test_replacement_preserves_dtype_and_training_state(self):
+        model = _norm_augmented_model().to(dtype=torch.float64)
+        model.train()
+
+        trainer = DASTrainer(model, device="cpu")
+
+        for module in trainer._das_modules().values():
+            assert module.training is True
+            for param in module.parameters(recurse=False):
+                assert param.dtype == torch.float64
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_replacement_preserves_cuda_device(self):
+        model = _norm_augmented_model().cuda()
+
+        trainer = DASTrainer(model, device="cuda")
+
+        for module in trainer._das_modules().values():
+            for param in module.parameters(recurse=False):
+                assert param.device.type == "cuda"
+
 
 class TestApplyDAS:
 

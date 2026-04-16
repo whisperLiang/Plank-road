@@ -938,6 +938,41 @@ class DASTrainer:
     # Linear → AutoFreezeFC)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _align_replacement_module(
+        new_mod: nn.Module,
+        target_mod: nn.Module,
+    ) -> nn.Module:
+        """Keep replacement modules aligned with the source placement/state."""
+        reference_tensor = next(
+            (
+                tensor
+                for tensor in (
+                    *target_mod.parameters(recurse=False),
+                    *target_mod.buffers(recurse=False),
+                )
+                if torch.is_tensor(tensor)
+            ),
+            None,
+        )
+        if reference_tensor is not None:
+            if reference_tensor.is_floating_point() or reference_tensor.is_complex():
+                new_mod = new_mod.to(
+                    device=reference_tensor.device,
+                    dtype=reference_tensor.dtype,
+                )
+            else:
+                new_mod = new_mod.to(device=reference_tensor.device)
+
+        target_params = dict(target_mod.named_parameters(recurse=False))
+        for name, param in new_mod.named_parameters(recurse=False):
+            source_param = target_params.get(name)
+            if source_param is not None:
+                param.requires_grad_(source_param.requires_grad)
+
+        new_mod.train(target_mod.training)
+        return new_mod
+
     def _replace_conv(self, model: nn.Module, name: str, count: int = 0) -> int:
         copy_keys = ["stride", "padding", "dilation", "groups", "bias", "padding_mode"]
         for mod_name, target_mod in model.named_children():
@@ -952,6 +987,7 @@ class DASTrainer:
                     num=count,
                     bn_only=self.bn_only,
                 )
+                new_mod = self._align_replacement_module(new_mod, target_mod)
                 new_mod.load_state_dict(target_mod.state_dict())
                 setattr(model, mod_name, new_mod)
             else:
@@ -970,6 +1006,7 @@ class DASTrainer:
                     num=count,
                     bn_only=self.bn_only,
                 )
+                new_mod = self._align_replacement_module(new_mod, target_mod)
                 new_mod.load_state_dict(target_mod.state_dict())
                 setattr(model, mod_name, new_mod)
             else:
@@ -989,6 +1026,7 @@ class DASTrainer:
                     num=count,
                     bn_only=self.bn_only,
                 )
+                new_mod = self._align_replacement_module(new_mod, target_mod)
                 new_mod.load_state_dict(target_mod.state_dict())
                 setattr(model, mod_name, new_mod)
             else:
@@ -1008,6 +1046,7 @@ class DASTrainer:
                     num=count,
                     bn_only=self.bn_only,
                 )
+                new_mod = self._align_replacement_module(new_mod, target_mod)
                 new_mod.load_state_dict(target_mod.state_dict())
                 setattr(model, mod_name, new_mod)
             else:
@@ -1026,6 +1065,7 @@ class DASTrainer:
                     num=count,
                     bn_only=self.bn_only,
                 )
+                new_mod = self._align_replacement_module(new_mod, target_mod)
                 new_mod.load_state_dict(target_mod.state_dict())
                 setattr(model, mod_name, new_mod)
             else:
