@@ -94,7 +94,13 @@ class ActivationClipper:
             ctx.idxs = None
             return x_flat.clone()
 
-        keep_n = max(1, int(numel * (1.0 - self.clip_ratio)))
+        keep_n = _retained_element_count(numel, self.clip_ratio)
+        if keep_n >= numel:
+            ctx.idxs = None
+            return x_flat.clone()
+        if keep_n == 0:
+            ctx.idxs = torch.empty((0,), device=x.device, dtype=torch.int32)
+            return x_flat.new_empty((0,))
         idxs = x_flat.abs().topk(keep_n, sorted=False)[1]
         clipped = x_flat[idxs]
         ctx.idxs = idxs.to(torch.int32)
@@ -119,6 +125,14 @@ def _pair(x):
     return (x, x)
 
 
+def _retained_element_count(numel: int, clip_ratio: float) -> int:
+    """Return ``ceil((1 - clip_ratio) * numel)`` clipped to ``[0, numel]``."""
+    if numel <= 0:
+        return 0
+    retained = math.ceil(float(numel) * max(0.0, 1.0 - float(clip_ratio)))
+    return max(0, min(int(numel), int(retained)))
+
+
 def _spectral_entropy_1d(x: torch.Tensor, *, max_samples: int = 2048, eps: float = 1e-12) -> float | None:
     """Compute normalised spectral entropy of a 1D signal.
 
@@ -127,9 +141,9 @@ def _spectral_entropy_1d(x: torch.Tensor, *, max_samples: int = 2048, eps: float
     if x.numel() == 0:
         return None
     flat = x.reshape(-1)
-    if flat.numel() > max_samples:
-        idx = torch.randperm(flat.numel(), device=flat.device)[:max_samples]
-        flat = flat[idx]
+    if max_samples > 0 and flat.numel() > max_samples:
+        positions = torch.linspace(0, flat.numel() - 1, steps=max_samples, device=flat.device)
+        flat = flat.index_select(0, positions.round().to(torch.int64))
     flat = flat.float()
     spectrum = torch.fft.rfft(flat)
     power = spectrum.abs().pow(2)
@@ -248,7 +262,7 @@ class _AutoFreezeConv2dFn(torch.autograd.Function):
             # Dynamic Activation Sparsity
             if module.sparsity_signal and module.clip_ratio > 0:
                 clipper = ActivationClipper(module.clip_ratio)
-                module.back_cache_size = int(x.numel() * (1.0 - module.clip_ratio))
+                module.back_cache_size = _retained_element_count(x.numel(), module.clip_ratio)
             else:
                 clipper = ActivationClipper(0)
                 module.back_cache_size = int(x.numel())
@@ -277,8 +291,8 @@ class _AutoFreezeConv2dFn(torch.autograd.Function):
             # Reconstruct input from clipped values
             x_restored = clipper.reshape(clipped_x, ctx).view(ctx.x_shape)
 
-            # Compute grad_x and grad_w via built-in convolution_backward
-            grad_x, grad_w = torch.ops.aten.convolution_backward(
+            # Compute grad_x / grad_w / grad_b via built-in convolution_backward
+            grad_x, grad_w, grad_b = torch.ops.aten.convolution_backward(
                 grad_out,
                 x_restored,
                 module.weight,
@@ -289,8 +303,8 @@ class _AutoFreezeConv2dFn(torch.autograd.Function):
                 False,
                 [0],
                 module.groups,
-                (True, True, False),
-            )[:2]
+                (True, True, module.bias is not None),
+            )
 
             del clipper
 
@@ -298,7 +312,7 @@ class _AutoFreezeConv2dFn(torch.autograd.Function):
             # BN-only mode: block weight gradient
             return None, grad_x, None, None
         else:
-            return None, grad_x, grad_w, None
+            return None, grad_x, grad_w, grad_b
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -309,16 +323,11 @@ class DASBatchNorm2d(nn.BatchNorm2d):
     """Drop-in replacement for ``nn.BatchNorm2d`` with Dynamic Activation
     Sparsity metadata tracking.
 
-    Unlike Conv and FC layers, BN activation tensors are comparatively
-    small (they scale linearly with channels, not quadratically with
-    spatial dimensions).  This implementation tracks ``activation_size``
-    for TGI memory importance computation but delegates the forward /
-    backward to standard PyTorch BN, keeping the implementation simple.
-
     When ``sparsity_signal`` is ``True`` **and** ``clip_ratio > 0``, a
-    custom autograd path with activation pruning is used (faithful to
-    SURGEON's ``AutoFreezeNorm2d``), computing ``grad_x`` from the
-    **full** input and ``grad_w`` from the **clipped** input.
+    custom autograd path stores only the sparse activation subset and
+    reconstructs a zero-filled activation tensor during backward.  This
+    keeps the BN path aligned with the same sparse-cache contract used by
+    Conv / FC DAS modules.
     """
 
     def __init__(
@@ -390,7 +399,6 @@ class _DASBatchNorm2dFn(torch.autograd.Function):
         check_backward_validity([x] + ([weight] if weight is not None else [])
                                 + ([bias] if bias is not None else []))
         ctx.module = module
-        ctx.x_full = x.clone()  # full input for accurate grad_x
 
         # RNG state
         ctx.fwd_cpu_state = torch.get_rng_state()
@@ -413,7 +421,7 @@ class _DASBatchNorm2dFn(torch.autograd.Function):
 
             # DAS clipping for weight gradient
             clipper = ActivationClipper(module.clip_ratio)
-            module.back_cache_size = int(x.numel() * (1.0 - module.clip_ratio))
+            module.back_cache_size = _retained_element_count(x.numel(), module.clip_ratio)
             ctx.clipper = clipper
             clipped_x = clipper.clip(x, ctx)
             clipped_x.requires_grad = x.requires_grad
@@ -433,51 +441,270 @@ class _DASBatchNorm2dFn(torch.autograd.Function):
         if ctx.had_cuda_in_fwd:
             rng_devices = ctx.fwd_gpu_devices
         with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            torch.set_rng_state(ctx.fwd_cpu_state)
             if ctx.had_cuda_in_fwd:
                 set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
 
-            # Full input → accurate grad_x
-            detached_x = ctx.x_full.detach()
+            detached_x = clipper.reshape(c_x, ctx).view(ctx.x_shape).detach()
             detached_x.requires_grad = c_x.requires_grad
             if module.affine:
                 weight = module.weight.detach().requires_grad_(module.weight.requires_grad)
                 bias = module.bias.detach().requires_grad_(module.bias.requires_grad)
-                weight_c = module.weight.detach().requires_grad_(module.weight.requires_grad)
-                bias_c = module.bias.detach().requires_grad_(module.bias.requires_grad)
             else:
-                weight = bias = weight_c = bias_c = None
-
-            # Clipped input → approximate grad_w
-            clipped_x = clipper.reshape(c_x, ctx).view(ctx.x_shape)
-            clipped_x.requires_grad = c_x.requires_grad
+                weight = bias = None
+            grad_b = None
 
             with torch.enable_grad():
                 y = module._bn_forward_for_backward(
                     detached_x, weight, bias,
                     running_mean, running_var, batch_mean, batch_var,
                 )
-                c_y = module._bn_forward_for_backward(
-                    clipped_x, weight_c, bias_c,
-                    running_mean, running_var, batch_mean, batch_var,
-                )
 
             with torch.no_grad():
                 if torch.is_tensor(y) and y.requires_grad:
                     torch.autograd.backward([y], [grad_out])
-                if torch.is_tensor(c_y) and c_y.requires_grad:
-                    torch.autograd.backward([c_y], [grad_out])
 
             grad_x = detached_x.grad
-            grad_w = weight_c.grad if module.affine and weight_c is not None else None
+            grad_w = weight.grad if module.affine and weight is not None else None
+            grad_b = bias.grad if module.affine and bias is not None else None
 
             del clipper
 
-        return None, grad_x, grad_w, None
+        return None, grad_x, grad_w, grad_b
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 4.  AutoFreezeFC — Linear with Dynamic Activation Sparsity
 # ═══════════════════════════════════════════════════════════════════════════
+
+class DASGroupNorm(nn.GroupNorm):
+    """Drop-in replacement for ``nn.GroupNorm`` with sparse activation caching."""
+
+    def __init__(
+        self,
+        num_groups: int,
+        num_channels: int,
+        eps: float = 1e-5,
+        affine: bool = True,
+        *,
+        name: str = "gn",
+        num: int = 0,
+        bn_only: bool = False,
+    ):
+        super().__init__(num_groups, num_channels, eps=eps, affine=affine)
+        self.name = name
+        self.num = num
+        self.clip_ratio: float = 0.0
+        self.sparsity_signal: bool = False
+        self.back_cache_size: int = 0
+        self.activation_size: int = 0
+        self.bn_only: bool = bn_only
+        self.track_spectral_entropy: bool = False
+        self.last_spectral_entropy: float | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.activation_size = int(x.numel())
+        if self.track_spectral_entropy:
+            self.last_spectral_entropy = _spectral_entropy_1d(x.detach())
+        if self.sparsity_signal and self.clip_ratio > 0:
+            return _DASGroupNormFn.apply(
+                self,
+                x,
+                self.weight if self.affine else None,
+                self.bias if self.affine else None,
+            )
+        return super().forward(x)
+
+    def _group_norm_forward(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor | None,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return F.group_norm(x, self.num_groups, weight, bias, self.eps)
+
+
+class _DASGroupNormFn(torch.autograd.Function):
+    """Autograd for GroupNorm with sparse activation caching."""
+
+    @staticmethod
+    def forward(ctx, module: DASGroupNorm, x, weight, bias):
+        check_backward_validity([x] + ([weight] if weight is not None else [])
+                                + ([bias] if bias is not None else []))
+        ctx.module = module
+        ctx.fwd_cpu_state = torch.get_rng_state()
+        ctx.had_cuda_in_fwd = torch.cuda._initialized
+        if ctx.had_cuda_in_fwd:
+            ctx.fwd_gpu_devices, ctx.fwd_gpu_states = get_device_states(x)
+
+        with torch.no_grad():
+            y = module._group_norm_forward(x, weight, bias)
+            module.activation_size = int(x.numel())
+            clipper = ActivationClipper(module.clip_ratio)
+            module.back_cache_size = _retained_element_count(x.numel(), module.clip_ratio)
+            ctx.clipper = clipper
+            clipped_x = clipper.clip(x, ctx)
+            clipped_x.requires_grad = x.requires_grad
+            ctx.save_for_backward(clipped_x)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        module = ctx.module
+        clipper = ctx.clipper
+        (clipped_x,) = ctx.saved_tensors
+
+        rng_devices = []
+        if ctx.had_cuda_in_fwd:
+            rng_devices = ctx.fwd_gpu_devices
+        with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            torch.set_rng_state(ctx.fwd_cpu_state)
+            if ctx.had_cuda_in_fwd:
+                set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
+
+            detached_x = clipper.reshape(clipped_x, ctx).view(ctx.x_shape).detach()
+            detached_x.requires_grad = clipped_x.requires_grad
+            if module.affine:
+                weight = module.weight.detach().requires_grad_(module.weight.requires_grad)
+                bias = module.bias.detach().requires_grad_(module.bias.requires_grad)
+            else:
+                weight = bias = None
+
+            with torch.enable_grad():
+                y = module._group_norm_forward(detached_x, weight, bias)
+
+            with torch.no_grad():
+                if torch.is_tensor(y) and y.requires_grad:
+                    torch.autograd.backward([y], [grad_out])
+
+            grad_x = detached_x.grad
+            grad_w = weight.grad if module.affine and weight is not None else None
+            grad_b = bias.grad if module.affine and bias is not None else None
+            del clipper
+
+        return None, grad_x, grad_w, grad_b
+
+
+class DASLayerNorm(nn.LayerNorm):
+    """Drop-in replacement for ``nn.LayerNorm`` with sparse activation caching."""
+
+    def __init__(
+        self,
+        normalized_shape,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool | None = None,
+        *,
+        name: str = "ln",
+        num: int = 0,
+        bn_only: bool = False,
+    ):
+        if bias is None:
+            super().__init__(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
+        else:
+            try:
+                super().__init__(
+                    normalized_shape,
+                    eps=eps,
+                    elementwise_affine=elementwise_affine,
+                    bias=bias,
+                )
+            except TypeError:
+                super().__init__(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
+                if elementwise_affine and not bias:
+                    self.register_parameter("bias", None)
+        self.name = name
+        self.num = num
+        self.clip_ratio: float = 0.0
+        self.sparsity_signal: bool = False
+        self.back_cache_size: int = 0
+        self.activation_size: int = 0
+        self.bn_only: bool = bn_only
+        self.track_spectral_entropy: bool = False
+        self.last_spectral_entropy: float | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.activation_size = int(x.numel())
+        if self.track_spectral_entropy:
+            self.last_spectral_entropy = _spectral_entropy_1d(x.detach())
+        if self.sparsity_signal and self.clip_ratio > 0:
+            return _DASLayerNormFn.apply(
+                self,
+                x,
+                self.weight if self.elementwise_affine else None,
+                self.bias if self.elementwise_affine else None,
+            )
+        return super().forward(x)
+
+    def _layer_norm_forward(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor | None,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+
+
+class _DASLayerNormFn(torch.autograd.Function):
+    """Autograd for LayerNorm with sparse activation caching."""
+
+    @staticmethod
+    def forward(ctx, module: DASLayerNorm, x, weight, bias):
+        check_backward_validity([x] + ([weight] if weight is not None else [])
+                                + ([bias] if bias is not None else []))
+        ctx.module = module
+        ctx.fwd_cpu_state = torch.get_rng_state()
+        ctx.had_cuda_in_fwd = torch.cuda._initialized
+        if ctx.had_cuda_in_fwd:
+            ctx.fwd_gpu_devices, ctx.fwd_gpu_states = get_device_states(x)
+
+        with torch.no_grad():
+            y = module._layer_norm_forward(x, weight, bias)
+            module.activation_size = int(x.numel())
+            clipper = ActivationClipper(module.clip_ratio)
+            module.back_cache_size = _retained_element_count(x.numel(), module.clip_ratio)
+            ctx.clipper = clipper
+            clipped_x = clipper.clip(x, ctx)
+            clipped_x.requires_grad = x.requires_grad
+            ctx.save_for_backward(clipped_x)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        module = ctx.module
+        clipper = ctx.clipper
+        (clipped_x,) = ctx.saved_tensors
+
+        rng_devices = []
+        if ctx.had_cuda_in_fwd:
+            rng_devices = ctx.fwd_gpu_devices
+        with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            torch.set_rng_state(ctx.fwd_cpu_state)
+            if ctx.had_cuda_in_fwd:
+                set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
+
+            detached_x = clipper.reshape(clipped_x, ctx).view(ctx.x_shape).detach()
+            detached_x.requires_grad = clipped_x.requires_grad
+            if module.elementwise_affine:
+                weight = module.weight.detach().requires_grad_(module.weight.requires_grad)
+                bias = None if module.bias is None else module.bias.detach().requires_grad_(module.bias.requires_grad)
+            else:
+                weight = bias = None
+
+            with torch.enable_grad():
+                y = module._layer_norm_forward(detached_x, weight, bias)
+
+            with torch.no_grad():
+                if torch.is_tensor(y) and y.requires_grad:
+                    torch.autograd.backward([y], [grad_out])
+
+            grad_x = detached_x.grad
+            grad_w = weight.grad if module.elementwise_affine and weight is not None else None
+            grad_b = bias.grad if module.elementwise_affine and bias is not None else None
+            del clipper
+
+        return None, grad_x, grad_w, grad_b
+
 
 class AutoFreezeFC(nn.Linear):
     """Drop-in replacement for ``nn.Linear`` with Dynamic Activation
@@ -537,7 +764,7 @@ class _AutoFreezeFCFn(torch.autograd.Function):
 
             if module.sparsity_signal and module.clip_ratio > 0:
                 clipper = ActivationClipper(module.clip_ratio)
-                module.back_cache_size = int(x.numel() * (1.0 - module.clip_ratio))
+                module.back_cache_size = _retained_element_count(x.numel(), module.clip_ratio)
             else:
                 clipper = ActivationClipper(0)
                 module.back_cache_size = int(x.numel())
@@ -565,8 +792,10 @@ class _AutoFreezeFCFn(torch.autograd.Function):
             x_restored = clipper.reshape(clipped_x, ctx)
 
             # Linear: weight.shape = (out, in)
-            ic, oc = module.weight.shape  # ic=out_features, oc=in_features
-            grad_w = grad_out.reshape(-1, ic).T.mm(x_restored.reshape(-1, oc))
+            out_features, in_features = module.weight.shape
+            grad_out_flat = grad_out.reshape(-1, out_features)
+            grad_w = grad_out_flat.T.mm(x_restored.reshape(-1, in_features))
+            grad_b = grad_out_flat.sum(dim=0) if module.bias is not None else None
             grad_x = torch.matmul(grad_out, module.weight)
 
             del clipper
@@ -574,12 +803,21 @@ class _AutoFreezeFCFn(torch.autograd.Function):
         if module.bn_only:
             return None, grad_x, None, None
         else:
-            return None, grad_x, grad_w, None
+            return None, grad_x, grad_w, grad_b
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 5.  TGI — Total Gradient Importance (gradient × memory)
 # ═══════════════════════════════════════════════════════════════════════════
+
+_DAS_MODULE_TYPES = (
+    AutoFreezeConv2d,
+    DASBatchNorm2d,
+    DASGroupNorm,
+    DASLayerNorm,
+    AutoFreezeFC,
+)
+
 
 def compute_tgi(
     params: list[torch.Tensor],
@@ -685,10 +923,12 @@ class DASTrainer:
         # Replace modules with AutoFreeze versions
         self._n_conv = self._replace_conv(model, model.__class__.__name__)
         self._n_bn = self._replace_bn(model, model.__class__.__name__)
+        self._n_gn = self._replace_group_norm(model, model.__class__.__name__)
+        self._n_ln = self._replace_layer_norm(model, model.__class__.__name__)
         self._n_fc = self._replace_fc(model, model.__class__.__name__)
         logger.info(
-            "[DAS] Replaced {} Conv + {} BN + {} FC layers with AutoFreeze versions.",
-            self._n_conv, self._n_bn, self._n_fc,
+            "[DAS] Replaced {} Conv + {} BN + {} GN + {} LN + {} FC layers with AutoFreeze versions.",
+            self._n_conv, self._n_bn, self._n_gn, self._n_ln, self._n_fc,
         )
         if self.use_spectral_entropy:
             self.enable_spectral_entropy_tracking(True)
@@ -736,6 +976,44 @@ class DASTrainer:
                 count = self._replace_bn(target_mod, f"{name}.{mod_name}", count)
         return count
 
+    def _replace_group_norm(self, model: nn.Module, name: str, count: int = 0) -> int:
+        copy_keys = ["eps", "affine"]
+        for mod_name, target_mod in model.named_children():
+            if isinstance(target_mod, nn.GroupNorm) and not isinstance(target_mod, DASGroupNorm):
+                count += 1
+                new_mod = DASGroupNorm(
+                    target_mod.num_groups,
+                    target_mod.num_channels,
+                    **{k: getattr(target_mod, k) for k in copy_keys},
+                    name=f"{name}.{mod_name}",
+                    num=count,
+                    bn_only=self.bn_only,
+                )
+                new_mod.load_state_dict(target_mod.state_dict())
+                setattr(model, mod_name, new_mod)
+            else:
+                count = self._replace_group_norm(target_mod, f"{name}.{mod_name}", count)
+        return count
+
+    def _replace_layer_norm(self, model: nn.Module, name: str, count: int = 0) -> int:
+        copy_keys = ["eps", "elementwise_affine"]
+        for mod_name, target_mod in model.named_children():
+            if isinstance(target_mod, nn.LayerNorm) and not isinstance(target_mod, DASLayerNorm):
+                count += 1
+                new_mod = DASLayerNorm(
+                    target_mod.normalized_shape,
+                    **{k: getattr(target_mod, k) for k in copy_keys},
+                    bias=(target_mod.bias is not None) if getattr(target_mod, "elementwise_affine", False) else False,
+                    name=f"{name}.{mod_name}",
+                    num=count,
+                    bn_only=self.bn_only,
+                )
+                new_mod.load_state_dict(target_mod.state_dict())
+                setattr(model, mod_name, new_mod)
+            else:
+                count = self._replace_layer_norm(target_mod, f"{name}.{mod_name}", count)
+        return count
+
     def _replace_fc(self, model: nn.Module, name: str, count: int = 0) -> int:
         for mod_name, target_mod in model.named_children():
             if isinstance(target_mod, nn.Linear) and not isinstance(target_mod, AutoFreezeFC):
@@ -762,7 +1040,7 @@ class DASTrainer:
         """Return all AutoFreeze / DAS modules keyed by name."""
         modules: dict[str, nn.Module] = {}
         for name, mod in self.model.named_modules():
-            if isinstance(mod, (AutoFreezeConv2d, DASBatchNorm2d, AutoFreezeFC)):
+            if isinstance(mod, _DAS_MODULE_TYPES):
                 modules[name] = mod
         return modules
 
@@ -776,7 +1054,7 @@ class DASTrainer:
         scores: dict[str, float] = {}
         mem_dict, mem_sum = self._get_layer_memories()
         for name, mod in self.model.named_modules():
-            if not isinstance(mod, (AutoFreezeConv2d, DASBatchNorm2d, AutoFreezeFC)):
+            if not isinstance(mod, _DAS_MODULE_TYPES):
                 continue
             entropy = getattr(mod, "last_spectral_entropy", None)
             if entropy is None:
@@ -791,8 +1069,23 @@ class DASTrainer:
         if not scores:
             self._pruning_ratios = {}
             return {}
-        max_score = max(scores.values()) or 1.0
-        pruning_ratios = {key: max(0.0, 1.0 - value / max_score) for key, value in scores.items()}
+        finite_scores = {
+            key: float(value)
+            for key, value in scores.items()
+            if math.isfinite(float(value))
+        }
+        if not finite_scores:
+            self._pruning_ratios = {}
+            return {}
+        max_score = max(finite_scores.values())
+        if max_score <= 0.0:
+            pruning_ratios = {key: 0.0 for key in finite_scores}
+            self._pruning_ratios = pruning_ratios
+            return pruning_ratios
+        pruning_ratios = {
+            key: min(1.0, max(0.0, 1.0 - value / max_score))
+            for key, value in finite_scores.items()
+        }
         self._pruning_ratios = pruning_ratios
         return pruning_ratios
 
@@ -815,7 +1108,7 @@ class DASTrainer:
         layer_memories: dict[str, float] = {}
         memory_sum = 0.0
         for name, mod in self.model.named_modules():
-            if isinstance(mod, (AutoFreezeConv2d, DASBatchNorm2d, AutoFreezeFC)):
+            if isinstance(mod, _DAS_MODULE_TYPES):
                 key = name + ".weight"
                 mem = float(getattr(mod, "activation_size", 1))
                 layer_memories[key] = mem
@@ -837,7 +1130,7 @@ class DASTrainer:
         """
         ratios = pruning_ratios if pruning_ratios is not None else self._pruning_ratios
         for name, mod in self.model.named_modules():
-            if isinstance(mod, (AutoFreezeConv2d, DASBatchNorm2d, AutoFreezeFC)):
+            if isinstance(mod, _DAS_MODULE_TYPES):
                 mod.sparsity_signal = True
                 key = name + ".weight"
                 mod.clip_ratio = ratios.get(key, 0.0)
@@ -845,7 +1138,7 @@ class DASTrainer:
     def deactivate_sparsity(self) -> None:
         """Disable DAS on all AutoFreeze modules (standard training)."""
         for _, mod in self.model.named_modules():
-            if isinstance(mod, (AutoFreezeConv2d, DASBatchNorm2d, AutoFreezeFC)):
+            if isinstance(mod, _DAS_MODULE_TYPES):
                 mod.sparsity_signal = False
 
     # ------------------------------------------------------------------
@@ -1036,7 +1329,7 @@ class DASTrainer:
         cached = 0
         per_layer = {}
         for name, mod in self.model.named_modules():
-            if isinstance(mod, (AutoFreezeConv2d, DASBatchNorm2d, AutoFreezeFC)):
+            if isinstance(mod, _DAS_MODULE_TYPES):
                 act = getattr(mod, "activation_size", 0)
                 bc = getattr(mod, "back_cache_size", 0)
                 per_layer[name] = {"activation_size": act, "back_cache_size": bc,
@@ -1118,7 +1411,7 @@ def apply_das_to_tail(
     trainer.device = torch.device(device)
     trainer._pruning_ratios = {}
 
-    n_conv = n_bn = n_fc = 0
+    n_conv = n_bn = n_gn = n_ln = n_fc = 0
     for tname in tail_module_names:
         submod = model
         for part in tname.split("."):
@@ -1130,14 +1423,18 @@ def apply_das_to_tail(
             continue
         n_conv += trainer._replace_conv(submod, tname)
         n_bn += trainer._replace_bn(submod, tname)
+        n_gn += trainer._replace_group_norm(submod, tname)
+        n_ln += trainer._replace_layer_norm(submod, tname)
         n_fc += trainer._replace_fc(submod, tname)
 
     trainer._n_conv = n_conv
     trainer._n_bn = n_bn
+    trainer._n_gn = n_gn
+    trainer._n_ln = n_ln
     trainer._n_fc = n_fc
     logger.info(
-        "[DAS] Applied to tail modules {}: {} Conv + {} BN + {} FC replaced.",
-        tail_module_names, n_conv, n_bn, n_fc,
+        "[DAS] Applied to tail modules {}: {} Conv + {} BN + {} GN + {} LN + {} FC replaced.",
+        tail_module_names, n_conv, n_bn, n_gn, n_ln, n_fc,
     )
     if trainer.use_spectral_entropy:
         trainer.enable_spectral_entropy_tracking(True)

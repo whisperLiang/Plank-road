@@ -23,6 +23,8 @@ from model_management.activation_sparsity import (  # noqa: F401
     apply_das_to_tail,
     AutoFreezeConv2d,
     DASBatchNorm2d,
+    DASGroupNorm,
+    DASLayerNorm,
     AutoFreezeFC,
     ActivationClipper,
     compute_tgi,

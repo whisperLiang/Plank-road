@@ -25,6 +25,8 @@ from model_management.activation_sparsity import (
     AutoFreezeConv2d,
     AutoFreezeFC,
     DASBatchNorm2d,
+    DASGroupNorm,
+    DASLayerNorm,
     DASTrainer,
     apply_das_to_model,
     apply_das_to_tail,
@@ -46,6 +48,29 @@ def _small_cnn():
         nn.Flatten(),
         nn.Linear(16, 5),
     )
+
+
+def _norm_augmented_model():
+    class _NormAugmentedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 4, 3, padding=1)
+            self.gn = nn.GroupNorm(2, 4)
+            self.pool = nn.AdaptiveAvgPool2d((2, 2))
+            self.flatten = nn.Flatten()
+            self.ln = nn.LayerNorm(16)
+            self.fc = nn.Linear(16, 3)
+
+        def forward(self, x):
+            x = self.conv(x)
+            x = self.gn(x)
+            x = torch.relu(x)
+            x = self.pool(x)
+            x = self.flatten(x)
+            x = self.ln(x)
+            return self.fc(x)
+
+    return _NormAugmentedModel()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -91,8 +116,20 @@ class TestActivationClipper:
             pass
         ctx = Ctx()
         clipped = clipper.clip(x, ctx)
-        # keep_n = max(1, int(100 * (1-0.9)))  (may be 9 or 10 due to float rounding)
-        assert 1 <= clipped.shape[0] <= 11
+        # keep_n = ceil(100 * (1-0.9)) = 10
+        assert clipped.shape[0] == 10
+
+    def test_clip_ratio_one_prunes_all_elements(self):
+        clipper = ActivationClipper(clip_ratio=1.0)
+        x = torch.arange(6, dtype=torch.float32)
+
+        class Ctx:
+            pass
+        ctx = Ctx()
+        clipped = clipper.clip(x, ctx)
+        assert clipped.numel() == 0
+        restored = clipper.reshape(clipped, ctx)
+        assert torch.equal(restored, torch.zeros_like(x))
 
     def test_clip_empty_tensor(self):
         clipper = ActivationClipper(clip_ratio=0.5)
@@ -158,6 +195,17 @@ class TestAutoFreezeConv2d:
         # bn_only should block weight gradient
         assert af.weight.grad is None
 
+    def test_backward_produces_bias_grad(self):
+        af = AutoFreezeConv2d(3, 8, 3, padding=1)
+        af.sparsity_signal = True
+        af.clip_ratio = 0.4
+
+        x = torch.randn(1, 3, 8, 8, requires_grad=True)
+        y = af(x)
+        y.sum().backward()
+        assert af.bias is not None
+        assert af.bias.grad is not None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 3.  DASBatchNorm2d
@@ -191,6 +239,18 @@ class TestDASBatchNorm2d:
         y.sum().backward()
         # Should complete without error
 
+    def test_sparse_backward_produces_affine_grads(self):
+        das = DASBatchNorm2d(8)
+        das.sparsity_signal = True
+        das.clip_ratio = 0.5
+        das.train()
+
+        x = torch.randn(2, 8, 4, 4, requires_grad=True)
+        y = das(x)
+        y.sum().backward()
+        assert das.weight is not None and das.weight.grad is not None
+        assert das.bias is not None and das.bias.grad is not None
+
     def test_activation_size_tracked(self):
         das = DASBatchNorm2d(8)
         das.sparsity_signal = False
@@ -203,6 +263,62 @@ class TestDASBatchNorm2d:
 # ═══════════════════════════════════════════════════════════════════════════
 # 4.  AutoFreezeFC
 # ═══════════════════════════════════════════════════════════════════════════
+
+class TestDASGroupNorm:
+
+    def test_forward_matches_group_norm_when_sparsity_off(self):
+        ref = nn.GroupNorm(2, 8)
+        das = DASGroupNorm(2, 8)
+        das.load_state_dict(ref.state_dict())
+        das.sparsity_signal = False
+
+        x = torch.randn(2, 8, 4, 4)
+        with torch.no_grad():
+            y_ref = ref(x)
+            y_das = das(x)
+        assert torch.allclose(y_ref, y_das, atol=1e-5)
+
+    def test_sparse_backward_produces_affine_grads(self):
+        das = DASGroupNorm(2, 8)
+        das.sparsity_signal = True
+        das.clip_ratio = 0.5
+
+        x = torch.randn(2, 8, 4, 4, requires_grad=True)
+        y = das(x)
+        y.sum().backward()
+
+        assert x.grad is not None
+        assert das.weight is not None and das.weight.grad is not None
+        assert das.bias is not None and das.bias.grad is not None
+
+
+class TestDASLayerNorm:
+
+    def test_forward_matches_layer_norm_when_sparsity_off(self):
+        ref = nn.LayerNorm(16)
+        das = DASLayerNorm(16)
+        das.load_state_dict(ref.state_dict())
+        das.sparsity_signal = False
+
+        x = torch.randn(2, 16)
+        with torch.no_grad():
+            y_ref = ref(x)
+            y_das = das(x)
+        assert torch.allclose(y_ref, y_das, atol=1e-5)
+
+    def test_sparse_backward_produces_affine_grads(self):
+        das = DASLayerNorm(16)
+        das.sparsity_signal = True
+        das.clip_ratio = 0.5
+
+        x = torch.randn(2, 16, requires_grad=True)
+        y = das(x)
+        y.sum().backward()
+
+        assert x.grad is not None
+        assert das.weight is not None and das.weight.grad is not None
+        assert das.bias is not None and das.bias.grad is not None
+
 
 class TestAutoFreezeFC:
 
@@ -236,6 +352,17 @@ class TestAutoFreezeFC:
         y = af(x)
         y.sum().backward()
         assert af.weight.grad is None
+
+    def test_backward_produces_bias_grad(self):
+        af = AutoFreezeFC(10, 5)
+        af.sparsity_signal = True
+        af.clip_ratio = 0.5
+
+        x = torch.randn(2, 10, requires_grad=True)
+        y = af(x)
+        y.sum().backward()
+        assert af.bias is not None
+        assert af.bias.grad is not None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -412,10 +539,34 @@ class TestDASTrainer:
         for value in ratios.values():
             assert 0.0 <= value <= 1.0
 
+    def test_zero_importance_scores_disable_pruning(self, cnn_trainer):
+        ratios = cnn_trainer._importance_scores_to_pruning_ratios(
+            {"layer1.weight": 0.0, "layer2.weight": 0.0}
+        )
+        assert ratios == {"layer1.weight": 0.0, "layer2.weight": 0.0}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 7.  apply_das_to_model / apply_das_to_tail
 # ═══════════════════════════════════════════════════════════════════════════
+
+class TestDASTrainerNormVariants:
+
+    def test_replaces_group_norm_and_layer_norm(self):
+        trainer = DASTrainer(_norm_augmented_model(), device="cpu")
+
+        assert trainer._n_conv == 1
+        assert trainer._n_gn == 1
+        assert trainer._n_ln == 1
+        assert trainer._n_fc == 1
+
+        modules = trainer._das_modules()
+        types = {type(m) for m in modules.values()}
+        assert AutoFreezeConv2d in types
+        assert DASGroupNorm in types
+        assert DASLayerNorm in types
+        assert AutoFreezeFC in types
+
 
 class TestApplyDAS:
 
@@ -467,3 +618,31 @@ class TestApplyDAS:
         assert trainer._n_conv == 0
         assert trainer._n_bn == 0
         assert trainer._n_fc == 0
+
+    def test_apply_das_to_tail_replaces_group_norm_and_layer_norm(self):
+        class TwoPartNormModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Sequential(nn.Conv2d(3, 4, 3, padding=1), nn.ReLU())
+                self.tail = nn.Sequential(
+                    nn.GroupNorm(2, 4),
+                    nn.AdaptiveAvgPool2d((2, 2)),
+                    nn.Flatten(),
+                    nn.LayerNorm(16),
+                    nn.Linear(16, 3),
+                )
+
+            def forward(self, x):
+                return self.tail(self.head(x))
+
+        model = TwoPartNormModel()
+        trainer = apply_das_to_tail(model, ["tail"], device="cpu")
+
+        assert isinstance(trainer, DASTrainer)
+        assert trainer._n_gn == 1
+        assert trainer._n_ln == 1
+        assert trainer._n_fc == 1
+        assert isinstance(model.head[0], nn.Conv2d)
+        assert not isinstance(model.head[0], AutoFreezeConv2d)
+        assert isinstance(model.tail[0], DASGroupNorm)
+        assert isinstance(model.tail[3], DASLayerNorm)
