@@ -101,8 +101,8 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         if cache_path and cache_path != request.cache_path:
             logger.info("Normalized train cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
-            "train_model_request from edge_id={} client_cache_path={} num_epoch={}",
-            request.edge_id, cache_path or "<uploaded-bundle>", request.num_epoch,
+            "train_model_request from edge_id={} client_cache_path={}",
+            request.edge_id, cache_path or "<uploaded-bundle>",
         )
         if self.continual_learner is None:
             logger.error("train_model_request: continual_learner not configured")
@@ -121,7 +121,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 request.edge_id,
                 [int(index) for index in request.frame_indices],
                 str(workspace),
-                int(request.num_epoch),
             )
         except Exception as exc:
             logger.exception("train_model_request error: {}", exc)
@@ -139,8 +138,8 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         if cache_path and cache_path != request.cache_path:
             logger.info("Normalized split-train cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
-            "split_train_request from edge_id={} client_cache_path={} num_epoch={}",
-            request.edge_id, cache_path or "<uploaded-bundle>", request.num_epoch,
+            "split_train_request from edge_id={} client_cache_path={}",
+            request.edge_id, cache_path or "<uploaded-bundle>",
         )
         if self.continual_learner is None:
             logger.error("split_train_request: continual_learner not configured")
@@ -161,7 +160,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                     [int(index) for index in request.all_frame_indices],
                     [int(index) for index in request.drift_frame_indices],
                     str(workspace),
-                    int(request.num_epoch),
                 )
         except Exception as exc:
             logger.exception("split_train_request error: {}", exc)
@@ -176,10 +174,9 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         if cache_path and cache_path != request.cache_path:
             logger.info("Normalized continual-learning cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
-            "continual_learning_request from edge_id={} client_cache_path={} num_epoch={} send_low_conf_features={}",
+            "continual_learning_request from edge_id={} client_cache_path={} send_low_conf_features={}",
             request.edge_id,
             cache_path or "<uploaded-bundle>",
-            request.num_epoch,
             request.send_low_conf_features,
         )
         if self.continual_learner is None:
@@ -203,7 +200,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 self.continual_learner.get_ground_truth_and_fixed_split_retrain(
                     request.edge_id,
                     str(workspace),
-                    int(request.num_epoch),
                 )
             )
             logger.info(
@@ -226,11 +222,10 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
     def submit_training_job(self, request, context):
         logger.info(
-            "submit_training_job edge_id={} request_id={} job_type={} num_epoch={}",
+            "submit_training_job edge_id={} request_id={} job_type={}",
             request.edge_id,
             request.request_id,
             request.job_type,
-            request.num_epoch,
         )
 
         # Track edge in registry
@@ -249,7 +244,13 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
         try:
             request_kind = self._request_kind_for_job_type(int(request.job_type))
-            logger.info("云端 gRPC 服务已收到新的训练请求 (request_id={}, job_type={}), 正在解压/处理发送来的 {} 字节的 ZIP 数据...", request.request_id, request_kind, len(getattr(request, "payload_zip", b"")))
+            logger.info(
+                "Cloud gRPC received a new training request (request_id={}, job_type={}); "
+                "unpacking/processing {} bytes of ZIP payload.",
+                request.request_id,
+                request_kind,
+                len(getattr(request, "payload_zip", b"")),
+            )
             
             workspace = prepare_request_workspace(
                 self.workspace_root,
@@ -283,7 +284,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 job_type=int(request.job_type),
                 workspace=str(workspace),
                 protocol_version=str(request.protocol_version or ""),
-                num_epoch=int(request.num_epoch),
                 send_low_conf_features=bool(request.send_low_conf_features),
                 frame_indices=[int(index) for index in request.frame_indices],
                 all_frame_indices=[int(index) for index in request.all_frame_indices],

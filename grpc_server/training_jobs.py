@@ -42,7 +42,6 @@ class TrainingJob:
     job_type: int
     workspace: str
     protocol_version: str
-    num_epoch: int
     send_low_conf_features: bool = False
     frame_indices: tuple[int, ...] = ()
     all_frame_indices: tuple[int, ...] = ()
@@ -104,7 +103,6 @@ class TrainingJobManager:
         job_type: int,
         workspace: str,
         protocol_version: str,
-        num_epoch: int,
         send_low_conf_features: bool = False,
         frame_indices: list[int] | tuple[int, ...] | None = None,
         all_frame_indices: list[int] | tuple[int, ...] | None = None,
@@ -127,7 +125,6 @@ class TrainingJobManager:
                 job_type=int(job_type),
                 workspace=str(workspace),
                 protocol_version=str(protocol_version or ""),
-                num_epoch=int(num_epoch),
                 send_low_conf_features=bool(send_low_conf_features),
                 frame_indices=tuple(int(value) for value in (frame_indices or [])),
                 all_frame_indices=tuple(int(value) for value in (all_frame_indices or [])),
@@ -274,7 +271,6 @@ class TrainingJobManager:
             edge_id = job.edge_id
             job_type = job.job_type
             workspace = job.workspace
-            num_epoch = job.num_epoch
             frame_indices = list(job.frame_indices)
             all_frame_indices = list(job.all_frame_indices)
             drift_frame_indices = list(job.drift_frame_indices)
@@ -285,7 +281,6 @@ class TrainingJobManager:
                 edge_id=edge_id,
                 job_type=job_type,
                 workspace=workspace,
-                num_epoch=num_epoch,
                 frame_indices=frame_indices,
                 all_frame_indices=all_frame_indices,
                 drift_frame_indices=drift_frame_indices,
@@ -353,7 +348,6 @@ class TrainingJobManager:
         edge_id: int,
         job_type: int,
         workspace: str,
-        num_epoch: int,
         frame_indices: list[int],
         all_frame_indices: list[int],
         drift_frame_indices: list[int],
@@ -364,7 +358,6 @@ class TrainingJobManager:
                 edge_id,
                 frame_indices,
                 workspace,
-                num_epoch,
             )
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_SPLIT:
             return self.continual_learner.get_ground_truth_and_split_retrain(
@@ -372,13 +365,11 @@ class TrainingJobManager:
                 all_frame_indices,
                 drift_frame_indices,
                 workspace,
-                num_epoch,
             )
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
             return self.continual_learner.get_ground_truth_and_fixed_split_retrain(
                 edge_id,
                 workspace,
-                num_epoch,
             )
         raise ValueError(f"Unsupported training job type: {job_type!r}")
 

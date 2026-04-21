@@ -205,25 +205,51 @@ server:
 
 
 @pytest.mark.parametrize(
-    ("field_name", "match_text"),
+    ("section", "field_name", "match_text"),
     [
-        ("trace_batch_size", "trace_batch_size has been removed"),
-        ("rebuild_batch_size", "rebuild_batch_size has been removed"),
-        ("min_wrapper_fixed_split_num_epoch", "min_wrapper_fixed_split_num_epoch has been removed"),
-        ("min_rfdetr_fixed_split_num_epoch", "min_rfdetr_fixed_split_num_epoch has been removed"),
+        ("client.retrain", "batch_size", "client.retrain.batch_size has been removed"),
+        ("client.retrain", "num_epoch", "client.retrain.num_epoch has been removed"),
+        ("server.continual_learning", "trace_batch_size", "trace_batch_size has been removed"),
+        ("server.continual_learning", "rebuild_batch_size", "rebuild_batch_size has been removed"),
+        ("server.continual_learning", "min_wrapper_fixed_split_num_epoch", "min_wrapper_fixed_split_num_epoch has been removed"),
+        ("server.continual_learning", "min_rfdetr_fixed_split_num_epoch", "min_rfdetr_fixed_split_num_epoch has been removed"),
     ],
 )
-def test_load_runtime_config_rejects_removed_cloud_fixed_split_fields(tmp_path, field_name, match_text):
+def test_load_runtime_config_rejects_removed_cloud_fixed_split_fields(
+    tmp_path,
+    section,
+    field_name,
+    match_text,
+):
+    if section == "client.retrain":
+        client_retrain_block = f"""
+  retrain:
+    cache_path: ./cache
+    {field_name}: 2
+""".rstrip()
+        server_cl_block = """
+  continual_learning:
+    batch_size: 4
+""".rstrip()
+    else:
+        client_retrain_block = """
+  retrain:
+    cache_path: ./cache
+""".rstrip()
+        server_cl_block = f"""
+  continual_learning:
+    batch_size: 4
+    {field_name}: 2
+""".rstrip()
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         f"""
 client:
   server_ip: 10.0.0.1:50051
+{client_retrain_block}
 server:
   listen_address: "[::]:50051"
-  continual_learning:
-    batch_size: 4
-    {field_name}: 2
+{server_cl_block}
 """.strip(),
         encoding="utf-8",
     )

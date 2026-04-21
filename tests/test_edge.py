@@ -280,7 +280,7 @@ class TestEdgeWorkerRouting:
         worker.fixed_split_plan = SimpleNamespace(split_config_id="plan-1")
         worker.config = SimpleNamespace(
             server_ip="cloud:50051",
-            retrain=SimpleNamespace(num_epoch=1),
+            retrain=SimpleNamespace(),
         )
         worker.edge_id = 1
         worker.sample_store = object()

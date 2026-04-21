@@ -38,8 +38,6 @@ class SourceConfig(ConfigSection):
 @dataclass
 class RetrainConfig(ConfigSection):
     flag: bool = True
-    num_epoch: int = 2
-    batch_size: int = 2
     cache_path: str = "./cache"
     collect_num: int = 20
 
@@ -243,6 +241,15 @@ def _validate_positive(name: str, value: int | float, *, allow_zero: bool = Fals
 
 def _validate_runtime_config(config: RuntimeConfig) -> None:
     removed_fields = {
+        "client.retrain.batch_size": (
+            "client.retrain.batch_size has been removed; "
+            "edge-side retraining no longer uses a client-configured batch size."
+        ),
+        "client.retrain.num_epoch": (
+            "client.retrain.num_epoch has been removed; "
+            "cloud training epochs are controlled by "
+            "server.continual_learning.num_epoch."
+        ),
         "trace_batch_size": (
             "server.continual_learning.trace_batch_size has been removed; "
             "use server.continual_learning.batch_size for the shared "
@@ -262,7 +269,14 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "cloud fixed-split retraining no longer forces a minimum epoch count."
         ),
     }
+    if getattr(config.client.retrain, "batch_size", None) is not None:
+        raise ValueError(removed_fields["client.retrain.batch_size"])
+    if getattr(config.client.retrain, "num_epoch", None) is not None:
+        raise ValueError(removed_fields["client.retrain.num_epoch"])
+
     for field_name, message in removed_fields.items():
+        if field_name.startswith("client."):
+            continue
         if getattr(config.server.continual_learning, field_name, None) is not None:
             raise ValueError(message)
 
@@ -277,11 +291,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "client.final_detection_threshold must be within [0, 1], "
             f"got {config.client.final_detection_threshold!r}"
         )
-    _validate_positive(
-        "client.retrain.num_epoch",
-        int(config.client.retrain.num_epoch),
-        allow_zero=True,
-    )
     _validate_positive("server.local_queue_maxsize", int(config.server.local_queue_maxsize))
     _validate_positive("server.wait_thresh", int(config.server.wait_thresh))
     _validate_positive(

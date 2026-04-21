@@ -45,8 +45,6 @@ client:
  # retrain
  retrain:
   flag: True
-  num_epoch: 2
-  batch_size: 2
   # Grace window for async cloud job status polling. A submitted job can be
   # briefly invisible if the cloud endpoint reconnects or routes to a different
   # worker; the edge keeps polling within this window before treating it as lost.

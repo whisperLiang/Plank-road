@@ -439,7 +439,6 @@ class EdgeWorker:
                 self._reset_pending_training_cycle()
                 continue
 
-            num_epoch = int(getattr(self.config.retrain, "num_epoch", 0))
             submitted_model_version = str(self.model_version)
             success = False
             model_b64 = ""
@@ -458,7 +457,6 @@ class EdgeWorker:
                     model_id=self.model_id,
                     model_version=self.model_version,
                     send_low_conf_features=decision.send_low_conf_features,
-                    num_epoch=num_epoch,
                     channel=training_channel,
                 )
                 if not accepted or not job_id:

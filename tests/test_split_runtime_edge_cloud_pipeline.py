@@ -1175,7 +1175,6 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
     success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
         edge_id=1,
         bundle_cache_path=str(bundle_root),
-        num_epoch=2,
     )
 
     assert success is True
@@ -1304,7 +1303,6 @@ def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf
     success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
         edge_id=1,
         bundle_cache_path=str(bundle_root),
-        num_epoch=2,
     )
 
     assert success is True
@@ -1439,7 +1437,6 @@ def test_fixed_split_retrain_returns_failure_when_no_finite_step(
     success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
         edge_id=1,
         bundle_cache_path=str(bundle_root),
-        num_epoch=2,
     )
 
     assert success is False
@@ -1604,7 +1601,6 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
     success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
         edge_id=1,
         bundle_cache_path=str(bundle_root),
-        num_epoch=2,
     )
 
     assert retrain_calls == [1, 1]
@@ -1746,7 +1742,6 @@ def test_fixed_split_retrain_reuses_prepared_batch_runtime_on_server(
     success, _, message = learner.get_ground_truth_and_fixed_split_retrain(
         edge_id=1,
         bundle_cache_path=str(bundle_root),
-        num_epoch=2,
     )
 
     assert "batch_feature_provider" in captured_prepare_kwargs

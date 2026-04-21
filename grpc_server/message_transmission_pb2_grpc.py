@@ -64,6 +64,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.DownloadTrainedModelReply.FromString,
                 _registered_method=True)
+        self.cancel_training_job = channel.unary_unary(
+                '/MessageTransmission/cancel_training_job',
+                request_serializer=message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.CancelTrainingJobReply.FromString,
+                _registered_method=True)
         self.query_resource = channel.unary_unary(
                 '/MessageTransmission/query_resource',
                 request_serializer=message__transmission__pb2.ResourceRequest.SerializeToString,
@@ -124,6 +129,13 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def cancel_training_job(self, request, context):
+        """Cancel a queued or running training job.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def query_resource(self, request, context):
         """Resource-aware CL trigger: edge queries cloud resource utilisation.
         """
@@ -170,6 +182,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.download_trained_model,
                     request_deserializer=message__transmission__pb2.DownloadTrainedModelRequest.FromString,
                     response_serializer=message__transmission__pb2.DownloadTrainedModelReply.SerializeToString,
+            ),
+            'cancel_training_job': grpc.unary_unary_rpc_method_handler(
+                    servicer.cancel_training_job,
+                    request_deserializer=message__transmission__pb2.CancelTrainingJobRequest.FromString,
+                    response_serializer=message__transmission__pb2.CancelTrainingJobReply.SerializeToString,
             ),
             'query_resource': grpc.unary_unary_rpc_method_handler(
                     servicer.query_resource,
@@ -344,6 +361,33 @@ class MessageTransmission(object):
             '/MessageTransmission/download_trained_model',
             message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
             message__transmission__pb2.DownloadTrainedModelReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def cancel_training_job(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/cancel_training_job',
+            message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
+            message__transmission__pb2.CancelTrainingJobReply.FromString,
             options,
             channel_credentials,
             insecure,

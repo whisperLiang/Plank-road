@@ -92,7 +92,11 @@ def prepare_request_workspace(
         workspace_dir = root / request_kind / f"edge_{safe_edge_id}" / request_id
         reset_workspace_dir(workspace_dir)
         _safe_extract_zip_bytes(payload_zip, workspace_dir)
-        logger.info(f"💾 云端已将 edge_{edge_id} 的 gRPC ZIP 数据解压并保存到目录: {workspace_dir}")
+        logger.info(
+            "Saved and unpacked the gRPC ZIP payload for edge_{} into workspace: {}",
+            edge_id,
+            workspace_dir,
+        )
         return workspace_dir
 
     return _resolve_requested_cache_path(root, client_cache_path)

@@ -37,8 +37,7 @@ message TrainRequest {
   repeated int64 frame_indices = 2;
   // Cloud-owned working directory hint; server resolves it inside workspace_root.
   string cache_path = 3;
-  // Number of training epochs (0 = use cloud default)
-  int64 num_epoch = 4;
+  reserved 4;
   bytes payload_zip = 5;
 }
 
@@ -56,8 +55,7 @@ message SplitTrainRequest {
   repeated int64 drift_frame_indices = 3;
   // Cloud-owned working directory hint; server resolves it inside workspace_root.
   string cache_path = 4;
-  // Number of training epochs (0 = use cloud default)
-  int64 num_epoch = 5;
+  reserved 5;
   bytes payload_zip = 6;
 }
 
@@ -72,7 +70,7 @@ message ContinualLearningRequest {
   string protocol_version = 1;
   int64 edge_id = 2;
   string cache_path = 3;
-  int64 num_epoch = 4;
+  reserved 4;
   bool send_low_conf_features = 5;
   bytes payload_zip = 6;
 }
@@ -90,7 +88,7 @@ message SubmitTrainingJobRequest {
   string request_id = 3;
   TrainingJobType job_type = 4;
   string cache_path = 5;
-  int64 num_epoch = 6;
+  reserved 6;
   bool send_low_conf_features = 7;
   repeated int64 frame_indices = 8;
   repeated int64 all_frame_indices = 9;

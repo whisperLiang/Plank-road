@@ -116,7 +116,6 @@ class TestMessageTransmissionServicer:
         request = message_transmission_pb2.TrainRequest(
             edge_id=1,
             cache_path="edge_1/train_model",
-            num_epoch=2,
             frame_indices=[1, 2, 3],
         )
 
@@ -137,7 +136,6 @@ class TestMessageTransmissionServicer:
         request = message_transmission_pb2.TrainRequest(
             edge_id=7,
             cache_path=r"..\ignored",
-            num_epoch=2,
             frame_indices=[4, 5],
             payload_zip=payload_zip,
         )
@@ -146,10 +144,9 @@ class TestMessageTransmissionServicer:
 
         assert reply.success is True
         mock_learner.get_ground_truth_and_retrain.assert_called_once()
-        _, frame_indices, workspace, epochs = mock_learner.get_ground_truth_and_retrain.call_args.args
+        _, frame_indices, workspace = mock_learner.get_ground_truth_and_retrain.call_args.args
         workspace_path = Path(workspace)
         assert frame_indices == [4, 5]
-        assert epochs == 2
         assert workspace_path.is_relative_to((tmp_path / "workspace").resolve())
         assert (workspace_path / "frames" / "1.jpg").read_bytes() == b"frame-bytes"
 
@@ -159,7 +156,6 @@ class TestMessageTransmissionServicer:
         request = message_transmission_pb2.TrainRequest(
             edge_id=3,
             cache_path="../outside",
-            num_epoch=2,
             frame_indices=[1, 2, 3],
         )
 
@@ -176,7 +172,6 @@ class TestMessageTransmissionServicer:
         request = message_transmission_pb2.TrainRequest(
             edge_id=3,
             cache_path="edge_3/train_model",
-            num_epoch=2,
             frame_indices=[1],
             payload_zip=payload_zip,
         )
@@ -199,7 +194,6 @@ class TestMessageTransmissionServicer:
         request = message_transmission_pb2.SplitTrainRequest(
             edge_id=5,
             cache_path="edge_5/split_train",
-            num_epoch=2,
             all_frame_indices=[4, 5, 6],
             drift_frame_indices=[5],
             payload_zip=payload_zip,
@@ -209,12 +203,11 @@ class TestMessageTransmissionServicer:
 
         assert reply.success is True
         mock_learner.get_ground_truth_and_split_retrain.assert_called_once()
-        _, all_indices, drift_indices, workspace, epochs = (
+        _, all_indices, drift_indices, workspace = (
             mock_learner.get_ground_truth_and_split_retrain.call_args.args
         )
         assert all_indices == [4, 5, 6]
         assert drift_indices == [5]
-        assert epochs == 2
         assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
 
     def test_continual_learning_request_uses_uploaded_bundle_workspace(self, tmp_path):
@@ -229,7 +222,6 @@ class TestMessageTransmissionServicer:
         request = message_transmission_pb2.ContinualLearningRequest(
             edge_id=1,
             cache_path="edge_1/continual_learning",
-            num_epoch=2,
             send_low_conf_features=True,
             protocol_version="edge-cl-bundle.v1",
             payload_zip=payload_zip,
@@ -239,8 +231,7 @@ class TestMessageTransmissionServicer:
 
         assert reply.success is True
         mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once()
-        _, workspace, epochs = mock_learner.get_ground_truth_and_fixed_split_retrain.call_args.args
-        assert epochs == 2
+        _, workspace = mock_learner.get_ground_truth_and_fixed_split_retrain.call_args.args
         assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
         assert (Path(workspace) / "bundle_manifest.json").read_text(encoding="utf-8") == "{}"
 
@@ -268,7 +259,6 @@ class TestMessageTransmissionServicer:
                     request_id="req-1",
                     job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
                     cache_path="edge_1/continual_learning",
-                    num_epoch=2,
                     send_low_conf_features=True,
                     protocol_version="edge-cl-bundle.v1",
                     payload_zip=payload_zip,
@@ -325,7 +315,6 @@ class TestMessageTransmissionServicer:
                 request_id="same-request",
                 job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
                 cache_path="edge_4/continual_learning",
-                num_epoch=2,
                 protocol_version="edge-cl-bundle.v1",
                 payload_zip=payload_zip,
             )

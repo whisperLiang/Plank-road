@@ -1454,7 +1454,6 @@ class CloudContinualLearner:
         edge_id: int,
         frame_indices: list[int],
         cache_path: str,
-        num_epoch: int = 0,
     ) -> tuple[bool, str, str]:
         """Label frames with large model, retrain edge model, return weights.
 
@@ -1462,8 +1461,7 @@ class CloudContinualLearner:
         -------
         (success, base64_model_data, message)
         """
-        if num_epoch <= 0:
-            num_epoch = self.default_num_epoch
+        num_epoch = self.default_num_epoch
 
         if not frame_indices:
             return False, "", "No frame indices provided."
@@ -1503,7 +1501,6 @@ class CloudContinualLearner:
         all_frame_indices: list[int],
         drift_frame_indices: list[int],
         cache_path: str,
-        num_epoch: int = 0,
     ) -> tuple[bool, str, str]:
         """Label **only** drift frames with the large model, then train the
         server-side model (rpn + roi_heads) on **all** cached backbone
@@ -1517,8 +1514,7 @@ class CloudContinualLearner:
         -------
         (success, base64_model_data, message)
         """
-        if num_epoch <= 0:
-            num_epoch = self.default_num_epoch
+        num_epoch = self.default_num_epoch
 
         if not all_frame_indices:
             return False, "", "No frame indices provided."
@@ -1568,10 +1564,8 @@ class CloudContinualLearner:
         self,
         edge_id: int,
         bundle_cache_path: str,
-        num_epoch: int = 0,
     ) -> tuple[bool, str, str]:
-        if num_epoch <= 0:
-            num_epoch = self.default_num_epoch
+        num_epoch = self.default_num_epoch
 
         with self._training_job_scope(edge_id):
             try:

@@ -113,7 +113,7 @@ def is_network_connected(address):
         return False
 
 
-def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_epoch=0):
+def request_cloud_training(server_ip, edge_id, frame_indices, cache_path):
     """Send selected frame indices to the cloud for GT annotation and edge-model
     fine-tuning.  Returns ``(success, model_data_b64, message)``.
 
@@ -128,8 +128,6 @@ def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_ep
     cache_path : str
         Absolute path to the local frame cache directory shared with the cloud
         (or accessible by both).
-    num_epoch : int
-        Number of fine-tuning epochs; 0 lets the cloud use its configured default.
 
     Returns
     -------
@@ -143,7 +141,6 @@ def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_ep
             edge_id=int(edge_id),
             frame_indices=[int(index) for index in frame_indices],
             cache_path=_server_workspace_hint(edge_id, "train_model"),
-            num_epoch=int(num_epoch),
             payload_zip=pack_training_payload(cache_path, frame_indices),
         )
         reply = stub.train_model_request(req)
@@ -155,7 +152,7 @@ def request_cloud_training(server_ip, edge_id, frame_indices, cache_path, num_ep
 
 def request_cloud_split_training(
     server_ip, edge_id, all_frame_indices, drift_frame_indices,
-    cache_path, num_epoch=0,
+    cache_path,
 ):
     """Send frame indices and drift info to cloud for **split-learning**
     continual learning.
@@ -177,7 +174,6 @@ def request_cloud_split_training(
         Subset of *all_frame_indices* where drift was detected.
     cache_path : str
         Shared cache directory containing ``features/`` and ``frames/`` dirs.
-    num_epoch : int
         Training epochs; 0 → cloud default.
 
     Returns
@@ -193,7 +189,6 @@ def request_cloud_split_training(
             all_frame_indices=[int(index) for index in all_frame_indices],
             drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
             cache_path=_server_workspace_hint(edge_id, "split_train"),
-            num_epoch=int(num_epoch),
             payload_zip=pack_training_payload(cache_path, all_frame_indices, drift_frame_indices),
         )
         reply = stub.split_train_request(req)
@@ -213,7 +208,6 @@ def request_continual_learning(
     model_id: str,
     model_version: str,
     send_low_conf_features: bool,
-    num_epoch: int = 0,
 ):
     try:
         payload_zip, manifest = pack_continual_learning_bundle(
@@ -233,7 +227,6 @@ def request_continual_learning(
             protocol_version=manifest["protocol_version"],
             edge_id=int(edge_id),
             cache_path=_server_workspace_hint(edge_id, "continual_learning"),
-            num_epoch=int(num_epoch),
             send_low_conf_features=bool(send_low_conf_features),
             payload_zip=payload_zip,
         )
@@ -251,7 +244,6 @@ def submit_training_job(
     request_id: str,
     job_type: int,
     cache_path: str,
-    num_epoch: int = 0,
     protocol_version: str = "",
     send_low_conf_features: bool = False,
     frame_indices: list[int] | None = None,
@@ -271,7 +263,6 @@ def submit_training_job(
             request_id=str(request_id or ""),
             job_type=int(job_type),
             cache_path=str(cache_path or ""),
-            num_epoch=int(num_epoch),
             send_low_conf_features=bool(send_low_conf_features),
             frame_indices=[int(index) for index in (frame_indices or [])],
             all_frame_indices=[int(index) for index in (all_frame_indices or [])],
@@ -347,7 +338,6 @@ def submit_continual_learning_job(
     model_id: str,
     model_version: str,
     send_low_conf_features: bool,
-    num_epoch: int = 0,
     request_id: str | None = None,
     channel=None,
 ):
@@ -366,7 +356,6 @@ def submit_continual_learning_job(
             request_id=str(request_id or uuid.uuid4().hex),
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
             cache_path=_server_workspace_hint(edge_id, "continual_learning"),
-            num_epoch=num_epoch,
             protocol_version=manifest["protocol_version"],
             send_low_conf_features=bool(send_low_conf_features),
             payload_zip=payload_zip,
