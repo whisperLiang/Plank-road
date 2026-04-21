@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torchvision.models as tv_models
+from types import SimpleNamespace
 
 import model_management.graph_ir as graph_ir
 from model_management.candidate_generator import (
@@ -21,6 +22,32 @@ from model_management.universal_model_split import (
     universal_split_retrain,
 )
 from tests.split_runtime_helpers import collect_valid_candidates, payload_without_boundary
+
+
+class _StaticSplitter:
+    def __init__(self, candidate) -> None:
+        self.graph = object()
+        self.model = object()
+        self.device = torch.device("cpu")
+        self._candidate = candidate
+
+    def trace(self, model, sample_input):
+        self.model = model
+        self.graph = object()
+
+    def split(self, *, candidate=None, candidate_id=None, layer_index=None, boundary_tensor_labels=None):
+        if candidate is not None:
+            return candidate
+        return self._candidate
+
+    def freeze_head(self, chosen) -> None:
+        return None
+
+    def unfreeze_tail(self, chosen) -> None:
+        return None
+
+    def get_tail_trainable_params(self, chosen):
+        return []
 
 
 class ToyDagNet(nn.Module):
@@ -351,3 +378,192 @@ def test_payload_cache_and_universal_split_retrain(tmp_path):
     )
     assert len(losses) == 1
     assert torch.isfinite(torch.tensor(losses[0]))
+
+
+def test_universal_split_retrain_pads_last_batch_to_runtime_batch_size(tmp_path):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+
+    class _PadLastSplitter(_StaticSplitter):
+        def __init__(self, chosen_candidate) -> None:
+            super().__init__(chosen_candidate)
+            self.seen_batches: list[tuple[int, int]] = []
+
+        def cloud_train_step(self, payload, targets=None, **kwargs):
+            assert isinstance(payload, SplitPayload)
+            batch_dim = payload.tensors["selected-boundary"].shape[0]
+            target_count = len(targets) if isinstance(targets, list) else 1
+            self.seen_batches.append((batch_dim, target_count))
+            return None, torch.tensor(1.0)
+
+        def _invalidate_validation_cache(self) -> None:
+            return None
+
+    splitter = _PadLastSplitter(candidate)
+    feature_dir = tmp_path / "features"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    cached_payload = SplitPayload(
+        tensors={"selected-boundary": torch.ones(1, 2)},
+        candidate_id="selected-candidate",
+        boundary_tensor_labels=["selected-boundary"],
+        primary_label="selected-boundary",
+        split_index=3,
+        split_label="selected-boundary",
+    )
+    torch.save(
+        {
+            "intermediate": cached_payload,
+            "candidate_id": cached_payload.candidate_id,
+            "boundary_tensor_labels": list(cached_payload.boundary_tensor_labels),
+            "split_index": cached_payload.split_index,
+            "split_label": cached_payload.split_label,
+            "pseudo_boxes": [],
+            "pseudo_labels": [],
+            "pseudo_scores": [],
+        },
+        feature_dir / "0.pt",
+    )
+
+    losses = universal_split_retrain(
+        model=nn.Identity(),
+        sample_input=torch.zeros(1, 2),
+        cache_path=str(tmp_path),
+        all_indices=[0],
+        gt_annotations={},
+        batch_size=2,
+        splitter=splitter,
+        chosen_candidate=candidate,
+        loss_fn=lambda output, _: torch.tensor(1.0),
+    )
+
+    assert losses == [pytest.approx(1.0)]
+    assert splitter.seen_batches == [(2, 2)]
+
+
+def test_universal_split_retrain_rejects_mismatched_cached_boundary_labels(tmp_path):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+    splitter = _StaticSplitter(candidate)
+    feature_dir = tmp_path / "features"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    mismatched_payload = SplitPayload(
+        tensors={"cached-boundary": torch.ones(1, 2)},
+        candidate_id="cached-candidate",
+        boundary_tensor_labels=["cached-boundary"],
+        primary_label="cached-boundary",
+        split_index=3,
+        split_label="cached-boundary",
+    )
+    torch.save(
+        {
+            "intermediate": mismatched_payload,
+            "candidate_id": mismatched_payload.candidate_id,
+            "boundary_tensor_labels": list(mismatched_payload.boundary_tensor_labels),
+            "split_index": mismatched_payload.split_index,
+            "split_label": mismatched_payload.split_label,
+            "pseudo_boxes": [],
+            "pseudo_labels": [],
+            "pseudo_scores": [],
+        },
+        feature_dir / "0.pt",
+    )
+
+    with pytest.raises(RuntimeError, match="Cached boundary tensor labels do not match"):
+        universal_split_retrain(
+            model=nn.Identity(),
+            sample_input=torch.zeros(1, 2),
+            cache_path=str(tmp_path),
+            all_indices=[0],
+            gt_annotations={},
+            candidate_id=candidate.candidate_id,
+            splitter=splitter,
+            device="cpu",
+            num_epoch=1,
+            loss_fn=lambda output, _: output.float().mean(),
+        )
+
+
+def test_universal_split_retrain_rejects_mismatched_cached_split_index(tmp_path):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+    splitter = _StaticSplitter(candidate)
+    feature_dir = tmp_path / "features"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "intermediate": torch.ones(1, 2),
+            "candidate_id": candidate.candidate_id,
+            "boundary_tensor_labels": None,
+            "split_index": 7,
+            "split_label": None,
+            "pseudo_boxes": [],
+            "pseudo_labels": [],
+            "pseudo_scores": [],
+        },
+        feature_dir / "0.pt",
+    )
+
+    with pytest.raises(RuntimeError, match="Cached legacy split index does not match"):
+        universal_split_retrain(
+            model=nn.Identity(),
+            sample_input=torch.zeros(1, 2),
+            cache_path=str(tmp_path),
+            all_indices=[0],
+            gt_annotations={},
+            candidate_id=candidate.candidate_id,
+            splitter=splitter,
+            device="cpu",
+            num_epoch=1,
+            loss_fn=lambda output, _: output.float().mean(),
+        )
+
+
+def test_universal_split_retrain_rejects_mismatched_cached_candidate_identity(tmp_path):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+    splitter = _StaticSplitter(candidate)
+    feature_dir = tmp_path / "features"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "intermediate": torch.ones(1, 2),
+            "candidate_id": "cached-candidate",
+            "boundary_tensor_labels": None,
+            "split_index": None,
+            "split_label": None,
+            "pseudo_boxes": [],
+            "pseudo_labels": [],
+            "pseudo_scores": [],
+        },
+        feature_dir / "0.pt",
+    )
+
+    with pytest.raises(RuntimeError, match="Cached candidate identity does not match"):
+        universal_split_retrain(
+            model=nn.Identity(),
+            sample_input=torch.zeros(1, 2),
+            cache_path=str(tmp_path),
+            all_indices=[0],
+            gt_annotations={},
+            candidate_id=candidate.candidate_id,
+            splitter=splitter,
+            device="cpu",
+            num_epoch=1,
+            loss_fn=lambda output, _: output.float().mean(),
+        )

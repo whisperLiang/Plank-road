@@ -10,6 +10,7 @@ candidate-driven:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import os
 import random
@@ -129,6 +130,14 @@ def _batch_payloads(
     raise TypeError(f"Unsupported payload type for batching: {type(first)!r}")
 
 
+def _clone_payload_for_padding(payload: SplitPayload | torch.Tensor) -> SplitPayload | torch.Tensor:
+    if isinstance(payload, SplitPayload):
+        return payload.detach(requires_grad=False)
+    if isinstance(payload, torch.Tensor):
+        return payload.detach().clone()
+    raise TypeError(f"Unsupported payload type for pad-last batching: {type(payload)!r}")
+
+
 def _cache_feature_dir(cache_path: str) -> str:
     feature_dir = os.path.join(cache_path, "features")
     os.makedirs(feature_dir, exist_ok=True)
@@ -166,6 +175,82 @@ def _describe_split_identity(
         f"boundary_tensor_labels={_format_boundary_labels(labels)}, "
         f"legacy_split_index={legacy_split_index}"
     )
+
+
+def _resolve_cached_split_identity(
+    record: Mapping[str, Any],
+    payload: Any,
+) -> tuple[str | None, list[str] | None, str | None, int | None]:
+    candidate_id = payload.candidate_id if isinstance(payload, SplitPayload) else None
+    boundary_tensor_labels = (
+        list(payload.boundary_tensor_labels)
+        if isinstance(payload, SplitPayload) and payload.boundary_tensor_labels
+        else None
+    )
+    split_label = payload.split_label if isinstance(payload, SplitPayload) else None
+    split_index = payload.split_index if isinstance(payload, SplitPayload) else None
+
+    record_boundary = record.get("boundary_tensor_labels")
+    if boundary_tensor_labels is None and record_boundary:
+        boundary_tensor_labels = list(record_boundary)
+    if split_label is None:
+        split_label = record.get("split_label")
+    if split_index is None:
+        split_index = record.get("split_index")
+    if candidate_id is None:
+        candidate_id = record.get("candidate_id")
+    return candidate_id, boundary_tensor_labels, split_label, split_index
+
+
+def _validate_cached_payload_identity(
+    *,
+    record: Mapping[str, Any],
+    payload: Any,
+    chosen: SplitCandidate,
+) -> None:
+    cached_candidate_id, cached_boundary_labels, cached_split_label, cached_split_index = (
+        _resolve_cached_split_identity(record, payload)
+    )
+    selected_boundary_labels = list(chosen.boundary_tensor_labels)
+    selected_split_label = (
+        selected_boundary_labels[-1] if selected_boundary_labels else None
+    )
+
+    if cached_boundary_labels is not None:
+        if cached_boundary_labels != selected_boundary_labels:
+            raise RuntimeError(
+                "Cached boundary tensor labels do not match the selected split combination. "
+                f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=cached_boundary_labels, legacy_split_index=cached_split_index)}), "
+                f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=selected_boundary_labels, legacy_split_index=chosen.legacy_layer_index)})."
+            )
+        return
+
+    if cached_split_label is not None:
+        if selected_split_label is None or str(cached_split_label) != str(selected_split_label):
+            raise RuntimeError(
+                "Cached split label does not match the selected split combination. "
+                f"cached_split_label={cached_split_label!r}, selected_split_label={selected_split_label!r}, "
+                f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=None, legacy_split_index=cached_split_index)}), "
+                f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=selected_boundary_labels, legacy_split_index=chosen.legacy_layer_index)})."
+            )
+        return
+
+    if cached_split_index is not None:
+        selected_split_index = chosen.legacy_layer_index
+        if selected_split_index is None or int(cached_split_index) != int(selected_split_index):
+            raise RuntimeError(
+                "Cached legacy split index does not match the selected split combination. "
+                f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=None, legacy_split_index=cached_split_index)}), "
+                f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=selected_boundary_labels, legacy_split_index=chosen.legacy_layer_index)})."
+            )
+        return
+
+    if cached_candidate_id is not None and cached_candidate_id != chosen.candidate_id:
+        raise RuntimeError(
+            "Cached candidate identity does not match the selected split combination. "
+            f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=None, legacy_split_index=None)}), "
+            f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=selected_boundary_labels, legacy_split_index=chosen.legacy_layer_index)})."
+        )
 
 
 def _write_split_cache_metadata(
@@ -224,7 +309,8 @@ def _infer_cached_split_choice(
     candidate_id = metadata.get("candidate_id")
     split_index = metadata.get("split_index")
     boundary_labels = metadata.get("boundary_tensor_labels")
-    if candidate_id is not None or split_index is not None:
+    split_label = metadata.get("split_label")
+    if candidate_id is not None or split_index is not None or split_label is not None or boundary_labels:
         return candidate_id, split_index, list(boundary_labels) if boundary_labels else None
 
     for frame_index in list(all_indices):
@@ -638,6 +724,7 @@ def save_split_feature_cache(
         "pseudo_boxes": pseudo_boxes,
         "pseudo_labels": pseudo_labels,
         "pseudo_scores": pseudo_scores,
+        "boundary_tensor_labels": list(cached_payload.boundary_tensor_labels),
         "split_index": cached_payload.split_index,
         "split_label": cached_payload.split_label,
         "candidate_id": cached_payload.candidate_id,
@@ -872,88 +959,11 @@ def universal_split_retrain(
             for frame_index in batch_indices:
                 record = load_split_feature_cache(cache_path, frame_index)
                 payload = record["intermediate"]
-                cached_candidate_id = record.get("candidate_id")
-                cached_split_index = record.get("split_index")
-                payload_boundary_labels = None
-                if isinstance(payload, SplitPayload):
-                    payload_boundary_labels = list(payload.boundary_tensor_labels)
-                if payload_boundary_labels is None:
-                    record_boundary = record.get("boundary_tensor_labels")
-                    payload_boundary_labels = list(record_boundary) if record_boundary else None
-                if payload_boundary_labels and list(chosen.boundary_tensor_labels) != payload_boundary_labels:
-                    if (
-                        isinstance(payload, SplitPayload)
-                        and len(payload.tensors) == len(chosen.boundary_tensor_labels)
-                    ):
-                        logger.warning(
-                            "Relabelling cached boundary tensors to match the selected split combination. "
-                            "cached=({}) selected=({}).",
-                            _describe_split_identity(
-                                candidate_id=cached_candidate_id,
-                                boundary_tensor_labels=payload_boundary_labels,
-                                legacy_split_index=cached_split_index,
-                            ),
-                            _describe_split_identity(
-                                candidate_id=chosen.candidate_id,
-                                boundary_tensor_labels=chosen.boundary_tensor_labels,
-                                legacy_split_index=chosen.legacy_layer_index,
-                            ),
-                        )
-                        payload = SplitPayload(
-                            tensors=OrderedDict(
-                                (label, tensor)
-                                for label, tensor in zip(
-                                    chosen.boundary_tensor_labels,
-                                    payload.tensors.values(),
-                                )
-                            ),
-                            metadata=dict(payload.metadata),
-                            candidate_id=chosen.candidate_id,
-                            boundary_tensor_labels=list(chosen.boundary_tensor_labels),
-                            primary_label=(
-                                chosen.boundary_tensor_labels[-1]
-                                if chosen.boundary_tensor_labels
-                                else None
-                            ),
-                            split_index=chosen.legacy_layer_index,
-                            split_label=(
-                                chosen.boundary_tensor_labels[-1]
-                                if chosen.boundary_tensor_labels
-                                else None
-                            ),
-                        )
-                    else:
-                        raise RuntimeError(
-                            "Cached boundary tensor labels do not match the selected split combination. "
-                            f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=payload_boundary_labels, legacy_split_index=cached_split_index)}), "
-                            f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=chosen.boundary_tensor_labels, legacy_split_index=chosen.legacy_layer_index)})."
-                        )
-                if (
-                    payload_boundary_labels is None
-                    and cached_candidate_id
-                    and cached_candidate_id != chosen.candidate_id
-                    and (
-                        cached_split_index is None
-                        or chosen.legacy_layer_index is None
-                        or cached_split_index != chosen.legacy_layer_index
-                    )
-                ):
-                    raise RuntimeError(
-                        "Cached split identity does not match the selected split combination. "
-                        f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=None, legacy_split_index=cached_split_index)}), "
-                        f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=chosen.boundary_tensor_labels, legacy_split_index=chosen.legacy_layer_index)})."
-                    )
-                if (
-                    payload_boundary_labels is None
-                    and cached_split_index is not None
-                    and chosen.legacy_layer_index is not None
-                    and cached_split_index != chosen.legacy_layer_index
-                ):
-                    raise RuntimeError(
-                        "Cached legacy split index does not match the selected split combination. "
-                        f"cached=({_describe_split_identity(candidate_id=cached_candidate_id, boundary_tensor_labels=None, legacy_split_index=cached_split_index)}), "
-                        f"selected=({_describe_split_identity(candidate_id=chosen.candidate_id, boundary_tensor_labels=chosen.boundary_tensor_labels, legacy_split_index=chosen.legacy_layer_index)})."
-                    )
+                _validate_cached_payload_identity(
+                    record=record,
+                    payload=payload,
+                    chosen=chosen,
+                )
 
                 targets = gt_annotations.get(frame_index)
                 
@@ -987,6 +997,11 @@ def universal_split_retrain(
             if not payloads:
                 continue
 
+            true_batch_size = len(batch_indices)
+            while len(payloads) < batch_size:
+                payloads.append(_clone_payload_for_padding(payloads[-1]))
+                targets_list.append(copy.deepcopy(targets_list[-1]))
+
             batched_payload = _batch_payloads(
                 payloads,
                 boundary_tensor_labels=chosen.boundary_tensor_labels,
@@ -1014,9 +1029,9 @@ def universal_split_retrain(
                     batch_loss.backward()
                     optimizer.step()
                     splitter._invalidate_validation_cache()
-                finite_steps += len(batch_indices)
-                epoch_finite_samples += len(batch_indices)
-                epoch_loss += float(batch_loss.item()) * len(batch_indices)
+                finite_steps += true_batch_size
+                epoch_finite_samples += true_batch_size
+                epoch_loss += float(batch_loss.item()) * true_batch_size
         losses.append(epoch_loss / max(1, epoch_finite_samples))
         batch_count = (len(all_indices) + batch_size - 1) // batch_size
         if num_epoch > 1 or _epoch == num_epoch - 1:

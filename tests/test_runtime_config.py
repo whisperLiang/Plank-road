@@ -155,3 +155,78 @@ server:
 
     with pytest.raises(ValueError, match="server.das.strategy"):
         load_runtime_config(config_path)
+
+
+def test_load_runtime_config_reads_cloud_continual_learning_batch_size(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 4
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.batch_size == 4
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("batch_size", 0),
+    ],
+)
+def test_load_runtime_config_rejects_invalid_cloud_batch_reconstruction_settings(
+    tmp_path,
+    field_name,
+    field_value,
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    {field_name}: {field_value}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=f"server.continual_learning.{field_name}"):
+        load_runtime_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "match_text"),
+    [
+        ("trace_batch_size", "trace_batch_size has been removed"),
+        ("rebuild_batch_size", "rebuild_batch_size has been removed"),
+        ("min_wrapper_fixed_split_num_epoch", "min_wrapper_fixed_split_num_epoch has been removed"),
+        ("min_rfdetr_fixed_split_num_epoch", "min_rfdetr_fixed_split_num_epoch has been removed"),
+    ],
+)
+def test_load_runtime_config_rejects_removed_cloud_fixed_split_fields(tmp_path, field_name, match_text):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 4
+    {field_name}: 2
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=match_text):
+        load_runtime_config(config_path)

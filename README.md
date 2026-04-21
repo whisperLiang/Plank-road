@@ -281,8 +281,8 @@ server:
 server:
   continual_learning:
     num_epoch: 2
+    batch_size: 2
     teacher_annotation_threshold: 0.3
-    min_wrapper_fixed_split_num_epoch: 10
     wrapper_fixed_split_learning_rate: 3.0e-5
 ```
 

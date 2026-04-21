@@ -106,9 +106,7 @@ class ContinualLearningConfig(ConfigSection):
     teacher_annotation_threshold: float = 0.5
     split_learning_rate: float = 1e-3
     wrapper_fixed_split_learning_rate: float = 3e-5
-    min_wrapper_fixed_split_num_epoch: int = 10
     rfdetr_fixed_split_learning_rate: float = 1e-4
-    min_rfdetr_fixed_split_num_epoch: int = 5
     max_concurrent_jobs: int = 2
 
 
@@ -244,6 +242,30 @@ def _validate_positive(name: str, value: int | float, *, allow_zero: bool = Fals
 
 
 def _validate_runtime_config(config: RuntimeConfig) -> None:
+    removed_fields = {
+        "trace_batch_size": (
+            "server.continual_learning.trace_batch_size has been removed; "
+            "use server.continual_learning.batch_size for the shared "
+            "cloud continual-learning batch size."
+        ),
+        "rebuild_batch_size": (
+            "server.continual_learning.rebuild_batch_size has been removed; "
+            "use server.continual_learning.batch_size for the shared "
+            "cloud continual-learning batch size."
+        ),
+        "min_wrapper_fixed_split_num_epoch": (
+            "server.continual_learning.min_wrapper_fixed_split_num_epoch has been removed; "
+            "cloud fixed-split retraining no longer forces a minimum epoch count."
+        ),
+        "min_rfdetr_fixed_split_num_epoch": (
+            "server.continual_learning.min_rfdetr_fixed_split_num_epoch has been removed; "
+            "cloud fixed-split retraining no longer forces a minimum epoch count."
+        ),
+    }
+    for field_name, message in removed_fields.items():
+        if getattr(config.server.continual_learning, field_name, None) is not None:
+            raise ValueError(message)
+
     _validate_positive("client.interval", int(config.client.interval))
     _validate_positive("client.local_queue_maxsize", int(config.client.local_queue_maxsize))
     _validate_positive("client.wait_thresh", int(config.client.wait_thresh))
@@ -266,6 +288,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.continual_learning.num_epoch",
         int(config.server.continual_learning.num_epoch),
         allow_zero=True,
+    )
+    _validate_positive(
+        "server.continual_learning.batch_size",
+        int(config.server.continual_learning.batch_size),
     )
     _validate_positive(
         "server.continual_learning.max_concurrent_jobs",

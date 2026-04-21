@@ -575,17 +575,40 @@ def _profile_from_report(
 
 
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
+    attempts: list[str] = []
+
     if plan.boundary_tensor_labels:
         try:
             return splitter.split(boundary_tensor_labels=plan.boundary_tensor_labels)
-        except KeyError:
-            pass
+        except KeyError as exc:
+            attempts.append(
+                "boundary_tensor_labels="
+                f"{_format_boundary_labels(plan.boundary_tensor_labels)} ({exc})"
+            )
+    if plan.split_label is not None:
+        try:
+            return splitter.split(layer_label=plan.split_label)
+        except KeyError as exc:
+            attempts.append(f"split_label={plan.split_label!r} ({exc})")
+    if plan.split_index is not None:
+        try:
+            return splitter.split(layer_index=plan.split_index)
+        except KeyError as exc:
+            attempts.append(f"split_index={plan.split_index!r} ({exc})")
     if plan.candidate_id is not None:
         try:
             return splitter.split(candidate_id=plan.candidate_id)
-        except KeyError:
-            pass
-    return splitter.split(layer_index=plan.split_index)
+        except KeyError as exc:
+            attempts.append(f"candidate_id={plan.candidate_id!r} ({exc})")
+    if not attempts:
+        raise RuntimeError(
+            "Split plan does not contain any canonical selector fields. "
+            f"split_config_id={plan.split_config_id!r}"
+        )
+    raise RuntimeError(
+        "Could not recover a split candidate from the canonical split plan. "
+        f"split_config_id={plan.split_config_id!r}, attempts={'; '.join(attempts)}"
+    )
 
 
 def validate_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> dict[str, Any]:

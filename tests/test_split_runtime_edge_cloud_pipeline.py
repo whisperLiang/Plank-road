@@ -16,7 +16,6 @@ from cloud_server import (
     CloudContinualLearner,
     _calibrate_tinynext_proxy_thresholds,
     _evaluate_detection_proxy_map,
-    _requires_trace_stable_feature_rebuild,
     _select_fixed_split_gt_sample_ids,
 )
 from edge.sample_store import EdgeSampleStore, LOW_CONFIDENCE
@@ -422,7 +421,7 @@ def test_cloud_bundle_trace_input_uses_raw_frame_geometry(tmp_path, monkeypatch)
     assert tuple(sample_input.shape) == (1, 3, 512, 960)
 
 
-def test_cloud_bundle_feature_provider_uses_raw_frame_geometry(tmp_path, monkeypatch):
+def test_cloud_bundle_batch_feature_provider_uses_raw_frame_geometry(tmp_path, monkeypatch):
     config = SimpleNamespace(
         edge_model_name="yolo26n",
         continual_learning=SimpleNamespace(),
@@ -460,10 +459,17 @@ def test_cloud_bundle_feature_provider_uses_raw_frame_geometry(tmp_path, monkeyp
 
     class DummySplitter:
         def edge_forward(self, runtime_input, *, candidate=None):
-            captured["runtime_tensor_shape"] = tuple(int(value) for value in runtime_input.shape[-2:])
-            return runtime_input
+            captured["runtime_tensor_shape"] = tuple(int(value) for value in runtime_input.shape)
+            return SplitPayload(
+                tensors={"payload": runtime_input},
+                candidate_id="candidate-1",
+                boundary_tensor_labels=["payload"],
+                primary_label="payload",
+                split_index=3,
+                split_label="payload",
+            )
 
-    provider = learner._bundle_feature_provider(
+    provider = learner._bundle_batch_feature_provider(
         object(),
         manifest,
         bundle_root=str(bundle_root),
@@ -471,11 +477,69 @@ def test_cloud_bundle_feature_provider_uses_raw_frame_geometry(tmp_path, monkeyp
         candidate=SimpleNamespace(candidate_id="candidate-1"),
     )
 
-    runtime_input = provider(str(raw_path), manifest["samples"][0], manifest)
+    payloads = provider([str(raw_path)], [manifest["samples"][0]], manifest)
 
     assert captured["frame_shape"] == (512, 960)
-    assert captured["runtime_tensor_shape"] == (512, 960)
-    assert tuple(runtime_input.shape) == (1, 3, 512, 960)
+    assert captured["runtime_tensor_shape"] == (2, 3, 512, 960)
+    assert len(payloads) == 1
+    assert tuple(payloads[0].tensors["payload"].shape) == (1, 3, 512, 960)
+
+
+def test_cloud_bundle_batch_feature_provider_fails_when_payload_is_not_batch_unbindable(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(batch_size=2),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    bundle_root = tmp_path / "bundle"
+    raw_dir = bundle_root / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_frame = np.zeros((32, 32, 3), dtype=np.uint8)
+    raw_path = raw_dir / "sample-1.jpg"
+    assert cv2.imwrite(str(raw_path), raw_frame)
+
+    manifest = {
+        "split_plan": _dummy_split_plan(model_name="yolo26n").to_dict(),
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "raw_relpath": "raw/sample-1.jpg",
+                "input_image_size": [32, 32],
+                "input_tensor_shape": [1, 3, 32, 32],
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        "cloud_server.prepare_split_runtime_input",
+        lambda model_arg, frame_arg, *, device: torch.zeros((1, 3, 32, 32), dtype=torch.float32),
+    )
+
+    class DummySplitter:
+        def edge_forward(self, runtime_input, *, candidate=None):
+            return SplitPayload(
+                tensors={"payload": torch.zeros((3, 32, 32), dtype=torch.float32)},
+                candidate_id="candidate-1",
+                boundary_tensor_labels=["payload"],
+                primary_label="payload",
+                split_index=3,
+                split_label="payload",
+            )
+
+    provider = learner._bundle_batch_feature_provider(
+        object(),
+        manifest,
+        bundle_root=str(bundle_root),
+        splitter=DummySplitter(),
+        candidate=SimpleNamespace(candidate_id="candidate-1"),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not unbind batched split payload tensor"):
+        provider([str(raw_path)], [manifest["samples"][0]], manifest)
 
 
 def test_proxy_eval_ignores_resize_metadata_and_uses_raw_frame_coordinates(tmp_path):
@@ -572,7 +636,7 @@ def test_cloud_learner_training_scope_serializes_same_edge_but_allows_other_edge
     assert learner.training_queue_state() == (0, 2)
 
 
-def test_wrapper_fixed_split_hparams_use_official_scale_rfdetr_defaults():
+def test_fixed_split_learning_rate_uses_model_family_specific_defaults():
     config = SimpleNamespace(
         edge_model_name="rfdetr_nano",
         continual_learning=SimpleNamespace(),
@@ -583,18 +647,14 @@ def test_wrapper_fixed_split_hparams_use_official_scale_rfdetr_defaults():
         large_object_detection=SimpleNamespace(),
     )
 
-    rfdetr_epochs, rfdetr_lr = learner._resolve_wrapper_fixed_split_hparams(
+    rfdetr_lr = learner._resolve_fixed_split_learning_rate(
         "rfdetr_nano",
-        requested_num_epoch=2,
     )
-    yolo_epochs, yolo_lr = learner._resolve_wrapper_fixed_split_hparams(
+    yolo_lr = learner._resolve_fixed_split_learning_rate(
         "yolov8n",
-        requested_num_epoch=2,
     )
 
-    assert rfdetr_epochs == 5
     assert rfdetr_lr == pytest.approx(1e-4)
-    assert yolo_epochs == 10
     assert yolo_lr == pytest.approx(3e-5)
 
 
@@ -1013,14 +1073,26 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
     monkeypatch.setattr("cloud_server.universal_split_retrain", lambda **kwargs: None)
     monkeypatch.setattr(
         learner,
-        "_build_bundle_trace_sample_input",
-        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+        "_build_bundle_batch_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(2, 3, 8, 8),
     )
-    monkeypatch.setattr(learner, "_bundle_feature_provider", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *args, **kwargs: (
+            "prepared-splitter",
+            SimpleNamespace(
+                candidate_id="candidate-1",
+                legacy_layer_index=3,
+                boundary_tensor_labels=["layer3"],
+            ),
+        ),
+    )
     monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
     monkeypatch.setattr(learner, "_build_teacher_targets", lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]})
 
-    def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, feature_provider=None):
+    def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, **kwargs):
+        assert "batch_feature_provider" in kwargs
         frame_dir = Path(working_cache_path) / "frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
         ok = cv2.imwrite(str(frame_dir / "sample-1.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
@@ -1185,8 +1257,20 @@ def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf
     monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
     monkeypatch.setattr(
         learner,
-        "_build_bundle_trace_sample_input",
-        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+        "_build_bundle_batch_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(2, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *args, **kwargs: (
+            "prepared-splitter",
+            SimpleNamespace(
+                candidate_id=split_plan.candidate_id,
+                legacy_layer_index=split_plan.split_index,
+                boundary_tensor_labels=list(split_plan.boundary_tensor_labels),
+            ),
+        ),
     )
     monkeypatch.setattr(
         learner,
@@ -1311,8 +1395,20 @@ def test_fixed_split_retrain_returns_failure_when_no_finite_step(
     monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
     monkeypatch.setattr(
         learner,
-        "_build_bundle_trace_sample_input",
-        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+        "_build_bundle_batch_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(2, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *args, **kwargs: (
+            "prepared-splitter",
+            SimpleNamespace(
+                candidate_id="candidate-1",
+                legacy_layer_index=3,
+                boundary_tensor_labels=["layer3"],
+            ),
+        ),
     )
     monkeypatch.setattr(
         learner,
@@ -1321,6 +1417,7 @@ def test_fixed_split_retrain_returns_failure_when_no_finite_step(
     )
 
     def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, **kwargs):
+        assert "batch_feature_provider" in kwargs
         frame_dir = Path(working_cache_path) / "frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
         assert cv2.imwrite(str(frame_dir / "sample-1.jpg"), raw_frame)
@@ -1448,8 +1545,20 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
     monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
     monkeypatch.setattr(
         learner,
-        "_build_bundle_trace_sample_input",
-        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+        "_build_bundle_batch_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(2, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *args, **kwargs: (
+            "prepared-splitter",
+            SimpleNamespace(
+                candidate_id=split_plan.candidate_id,
+                legacy_layer_index=split_plan.split_index,
+                boundary_tensor_labels=list(split_plan.boundary_tensor_labels),
+            ),
+        ),
     )
     monkeypatch.setattr(
         learner,
@@ -1457,7 +1566,8 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
         lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]},
     )
 
-    def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, feature_provider=None, **kwargs):
+    def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, **kwargs):
+        assert "batch_feature_provider" in kwargs
         frame_dir = Path(working_cache_path) / "frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
         ok = cv2.imwrite(str(frame_dir / "sample-1.jpg"), raw_frame)
@@ -1497,7 +1607,7 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
         num_epoch=2,
     )
 
-    assert retrain_calls == [1, 1, 1, 1, 1]
+    assert retrain_calls == [1, 1]
     assert success is True
     assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message
     returned_state = torch.load(
@@ -1508,7 +1618,7 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
     assert float(returned_state["weight"][0]) == pytest.approx(0.9)
 
 
-def test_tinynext_fixed_split_rebuilds_trace_stable_features_on_server(
+def test_fixed_split_retrain_reuses_prepared_batch_runtime_on_server(
     tmp_path,
     monkeypatch,
 ):
@@ -1585,8 +1695,8 @@ def test_tinynext_fixed_split_rebuilds_trace_stable_features_on_server(
     monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
     monkeypatch.setattr(
         learner,
-        "_build_bundle_trace_sample_input",
-        lambda *args, **kwargs: torch.zeros(1, 3, 8, 8),
+        "_build_bundle_batch_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(2, 3, 8, 8),
     )
     monkeypatch.setattr(
         learner,
@@ -1639,7 +1749,7 @@ def test_tinynext_fixed_split_rebuilds_trace_stable_features_on_server(
         num_epoch=2,
     )
 
-    assert _requires_trace_stable_feature_rebuild("tinynext_s") is True
-    assert captured_prepare_kwargs["prefer_feature_rebuild"] is True
+    assert "batch_feature_provider" in captured_prepare_kwargs
+    assert callable(captured_prepare_kwargs["batch_feature_provider"])
     assert success is True
     assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message

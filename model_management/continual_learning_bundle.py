@@ -85,15 +85,16 @@ def _payload_matches_split_plan(payload: Any, split_plan: dict[str, Any]) -> boo
         return True
     expected_boundary = split_plan.get("boundary_tensor_labels") or []
     if expected_boundary:
-        if list(payload.boundary_tensor_labels) == list(expected_boundary):
-            return True
-    expected_candidate_id = split_plan.get("candidate_id")
-    if expected_candidate_id and payload.candidate_id is not None:
-        if str(payload.candidate_id) == str(expected_candidate_id):
-            return True
+        return list(payload.boundary_tensor_labels) == list(expected_boundary)
+    expected_split_label = split_plan.get("split_label")
+    if expected_split_label is not None and payload.split_label is not None:
+        return str(payload.split_label) == str(expected_split_label)
     expected_split_index = split_plan.get("split_index")
     if expected_split_index is not None and payload.split_index is not None:
         return int(payload.split_index) == int(expected_split_index)
+    expected_candidate_id = split_plan.get("candidate_id")
+    if expected_candidate_id and payload.candidate_id is not None:
+        return str(payload.candidate_id) == str(expected_candidate_id)
     return True
 
 
@@ -114,9 +115,7 @@ def prepare_split_training_cache(
     bundle_root: str,
     target_cache_path: str,
     *,
-    feature_provider: Callable[[str, dict[str, Any], dict[str, Any]], Any] | None = None,
     batch_feature_provider: Callable[[list[str], list[dict[str, Any]], dict[str, Any]], list[Any]] | None = None,
-    prefer_feature_rebuild: bool = False,
 ) -> dict[str, Any]:
     manifest = load_training_bundle_manifest(bundle_root)
     os.makedirs(target_cache_path, exist_ok=True)
@@ -154,99 +153,63 @@ def prepare_split_training_cache(
             if raw_relpath is not None
             else None
         )
-        needs_rebuild = False
         intermediate = None
 
-        if bundled_feature and not prefer_feature_rebuild:
+        if bundled_feature:
             intermediate = _load_intermediate(
                 os.path.join(bundle_root, bundled_feature.replace("/", os.sep))
             )
             if not _payload_matches_split_plan(intermediate, split_plan):
-                if raw_path is not None and (feature_provider is not None or batch_feature_provider is not None):
-                    logger.warning(
-                        "Rebuilding bundled sample {} features because payload split metadata does not match the manifest split plan.",
-                        sample_id,
-                    )
-                    needs_rebuild = True
-                else:
-                    logger.warning(
-                        "Skipping bundled sample {} because payload split metadata does not match the manifest split plan and no raw sample is available for reconstruction.",
-                        sample_id,
-                    )
-                    continue
-        else:
-            if bundled_feature and raw_relpath is None:
-                intermediate = _load_intermediate(
-                    os.path.join(bundle_root, bundled_feature.replace("/", os.sep))
-                )
-                if not _payload_matches_split_plan(intermediate, split_plan):
-                    raise RuntimeError(
-                        f"Sample {sample_id} requires server-side feature reconstruction, "
-                        "but only a split-incompatible bundled feature is available."
-                    )
                 logger.warning(
-                    "Reusing bundled feature for sample {} because trace-stable reconstruction was requested but no raw sample is available.",
+                    "Bundled sample {} feature metadata does not match the manifest split plan; reusing the bundled intermediate without reconstruction.",
                     sample_id,
                 )
-            else:
-                if raw_relpath is None or (feature_provider is None and batch_feature_provider is None):
-                    raise RuntimeError(
-                        f"Sample {sample_id} requires server-side feature reconstruction, "
-                        "but no feature provider is configured."
-                    )
-                if bundled_feature and prefer_feature_rebuild:
-                    logger.warning(
-                        "Rebuilding bundled sample {} features on the server because this model requires trace-stable payloads.",
-                        sample_id,
-                    )
-                needs_rebuild = True
-
-        if needs_rebuild:
-            pending_rebuilds.append({
-                "sample": sample,
-                "raw_path": raw_path,
-                "inference_result": inference_result,
-                "sample_id": sample_id
-            })
-        else:
             processed_items.append({
                 "sample": sample,
                 "inference_result": inference_result,
                 "sample_id": sample_id,
-                "intermediate": intermediate
+                "intermediate": intermediate,
+            })
+        else:
+            if raw_relpath is None:
+                raise RuntimeError(
+                    f"Sample {sample_id} is missing both bundled intermediate features and a raw sample."
+                )
+            if raw_path is None or not os.path.exists(raw_path):
+                raise FileNotFoundError(raw_path or raw_relpath)
+            pending_rebuilds.append({
+                "sample": sample,
+                "raw_path": raw_path,
+                "inference_result": inference_result,
+                "sample_id": sample_id,
             })
 
-    # Rebuild pending samples one-by-one. Wrapper detection models can have
-    # trace-batch-size dependent output structures, so batched rebuilds are
-    # not guaranteed to succeed even when single-sample rebuild works.
     if pending_rebuilds:
+        if batch_feature_provider is None:
+            raise RuntimeError(
+                "Samples require server-side feature reconstruction, but no batch feature provider is configured."
+            )
         logger.info(
-            "[Rebuild] Detected {} samples needing feature rebuild. Using single-sample reconstruction.",
+            "[Rebuild] Reconstructing {} samples via cloud batch reconstruction.",
             len(pending_rebuilds),
         )
-        for idx, pending in enumerate(pending_rebuilds, start=1):
-            if feature_provider is not None:
-                intermediate = feature_provider(pending["raw_path"], pending["sample"], manifest)
-            elif batch_feature_provider is not None:
-                rebuilt = batch_feature_provider([pending["raw_path"]], [pending["sample"]], manifest)
-                if not rebuilt:
-                    raise RuntimeError(f"Batch feature provider returned no payloads for sample {pending['sample_id']}.")
-                intermediate = rebuilt[0]
-            else:
-                raise RuntimeError(
-                    f"Sample {pending['sample_id']} requires server-side feature reconstruction, "
-                    "but no feature provider is configured."
-                )
-
+        rebuilt_payloads = batch_feature_provider(
+            [pending["raw_path"] for pending in pending_rebuilds],
+            [pending["sample"] for pending in pending_rebuilds],
+            manifest,
+        )
+        if len(rebuilt_payloads) != len(pending_rebuilds):
+            raise RuntimeError(
+                "Batch feature provider returned the wrong number of payloads: "
+                f"expected {len(pending_rebuilds)}, got {len(rebuilt_payloads)}."
+            )
+        for pending, intermediate in zip(pending_rebuilds, rebuilt_payloads):
             processed_items.append({
                 "sample": pending["sample"],
                 "inference_result": pending["inference_result"],
                 "sample_id": pending["sample_id"],
                 "intermediate": intermediate,
             })
-
-            if idx % 10 == 0 or idx == len(pending_rebuilds):
-                logger.info("[Rebuild] Progress: {}/{} samples rebuilt.", idx, len(pending_rebuilds))
 
     for item in processed_items:
         sample = item["sample"]
@@ -274,10 +237,10 @@ def prepare_split_training_cache(
             pseudo_labels=inference_result.get("labels", []),
             pseudo_scores=inference_result.get("scores", []),
             extra_metadata={
-                "candidate_id": split_plan.get("candidate_id"),
-                "split_index": split_plan.get("split_index"),
-                "split_label": split_plan.get("split_label"),
-                "boundary_tensor_labels": list(split_plan.get("boundary_tensor_labels", [])),
+                "split_plan_candidate_id": split_plan.get("candidate_id"),
+                "split_plan_split_index": split_plan.get("split_index"),
+                "split_plan_split_label": split_plan.get("split_label"),
+                "split_plan_boundary_tensor_labels": list(split_plan.get("boundary_tensor_labels", [])),
                 "sample_id": sample_id,
                 "confidence_bucket": sample.get("confidence_bucket"),
                 "model_id": sample.get("model_id"),

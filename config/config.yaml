@@ -177,8 +177,6 @@ server:
  continual_learning:
   num_epoch: 5
   batch_size: 16
-  min_wrapper_fixed_split_num_epoch: 10
-  min_rfdetr_fixed_split_num_epoch: 10
   max_concurrent_jobs: 4
   # Cloud-side teacher threshold used only for GT annotation during
   # continual learning. Lower values recover more small/far objects but

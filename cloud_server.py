@@ -10,6 +10,7 @@ import random
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from collections.abc import Mapping
 
@@ -59,6 +60,7 @@ from model_management.continual_learning_bundle import (
     prepare_split_training_cache,
 )
 from model_management.fixed_split import SplitPlan, apply_split_plan
+from model_management.payload import SplitPayload
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
@@ -85,12 +87,6 @@ def _looks_like_fused_ultralytics_state_dict(state: object) -> bool:
     has_conv_bias = any(".conv.bias" in key for key in string_keys)
     has_batch_norm = any(".bn." in key for key in string_keys)
     return has_conv_bias and not has_batch_norm
-
-
-def _requires_trace_stable_feature_rebuild(model_name: str) -> bool:
-    name_lower = str(model_name).strip().lower()
-    return name_lower.startswith("rfdetr_") or name_lower.startswith("tinynext_")
-
 
 def _select_fixed_split_gt_sample_ids(
     manifest: Mapping[str, object],
@@ -501,6 +497,34 @@ class CloudContinualLearner:
             int(getattr(cl_cfg, "max_concurrent_jobs", 2))
             if cl_cfg else 2
         )
+        self.batch_size = (
+            int(getattr(cl_cfg, "batch_size", 2))
+            if cl_cfg else 2
+        )
+        removed_cl_fields = {
+            "trace_batch_size": (
+                "server.continual_learning.trace_batch_size has been removed; "
+                "use server.continual_learning.batch_size for the shared "
+                "cloud continual-learning batch size."
+            ),
+            "rebuild_batch_size": (
+                "server.continual_learning.rebuild_batch_size has been removed; "
+                "use server.continual_learning.batch_size for the shared "
+                "cloud continual-learning batch size."
+            ),
+            "min_wrapper_fixed_split_num_epoch": (
+                "server.continual_learning.min_wrapper_fixed_split_num_epoch has been removed; "
+                "cloud fixed-split retraining no longer forces a minimum epoch count."
+            ),
+            "min_rfdetr_fixed_split_num_epoch": (
+                "server.continual_learning.min_rfdetr_fixed_split_num_epoch has been removed; "
+                "cloud fixed-split retraining no longer forces a minimum epoch count."
+            ),
+        }
+        if cl_cfg:
+            for field_name, message in removed_cl_fields.items():
+                if getattr(cl_cfg, field_name, None) is not None:
+                    raise ValueError(message)
         self.default_split_learning_rate = (
             float(getattr(cl_cfg, "split_learning_rate", 1e-3))
             if cl_cfg else 1e-3
@@ -513,17 +537,9 @@ class CloudContinualLearner:
             float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
             if cl_cfg else 3e-5
         )
-        self.min_wrapper_fixed_split_num_epoch = (
-            int(getattr(cl_cfg, "min_wrapper_fixed_split_num_epoch", 1))
-            if cl_cfg else 1
-        )
         self.rfdetr_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
             if cl_cfg else 1e-4
-        )
-        self.min_rfdetr_fixed_split_num_epoch = (
-            int(getattr(cl_cfg, "min_rfdetr_fixed_split_num_epoch", 5))
-            if cl_cfg else 5
         )
 
         # Dynamic Activation Sparsity (SURGEON) config
@@ -796,6 +812,46 @@ class CloudContinualLearner:
                 return runtime_image_size
         return 224, 224
 
+    def _normalize_bundle_runtime_tensor(
+        self,
+        runtime_input,
+        *,
+        context: str,
+    ) -> torch.Tensor:
+        if not isinstance(runtime_input, torch.Tensor):
+            raise TypeError(
+                f"{context} requires tensor split-runtime inputs, got {type(runtime_input).__name__}."
+            )
+        if runtime_input.ndim == 3:
+            runtime_input = runtime_input.unsqueeze(0)
+        if runtime_input.ndim < 4:
+            raise RuntimeError(
+                f"{context} expected a batched image tensor, got shape {tuple(runtime_input.shape)}."
+            )
+        if runtime_input.shape[0] != 1:
+            raise RuntimeError(
+                f"{context} expected a single-sample runtime tensor before batching, got shape {tuple(runtime_input.shape)}."
+            )
+        return runtime_input
+
+    def _prepare_bundle_runtime_tensor(
+        self,
+        model: torch.nn.Module,
+        frame,
+        *,
+        sample_metadata: Mapping[str, object] | None = None,
+        context: str,
+    ) -> torch.Tensor:
+        runtime_input = self._prepare_split_runtime_input(
+            model,
+            frame,
+            sample_metadata=sample_metadata,
+        )
+        return self._normalize_bundle_runtime_tensor(
+            runtime_input,
+            context=context,
+        )
+
     def _build_bundle_trace_sample_input(
         self,
         model: torch.nn.Module,
@@ -843,32 +899,110 @@ class CloudContinualLearner:
             )
         return sample_input
 
-    def _bundle_feature_provider(
+    def _build_bundle_batch_trace_sample_input(
         self,
         model: torch.nn.Module,
-        manifest: dict[str, object],
-        *,
         bundle_root: str,
-        splitter: UniversalModelSplitter | None = None,
-        candidate=None,
-    ):
-        if splitter is None or candidate is None:
-            splitter, candidate = self._build_bundle_splitter(
-                model,
-                manifest,
-                bundle_root=bundle_root,
-            )
+        manifest: dict[str, object],
+    ) -> torch.Tensor:
+        batch_target = max(1, int(self.batch_size))
+        prepared_inputs: list[torch.Tensor] = []
 
-        def _provider(raw_path: str, sample: dict[str, object], manifest_payload: dict[str, object]):
+        for sample in manifest.get("samples", []):
+            raw_relpath = sample.get("raw_relpath")
+            if raw_relpath is None:
+                continue
+            raw_path = os.path.join(bundle_root, str(raw_relpath).replace("/", os.sep))
+            if not os.path.exists(raw_path):
+                continue
             frame = cv2.imread(raw_path)
             if frame is None:
-                raise FileNotFoundError(raw_path)
-            return splitter.edge_forward(
-                self._prepare_split_runtime_input(model, frame),
-                candidate=candidate,
+                continue
+            prepared_inputs.append(
+                self._prepare_bundle_runtime_tensor(
+                    model,
+                    frame,
+                    sample_metadata=sample,
+                    context="Cloud fixed-split batch tracing",
+                )
+            )
+            if len(prepared_inputs) >= batch_target:
+                break
+
+        if not prepared_inputs:
+            trace_image_size = self._infer_bundle_trace_image_size(manifest)
+            prepared_inputs.append(
+                self._normalize_bundle_runtime_tensor(
+                    build_split_runtime_sample_input(
+                        model,
+                        image_size=trace_image_size,
+                        device=self.device,
+                    ),
+                    context="Cloud fixed-split batch tracing",
+                )
             )
 
-        return _provider
+        batch_input = self._pad_runtime_batch_inputs(
+            prepared_inputs,
+            target_batch_size=batch_target,
+        )
+        logger.info(
+            "[FixedSplitCL] Tracing split runtime with batch input (input_tensor_shape={}).",
+            tuple(batch_input.shape),
+        )
+        return batch_input
+
+    def _split_batched_payload(
+        self,
+        batch_payload: SplitPayload,
+        *,
+        batch_size: int,
+    ) -> list[SplitPayload]:
+        if not isinstance(batch_payload, SplitPayload):
+            raise TypeError(
+                "Cloud batch reconstruction expected SplitPayload output, "
+                f"got {type(batch_payload).__name__}."
+            )
+
+        unbound_tensors: dict[str, tuple[torch.Tensor, ...]] = {}
+        for label, tensor in batch_payload.tensors.items():
+            if tensor.ndim == 0 or tensor.shape[0] != batch_size:
+                raise RuntimeError(
+                    "Could not unbind batched split payload tensor along the batch dimension. "
+                    f"label={label!r}, expected_batch_size={batch_size}, shape={tuple(tensor.shape)}."
+                )
+            unbound_tensors[label] = tensor.unbind(dim=0)
+
+        payloads: list[SplitPayload] = []
+        for index in range(batch_size):
+            payloads.append(
+                SplitPayload(
+                    tensors=OrderedDict(
+                        (label, tensor_slices[index].unsqueeze(0))
+                        for label, tensor_slices in unbound_tensors.items()
+                    ),
+                    metadata=dict(batch_payload.metadata),
+                    candidate_id=batch_payload.candidate_id,
+                    boundary_tensor_labels=list(batch_payload.boundary_tensor_labels),
+                    primary_label=batch_payload.primary_label,
+                    split_index=batch_payload.split_index,
+                    split_label=batch_payload.split_label,
+                )
+            )
+        return payloads
+
+    @staticmethod
+    def _pad_runtime_batch_inputs(
+        prepared_inputs: list[torch.Tensor],
+        *,
+        target_batch_size: int,
+    ) -> torch.Tensor:
+        if not prepared_inputs:
+            raise ValueError("prepared_inputs must contain at least one tensor.")
+        padded_inputs = list(prepared_inputs)
+        while len(padded_inputs) < target_batch_size:
+            padded_inputs.append(padded_inputs[-1].clone())
+        return torch.cat(padded_inputs[:target_batch_size], dim=0)
 
     def _bundle_batch_feature_provider(
         self,
@@ -889,54 +1023,42 @@ class CloudContinualLearner:
         def _batch_provider(raw_paths: list[str], samples: list[dict[str, object]], manifest_payload: dict[str, object]):
             if not raw_paths:
                 return []
-
-            frames = [cv2.imread(p) for p in raw_paths]
-            for frame, p in zip(frames, raw_paths):
-                if frame is None:
-                    raise FileNotFoundError(p)
-
-            inputs = torch.cat([self._prepare_split_runtime_input(model, f) for f in frames], dim=0)
-            
-            try:
-                batch_payload = splitter.edge_forward(inputs, candidate=candidate)
-            except Exception as exc:
-                logger.warning(
-                    "[CL] Batched edge_forward failed while rebuilding split features ({} samples). "
-                    "Falling back to per-sample feature extraction. Error: {}",
-                    len(raw_paths),
-                    exc,
+            if len(raw_paths) != len(samples):
+                raise ValueError(
+                    "Cloud batch reconstruction expects one sample metadata record per raw path."
                 )
-                return [
-                    splitter.edge_forward(
-                        self._prepare_split_runtime_input(model, frame),
-                        candidate=candidate,
+
+            payloads: list[SplitPayload] = []
+            chunk_size = max(1, int(self.batch_size))
+            for offset in range(0, len(raw_paths), chunk_size):
+                chunk_paths = raw_paths[offset:offset + chunk_size]
+                chunk_samples = samples[offset:offset + chunk_size]
+                prepared_inputs: list[torch.Tensor] = []
+                for raw_path, sample in zip(chunk_paths, chunk_samples):
+                    frame = cv2.imread(raw_path)
+                    if frame is None:
+                        raise FileNotFoundError(raw_path)
+                    prepared_inputs.append(
+                        self._prepare_bundle_runtime_tensor(
+                            model,
+                            frame,
+                            sample_metadata=sample,
+                            context="Cloud fixed-split feature reconstruction",
+                        )
                     )
-                    for frame in frames
-                ]
-            
-            from model_management.payload import SplitPayload
-            import collections
-            payloads = []
-            
-            batch_size = len(raw_paths)
-            unbound_tensors = {}
-            for k, v in batch_payload.tensors.items():
-                if v.ndim > 0 and v.shape[0] == batch_size:
-                    unbound_tensors[k] = v.unbind(dim=0)
-                else:
-                    unbound_tensors[k] = [v] * batch_size
-                    
-            for i in range(batch_size):
-                payload = SplitPayload(
-                    tensors=collections.OrderedDict({k: unbound_tensors[k][i].unsqueeze(0) if unbound_tensors[k][i].ndim > 0 else unbound_tensors[k][i] for k in batch_payload.tensors}),
-                    metadata=dict(batch_payload.metadata),
-                    candidate_id=batch_payload.candidate_id,
-                    boundary_tensor_labels=list(batch_payload.boundary_tensor_labels),
-                    primary_label=batch_payload.primary_label,
-                    split_index=batch_payload.split_index,
-                    split_label=batch_payload.split_label,
+
+                inputs = self._pad_runtime_batch_inputs(
+                    prepared_inputs,
+                    target_batch_size=chunk_size,
                 )
-                payloads.append(payload)
+                batch_payload = splitter.edge_forward(inputs, candidate=candidate)
+                chunk_payloads = self._split_batched_payload(
+                    batch_payload,
+                    batch_size=chunk_size,
+                )
+                payloads.extend(
+                    chunk_payloads[:len(chunk_paths)]
+                )
             return payloads
 
         return _batch_provider
@@ -951,7 +1073,7 @@ class CloudContinualLearner:
         split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
         splitter = UniversalModelSplitter(device=self.device)
         split_model = get_split_runtime_model(model)
-        sample_input = self._build_bundle_trace_sample_input(
+        sample_input = self._build_bundle_batch_trace_sample_input(
             model,
             bundle_root,
             manifest,
@@ -960,22 +1082,17 @@ class CloudContinualLearner:
         candidate = apply_split_plan(splitter, split_plan)
         return splitter, candidate
 
-    def _resolve_wrapper_fixed_split_hparams(
+    def _resolve_fixed_split_learning_rate(
         self,
         model_name: str,
-        *,
-        requested_num_epoch: int,
-    ) -> tuple[int, float]:
+    ) -> float:
         name_lower = str(model_name).lower()
         if name_lower.startswith("rfdetr_"):
-            min_epochs = self.min_rfdetr_fixed_split_num_epoch
             learning_rate = self.rfdetr_fixed_split_learning_rate
         else:
-            min_epochs = self.min_wrapper_fixed_split_num_epoch
             learning_rate = self.wrapper_fixed_split_learning_rate
 
-        effective_num_epoch = max(int(requested_num_epoch), int(min_epochs))
-        return effective_num_epoch, float(learning_rate)
+        return float(learning_rate)
 
     def _prepare_fixed_split_working_cache(
         self,
@@ -984,46 +1101,25 @@ class CloudContinualLearner:
         *,
         bundle_cache_path: str,
         working_cache: str,
-        requires_trace_stable_rebuild: bool,
     ) -> tuple[dict[str, object], str, UniversalModelSplitter | None, object | None]:
-        prepared_splitter = None
-        prepared_candidate = None
         if os.path.isdir(working_cache):
             shutil.rmtree(working_cache, ignore_errors=True)
 
-        provider_kwargs = {}
-        if requires_trace_stable_rebuild:
-            prepared_splitter, prepared_candidate = self._build_bundle_splitter(
-                model,
-                manifest,
-                bundle_root=bundle_cache_path,
-            )
-            provider_kwargs = {
-                "splitter": prepared_splitter,
-                "candidate": prepared_candidate,
-            }
-
-        prepare_kwargs = {
-            "feature_provider": self._bundle_feature_provider(
-                model,
-                manifest,
-                bundle_root=bundle_cache_path,
-                **provider_kwargs,
-            ),
-            "batch_feature_provider": self._bundle_batch_feature_provider(
-                model,
-                manifest,
-                bundle_root=bundle_cache_path,
-                **provider_kwargs,
-            ),
-        }
-        if requires_trace_stable_rebuild:
-            prepare_kwargs["prefer_feature_rebuild"] = True
-
+        prepared_splitter, prepared_candidate = self._build_bundle_splitter(
+            model,
+            manifest,
+            bundle_root=bundle_cache_path,
+        )
         bundle_info = prepare_split_training_cache(
             bundle_cache_path,
             working_cache,
-            **prepare_kwargs,
+            batch_feature_provider=self._bundle_batch_feature_provider(
+                model,
+                manifest,
+                bundle_root=bundle_cache_path,
+                splitter=prepared_splitter,
+                candidate=prepared_candidate,
+            ),
         )
         return bundle_info, os.path.join(working_cache, "frames"), prepared_splitter, prepared_candidate
 
@@ -1153,7 +1249,7 @@ class CloudContinualLearner:
             raise ValueError("No annotated raw frames were available for retraining.")
 
         dataset = DetectionDataset(frames)
-        batch_size = getattr(self.config.continual_learning, "batch_size", 2) if hasattr(self.config, "continual_learning") else 2
+        batch_size = self.batch_size
         logger.info("[CL] Starting retraining with batch_size={}", batch_size)
         data_loader = DataLoader(
             dataset=dataset,
@@ -1255,26 +1351,17 @@ class CloudContinualLearner:
         effective_num_epoch = num_epoch
         effective_learning_rate = self.default_split_learning_rate
         if gt_annotations and model_zoo.is_wrapper_model(current_model_name):
-            tuned_num_epoch, tuned_learning_rate = self._resolve_wrapper_fixed_split_hparams(
+            effective_learning_rate = self._resolve_fixed_split_learning_rate(
                 current_model_name,
-                requested_num_epoch=effective_num_epoch,
             )
-            if tuned_num_epoch != effective_num_epoch:
-                logger.info(
-                    "[FixedSplitCL] Promoting wrapper fixed-split retraining epochs from {} to {}.",
-                    effective_num_epoch,
-                    tuned_num_epoch,
-                )
-                effective_num_epoch = tuned_num_epoch
-            effective_learning_rate = tuned_learning_rate
             logger.info(
                 "[FixedSplitCL] Using wrapper fixed-split learning rate {}.",
                 effective_learning_rate,
             )
             
-        bs = getattr(self.config.continual_learning, "batch_size", 2) if hasattr(self.config, "continual_learning") else 2
+        bs = self.batch_size
         logger.info(
-            "[FixedSplitCL] Starting split retrain configuration: Epochs={}, Learning Rate={}, Batch Size={}, Total Samples={}",
+            "[FixedSplitCL] Starting split retrain configuration: Epochs={}, Learning Rate={}, Runtime Batch Size={}, Total Samples={}",
             effective_num_epoch,
             effective_learning_rate,
             bs,
@@ -1283,7 +1370,7 @@ class CloudContinualLearner:
 
         split_retrain_kwargs = {
             "model": get_split_runtime_model(model),
-            "sample_input": self._build_bundle_trace_sample_input(
+            "sample_input": self._build_bundle_batch_trace_sample_input(
                 model,
                 bundle_cache_path,
                 manifest,
@@ -1492,14 +1579,9 @@ class CloudContinualLearner:
                 if manifest.get("protocol_version") != CONTINUAL_LEARNING_PROTOCOL_VERSION:
                     raise RuntimeError(
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
-                    )
+                )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
                 baseline_source = "cached"
-                has_split_plan = bool(dict(manifest.get("split_plan", {})).get("split_config_id"))
-                requires_trace_stable_rebuild = bool(
-                    has_split_plan
-                    and _requires_trace_stable_feature_rebuild(current_model_name)
-                )
 
                 tmp_model = self._load_edge_training_model(
                     model_name=current_model_name,
@@ -1512,7 +1594,6 @@ class CloudContinualLearner:
                         manifest,
                         bundle_cache_path=bundle_cache_path,
                         working_cache=working_cache,
-                        requires_trace_stable_rebuild=requires_trace_stable_rebuild,
                     )
                 )
                 gt_sample_ids = _select_fixed_split_gt_sample_ids(
@@ -1585,7 +1666,6 @@ class CloudContinualLearner:
                                 manifest,
                                 bundle_cache_path=bundle_cache_path,
                                 working_cache=working_cache,
-                                requires_trace_stable_rebuild=requires_trace_stable_rebuild,
                             )
                         )
                         if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":

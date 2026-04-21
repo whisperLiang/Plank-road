@@ -603,7 +603,7 @@ def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_availabl
     assert plan.total_parameter_count == 100
 
 
-def test_apply_split_plan_falls_back_from_boundary_labels_to_candidate_and_split_index():
+def test_apply_split_plan_prefers_canonical_split_selectors_before_candidate_id():
     plan = SplitPlan(
         split_config_id="plan-1",
         model_name="dummy-model",
@@ -619,53 +619,151 @@ def test_apply_split_plan_falls_back_from_boundary_labels_to_candidate_and_split
         trace_signature="sig",
     )
 
-    class CandidateRuntime:
+    class SplitLabelRuntime:
         def __init__(self):
             self.calls = []
 
-        def split(self, *, boundary_tensor_labels=None, candidate_id=None, layer_index=None):
+        def split(
+            self,
+            *,
+            boundary_tensor_labels=None,
+            layer_label=None,
+            layer_index=None,
+            candidate_id=None,
+        ):
             self.calls.append(
                 {
                     "boundary_tensor_labels": boundary_tensor_labels,
-                    "candidate_id": candidate_id,
+                    "layer_label": layer_label,
                     "layer_index": layer_index,
+                    "candidate_id": candidate_id,
                 }
             )
             if boundary_tensor_labels is not None:
                 raise KeyError("missing boundary labels")
+            if layer_label is not None:
+                return "label-match"
+            raise AssertionError("split_label should be used before weaker fallbacks")
+
+    runtime = SplitLabelRuntime()
+    assert apply_split_plan(runtime, plan) == "label-match"
+    assert runtime.calls == [
+        {
+            "boundary_tensor_labels": ["missing-boundary"],
+            "layer_label": None,
+            "layer_index": None,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": "layer7",
+            "layer_index": None,
+            "candidate_id": None,
+        },
+    ]
+
+    class SplitIndexRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def split(
+            self,
+            *,
+            boundary_tensor_labels=None,
+            layer_label=None,
+            layer_index=None,
+            candidate_id=None,
+        ):
+            self.calls.append(
+                {
+                    "boundary_tensor_labels": boundary_tensor_labels,
+                    "layer_label": layer_label,
+                    "layer_index": layer_index,
+                    "candidate_id": candidate_id,
+                }
+            )
+            if boundary_tensor_labels is not None or layer_label is not None:
+                raise KeyError("fallback")
+            if layer_index is not None:
+                return "layer-match"
+            raise AssertionError("candidate_id fallback should not be used here")
+
+    runtime = SplitIndexRuntime()
+    assert apply_split_plan(runtime, plan) == "layer-match"
+    assert runtime.calls == [
+        {
+            "boundary_tensor_labels": ["missing-boundary"],
+            "layer_label": None,
+            "layer_index": None,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": "layer7",
+            "layer_index": None,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": None,
+            "layer_index": 7,
+            "candidate_id": None,
+        },
+    ]
+
+    class CandidateRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def split(
+            self,
+            *,
+            boundary_tensor_labels=None,
+            layer_label=None,
+            layer_index=None,
+            candidate_id=None,
+        ):
+            self.calls.append(
+                {
+                    "boundary_tensor_labels": boundary_tensor_labels,
+                    "layer_label": layer_label,
+                    "layer_index": layer_index,
+                    "candidate_id": candidate_id,
+                }
+            )
+            if boundary_tensor_labels is not None or layer_label is not None or layer_index is not None:
+                raise KeyError("fallback")
             if candidate_id is not None:
                 return "candidate-match"
-            raise AssertionError("layer_index fallback should not be used here")
+            raise AssertionError("candidate_id should be the final fallback")
 
     runtime = CandidateRuntime()
     assert apply_split_plan(runtime, plan) == "candidate-match"
     assert runtime.calls == [
-        {"boundary_tensor_labels": ["missing-boundary"], "candidate_id": None, "layer_index": None},
-        {"boundary_tensor_labels": None, "candidate_id": "candidate-2", "layer_index": None},
-    ]
-
-    class LayerRuntime:
-        def __init__(self):
-            self.calls = []
-
-        def split(self, *, boundary_tensor_labels=None, candidate_id=None, layer_index=None):
-            self.calls.append(
-                {
-                    "boundary_tensor_labels": boundary_tensor_labels,
-                    "candidate_id": candidate_id,
-                    "layer_index": layer_index,
-                }
-            )
-            if boundary_tensor_labels is not None or candidate_id is not None:
-                raise KeyError("fallback")
-            return "layer-match"
-
-    runtime = LayerRuntime()
-    assert apply_split_plan(runtime, plan) == "layer-match"
-    assert runtime.calls == [
-        {"boundary_tensor_labels": ["missing-boundary"], "candidate_id": None, "layer_index": None},
-        {"boundary_tensor_labels": None, "candidate_id": "candidate-2", "layer_index": None},
-        {"boundary_tensor_labels": None, "candidate_id": None, "layer_index": 7},
+        {
+            "boundary_tensor_labels": ["missing-boundary"],
+            "layer_label": None,
+            "layer_index": None,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": "layer7",
+            "layer_index": None,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": None,
+            "layer_index": 7,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": None,
+            "layer_index": None,
+            "candidate_id": "candidate-2",
+        },
     ]
 
 
@@ -873,9 +971,10 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
 
     provider_calls = {"count": 0}
 
-    def _provider(raw_path, sample, manifest):
+    def _batch_provider(raw_paths, samples, manifest):
         provider_calls["count"] += 1
-        return _payload()
+        assert len(raw_paths) == len(samples)
+        return [_payload() for _ in raw_paths]
 
     raw_only_zip, _ = pack_continual_learning_bundle(
         store,
@@ -891,7 +990,7 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
     prepare_split_training_cache(
         str(raw_only_root),
         str(tmp_path / "raw_only_cache"),
-        feature_provider=_provider,
+        batch_feature_provider=_batch_provider,
     )
     assert provider_calls["count"] == 1
 
@@ -910,12 +1009,12 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
     prepare_split_training_cache(
         str(raw_plus_root),
         str(tmp_path / "raw_plus_cache"),
-        feature_provider=_provider,
+        batch_feature_provider=_batch_provider,
     )
     assert provider_calls["count"] == 0
 
 
-def test_prepare_split_training_cache_accepts_matching_split_index_when_boundary_labels_drift(tmp_path):
+def test_prepare_split_training_cache_reuses_bundled_feature_when_boundary_labels_drift(tmp_path):
     bundle_root = tmp_path / "bundle"
     (bundle_root / "features").mkdir(parents=True)
     (bundle_root / "results").mkdir()
@@ -980,6 +1079,10 @@ def test_prepare_split_training_cache_accepts_matching_split_index_when_boundary
     )
 
     assert info["all_sample_ids"] == ["sample-1"]
+    record = load_split_feature_cache(str(tmp_path / "prepared_cache"), "sample-1")
+    assert record["candidate_id"] == payload.candidate_id
+    assert record["boundary_tensor_labels"] == list(payload.boundary_tensor_labels)
+    assert record["split_plan_boundary_tensor_labels"] == ["new-boundary"]
 
 
 def test_prepare_split_training_cache_backfills_input_image_size_from_raw_sample(tmp_path, sample_bgr_frame):
@@ -1016,14 +1119,14 @@ def test_prepare_split_training_cache_backfills_input_image_size_from_raw_sample
     prepare_split_training_cache(
         str(bundle_root),
         str(cache_root),
-        feature_provider=lambda *_: _payload(),
+        batch_feature_provider=lambda raw_paths, samples, manifest: [_payload() for _ in raw_paths],
     )
 
     record = load_split_feature_cache(str(cache_root), "low-1")
     assert record["input_image_size"] == list(sample_bgr_frame.shape[:2])
 
 
-def test_prepare_split_training_cache_reuses_feature_only_sample_when_trace_stable_rebuild_requested(tmp_path):
+def test_prepare_split_training_cache_reuses_feature_only_sample_without_rebuild(tmp_path):
     bundle_root = tmp_path / "bundle"
     (bundle_root / "features").mkdir(parents=True)
     (bundle_root / "results").mkdir()
@@ -1070,24 +1173,24 @@ def test_prepare_split_training_cache_reuses_feature_only_sample_when_trace_stab
         encoding="utf-8",
     )
 
-    def _provider(*_args, **_kwargs):
-        raise AssertionError("feature_provider should not be called for feature-only samples without raw input")
+    def _batch_provider(*_args, **_kwargs):
+        raise AssertionError("batch_feature_provider should not be called for feature-only samples without raw input")
 
     cache_root = tmp_path / "prepared_cache"
     info = prepare_split_training_cache(
         str(bundle_root),
         str(cache_root),
-        feature_provider=_provider,
-        prefer_feature_rebuild=True,
+        batch_feature_provider=_batch_provider,
     )
 
     assert info["all_sample_ids"] == ["sample-1"]
     record = load_split_feature_cache(str(cache_root), "sample-1")
     assert record["candidate_id"] == payload.candidate_id
     assert record["boundary_tensor_labels"] == list(payload.boundary_tensor_labels)
+    assert record["split_plan_boundary_tensor_labels"] == list(_dummy_plan().boundary_tensor_labels)
 
 
-def test_prepare_split_training_cache_skips_incompatible_feature_only_samples(tmp_path):
+def test_prepare_split_training_cache_reuses_incompatible_feature_only_samples(tmp_path):
     bundle_root = tmp_path / "bundle"
     (bundle_root / "features").mkdir(parents=True)
     (bundle_root / "results").mkdir()
@@ -1146,5 +1249,93 @@ def test_prepare_split_training_cache_skips_incompatible_feature_only_samples(tm
         str(tmp_path / "prepared_cache"),
     )
 
-    assert info["all_sample_ids"] == []
+    assert info["all_sample_ids"] == ["old-1"]
     assert info["drift_sample_ids"] == []
+    record = load_split_feature_cache(str(tmp_path / "prepared_cache"), "old-1")
+    assert record["candidate_id"] == payload.candidate_id
+    assert record["boundary_tensor_labels"] == list(payload.boundary_tensor_labels)
+    assert record["split_plan_boundary_tensor_labels"] == list(_dummy_plan().boundary_tensor_labels)
+
+
+def test_prepare_split_training_cache_raises_when_sample_has_no_feature_or_raw(tmp_path):
+    bundle_root = tmp_path / "bundle"
+    (bundle_root / "results").mkdir(parents=True)
+    (bundle_root / "results" / "sample-1.json").write_text(
+        json.dumps({"boxes": [], "labels": [], "scores": []}),
+        encoding="utf-8",
+    )
+    manifest = {
+        "protocol_version": "edge-cl-bundle.v1",
+        "edge_id": 1,
+        "model": {"model_id": "model-a", "model_version": "0"},
+        "split_plan": _dummy_plan().to_dict(),
+        "drift_sample_ids": [],
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "frame_index": 1,
+                "confidence": 0.1,
+                "confidence_bucket": LOW_CONFIDENCE,
+                "drift_flag": False,
+                "feature_relpath": None,
+                "feature_bytes": 0,
+                "result_relpath": "results/sample-1.json",
+                "metadata_relpath": "metadata/sample-1.json",
+                "raw_relpath": None,
+                "raw_bytes": 0,
+                "has_feature": False,
+                "has_raw_sample": False,
+                "split_config_id": "plan-1",
+                "model_id": "model-a",
+                "model_version": "0",
+                "input_image_size": None,
+                "input_tensor_shape": None,
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    }
+    (bundle_root / "bundle_manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="missing both bundled intermediate features and a raw sample"):
+        prepare_split_training_cache(
+            str(bundle_root),
+            str(tmp_path / "prepared_cache"),
+        )
+
+
+def test_prepare_split_training_cache_raises_when_batch_rebuild_count_is_wrong(tmp_path, sample_bgr_frame):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    store.store_sample(
+        sample_id="low-1",
+        frame_index=2,
+        confidence=0.2,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=LOW_CONFIDENCE,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_planned_payload(plan),
+        raw_frame=sample_bgr_frame,
+    )
+    raw_only_zip, _ = pack_continual_learning_bundle(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="0",
+    )
+    bundle_root = tmp_path / "bundle"
+    with zipfile.ZipFile(io.BytesIO(raw_only_zip), "r") as zf:
+        zf.extractall(bundle_root)
+
+    with pytest.raises(RuntimeError, match="wrong number of payloads"):
+        prepare_split_training_cache(
+            str(bundle_root),
+            str(tmp_path / "prepared_cache"),
+            batch_feature_provider=lambda raw_paths, samples, manifest: [],
+        )
