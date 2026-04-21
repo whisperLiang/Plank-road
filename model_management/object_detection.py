@@ -371,6 +371,36 @@ class Object_Detection:
         )
         return pred_boxes, pred_class, pred_score
 
+    def large_inference_batch(self, images, threshold=None):
+        if threshold is None:
+            threshold = self.threshold_high
+        frames = list(images or [])
+        if not frames:
+            return []
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        prepared_images = [self._prepare_image_tensor(frame) for frame in frames]
+        outputs = self.model(prepared_images)
+        if isinstance(outputs, tuple):
+            outputs = outputs[0]
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+        if not isinstance(outputs, (list, tuple)):
+            return [(None, None, None) for _ in frames]
+
+        predictions = []
+        for index in range(len(frames)):
+            output = outputs[index] if index < len(outputs) else None
+            predictions.append(
+                self._parse_prediction_output(
+                    [] if output is None else [output],
+                    float(threshold),
+                )
+            )
+        return predictions
+
     def get_model_prediction(self, img, threshold, model=None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

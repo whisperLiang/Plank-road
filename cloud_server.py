@@ -2,6 +2,7 @@
 import argparse
 import copy
 import base64
+import hashlib
 import io
 import json
 import os
@@ -67,6 +68,151 @@ from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
 def _collate_fn(batch):
     return tuple(zip(*batch))
+
+
+_FIXED_SPLIT_WORKING_CACHE_VERSION = 1
+
+
+def _stable_json_dumps(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _json_fingerprint(payload: object) -> str:
+    return hashlib.sha1(_stable_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def _read_json_file(path: str) -> dict[str, object]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_json_file(path: str, payload: Mapping[str, object]) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(dict(payload), handle, indent=2, sort_keys=True)
+
+
+def _build_fixed_split_cache_identity(
+    manifest: Mapping[str, object],
+) -> dict[str, object]:
+    manifest_payload = dict(manifest)
+    model_meta = dict(manifest_payload.get("model", {}))
+    split_plan = dict(manifest_payload.get("split_plan", {}))
+    sample_ids = sorted(
+        str(sample.get("sample_id", "")).strip()
+        for sample in manifest_payload.get("samples", [])
+        if isinstance(sample, Mapping) and str(sample.get("sample_id", "")).strip()
+    )
+    identity_payload = {
+        "manifest": manifest_payload,
+        "split_plan": split_plan,
+        "model_id": str(model_meta.get("model_id", "")).strip(),
+        "model_version": str(model_meta.get("model_version", "")).strip(),
+    }
+    return {
+        "cache_version": _FIXED_SPLIT_WORKING_CACHE_VERSION,
+        "fingerprint": _json_fingerprint(identity_payload),
+        "manifest_hash": _json_fingerprint(manifest_payload),
+        "split_plan_hash": _json_fingerprint(split_plan),
+        "model_id": identity_payload["model_id"],
+        "model_version": identity_payload["model_version"],
+        "sample_ids": sample_ids,
+    }
+
+
+def _working_cache_manifest_path(working_cache: str) -> str:
+    return os.path.join(working_cache, "cache_manifest.json")
+
+
+def _working_cache_metadata_index_path(working_cache: str) -> str:
+    return os.path.join(working_cache, "metadata_index.json")
+
+
+def _can_deserialize_split_feature_cache(cache_path: str, sample_id: str) -> bool:
+    try:
+        load_split_feature_cache(cache_path, sample_id)
+    except Exception:
+        return False
+    return True
+
+
+def _load_proxy_eval_frame(
+    frame_dir: str,
+    sample_id: str,
+    *,
+    frame_cache: dict[str, np.ndarray | None] | None = None,
+) -> np.ndarray | None:
+    if frame_cache is not None and sample_id in frame_cache:
+        return frame_cache[sample_id]
+
+    frame_path = os.path.join(frame_dir, f"{sample_id}.jpg")
+    if not os.path.exists(frame_path):
+        frame = None
+    else:
+        frame = cv2.imread(frame_path)
+
+    if frame_cache is not None:
+        frame_cache[sample_id] = frame
+    return frame
+
+
+def _normalize_proxy_sample_ids(
+    gt_annotations: Mapping[str, Mapping[str, object]],
+    *,
+    max_samples: int | None = None,
+) -> list[str]:
+    sample_ids = sorted(str(sample_id) for sample_id in gt_annotations.keys())
+    if max_samples is None or int(max_samples) <= 0:
+        return sample_ids
+    return sample_ids[: int(max_samples)]
+
+
+def _build_tinynext_threshold_candidates(
+    *,
+    current_low: float,
+    current_high: float,
+    default_high: float,
+    configured_candidates: list[float] | None = None,
+) -> list[float]:
+    raw_candidates: list[float]
+    if configured_candidates:
+        raw_candidates = [float(candidate) for candidate in configured_candidates]
+    else:
+        deltas = (-0.02, -0.01, -0.005, -0.002, 0.0, 0.002, 0.005, 0.01, 0.02)
+        raw_candidates = [
+            float(default_high),
+            float(current_high),
+            *(float(current_high) + delta for delta in deltas),
+            *(float(default_high) + delta for delta in (-0.01, -0.005, 0.005, 0.01)),
+        ]
+    return sorted(
+        set(
+            round(max(float(current_low), float(candidate)), 3)
+            for candidate in raw_candidates
+        )
+    )
+
+
+def _model_state_fingerprint(model: torch.nn.Module) -> str:
+    hasher = hashlib.sha1()
+    for key, value in model.state_dict().items():
+        hasher.update(str(key).encode("utf-8"))
+        if torch.is_tensor(value):
+            tensor = value.detach().cpu().contiguous()
+            hasher.update(str(tensor.dtype).encode("utf-8"))
+            hasher.update(str(tuple(tensor.shape)).encode("utf-8"))
+            hasher.update(tensor.numpy().tobytes())
+        else:
+            hasher.update(_stable_json_dumps(value).encode("utf-8"))
+    return hasher.hexdigest()
 
 
 def _looks_like_fused_ultralytics_state_dict(state: object) -> bool:
@@ -217,8 +363,13 @@ def _evaluate_detection_proxy_map(
     threshold_high: float | None = None,
     model_name: str | None = None,
     sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
+    frame_cache: dict[str, np.ndarray | None] | None = None,
+    max_samples: int | None = None,
 ) -> dict[str, float | int | None]:
-    sample_ids = sorted(str(sample_id) for sample_id in gt_annotations.keys())
+    sample_ids = _normalize_proxy_sample_ids(
+        gt_annotations,
+        max_samples=max_samples,
+    )
     scores: list[float] = []
     skipped_empty_gt = 0
     skipped_missing_frame = 0
@@ -246,7 +397,11 @@ def _evaluate_detection_proxy_map(
                 skipped_missing_frame += 1
                 continue
 
-            frame = cv2.imread(frame_path)
+            frame = _load_proxy_eval_frame(
+                frame_dir,
+                sample_id,
+                frame_cache=frame_cache,
+            )
             if frame is None:
                 skipped_missing_frame += 1
                 continue
@@ -357,26 +512,17 @@ def _calibrate_tinynext_proxy_thresholds(
     gt_annotations: Mapping[str, Mapping[str, object]],
     device: torch.device,
     model_name: str,
+    frame_cache: dict[str, np.ndarray | None] | None = None,
+    max_samples: int | None = None,
+    candidate_thresholds: list[float] | None = None,
 ) -> tuple[dict[str, float | int | None], float, float]:
     current_low, current_high = get_model_detection_thresholds(model, model_name)
     _, default_high = get_detection_thresholds(model_name)
-    candidate_highs = sorted(
-        set(
-            round(max(float(current_low), candidate), 3)
-            for candidate in (
-                float(default_high),
-                0.08,
-                0.10,
-                0.12,
-                0.14,
-                0.15,
-                0.16,
-                0.18,
-                0.20,
-                0.22,
-                *(float(current_high) + delta for delta in (-0.03, -0.02, -0.015, -0.01, -0.005, -0.004, -0.002, 0.0, 0.002, 0.004, 0.005, 0.01, 0.015, 0.02, 0.03)),
-            )
-        )
+    candidate_highs = _build_tinynext_threshold_candidates(
+        current_low=float(current_low),
+        current_high=float(current_high),
+        default_high=float(default_high),
+        configured_candidates=candidate_thresholds,
     )
 
     best_high = float(current_high)
@@ -388,6 +534,8 @@ def _calibrate_tinynext_proxy_thresholds(
         model_name=model_name,
         threshold_low=current_low,
         threshold_high=current_high,
+        frame_cache=frame_cache,
+        max_samples=max_samples,
     )
 
     for candidate_high in candidate_highs:
@@ -399,6 +547,8 @@ def _calibrate_tinynext_proxy_thresholds(
             model_name=model_name,
             threshold_low=current_low,
             threshold_high=candidate_high,
+            frame_cache=frame_cache,
+            max_samples=max_samples,
         )
         if _proxy_metrics_are_better(candidate_metrics, best_metrics):
             best_metrics = candidate_metrics
@@ -533,6 +683,10 @@ class CloudContinualLearner:
             float(getattr(cl_cfg, "teacher_annotation_threshold", 0.6))
             if cl_cfg else 0.6
         )
+        self.teacher_batch_size = (
+            int(getattr(cl_cfg, "teacher_batch_size", self.batch_size))
+            if cl_cfg else self.batch_size
+        )
         self.wrapper_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
             if cl_cfg else 3e-5
@@ -540,6 +694,27 @@ class CloudContinualLearner:
         self.rfdetr_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
             if cl_cfg else 1e-4
+        )
+        raw_proxy_eval_max_samples = getattr(cl_cfg, "proxy_eval_max_samples", None) if cl_cfg else None
+        self.proxy_eval_max_samples = (
+            None
+            if raw_proxy_eval_max_samples in (None, "", 0)
+            else int(raw_proxy_eval_max_samples)
+        )
+        raw_threshold_candidates = (
+            getattr(cl_cfg, "proxy_eval_threshold_candidates", None)
+            if cl_cfg else None
+        )
+        if isinstance(raw_threshold_candidates, (list, tuple)):
+            self.proxy_eval_threshold_candidates = [
+                float(candidate)
+                for candidate in raw_threshold_candidates
+            ]
+        else:
+            self.proxy_eval_threshold_candidates = None
+        self.proxy_eval_frame_cache_enabled = (
+            bool(getattr(cl_cfg, "proxy_eval_frame_cache_enabled", True))
+            if cl_cfg else True
         )
 
         # Dynamic Activation Sparsity (SURGEON) config
@@ -752,12 +927,44 @@ class CloudContinualLearner:
             model_name or self.edge_model_name,
             edge_id=edge_id,
         )
-        torch.save(model.state_dict(), edge_weights)
+        state_dict = model.state_dict()
+        buf = io.BytesIO()
+        torch.save(state_dict, buf)
+        serialized = buf.getvalue()
+        with open(edge_weights, "wb") as handle:
+            handle.write(serialized)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        buf = io.BytesIO()
-        torch.save(model.state_dict(), buf)
-        return buf.getvalue()
+        return serialized
+
+    @staticmethod
+    def _log_stage_duration(stage: str, started_at: float) -> float:
+        elapsed = time.perf_counter() - started_at
+        logger.info("[FixedSplitCL] {} took {:.3f}s.", stage, elapsed)
+        return elapsed
+
+    @staticmethod
+    def _build_teacher_targets_from_prediction(
+        pred_boxes,
+        pred_class,
+        pred_score=None,
+    ) -> dict[str, object] | None:
+        if pred_boxes is None or pred_class is None:
+            return None
+
+        boxes = list(pred_boxes)
+        labels = list(pred_class)
+        if not boxes or not labels:
+            return None
+
+        count = min(len(boxes), len(labels))
+        if count <= 0:
+            return None
+
+        return {
+            "boxes": boxes[:count],
+            "labels": labels[:count],
+        }
 
     @staticmethod
     def _runtime_image_size_from_metadata(
@@ -783,24 +990,30 @@ class CloudContinualLearner:
         except TypeError:
             return self.large_od.large_inference(frame)
 
+    def _teacher_inference_batch(self, frames):
+        batch_inference = getattr(self.large_od, "large_inference_batch", None)
+        if batch_inference is None:
+            return [self._teacher_inference(frame) for frame in frames]
+        try:
+            return batch_inference(
+                frames,
+                threshold=self.teacher_annotation_threshold,
+            )
+        except TypeError:
+            return batch_inference(frames)
+
     def _build_teacher_targets(self, frame) -> dict[str, object] | None:
         pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
-        if pred_boxes is None or pred_class is None:
-            return None
+        return self._build_teacher_targets_from_prediction(
+            pred_boxes,
+            pred_class,
+            pred_score,
+        )
 
-        boxes = list(pred_boxes)
-        labels = list(pred_class)
-        if not boxes or not labels:
+    def _proxy_eval_frame_cache(self) -> dict[str, np.ndarray | None] | None:
+        if not self.proxy_eval_frame_cache_enabled:
             return None
-
-        count = min(len(boxes), len(labels))
-        if count <= 0:
-            return None
-
-        return {
-            "boxes": boxes[:count],
-            "labels": labels[:count],
-        }
+        return {}
 
     def _infer_bundle_trace_image_size(
         self,
@@ -1069,18 +1282,112 @@ class CloudContinualLearner:
         manifest: dict[str, object],
         *,
         bundle_root: str,
+        trace_sample_input: torch.Tensor | None = None,
     ):
         split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
         splitter = UniversalModelSplitter(device=self.device)
         split_model = get_split_runtime_model(model)
-        sample_input = self._build_bundle_batch_trace_sample_input(
-            model,
-            bundle_root,
-            manifest,
-        )
+        sample_input = trace_sample_input
+        if sample_input is None:
+            sample_input = self._build_bundle_batch_trace_sample_input(
+                model,
+                bundle_root,
+                manifest,
+            )
         splitter.trace(split_model, sample_input)
         candidate = apply_split_plan(splitter, split_plan)
         return splitter, candidate
+
+    @staticmethod
+    def _working_cache_manifest_matches(
+        existing_manifest: Mapping[str, object],
+        expected_identity: Mapping[str, object],
+    ) -> bool:
+        if not existing_manifest:
+            return False
+        return (
+            int(existing_manifest.get("cache_version", -1)) == int(expected_identity["cache_version"])
+            and str(existing_manifest.get("fingerprint", "")).strip()
+            == str(expected_identity["fingerprint"]).strip()
+        )
+
+    def _write_fixed_split_working_cache_manifest(
+        self,
+        working_cache: str,
+        *,
+        cache_identity: Mapping[str, object],
+        bundle_info: Mapping[str, object],
+        cache_reused: bool,
+    ) -> None:
+        manifest_payload = {
+            **dict(cache_identity),
+            "all_sample_ids": list(bundle_info.get("all_sample_ids", [])),
+            "drift_sample_ids": list(bundle_info.get("drift_sample_ids", [])),
+            "cache_reused": bool(cache_reused),
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        _write_json_file(
+            _working_cache_manifest_path(working_cache),
+            manifest_payload,
+        )
+
+    def _validate_fixed_split_working_cache(
+        self,
+        *,
+        working_cache: str,
+        bundle_info: Mapping[str, object],
+        cache_identity: Mapping[str, object],
+        verify_feature_records: bool = False,
+    ) -> tuple[bool, str | None]:
+        if not os.path.isdir(working_cache):
+            return False, "working cache directory is missing"
+
+        feature_dir = os.path.join(working_cache, "features")
+        frame_dir = os.path.join(working_cache, "frames")
+        if not os.path.isdir(feature_dir):
+            return False, "feature cache directory is missing"
+
+        metadata_index = _read_json_file(
+            _working_cache_metadata_index_path(working_cache),
+        )
+        metadata_samples = metadata_index.get("samples")
+        if not isinstance(metadata_samples, Mapping):
+            return False, "metadata index is missing sample entries"
+
+        cached_manifest = _read_json_file(_working_cache_manifest_path(working_cache))
+        if cached_manifest and not self._working_cache_manifest_matches(
+            cached_manifest,
+            cache_identity,
+        ):
+            return False, "cache manifest fingerprint does not match the current bundle"
+
+        for sample_id in bundle_info.get("all_sample_ids", []):
+            sample_key = str(sample_id)
+            feature_path = os.path.join(feature_dir, f"{sample_key}.pt")
+            if not os.path.exists(feature_path):
+                return False, f"cached feature record missing for {sample_key}"
+            if os.path.getsize(feature_path) <= 0:
+                return False, f"cached feature record is empty for {sample_key}"
+            if verify_feature_records and not _can_deserialize_split_feature_cache(
+                working_cache,
+                sample_key,
+            ):
+                return False, f"cached feature record is unreadable for {sample_key}"
+
+            sample_metadata = metadata_samples.get(sample_key)
+            if not isinstance(sample_metadata, Mapping):
+                return False, f"metadata index missing entry for {sample_key}"
+
+            if bool(sample_metadata.get("has_raw_sample")):
+                if not os.path.isdir(frame_dir):
+                    return False, "frame cache directory is missing"
+                frame_path = os.path.join(frame_dir, f"{sample_key}.jpg")
+                if not os.path.exists(frame_path):
+                    return False, f"raw frame missing for {sample_key}"
+                if os.path.getsize(frame_path) <= 0:
+                    return False, f"raw frame is empty for {sample_key}"
+
+        return True, None
 
     def _resolve_fixed_split_learning_rate(
         self,
@@ -1101,27 +1408,85 @@ class CloudContinualLearner:
         *,
         bundle_cache_path: str,
         working_cache: str,
-    ) -> tuple[dict[str, object], str, UniversalModelSplitter | None, object | None]:
-        if os.path.isdir(working_cache):
+        force_rebuild: bool = False,
+    ) -> tuple[dict[str, object], str, torch.Tensor, UniversalModelSplitter | None, object | None]:
+        cache_identity = _build_fixed_split_cache_identity(manifest)
+        cached_manifest = _read_json_file(_working_cache_manifest_path(working_cache))
+        can_attempt_reuse = (
+            not force_rebuild
+            and os.path.isdir(working_cache)
+            and self._working_cache_manifest_matches(cached_manifest, cache_identity)
+        )
+        if force_rebuild or (
+            os.path.isdir(working_cache)
+            and not can_attempt_reuse
+        ):
             shutil.rmtree(working_cache, ignore_errors=True)
 
+        trace_sample_input = self._build_bundle_batch_trace_sample_input(
+            model,
+            bundle_cache_path,
+            manifest,
+        )
         prepared_splitter, prepared_candidate = self._build_bundle_splitter(
             model,
             manifest,
             bundle_root=bundle_cache_path,
+            trace_sample_input=trace_sample_input,
         )
-        bundle_info = prepare_split_training_cache(
-            bundle_cache_path,
+
+        def _prepare_cache() -> dict[str, object]:
+            return prepare_split_training_cache(
+                bundle_cache_path,
+                working_cache,
+                batch_feature_provider=self._bundle_batch_feature_provider(
+                    model,
+                    manifest,
+                    bundle_root=bundle_cache_path,
+                    splitter=prepared_splitter,
+                    candidate=prepared_candidate,
+                ),
+            )
+
+        bundle_info = _prepare_cache()
+        cache_valid, cache_error = self._validate_fixed_split_working_cache(
+            working_cache=working_cache,
+            bundle_info=bundle_info,
+            cache_identity=cache_identity,
+            verify_feature_records=can_attempt_reuse,
+        )
+        if not cache_valid and can_attempt_reuse:
+            logger.warning(
+                "[FixedSplitCL] Fixed-split working cache failed validation ({}); rebuilding.",
+                cache_error,
+            )
+            shutil.rmtree(working_cache, ignore_errors=True)
+            bundle_info = _prepare_cache()
+            cache_valid, cache_error = self._validate_fixed_split_working_cache(
+                working_cache=working_cache,
+                bundle_info=bundle_info,
+                cache_identity=cache_identity,
+                verify_feature_records=False,
+            )
+        if not cache_valid:
+            raise RuntimeError(
+                "Fixed-split working cache is incomplete after preparation: "
+                f"{cache_error or 'unknown validation failure'}."
+            )
+
+        self._write_fixed_split_working_cache_manifest(
             working_cache,
-            batch_feature_provider=self._bundle_batch_feature_provider(
-                model,
-                manifest,
-                bundle_root=bundle_cache_path,
-                splitter=prepared_splitter,
-                candidate=prepared_candidate,
-            ),
+            cache_identity=cache_identity,
+            bundle_info=bundle_info,
+            cache_reused=can_attempt_reuse,
         )
-        return bundle_info, os.path.join(working_cache, "frames"), prepared_splitter, prepared_candidate
+        return (
+            bundle_info,
+            os.path.join(working_cache, "frames"),
+            trace_sample_input,
+            prepared_splitter,
+            prepared_candidate,
+        )
 
     def _collect_teacher_annotations(
         self,
@@ -1133,7 +1498,8 @@ class CloudContinualLearner:
     ) -> dict:
         transform = key_transform or (lambda sample_id: sample_id)
         annotations = {}
-        logger.info("🧠 cloud model is annotating for samples...")
+        logger.info("[CL] Cloud model is annotating samples.")
+        pending_samples: list[tuple[object, np.ndarray]] = []
         for sample_id in sample_ids:
             img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
             if not os.path.exists(img_path):
@@ -1143,10 +1509,33 @@ class CloudContinualLearner:
             frame = cv2.imread(img_path)
             if frame is None:
                 continue
-            teacher_targets = self._build_teacher_targets(frame)
-            if teacher_targets is None:
-                continue
-            annotations[transform(sample_id)] = teacher_targets
+            pending_samples.append((sample_id, frame))
+
+        batch_size = max(1, int(self.teacher_batch_size))
+        for start in range(0, len(pending_samples), batch_size):
+            batch = pending_samples[start : start + batch_size]
+            batch_frames = [frame for _, frame in batch]
+            predictions = self._teacher_inference_batch(batch_frames)
+            if not isinstance(predictions, (list, tuple)) or len(predictions) != len(batch):
+                predictions = [self._teacher_inference(frame) for _, frame in batch]
+
+            for (sample_id, _), prediction in zip(batch, predictions):
+                pred_boxes = pred_class = pred_score = None
+                if isinstance(prediction, (list, tuple)):
+                    if len(prediction) >= 1:
+                        pred_boxes = prediction[0]
+                    if len(prediction) >= 2:
+                        pred_class = prediction[1]
+                    if len(prediction) >= 3:
+                        pred_score = prediction[2]
+                teacher_targets = self._build_teacher_targets_from_prediction(
+                    pred_boxes,
+                    pred_class,
+                    pred_score,
+                )
+                if teacher_targets is None:
+                    continue
+                annotations[transform(sample_id)] = teacher_targets
         return annotations
 
     @staticmethod
@@ -1155,13 +1544,28 @@ class CloudContinualLearner:
         sample_ids,
     ) -> dict[str, dict[str, object]]:
         metadata: dict[str, dict[str, object]] = {}
+        metadata_index = _read_json_file(_working_cache_metadata_index_path(cache_path))
+        metadata_samples = metadata_index.get("samples")
+        pending_sample_ids: list[str] = []
         for sample_id in sample_ids:
+            sample_key = str(sample_id)
+            sample_metadata = (
+                metadata_samples.get(sample_key)
+                if isinstance(metadata_samples, Mapping)
+                else None
+            )
+            if isinstance(sample_metadata, Mapping):
+                metadata[sample_key] = dict(sample_metadata)
+                continue
+            pending_sample_ids.append(sample_key)
+
+        for sample_key in pending_sample_ids:
             try:
-                record = load_split_feature_cache(cache_path, sample_id)
+                record = load_split_feature_cache(cache_path, sample_key)
             except FileNotFoundError:
                 continue
             if isinstance(record, dict):
-                metadata[str(sample_id)] = record
+                metadata[sample_key] = record
         return metadata
 
     def _evaluate_fixed_split_proxy_map(
@@ -1172,6 +1576,8 @@ class CloudContinualLearner:
         gt_annotations: Mapping[str, Mapping[str, object]],
         model_name: str,
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
+        frame_cache: dict[str, np.ndarray | None] | None = None,
+        max_samples: int | None = None,
     ) -> dict[str, float | int | None]:
         return _evaluate_detection_proxy_map(
             model,
@@ -1180,6 +1586,8 @@ class CloudContinualLearner:
             device=self.device,
             model_name=model_name,
             sample_metadata_by_id=sample_metadata_by_id,
+            frame_cache=frame_cache,
+            max_samples=max_samples,
         )
 
     @staticmethod
@@ -1343,11 +1751,14 @@ class CloudContinualLearner:
         gt_annotations: dict[str, dict],
         num_epoch: int,
         proxy_metrics_before: dict[str, float | int | None],
+        prepared_trace_sample_input: torch.Tensor,
         prepared_splitter: UniversalModelSplitter | None,
         prepared_candidate,
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
+        proxy_eval_frame_cache: dict[str, np.ndarray | None] | None = None,
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
         baseline_state = _snapshot_model_state(model)
+        baseline_proxy_state_key = _model_state_fingerprint(model)
         effective_num_epoch = num_epoch
         effective_learning_rate = self.default_split_learning_rate
         if gt_annotations and model_zoo.is_wrapper_model(current_model_name):
@@ -1370,11 +1781,7 @@ class CloudContinualLearner:
 
         split_retrain_kwargs = {
             "model": get_split_runtime_model(model),
-            "sample_input": self._build_bundle_batch_trace_sample_input(
-                model,
-                bundle_cache_path,
-                manifest,
-            ),
+            "sample_input": prepared_trace_sample_input,
             "cache_path": working_cache,
             "all_indices": bundle_info["all_sample_ids"],
             "gt_annotations": gt_annotations,
@@ -1389,21 +1796,42 @@ class CloudContinualLearner:
             "chosen_candidate": prepared_candidate,
             "batch_size": bs,
         }
+        proxy_metrics_cache: dict[str, dict[str, float | int | None]] = {}
+        if proxy_metrics_before:
+            proxy_metrics_cache[baseline_proxy_state_key] = dict(proxy_metrics_before)
+
+        def _evaluate_proxy_metrics_for_current_state() -> dict[str, float | int | None]:
+            state_key = _model_state_fingerprint(model)
+            cached_metrics = proxy_metrics_cache.get(state_key)
+            if cached_metrics is not None:
+                return dict(cached_metrics)
+            metrics = self._evaluate_fixed_split_proxy_map(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                model_name=current_model_name,
+                sample_metadata_by_id=sample_metadata_by_id,
+                frame_cache=proxy_eval_frame_cache,
+                max_samples=self.proxy_eval_max_samples,
+            )
+            proxy_metrics_cache[state_key] = dict(metrics)
+            return dict(metrics)
+
         if gt_annotations and str(current_model_name).lower().startswith("rfdetr_"):
             best_state = baseline_state
             best_metrics = dict(proxy_metrics_before)
+            split_retrain_elapsed = 0.0
+            proxy_eval_elapsed = 0.0
             for epoch_index in range(int(effective_num_epoch)):
+                stage_started = time.perf_counter()
                 universal_split_retrain(
                     **split_retrain_kwargs,
                     num_epoch=1,
                 )
-                candidate_metrics = self._evaluate_fixed_split_proxy_map(
-                    model,
-                    frame_dir=frame_dir,
-                    gt_annotations=gt_annotations,
-                    model_name=current_model_name,
-                    sample_metadata_by_id=sample_metadata_by_id,
-                )
+                split_retrain_elapsed += time.perf_counter() - stage_started
+                stage_started = time.perf_counter()
+                candidate_metrics = _evaluate_proxy_metrics_for_current_state()
+                proxy_eval_elapsed += time.perf_counter() - stage_started
                 if _proxy_metrics_are_better(candidate_metrics, best_metrics):
                     best_state = _snapshot_model_state(model)
                     best_metrics = dict(candidate_metrics)
@@ -1412,37 +1840,45 @@ class CloudContinualLearner:
                         epoch_index + 1,
                         float(candidate_metrics.get("map") or 0.0),
                     )
+            logger.info("[FixedSplitCL] split retraining took {:.3f}s.", split_retrain_elapsed)
+            logger.info("[FixedSplitCL] proxy evaluation after retrain took {:.3f}s.", proxy_eval_elapsed)
             model.load_state_dict(best_state)
             _set_detection_model_eval_mode(model)
             return dict(best_metrics), baseline_state
 
+        split_retrain_started = time.perf_counter()
         universal_split_retrain(
             **split_retrain_kwargs,
             num_epoch=effective_num_epoch,
         )
+        self._log_stage_duration("split retraining", split_retrain_started)
+        proxy_eval_started = time.perf_counter()
+        current_proxy_state_key = _model_state_fingerprint(model)
+        if current_proxy_state_key == baseline_proxy_state_key:
+            proxy_metrics_after = dict(proxy_metrics_before)
         if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
-            proxy_metrics_after, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
-                model,
-                frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
-                device=self.device,
-                model_name=current_model_name,
-            )
-            if abs(calibrated_high - initial_high) > 1e-6:
-                logger.info(
-                    "[FixedSplitCL] Calibrated {} threshold_high {} -> {} after split retrain.",
-                    current_model_name,
-                    initial_high,
-                    calibrated_high,
+            if current_proxy_state_key != baseline_proxy_state_key:
+                proxy_metrics_after, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                    model,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    device=self.device,
+                    model_name=current_model_name,
+                    frame_cache=proxy_eval_frame_cache,
+                    max_samples=self.proxy_eval_max_samples,
+                    candidate_thresholds=self.proxy_eval_threshold_candidates,
                 )
+                if abs(calibrated_high - initial_high) > 1e-6:
+                    logger.info(
+                        "[FixedSplitCL] Calibrated {} threshold_high {} -> {} after split retrain.",
+                        current_model_name,
+                        initial_high,
+                        calibrated_high,
+                    )
         else:
-            proxy_metrics_after = self._evaluate_fixed_split_proxy_map(
-                model,
-                frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
-                model_name=current_model_name,
-                sample_metadata_by_id=sample_metadata_by_id,
-            )
+            if current_proxy_state_key != baseline_proxy_state_key:
+                proxy_metrics_after = _evaluate_proxy_metrics_for_current_state()
+        self._log_stage_duration("proxy evaluation after retrain", proxy_eval_started)
         return proxy_metrics_after, baseline_state
 
     # ------------------------------------------------------------------
@@ -1568,12 +2004,15 @@ class CloudContinualLearner:
         num_epoch = self.default_num_epoch
 
         with self._training_job_scope(edge_id):
+            total_round_started = time.perf_counter()
             try:
+                stage_started = time.perf_counter()
                 manifest = load_training_bundle_manifest(bundle_cache_path)
+                self._log_stage_duration("loading bundle manifest", stage_started)
                 if manifest.get("protocol_version") != CONTINUAL_LEARNING_PROTOCOL_VERSION:
                     raise RuntimeError(
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
-                )
+                    )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
                 baseline_source = "cached"
 
@@ -1582,7 +2021,14 @@ class CloudContinualLearner:
                     edge_id=edge_id,
                 )
                 working_cache = os.path.join(bundle_cache_path, "working_cache")
-                bundle_info, frame_dir, prepared_splitter, prepared_candidate = (
+                stage_started = time.perf_counter()
+                (
+                    bundle_info,
+                    frame_dir,
+                    prepared_trace_sample_input,
+                    prepared_splitter,
+                    prepared_candidate,
+                ) = (
                     self._prepare_fixed_split_working_cache(
                         tmp_model,
                         manifest,
@@ -1590,21 +2036,26 @@ class CloudContinualLearner:
                         working_cache=working_cache,
                     )
                 )
+                self._log_stage_duration("preparing/reusing working cache", stage_started)
                 gt_sample_ids = _select_fixed_split_gt_sample_ids(
                     manifest,
                     prepared_sample_ids=bundle_info["all_sample_ids"],
                 )
+                stage_started = time.perf_counter()
                 gt_annotations = self._collect_teacher_annotations(
                     frame_dir,
                     gt_sample_ids,
                     missing_raw_message="[FixedSplitCL] GT sample {} missing raw frame.",
                     key_transform=str,
                 )
+                self._log_stage_duration("teacher annotation", stage_started)
                 sample_metadata_by_id = self._load_cached_sample_metadata(
                     working_cache,
                     bundle_info["all_sample_ids"],
                 )
+                proxy_eval_frame_cache = self._proxy_eval_frame_cache()
 
+                stage_started = time.perf_counter()
                 if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
                     proxy_metrics_before, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
                         tmp_model,
@@ -1612,6 +2063,9 @@ class CloudContinualLearner:
                         gt_annotations=gt_annotations,
                         device=self.device,
                         model_name=current_model_name,
+                        frame_cache=proxy_eval_frame_cache,
+                        max_samples=self.proxy_eval_max_samples,
+                        candidate_thresholds=self.proxy_eval_threshold_candidates,
                     )
                     if abs(calibrated_high - initial_high) > 1e-6:
                         logger.info(
@@ -1627,7 +2081,10 @@ class CloudContinualLearner:
                         gt_annotations=gt_annotations,
                         model_name=current_model_name,
                         sample_metadata_by_id=sample_metadata_by_id,
+                        frame_cache=proxy_eval_frame_cache,
+                        max_samples=self.proxy_eval_max_samples,
                     )
+                self._log_stage_duration("proxy evaluation before retrain", stage_started)
                 is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
 
                 if (
@@ -1654,14 +2111,28 @@ class CloudContinualLearner:
                         baseline_source = "native pretrained"
                         tmp_model.to(self.device)
                         get_split_runtime_model(tmp_model).eval()
-                        bundle_info, frame_dir, prepared_splitter, prepared_candidate = (
+                        stage_started = time.perf_counter()
+                        (
+                            bundle_info,
+                            frame_dir,
+                            prepared_trace_sample_input,
+                            prepared_splitter,
+                            prepared_candidate,
+                        ) = (
                             self._prepare_fixed_split_working_cache(
                                 tmp_model,
                                 manifest,
                                 bundle_cache_path=bundle_cache_path,
                                 working_cache=working_cache,
+                                force_rebuild=True,
                             )
                         )
+                        self._log_stage_duration("preparing/reusing working cache", stage_started)
+                        sample_metadata_by_id = self._load_cached_sample_metadata(
+                            working_cache,
+                            bundle_info["all_sample_ids"],
+                        )
+                        stage_started = time.perf_counter()
                         if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
                             proxy_metrics_before, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
                                 tmp_model,
@@ -1669,6 +2140,9 @@ class CloudContinualLearner:
                                 gt_annotations=gt_annotations,
                                 device=self.device,
                                 model_name=current_model_name,
+                                frame_cache=proxy_eval_frame_cache,
+                                max_samples=self.proxy_eval_max_samples,
+                                candidate_thresholds=self.proxy_eval_threshold_candidates,
                             )
                             if abs(calibrated_high - initial_high) > 1e-6:
                                 logger.info(
@@ -1684,7 +2158,10 @@ class CloudContinualLearner:
                                 gt_annotations=gt_annotations,
                                 model_name=current_model_name,
                                 sample_metadata_by_id=sample_metadata_by_id,
+                                frame_cache=proxy_eval_frame_cache,
+                                max_samples=self.proxy_eval_max_samples,
                             )
+                        self._log_stage_duration("proxy evaluation before retrain", stage_started)
 
                 proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
                     tmp_model,
@@ -1697,9 +2174,11 @@ class CloudContinualLearner:
                     gt_annotations=gt_annotations,
                     num_epoch=num_epoch,
                     proxy_metrics_before=proxy_metrics_before,
+                    prepared_trace_sample_input=prepared_trace_sample_input,
                     prepared_splitter=prepared_splitter,
                     prepared_candidate=prepared_candidate,
                     sample_metadata_by_id=sample_metadata_by_id,
+                    proxy_eval_frame_cache=proxy_eval_frame_cache,
                 )
                 proxy_summary = _format_proxy_map_summary(
                     proxy_metrics_before,
@@ -1730,6 +2209,7 @@ class CloudContinualLearner:
                     )
                     tmp_model.load_state_dict(baseline_state)
                     _set_detection_model_eval_mode(tmp_model)
+                    stage_started = time.perf_counter()
                     encoded = base64.b64encode(
                         self._serialise_model_bytes(
                             tmp_model,
@@ -1737,6 +2217,8 @@ class CloudContinualLearner:
                             edge_id=edge_id,
                         )
                     ).decode("utf-8")
+                    self._log_stage_duration("serialization / encoding", stage_started)
+                    self._log_stage_duration("total round time", total_round_started)
                     fallback_message = (
                         f"Kept {baseline_source} weights; rejected retrained weights because {rejection_reason}"
                     )
@@ -1746,6 +2228,7 @@ class CloudContinualLearner:
                         fallback_message = f"{fallback_message}; proxy_mAP@0.5 skipped"
                     return True, encoded, fallback_message
 
+                stage_started = time.perf_counter()
                 encoded = base64.b64encode(
                     self._serialise_model_bytes(
                         tmp_model,
@@ -1753,6 +2236,8 @@ class CloudContinualLearner:
                         edge_id=edge_id,
                     )
                 ).decode("utf-8")
+                self._log_stage_duration("serialization / encoding", stage_started)
+                self._log_stage_duration("total round time", total_round_started)
                 success_message = (
                     f"Fixed split retraining successful; {proxy_summary}"
                     if proxy_summary is not None
@@ -1767,6 +2252,7 @@ class CloudContinualLearner:
                 )
                 return True, encoded, success_message
             except Exception as exc:
+                self._log_stage_duration("total round time", total_round_started)
                 logger.exception("[FixedSplitCL] Retraining failed for edge {}: {}", edge_id, exc)
                 return False, "", str(exc)
 

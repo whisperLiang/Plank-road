@@ -176,6 +176,56 @@ server:
     assert config.server.continual_learning.batch_size == 4
 
 
+def test_load_runtime_config_reads_cloud_proxy_eval_knobs(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 4
+    teacher_batch_size: 3
+    proxy_eval_max_samples: 24
+    proxy_eval_threshold_candidates: [0.08, 0.148, 0.2]
+    proxy_eval_frame_cache_enabled: true
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.batch_size == 4
+    assert config.server.continual_learning.teacher_batch_size == 3
+    assert config.server.continual_learning.proxy_eval_max_samples == 24
+    assert config.server.continual_learning.proxy_eval_threshold_candidates == [
+        0.08,
+        0.148,
+        0.2,
+    ]
+    assert config.server.continual_learning.proxy_eval_frame_cache_enabled is True
+
+
+def test_load_runtime_config_defaults_teacher_batch_size_to_cloud_batch_size(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 7
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.teacher_batch_size == 7
+
+
 @pytest.mark.parametrize(
     ("field_name", "field_value"),
     [
@@ -205,14 +255,60 @@ server:
 
 
 @pytest.mark.parametrize(
+    ("field_block", "match_text"),
+    [
+        ("teacher_batch_size: 0", "server.continual_learning.teacher_batch_size"),
+        ("proxy_eval_max_samples: -1", "server.continual_learning.proxy_eval_max_samples"),
+        (
+            "proxy_eval_threshold_candidates: []",
+            "server.continual_learning.proxy_eval_threshold_candidates",
+        ),
+        (
+            "proxy_eval_frame_cache_enabled: 1",
+            "server.continual_learning.proxy_eval_frame_cache_enabled",
+        ),
+    ],
+)
+def test_load_runtime_config_rejects_invalid_cloud_proxy_eval_settings(
+    tmp_path,
+    field_block,
+    match_text,
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 4
+    {field_block}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=match_text):
+        load_runtime_config(config_path)
+
+
+@pytest.mark.parametrize(
     ("section", "field_name", "match_text"),
     [
         ("client.retrain", "batch_size", "client.retrain.batch_size has been removed"),
         ("client.retrain", "num_epoch", "client.retrain.num_epoch has been removed"),
         ("server.continual_learning", "trace_batch_size", "trace_batch_size has been removed"),
         ("server.continual_learning", "rebuild_batch_size", "rebuild_batch_size has been removed"),
-        ("server.continual_learning", "min_wrapper_fixed_split_num_epoch", "min_wrapper_fixed_split_num_epoch has been removed"),
-        ("server.continual_learning", "min_rfdetr_fixed_split_num_epoch", "min_rfdetr_fixed_split_num_epoch has been removed"),
+        (
+            "server.continual_learning",
+            "min_wrapper_fixed_split_num_epoch",
+            "min_wrapper_fixed_split_num_epoch has been removed",
+        ),
+        (
+            "server.continual_learning",
+            "min_rfdetr_fixed_split_num_epoch",
+            "min_rfdetr_fixed_split_num_epoch has been removed",
+        ),
     ],
 )
 def test_load_runtime_config_rejects_removed_cloud_fixed_split_fields(
@@ -255,4 +351,80 @@ server:
     )
 
     with pytest.raises(ValueError, match=match_text):
+        load_runtime_config(config_path)
+
+
+def test_load_runtime_config_proxy_eval_frame_cache_defaults_to_true(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 4
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.proxy_eval_frame_cache_enabled is True
+
+
+def test_load_runtime_config_proxy_eval_max_samples_defaults_to_zero(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 4
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.proxy_eval_max_samples == 0
+
+
+def test_load_runtime_config_proxy_eval_threshold_candidates_defaults_to_none(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 4
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.proxy_eval_threshold_candidates is None
+
+
+def test_load_runtime_config_rejects_out_of_range_threshold_candidate(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 4
+    proxy_eval_threshold_candidates: [0.1, 1.5]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be within \\[0, 1\\]"):
         load_runtime_config(config_path)

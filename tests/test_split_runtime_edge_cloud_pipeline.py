@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+import os
 import zipfile
 import threading
 from pathlib import Path
@@ -41,6 +43,7 @@ from model_management.split_model_adapters import (
 from model_management.split_runtime import compare_outputs
 from model_management.universal_model_split import UniversalModelSplitter
 from tests.split_runtime_helpers import NEW_DETECTORS, build_public_detector
+
 YOLO_DETECTORS = ("yolo26n",)
 
 
@@ -127,9 +130,9 @@ def test_detection_confidence_uses_top5_raw_mean():
     assert detector._summarize_detection_confidence([0.62, 0.18, 0.15, 0.09]) == pytest.approx(
         (0.62 + 0.18 + 0.15 + 0.09) / 4.0
     )
-    assert detector._summarize_detection_confidence([0.88, 0.87, 0.79, 0.29, 0.25, 0.24]) == pytest.approx(
-        (0.88 + 0.87 + 0.79 + 0.29 + 0.25) / 5.0
-    )
+    assert detector._summarize_detection_confidence(
+        [0.88, 0.87, 0.79, 0.29, 0.25, 0.24]
+    ) == pytest.approx((0.88 + 0.87 + 0.79 + 0.29 + 0.25) / 5.0)
 
 
 def test_tinynext_final_parse_deduplicates_heavily_overlapping_boxes():
@@ -138,14 +141,16 @@ def test_tinynext_final_parse_deduplicates_heavily_overlapping_boxes():
     detector.threshold_high = 0.15
 
     boxes, labels, scores = detector._parse_prediction_output(
-        [{
-            "boxes": torch.tensor(
-                [[10.0, 10.0, 50.0, 50.0], [14.0, 14.0, 46.0, 46.0], [60.0, 60.0, 90.0, 90.0]],
-                dtype=torch.float32,
-            ),
-            "labels": torch.tensor([1, 2, 3], dtype=torch.int64),
-            "scores": torch.tensor([0.91, 0.88, 0.54], dtype=torch.float32),
-        }],
+        [
+            {
+                "boxes": torch.tensor(
+                    [[10.0, 10.0, 50.0, 50.0], [14.0, 14.0, 46.0, 46.0], [60.0, 60.0, 90.0, 90.0]],
+                    dtype=torch.float32,
+                ),
+                "labels": torch.tensor([1, 2, 3], dtype=torch.int64),
+                "scores": torch.tensor([0.91, 0.88, 0.54], dtype=torch.float32),
+            }
+        ],
         threshold=0.15,
     )
 
@@ -160,14 +165,16 @@ def test_tinynext_low_threshold_parse_keeps_overlapping_proposals_for_observable
     detector.threshold_high = 0.15
 
     boxes, labels, scores = detector._parse_prediction_output(
-        [{
-            "boxes": torch.tensor(
-                [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0]],
-                dtype=torch.float32,
-            ),
-            "labels": torch.tensor([1, 2], dtype=torch.int64),
-            "scores": torch.tensor([0.91, 0.88], dtype=torch.float32),
-        }],
+        [
+            {
+                "boxes": torch.tensor(
+                    [[10.0, 10.0, 50.0, 50.0], [11.0, 11.0, 49.0, 49.0]],
+                    dtype=torch.float32,
+                ),
+                "labels": torch.tensor([1, 2], dtype=torch.int64),
+                "scores": torch.tensor([0.91, 0.88], dtype=torch.float32),
+            }
+        ],
         threshold=0.02,
     )
 
@@ -182,14 +189,16 @@ def test_rfdetr_final_parse_deduplicates_cross_class_overlaps():
     detector.threshold_high = 0.2
 
     boxes, labels, scores = detector._parse_prediction_output(
-        [{
-            "boxes": torch.tensor(
-                [[10.0, 10.0, 50.0, 50.0], [14.0, 14.0, 46.0, 46.0], [60.0, 60.0, 90.0, 90.0]],
-                dtype=torch.float32,
-            ),
-            "labels": torch.tensor([2, 7, 9], dtype=torch.int64),
-            "scores": torch.tensor([0.91, 0.88, 0.51], dtype=torch.float32),
-        }],
+        [
+            {
+                "boxes": torch.tensor(
+                    [[10.0, 10.0, 50.0, 50.0], [14.0, 14.0, 46.0, 46.0], [60.0, 60.0, 90.0, 90.0]],
+                    dtype=torch.float32,
+                ),
+                "labels": torch.tensor([2, 7, 9], dtype=torch.int64),
+                "scores": torch.tensor([0.91, 0.88, 0.51], dtype=torch.float32),
+            }
+        ],
         threshold=0.2,
     )
 
@@ -204,22 +213,27 @@ def test_rfdetr_final_parse_deduplicates_real_overlap_profile():
     detector.threshold_high = 0.2
 
     boxes, labels, scores = detector._parse_prediction_output(
-        [{
-            "boxes": torch.tensor(
-                [
-                    [1657.2, 548.8, 1693.3, 601.8],
-                    [1666.5, 555.2, 1698.0, 602.5],
-                    [1282.1, 334.3, 1304.7, 379.5],
-                ],
-                dtype=torch.float32,
-            ),
-            "labels": torch.tensor([10, 10, 1], dtype=torch.int64),
-            "scores": torch.tensor([0.2982, 0.2104, 0.2016], dtype=torch.float32),
-        }],
+        [
+            {
+                "boxes": torch.tensor(
+                    [
+                        [1657.2, 548.8, 1693.3, 601.8],
+                        [1666.5, 555.2, 1698.0, 602.5],
+                        [1282.1, 334.3, 1304.7, 379.5],
+                    ],
+                    dtype=torch.float32,
+                ),
+                "labels": torch.tensor([10, 10, 1], dtype=torch.int64),
+                "scores": torch.tensor([0.2982, 0.2104, 0.2016], dtype=torch.float32),
+            }
+        ],
         threshold=0.2,
     )
 
-    assert boxes == [[1657.199951171875, 548.7999877929688, 1693.300048828125, 601.7999877929688], [1282.0999755859375, 334.29998779296875, 1304.699951171875, 379.5]]
+    assert boxes == [
+        [1657.199951171875, 548.7999877929688, 1693.300048828125, 601.7999877929688],
+        [1282.0999755859375, 334.29998779296875, 1304.699951171875, 379.5],
+    ]
     assert labels == [10, 1]
     assert scores == pytest.approx([0.2982, 0.2016])
 
@@ -354,7 +368,9 @@ def test_summarize_split_runtime_observables_extracts_yolo_like_stats():
         },
     )
 
-    stats = summarize_split_runtime_observables(YOLODetectionModel.__new__(YOLODetectionModel), outputs)
+    stats = summarize_split_runtime_observables(
+        YOLODetectionModel.__new__(YOLODetectionModel), outputs
+    )
 
     assert stats["feature_spectral_entropy"] is not None
     assert 0.0 <= stats["feature_spectral_entropy"] <= 1.0
@@ -485,7 +501,9 @@ def test_cloud_bundle_batch_feature_provider_uses_raw_frame_geometry(tmp_path, m
     assert tuple(payloads[0].tensors["payload"].shape) == (1, 3, 512, 960)
 
 
-def test_cloud_bundle_batch_feature_provider_fails_when_payload_is_not_batch_unbindable(tmp_path, monkeypatch):
+def test_cloud_bundle_batch_feature_provider_fails_when_payload_is_not_batch_unbindable(
+    tmp_path, monkeypatch
+):
     config = SimpleNamespace(
         edge_model_name="yolo26n",
         continual_learning=SimpleNamespace(batch_size=2),
@@ -550,11 +568,13 @@ def test_proxy_eval_ignores_resize_metadata_and_uses_raw_frame_coordinates(tmp_p
 
     class DummyModel(torch.nn.Module):
         def forward(self, images):
-            return [{
-                "labels": torch.tensor([1], dtype=torch.int64),
-                "boxes": torch.tensor([[64.0, 96.0, 320.0, 384.0]], dtype=torch.float32),
-                "scores": torch.tensor([0.95], dtype=torch.float32),
-            }]
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[64.0, 96.0, 320.0, 384.0]], dtype=torch.float32),
+                    "scores": torch.tensor([0.95], dtype=torch.float32),
+                }
+            ]
 
     metrics = _evaluate_detection_proxy_map(
         DummyModel(),
@@ -969,7 +989,9 @@ def test_load_edge_training_model_recovers_from_corrupted_cached_weights(tmp_pat
         build_calls.append((model_name, bool(pretrained), str(device)))
         return DummyModel()
 
-    monkeypatch.setattr("model_management.model_zoo.build_detection_model", fake_build_detection_model)
+    monkeypatch.setattr(
+        "model_management.model_zoo.build_detection_model", fake_build_detection_model
+    )
     monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
 
     model = learner._load_edge_training_model(model_name="yolo26n")
@@ -985,7 +1007,9 @@ def test_load_edge_training_model_rejects_legacy_rfdetr_cached_weights(tmp_path,
         def __init__(self):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
-            self.register_buffer("plank_rfdetr_cache_version", torch.tensor(1.0, dtype=torch.float32))
+            self.register_buffer(
+                "plank_rfdetr_cache_version", torch.tensor(1.0, dtype=torch.float32)
+            )
 
     config = SimpleNamespace(
         edge_model_name="rfdetr_nano",
@@ -1006,27 +1030,35 @@ def test_load_edge_training_model_rejects_legacy_rfdetr_cached_weights(tmp_path,
     build_calls: list[dict[str, object]] = []
 
     def fake_build_detection_model(model_name, pretrained=False, device="cpu", **kwargs):
-        build_calls.append({
-            "model_name": model_name,
-            "pretrained": bool(pretrained),
-            "device": str(device),
-            "weights_path": kwargs.get("weights_path"),
-        })
+        build_calls.append(
+            {
+                "model_name": model_name,
+                "pretrained": bool(pretrained),
+                "device": str(device),
+                "weights_path": kwargs.get("weights_path"),
+            }
+        )
         return DummyModel()
 
-    monkeypatch.setattr("model_management.model_zoo.build_detection_model", fake_build_detection_model)
-    monkeypatch.setattr("model_management.model_zoo.ensure_local_model_artifact", lambda _: artifact_path)
+    monkeypatch.setattr(
+        "model_management.model_zoo.build_detection_model", fake_build_detection_model
+    )
+    monkeypatch.setattr(
+        "model_management.model_zoo.ensure_local_model_artifact", lambda _: artifact_path
+    )
     monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
 
     model = learner._load_edge_training_model(model_name="rfdetr_nano")
 
     assert isinstance(model, DummyModel)
-    assert build_calls == [{
-        "model_name": "rfdetr_nano",
-        "pretrained": True,
-        "device": str(learner.device),
-        "weights_path": str(artifact_path),
-    }]
+    assert build_calls == [
+        {
+            "model_name": "rfdetr_nano",
+            "pretrained": True,
+            "device": str(learner.device),
+            "weights_path": str(artifact_path),
+        }
+    ]
     recovered_state = torch.load(cached_weights, map_location="cpu", weights_only=False)
     assert "plank_rfdetr_cache_version" in recovered_state
 
@@ -1038,7 +1070,9 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
             self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
 
         def forward(self, images):
-            return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+            return [
+                {"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}
+            ]
 
     config = SimpleNamespace(
         edge_model_name="rfdetr_nano",
@@ -1089,17 +1123,45 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
         ),
     )
     monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
-    monkeypatch.setattr(learner, "_build_teacher_targets", lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]})
+    monkeypatch.setattr(
+        learner,
+        "_teacher_inference_batch",
+        lambda frames: [([[1, 1, 6, 6]], [1], [0.9])] * len(frames),
+    )
 
     def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, **kwargs):
         assert "batch_feature_provider" in kwargs
         frame_dir = Path(working_cache_path) / "frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
+        feature_dir = Path(working_cache_path) / "features"
+        feature_dir.mkdir(parents=True, exist_ok=True)
         ok = cv2.imwrite(str(frame_dir / "sample-1.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
         assert ok
+        torch.save({"intermediate": torch.zeros(1, 2)}, feature_dir / "sample-1.pt")
+        metadata_index = {
+            "version": 1,
+            "protocol_version": "edge-cl-bundle.v1",
+            "model": {},
+            "split_plan": {},
+            "all_sample_ids": ["sample-1"],
+            "drift_sample_ids": ["sample-1"],
+            "samples": {
+                "sample-1": {
+                    "sample_id": "sample-1",
+                    "feature_relpath": "features/sample-1.pt",
+                    "has_raw_sample": True,
+                    "frame_relpath": "frames/sample-1.jpg",
+                },
+            },
+        }
+        (Path(working_cache_path) / "metadata_index.json").write_text(
+            json.dumps(metadata_index, indent=2), encoding="utf-8"
+        )
         return {"all_sample_ids": ["sample-1"], "drift_sample_ids": ["sample-1"]}
 
-    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
+    monkeypatch.setattr(
+        "cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache
+    )
 
     proxy_metrics = iter(
         [
@@ -1196,7 +1258,13 @@ def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf
         def forward(self, images):
             score = float(self.weight.detach().cpu().item())
             if score <= 0.0:
-                return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+                return [
+                    {
+                        "labels": torch.empty(0),
+                        "boxes": torch.empty((0, 4)),
+                        "scores": torch.empty(0),
+                    }
+                ]
             return [
                 {
                     "labels": torch.tensor([1], dtype=torch.int64),
@@ -1273,8 +1341,8 @@ def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf
     )
     monkeypatch.setattr(
         learner,
-        "_build_teacher_targets",
-        lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]},
+        "_teacher_inference_batch",
+        lambda frames: [([[1, 1, 6, 6]], [1], [0.9])] * len(frames),
     )
 
     def fake_universal_split_retrain(*, model, gt_annotations, **kwargs):
@@ -1335,7 +1403,13 @@ def test_fixed_split_retrain_returns_failure_when_no_finite_step(
         def forward(self, images):
             score = float(self.weight.detach().cpu().item())
             if score <= 0.0:
-                return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+                return [
+                    {
+                        "labels": torch.empty(0),
+                        "boxes": torch.empty((0, 4)),
+                        "scores": torch.empty(0),
+                    }
+                ]
             return [
                 {
                     "labels": torch.tensor([1], dtype=torch.int64),
@@ -1410,18 +1484,42 @@ def test_fixed_split_retrain_returns_failure_when_no_finite_step(
     )
     monkeypatch.setattr(
         learner,
-        "_build_teacher_targets",
-        lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]},
+        "_teacher_inference_batch",
+        lambda frames: [([[1, 1, 6, 6]], [1], [0.9])] * len(frames),
     )
 
     def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, **kwargs):
         assert "batch_feature_provider" in kwargs
         frame_dir = Path(working_cache_path) / "frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
+        feature_dir = Path(working_cache_path) / "features"
+        feature_dir.mkdir(parents=True, exist_ok=True)
         assert cv2.imwrite(str(frame_dir / "sample-1.jpg"), raw_frame)
+        torch.save({"intermediate": torch.zeros(1, 2)}, feature_dir / "sample-1.pt")
+        metadata_index = {
+            "version": 1,
+            "protocol_version": "edge-cl-bundle.v1",
+            "model": {},
+            "split_plan": {},
+            "all_sample_ids": ["sample-1"],
+            "drift_sample_ids": [],
+            "samples": {
+                "sample-1": {
+                    "sample_id": "sample-1",
+                    "feature_relpath": "features/sample-1.pt",
+                    "has_raw_sample": True,
+                    "frame_relpath": "frames/sample-1.jpg",
+                },
+            },
+        }
+        (Path(working_cache_path) / "metadata_index.json").write_text(
+            json.dumps(metadata_index, indent=2), encoding="utf-8"
+        )
         return {"all_sample_ids": ["sample-1"], "drift_sample_ids": []}
 
-    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
+    monkeypatch.setattr(
+        "cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache
+    )
 
     monkeypatch.setattr(
         learner,
@@ -1483,7 +1581,13 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
         def forward(self, images):
             score = float(self.weight.detach().cpu().item())
             if score <= 0.0:
-                return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+                return [
+                    {
+                        "labels": torch.empty(0),
+                        "boxes": torch.empty((0, 4)),
+                        "scores": torch.empty(0),
+                    }
+                ]
             return [
                 {
                     "labels": torch.tensor([1], dtype=torch.int64),
@@ -1559,19 +1663,43 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
     )
     monkeypatch.setattr(
         learner,
-        "_build_teacher_targets",
-        lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]},
+        "_teacher_inference_batch",
+        lambda frames: [([[1, 1, 6, 6]], [1], [0.9])] * len(frames),
     )
 
     def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, **kwargs):
         assert "batch_feature_provider" in kwargs
         frame_dir = Path(working_cache_path) / "frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
+        feature_dir = Path(working_cache_path) / "features"
+        feature_dir.mkdir(parents=True, exist_ok=True)
         ok = cv2.imwrite(str(frame_dir / "sample-1.jpg"), raw_frame)
         assert ok
+        torch.save({"intermediate": torch.zeros(1, 2)}, feature_dir / "sample-1.pt")
+        metadata_index = {
+            "version": 1,
+            "protocol_version": "edge-cl-bundle.v1",
+            "model": {},
+            "split_plan": {},
+            "all_sample_ids": ["sample-1"],
+            "drift_sample_ids": [],
+            "samples": {
+                "sample-1": {
+                    "sample_id": "sample-1",
+                    "feature_relpath": "features/sample-1.pt",
+                    "has_raw_sample": True,
+                    "frame_relpath": "frames/sample-1.jpg",
+                },
+            },
+        }
+        (Path(working_cache_path) / "metadata_index.json").write_text(
+            json.dumps(metadata_index, indent=2), encoding="utf-8"
+        )
         return {"all_sample_ids": ["sample-1"], "drift_sample_ids": []}
 
-    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
+    monkeypatch.setattr(
+        "cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache
+    )
 
     epoch_weights = iter([0.9, 0.2, 0.15, 0.1, 0.05])
     retrain_calls = []
@@ -1626,7 +1754,13 @@ def test_fixed_split_retrain_reuses_prepared_batch_runtime_on_server(
         def forward(self, images):
             score = float(self.weight.detach().cpu().item())
             if score <= 0.0:
-                return [{"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}]
+                return [
+                    {
+                        "labels": torch.empty(0),
+                        "boxes": torch.empty((0, 4)),
+                        "scores": torch.empty(0),
+                    }
+                ]
             return [
                 {
                     "labels": torch.tensor([1], dtype=torch.int64),
@@ -1685,6 +1819,7 @@ def test_fixed_split_retrain_reuses_prepared_batch_runtime_on_server(
     )
     cloud_model = DummyModel(weight=0.1)
     captured_prepare_kwargs = {}
+    trace_input_calls = {"count": 0}
 
     monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: cloud_model)
     monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda model: model)
@@ -1692,7 +1827,7 @@ def test_fixed_split_retrain_reuses_prepared_batch_runtime_on_server(
     monkeypatch.setattr(
         learner,
         "_build_bundle_batch_trace_sample_input",
-        lambda *args, **kwargs: torch.zeros(2, 3, 8, 8),
+        lambda *args, **kwargs: trace_input_calls.__setitem__("count", trace_input_calls["count"] + 1) or torch.zeros(2, 3, 8, 8),
     )
     monkeypatch.setattr(
         learner,
@@ -1701,18 +1836,42 @@ def test_fixed_split_retrain_reuses_prepared_batch_runtime_on_server(
     )
     monkeypatch.setattr(
         learner,
-        "_build_teacher_targets",
-        lambda frame: {"boxes": [[1, 1, 6, 6]], "labels": [1]},
+        "_teacher_inference_batch",
+        lambda frames: [([[1, 1, 6, 6]], [1], [0.9])] * len(frames),
     )
 
     def fake_prepare_split_training_cache(bundle_root_arg, working_cache_arg, **kwargs):
         captured_prepare_kwargs.update(kwargs)
         frames_dir = Path(working_cache_arg) / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
+        feature_dir = Path(working_cache_arg) / "features"
+        feature_dir.mkdir(parents=True, exist_ok=True)
         assert cv2.imwrite(str(frames_dir / "sample-1.jpg"), raw_frame)
+        torch.save({"intermediate": torch.zeros(1, 2)}, feature_dir / "sample-1.pt")
+        metadata_index = {
+            "version": 1,
+            "protocol_version": "edge-cl-bundle.v1",
+            "model": {},
+            "split_plan": {},
+            "all_sample_ids": ["sample-1"],
+            "drift_sample_ids": [],
+            "samples": {
+                "sample-1": {
+                    "sample_id": "sample-1",
+                    "feature_relpath": "features/sample-1.pt",
+                    "has_raw_sample": True,
+                    "frame_relpath": "frames/sample-1.jpg",
+                },
+            },
+        }
+        (Path(working_cache_arg) / "metadata_index.json").write_text(
+            json.dumps(metadata_index, indent=2), encoding="utf-8"
+        )
         return {"all_sample_ids": ["sample-1"], "drift_sample_ids": []}
 
-    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache)
+    monkeypatch.setattr(
+        "cloud_server.prepare_split_training_cache", fake_prepare_split_training_cache
+    )
 
     def fake_universal_split_retrain(*, model, gt_annotations, **kwargs):
         assert kwargs["splitter"] == "prepared-splitter"
@@ -1746,5 +1905,652 @@ def test_fixed_split_retrain_reuses_prepared_batch_runtime_on_server(
 
     assert "batch_feature_provider" in captured_prepare_kwargs
     assert callable(captured_prepare_kwargs["batch_feature_provider"])
+    assert trace_input_calls["count"] == 1
     assert success is True
     assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message
+
+
+def test_working_cache_is_reused_when_fingerprint_matches(tmp_path, monkeypatch):
+    from cloud_server import (
+        _build_fixed_split_cache_identity,
+        _read_json_file,
+        _working_cache_manifest_path,
+    )
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": [],
+        "samples": [
+            {
+                "sample_id": "s1",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "frames/s1.jpg",
+                "feature_relpath": None,
+            }
+        ],
+    }
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: DummyModel())
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda m: m)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_batch_trace_sample_input",
+        lambda *a, **kw: torch.zeros(2, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *a, **kw: (
+            "splitter",
+            SimpleNamespace(
+                candidate_id="c-1",
+                legacy_layer_index=3,
+                boundary_tensor_labels=["l3"],
+            ),
+        ),
+    )
+
+    prepare_calls = {"count": 0}
+
+    def fake_prepare(bundle_path, working_cache, **kwargs):
+        prepare_calls["count"] += 1
+        wc = Path(working_cache)
+        (wc / "frames").mkdir(parents=True, exist_ok=True)
+        (wc / "features").mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(wc / "frames" / "s1.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
+        torch.save({"intermediate": torch.zeros(1)}, wc / "features" / "s1.pt")
+        (wc / "metadata_index.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "protocol_version": "edge-cl-bundle.v1",
+                    "model": {},
+                    "split_plan": {},
+                    "all_sample_ids": ["s1"],
+                    "drift_sample_ids": [],
+                    "samples": {
+                        "s1": {
+                            "sample_id": "s1",
+                            "feature_relpath": "features/s1.pt",
+                            "has_raw_sample": True,
+                            "frame_relpath": "frames/s1.jpg",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"all_sample_ids": ["s1"], "drift_sample_ids": []}
+
+    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare)
+
+    class DummyModel(torch.nn.Module):
+        def forward(self, images):
+            return [
+                {"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}
+            ]
+
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    working_cache = bundle_root / "working_cache"
+
+    result = learner._prepare_fixed_split_working_cache(
+        DummyModel(),
+        manifest,
+        bundle_cache_path=str(bundle_root),
+        working_cache=str(working_cache),
+    )
+    assert prepare_calls["count"] == 1
+
+    cache_manifest = _read_json_file(_working_cache_manifest_path(str(working_cache)))
+    assert cache_manifest.get("cache_reused") is False
+
+    result2 = learner._prepare_fixed_split_working_cache(
+        DummyModel(),
+        manifest,
+        bundle_cache_path=str(bundle_root),
+        working_cache=str(working_cache),
+    )
+    assert prepare_calls["count"] == 2
+    cache_manifest2 = _read_json_file(_working_cache_manifest_path(str(working_cache)))
+    assert cache_manifest2.get("cache_reused") is True
+
+
+def test_working_cache_rebuilds_when_reused_feature_record_is_corrupt(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": [],
+        "samples": [
+            {
+                "sample_id": "s1",
+                "confidence_bucket": "low_confidence",
+                "raw_relpath": "frames/s1.jpg",
+                "feature_relpath": None,
+            }
+        ],
+    }
+
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: DummyModel())
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda m: m)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_batch_trace_sample_input",
+        lambda *a, **kw: torch.zeros(2, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *a, **kw: (
+            "splitter",
+            SimpleNamespace(
+                candidate_id="c-1",
+                legacy_layer_index=3,
+                boundary_tensor_labels=["l3"],
+            ),
+        ),
+    )
+
+    prepare_calls = {"count": 0}
+
+    def fake_prepare(bundle_path, working_cache, **kwargs):
+        prepare_calls["count"] += 1
+        wc = Path(working_cache)
+        (wc / "frames").mkdir(parents=True, exist_ok=True)
+        (wc / "features").mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(wc / "frames" / "s1.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
+        feature_path = wc / "features" / "s1.pt"
+        if not feature_path.exists():
+            torch.save(
+                {
+                    "intermediate": SplitPayload(
+                        tensors={"payload": torch.ones(1, 2, 2)},
+                        candidate_id="c-1",
+                        boundary_tensor_labels=["l3"],
+                        primary_label="payload",
+                        split_index=3,
+                        split_label="layer3",
+                    )
+                },
+                feature_path,
+            )
+        (wc / "metadata_index.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "protocol_version": "edge-cl-bundle.v1",
+                    "model": {},
+                    "split_plan": {},
+                    "all_sample_ids": ["s1"],
+                    "drift_sample_ids": [],
+                    "samples": {
+                        "s1": {
+                            "sample_id": "s1",
+                            "feature_relpath": "features/s1.pt",
+                            "has_raw_sample": True,
+                            "frame_relpath": "frames/s1.jpg",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"all_sample_ids": ["s1"], "drift_sample_ids": []}
+
+    monkeypatch.setattr("cloud_server.prepare_split_training_cache", fake_prepare)
+
+    class DummyModel(torch.nn.Module):
+        def forward(self, images):
+            return [
+                {"labels": torch.empty(0), "boxes": torch.empty((0, 4)), "scores": torch.empty(0)}
+            ]
+
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    working_cache = bundle_root / "working_cache"
+
+    learner._prepare_fixed_split_working_cache(
+        DummyModel(),
+        manifest,
+        bundle_cache_path=str(bundle_root),
+        working_cache=str(working_cache),
+    )
+    assert prepare_calls["count"] == 1
+
+    (working_cache / "features" / "s1.pt").write_bytes(b"corrupt-cache-record")
+
+    learner._prepare_fixed_split_working_cache(
+        DummyModel(),
+        manifest,
+        bundle_cache_path=str(bundle_root),
+        working_cache=str(working_cache),
+    )
+
+    assert prepare_calls["count"] == 3
+    repaired_record = torch.load(
+        working_cache / "features" / "s1.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert isinstance(repaired_record, dict)
+    assert "intermediate" in repaired_record
+
+
+def test_fixed_split_retrain_rejects_proxy_map_regression_and_keeps_baseline(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float = 1.0):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+        def forward(self, images):
+            score = float(self.weight.detach().cpu().item())
+            if score <= 0.0:
+                return [
+                    {
+                        "labels": torch.empty(0, dtype=torch.int64),
+                        "boxes": torch.empty((0, 4), dtype=torch.float32),
+                        "scores": torch.empty(0, dtype=torch.float32),
+                    }
+                ]
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
+                    "scores": torch.tensor([score], dtype=torch.float32),
+                }
+            ]
+
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    model = DummyModel(weight=1.0)
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "yolo26n", "model_version": "0"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": ["sample-1"],
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "confidence_bucket": LOW_CONFIDENCE,
+                "raw_relpath": "frames/sample-1.jpg",
+                "feature_relpath": None,
+            }
+        ],
+    }
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda current_model: current_model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_batch_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(2, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *args, **kwargs: (
+            "prepared-splitter",
+            SimpleNamespace(
+                candidate_id="candidate-1",
+                legacy_layer_index=3,
+                boundary_tensor_labels=["layer3"],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_teacher_inference_batch",
+        lambda frames: [([[1, 1, 6, 6]], [1], [0.9])] * len(frames),
+    )
+
+    def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, **kwargs):
+        frame_dir = Path(working_cache_path) / "frames"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        feature_dir = Path(working_cache_path) / "features"
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        assert cv2.imwrite(str(frame_dir / "sample-1.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
+        torch.save({"intermediate": torch.zeros(1, 2)}, feature_dir / "sample-1.pt")
+        (Path(working_cache_path) / "metadata_index.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+                    "model": {},
+                    "split_plan": {},
+                    "all_sample_ids": ["sample-1"],
+                    "drift_sample_ids": ["sample-1"],
+                    "samples": {
+                        "sample-1": {
+                            "sample_id": "sample-1",
+                            "feature_relpath": "features/sample-1.pt",
+                            "has_raw_sample": True,
+                            "frame_relpath": "frames/sample-1.jpg",
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return {"all_sample_ids": ["sample-1"], "drift_sample_ids": ["sample-1"]}
+
+    monkeypatch.setattr(
+        "cloud_server.prepare_split_training_cache",
+        fake_prepare_split_training_cache,
+    )
+    monkeypatch.setattr(
+        "cloud_server.universal_split_retrain",
+        lambda *, model, **kwargs: model.weight.data.fill_(0.2),
+    )
+    proxy_metrics = iter(
+        [
+            {
+                "map": 0.8,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
+            {
+                "map": 0.3,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        "cloud_server._evaluate_detection_proxy_map",
+        lambda *args, **kwargs: next(proxy_metrics),
+    )
+
+    serialized_weights: list[float] = []
+
+    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None):
+        serialized_weights.append(float(current_model.state_dict()["weight"][0]))
+        return b"baseline-kept"
+
+    monkeypatch.setattr(learner, "_serialise_model_bytes", fake_serialise_model_bytes)
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path / "bundle"),
+    )
+
+    assert success is True
+    assert model_data == base64.b64encode(b"baseline-kept").decode("utf-8")
+    assert "rejected retrained weights because proxy_mAP@0.5 regressed 0.8000 -> 0.3000" in message
+    assert serialized_weights == [1.0]
+
+
+def test_fixed_split_retrain_rejects_dead_detector_and_keeps_baseline(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float = 1.0):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+        def forward(self, images):
+            score = float(self.weight.detach().cpu().item())
+            if score <= 0.0:
+                return [
+                    {
+                        "labels": torch.empty(0, dtype=torch.int64),
+                        "boxes": torch.empty((0, 4), dtype=torch.float32),
+                        "scores": torch.empty(0, dtype=torch.float32),
+                    }
+                ]
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
+                    "scores": torch.tensor([score], dtype=torch.float32),
+                }
+            ]
+
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    model = DummyModel(weight=1.0)
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "yolo26n", "model_version": "0"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": ["sample-1"],
+        "samples": [
+            {
+                "sample_id": "sample-1",
+                "confidence_bucket": LOW_CONFIDENCE,
+                "raw_relpath": "frames/sample-1.jpg",
+                "feature_relpath": None,
+            }
+        ],
+    }
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda current_model: current_model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_batch_trace_sample_input",
+        lambda *args, **kwargs: torch.zeros(2, 3, 8, 8),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *args, **kwargs: (
+            "prepared-splitter",
+            SimpleNamespace(
+                candidate_id="candidate-1",
+                legacy_layer_index=3,
+                boundary_tensor_labels=["layer3"],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_teacher_inference_batch",
+        lambda frames: [([[1, 1, 6, 6]], [1], [0.9])] * len(frames),
+    )
+
+    def fake_prepare_split_training_cache(bundle_cache_path, working_cache_path, **kwargs):
+        frame_dir = Path(working_cache_path) / "frames"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        feature_dir = Path(working_cache_path) / "features"
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        assert cv2.imwrite(str(frame_dir / "sample-1.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
+        torch.save({"intermediate": torch.zeros(1, 2)}, feature_dir / "sample-1.pt")
+        (Path(working_cache_path) / "metadata_index.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+                    "model": {},
+                    "split_plan": {},
+                    "all_sample_ids": ["sample-1"],
+                    "drift_sample_ids": ["sample-1"],
+                    "samples": {
+                        "sample-1": {
+                            "sample_id": "sample-1",
+                            "feature_relpath": "features/sample-1.pt",
+                            "has_raw_sample": True,
+                            "frame_relpath": "frames/sample-1.jpg",
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return {"all_sample_ids": ["sample-1"], "drift_sample_ids": ["sample-1"]}
+
+    monkeypatch.setattr(
+        "cloud_server.prepare_split_training_cache",
+        fake_prepare_split_training_cache,
+    )
+    monkeypatch.setattr(
+        "cloud_server.universal_split_retrain",
+        lambda *, model, **kwargs: model.weight.data.fill_(0.0),
+    )
+    proxy_metrics = iter(
+        [
+            {
+                "map": 0.8,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 1,
+                "total_prediction_boxes": 1,
+            },
+            {
+                "map": 0.0,
+                "evaluated_samples": 1,
+                "skipped_empty_gt": 0,
+                "skipped_missing_frame": 0,
+                "total_gt_samples": 1,
+                "nonempty_predictions": 0,
+                "total_prediction_boxes": 0,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        "cloud_server._evaluate_detection_proxy_map",
+        lambda *args, **kwargs: next(proxy_metrics),
+    )
+
+    serialized_weights: list[float] = []
+
+    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None):
+        serialized_weights.append(float(current_model.state_dict()["weight"][0]))
+        return b"baseline-kept"
+
+    monkeypatch.setattr(learner, "_serialise_model_bytes", fake_serialise_model_bytes)
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path / "bundle"),
+    )
+
+    assert success is True
+    assert model_data == base64.b64encode(b"baseline-kept").decode("utf-8")
+    assert "rejected retrained weights because updated weights produced no detections on the GT-annotated proxy set" in message
+    assert serialized_weights == [1.0]
+
+
+def test_batch_teacher_annotation_returns_correct_result_shape(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(teacher_batch_size=2),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir(parents=True)
+    for i in range(3):
+        cv2.imwrite(str(frame_dir / f"{i}.jpg"), np.zeros((8, 8, 3), dtype=np.uint8))
+
+    monkeypatch.setattr(
+        learner,
+        "_teacher_inference_batch",
+        lambda frames: [([[float(i), 0, 10, 10]], [i + 1], [0.9]) for i in range(len(frames))],
+    )
+
+    annotations = learner._collect_teacher_annotations(str(frame_dir), ["0", "1", "2"])
+
+    assert len(annotations) == 3
+    for key in ["0", "1", "2"]:
+        assert key in annotations
+        assert "boxes" in annotations[key]
+        assert "labels" in annotations[key]
+
+
+def test_serialise_model_bytes_returns_loadable_state_dict(tmp_path):
+    config = SimpleNamespace(
+        edge_model_name="test-model",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path)
+
+    model = torch.nn.Linear(4, 2)
+    model_bytes = learner._serialise_model_bytes(model, model_name="test-model", edge_id=1)
+
+    assert isinstance(model_bytes, bytes)
+    assert len(model_bytes) > 0
+
+    loaded = torch.load(io.BytesIO(model_bytes), map_location="cpu", weights_only=False)
+    assert "weight" in loaded
+    assert "bias" in loaded
+    assert torch.equal(loaded["weight"], model.weight.data)
+    assert torch.equal(loaded["bias"], model.bias.data)
+
+    file_path = learner._edge_weights_path("test-model", edge_id=1)
+    assert os.path.exists(file_path)
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+    assert file_bytes == model_bytes

@@ -101,11 +101,19 @@ class SplitLearningConfig(ConfigSection):
 class ContinualLearningConfig(ConfigSection):
     num_epoch: int = 5
     batch_size: int = 2
+    teacher_batch_size: int | None = None
     teacher_annotation_threshold: float = 0.5
+    proxy_eval_max_samples: int = 0
+    proxy_eval_threshold_candidates: list[float] | None = None
+    proxy_eval_frame_cache_enabled: bool = True
     split_learning_rate: float = 1e-3
     wrapper_fixed_split_learning_rate: float = 3e-5
     rfdetr_fixed_split_learning_rate: float = 1e-4
     max_concurrent_jobs: int = 2
+
+    def __post_init__(self) -> None:
+        if self.teacher_batch_size is None:
+            self.teacher_batch_size = int(self.batch_size)
 
 
 @dataclass
@@ -239,6 +247,22 @@ def _validate_positive(name: str, value: int | float, *, allow_zero: bool = Fals
         raise ValueError(f"{name} must be > 0, got {value!r}")
 
 
+def _validate_threshold_candidates(name: str, value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{name} must be a non-empty sequence of thresholds")
+    for index, candidate in enumerate(value):
+        if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+            raise ValueError(
+                f"{name}[{index}] must be a numeric threshold, got {candidate!r}"
+            )
+        if not 0.0 <= float(candidate) <= 1.0:
+            raise ValueError(
+                f"{name}[{index}] must be within [0, 1], got {candidate!r}"
+            )
+
+
 def _validate_runtime_config(config: RuntimeConfig) -> None:
     removed_fields = {
         "client.retrain.batch_size": (
@@ -302,6 +326,27 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.continual_learning.batch_size",
         int(config.server.continual_learning.batch_size),
     )
+    _validate_positive(
+        "server.continual_learning.teacher_batch_size",
+        int(config.server.continual_learning.teacher_batch_size),
+    )
+    _validate_positive(
+        "server.continual_learning.proxy_eval_max_samples",
+        int(config.server.continual_learning.proxy_eval_max_samples),
+        allow_zero=True,
+    )
+    _validate_threshold_candidates(
+        "server.continual_learning.proxy_eval_threshold_candidates",
+        config.server.continual_learning.proxy_eval_threshold_candidates,
+    )
+    if not isinstance(
+        config.server.continual_learning.proxy_eval_frame_cache_enabled,
+        bool,
+    ):
+        raise ValueError(
+            "server.continual_learning.proxy_eval_frame_cache_enabled must be a boolean, "
+            f"got {config.server.continual_learning.proxy_eval_frame_cache_enabled!r}"
+        )
     _validate_positive(
         "server.continual_learning.max_concurrent_jobs",
         int(config.server.continual_learning.max_concurrent_jobs),

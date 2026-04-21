@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -35,7 +37,9 @@ class _StaticSplitter:
         self.model = model
         self.graph = object()
 
-    def split(self, *, candidate=None, candidate_id=None, layer_index=None, boundary_tensor_labels=None):
+    def split(
+        self, *, candidate=None, candidate_id=None, layer_index=None, boundary_tensor_labels=None
+    ):
         if candidate is not None:
             return candidate
         return self._candidate
@@ -48,6 +52,42 @@ class _StaticSplitter:
 
     def get_tail_trainable_params(self, chosen):
         return []
+
+
+def _write_cached_split_record(
+    tmp_path,
+    frame_index: int,
+    *,
+    candidate,
+    boundary_label: str = "selected-boundary",
+    value: float,
+    pseudo_boxes,
+    pseudo_labels,
+    pseudo_scores,
+    **extra_record_fields,
+) -> None:
+    feature_dir = tmp_path / "features"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    payload = SplitPayload(
+        tensors={boundary_label: torch.full((1, 2), float(value))},
+        candidate_id=candidate.candidate_id,
+        boundary_tensor_labels=[boundary_label],
+        primary_label=boundary_label,
+        split_index=candidate.legacy_layer_index,
+        split_label=boundary_label,
+    )
+    record = {
+        "intermediate": payload,
+        "candidate_id": payload.candidate_id,
+        "boundary_tensor_labels": list(payload.boundary_tensor_labels),
+        "split_index": payload.split_index,
+        "split_label": payload.split_label,
+        "pseudo_boxes": pseudo_boxes,
+        "pseudo_labels": pseudo_labels,
+        "pseudo_scores": pseudo_scores,
+    }
+    record.update(extra_record_fields)
+    torch.save(record, feature_dir / f"{frame_index}.pt")
 
 
 class ToyDagNet(nn.Module):
@@ -162,7 +202,9 @@ def test_trace_marks_parametric_nodes_trainable_even_when_model_is_frozen():
     splitter.trace(model, sample)
 
     trainable_labels = [
-        label for label in splitter.graph.relevant_labels if splitter.graph.nodes[label].has_trainable_params
+        label
+        for label in splitter.graph.relevant_labels
+        if splitter.graph.nodes[label].has_trainable_params
     ]
     assert trainable_labels
 
@@ -264,7 +306,9 @@ def test_tensor_exact_match_aligns_devices_before_comparing(monkeypatch):
     assert cpu_calls == 2
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for cross-device regression coverage")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for cross-device regression coverage"
+)
 def test_tensor_exact_match_handles_cpu_and_cuda_tensors():
     candidate = torch.tensor([[1.0, 2.0]], device="cpu")
     target = candidate.to("cuda")
@@ -272,7 +316,9 @@ def test_tensor_exact_match_handles_cpu_and_cuda_tensors():
     assert graph_ir._tensor_exact_match(candidate, target)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for cross-device regression coverage")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for cross-device regression coverage"
+)
 def test_find_tensor_path_handles_cpu_and_cuda_tensors():
     target = torch.tensor([[1.0, 2.0]], device="cpu")
     container = {"branch": [target.to("cuda")]}
@@ -287,7 +333,8 @@ def test_dag_boundary_payload_is_minimal_and_cache_independent():
     splitter.trace(model, sample)
 
     cat_nodes = [
-        node for node in splitter.graph.nodes.values()
+        node
+        for node in splitter.graph.nodes.values()
         if node.aggregation_kind == "cat" and len(node.parent_labels) >= 2
     ]
     assert cat_nodes
@@ -351,7 +398,9 @@ def test_runtime_injects_device_for_parentless_tensor_factories():
 def test_safe_topk_clips_k_to_available_dimension():
     tensor = torch.tensor([0.2, 0.5, 0.1], dtype=torch.float32)
 
-    result = __import__("model_management.split_runtime", fromlist=["_maybe_call_safe_topk"])._maybe_call_safe_topk(
+    result = __import__(
+        "model_management.split_runtime", fromlist=["_maybe_call_safe_topk"]
+    )._maybe_call_safe_topk(
         [tensor, 5],
         {},
     )
@@ -401,6 +450,188 @@ def test_payload_cache_and_universal_split_retrain(tmp_path):
     )
     assert len(losses) == 1
     assert torch.isfinite(torch.tensor(losses[0]))
+
+
+@pytest.mark.parametrize("das_strategy", ["tgi", "entropy"])
+def test_universal_split_retrain_preloads_cache_for_split_choice_probe_and_train(
+    tmp_path,
+    monkeypatch,
+    das_strategy,
+):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+
+    class _PreloadedCacheSplitter(_StaticSplitter):
+        def __init__(self, chosen_candidate) -> None:
+            super().__init__(chosen_candidate)
+            self.graph = SimpleNamespace(nodes={})
+            self.seen_training_targets: list[list[dict[str, object]]] = []
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+        def cloud_forward(self, payload, **kwargs):
+            assert isinstance(payload, SplitPayload)
+            return payload.primary_tensor().float()
+
+        def cloud_train_step(self, payload, targets=None, **kwargs):
+            assert isinstance(payload, SplitPayload)
+            self.seen_training_targets.append(copy.deepcopy(targets))
+            return None, torch.tensor(1.0)
+
+        def _invalidate_validation_cache(self) -> None:
+            return None
+
+    class _DummyDasTrainer:
+        def __init__(self) -> None:
+            self.probe_samples = 0
+            self.probe_target_count = 0
+            self.entropy_refresh_calls = 0
+            self.deactivate_calls = 0
+            self.activated_ratios: list[dict[str, float]] = []
+
+        def probe_with_targets(self, forward):
+            result = forward()
+            assert "loss" in result
+            self.probe_target_count += 1
+            return {"selected-boundary": 0.25}
+
+        def refresh_pruning_ratios_from_entropy(self):
+            self.entropy_refresh_calls += 1
+            return {"selected-boundary": 0.5}
+
+        def activate_sparsity(self, ratios):
+            self.activated_ratios.append(dict(ratios))
+
+        def deactivate_sparsity(self):
+            self.deactivate_calls += 1
+
+    splitter = _PreloadedCacheSplitter(candidate)
+    _write_cached_split_record(
+        tmp_path,
+        0,
+        candidate=candidate,
+        value=1.0,
+        pseudo_boxes=["pseudo-box-0"],
+        pseudo_labels=["pseudo-label-0"],
+        pseudo_scores=["pseudo-score-0"],
+        sample_id="sample-0",
+        confidence_bucket="high",
+        input_image_size=[32, 32],
+        input_tensor_shape=[1, 2],
+        input_resize_mode="stretch",
+    )
+    _write_cached_split_record(
+        tmp_path,
+        1,
+        candidate=candidate,
+        value=2.0,
+        pseudo_boxes=["pseudo-box-1"],
+        pseudo_labels=["pseudo-label-1"],
+        pseudo_scores=["pseudo-score-1"],
+        sample_id="sample-1",
+        confidence_bucket="medium",
+        input_image_size=[48, 48],
+        input_tensor_shape=[1, 2],
+        input_resize_mode="letterbox",
+    )
+
+    load_calls: list[int] = []
+    original_load = load_split_feature_cache
+
+    def _tracking_load(cache_path: str, frame_index: int):
+        load_calls.append(frame_index)
+        return original_load(cache_path, frame_index)
+
+    probe_targets: list[dict[str, object]] = []
+
+    def _capture_loss(outputs, targets, **kwargs):
+        probe_targets.append(copy.deepcopy(targets))
+        return outputs.float().mean()
+
+    das_trainer = _DummyDasTrainer()
+    monkeypatch.setattr(
+        "model_management.universal_model_split.load_split_feature_cache", _tracking_load
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split.apply_das_to_model",
+        lambda *args, **kwargs: das_trainer,
+    )
+
+    losses = universal_split_retrain(
+        model=nn.Identity(),
+        sample_input=torch.zeros(1, 2),
+        cache_path=str(tmp_path),
+        all_indices=[0, 1],
+        gt_annotations={
+            0: {
+                "boxes": ["gt-box-0"],
+                "labels": ["gt-label-0"],
+                "scores": ["gt-score-0"],
+            }
+        },
+        batch_size=2,
+        splitter=splitter,
+        das_enabled=True,
+        das_probe_samples=2,
+        das_strategy=das_strategy,
+        loss_fn=_capture_loss,
+    )
+
+    assert losses == [pytest.approx(1.0)]
+    assert load_calls == [0, 1]
+    assert splitter.seen_training_targets == [
+        [
+            {
+                "boxes": ["gt-box-0"],
+                "labels": ["gt-label-0"],
+                "scores": ["gt-score-0"],
+                "_split_meta": {
+                    "candidate_id": "selected-candidate",
+                    "split_index": 3,
+                    "split_label": "selected-boundary",
+                    "boundary_tensor_labels": ["selected-boundary"],
+                    "sample_id": "sample-0",
+                    "confidence_bucket": "high",
+                    "input_image_size": [32, 32],
+                    "input_tensor_shape": [1, 2],
+                    "input_resize_mode": "stretch",
+                },
+            },
+            {
+                "boxes": ["pseudo-box-1"],
+                "labels": ["pseudo-label-1"],
+                "scores": ["pseudo-score-1"],
+                "_split_meta": {
+                    "candidate_id": "selected-candidate",
+                    "split_index": 3,
+                    "split_label": "selected-boundary",
+                    "boundary_tensor_labels": ["selected-boundary"],
+                    "sample_id": "sample-1",
+                    "confidence_bucket": "medium",
+                    "input_image_size": [48, 48],
+                    "input_tensor_shape": [1, 2],
+                    "input_resize_mode": "letterbox",
+                },
+            },
+        ]
+    ]
+
+    if das_strategy == "tgi":
+        assert [target["boxes"] for target in probe_targets] == [["gt-box-0"], ["pseudo-box-1"]]
+        assert "input_resize_mode" not in probe_targets[0]["_split_meta"]
+        assert "input_resize_mode" not in probe_targets[1]["_split_meta"]
+        assert das_trainer.probe_target_count == 2
+        assert das_trainer.activated_ratios == [{"selected-boundary": 0.25}]
+    else:
+        assert probe_targets == []
+        assert das_trainer.deactivate_calls == 1
+        assert das_trainer.entropy_refresh_calls == 2
+        assert das_trainer.activated_ratios == [{"selected-boundary": 0.5}]
 
 
 def test_universal_split_retrain_pads_last_batch_to_runtime_batch_size(tmp_path):
@@ -590,3 +821,207 @@ def test_universal_split_retrain_rejects_mismatched_cached_candidate_identity(tm
             num_epoch=1,
             loss_fn=lambda output, _: output.float().mean(),
         )
+
+
+def test_universal_split_retrain_loads_each_record_exactly_once(tmp_path, monkeypatch):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+
+    class _CountingLoadSplitter(_StaticSplitter):
+        def __init__(self, chosen_candidate):
+            super().__init__(chosen_candidate)
+            self.graph = SimpleNamespace(nodes={})
+            self.train_calls = 0
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+        def cloud_forward(self, payload, **kwargs):
+            return payload.primary_tensor().float()
+
+        def cloud_train_step(self, payload, targets=None, **kwargs):
+            self.train_calls += 1
+            return None, torch.tensor(1.0)
+
+        def _invalidate_validation_cache(self):
+            return None
+
+    splitter = _CountingLoadSplitter(candidate)
+    for idx in range(3):
+        _write_cached_split_record(
+            tmp_path,
+            idx,
+            candidate=candidate,
+            value=float(idx),
+            pseudo_boxes=[],
+            pseudo_labels=[],
+            pseudo_scores=[],
+        )
+
+    load_counts = {"total": 0}
+    original_load = load_split_feature_cache
+
+    def _tracking_load(cache_path, frame_index):
+        load_counts["total"] += 1
+        return original_load(cache_path, frame_index)
+
+    monkeypatch.setattr(
+        "model_management.universal_model_split.load_split_feature_cache", _tracking_load
+    )
+
+    losses = universal_split_retrain(
+        model=nn.Identity(),
+        sample_input=torch.zeros(1, 2),
+        cache_path=str(tmp_path),
+        all_indices=[0, 1, 2, 0, 1],
+        gt_annotations={},
+        batch_size=3,
+        splitter=splitter,
+        chosen_candidate=candidate,
+        loss_fn=lambda output, _: output.float().mean(),
+    )
+
+    assert len(losses) == 1
+    assert load_counts["total"] == 3
+
+
+def test_universal_split_retrain_preserves_gt_over_pseudo_target_selection(tmp_path):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+
+    class _InspectingSplitter(_StaticSplitter):
+        def __init__(self, chosen_candidate):
+            super().__init__(chosen_candidate)
+            self.graph = SimpleNamespace(nodes={})
+            self.captured_targets = []
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+        def cloud_train_step(self, payload, targets=None, **kwargs):
+            self.captured_targets.append(copy.deepcopy(targets))
+            return None, torch.tensor(1.0)
+
+        def _invalidate_validation_cache(self):
+            return None
+
+    splitter = _InspectingSplitter(candidate)
+    _write_cached_split_record(
+        tmp_path,
+        0,
+        candidate=candidate,
+        value=1.0,
+        pseudo_boxes=[[1, 2, 3, 4]],
+        pseudo_labels=[99],
+        pseudo_scores=[0.5],
+    )
+    _write_cached_split_record(
+        tmp_path,
+        1,
+        candidate=candidate,
+        value=2.0,
+        pseudo_boxes=[[5, 6, 7, 8]],
+        pseudo_labels=[88],
+        pseudo_scores=[0.3],
+    )
+
+    losses = universal_split_retrain(
+        model=nn.Identity(),
+        sample_input=torch.zeros(1, 2),
+        cache_path=str(tmp_path),
+        all_indices=[0, 1],
+        gt_annotations={0: {"boxes": [[10, 20, 30, 40]], "labels": [1]}},
+        batch_size=2,
+        splitter=splitter,
+        chosen_candidate=candidate,
+        loss_fn=lambda output, _: output.float().mean(),
+    )
+
+    assert len(splitter.captured_targets) == 1
+    batch_targets = splitter.captured_targets[0]
+    assert isinstance(batch_targets, list)
+    assert len(batch_targets) == 2
+
+    gt_target = batch_targets[0]
+    assert gt_target["boxes"] == [[10, 20, 30, 40]]
+    assert gt_target["labels"] == [1]
+
+    pseudo_target = batch_targets[1]
+    assert pseudo_target["boxes"] == [[5, 6, 7, 8]]
+    assert pseudo_target["labels"] == [88]
+
+
+def test_universal_split_retrain_keeps_split_meta_fields_unchanged(tmp_path):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+
+    class _MetaCapturingSplitter(_StaticSplitter):
+        def __init__(self, chosen_candidate):
+            super().__init__(chosen_candidate)
+            self.graph = SimpleNamespace(nodes={})
+            self.captured_metas = []
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+        def cloud_train_step(self, payload, targets=None, **kwargs):
+            if isinstance(targets, list):
+                for t in targets:
+                    if isinstance(t, dict) and "_split_meta" in t:
+                        self.captured_metas.append(dict(t["_split_meta"]))
+            return None, torch.tensor(1.0)
+
+        def _invalidate_validation_cache(self):
+            return None
+
+    splitter = _MetaCapturingSplitter(candidate)
+    _write_cached_split_record(
+        tmp_path,
+        0,
+        candidate=candidate,
+        value=1.0,
+        pseudo_boxes=[],
+        pseudo_labels=[],
+        pseudo_scores=[],
+        sample_id="sample-0",
+        confidence_bucket="high",
+        input_image_size=[32, 32],
+        input_tensor_shape=[1, 3, 32, 32],
+        input_resize_mode="stretch",
+    )
+
+    losses = universal_split_retrain(
+        model=nn.Identity(),
+        sample_input=torch.zeros(1, 2),
+        cache_path=str(tmp_path),
+        all_indices=[0],
+        gt_annotations={},
+        batch_size=1,
+        splitter=splitter,
+        chosen_candidate=candidate,
+        loss_fn=lambda output, _: output.float().mean(),
+    )
+
+    assert len(splitter.captured_metas) == 1
+    meta = splitter.captured_metas[0]
+    assert meta["candidate_id"] == "selected-candidate"
+    assert meta["split_index"] == 3
+    assert meta["split_label"] == "selected-boundary"
+    assert meta["boundary_tensor_labels"] == ["selected-boundary"]
+    assert meta["sample_id"] == "sample-0"
+    assert meta["confidence_bucket"] == "high"
+    assert meta["input_image_size"] == [32, 32]
+    assert meta["input_tensor_shape"] == [1, 3, 32, 32]
+    assert meta["input_resize_mode"] == "stretch"

@@ -304,6 +304,8 @@ def _load_split_cache_metadata(cache_path: str) -> dict[str, Any]:
 def _infer_cached_split_choice(
     cache_path: str,
     all_indices: Sequence[int],
+    *,
+    preloaded_records: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> tuple[str | None, int | None, list[str] | None]:
     metadata = _load_split_cache_metadata(cache_path)
     candidate_id = metadata.get("candidate_id")
@@ -314,10 +316,15 @@ def _infer_cached_split_choice(
         return candidate_id, split_index, list(boundary_labels) if boundary_labels else None
 
     for frame_index in list(all_indices):
-        try:
-            record = load_split_feature_cache(cache_path, frame_index)
-        except FileNotFoundError:
-            continue
+        if preloaded_records is not None:
+            record = preloaded_records.get(frame_index)
+            if record is None:
+                continue
+        else:
+            try:
+                record = load_split_feature_cache(cache_path, frame_index)
+            except FileNotFoundError:
+                continue
         payload = record.get("intermediate")
         if isinstance(payload, SplitPayload):
             return payload.candidate_id, payload.split_index, list(payload.boundary_tensor_labels)
@@ -773,12 +780,62 @@ def universal_split_retrain(
     if splitter.graph is None or splitter.model is None:
         splitter.trace(model, _move_nested(sample_input, splitter.device))
 
+    unique_indices = list(OrderedDict.fromkeys(all_indices))
+    preloaded_records: OrderedDict[int, dict[str, Any]] = OrderedDict()
+    if unique_indices and (
+        num_epoch > 0 or (chosen_candidate is None and candidate_id is None and split_layer is None)
+    ):
+        # Deduplicate repeated frame ids so retrain only hits disk once per cached sample.
+        preloaded_records = OrderedDict(
+            (frame_index, load_split_feature_cache(cache_path, frame_index))
+            for frame_index in unique_indices
+        )
+
+    def _record_for(frame_index: int) -> dict[str, Any]:
+        return preloaded_records[frame_index]
+
+    def _targets_from_record(
+        frame_index: int,
+        record: Mapping[str, Any],
+        *,
+        include_resize_mode: bool,
+    ) -> Any:
+        targets = gt_annotations.get(frame_index)
+        if targets is None:
+            targets = {
+                "boxes": record.get("pseudo_boxes"),
+                "labels": record.get("pseudo_labels"),
+                "scores": record.get("pseudo_scores"),
+            }
+        if isinstance(targets, dict):
+            split_meta = {
+                "candidate_id": record.get("candidate_id"),
+                "split_index": record.get("split_index"),
+                "split_label": record.get("split_label"),
+                "boundary_tensor_labels": record.get("boundary_tensor_labels"),
+                "sample_id": record.get("sample_id"),
+                "confidence_bucket": record.get("confidence_bucket"),
+                "input_image_size": record.get("input_image_size"),
+                "input_tensor_shape": record.get("input_tensor_shape"),
+            }
+            if include_resize_mode:
+                split_meta["input_resize_mode"] = record.get("input_resize_mode")
+            targets = {
+                **targets,
+                "_split_meta": split_meta,
+            }
+        return targets
+
     if chosen_candidate is not None:
         chosen = splitter.split(candidate=chosen_candidate)
     else:
         boundary_labels: list[str] | None = None
         if candidate_id is None and split_layer is None:
-            candidate_id, split_layer, boundary_labels = _infer_cached_split_choice(cache_path, all_indices)
+            candidate_id, split_layer, boundary_labels = _infer_cached_split_choice(
+                cache_path,
+                all_indices,
+                preloaded_records=preloaded_records or None,
+            )
         if boundary_labels:
             try:
                 chosen = splitter.split(boundary_tensor_labels=boundary_labels)
@@ -875,30 +932,13 @@ def universal_split_retrain(
             aggregated: dict[str, float] = {}
             counts: dict[str, int] = {}
             for probe_index in probe_indices:
-                record = load_split_feature_cache(cache_path, probe_index)
+                record = _record_for(probe_index)
                 payload = record["intermediate"]
-                targets = gt_annotations.get(probe_index)
-                if targets is None:
-                    targets = {
-                        "boxes": record.get("pseudo_boxes"),
-                        "labels": record.get("pseudo_labels"),
-                        "scores": record.get("pseudo_scores"),
-                    }
-                if isinstance(targets, dict):
-                    split_meta = {
-                        "candidate_id": record.get("candidate_id"),
-                        "split_index": record.get("split_index"),
-                        "split_label": record.get("split_label"),
-                        "boundary_tensor_labels": record.get("boundary_tensor_labels"),
-                        "sample_id": record.get("sample_id"),
-                        "confidence_bucket": record.get("confidence_bucket"),
-                        "input_image_size": record.get("input_image_size"),
-                        "input_tensor_shape": record.get("input_tensor_shape"),
-                    }
-                    targets = {
-                        **targets,
-                        "_split_meta": split_meta,
-                    }
+                targets = _targets_from_record(
+                    probe_index,
+                    record,
+                    include_resize_mode=False,
+                )
 
                 def _probe_forward():
                     outputs = splitter.cloud_forward(payload, candidate=chosen)
@@ -939,7 +979,7 @@ def universal_split_retrain(
                 counts: dict[str, int] = {}
                 with torch.no_grad():
                     for probe_index in probe_indices:
-                        record = load_split_feature_cache(cache_path, probe_index)
+                        record = _record_for(probe_index)
                         payload = record["intermediate"]
                         splitter.cloud_forward(payload, candidate=chosen)
                         ratios = das_trainer.refresh_pruning_ratios_from_entropy()
@@ -957,7 +997,7 @@ def universal_split_retrain(
             targets_list = []
             
             for frame_index in batch_indices:
-                record = load_split_feature_cache(cache_path, frame_index)
+                record = _record_for(frame_index)
                 payload = record["intermediate"]
                 _validate_cached_payload_identity(
                     record=record,
@@ -965,31 +1005,11 @@ def universal_split_retrain(
                     chosen=chosen,
                 )
 
-                targets = gt_annotations.get(frame_index)
-                
-                if targets is None:
-                    targets = {
-                        "boxes": record.get("pseudo_boxes"),
-                        "labels": record.get("pseudo_labels"),
-                        "scores": record.get("pseudo_scores"),
-                    }
-                    
-                if isinstance(targets, dict):
-                    split_meta = {
-                        "candidate_id": record.get("candidate_id"),
-                        "split_index": record.get("split_index"),
-                        "split_label": record.get("split_label"),
-                        "boundary_tensor_labels": record.get("boundary_tensor_labels"),
-                        "sample_id": record.get("sample_id"),
-                        "confidence_bucket": record.get("confidence_bucket"),
-                        "input_image_size": record.get("input_image_size"),
-                        "input_tensor_shape": record.get("input_tensor_shape"),
-                        "input_resize_mode": record.get("input_resize_mode"),
-                    }
-                    targets = {
-                        **targets,
-                        "_split_meta": split_meta,
-                    }
+                targets = _targets_from_record(
+                    frame_index,
+                    record,
+                    include_resize_mode=True,
+                )
                 
                 payloads.append(payload)
                 targets_list.append(targets)
