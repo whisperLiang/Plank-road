@@ -20,7 +20,7 @@ from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.universal_model_split import UniversalModelSplitter
 
 
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v1"
+FIXED_SPLIT_PLAN_VERSION = "fixed-split.v2"
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
 

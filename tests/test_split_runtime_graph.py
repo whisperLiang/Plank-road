@@ -167,6 +167,29 @@ def test_trace_marks_parametric_nodes_trainable_even_when_model_is_frozen():
     assert trainable_labels
 
 
+def test_canonicalize_trace_label_strips_only_unstable_suffix():
+    assert graph_ir._canonicalize_trace_label("splitwithsizes_1_388") == "splitwithsizes_1"
+    assert graph_ir._canonicalize_trace_label("permute_59_491") == "permute_59"
+    assert graph_ir._canonicalize_trace_label("conv2d_7") == "conv2d_7"
+
+
+def test_remap_parent_refs_updates_parent_tensor_labels():
+    template = {
+        "payload": graph_ir.ParentTensorRef(
+            parent_label="splitwithsizes_1_388",
+            path=("x",),
+        )
+    }
+    remapped = graph_ir._remap_parent_refs(
+        template,
+        {"splitwithsizes_1_388": "splitwithsizes_1"},
+    )
+
+    assert isinstance(remapped["payload"], graph_ir.ParentTensorRef)
+    assert remapped["payload"].parent_label == "splitwithsizes_1"
+    assert remapped["payload"].path == ("x",)
+
+
 def test_runtime_trace_cleans_up_raw_torchlens_history(monkeypatch):
     model, sample = _make_sequential_model()
     cleanup_called = False

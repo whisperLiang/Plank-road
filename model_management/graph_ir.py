@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import inspect
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
@@ -455,6 +456,60 @@ def _replace_placeholders(obj: Any, resolver) -> Any:
         except Exception:
             return rebuilt
     return _safe_deepcopy(obj)
+
+
+_TRACE_LABEL_SUFFIX_PATTERN = re.compile(r"^(.*?_\d+)_\d+$")
+
+
+def _canonicalize_trace_label(label: str) -> str:
+    """Drop the unstable TorchLens trace suffix while preserving op occurrence ids."""
+
+    if not isinstance(label, str) or not label:
+        return str(label)
+    match = _TRACE_LABEL_SUFFIX_PATTERN.match(label)
+    if match is None:
+        return label
+    return match.group(1)
+
+
+def _build_canonical_label_map(layer_list: Sequence[Any]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    occurrences: dict[str, int] = {}
+    for index, layer in enumerate(layer_list):
+        raw_label = str(_get_attr(layer, "layer_label", default=f"layer_{index}"))
+        base_label = _canonicalize_trace_label(raw_label)
+        occurrence = occurrences.get(base_label, 0) + 1
+        occurrences[base_label] = occurrence
+        mapping[raw_label] = base_label if occurrence == 1 else f"{base_label}__{occurrence}"
+    return mapping
+
+
+def _remap_trace_label(label: str | None, label_map: Mapping[str, str]) -> str | None:
+    if label is None:
+        return None
+    return label_map.get(str(label), str(label))
+
+
+def _remap_trace_labels(labels: Sequence[str], label_map: Mapping[str, str]) -> list[str]:
+    remapped: list[str] = []
+    for label in labels:
+        mapped = _remap_trace_label(label, label_map)
+        if mapped is not None and mapped not in remapped:
+            remapped.append(mapped)
+    return remapped
+
+
+def _remap_parent_refs(obj: Any, label_map: Mapping[str, str]) -> Any:
+    def _resolver(ref: Any) -> Any:
+        if isinstance(ref, ParentTensorRef):
+            return ParentTensorRef(
+                parent_label=label_map.get(ref.parent_label, ref.parent_label),
+                path=ref.path,
+                frozen_value=ref.frozen_value,
+            )
+        return ref
+
+    return _replace_placeholders(obj, _resolver)
 
 
 def normalize_runtime_inputs(
@@ -1069,18 +1124,29 @@ def build_graph_from_trace(
     trainable_param_names: set[str] | None = None,
 ) -> GraphIR:
     layer_list = list(_get_attr(history, "layer_list", default=[])) or []
+    canonical_label_map = _build_canonical_label_map(layer_list)
     parent_layer_lookup = {
-        _get_attr(layer, "layer_label", default=f"layer_{index}"): layer
+        str(_get_attr(layer, "layer_label", default=f"layer_{index}")): layer
         for index, layer in enumerate(layer_list)
+    }
+    canonical_parent_layer_lookup = {
+        canonical_label_map.get(raw_label, raw_label): layer
+        for raw_label, layer in parent_layer_lookup.items()
     }
     label2idx = build_label_maps(history)
     input_labels, output_labels = identify_io_nodes(history)
-    topo = _topological_order_from_history(history)
+    input_labels = _remap_trace_labels(input_labels, canonical_label_map)
+    output_labels = _remap_trace_labels(output_labels, canonical_label_map)
+    topo = _remap_trace_labels(_topological_order_from_history(history), canonical_label_map)
     nodes: "OrderedDict[str, GraphNode]" = OrderedDict()
 
     for index, layer in enumerate(layer_list):
-        label = _get_attr(layer, "layer_label", default=f"layer_{index}")
-        explicit_parent_labels = list(_get_attr(layer, "parent_layers", default=[])) or []
+        raw_label = str(_get_attr(layer, "layer_label", default=f"layer_{index}"))
+        label = canonical_label_map.get(raw_label, raw_label)
+        explicit_parent_labels = _remap_trace_labels(
+            list(_get_attr(layer, "parent_layers", default=[])) or [],
+            canonical_label_map,
+        )
         func_name = _infer_func_name(layer)
         node_type = (_get_attr(layer, "layer_type", default="operation") or "operation").lower()
         if label not in topo:
@@ -1090,6 +1156,9 @@ def build_graph_from_trace(
             previous_layers=layer_list[:index],
             parent_layer_lookup=parent_layer_lookup,
         )
+        arg_template = _remap_parent_refs(arg_template, canonical_label_map)
+        kwarg_template = _remap_parent_refs(kwarg_template, canonical_label_map)
+        inferred_parent_labels = _remap_trace_labels(inferred_parent_labels, canonical_label_map)
         parent_labels = list(
             OrderedDict.fromkeys(explicit_parent_labels + [parent for parent in inferred_parent_labels if parent != label])
         )
@@ -1108,14 +1177,17 @@ def build_graph_from_trace(
             func_name=func_name,
             func=_get_attr(layer, "func_applied", default=None),
             parent_labels=parent_labels,
-            child_labels=list(_get_attr(layer, "child_layers", default=[])) or [],
+            child_labels=_remap_trace_labels(
+                list(_get_attr(layer, "child_layers", default=[])) or [],
+                canonical_label_map,
+            ),
             parent_arg_locations={
                 "args": {
-                    _normalize_path_key(path): parent
+                    _normalize_path_key(path): canonical_label_map.get(parent, parent)
                     for path, parent in dict((_get_attr(layer, "parent_layer_arg_locs", default={}) or {}).get("args", {})).items()
                 },
                 "kwargs": {
-                    _normalize_path_key(path): parent
+                    _normalize_path_key(path): canonical_label_map.get(parent, parent)
                     for path, parent in dict((_get_attr(layer, "parent_layer_arg_locs", default={}) or {}).get("kwargs", {})).items()
                 },
             },
@@ -1183,7 +1255,11 @@ def build_graph_from_trace(
             input_address_to_label[address] = label
     if not output_address_to_label and output_labels and output_leaves:
         output_address_to_label.update(
-            _match_leaf_addresses_to_labels(output_labels, output_leaves, parent_layer_lookup)
+            _match_leaf_addresses_to_labels(
+                output_labels,
+                output_leaves,
+                canonical_parent_layer_lookup,
+            )
         )
         if len(output_address_to_label) < min(len(output_labels), len(output_leaves)):
             assigned_labels = set(output_address_to_label.values())
