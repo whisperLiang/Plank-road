@@ -39,6 +39,7 @@ class SourceConfig(ConfigSection):
 class RetrainConfig(ConfigSection):
     flag: bool = True
     num_epoch: int = 2
+    batch_size: int = 2
     cache_path: str = "./cache"
     collect_num: int = 20
 
@@ -101,6 +102,7 @@ class SplitLearningConfig(ConfigSection):
 @dataclass
 class ContinualLearningConfig(ConfigSection):
     num_epoch: int = 5
+    batch_size: int = 2
     teacher_annotation_threshold: float = 0.5
     split_learning_rate: float = 1e-3
     wrapper_fixed_split_learning_rate: float = 3e-5

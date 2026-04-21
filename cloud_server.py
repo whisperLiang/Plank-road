@@ -514,8 +514,8 @@ class CloudContinualLearner:
             if cl_cfg else 3e-5
         )
         self.min_wrapper_fixed_split_num_epoch = (
-            int(getattr(cl_cfg, "min_wrapper_fixed_split_num_epoch", 10))
-            if cl_cfg else 10
+            int(getattr(cl_cfg, "min_wrapper_fixed_split_num_epoch", 1))
+            if cl_cfg else 1
         )
         self.rfdetr_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
@@ -812,14 +812,36 @@ class CloudContinualLearner:
             frame = cv2.imread(raw_path)
             if frame is None:
                 continue
-            return self._prepare_split_runtime_input(model, frame)
+            sample_input = self._prepare_split_runtime_input(model, frame)
+            if isinstance(sample_input, torch.Tensor):
+                logger.info(
+                    "[FixedSplitCL] Tracing split runtime with single-sample input (input_tensor_shape={}).",
+                    tuple(sample_input.shape),
+                )
+            else:
+                logger.info(
+                    "[FixedSplitCL] Tracing split runtime with single-sample input (input_type={}).",
+                    type(sample_input).__name__,
+                )
+            return sample_input
 
         trace_image_size = self._infer_bundle_trace_image_size(manifest)
-        return build_split_runtime_sample_input(
+        sample_input = build_split_runtime_sample_input(
             model,
             image_size=trace_image_size,
             device=self.device,
         )
+        if isinstance(sample_input, torch.Tensor):
+            logger.info(
+                "[FixedSplitCL] Tracing split runtime with single-sample input (input_tensor_shape={}).",
+                tuple(sample_input.shape),
+            )
+        else:
+            logger.info(
+                "[FixedSplitCL] Tracing split runtime with single-sample input (input_type={}).",
+                type(sample_input).__name__,
+            )
+        return sample_input
 
     def _bundle_feature_provider(
         self,
@@ -847,6 +869,77 @@ class CloudContinualLearner:
             )
 
         return _provider
+
+    def _bundle_batch_feature_provider(
+        self,
+        model: torch.nn.Module,
+        manifest: dict[str, object],
+        *,
+        bundle_root: str,
+        splitter: UniversalModelSplitter | None = None,
+        candidate=None,
+    ):
+        if splitter is None or candidate is None:
+            splitter, candidate = self._build_bundle_splitter(
+                model,
+                manifest,
+                bundle_root=bundle_root,
+            )
+
+        def _batch_provider(raw_paths: list[str], samples: list[dict[str, object]], manifest_payload: dict[str, object]):
+            if not raw_paths:
+                return []
+
+            frames = [cv2.imread(p) for p in raw_paths]
+            for frame, p in zip(frames, raw_paths):
+                if frame is None:
+                    raise FileNotFoundError(p)
+
+            inputs = torch.cat([self._prepare_split_runtime_input(model, f) for f in frames], dim=0)
+            
+            try:
+                batch_payload = splitter.edge_forward(inputs, candidate=candidate)
+            except Exception as exc:
+                logger.warning(
+                    "[CL] Batched edge_forward failed while rebuilding split features ({} samples). "
+                    "Falling back to per-sample feature extraction. Error: {}",
+                    len(raw_paths),
+                    exc,
+                )
+                return [
+                    splitter.edge_forward(
+                        self._prepare_split_runtime_input(model, frame),
+                        candidate=candidate,
+                    )
+                    for frame in frames
+                ]
+            
+            from model_management.payload import SplitPayload
+            import collections
+            payloads = []
+            
+            batch_size = len(raw_paths)
+            unbound_tensors = {}
+            for k, v in batch_payload.tensors.items():
+                if v.ndim > 0 and v.shape[0] == batch_size:
+                    unbound_tensors[k] = v.unbind(dim=0)
+                else:
+                    unbound_tensors[k] = [v] * batch_size
+                    
+            for i in range(batch_size):
+                payload = SplitPayload(
+                    tensors=collections.OrderedDict({k: unbound_tensors[k][i].unsqueeze(0) if unbound_tensors[k][i].ndim > 0 else unbound_tensors[k][i] for k in batch_payload.tensors}),
+                    metadata=dict(batch_payload.metadata),
+                    candidate_id=batch_payload.candidate_id,
+                    boundary_tensor_labels=list(batch_payload.boundary_tensor_labels),
+                    primary_label=batch_payload.primary_label,
+                    split_index=batch_payload.split_index,
+                    split_label=batch_payload.split_label,
+                )
+                payloads.append(payload)
+            return payloads
+
+        return _batch_provider
 
     def _build_bundle_splitter(
         self,
@@ -917,6 +1010,12 @@ class CloudContinualLearner:
                 bundle_root=bundle_cache_path,
                 **provider_kwargs,
             ),
+            "batch_feature_provider": self._bundle_batch_feature_provider(
+                model,
+                manifest,
+                bundle_root=bundle_cache_path,
+                **provider_kwargs,
+            ),
         }
         if requires_trace_stable_rebuild:
             prepare_kwargs["prefer_feature_rebuild"] = True
@@ -938,6 +1037,7 @@ class CloudContinualLearner:
     ) -> dict:
         transform = key_transform or (lambda sample_id: sample_id)
         annotations = {}
+        logger.info("🧠 cloud model is annotating for samples...")
         for sample_id in sample_ids:
             img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
             if not os.path.exists(img_path):
@@ -1053,7 +1153,13 @@ class CloudContinualLearner:
             raise ValueError("No annotated raw frames were available for retraining.")
 
         dataset = DetectionDataset(frames)
-        data_loader = DataLoader(dataset=dataset, batch_size=2, collate_fn=_collate_fn)
+        batch_size = getattr(self.config.continual_learning, "batch_size", 2) if hasattr(self.config, "continual_learning") else 2
+        logger.info("[CL] Starting retraining with batch_size={}", batch_size)
+        data_loader = DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            collate_fn=_collate_fn,
+        )
         tr_metric = RetrainMetric()
 
         roi_params = [p for p in tmp_model.parameters() if p.requires_grad]
@@ -1165,6 +1271,15 @@ class CloudContinualLearner:
                 "[FixedSplitCL] Using wrapper fixed-split learning rate {}.",
                 effective_learning_rate,
             )
+            
+        bs = getattr(self.config.continual_learning, "batch_size", 2) if hasattr(self.config, "continual_learning") else 2
+        logger.info(
+            "[FixedSplitCL] Starting split retrain configuration: Epochs={}, Learning Rate={}, Batch Size={}, Total Samples={}",
+            effective_num_epoch,
+            effective_learning_rate,
+            bs,
+            len(bundle_info["all_sample_ids"])
+        )
 
         split_retrain_kwargs = {
             "model": get_split_runtime_model(model),
@@ -1185,6 +1300,7 @@ class CloudContinualLearner:
             "das_strategy": self.das_strategy,
             "splitter": prepared_splitter,
             "chosen_candidate": prepared_candidate,
+            "batch_size": bs,
         }
         if gt_annotations and str(current_model_name).lower().startswith("rfdetr_"):
             best_state = baseline_state
@@ -1696,7 +1812,7 @@ class CloudContinualLearner:
         model_name = str(model_name or self.edge_model_name)
         annotation_path = os.path.join(cache_path, "annotation.txt")
         frame_dir = os.path.join(cache_path, "frames")
-        gt_annotations = _load_annotation_targets(annotation_path)
+        gt_annotations = load_annotation_targets(annotation_path)
         return self._retrain_edge_model_with_targets(
             frame_dir=frame_dir,
             frame_ids=frame_indices,

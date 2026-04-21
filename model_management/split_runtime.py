@@ -6,8 +6,9 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
-
+import os
 import torch
+from loguru import logger
 
 from model_management.candidate_generator import enumerate_candidates
 from model_management.graph_ir import (
@@ -40,6 +41,28 @@ def _flatten_tensors(obj: Any) -> list[torch.Tensor]:
         for value in obj.values():
             tensors.extend(_flatten_tensors(value))
     return tensors
+
+
+def _infer_trace_batch_size(graph: GraphIR) -> int:
+    try:
+        for sample in tuple(graph.sample_args) + tuple(graph.sample_kwargs.values()):
+            for tensor in _flatten_tensors(sample):
+                if tensor.ndim > 0:
+                    return max(1, int(tensor.shape[0]))
+    except Exception:
+        return 1
+    return 1
+
+
+def _prod_ints(values: list[int]) -> int | None:
+    prod = 1
+    for value in values:
+        if value == -1:
+            return None
+        if value < 0:
+            return None
+        prod *= int(value)
+    return prod
 
 
 def _coerce_numeric_tensor(obj: Any, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
@@ -402,6 +425,7 @@ class GraphSplitRuntime:
         *,
         clone_parent_labels: set[str] | None = None,
         clone_cache: dict[tuple[str, tuple[Any, ...] | None], Any] | None = None,
+        overall_batch_size: int = 1,
     ) -> Any:
         model, graph = self._ensure_ready()
         node = graph.nodes[label]
@@ -442,11 +466,231 @@ class GraphSplitRuntime:
         )
         args_list = list(args) if isinstance(args, tuple) else list(args)
         kwargs_dict = dict(kwargs)
+
+        trace_batch_size = _infer_trace_batch_size(graph)
+
+        # ==== 动态泛化 Batch Size (仅在 replay batch != trace batch 时启用) ====
+        if overall_batch_size > 1 and trace_batch_size != overall_batch_size:
+            fn_name = node.func_name.lower()
+            
+            # --- 1. 处理 Tensor 的形变操作 (第一个参数是 self tensor) ---
+            if fn_name in ("view", "reshape") and len(args_list) > 1:
+                input_tensor = args_list[0]
+                if hasattr(input_tensor, "shape") and input_tensor.ndim > 0:
+                    candidate_batch_size = overall_batch_size
+                    orig_sh = args_list[1]
+                    patched = False
+                    
+                    # 参数形式 1: args 散装传入 -> tensor.view(4, C, H, W)
+                    if len(args_list) > 2 and isinstance(args_list[1], int):
+                        if all(isinstance(value, int) for value in args_list[1:]):
+                            desired_shape = [int(value) for value in args_list[1:]]
+                            desired_prod = _prod_ints(desired_shape)
+                            if desired_prod is not None:
+                                numel = int(input_tensor.numel())
+                                if desired_prod > 0 and desired_prod != numel and numel % desired_prod == 0:
+                                    factor = numel // desired_prod
+                                    if factor > 1:
+                                        desired_shape[0] = int(desired_shape[0]) * int(factor)
+                                        args_list[1:] = desired_shape
+                                        patched = True
+                        if not patched:
+                            desired = int(args_list[1])
+                            if (
+                                int(getattr(input_tensor, "shape")[0]) == candidate_batch_size
+                                and desired in (1, trace_batch_size)
+                            ):
+                                args_list[1] = candidate_batch_size
+                                patched = True
+                    # 参数形式 2: shape 是 tuple -> tensor.view((4, C, H, W))
+                    elif len(args_list) == 2 and isinstance(args_list[1], (tuple, list, torch.Size)):
+                        c_shape = list(args_list[1])
+                        if c_shape and all(isinstance(item, int) for item in c_shape):
+                            desired_shape = [int(item) for item in c_shape]
+                            desired_prod = _prod_ints(desired_shape)
+                            if desired_prod is not None:
+                                numel = int(input_tensor.numel())
+                                if desired_prod > 0 and desired_prod != numel and numel % desired_prod == 0:
+                                    factor = numel // desired_prod
+                                    if factor > 1:
+                                        desired_shape[0] = int(desired_shape[0]) * int(factor)
+                                        args_list[1] = tuple(desired_shape)
+                                        patched = True
+                        if not patched and (
+                            len(c_shape) > 0
+                            and isinstance(c_shape[0], int)
+                            and int(getattr(input_tensor, "shape")[0]) == candidate_batch_size
+                            and int(c_shape[0]) in (1, trace_batch_size)
+                        ):
+                            c_shape[0] = candidate_batch_size
+                            args_list[1] = tuple(c_shape)
+                            patched = True
+
+                    if patched and os.environ.get("DEBUG_SPLIT_RUNTIME") == "1":
+                        logger.info("[SplitRuntime] shape patch {} @ {}: {} -> {}", fn_name, label, orig_sh, args_list[1])
+
+            elif fn_name in ("repeat", "tile") and len(args_list) > 1:
+                input_tensor = args_list[0]
+                if hasattr(input_tensor, "shape") and input_tensor.ndim > 0:
+                    candidate_batch_size = overall_batch_size
+                    
+                    # For repeat/tile, the arguments are repetition factors.
+                    # If the trace repeated `trace_batch_size` times, it was likely because the input had batch dim = 1.
+                    # If the current input ALREADY has batch dim = candidate_batch_size, we should repeat 1 time, not candidate_batch_size times!
+                    # If it still has batch dim = 1, we should repeat candidate_batch_size times.
+                    
+                    if len(args_list) > 2 and isinstance(args_list[1], int):
+                        factor = int(args_list[1])
+                        if factor == trace_batch_size:
+                            in_batch = int(getattr(input_tensor, "shape")[0])
+                            args_list[1] = 1 if in_batch == candidate_batch_size else candidate_batch_size
+                    
+                    elif len(args_list) == 2 and isinstance(args_list[1], (tuple, list, torch.Size)):
+                        c_shape = list(args_list[1])
+                        if len(c_shape) > 0 and isinstance(c_shape[0], int) and int(c_shape[0]) == trace_batch_size:
+                            in_batch = int(getattr(input_tensor, "shape")[0])
+                            c_shape[0] = 1 if in_batch == candidate_batch_size else candidate_batch_size
+                            args_list[1] = tuple(c_shape)
+                            
+            # --- 2. 处理工厂函数 (无 self tensor, 参数即 shape) ---
+            elif fn_name == "expand" and len(args_list) > 1:
+                input_tensor = args_list[0]
+                if hasattr(input_tensor, "shape") and input_tensor.ndim > 0:
+                    candidate_batch_size = overall_batch_size
+                    orig_sh = args_list[1]
+                    patched = False
+
+                    # tensor.expand(B, ...)
+                    if len(args_list) > 2 and isinstance(args_list[1], int):
+                        desired = int(args_list[1])
+                        if desired in (1, trace_batch_size):
+                            args_list[1] = candidate_batch_size
+                            patched = True
+
+                    # tensor.expand((B, ...))
+                    elif len(args_list) == 2 and isinstance(args_list[1], (tuple, list, torch.Size)):
+                        c_shape = list(args_list[1])
+                        if len(c_shape) > 0 and isinstance(c_shape[0], int) and int(c_shape[0]) in (1, trace_batch_size):
+                            c_shape[0] = candidate_batch_size
+                            args_list[1] = tuple(c_shape)
+                            patched = True
+            elif fn_name in ("zeros", "ones", "empty", "randn", "full"):
+                candidate_batch_size = overall_batch_size
+                orig_sh = None
+                patched = False
+                # 检查 kwargs 里是否有 size
+                if "size" in kwargs_dict and isinstance(kwargs_dict["size"], (list, tuple, torch.Size)):
+                    orig_sh = kwargs_dict["size"]
+                    c_shape = list(kwargs_dict["size"])
+                    if len(c_shape) > 0 and isinstance(c_shape[0], int) and int(c_shape[0]) in (1, trace_batch_size):
+                        c_shape[0] = candidate_batch_size
+                        kwargs_dict["size"] = tuple(c_shape)
+                        patched = True
+                else:
+                    # tuple 形式如 zeros((4, C, H), ...)
+                    if len(args_list) > 0 and isinstance(args_list[0], (tuple, list, torch.Size)):
+                        orig_sh = args_list[0]
+                        c_shape = list(args_list[0])
+                        if len(c_shape) > 0 and isinstance(c_shape[0], int) and int(c_shape[0]) in (1, trace_batch_size):
+                            c_shape[0] = candidate_batch_size
+                            args_list[0] = tuple(c_shape)
+                            patched = True
+                    # 散装形式如 zeros(4, C, H, ...)
+                    elif len(args_list) > 0 and isinstance(args_list[0], int):
+                        orig_sh = args_list[0]
+                        desired = int(args_list[0])
+                        if desired in (1, trace_batch_size):
+                            args_list[0] = candidate_batch_size
+                            patched = True
+                            
+        args = tuple(args_list)
+        # =========================================================================================
+
         try:
             safe_topk = None
             if node.func_name.lower() == "topk":
                 safe_topk = _maybe_call_safe_topk(args_list, kwargs_dict)
-            output = safe_topk if safe_topk is not None else node.func(*args, **kwargs)
+            if node.func_name.lower() == "cat" and overall_batch_size > 1 and trace_batch_size != overall_batch_size:
+                dim = kwargs_dict.get("dim", 0)
+                pieces = args_list[0] if args_list and isinstance(args_list[0], (list, tuple)) else None
+                if pieces and all(hasattr(piece, "ndim") for piece in pieces):
+                    tensors = list(pieces)
+                    try:
+                        ref_ndim = int(tensors[0].ndim)
+                    except AttributeError:
+                        ref_ndim = -1
+                    if ref_ndim > 0 and all(int(getattr(t, "ndim", -1)) == ref_ndim for t in tensors):
+                        if isinstance(dim, int) and dim < 0:
+                            dim = ref_ndim + int(dim)
+                        desired_sizes = [1] * ref_ndim
+                        for axis in range(ref_ndim):
+                            if axis == int(dim):
+                                continue
+                            desired_sizes[axis] = max(int(t.shape[axis]) for t in tensors)
+                        patched = False
+                        patched_tensors: list[torch.Tensor] = []
+                        for t in tensors:
+                            shape = list(t.shape)
+                            expand_shape: list[int] = [-1] * ref_ndim
+                            can_expand = False
+                            for axis in range(ref_ndim):
+                                if axis == int(dim):
+                                    continue
+                                want = int(desired_sizes[axis])
+                                have = int(shape[axis])
+                                if want == have:
+                                    continue
+                                if have == 1 and want > 1:
+                                    expand_shape[axis] = want
+                                    can_expand = True
+                                else:
+                                    can_expand = False
+                                    break
+                            if can_expand:
+                                patched_tensors.append(t.expand(*expand_shape))
+                                patched = True
+                            else:
+                                patched_tensors.append(t)
+                        if patched:
+                            args_list[0] = tuple(patched_tensors) if isinstance(pieces, tuple) else patched_tensors
+            output = safe_topk if safe_topk is not None else node.func(*args, **kwargs_dict)
+        except RuntimeError:
+            if node.func_name.lower() == "cat":
+                dim = kwargs_dict.get("dim", 0)
+                pieces = args_list[0] if args_list and isinstance(args_list[0], (list, tuple)) else ()
+                shapes = [tuple(t.shape) for t in pieces if isinstance(t, torch.Tensor)]
+                mismatch_axes: list[int] = []
+                if shapes:
+                    ref = shapes[0]
+                    ref_ndim = len(ref)
+                    if isinstance(dim, int) and dim < 0:
+                        dim = ref_ndim + int(dim)
+                    for axis in range(ref_ndim):
+                        if axis == int(dim):
+                            continue
+                        sizes = {shape[axis] for shape in shapes if len(shape) == ref_ndim}
+                        if len(sizes) > 1:
+                            mismatch_axes.append(axis)
+                logger.error(
+                    "[SplitRuntime] cat failed @ {} (dim={}) overall_batch_size={} trace_batch_size={} mismatch_axes={} shapes={} parent_labels={}",
+                    label,
+                    dim,
+                    overall_batch_size,
+                    locals().get("trace_batch_size", None),
+                    mismatch_axes,
+                    shapes,
+                    list(getattr(node, "parent_labels", ())),
+                )
+                if True:
+                    parents = {}
+                    for parent_label in getattr(node, "parent_labels", ()):
+                        value = available_tensors.get(parent_label)
+                        if isinstance(value, torch.Tensor):
+                            parents[parent_label] = {"type": "tensor", "shape": tuple(value.shape), "dtype": str(value.dtype)}
+                        else:
+                            parents[parent_label] = {"type": type(value).__name__}
+                    logger.info("[SplitRuntime] cat parent snapshots @ {} -> {}", label, parents)
+            raise
         except IndexError:
             output = _maybe_retry_getitem_with_safe_indexing(node.func, args_list, kwargs_dict)
             if output is None:
@@ -468,6 +712,13 @@ class GraphSplitRuntime:
     ) -> OrderedDict[str, Any]:
         _, graph = self._ensure_ready()
         node_set = set(node_labels)
+        
+        overall_batch_size = 1
+        for val in initial_tensors.values():
+            if isinstance(val, torch.Tensor) and val.ndim > 0:
+                overall_batch_size = val.shape[0]
+                break
+
         available = OrderedDict((label, tensor) for label, tensor in initial_tensors.items())
         remaining_users: dict[str, int] = {label: 0 for label in node_set}
         for label in graph.topological_order:
@@ -496,6 +747,7 @@ class GraphSplitRuntime:
                 available,
                 clone_parent_labels=clone_parent_labels,
                 clone_cache={},
+                overall_batch_size=overall_batch_size,
             )
             for parent in node.parent_labels:
                 if parent in remaining_users:

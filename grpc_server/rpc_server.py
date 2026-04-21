@@ -249,6 +249,8 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
         try:
             request_kind = self._request_kind_for_job_type(int(request.job_type))
+            logger.info("云端 gRPC 服务已收到新的训练请求 (request_id={}, job_type={}), 正在解压/处理发送来的 {} 字节的 ZIP 数据...", request.request_id, request_kind, len(getattr(request, "payload_zip", b"")))
+            
             workspace = prepare_request_workspace(
                 self.workspace_root,
                 edge_id=request.edge_id,

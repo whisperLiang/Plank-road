@@ -36,8 +36,10 @@ class RetrainMetric:
         }
 
     def log_iter(self, epoch, num_epoch, data_loader):
+        batch_size = getattr(data_loader, "batch_size", "unknown")
+        total_samples = len(data_loader.dataset) if hasattr(data_loader, "dataset") else "unknown"
         loop = tqdm(enumerate(data_loader, 1), total=len(data_loader),
-                    desc=f'Epoch [{epoch}/{num_epoch}]')
+                    desc=f'Epoch [{epoch}/{num_epoch}] (BS={batch_size}, total={total_samples})')
 
         self.reset_metrics()
         data_load_time = []

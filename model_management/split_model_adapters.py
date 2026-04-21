@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 
 import cv2
 import numpy as np
@@ -389,11 +389,22 @@ def build_split_training_loss(model: torch.nn.Module):
 
         def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
             logits, pred_boxes = _extract_detr_outputs(outputs)
-            labels = _build_detr_training_labels(
-                targets,
-                device=logits.device,
-                num_labels=int(getattr(core_model.config, "num_labels", logits.shape[-1])),
-            )
+            
+            if isinstance(targets, list):
+                labels = []
+                for target_item in targets:
+                    labels.extend(_build_detr_training_labels(
+                        target_item,
+                        device=logits.device,
+                        num_labels=int(getattr(core_model.config, "num_labels", logits.shape[-1])),
+                    ))
+            else:
+                labels = _build_detr_training_labels(
+                    targets,
+                    device=logits.device,
+                    num_labels=int(getattr(core_model.config, "num_labels", logits.shape[-1])),
+                )
+                
             loss, _, _ = core_model.loss_function(
                 logits,
                 labels,
@@ -419,11 +430,22 @@ def build_split_training_loss(model: torch.nn.Module):
             predictions = _extract_rfdetr_outputs(outputs)
             device = _first_tensor_device(predictions, fallback=next(model.parameters()).device)
             criterion.to(device)
-            labels = _build_rfdetr_training_labels(
-                targets,
-                device=device,
-                num_classes=int(getattr(model, "num_classes", 0)),
-            )
+            
+            if isinstance(targets, list):
+                labels = []
+                for target_item in targets:
+                    labels.extend(_build_rfdetr_training_labels(
+                        target_item,
+                        device=device,
+                        num_classes=int(getattr(model, "num_classes", 0)),
+                    ))
+            else:
+                labels = _build_rfdetr_training_labels(
+                    targets,
+                    device=device,
+                    num_classes=int(getattr(model, "num_classes", 0)),
+                )
+                
             loss_dict = criterion(predictions, labels)
             return sum(loss_dict.values())
 
@@ -433,23 +455,32 @@ def build_split_training_loss(model: torch.nn.Module):
         def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
             head_outputs = _extract_anchor_detector_outputs(outputs)
             device = next(iter(head_outputs.values())).device
-            original_image_size, model_input_size = _infer_original_and_model_input_image_sizes(targets)
-            resize_mode = _resolve_anchor_resize_mode(model, targets)
-            dummy_image = torch.zeros(
-                (3, model_input_size[0], model_input_size[1]),
-                dtype=torch.float32,
-                device=device,
-            )
-            image_targets = [
-                _build_anchor_training_target(
-                    targets,
+            
+            target_list = targets if isinstance(targets, list) else [targets]
+            
+            image_targets = []
+            dummy_images = []
+            
+            for target_item in target_list:
+                original_image_size, model_input_size = _infer_original_and_model_input_image_sizes(target_item)
+                resize_mode = _resolve_anchor_resize_mode(model, target_item)
+                dummy_image = torch.zeros(
+                    (3, model_input_size[0], model_input_size[1]),
+                    dtype=torch.float32,
                     device=device,
-                    original_image_size=original_image_size,
-                    model_input_size=model_input_size,
-                    resize_mode=resize_mode,
                 )
-            ]
-            transformed_images, transformed_targets = model.transform([dummy_image], image_targets)
+                dummy_images.append(dummy_image)
+                image_targets.append(
+                    _build_anchor_training_target(
+                        target_item,
+                        device=device,
+                        original_image_size=original_image_size,
+                        model_input_size=model_input_size,
+                        resize_mode=resize_mode,
+                    )
+                )
+            
+            transformed_images, transformed_targets = model.transform(dummy_images, image_targets)
             features = model.backbone(transformed_images.tensors)
             if isinstance(features, torch.Tensor):
                 features = OrderedDict([("0", features)])
@@ -1393,19 +1424,61 @@ def _prepare_coco80_targets(
 
 
 def _build_ultralytics_training_batch(
-    targets: dict[str, Any],
+    targets: Any,
     *,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    boxes, labels, image_size = _prepare_coco80_targets(targets, device=device)
-    normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=image_size)
-    height, width = image_size
-    return {
-        "img": torch.zeros((1, 3, height, width), dtype=torch.float32, device=device),
-        "batch_idx": torch.zeros((labels.shape[0],), dtype=torch.long, device=device),
-        "cls": labels.to(dtype=torch.float32).view(-1, 1),
-        "bboxes": normalized_boxes.to(dtype=torch.float32),
-    }
+    if isinstance(targets, dict):
+        boxes, labels, image_size = _prepare_coco80_targets(targets, device=device)
+        normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=image_size)
+        height, width = image_size
+        return {
+            "img": torch.zeros((1, 3, height, width), dtype=torch.float32, device=device),
+            "batch_idx": torch.zeros((labels.shape[0],), dtype=torch.long, device=device),
+            "cls": labels.to(dtype=torch.float32).view(-1, 1),
+            "bboxes": normalized_boxes.to(dtype=torch.float32),
+        }
+
+    if isinstance(targets, (list, tuple)) and targets and all(isinstance(item, dict) for item in targets):
+        box_pieces: list[torch.Tensor] = []
+        label_pieces: list[torch.Tensor] = []
+        batch_idx_pieces: list[torch.Tensor] = []
+        image_size: tuple[int, int] | None = None
+        for batch_index, sample_targets in enumerate(targets):
+            boxes, labels, sample_image_size = _prepare_coco80_targets(sample_targets, device=device)
+            if image_size is None:
+                image_size = sample_image_size
+            elif image_size != sample_image_size:
+                raise RuntimeError(
+                    "Wrapper-model split retraining expects a consistent model input size within each batch. "
+                    f"Got {image_size} and {sample_image_size}."
+                )
+            normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=sample_image_size)
+            box_pieces.append(normalized_boxes.to(dtype=torch.float32))
+            label_pieces.append(labels.to(dtype=torch.float32).view(-1, 1))
+            if labels.numel() == 0:
+                batch_idx_pieces.append(torch.zeros((0,), dtype=torch.long, device=device))
+            else:
+                batch_idx_pieces.append(torch.full((labels.shape[0],), int(batch_index), dtype=torch.long, device=device))
+
+        height, width = image_size if image_size is not None else (224, 224)
+        bboxes = torch.cat(box_pieces, dim=0) if box_pieces else torch.zeros((0, 4), dtype=torch.float32, device=device)
+        cls = torch.cat(label_pieces, dim=0) if label_pieces else torch.zeros((0, 1), dtype=torch.float32, device=device)
+        batch_idx = (
+            torch.cat(batch_idx_pieces, dim=0)
+            if batch_idx_pieces
+            else torch.zeros((0,), dtype=torch.long, device=device)
+        )
+        return {
+            "img": torch.zeros((len(targets), 3, height, width), dtype=torch.float32, device=device),
+            "batch_idx": batch_idx,
+            "cls": cls,
+            "bboxes": bboxes,
+        }
+
+    raise RuntimeError(
+        "Split training targets must be a dict or a non-empty list of dicts for wrapper-model loss computation."
+    )
 
 
 def _build_detr_training_labels(

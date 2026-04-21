@@ -142,7 +142,12 @@ class Object_Detection:
         set_detection_trainable_params(tmp_model, self.model_name)
 
         dataset = TrafficDataset(root=path, select_index = select_index)
-        data_loader = DataLoader(dataset=dataset, batch_size=2, collate_fn=_collate_fn, )
+        batch_size = getattr(self.config.client.retrain, "batch_size", 2) if hasattr(self.config, "client") else getattr(self.config.retrain, "batch_size", 2)
+        data_loader = DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            collate_fn=_collate_fn,
+        )
         tr_metric = RetrainMetric()
 
         # Use a smaller learning rate for fine-tuning

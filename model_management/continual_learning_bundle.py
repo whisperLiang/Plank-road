@@ -115,6 +115,7 @@ def prepare_split_training_cache(
     target_cache_path: str,
     *,
     feature_provider: Callable[[str, dict[str, Any], dict[str, Any]], Any] | None = None,
+    batch_feature_provider: Callable[[list[str], list[dict[str, Any]], dict[str, Any]], list[Any]] | None = None,
     prefer_feature_rebuild: bool = False,
 ) -> dict[str, Any]:
     manifest = load_training_bundle_manifest(bundle_root)
@@ -123,6 +124,9 @@ def prepare_split_training_cache(
     all_sample_ids: list[str] = []
     drift_sample_ids: list[str] = []
     split_plan = dict(manifest.get("split_plan", {}))
+
+    pending_rebuilds = []
+    processed_items = []
 
     for sample in manifest.get("samples", []):
         sample_id = str(sample["sample_id"])
@@ -150,17 +154,20 @@ def prepare_split_training_cache(
             if raw_relpath is not None
             else None
         )
+        needs_rebuild = False
+        intermediate = None
+
         if bundled_feature and not prefer_feature_rebuild:
             intermediate = _load_intermediate(
                 os.path.join(bundle_root, bundled_feature.replace("/", os.sep))
             )
             if not _payload_matches_split_plan(intermediate, split_plan):
-                if raw_path is not None and feature_provider is not None:
+                if raw_path is not None and (feature_provider is not None or batch_feature_provider is not None):
                     logger.warning(
                         "Rebuilding bundled sample {} features because payload split metadata does not match the manifest split plan.",
                         sample_id,
                     )
-                    intermediate = feature_provider(raw_path, sample, manifest)
+                    needs_rebuild = True
                 else:
                     logger.warning(
                         "Skipping bundled sample {} because payload split metadata does not match the manifest split plan and no raw sample is available for reconstruction.",
@@ -182,7 +189,7 @@ def prepare_split_training_cache(
                     sample_id,
                 )
             else:
-                if raw_relpath is None or feature_provider is None:
+                if raw_relpath is None or (feature_provider is None and batch_feature_provider is None):
                     raise RuntimeError(
                         f"Sample {sample_id} requires server-side feature reconstruction, "
                         "but no feature provider is configured."
@@ -192,7 +199,60 @@ def prepare_split_training_cache(
                         "Rebuilding bundled sample {} features on the server because this model requires trace-stable payloads.",
                         sample_id,
                     )
-                intermediate = feature_provider(raw_path, sample, manifest)
+                needs_rebuild = True
+
+        if needs_rebuild:
+            pending_rebuilds.append({
+                "sample": sample,
+                "raw_path": raw_path,
+                "inference_result": inference_result,
+                "sample_id": sample_id
+            })
+        else:
+            processed_items.append({
+                "sample": sample,
+                "inference_result": inference_result,
+                "sample_id": sample_id,
+                "intermediate": intermediate
+            })
+
+    # Rebuild pending samples one-by-one. Wrapper detection models can have
+    # trace-batch-size dependent output structures, so batched rebuilds are
+    # not guaranteed to succeed even when single-sample rebuild works.
+    if pending_rebuilds:
+        logger.info(
+            "[Rebuild] Detected {} samples needing feature rebuild. Using single-sample reconstruction.",
+            len(pending_rebuilds),
+        )
+        for idx, pending in enumerate(pending_rebuilds, start=1):
+            if feature_provider is not None:
+                intermediate = feature_provider(pending["raw_path"], pending["sample"], manifest)
+            elif batch_feature_provider is not None:
+                rebuilt = batch_feature_provider([pending["raw_path"]], [pending["sample"]], manifest)
+                if not rebuilt:
+                    raise RuntimeError(f"Batch feature provider returned no payloads for sample {pending['sample_id']}.")
+                intermediate = rebuilt[0]
+            else:
+                raise RuntimeError(
+                    f"Sample {pending['sample_id']} requires server-side feature reconstruction, "
+                    "but no feature provider is configured."
+                )
+
+            processed_items.append({
+                "sample": pending["sample"],
+                "inference_result": pending["inference_result"],
+                "sample_id": pending["sample_id"],
+                "intermediate": intermediate,
+            })
+
+            if idx % 10 == 0 or idx == len(pending_rebuilds):
+                logger.info("[Rebuild] Progress: {}/{} samples rebuilt.", idx, len(pending_rebuilds))
+
+    for item in processed_items:
+        sample = item["sample"]
+        sample_id = item["sample_id"]
+        inference_result = item["inference_result"]
+        intermediate = item["intermediate"]
 
         copied_raw = _copy_raw_sample(
             bundle_root,

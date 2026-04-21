@@ -46,12 +46,13 @@ client:
  retrain:
   flag: True
   num_epoch: 2
+  batch_size: 2
   # Grace window for async cloud job status polling. A submitted job can be
   # briefly invisible if the cloud endpoint reconnects or routes to a different
   # worker; the edge keeps polling within this window before treating it as lost.
   status_not_found_grace_sec: 60
   cache_path: './cache'
-  collect_num: 80
+  collect_num: 8
  # drift detection
  drift_detection:
   # Fallback confidence threshold for edge-side sample bucketing when full quality signals are unavailable
@@ -126,7 +127,7 @@ client:
   # --- Shared with drift_detection (PD urgency controller) ---
   # Conservative profile: delay CL until enough evidence accumulates and let
   # the Q_cloud/Q_bw penalties suppress repeated training decisions.
-  V: 5.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
+  V: 10.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
   K_p: 0.6              # PD proportional gain
   K_d: 0.2              # PD derivative gain
   # confidence_threshold: 0.8
@@ -175,6 +176,9 @@ server:
  # continual learning settings
  continual_learning:
   num_epoch: 5
+  batch_size: 16
+  min_wrapper_fixed_split_num_epoch: 10
+  min_rfdetr_fixed_split_num_epoch: 10
   max_concurrent_jobs: 4
   # Cloud-side teacher threshold used only for GT annotation during
   # continual learning. Lower values recover more small/far objects but
@@ -192,7 +196,7 @@ server:
  # Importance = gradient_norm / sqrt(numel) × log(M_total / M_layer)).
  # Layers with higher TGI keep more activations.
  das:
-  enabled: True
+  enabled: False
   # bn_only: True → only BN parameters are updated; Conv/FC weight
   #   gradients are blocked.  Useful for conservative adaptation.
   bn_only: False
