@@ -767,6 +767,106 @@ def test_apply_split_plan_prefers_canonical_split_selectors_before_candidate_id(
     ]
 
 
+def test_apply_split_plan_prefers_enumerated_split_index_candidate_over_legacy_fallback():
+    plan = SplitPlan(
+        split_config_id="plan-legacy",
+        model_name="dummy-model",
+        candidate_id="candidate-edge",
+        split_index=7,
+        split_label="edge-boundary",
+        boundary_tensor_labels=["missing-boundary"],
+        payload_bytes=128,
+        privacy_metric=0.4,
+        privacy_risk=0.6,
+        layer_freezing_ratio=0.5,
+        constraints={
+            "max_candidates": 8,
+            "max_boundary_count": 4,
+            "max_payload_bytes": 1024,
+        },
+        trace_signature="sig",
+    )
+
+    best_match = SplitCandidate(
+        candidate_id="candidate-batch-compatible",
+        edge_nodes=["edge-boundary"],
+        cloud_nodes=["cloud"],
+        boundary_edges=[("edge-boundary", "cloud")],
+        boundary_tensor_labels=["edge-boundary"],
+        edge_input_labels=["input"],
+        cloud_input_labels=[],
+        cloud_output_labels=["cloud"],
+        estimated_edge_flops=1.0,
+        estimated_cloud_flops=1.0,
+        estimated_payload_bytes=128,
+        estimated_privacy_risk=0.2,
+        estimated_latency=1.0,
+        is_trainable_tail=True,
+        legacy_layer_index=7,
+        boundary_count=1,
+    )
+    weaker_match = SplitCandidate(
+        candidate_id="candidate-weaker",
+        edge_nodes=["aux", "edge-boundary"],
+        cloud_nodes=["cloud"],
+        boundary_edges=[("aux", "cloud"), ("edge-boundary", "cloud")],
+        boundary_tensor_labels=["aux", "edge-boundary"],
+        edge_input_labels=["input"],
+        cloud_input_labels=[],
+        cloud_output_labels=["cloud"],
+        estimated_edge_flops=1.0,
+        estimated_cloud_flops=1.0,
+        estimated_payload_bytes=512,
+        estimated_privacy_risk=0.2,
+        estimated_latency=1.0,
+        is_trainable_tail=True,
+        legacy_layer_index=7,
+        boundary_count=2,
+    )
+
+    class EnumeratedRuntime:
+        def __init__(self):
+            self.calls = []
+            self.candidates = []
+            self._candidate_enumeration_config = None
+
+        def enumerate_candidates(self, *, max_candidates, max_boundary_count, max_payload_bytes):
+            self.calls.append(
+                (
+                    int(max_candidates),
+                    int(max_boundary_count),
+                    int(max_payload_bytes),
+                )
+            )
+            self.candidates = [weaker_match, best_match]
+            self._candidate_enumeration_config = (
+                int(max_candidates),
+                int(max_boundary_count),
+                int(max_payload_bytes),
+            )
+            return list(self.candidates)
+
+        def split(
+            self,
+            *,
+            boundary_tensor_labels=None,
+            layer_label=None,
+            layer_index=None,
+            candidate_id=None,
+        ):
+            if boundary_tensor_labels is not None or layer_label is not None:
+                raise KeyError("fallback")
+            if layer_index is not None:
+                return "legacy-fallback"
+            if candidate_id is not None:
+                return "candidate-fallback"
+            raise AssertionError("Unexpected split selector.")
+
+    runtime = EnumeratedRuntime()
+    assert apply_split_plan(runtime, plan) is best_match
+    assert runtime.calls == [(8, 4, 1024)]
+
+
 def test_high_confidence_sample_saves_feature_and_result_without_raw(tmp_path):
     store = EdgeSampleStore(str(tmp_path))
     record = store.store_sample(

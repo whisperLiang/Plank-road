@@ -338,6 +338,47 @@ def _fallback_candidate_pool(
     return list(current_candidates or [])
 
 
+def _constraints_from_plan(plan: SplitPlan) -> SplitConstraints:
+    payload = dict(plan.constraints or {})
+    return SplitConstraints(
+        privacy_leakage_upper_bound=float(payload.get("privacy_leakage_upper_bound", 0.0)),
+        max_layer_freezing_ratio=float(payload.get("max_layer_freezing_ratio", 1.0)),
+        validate_candidates=bool(payload.get("validate_candidates", True)),
+        max_candidates=int(payload.get("max_candidates", 24)),
+        max_boundary_count=int(payload.get("max_boundary_count", 8)),
+        max_payload_bytes=int(payload.get("max_payload_bytes", 32 * 1024 * 1024)),
+        privacy_leakage_epsilon=float(payload.get("privacy_leakage_epsilon", 1e-12)),
+    )
+
+
+def _plan_candidate_pool(
+    runtime: UniversalModelSplitter,
+    plan: SplitPlan,
+) -> list[SplitCandidate]:
+    constraints = _constraints_from_plan(plan)
+    return _fallback_candidate_pool(runtime, constraints)
+
+
+def _split_index_candidate_key(
+    candidate: SplitCandidate,
+    plan: SplitPlan,
+) -> tuple[int, int, int, int, int, int, str]:
+    candidate_split_label = (
+        candidate.boundary_tensor_labels[-1]
+        if candidate.boundary_tensor_labels
+        else None
+    )
+    return (
+        0 if plan.boundary_count and int(candidate.boundary_count) == int(plan.boundary_count) else 1,
+        0 if int(plan.payload_bytes or 0) > 0 and int(candidate.estimated_payload_bytes) == int(plan.payload_bytes) else 1,
+        0 if plan.split_label is not None and str(candidate_split_label) == str(plan.split_label) else 1,
+        0 if plan.candidate_id is not None and str(candidate.candidate_id) == str(plan.candidate_id) else 1,
+        int(candidate.estimated_payload_bytes),
+        int(candidate.boundary_count),
+        str(candidate.candidate_id),
+    )
+
+
 def _enumerate_feasible_candidates(
     runtime: UniversalModelSplitter,
     constraints: SplitConstraints,
@@ -576,6 +617,7 @@ def _profile_from_report(
 
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
     attempts: list[str] = []
+    candidate_pool = _plan_candidate_pool(splitter, plan)
 
     if plan.boundary_tensor_labels:
         try:
@@ -591,6 +633,15 @@ def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> Split
         except KeyError as exc:
             attempts.append(f"split_label={plan.split_label!r} ({exc})")
     if plan.split_index is not None:
+        indexed_matches = [
+            item
+            for item in candidate_pool
+            if item.legacy_layer_index is not None
+            and int(item.legacy_layer_index) == int(plan.split_index)
+        ]
+        if indexed_matches:
+            indexed_matches.sort(key=lambda item: _split_index_candidate_key(item, plan))
+            return indexed_matches[0]
         try:
             return splitter.split(layer_index=plan.split_index)
         except KeyError as exc:
