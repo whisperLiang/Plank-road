@@ -1,24 +1,24 @@
 
 import argparse
-import copy
 import base64
+import copy
 import hashlib
 import io
 import json
 import os
-import re
 import random
+import re
 import shutil
 import threading
 import time
 from collections import OrderedDict
-from contextlib import contextmanager
 from collections.abc import Mapping
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
 import torch
-from datetime import datetime
+from datetime import datetime, timezone
 import grpc
 from concurrent import futures
 from torch.utils.data import DataLoader
@@ -134,6 +134,10 @@ def _working_cache_manifest_path(working_cache: str) -> str:
 
 def _working_cache_metadata_index_path(working_cache: str) -> str:
     return os.path.join(working_cache, "metadata_index.json")
+
+
+def _sanitize_cache_segment(value: object) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value).strip()) or "unknown"
 
 
 def _can_deserialize_split_feature_cache(cache_path: str, sample_id: str) -> bool:
@@ -353,6 +357,36 @@ def _prediction_from_model_output(
     }
 
 
+def _batched_predictions_from_model_output(
+    output: object,
+    *,
+    batch_size: int,
+    threshold_low: float = 0.2,
+    threshold_high: float = 0.6,
+) -> list[dict[str, list]]:
+    empty = {"labels": [], "boxes": [], "scores": []}
+    if isinstance(output, tuple):
+        output = output[0]
+    if isinstance(output, Mapping):
+        outputs = [output]
+    elif isinstance(output, (list, tuple)):
+        outputs = list(output)
+    else:
+        outputs = []
+
+    if len(outputs) != int(batch_size) or not all(isinstance(item, Mapping) for item in outputs):
+        return [dict(empty) for _ in range(int(batch_size))]
+
+    return [
+        _prediction_from_model_output(
+            item,
+            threshold_low=threshold_low,
+            threshold_high=threshold_high,
+        )
+        for item in outputs
+    ]
+
+
 def _evaluate_detection_proxy_map(
     model: torch.nn.Module,
     *,
@@ -365,6 +399,7 @@ def _evaluate_detection_proxy_map(
     sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
     frame_cache: dict[str, np.ndarray | None] | None = None,
     max_samples: int | None = None,
+    inference_batch_size: int = 1,
 ) -> dict[str, float | int | None]:
     sample_ids = _normalize_proxy_sample_ids(
         gt_annotations,
@@ -382,45 +417,56 @@ def _evaluate_detection_proxy_map(
             str(model_name or getattr(model, "model_name", "")),
         )
 
+    pending_samples: list[tuple[str, list[object], list[object], np.ndarray]] = []
+    for sample_id in sample_ids:
+        target = gt_annotations.get(sample_id) or {}
+        gt_boxes = list(target.get("boxes") or [])
+        gt_labels = list(target.get("labels") or [])
+        if not gt_boxes or not gt_labels:
+            skipped_empty_gt += 1
+            continue
+
+        frame_path = os.path.join(frame_dir, f"{sample_id}.jpg")
+        if not os.path.exists(frame_path):
+            skipped_missing_frame += 1
+            continue
+
+        frame = _load_proxy_eval_frame(
+            frame_dir,
+            sample_id,
+            frame_cache=frame_cache,
+        )
+        if frame is None:
+            skipped_missing_frame += 1
+            continue
+        pending_samples.append((sample_id, gt_boxes, gt_labels, frame))
+
     _set_detection_model_eval_mode(model)
     with torch.no_grad():
-        for sample_id in sample_ids:
-            target = gt_annotations.get(sample_id) or {}
-            gt_boxes = list(target.get("boxes") or [])
-            gt_labels = list(target.get("labels") or [])
-            if not gt_boxes or not gt_labels:
-                skipped_empty_gt += 1
-                continue
-
-            frame_path = os.path.join(frame_dir, f"{sample_id}.jpg")
-            if not os.path.exists(frame_path):
-                skipped_missing_frame += 1
-                continue
-
-            frame = _load_proxy_eval_frame(
-                frame_dir,
-                sample_id,
-                frame_cache=frame_cache,
-            )
-            if frame is None:
-                skipped_missing_frame += 1
-                continue
-
-            prediction = _prediction_from_model_output(
-                model([_prepare_eval_image_tensor(frame, device=device)]),
+        batch_size = max(1, int(inference_batch_size))
+        for start in range(0, len(pending_samples), batch_size):
+            batch = pending_samples[start : start + batch_size]
+            batch_inputs = [
+                _prepare_eval_image_tensor(frame, device=device)
+                for _, _, _, frame in batch
+            ]
+            predictions = _batched_predictions_from_model_output(
+                model(batch_inputs),
+                batch_size=len(batch),
                 threshold_low=threshold_low,
                 threshold_high=threshold_high,
             )
-            predicted_boxes = list(prediction.get("boxes") or [])
-            total_prediction_boxes += len(predicted_boxes)
-            if predicted_boxes:
-                nonempty_predictions += 1
-            score = calculate_map(
-                {"labels": gt_labels, "boxes": gt_boxes},
-                prediction,
-                0.5,
-            )
-            scores.append(float(score))
+            for (_, gt_boxes, gt_labels, _), prediction in zip(batch, predictions):
+                predicted_boxes = list(prediction.get("boxes") or [])
+                total_prediction_boxes += len(predicted_boxes)
+                if predicted_boxes:
+                    nonempty_predictions += 1
+                score = calculate_map(
+                    {"labels": gt_labels, "boxes": gt_boxes},
+                    prediction,
+                    0.5,
+                )
+                scores.append(float(score))
 
     return {
         "map": float(np.mean(scores)) if scores else None,
@@ -515,6 +561,7 @@ def _calibrate_tinynext_proxy_thresholds(
     frame_cache: dict[str, np.ndarray | None] | None = None,
     max_samples: int | None = None,
     candidate_thresholds: list[float] | None = None,
+    inference_batch_size: int = 1,
 ) -> tuple[dict[str, float | int | None], float, float]:
     current_low, current_high = get_model_detection_thresholds(model, model_name)
     _, default_high = get_detection_thresholds(model_name)
@@ -536,6 +583,7 @@ def _calibrate_tinynext_proxy_thresholds(
         threshold_high=current_high,
         frame_cache=frame_cache,
         max_samples=max_samples,
+        inference_batch_size=inference_batch_size,
     )
 
     for candidate_high in candidate_highs:
@@ -549,6 +597,7 @@ def _calibrate_tinynext_proxy_thresholds(
             threshold_high=candidate_high,
             frame_cache=frame_cache,
             max_samples=max_samples,
+            inference_batch_size=inference_batch_size,
         )
         if _proxy_metrics_are_better(candidate_metrics, best_metrics):
             best_metrics = candidate_metrics
@@ -716,6 +765,14 @@ class CloudContinualLearner:
             bool(getattr(cl_cfg, "proxy_eval_frame_cache_enabled", True))
             if cl_cfg else True
         )
+        self.workspace_root = os.path.abspath(
+            str(getattr(config, "workspace_root", "./cache/server_workspace"))
+        )
+        self.fixed_split_cache_root = os.path.join(
+            self.workspace_root,
+            "fixed_split_working_cache",
+        )
+        os.makedirs(self.fixed_split_cache_root, exist_ok=True)
 
         # Dynamic Activation Sparsity (SURGEON) config
         das_cfg = getattr(config, "das", None)
@@ -741,6 +798,19 @@ class CloudContinualLearner:
                 lock = threading.Lock()
                 self._edge_locks[edge_key] = lock
             return lock
+
+    def _fixed_split_working_cache_path(
+        self,
+        *,
+        edge_id: int | str,
+        model_name: str,
+    ) -> str:
+        return os.path.join(
+            self.fixed_split_cache_root,
+            f"edge_{_sanitize_cache_segment(edge_id)}",
+            _sanitize_cache_segment(model_name),
+            "working_cache",
+        )
 
     @contextmanager
     def _training_job_scope(self, edge_id: int | str):
@@ -1324,7 +1394,11 @@ class CloudContinualLearner:
             "all_sample_ids": list(bundle_info.get("all_sample_ids", [])),
             "drift_sample_ids": list(bundle_info.get("drift_sample_ids", [])),
             "cache_reused": bool(cache_reused),
-            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "updated_at": (
+                datetime.now(timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            ),
         }
         _write_json_file(
             _working_cache_manifest_path(working_cache),
@@ -1578,6 +1652,7 @@ class CloudContinualLearner:
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
         frame_cache: dict[str, np.ndarray | None] | None = None,
         max_samples: int | None = None,
+        inference_batch_size: int | None = None,
     ) -> dict[str, float | int | None]:
         return _evaluate_detection_proxy_map(
             model,
@@ -1588,6 +1663,11 @@ class CloudContinualLearner:
             sample_metadata_by_id=sample_metadata_by_id,
             frame_cache=frame_cache,
             max_samples=max_samples,
+            inference_batch_size=(
+                self.batch_size
+                if inference_batch_size is None
+                else inference_batch_size
+            ),
         )
 
     @staticmethod
@@ -1813,6 +1893,7 @@ class CloudContinualLearner:
                 sample_metadata_by_id=sample_metadata_by_id,
                 frame_cache=proxy_eval_frame_cache,
                 max_samples=self.proxy_eval_max_samples,
+                inference_batch_size=self.batch_size,
             )
             proxy_metrics_cache[state_key] = dict(metrics)
             return dict(metrics)
@@ -1867,6 +1948,7 @@ class CloudContinualLearner:
                     frame_cache=proxy_eval_frame_cache,
                     max_samples=self.proxy_eval_max_samples,
                     candidate_thresholds=self.proxy_eval_threshold_candidates,
+                    inference_batch_size=self.batch_size,
                 )
                 if abs(calibrated_high - initial_high) > 1e-6:
                     logger.info(
@@ -2020,7 +2102,10 @@ class CloudContinualLearner:
                     model_name=current_model_name,
                     edge_id=edge_id,
                 )
-                working_cache = os.path.join(bundle_cache_path, "working_cache")
+                working_cache = self._fixed_split_working_cache_path(
+                    edge_id=edge_id,
+                    model_name=current_model_name,
+                )
                 stage_started = time.perf_counter()
                 (
                     bundle_info,
@@ -2066,6 +2151,7 @@ class CloudContinualLearner:
                         frame_cache=proxy_eval_frame_cache,
                         max_samples=self.proxy_eval_max_samples,
                         candidate_thresholds=self.proxy_eval_threshold_candidates,
+                        inference_batch_size=self.batch_size,
                     )
                     if abs(calibrated_high - initial_high) > 1e-6:
                         logger.info(
@@ -2143,6 +2229,7 @@ class CloudContinualLearner:
                                 frame_cache=proxy_eval_frame_cache,
                                 max_samples=self.proxy_eval_max_samples,
                                 candidate_thresholds=self.proxy_eval_threshold_candidates,
+                                inference_batch_size=self.batch_size,
                             )
                             if abs(calibrated_high - initial_high) > 1e-6:
                                 logger.info(

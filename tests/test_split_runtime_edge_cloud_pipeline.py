@@ -594,6 +594,51 @@ def test_proxy_eval_ignores_resize_metadata_and_uses_raw_frame_coordinates(tmp_p
     assert metrics["evaluated_samples"] == 1
 
 
+def test_proxy_eval_batches_model_forward_calls(tmp_path):
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    gt_annotations = {}
+    for index in range(5):
+        sample_id = f"sample-{index}"
+        assert cv2.imwrite(
+            str(frame_dir / f"{sample_id}.jpg"),
+            np.zeros((64, 64, 3), dtype=np.uint8),
+        )
+        gt_annotations[sample_id] = {
+            "boxes": [[8.0, 8.0, 48.0, 48.0]],
+            "labels": [1],
+        }
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, images):
+            self.forward_calls += 1
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[8.0, 8.0, 48.0, 48.0]], dtype=torch.float32),
+                    "scores": torch.tensor([0.95], dtype=torch.float32),
+                }
+                for _ in images
+            ]
+
+    model = DummyModel()
+    metrics = _evaluate_detection_proxy_map(
+        model,
+        frame_dir=str(frame_dir),
+        gt_annotations=gt_annotations,
+        device=torch.device("cpu"),
+        inference_batch_size=2,
+    )
+
+    assert model.forward_calls == 3
+    assert metrics["evaluated_samples"] == 5
+    assert metrics["map"] == pytest.approx(1.0)
+
+
 def test_cloud_learner_edge_scoped_cache_paths_are_isolated(tmp_path):
     config = SimpleNamespace(
         edge_model_name="yolo26n",
@@ -614,6 +659,31 @@ def test_cloud_learner_edge_scoped_cache_paths_are_isolated(tmp_path):
     assert edge_one.endswith("tmp_edge_model_yolo26n_edge_1.pth")
     assert edge_two.endswith("tmp_edge_model_yolo26n_edge_2.pth")
     assert legacy.endswith("tmp_edge_model_yolo26n.pth")
+
+
+def test_fixed_split_working_cache_paths_are_stable_across_request_bundles(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        workspace_root=str(workspace_root),
+        continual_learning=SimpleNamespace(max_concurrent_jobs=2),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    edge_one_a = learner._fixed_split_working_cache_path(edge_id=1, model_name="rfdetr_nano")
+    edge_one_b = learner._fixed_split_working_cache_path(edge_id="1", model_name="rfdetr_nano")
+    edge_two = learner._fixed_split_working_cache_path(edge_id=2, model_name="rfdetr_nano")
+    other_model = learner._fixed_split_working_cache_path(edge_id=1, model_name="tinynext_s")
+
+    assert edge_one_a == edge_one_b
+    assert edge_one_a != edge_two
+    assert edge_one_a != other_model
+    assert edge_one_a.startswith(str(workspace_root / "fixed_split_working_cache"))
+    assert edge_one_a.endswith(os.path.join("edge_1", "rfdetr_nano", "working_cache"))
 
 
 def test_cloud_learner_training_scope_serializes_same_edge_but_allows_other_edges():
