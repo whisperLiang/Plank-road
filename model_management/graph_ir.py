@@ -29,6 +29,7 @@ _IMMUTABLE_TRACE_METADATA_TYPES = (
     slice,
 )
 _TORCHLENS_OUTPUT_CAPTURE_LOCK = threading.Lock()
+_PARENT_REF_RECOVERY_MAX_FLOAT_NUMEL = 16384
 
 
 def _get_attr(obj: Any, *names: str, default: Any = None) -> Any:
@@ -1121,6 +1122,16 @@ def _find_matching_parent_ref(
     return None
 
 
+def _should_try_parent_ref_recovery(tensor: torch.Tensor) -> bool:
+    if tensor.requires_grad:
+        return True
+    if tensor.ndim == 0:
+        return True
+    if not tensor.is_floating_point():
+        return True
+    return int(tensor.numel()) <= _PARENT_REF_RECOVERY_MAX_FLOAT_NUMEL
+
+
 def _build_arg_templates(
     layer: Any,
     *,
@@ -1273,6 +1284,8 @@ def _build_arg_templates(
     kwarg_template = _mark(creation_kwargs, "kwargs", ())
 
     for path, tensor_const in list(_iter_constant_tensor_paths(arg_template)):
+        if not _should_try_parent_ref_recovery(tensor_const.tensor):
+            continue
         parent_ref = _find_matching_parent_ref(
             tensor_const.tensor,
             current_label=current_label,
@@ -1286,6 +1299,8 @@ def _build_arg_templates(
         inferred_parent_labels.append(parent_ref.parent_label)
 
     for path, tensor_const in list(_iter_constant_tensor_paths(kwarg_template)):
+        if not _should_try_parent_ref_recovery(tensor_const.tensor):
+            continue
         parent_ref = _find_matching_parent_ref(
             tensor_const.tensor,
             current_label=current_label,

@@ -252,6 +252,16 @@ def test_remap_parent_refs_updates_parent_tensor_labels():
     assert remapped["payload"].path == ("x",)
 
 
+def test_parent_ref_recovery_skips_large_float_tensors_but_keeps_structural_tensors():
+    large_float = torch.zeros(8, 96, 96, 6, dtype=torch.float32)
+    small_float = torch.zeros(8, 8, 8, dtype=torch.float32)
+    scalar_index = torch.tensor(1, dtype=torch.int64)
+
+    assert not graph_ir._should_try_parent_ref_recovery(large_float)
+    assert graph_ir._should_try_parent_ref_recovery(small_float)
+    assert graph_ir._should_try_parent_ref_recovery(scalar_index)
+
+
 def test_runtime_trace_cleans_up_raw_torchlens_history(monkeypatch):
     model, sample = _make_sequential_model()
     cleanup_called = False
