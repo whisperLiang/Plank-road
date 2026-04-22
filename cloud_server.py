@@ -5,6 +5,7 @@ import copy
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import re
@@ -791,6 +792,10 @@ class CloudContinualLearner:
             float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
             if cl_cfg else 1e-4
         )
+        self.rfdetr_fixed_split_target_steps_per_round = (
+            int(getattr(cl_cfg, "rfdetr_fixed_split_target_steps_per_round", 4))
+            if cl_cfg else 4
+        )
         raw_proxy_eval_max_samples = getattr(cl_cfg, "proxy_eval_max_samples", None) if cl_cfg else None
         self.proxy_eval_max_samples = (
             None
@@ -1467,8 +1472,13 @@ class CloudContinualLearner:
         model: torch.nn.Module,
         bundle_root: str,
         manifest: dict[str, object],
+        *,
+        runtime_batch_size: int | None = None,
     ) -> torch.Tensor:
-        batch_target = max(1, int(self.batch_size))
+        batch_target = max(
+            1,
+            int(self.batch_size if runtime_batch_size is None else runtime_batch_size),
+        )
         prepared_inputs: list[torch.Tensor] = []
 
         for sample in manifest.get("samples", []):
@@ -1575,12 +1585,14 @@ class CloudContinualLearner:
         bundle_root: str,
         splitter: UniversalModelSplitter | None = None,
         candidate=None,
+        runtime_batch_size: int | None = None,
     ):
         if splitter is None or candidate is None:
             splitter, candidate = self._build_bundle_splitter(
                 model,
                 manifest,
                 bundle_root=bundle_root,
+                runtime_batch_size=runtime_batch_size,
             )
 
         def _batch_provider(raw_paths: list[str], samples: list[dict[str, object]], manifest_payload: dict[str, object]):
@@ -1592,7 +1604,10 @@ class CloudContinualLearner:
                 )
 
             payloads: list[SplitPayload] = []
-            chunk_size = max(1, int(self.batch_size))
+            chunk_size = max(
+                1,
+                int(self.batch_size if runtime_batch_size is None else runtime_batch_size),
+            )
             for offset in range(0, len(raw_paths), chunk_size):
                 chunk_paths = raw_paths[offset:offset + chunk_size]
                 chunk_samples = samples[offset:offset + chunk_size]
@@ -1631,13 +1646,18 @@ class CloudContinualLearner:
         *,
         model_name: str,
         manifest: Mapping[str, object],
+        runtime_batch_size: int | None = None,
     ) -> FixedSplitRuntimeTemplateKey:
         split_plan = dict(manifest.get("split_plan", {}))
         trace_image_size = self._infer_bundle_trace_image_size(dict(manifest))
+        batch_size = max(
+            1,
+            int(self.batch_size if runtime_batch_size is None else runtime_batch_size),
+        )
         trace_input_shape = None
         if trace_image_size is not None:
             trace_input_shape = (
-                max(1, int(self.batch_size)),
+                batch_size,
                 3,
                 int(trace_image_size[0]),
                 int(trace_image_size[1]),
@@ -1646,7 +1666,7 @@ class CloudContinualLearner:
             model_name=str(model_name),
             trace_image_size=trace_image_size,
             trace_input_shape=trace_input_shape,
-            trace_batch_size=max(1, int(self.batch_size)),
+            trace_batch_size=batch_size,
             split_plan_hash=_json_fingerprint(split_plan),
             version=FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION,
         )
@@ -1659,6 +1679,7 @@ class CloudContinualLearner:
         bundle_root: str,
         template_key: FixedSplitRuntimeTemplateKey,
         trace_sample_input: torch.Tensor | None = None,
+        runtime_batch_size: int | None = None,
     ) -> FixedSplitRuntimeTemplate:
         split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
         splitter = UniversalModelSplitter(device=self.device)
@@ -1669,6 +1690,7 @@ class CloudContinualLearner:
                 model,
                 bundle_root,
                 manifest,
+                runtime_batch_size=runtime_batch_size,
             )
         splitter.trace_graph(split_model, sample_input)
         if splitter.graph is None:
@@ -1743,11 +1765,13 @@ class CloudContinualLearner:
         *,
         bundle_root: str,
         trace_sample_input: torch.Tensor | None = None,
+        runtime_batch_size: int | None = None,
     ) -> FixedSplitRuntimeTemplateLookup:
         model_name = self._resolve_fixed_split_model_name(manifest)
         template_key = self._fixed_split_runtime_template_key(
             model_name=model_name,
             manifest=manifest,
+            runtime_batch_size=runtime_batch_size,
         )
         logger.info(
             "[FixedSplitCL] runtime template cache key={}.",
@@ -1761,6 +1785,7 @@ class CloudContinualLearner:
                 bundle_root=bundle_root,
                 template_key=template_key,
                 trace_sample_input=trace_sample_input,
+                runtime_batch_size=runtime_batch_size,
             ),
         )
 
@@ -1792,12 +1817,14 @@ class CloudContinualLearner:
         *,
         bundle_root: str,
         trace_sample_input: torch.Tensor | None = None,
+        runtime_batch_size: int | None = None,
     ):
         template_lookup = self._get_or_create_fixed_split_runtime_template(
             model,
             manifest,
             bundle_root=bundle_root,
             trace_sample_input=trace_sample_input,
+            runtime_batch_size=runtime_batch_size,
         )
         if template_lookup.cache_status in {"hit", "wait"}:
             logger.info(
@@ -1914,6 +1941,32 @@ class CloudContinualLearner:
 
         return float(learning_rate)
 
+    @staticmethod
+    def _count_manifest_training_samples(manifest: Mapping[str, object]) -> int:
+        count = 0
+        for sample in manifest.get("samples", []):
+            if not isinstance(sample, Mapping):
+                continue
+            if str(sample.get("sample_id", "")).strip():
+                count += 1
+        return count
+
+    def _resolve_fixed_split_runtime_batch_size(
+        self,
+        model_name: str,
+        *,
+        num_train_samples: int,
+    ) -> int:
+        configured_batch_size = max(1, int(self.batch_size))
+        if not str(model_name).lower().startswith("rfdetr_"):
+            return configured_batch_size
+        target_steps = max(1, int(self.rfdetr_fixed_split_target_steps_per_round))
+        effective_batch_size = min(
+            configured_batch_size,
+            max(1, math.ceil(max(0, int(num_train_samples)) / target_steps)),
+        )
+        return int(effective_batch_size)
+
     def _prepare_fixed_split_working_cache(
         self,
         model: torch.nn.Module,
@@ -1922,6 +1975,7 @@ class CloudContinualLearner:
         bundle_cache_path: str,
         working_cache: str,
         force_rebuild: bool = False,
+        runtime_batch_size: int | None = None,
     ) -> tuple[dict[str, object], str, torch.Tensor | None, UniversalModelSplitter | None, object | None]:
         cache_identity = _build_fixed_split_cache_identity(manifest)
         cached_manifest = _read_json_file(_working_cache_manifest_path(working_cache))
@@ -1942,6 +1996,7 @@ class CloudContinualLearner:
                 model,
                 bundle_cache_path,
                 manifest,
+                runtime_batch_size=runtime_batch_size,
             )
 
         stage_started = time.perf_counter()
@@ -1950,6 +2005,7 @@ class CloudContinualLearner:
             manifest,
             bundle_root=bundle_cache_path,
             trace_sample_input=prepared_trace_sample_input,
+            runtime_batch_size=runtime_batch_size,
         )
         self._log_stage_duration("runtime template load / bind", stage_started)
 
@@ -1963,6 +2019,7 @@ class CloudContinualLearner:
                     bundle_root=bundle_cache_path,
                     splitter=prepared_splitter,
                     candidate=prepared_candidate,
+                    runtime_batch_size=runtime_batch_size,
                 ),
             )
 
@@ -2294,6 +2351,7 @@ class CloudContinualLearner:
         prepared_trace_sample_input: object | None,
         prepared_splitter: UniversalModelSplitter | None,
         prepared_candidate,
+        effective_batch_size: int,
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
         proxy_eval_frame_cache: dict[str, np.ndarray | None] | None = None,
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
@@ -2309,8 +2367,9 @@ class CloudContinualLearner:
                 "[FixedSplitCL] Using wrapper fixed-split learning rate {}.",
                 effective_learning_rate,
             )
-            
-        bs = self.batch_size
+
+        bs = max(1, int(effective_batch_size))
+        is_rfdetr_fixed_split = str(current_model_name).lower().startswith("rfdetr_")
         logger.info(
             "[FixedSplitCL] Starting split retrain configuration: Epochs={}, Learning Rate={}, Runtime Batch Size={}, Total Samples={}",
             effective_num_epoch,
@@ -2318,6 +2377,14 @@ class CloudContinualLearner:
             bs,
             len(bundle_info["all_sample_ids"])
         )
+        if is_rfdetr_fixed_split:
+            logger.info(
+                "[FixedSplitCL] RF-DETR effective batch size {} resolved from configured batch size {} with target_steps_per_round={} and samples={}.",
+                bs,
+                int(self.batch_size),
+                int(self.rfdetr_fixed_split_target_steps_per_round),
+                len(bundle_info["all_sample_ids"]),
+            )
         if prepared_trace_sample_input is None and prepared_splitter is not None:
             logger.info(
                 "[FixedSplitCL] Split retrain will reuse the bound runtime template and skip retracing inside universal_split_retrain."
@@ -2340,6 +2407,13 @@ class CloudContinualLearner:
             "chosen_candidate": prepared_candidate,
             "batch_size": bs,
         }
+        if is_rfdetr_fixed_split:
+            split_retrain_kwargs.update(
+                optimizer_name="adamw",
+                weight_decay=1e-4,
+                grad_clip_norm=1.0,
+                shuffle_samples=True,
+            )
         proxy_metrics_cache: dict[str, dict[str, float | int | None]] = {}
         if proxy_metrics_before:
             proxy_metrics_cache[baseline_proxy_state_key] = dict(proxy_metrics_before)
@@ -2357,12 +2431,12 @@ class CloudContinualLearner:
                 sample_metadata_by_id=sample_metadata_by_id,
                 frame_cache=proxy_eval_frame_cache,
                 max_samples=self.proxy_eval_max_samples,
-                inference_batch_size=self.batch_size,
+                inference_batch_size=bs,
             )
             proxy_metrics_cache[state_key] = dict(metrics)
             return dict(metrics)
 
-        if gt_annotations and str(current_model_name).lower().startswith("rfdetr_"):
+        if gt_annotations and is_rfdetr_fixed_split:
             best_state = baseline_state
             best_metrics = dict(proxy_metrics_before)
             split_retrain_elapsed = 0.0
@@ -2420,7 +2494,7 @@ class CloudContinualLearner:
                     frame_cache=proxy_eval_frame_cache,
                     max_samples=self.proxy_eval_max_samples,
                     candidate_thresholds=self.proxy_eval_threshold_candidates,
-                    inference_batch_size=self.batch_size,
+                    inference_batch_size=bs,
                 )
                 if abs(calibrated_high - initial_high) > 1e-6:
                     logger.info(
@@ -2554,8 +2628,10 @@ class CloudContinualLearner:
         self,
         edge_id: int,
         bundle_cache_path: str,
+        *,
+        num_epoch: int | None = None,
     ) -> tuple[bool, str, str]:
-        num_epoch = self.default_num_epoch
+        effective_num_epoch = self.default_num_epoch if num_epoch is None else int(num_epoch)
 
         with self._training_job_scope(edge_id):
             total_round_started = time.perf_counter()
@@ -2568,6 +2644,11 @@ class CloudContinualLearner:
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
                     )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
+                bundle_sample_count = self._count_manifest_training_samples(manifest)
+                effective_batch_size = self._resolve_fixed_split_runtime_batch_size(
+                    current_model_name,
+                    num_train_samples=bundle_sample_count,
+                )
                 bundle_model_version = _normalize_model_version(
                     manifest.get("model", {}).get("model_version", "0"),
                     field_name="bundle model version",
@@ -2632,6 +2713,7 @@ class CloudContinualLearner:
                         manifest,
                         bundle_cache_path=bundle_cache_path,
                         working_cache=working_cache,
+                        runtime_batch_size=effective_batch_size,
                     )
                 )
                 self._log_stage_duration("preparing/reusing working cache", stage_started)
@@ -2664,7 +2746,7 @@ class CloudContinualLearner:
                         frame_cache=proxy_eval_frame_cache,
                         max_samples=self.proxy_eval_max_samples,
                         candidate_thresholds=self.proxy_eval_threshold_candidates,
-                        inference_batch_size=self.batch_size,
+                        inference_batch_size=effective_batch_size,
                     )
                     if abs(calibrated_high - initial_high) > 1e-6:
                         logger.info(
@@ -2682,6 +2764,7 @@ class CloudContinualLearner:
                         sample_metadata_by_id=sample_metadata_by_id,
                         frame_cache=proxy_eval_frame_cache,
                         max_samples=self.proxy_eval_max_samples,
+                        inference_batch_size=effective_batch_size,
                     )
                 self._log_stage_duration("proxy evaluation before retrain", stage_started)
                 is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
@@ -2724,6 +2807,7 @@ class CloudContinualLearner:
                                 bundle_cache_path=bundle_cache_path,
                                 working_cache=working_cache,
                                 force_rebuild=True,
+                                runtime_batch_size=effective_batch_size,
                             )
                         )
                         self._log_stage_duration("preparing/reusing working cache", stage_started)
@@ -2742,7 +2826,7 @@ class CloudContinualLearner:
                                 frame_cache=proxy_eval_frame_cache,
                                 max_samples=self.proxy_eval_max_samples,
                                 candidate_thresholds=self.proxy_eval_threshold_candidates,
-                                inference_batch_size=self.batch_size,
+                                inference_batch_size=effective_batch_size,
                             )
                             if abs(calibrated_high - initial_high) > 1e-6:
                                 logger.info(
@@ -2760,6 +2844,7 @@ class CloudContinualLearner:
                                 sample_metadata_by_id=sample_metadata_by_id,
                                 frame_cache=proxy_eval_frame_cache,
                                 max_samples=self.proxy_eval_max_samples,
+                                inference_batch_size=effective_batch_size,
                             )
                         self._log_stage_duration("proxy evaluation before retrain", stage_started)
 
@@ -2772,11 +2857,12 @@ class CloudContinualLearner:
                     working_cache=working_cache,
                     frame_dir=frame_dir,
                     gt_annotations=gt_annotations,
-                    num_epoch=num_epoch,
+                    num_epoch=effective_num_epoch,
                     proxy_metrics_before=proxy_metrics_before,
                     prepared_trace_sample_input=prepared_trace_sample_input,
                     prepared_splitter=prepared_splitter,
                     prepared_candidate=prepared_candidate,
+                    effective_batch_size=effective_batch_size,
                     sample_metadata_by_id=sample_metadata_by_id,
                     proxy_eval_frame_cache=proxy_eval_frame_cache,
                 )

@@ -765,6 +765,58 @@ def test_fixed_split_learning_rate_uses_model_family_specific_defaults():
     assert yolo_lr == pytest.approx(3e-5)
 
 
+def test_rfdetr_fixed_split_runtime_batch_size_shapes_trace_and_template_key(
+    tmp_path,
+    monkeypatch,
+):
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(
+            batch_size=16,
+            rfdetr_fixed_split_target_steps_per_round=4,
+        ),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    effective_batch_size = learner._resolve_fixed_split_runtime_batch_size(
+        "rfdetr_nano",
+        num_train_samples=12,
+    )
+    monkeypatch.setattr(
+        "cloud_server.build_split_runtime_sample_input",
+        lambda *args, **kwargs: torch.ones(1, 3, 8, 8),
+    )
+
+    trace_input = learner._build_bundle_batch_trace_sample_input(
+        torch.nn.Identity(),
+        str(tmp_path),
+        {"samples": []},
+        runtime_batch_size=effective_batch_size,
+    )
+    template_key = learner._fixed_split_runtime_template_key(
+        model_name="rfdetr_nano",
+        manifest={
+            "split_plan": {},
+            "samples": [
+                {
+                    "sample_id": "sample-0",
+                    "input_tensor_shape": [1, 3, 384, 384],
+                }
+            ],
+        },
+        runtime_batch_size=effective_batch_size,
+    )
+
+    assert effective_batch_size == 3
+    assert tuple(trace_input.shape) == (3, 3, 8, 8)
+    assert template_key.trace_batch_size == 3
+    assert template_key.trace_input_shape == (3, 3, 384, 384)
+
+
 def test_select_fixed_split_gt_sample_ids_includes_raw_plus_feature_low_conf_samples():
     manifest = {
         "drift_sample_ids": [],
@@ -2138,6 +2190,207 @@ def test_fixed_split_retrain_keeps_best_rfdetr_epoch_by_proxy_map(
         weights_only=False,
     )
     assert float(returned_state["weight"][0]) == pytest.approx(0.9)
+
+
+def test_rfdetr_fixed_split_retrain_uses_effective_batch_size_for_proxy_eval_and_retrain(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+        def forward(self, images):
+            score = float(self.weight.detach().cpu().item())
+            if score <= 0.0:
+                return [
+                    {
+                        "labels": torch.empty(0),
+                        "boxes": torch.empty((0, 4)),
+                        "scores": torch.empty(0),
+                    }
+                ]
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
+                    "scores": torch.tensor([score], dtype=torch.float32),
+                }
+            ]
+
+    all_sample_ids = [f"sample-{index}" for index in range(12)]
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "drift_sample_ids": ["sample-0"],
+        "samples": [
+            {
+                "sample_id": sample_id,
+                "confidence_bucket": LOW_CONFIDENCE,
+                "raw_relpath": f"frames/{sample_id}.jpg",
+                "input_tensor_shape": [1, 3, 384, 384],
+            }
+            for sample_id in all_sample_ids
+        ],
+    }
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(
+            batch_size=16,
+            num_epoch=2,
+            rfdetr_fixed_split_target_steps_per_round=4,
+        ),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+
+    model = DummyModel(weight=0.1)
+    prepare_runtime_batch_sizes: list[int] = []
+    proxy_batch_sizes: list[int] = []
+    retrain_batch_sizes: list[int] = []
+    epoch_weights = iter([0.9, 0.8])
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda current_model: current_model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
+
+    def fake_prepare_cache(*args, runtime_batch_size=None, **kwargs):
+        prepare_runtime_batch_sizes.append(int(runtime_batch_size))
+        return (
+            {"all_sample_ids": list(all_sample_ids), "drift_sample_ids": ["sample-0"]},
+            str(tmp_path / "frames"),
+            "prepared-trace",
+            "prepared-splitter",
+            SimpleNamespace(
+                candidate_id="candidate-1",
+                legacy_layer_index=3,
+                boundary_tensor_labels=["layer3"],
+            ),
+        )
+
+    monkeypatch.setattr(learner, "_prepare_fixed_split_working_cache", fake_prepare_cache)
+    monkeypatch.setattr(
+        learner,
+        "_collect_teacher_annotations",
+        lambda *args, **kwargs: {"sample-0": {"boxes": [[1, 1, 6, 6]], "labels": [1]}},
+    )
+    monkeypatch.setattr(learner, "_load_cached_sample_metadata", lambda *args, **kwargs: {})
+    monkeypatch.setattr(learner, "_proxy_eval_frame_cache", lambda: None)
+
+    def fake_universal_split_retrain(*, model, num_epoch, **kwargs):
+        retrain_batch_sizes.append(int(kwargs["batch_size"]))
+        assert kwargs["optimizer_name"] == "adamw"
+        assert kwargs["weight_decay"] == pytest.approx(1e-4)
+        assert kwargs["grad_clip_norm"] == pytest.approx(1.0)
+        assert kwargs["shuffle_samples"] is True
+        with torch.no_grad():
+            model.weight.fill_(next(epoch_weights))
+        return [0.1]
+
+    monkeypatch.setattr("cloud_server.universal_split_retrain", fake_universal_split_retrain)
+
+    def fake_evaluate_proxy_map(model, **kwargs):
+        proxy_batch_sizes.append(int(kwargs["inference_batch_size"]))
+        return _proxy_metrics(float(model.weight.detach().cpu().item()))
+
+    monkeypatch.setattr("cloud_server._evaluate_detection_proxy_map", fake_evaluate_proxy_map)
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path),
+    )
+
+    assert prepare_runtime_batch_sizes == [3]
+    assert retrain_batch_sizes == [3, 3]
+    assert proxy_batch_sizes
+    assert set(proxy_batch_sizes) == {3}
+    assert success is True
+    assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message
+    returned_state = torch.load(
+        io.BytesIO(base64.b64decode(model_data)),
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert float(returned_state["weight"][0]) == pytest.approx(0.9)
+
+
+def test_fixed_split_retrain_accepts_num_epoch_override(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(num_epoch=2),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    model = DummyModel(weight=0.1)
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": [],
+        "samples": [],
+    }
+    captured_num_epochs: list[int] = []
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: model)
+    monkeypatch.setattr(
+        learner,
+        "_prepare_fixed_split_working_cache",
+        lambda *args, **kwargs: (
+            {"all_sample_ids": ["sample-1"]},
+            str(tmp_path / "frames"),
+            None,
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_collect_teacher_annotations",
+        lambda *args, **kwargs: {"sample-1": {"boxes": [[1, 1, 6, 6]], "labels": [1]}},
+    )
+    monkeypatch.setattr(learner, "_load_cached_sample_metadata", lambda *args, **kwargs: {})
+    monkeypatch.setattr(learner, "_proxy_eval_frame_cache", lambda: {})
+    monkeypatch.setattr(
+        learner,
+        "_evaluate_fixed_split_proxy_map",
+        lambda *args, **kwargs: _proxy_metrics(0.6),
+    )
+
+    def fake_run_fixed_split_retrain(*args, **kwargs):
+        captured_num_epochs.append(int(kwargs["num_epoch"]))
+        return _proxy_metrics(0.6), copy.deepcopy(model.state_dict())
+
+    monkeypatch.setattr(learner, "_run_fixed_split_retrain", fake_run_fixed_split_retrain)
+
+    success, _, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path / "bundle"),
+        num_epoch=7,
+    )
+
+    assert success is True
+    assert "Fixed split retraining successful" in message
+    assert captured_num_epochs == [7]
 
 
 def test_fixed_split_retrain_reuses_prepared_batch_runtime_on_server(

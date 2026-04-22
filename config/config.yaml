@@ -175,6 +175,10 @@ server:
  continual_learning:
   num_epoch: 50
   batch_size: 16
+  # RF-DETR fixed-split jobs shrink the effective runtime batch size toward
+  # this many optimizer steps per outer round so small bundles do not collapse
+  # into a single heavily padded update.
+  rfdetr_fixed_split_target_steps_per_round: 4
   max_concurrent_jobs: 4
   # Cloud-side teacher threshold used only for GT annotation during
   # continual learning. Lower values recover more small/far objects but

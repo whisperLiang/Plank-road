@@ -14,8 +14,9 @@ class ConfigSection:
     _extras: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def __getattr__(self, name: str) -> Any:
-        if name in self._extras:
-            return self._extras[name]
+        extras = self.__dict__.get("_extras")
+        if isinstance(extras, dict) and name in extras:
+            return extras[name]
         raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
 
@@ -109,6 +110,7 @@ class ContinualLearningConfig(ConfigSection):
     split_learning_rate: float = 1e-3
     wrapper_fixed_split_learning_rate: float = 3e-5
     rfdetr_fixed_split_learning_rate: float = 1e-4
+    rfdetr_fixed_split_target_steps_per_round: int = 4
     max_concurrent_jobs: int = 2
 
     def __post_init__(self) -> None:
@@ -325,6 +327,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive(
         "server.continual_learning.batch_size",
         int(config.server.continual_learning.batch_size),
+    )
+    _validate_positive(
+        "server.continual_learning.rfdetr_fixed_split_target_steps_per_round",
+        int(config.server.continual_learning.rfdetr_fixed_split_target_steps_per_round),
     )
     _validate_positive(
         "server.continual_learning.teacher_batch_size",

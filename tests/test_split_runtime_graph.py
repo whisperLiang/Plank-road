@@ -928,6 +928,111 @@ def test_universal_split_retrain_pads_last_batch_to_runtime_batch_size(tmp_path)
     assert splitter.seen_batches == [(2, 2)]
 
 
+def test_universal_split_retrain_supports_adamw_shuffle_and_grad_clip(
+    tmp_path,
+    monkeypatch,
+):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+
+    class _OptimizingSplitter(_StaticSplitter):
+        def __init__(self, chosen_candidate) -> None:
+            super().__init__(chosen_candidate)
+            self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+            self.seen_batch_orders: list[list[float]] = []
+
+        def get_tail_trainable_params(self, chosen):
+            return [self.weight]
+
+        def cloud_train_step(self, payload, targets=None, **kwargs):
+            assert isinstance(payload, SplitPayload)
+            batch_values = payload.tensors["selected-boundary"][:, 0].tolist()
+            self.seen_batch_orders.append([float(value) for value in batch_values])
+            loss = payload.tensors["selected-boundary"].float().mean() * self.weight
+            return None, loss.sum()
+
+        def _invalidate_validation_cache(self) -> None:
+            return None
+
+    splitter = _OptimizingSplitter(candidate)
+    for index in range(5):
+        _write_cached_split_record(
+            tmp_path,
+            index,
+            candidate=candidate,
+            value=float(index),
+            pseudo_boxes=[[0.0, 0.0, 1.0, 1.0]],
+            pseudo_labels=[1],
+            pseudo_scores=[0.9],
+        )
+
+    shuffle_inputs: list[list[int]] = []
+    clip_calls: list[float] = []
+    created_optimizers: list[torch.optim.Optimizer] = []
+    original_adamw = torch.optim.AdamW
+
+    class _TrackingAdamW(original_adamw):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.step_calls = 0
+
+        def step(self, *args, **kwargs):
+            self.step_calls += 1
+            return super().step(*args, **kwargs)
+
+    def _reverse_shuffle(items):
+        shuffle_inputs.append(list(items))
+        items.reverse()
+
+    def _tracking_clip(params, max_norm, *args, **kwargs):
+        clip_calls.append(float(max_norm))
+        return torch.tensor(0.0)
+
+    def _tracking_adamw(params, **kwargs):
+        optimizer = _TrackingAdamW(params, **kwargs)
+        created_optimizers.append(optimizer)
+        return optimizer
+
+    monkeypatch.setattr("model_management.universal_model_split.random.shuffle", _reverse_shuffle)
+    monkeypatch.setattr(
+        "model_management.universal_model_split.torch.nn.utils.clip_grad_norm_",
+        _tracking_clip,
+    )
+    monkeypatch.setattr(
+        "model_management.universal_model_split.torch.optim.AdamW",
+        _tracking_adamw,
+    )
+
+    losses = universal_split_retrain(
+        model=nn.Identity(),
+        sample_input=torch.zeros(1, 2),
+        cache_path=str(tmp_path),
+        all_indices=[0, 1, 2, 3, 4],
+        gt_annotations={},
+        batch_size=2,
+        splitter=splitter,
+        chosen_candidate=candidate,
+        optimizer_name="adamw",
+        weight_decay=1e-4,
+        grad_clip_norm=1.0,
+        shuffle_samples=True,
+    )
+
+    assert len(losses) == 1
+    assert torch.isfinite(torch.tensor(losses[0]))
+    assert shuffle_inputs == [[0, 1, 2, 3, 4]]
+    assert splitter.seen_batch_orders == [[4.0, 3.0], [2.0, 1.0], [0.0, 0.0]]
+    assert len(clip_calls) == 3
+    assert clip_calls == [pytest.approx(1.0), pytest.approx(1.0), pytest.approx(1.0)]
+    assert len(created_optimizers) == 1
+    assert created_optimizers[0].param_groups[0]["weight_decay"] == pytest.approx(1e-4)
+    assert created_optimizers[0].step_calls == 3
+
+
 def test_universal_split_retrain_rejects_mismatched_cached_boundary_labels(tmp_path):
     candidate = SimpleNamespace(
         candidate_id="selected-candidate",

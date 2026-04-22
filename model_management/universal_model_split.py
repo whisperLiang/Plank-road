@@ -71,6 +71,21 @@ def _move_nested(obj: Any, device: torch.device) -> Any:
     return obj
 
 
+def _count_detection_target_boxes(targets: Any) -> int:
+    if isinstance(targets, list):
+        return sum(_count_detection_target_boxes(target) for target in targets)
+    if not isinstance(targets, Mapping):
+        return 0
+    boxes = targets.get("boxes")
+    if isinstance(boxes, torch.Tensor):
+        if boxes.ndim == 0:
+            return int(boxes.numel() > 0)
+        return int(boxes.shape[0])
+    if isinstance(boxes, (list, tuple)):
+        return len(boxes)
+    return 0
+
+
 def _batch_tensors(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
     if not tensors:
         raise ValueError("Cannot batch an empty tensor sequence.")
@@ -936,6 +951,10 @@ def universal_split_retrain(
     das_probe_samples: int = 10,
     das_strategy: str = "tgi",
     das_use_spectral_entropy: bool = False,
+    optimizer_name: str = "adam",
+    weight_decay: float = 0.0,
+    grad_clip_norm: float | None = None,
+    shuffle_samples: bool = False,
     epoch_log_context: str | None = None,
     **_: Any,
 ) -> list[float]:
@@ -1085,14 +1104,47 @@ def universal_split_retrain(
             )
         das_trainer.probe_samples = max(0, int(das_probe_samples)) if das_use_entropy else max(1, int(das_probe_samples))
 
-    params = splitter.get_tail_trainable_params(chosen)
-    optimizer = torch.optim.Adam(params, lr=float(learning_rate)) if params else None
+    params = list(splitter.get_tail_trainable_params(chosen))
+    optimizer_kind = str(optimizer_name).strip().lower()
+    if optimizer_kind not in {"adam", "adamw"}:
+        raise ValueError(f"Unsupported optimizer_name: {optimizer_name!r}")
+    optimizer = None
+    if params:
+        if optimizer_kind == "adamw":
+            optimizer = torch.optim.AdamW(
+                params,
+                lr=float(learning_rate),
+                weight_decay=float(weight_decay),
+            )
+        else:
+            optimizer = torch.optim.Adam(
+                params,
+                lr=float(learning_rate),
+                weight_decay=float(weight_decay),
+            )
+    logger.info(
+        "[FixedSplitCL] Split retrain optimizer={} lr={} weight_decay={} grad_clip_norm={} shuffle_samples={} batch_size={} samples={}.",
+        optimizer_kind.upper() if optimizer is not None else "NONE",
+        float(learning_rate),
+        float(weight_decay),
+        "disabled" if grad_clip_norm is None else float(grad_clip_norm),
+        bool(shuffle_samples),
+        batch_size,
+        len(all_indices),
+    )
     losses: list[float] = []
     finite_steps = 0
 
     for _epoch in range(num_epoch):
+        epoch_indices = list(all_indices)
+        if shuffle_samples and len(epoch_indices) > 1:
+            random.shuffle(epoch_indices)
         epoch_loss = 0.0
         epoch_finite_samples = 0
+        epoch_finite_batches = 0
+        epoch_raw_loss_total = 0.0
+        epoch_gt_box_count = 0
+        epoch_optimizer_steps = 0
         if das_trainer is not None and not das_use_entropy:
             probe_count = min(len(all_indices), int(das_trainer.probe_samples))
             probe_indices = (
@@ -1160,10 +1212,10 @@ def universal_split_retrain(
                 averaged = {key: aggregated[key] / counts[key] for key in aggregated} if counts else {}
                 das_trainer.activate_sparsity(averaged)
 
-        for i in range(0, len(all_indices), batch_size):
-            batch_indices = all_indices[i:i + batch_size]
+        for i in range(0, len(epoch_indices), batch_size):
+            batch_indices = epoch_indices[i:i + batch_size]
             batch_loss = 0.0
-            
+
             payloads = []
             targets_list = []
             
@@ -1189,6 +1241,7 @@ def universal_split_retrain(
                 continue
 
             true_batch_size = len(batch_indices)
+            true_targets = list(targets_list)
             while len(payloads) < batch_size:
                 payloads.append(_clone_payload_for_padding(payloads[-1]))
                 targets_list.append(copy.deepcopy(targets_list[-1]))
@@ -1215,37 +1268,60 @@ def universal_split_retrain(
                 batch_loss = 0.0
 
             if not isinstance(batch_loss, float): # If we actually computed valid losses
+                batch_loss_value = float(batch_loss.item())
+                epoch_finite_batches += 1
+                epoch_raw_loss_total += batch_loss_value
+                epoch_gt_box_count += sum(
+                    _count_detection_target_boxes(target)
+                    for target in true_targets
+                )
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
                     batch_loss.backward()
+                    if grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(params, float(grad_clip_norm))
                     optimizer.step()
                     splitter._invalidate_validation_cache()
+                    epoch_optimizer_steps += 1
                 finite_steps += true_batch_size
                 epoch_finite_samples += true_batch_size
-                epoch_loss += float(batch_loss.item()) * true_batch_size
-        losses.append(epoch_loss / max(1, epoch_finite_samples))
-        batch_count = (len(all_indices) + batch_size - 1) // batch_size
+                epoch_loss += batch_loss_value * true_batch_size
+        average_loss = epoch_loss / max(1, epoch_finite_samples)
+        raw_average_loss = epoch_raw_loss_total / max(1, epoch_finite_batches)
+        normalized_loss = (
+            epoch_raw_loss_total / epoch_gt_box_count
+            if epoch_gt_box_count > 0
+            else average_loss
+        )
+        losses.append(average_loss)
+        batch_count = (len(epoch_indices) + batch_size - 1) // batch_size
         if num_epoch > 1 or _epoch == num_epoch - 1:
             if epoch_log_context:
                 logger.info(
-                    "[FixedSplitCL] {} finished (inner epoch {}/{}). Samples: {}, Batch Size: {}, Batches: {}, Avg loss: {:.4f}",
+                    "[FixedSplitCL] {} finished (inner epoch {}/{}). Samples: {}, Batch Size: {}, Batches: {}, Optimizer Steps: {}, Avg loss: {:.4f}, Raw Avg loss: {:.4f}, Normalized loss: {:.4f}",
                     epoch_log_context,
                     _epoch + 1,
                     num_epoch,
-                    len(all_indices),
+                    len(epoch_indices),
                     batch_size,
                     batch_count,
+                    epoch_optimizer_steps,
                     losses[-1],
+                    raw_average_loss,
+                    normalized_loss,
                 )
             else:
                 logger.info(
-                    "[FixedSplitCL] epoch {}/{} finished. Samples: {}, Batch Size: {}, Batches: {}, Avg loss: {:.4f}",
+                    "[FixedSplitCL] epoch {}/{} finished. Samples: {}, Batch Size: {}, Batches: {}, Optimizer Steps: {}, Avg loss: {:.4f}, Raw Avg loss: {:.4f}, Normalized loss: {:.4f}",
                     _epoch + 1,
                     num_epoch,
-                    len(all_indices),
+                    len(epoch_indices),
                     batch_size,
                     batch_count,
+                    epoch_optimizer_steps,
                     losses[-1],
+                    raw_average_loss,
+                    normalized_loss,
                 )
     if optimizer is not None and params and finite_steps == 0:
         raise RuntimeError(
