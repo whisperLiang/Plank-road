@@ -168,10 +168,33 @@ def _clone_tree_tensors(tree: Any, *, device: torch.device | None = None, detach
 def _tensor_exact_match(candidate: Any, target: torch.Tensor) -> bool:
     if not isinstance(candidate, torch.Tensor):
         return False
+    if candidate is target:
+        return True
     if candidate.shape != target.shape or candidate.dtype != target.dtype:
         return False
+    if (
+        candidate.device == target.device
+        and _share_same_tensor_storage(candidate, target)
+    ):
+        return True
     candidate_compare, target_compare = _prepare_tensors_for_exact_match(candidate, target)
+    if candidate_compare is target_compare:
+        return True
     return torch.equal(candidate_compare, target_compare)
+
+
+def _share_same_tensor_storage(candidate: torch.Tensor, target: torch.Tensor) -> bool:
+    try:
+        candidate_ptr = int(candidate.untyped_storage().data_ptr())
+        target_ptr = int(target.untyped_storage().data_ptr())
+    except Exception:
+        return False
+    return (
+        candidate_ptr == target_ptr
+        and int(candidate.storage_offset()) == int(target.storage_offset())
+        and tuple(int(dim) for dim in candidate.stride())
+        == tuple(int(dim) for dim in target.stride())
+    )
 
 
 def _tensors_need_device_alignment(candidate: torch.Tensor, target: torch.Tensor) -> bool:
@@ -1157,16 +1180,17 @@ def _build_arg_templates(
                     if parent_layer_indexes is not None
                     else None
                 )
-                explicit_activation_match = _find_parent_activation_ref(
-                    obj,
-                    previous_layers=previous_layers,
-                    exclude_labels=set(),
-                    previous_layer_indexes=previous_layer_indexes,
-                    previous_layer_count=previous_layer_count,
+
+                # Fast path: when TorchLens already gives the parent label for this
+                # argument location, avoid a full backwards scan across prior layers.
+                direct_parent_path = (
+                    parent_layer_index.activation_paths_by_tensor_id.get(id(obj))
+                    if parent_layer_index is not None
+                    else None
                 )
-                if explicit_activation_match is not None:
-                    inferred_parent_labels.append(explicit_activation_match.parent_label)
-                    return explicit_activation_match
+                if direct_parent_path is not None:
+                    inferred_parent_labels.append(parent_label)
+                    return ParentTensorRef(parent_label=parent_label, path=direct_parent_path)
 
                 explicit_path = (
                     parent_layer_index.child_output_paths_by_label.get(current_label)
