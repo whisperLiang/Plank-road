@@ -164,6 +164,29 @@ def _sanitize_cache_segment(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value).strip()) or "unknown"
 
 
+def _normalize_model_version(
+    value: object,
+    *,
+    field_name: str = "model version",
+) -> str:
+    raw_value = str(value if value is not None else "").strip() or "0"
+    try:
+        normalized = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
+    if normalized < 0:
+        raise ValueError(f"Invalid {field_name}: {value!r}")
+    return str(normalized)
+
+
+def _increment_model_version(
+    value: object,
+    *,
+    field_name: str = "model version",
+) -> str:
+    return str(int(_normalize_model_version(value, field_name=field_name)) + 1)
+
+
 def _can_deserialize_split_feature_cache(cache_path: str, sample_id: str) -> bool:
     try:
         load_split_feature_cache(cache_path, sample_id)
@@ -1010,6 +1033,15 @@ class CloudContinualLearner:
             f"tmp_edge_model_{safe_name}_edge_{safe_edge}.pth",
         )
 
+    def _edge_weights_metadata_path(
+        self,
+        model_name: str,
+        *,
+        edge_id: int | str | None = None,
+    ) -> str:
+        weights_path = self._edge_weights_path(model_name, edge_id=edge_id)
+        return f"{os.path.splitext(weights_path)[0]}.meta.json"
+
     def _legacy_edge_weights_path(self) -> str:
         return os.path.join(self.weight_folder, "tmp_edge_model.pth")
 
@@ -1047,13 +1079,66 @@ class CloudContinualLearner:
                     build_kwargs["weights_path"] = str(artifact_path)
         return model_zoo.build_detection_model(model_name, **build_kwargs)
 
+    def _read_edge_weights_metadata(
+        self,
+        model_name: str,
+        *,
+        edge_id: int | str | None = None,
+    ) -> dict[str, object]:
+        return _read_json_file(
+            self._edge_weights_metadata_path(model_name, edge_id=edge_id)
+        )
+
+    def _require_matching_edge_weights_metadata(
+        self,
+        *,
+        model_name: str,
+        edge_id: int | str,
+        bundle_model_version: str,
+    ) -> dict[str, object]:
+        metadata_path = self._edge_weights_metadata_path(model_name, edge_id=edge_id)
+        metadata = self._read_edge_weights_metadata(model_name, edge_id=edge_id)
+        if not metadata:
+            raise RuntimeError(
+                "[FixedSplitCL] Missing persisted edge checkpoint metadata for "
+                f"edge {edge_id} model {model_name} at {metadata_path}; "
+                f"cannot resume bundle model_version={bundle_model_version}."
+            )
+        metadata_edge_id = str(metadata.get("edge_id", "")).strip()
+        if metadata_edge_id and metadata_edge_id != str(edge_id):
+            raise RuntimeError(
+                "[FixedSplitCL] Edge checkpoint metadata mismatch for "
+                f"edge {edge_id} model {model_name}: metadata edge_id={metadata_edge_id!r}."
+            )
+        metadata_model_name = str(metadata.get("model_name", "")).strip()
+        if metadata_model_name and metadata_model_name != str(model_name):
+            raise RuntimeError(
+                "[FixedSplitCL] Edge checkpoint metadata mismatch for "
+                f"edge {edge_id}: expected model {model_name} but found {metadata_model_name!r}."
+            )
+        checkpoint_model_version = _normalize_model_version(
+            metadata.get("checkpoint_model_version", "0"),
+            field_name="checkpoint model version",
+        )
+        if checkpoint_model_version != str(bundle_model_version):
+            raise RuntimeError(
+                "[FixedSplitCL] Persisted edge checkpoint version mismatch for "
+                f"edge {edge_id} model {model_name}: checkpoint_model_version="
+                f"{checkpoint_model_version}, bundle model_version={bundle_model_version}."
+            )
+        return metadata
+
     def _load_edge_training_model(
         self,
         *,
         model_name: str | None = None,
         edge_id: int | str | None = None,
+        cache_policy: str = "auto",
     ) -> torch.nn.Module:
         model_name = str(model_name or self.edge_model_name)
+        cache_policy = str(cache_policy or "auto").strip().lower()
+        if cache_policy not in {"auto", "native_only", "edge_only"}:
+            raise ValueError(f"Unsupported cache policy: {cache_policy!r}")
         edge_weights = self._edge_weights_path(model_name, edge_id=edge_id)
         legacy_candidates = [
             self._edge_weights_path(model_name),
@@ -1061,10 +1146,18 @@ class CloudContinualLearner:
         ]
         candidate_weights = None
         cache_source = "native weights"
+        native_source_label = self._native_training_source_label(model_name)
+
+        if cache_policy == "native_only":
+            tmp_model = self._build_native_training_model(model_name)
+            tmp_model.to(self.device)
+            get_split_runtime_model(tmp_model).eval()
+            return tmp_model
+
         if os.path.exists(edge_weights):
             candidate_weights = edge_weights
             cache_source = "edge-scoped cache"
-        else:
+        elif cache_policy == "auto":
             for legacy_weights in legacy_candidates:
                 if os.path.exists(legacy_weights):
                     candidate_weights = legacy_weights
@@ -1074,7 +1167,6 @@ class CloudContinualLearner:
                         else "global legacy cache"
                     )
                     break
-        native_source_label = self._native_training_source_label(model_name)
 
         if candidate_weights is not None and os.path.exists(candidate_weights):
             fallback_reason = None
@@ -1121,6 +1213,11 @@ class CloudContinualLearner:
                         return tmp_model
 
             if fallback_reason is not None:
+                if cache_policy == "edge_only":
+                    raise RuntimeError(
+                        "[CL] Failed to load required edge-scoped cache for "
+                        f"{model_name} from {candidate_weights}: {fallback_reason}"
+                    )
                 logger.warning(
                     "[CL] {}. Falling back to native {} weights for {}.",
                     fallback_reason,
@@ -1136,6 +1233,11 @@ class CloudContinualLearner:
                     native_source_label,
                 )
         else:
+            if cache_policy == "edge_only":
+                raise RuntimeError(
+                    "[CL] Required edge-scoped cache for "
+                    f"{model_name} is missing at {edge_weights}."
+                )
             logger.info(
                 "[CL] No cached {} weights found; starting from native {} weights.",
                 model_name,
@@ -1152,9 +1254,11 @@ class CloudContinualLearner:
         *,
         model_name: str | None = None,
         edge_id: int | str | None = None,
+        weights_metadata: Mapping[str, object] | None = None,
     ) -> bytes:
+        resolved_model_name = model_name or self.edge_model_name
         edge_weights = self._edge_weights_path(
-            model_name or self.edge_model_name,
+            resolved_model_name,
             edge_id=edge_id,
         )
         state_dict = model.state_dict()
@@ -1163,6 +1267,16 @@ class CloudContinualLearner:
         serialized = buf.getvalue()
         with open(edge_weights, "wb") as handle:
             handle.write(serialized)
+        if weights_metadata is not None:
+            if edge_id is None:
+                raise ValueError("weights metadata requires an edge_id")
+            _write_json_file(
+                self._edge_weights_metadata_path(
+                    resolved_model_name,
+                    edge_id=edge_id,
+                ),
+                weights_metadata,
+            )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return serialized
@@ -2446,12 +2560,53 @@ class CloudContinualLearner:
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
                     )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
-                baseline_source = "cached"
-
-                tmp_model = self._load_edge_training_model(
-                    model_name=current_model_name,
-                    edge_id=edge_id,
+                bundle_model_version = _normalize_model_version(
+                    manifest.get("model", {}).get("model_version", "0"),
+                    field_name="bundle model version",
                 )
+                next_checkpoint_model_version = _increment_model_version(
+                    bundle_model_version,
+                    field_name="bundle model version",
+                )
+                baseline_source = f"native {self._native_training_source_label(current_model_name)}"
+
+                if bundle_model_version == "0":
+                    logger.info(
+                        "[FixedSplitCL] Bundle model_version=0 for edge {}; ignoring any cached {} weights and starting from native {} weights.",
+                        edge_id,
+                        current_model_name,
+                        self._native_training_source_label(current_model_name),
+                    )
+                    tmp_model = self._load_edge_training_model(
+                        model_name=current_model_name,
+                        edge_id=edge_id,
+                        cache_policy="native_only",
+                    )
+                else:
+                    metadata = self._require_matching_edge_weights_metadata(
+                        model_name=current_model_name,
+                        edge_id=edge_id,
+                        bundle_model_version=bundle_model_version,
+                    )
+                    logger.info(
+                        "[FixedSplitCL] Resuming edge {} {} training from persisted checkpoint version {}.",
+                        edge_id,
+                        current_model_name,
+                        metadata["checkpoint_model_version"],
+                    )
+                    baseline_source = "edge-scoped cache"
+                    tmp_model = self._load_edge_training_model(
+                        model_name=current_model_name,
+                        edge_id=edge_id,
+                        cache_policy="edge_only",
+                    )
+                weights_metadata = {
+                    "edge_id": int(edge_id),
+                    "model_name": str(current_model_name),
+                    "checkpoint_model_version": next_checkpoint_model_version,
+                    "source_base_model_version": bundle_model_version,
+                    "updated_at_ms": int(time.time() * 1000),
+                }
                 working_cache = self._fixed_split_working_cache_path(
                     edge_id=edge_id,
                     model_name=current_model_name,
@@ -2652,6 +2807,7 @@ class CloudContinualLearner:
                             tmp_model,
                             model_name=current_model_name,
                             edge_id=edge_id,
+                            weights_metadata=weights_metadata,
                         )
                     ).decode("utf-8")
                     self._log_stage_duration("serialization / encoding", stage_started)
@@ -2671,6 +2827,7 @@ class CloudContinualLearner:
                         tmp_model,
                         model_name=current_model_name,
                         edge_id=edge_id,
+                        weights_metadata=weights_metadata,
                     )
                 ).decode("utf-8")
                 self._log_stage_duration("serialization / encoding", stage_started)

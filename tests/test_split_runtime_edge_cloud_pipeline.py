@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
 import os
@@ -100,6 +101,18 @@ def _planned_payload(plan: SplitPlan) -> SplitPayload:
         split_index=plan.split_index,
         split_label=plan.split_label,
     )
+
+
+def _proxy_metrics(map_score: float) -> dict[str, object]:
+    return {
+        "map": float(map_score),
+        "evaluated_samples": 1,
+        "skipped_empty_gt": 0,
+        "skipped_missing_frame": 0,
+        "total_gt_samples": 1,
+        "nonempty_predictions": 1,
+        "total_prediction_boxes": 1,
+    }
 
 
 def test_large_inference_accepts_threshold_override():
@@ -654,11 +667,15 @@ def test_cloud_learner_edge_scoped_cache_paths_are_isolated(tmp_path):
     edge_one = learner._edge_weights_path("yolo26n", edge_id=1)
     edge_two = learner._edge_weights_path("yolo26n", edge_id=2)
     legacy = learner._edge_weights_path("yolo26n")
+    edge_one_meta = learner._edge_weights_metadata_path("yolo26n", edge_id=1)
+    edge_two_meta = learner._edge_weights_metadata_path("yolo26n", edge_id=2)
 
     assert edge_one != edge_two
     assert edge_one.endswith("tmp_edge_model_yolo26n_edge_1.pth")
     assert edge_two.endswith("tmp_edge_model_yolo26n_edge_2.pth")
     assert legacy.endswith("tmp_edge_model_yolo26n.pth")
+    assert edge_one_meta.endswith("tmp_edge_model_yolo26n_edge_1.meta.json")
+    assert edge_two_meta.endswith("tmp_edge_model_yolo26n_edge_2.meta.json")
 
 
 def test_fixed_split_working_cache_paths_are_stable_across_request_bundles(tmp_path):
@@ -1133,6 +1150,308 @@ def test_load_edge_training_model_rejects_legacy_rfdetr_cached_weights(tmp_path,
     assert "plank_rfdetr_cache_version" in recovered_state
 
 
+def test_fixed_split_retrain_uses_native_only_for_first_round_even_with_stale_edge_cache(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+
+    edge_weights = learner._edge_weights_path("rfdetr_nano", edge_id=1)
+    torch.save({"weight": torch.tensor([99.0], dtype=torch.float32)}, edge_weights)
+    Path(learner._edge_weights_metadata_path("rfdetr_nano", edge_id=1)).write_text(
+        json.dumps(
+            {
+                "edge_id": 1,
+                "model_name": "rfdetr_nano",
+                "checkpoint_model_version": "99",
+                "source_base_model_version": "98",
+                "updated_at_ms": 123,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": [],
+        "samples": [],
+    }
+
+    load_calls: list[dict[str, object]] = []
+    model = DummyModel(weight=0.25)
+
+    def fake_load_edge_training_model(**kwargs):
+        load_calls.append(dict(kwargs))
+        return model
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", fake_load_edge_training_model)
+    monkeypatch.setattr(
+        learner,
+        "_prepare_fixed_split_working_cache",
+        lambda *args, **kwargs: (
+            {"all_sample_ids": ["sample-1"]},
+            str(tmp_path / "frames"),
+            None,
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_collect_teacher_annotations",
+        lambda *args, **kwargs: {"sample-1": {"boxes": [[1, 1, 6, 6]], "labels": [1]}},
+    )
+    monkeypatch.setattr(learner, "_load_cached_sample_metadata", lambda *args, **kwargs: {})
+    monkeypatch.setattr(learner, "_proxy_eval_frame_cache", lambda: {})
+    monkeypatch.setattr(
+        learner,
+        "_evaluate_fixed_split_proxy_map",
+        lambda *args, **kwargs: _proxy_metrics(0.6),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_run_fixed_split_retrain",
+        lambda *args, **kwargs: (_proxy_metrics(0.6), copy.deepcopy(model.state_dict())),
+    )
+
+    success, _, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path / "bundle"),
+    )
+
+    assert success is True
+    assert "Fixed split retraining successful" in message
+    assert load_calls == [
+        {
+            "model_name": "rfdetr_nano",
+            "edge_id": 1,
+            "cache_policy": "native_only",
+        }
+    ]
+
+
+def test_fixed_split_retrain_uses_edge_only_when_metadata_matches_model_version(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+    Path(learner._edge_weights_metadata_path("rfdetr_nano", edge_id=1)).write_text(
+        json.dumps(
+            {
+                "edge_id": 1,
+                "model_name": "rfdetr_nano",
+                "checkpoint_model_version": "2",
+                "source_base_model_version": "1",
+                "updated_at_ms": 123,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano", "model_version": "2"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": [],
+        "samples": [],
+    }
+
+    load_calls: list[dict[str, object]] = []
+    model = DummyModel(weight=0.5)
+
+    def fake_load_edge_training_model(**kwargs):
+        load_calls.append(dict(kwargs))
+        return model
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", fake_load_edge_training_model)
+    monkeypatch.setattr(
+        learner,
+        "_prepare_fixed_split_working_cache",
+        lambda *args, **kwargs: (
+            {"all_sample_ids": ["sample-1"]},
+            str(tmp_path / "frames"),
+            None,
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_collect_teacher_annotations",
+        lambda *args, **kwargs: {"sample-1": {"boxes": [[1, 1, 6, 6]], "labels": [1]}},
+    )
+    monkeypatch.setattr(learner, "_load_cached_sample_metadata", lambda *args, **kwargs: {})
+    monkeypatch.setattr(learner, "_proxy_eval_frame_cache", lambda: {})
+    monkeypatch.setattr(
+        learner,
+        "_evaluate_fixed_split_proxy_map",
+        lambda *args, **kwargs: _proxy_metrics(0.7),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_run_fixed_split_retrain",
+        lambda *args, **kwargs: (_proxy_metrics(0.8), copy.deepcopy(model.state_dict())),
+    )
+
+    success, _, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path / "bundle"),
+    )
+
+    assert success is True
+    assert "proxy_mAP@0.5 0.7000 -> 0.8000" in message
+    assert load_calls == [
+        {
+            "model_name": "rfdetr_nano",
+            "edge_id": 1,
+            "cache_policy": "edge_only",
+        }
+    ]
+    metadata = json.loads(
+        Path(learner._edge_weights_metadata_path("rfdetr_nano", edge_id=1)).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["checkpoint_model_version"] == "3"
+    assert metadata["source_base_model_version"] == "2"
+
+
+def test_fixed_split_retrain_fails_when_resume_metadata_is_missing(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"weight": torch.tensor([1.0], dtype=torch.float32)},
+        learner._edge_weights_path("rfdetr_nano", edge_id=1),
+    )
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano", "model_version": "1"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": [],
+        "samples": [],
+    }
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(
+        learner,
+        "_load_edge_training_model",
+        lambda **kwargs: pytest.fail("resume should fail before loading cached weights"),
+    )
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path / "bundle"),
+    )
+
+    assert success is False
+    assert model_data == ""
+    assert "Missing persisted edge checkpoint metadata" in message
+
+
+def test_fixed_split_retrain_fails_when_resume_metadata_version_mismatches_bundle(
+    tmp_path,
+    monkeypatch,
+):
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"weight": torch.tensor([1.0], dtype=torch.float32)},
+        learner._edge_weights_path("rfdetr_nano", edge_id=1),
+    )
+    Path(learner._edge_weights_metadata_path("rfdetr_nano", edge_id=1)).write_text(
+        json.dumps(
+            {
+                "edge_id": 1,
+                "model_name": "rfdetr_nano",
+                "checkpoint_model_version": "2",
+                "source_base_model_version": "1",
+                "updated_at_ms": 123,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "rfdetr_nano", "model_version": "3"},
+        "split_plan": {"candidate_id": "c-1"},
+        "drift_sample_ids": [],
+        "samples": [],
+    }
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(
+        learner,
+        "_load_edge_training_model",
+        lambda **kwargs: pytest.fail("resume should fail before loading cached weights"),
+    )
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path / "bundle"),
+    )
+
+    assert success is False
+    assert model_data == ""
+    assert "checkpoint_model_version=2, bundle model_version=3" in message
+
+
 def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, monkeypatch):
     class DummyModel(torch.nn.Module):
         def __init__(self):
@@ -1298,7 +1617,7 @@ def test_fixed_split_retrain_keeps_baseline_when_proxy_map_regresses(tmp_path, m
 
     serialised_states: list[float] = []
 
-    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None):
+    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None, weights_metadata=None):
         serialised_states.append(float(current_model.state_dict()["weight"][0]))
         return b"baseline-weights"
 
@@ -1459,6 +1778,15 @@ def test_fixed_split_retrain_improves_edge_weights_for_raw_plus_feature_low_conf
 
     assert edge_before == pytest.approx(0.1)
     assert edge_after == pytest.approx(0.9)
+    metadata = json.loads(
+        Path(learner._edge_weights_metadata_path("rfdetr_nano", edge_id=1)).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["edge_id"] == 1
+    assert metadata["model_name"] == "rfdetr_nano"
+    assert metadata["checkpoint_model_version"] == "1"
+    assert metadata["source_base_model_version"] == "0"
 
 
 def test_fixed_split_retrain_returns_failure_when_no_finite_step(
@@ -2380,7 +2708,7 @@ def test_fixed_split_retrain_rejects_proxy_map_regression_and_keeps_baseline(
 
     serialized_weights: list[float] = []
 
-    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None):
+    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None, weights_metadata=None):
         serialized_weights.append(float(current_model.state_dict()["weight"][0]))
         return b"baseline-kept"
 
@@ -2547,7 +2875,7 @@ def test_fixed_split_retrain_rejects_dead_detector_and_keeps_baseline(
 
     serialized_weights: list[float] = []
 
-    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None):
+    def fake_serialise_model_bytes(current_model, *, model_name=None, edge_id=None, weights_metadata=None):
         serialized_weights.append(float(current_model.state_dict()["weight"][0]))
         return b"baseline-kept"
 
