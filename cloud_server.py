@@ -1822,11 +1822,20 @@ class CloudContinualLearner:
         ):
             shutil.rmtree(working_cache, ignore_errors=True)
 
+        prepared_trace_sample_input = None
+        if force_rebuild or not can_attempt_reuse:
+            prepared_trace_sample_input = self._build_bundle_batch_trace_sample_input(
+                model,
+                bundle_cache_path,
+                manifest,
+            )
+
         stage_started = time.perf_counter()
         prepared_splitter, prepared_candidate = self._build_bundle_splitter(
             model,
             manifest,
             bundle_root=bundle_cache_path,
+            trace_sample_input=prepared_trace_sample_input,
         )
         self._log_stage_duration("runtime template load / bind", stage_started)
 
@@ -1882,7 +1891,7 @@ class CloudContinualLearner:
         return (
             bundle_info,
             os.path.join(working_cache, "frames"),
-            None,
+            prepared_trace_sample_input,
             prepared_splitter,
             prepared_candidate,
         )
