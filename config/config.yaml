@@ -173,7 +173,7 @@ server:
  wait_thresh: 10
  # continual learning settings
  continual_learning:
-  num_epoch: 5
+  num_epoch: 50
   batch_size: 16
   max_concurrent_jobs: 4
   # Cloud-side teacher threshold used only for GT annotation during

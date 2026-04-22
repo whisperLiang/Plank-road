@@ -2367,11 +2367,19 @@ class CloudContinualLearner:
             best_metrics = dict(proxy_metrics_before)
             split_retrain_elapsed = 0.0
             proxy_eval_elapsed = 0.0
+            logger.info(
+                "[FixedSplitCL] RF-DETR fixed-split retrain will run {} outer rounds with 1 inner epoch per round and evaluate proxy mAP after each round.",
+                int(effective_num_epoch),
+            )
             for epoch_index in range(int(effective_num_epoch)):
+                outer_epoch_label = (
+                    f"RF-DETR outer epoch {epoch_index + 1}/{int(effective_num_epoch)}"
+                )
                 stage_started = time.perf_counter()
                 universal_split_retrain(
                     **split_retrain_kwargs,
                     num_epoch=1,
+                    epoch_log_context=outer_epoch_label,
                 )
                 split_retrain_elapsed += time.perf_counter() - stage_started
                 stage_started = time.perf_counter()
@@ -2381,7 +2389,7 @@ class CloudContinualLearner:
                     best_state = _snapshot_model_state(model)
                     best_metrics = dict(candidate_metrics)
                     logger.info(
-                        "[FixedSplitCL] Kept RF-DETR candidate from epoch {} with proxy_mAP@0.5={:.4f}.",
+                        "[FixedSplitCL] Kept RF-DETR candidate from outer epoch {} with proxy_mAP@0.5={:.4f}.",
                         epoch_index + 1,
                         float(candidate_metrics.get("map") or 0.0),
                     )

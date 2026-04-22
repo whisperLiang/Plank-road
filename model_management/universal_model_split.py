@@ -936,6 +936,7 @@ def universal_split_retrain(
     das_probe_samples: int = 10,
     das_strategy: str = "tgi",
     das_use_spectral_entropy: bool = False,
+    epoch_log_context: str | None = None,
     **_: Any,
 ) -> list[float]:
     splitter = splitter or UniversalModelSplitter(device=device)
@@ -1225,10 +1226,27 @@ def universal_split_retrain(
         losses.append(epoch_loss / max(1, epoch_finite_samples))
         batch_count = (len(all_indices) + batch_size - 1) // batch_size
         if num_epoch > 1 or _epoch == num_epoch - 1:
-            logger.info(
-                "[FixedSplitCL] epoch {}/{} finished. Samples: {}, Batch Size: {}, Batches: {}, Avg loss: {:.4f}", 
-                _epoch + 1, num_epoch, len(all_indices), batch_size, batch_count, losses[-1]
-            )
+            if epoch_log_context:
+                logger.info(
+                    "[FixedSplitCL] {} finished (inner epoch {}/{}). Samples: {}, Batch Size: {}, Batches: {}, Avg loss: {:.4f}",
+                    epoch_log_context,
+                    _epoch + 1,
+                    num_epoch,
+                    len(all_indices),
+                    batch_size,
+                    batch_count,
+                    losses[-1],
+                )
+            else:
+                logger.info(
+                    "[FixedSplitCL] epoch {}/{} finished. Samples: {}, Batch Size: {}, Batches: {}, Avg loss: {:.4f}",
+                    _epoch + 1,
+                    num_epoch,
+                    len(all_indices),
+                    batch_size,
+                    batch_count,
+                    losses[-1],
+                )
     if optimizer is not None and params and finite_steps == 0:
         raise RuntimeError(
             "Split retraining did not produce any finite optimization step. "
