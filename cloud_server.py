@@ -435,37 +435,50 @@ def _batched_predictions_from_model_output(
     ]
 
 
-def _evaluate_detection_proxy_map(
+def _filter_prediction_by_high_threshold(
+    prediction: Mapping[str, object],
+    *,
+    threshold_high: float,
+) -> dict[str, list]:
+    empty = {"labels": [], "boxes": [], "scores": []}
+    scores = list(prediction.get("scores") or [])
+    if not scores:
+        return empty
+
+    high_indices = [
+        index for index, score in enumerate(scores) if float(score) > float(threshold_high)
+    ]
+    if not high_indices:
+        return empty
+
+    labels = list(prediction.get("labels") or [])
+    boxes = list(prediction.get("boxes") or [])
+    return {
+        "labels": [labels[index] for index in high_indices],
+        "boxes": [boxes[index] for index in high_indices],
+        "scores": [scores[index] for index in high_indices],
+    }
+
+
+def _build_detection_proxy_prediction_cache(
     model: torch.nn.Module,
     *,
     frame_dir: str,
     gt_annotations: Mapping[str, Mapping[str, object]],
     device: torch.device,
-    threshold_low: float | None = None,
-    threshold_high: float | None = None,
-    model_name: str | None = None,
-    sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
+    threshold_low: float,
     frame_cache: dict[str, np.ndarray | None] | None = None,
     max_samples: int | None = None,
     inference_batch_size: int = 1,
-) -> dict[str, float | int | None]:
+) -> dict[str, object]:
     sample_ids = _normalize_proxy_sample_ids(
         gt_annotations,
         max_samples=max_samples,
     )
-    scores: list[float] = []
     skipped_empty_gt = 0
     skipped_missing_frame = 0
-    nonempty_predictions = 0
-    total_prediction_boxes = 0
+    pending_samples: list[tuple[list[object], list[object], np.ndarray]] = []
 
-    if threshold_low is None or threshold_high is None:
-        threshold_low, threshold_high = get_model_detection_thresholds(
-            model,
-            str(model_name or getattr(model, "model_name", "")),
-        )
-
-    pending_samples: list[tuple[str, list[object], list[object], np.ndarray]] = []
     for sample_id in sample_ids:
         target = gt_annotations.get(sample_id) or {}
         gt_boxes = list(target.get("boxes") or [])
@@ -487,8 +500,10 @@ def _evaluate_detection_proxy_map(
         if frame is None:
             skipped_missing_frame += 1
             continue
-        pending_samples.append((sample_id, gt_boxes, gt_labels, frame))
 
+        pending_samples.append((gt_boxes, gt_labels, frame))
+
+    prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
     _set_detection_model_eval_mode(model)
     with torch.no_grad():
         batch_size = max(1, int(inference_batch_size))
@@ -496,35 +511,100 @@ def _evaluate_detection_proxy_map(
             batch = pending_samples[start : start + batch_size]
             batch_inputs = [
                 _prepare_eval_image_tensor(frame, device=device)
-                for _, _, _, frame in batch
+                for _, _, frame in batch
             ]
-            predictions = _batched_predictions_from_model_output(
+            low_threshold_predictions = _batched_predictions_from_model_output(
                 model(batch_inputs),
                 batch_size=len(batch),
                 threshold_low=threshold_low,
-                threshold_high=threshold_high,
+                threshold_high=threshold_low,
             )
-            for (_, gt_boxes, gt_labels, _), prediction in zip(batch, predictions):
-                predicted_boxes = list(prediction.get("boxes") or [])
-                total_prediction_boxes += len(predicted_boxes)
-                if predicted_boxes:
-                    nonempty_predictions += 1
-                score = calculate_map(
-                    {"labels": gt_labels, "boxes": gt_boxes},
-                    prediction,
-                    0.5,
-                )
-                scores.append(float(score))
+            for (gt_boxes, gt_labels, _), prediction in zip(batch, low_threshold_predictions):
+                prediction_rows.append((gt_boxes, gt_labels, prediction))
+
+    return {
+        "prediction_rows": prediction_rows,
+        "skipped_empty_gt": skipped_empty_gt,
+        "skipped_missing_frame": skipped_missing_frame,
+        "total_gt_samples": len(sample_ids),
+        "threshold_low": float(threshold_low),
+    }
+
+
+def _evaluate_detection_proxy_map_from_cache(
+    prediction_cache: Mapping[str, object],
+    *,
+    threshold_high: float,
+) -> dict[str, float | int | None]:
+    scores: list[float] = []
+    nonempty_predictions = 0
+    total_prediction_boxes = 0
+
+    for gt_boxes, gt_labels, prediction in prediction_cache.get("prediction_rows", []):
+        filtered_prediction = _filter_prediction_by_high_threshold(
+            prediction,
+            threshold_high=threshold_high,
+        )
+        predicted_boxes = list(filtered_prediction.get("boxes") or [])
+        total_prediction_boxes += len(predicted_boxes)
+        if predicted_boxes:
+            nonempty_predictions += 1
+        score = calculate_map(
+            {"labels": gt_labels, "boxes": gt_boxes},
+            filtered_prediction,
+            0.5,
+        )
+        scores.append(float(score))
 
     return {
         "map": float(np.mean(scores)) if scores else None,
         "evaluated_samples": len(scores),
-        "skipped_empty_gt": skipped_empty_gt,
-        "skipped_missing_frame": skipped_missing_frame,
-        "total_gt_samples": len(sample_ids),
+        "skipped_empty_gt": int(prediction_cache.get("skipped_empty_gt", 0)),
+        "skipped_missing_frame": int(prediction_cache.get("skipped_missing_frame", 0)),
+        "total_gt_samples": int(prediction_cache.get("total_gt_samples", 0)),
         "nonempty_predictions": nonempty_predictions,
         "total_prediction_boxes": total_prediction_boxes,
     }
+
+
+def _evaluate_detection_proxy_map(
+    model: torch.nn.Module,
+    *,
+    frame_dir: str,
+    gt_annotations: Mapping[str, Mapping[str, object]],
+    device: torch.device,
+    threshold_low: float | None = None,
+    threshold_high: float | None = None,
+    model_name: str | None = None,
+    sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
+    frame_cache: dict[str, np.ndarray | None] | None = None,
+    max_samples: int | None = None,
+    inference_batch_size: int = 1,
+    prediction_cache: Mapping[str, object] | None = None,
+) -> dict[str, float | int | None]:
+    if threshold_low is None or threshold_high is None:
+        threshold_low, threshold_high = get_model_detection_thresholds(
+            model,
+            str(model_name or getattr(model, "model_name", "")),
+        )
+
+    active_prediction_cache = prediction_cache
+    if active_prediction_cache is None:
+        active_prediction_cache = _build_detection_proxy_prediction_cache(
+            model,
+            frame_dir=frame_dir,
+            gt_annotations=gt_annotations,
+            device=device,
+            threshold_low=float(threshold_low),
+            frame_cache=frame_cache,
+            max_samples=max_samples,
+            inference_batch_size=inference_batch_size,
+        )
+
+    return _evaluate_detection_proxy_map_from_cache(
+        active_prediction_cache,
+        threshold_high=float(threshold_high),
+    )
 
 
 def _format_proxy_map_summary(
@@ -620,6 +700,18 @@ def _calibrate_tinynext_proxy_thresholds(
         configured_candidates=candidate_thresholds,
     )
 
+    prediction_cache = _build_detection_proxy_prediction_cache(
+        model,
+        frame_dir=frame_dir,
+        gt_annotations=gt_annotations,
+        device=device,
+        threshold_low=float(current_low),
+        frame_cache=frame_cache,
+        max_samples=max_samples,
+        inference_batch_size=inference_batch_size,
+    )
+    metrics_by_threshold: dict[float, dict[str, float | int | None]] = {}
+
     best_high = float(current_high)
     best_metrics = _evaluate_detection_proxy_map(
         model,
@@ -632,21 +724,28 @@ def _calibrate_tinynext_proxy_thresholds(
         frame_cache=frame_cache,
         max_samples=max_samples,
         inference_batch_size=inference_batch_size,
+        prediction_cache=prediction_cache,
     )
+    metrics_by_threshold[round(float(current_high), 6)] = dict(best_metrics)
 
     for candidate_high in candidate_highs:
-        candidate_metrics = _evaluate_detection_proxy_map(
-            model,
-            frame_dir=frame_dir,
-            gt_annotations=gt_annotations,
-            device=device,
-            model_name=model_name,
-            threshold_low=current_low,
-            threshold_high=candidate_high,
-            frame_cache=frame_cache,
-            max_samples=max_samples,
-            inference_batch_size=inference_batch_size,
-        )
+        threshold_key = round(float(candidate_high), 6)
+        candidate_metrics = metrics_by_threshold.get(threshold_key)
+        if candidate_metrics is None:
+            candidate_metrics = _evaluate_detection_proxy_map(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                device=device,
+                model_name=model_name,
+                threshold_low=current_low,
+                threshold_high=candidate_high,
+                frame_cache=frame_cache,
+                max_samples=max_samples,
+                inference_batch_size=inference_batch_size,
+                prediction_cache=prediction_cache,
+            )
+            metrics_by_threshold[threshold_key] = dict(candidate_metrics)
         if _proxy_metrics_are_better(candidate_metrics, best_metrics):
             best_metrics = candidate_metrics
             best_high = float(candidate_high)
@@ -791,6 +890,10 @@ class CloudContinualLearner:
         self.rfdetr_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
             if cl_cfg else 1e-4
+        )
+        self.yolo_fixed_split_target_steps_per_round = (
+            int(getattr(cl_cfg, "yolo_fixed_split_target_steps_per_round", 4))
+            if cl_cfg else 4
         )
         self.rfdetr_fixed_split_target_steps_per_round = (
             int(getattr(cl_cfg, "rfdetr_fixed_split_target_steps_per_round", 4))
@@ -1941,6 +2044,48 @@ class CloudContinualLearner:
 
         return float(learning_rate)
 
+    def _resolve_fixed_split_target_steps_per_round(
+        self,
+        model_name: str,
+    ) -> int | None:
+        model_family = model_zoo.get_model_family(str(model_name))
+        if model_family == "rfdetr":
+            return max(1, int(self.rfdetr_fixed_split_target_steps_per_round))
+        if model_family == "yolo":
+            return max(1, int(self.yolo_fixed_split_target_steps_per_round))
+        return None
+
+    @staticmethod
+    def _uses_proxy_selected_fixed_split_epochs(
+        model_name: str,
+    ) -> bool:
+        return model_zoo.get_model_family(str(model_name)) in {"rfdetr", "yolo"}
+
+    @staticmethod
+    def _resolve_fixed_split_training_label(
+        model_name: str,
+    ) -> str:
+        model_family = model_zoo.get_model_family(str(model_name))
+        if model_family == "rfdetr":
+            return "RF-DETR"
+        if model_family == "yolo":
+            return str(model_name)
+        return str(model_name)
+
+    @staticmethod
+    def _fixed_split_optimizer_overrides(
+        model_name: str,
+    ) -> dict[str, object]:
+        model_family = model_zoo.get_model_family(str(model_name))
+        if model_family in {"rfdetr", "yolo"}:
+            return {
+                "optimizer_name": "adamw",
+                "weight_decay": 1e-4,
+                "grad_clip_norm": 1.0,
+                "shuffle_samples": True,
+            }
+        return {}
+
     @staticmethod
     def _count_manifest_training_samples(manifest: Mapping[str, object]) -> int:
         count = 0
@@ -1958,9 +2103,9 @@ class CloudContinualLearner:
         num_train_samples: int,
     ) -> int:
         configured_batch_size = max(1, int(self.batch_size))
-        if not str(model_name).lower().startswith("rfdetr_"):
+        target_steps = self._resolve_fixed_split_target_steps_per_round(model_name)
+        if target_steps is None:
             return configured_batch_size
-        target_steps = max(1, int(self.rfdetr_fixed_split_target_steps_per_round))
         effective_batch_size = min(
             configured_batch_size,
             max(1, math.ceil(max(0, int(num_train_samples)) / target_steps)),
@@ -2369,7 +2514,14 @@ class CloudContinualLearner:
             )
 
         bs = max(1, int(effective_batch_size))
-        is_rfdetr_fixed_split = str(current_model_name).lower().startswith("rfdetr_")
+        training_label = self._resolve_fixed_split_training_label(current_model_name)
+        target_steps_per_round = self._resolve_fixed_split_target_steps_per_round(
+            current_model_name,
+        )
+        uses_proxy_selected_epochs = (
+            gt_annotations
+            and self._uses_proxy_selected_fixed_split_epochs(current_model_name)
+        )
         logger.info(
             "[FixedSplitCL] Starting split retrain configuration: Epochs={}, Learning Rate={}, Runtime Batch Size={}, Total Samples={}",
             effective_num_epoch,
@@ -2377,12 +2529,13 @@ class CloudContinualLearner:
             bs,
             len(bundle_info["all_sample_ids"])
         )
-        if is_rfdetr_fixed_split:
+        if target_steps_per_round is not None:
             logger.info(
-                "[FixedSplitCL] RF-DETR effective batch size {} resolved from configured batch size {} with target_steps_per_round={} and samples={}.",
+                "[FixedSplitCL] {} effective batch size {} resolved from configured batch size {} with target_steps_per_round={} and samples={}.",
+                training_label,
                 bs,
                 int(self.batch_size),
-                int(self.rfdetr_fixed_split_target_steps_per_round),
+                int(target_steps_per_round),
                 len(bundle_info["all_sample_ids"]),
             )
         if prepared_trace_sample_input is None and prepared_splitter is not None:
@@ -2407,13 +2560,9 @@ class CloudContinualLearner:
             "chosen_candidate": prepared_candidate,
             "batch_size": bs,
         }
-        if is_rfdetr_fixed_split:
-            split_retrain_kwargs.update(
-                optimizer_name="adamw",
-                weight_decay=1e-4,
-                grad_clip_norm=1.0,
-                shuffle_samples=True,
-            )
+        split_retrain_kwargs.update(
+            self._fixed_split_optimizer_overrides(current_model_name)
+        )
         proxy_metrics_cache: dict[str, dict[str, float | int | None]] = {}
         if proxy_metrics_before:
             proxy_metrics_cache[baseline_proxy_state_key] = dict(proxy_metrics_before)
@@ -2436,18 +2585,19 @@ class CloudContinualLearner:
             proxy_metrics_cache[state_key] = dict(metrics)
             return dict(metrics)
 
-        if gt_annotations and is_rfdetr_fixed_split:
+        if uses_proxy_selected_epochs:
             best_state = baseline_state
             best_metrics = dict(proxy_metrics_before)
             split_retrain_elapsed = 0.0
             proxy_eval_elapsed = 0.0
             logger.info(
-                "[FixedSplitCL] RF-DETR fixed-split retrain will run {} outer rounds with 1 inner epoch per round and evaluate proxy mAP after each round.",
+                "[FixedSplitCL] {} fixed-split retrain will run {} outer rounds with 1 inner epoch per round and evaluate proxy mAP after each round.",
+                training_label,
                 int(effective_num_epoch),
             )
             for epoch_index in range(int(effective_num_epoch)):
                 outer_epoch_label = (
-                    f"RF-DETR outer epoch {epoch_index + 1}/{int(effective_num_epoch)}"
+                    f"{training_label} outer epoch {epoch_index + 1}/{int(effective_num_epoch)}"
                 )
                 stage_started = time.perf_counter()
                 universal_split_retrain(
@@ -2463,7 +2613,8 @@ class CloudContinualLearner:
                     best_state = _snapshot_model_state(model)
                     best_metrics = dict(candidate_metrics)
                     logger.info(
-                        "[FixedSplitCL] Kept RF-DETR candidate from outer epoch {} with proxy_mAP@0.5={:.4f}.",
+                        "[FixedSplitCL] Kept {} candidate from outer epoch {} with proxy_mAP@0.5={:.4f}.",
+                        training_label,
                         epoch_index + 1,
                         float(candidate_metrics.get("map") or 0.0),
                     )

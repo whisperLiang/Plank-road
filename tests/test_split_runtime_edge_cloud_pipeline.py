@@ -817,6 +817,58 @@ def test_rfdetr_fixed_split_runtime_batch_size_shapes_trace_and_template_key(
     assert template_key.trace_input_shape == (3, 3, 384, 384)
 
 
+def test_yolo_fixed_split_runtime_batch_size_shapes_trace_and_template_key(
+    tmp_path,
+    monkeypatch,
+):
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(
+            batch_size=16,
+            yolo_fixed_split_target_steps_per_round=4,
+        ),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    effective_batch_size = learner._resolve_fixed_split_runtime_batch_size(
+        "yolo26n",
+        num_train_samples=12,
+    )
+    monkeypatch.setattr(
+        "cloud_server.build_split_runtime_sample_input",
+        lambda *args, **kwargs: torch.ones(1, 3, 8, 8),
+    )
+
+    trace_input = learner._build_bundle_batch_trace_sample_input(
+        torch.nn.Identity(),
+        str(tmp_path),
+        {"samples": []},
+        runtime_batch_size=effective_batch_size,
+    )
+    template_key = learner._fixed_split_runtime_template_key(
+        model_name="yolo26n",
+        manifest={
+            "split_plan": {},
+            "samples": [
+                {
+                    "sample_id": "sample-0",
+                    "input_tensor_shape": [1, 3, 384, 640],
+                }
+            ],
+        },
+        runtime_batch_size=effective_batch_size,
+    )
+
+    assert effective_batch_size == 3
+    assert tuple(trace_input.shape) == (3, 3, 8, 8)
+    assert template_key.trace_batch_size == 3
+    assert template_key.trace_input_shape == (3, 3, 384, 640)
+
+
 def test_select_fixed_split_gt_sample_ids_includes_raw_plus_feature_low_conf_samples():
     manifest = {
         "drift_sample_ids": [],
@@ -937,6 +989,74 @@ def test_calibrate_tinynext_proxy_thresholds_picks_best_near_default_threshold(m
     assert calibrated_high == pytest.approx(0.148)
     assert metrics["map"] == pytest.approx(0.1905)
     assert get_model_detection_thresholds(model, "tinynext_s") == pytest.approx((0.02, 0.148))
+
+
+def test_calibrate_tinynext_proxy_thresholds_reuses_single_forward_for_multiple_candidates(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, images):
+            self.forward_calls += 1
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
+                    "scores": torch.tensor([0.16], dtype=torch.float32),
+                }
+                for _ in images
+            ]
+
+    model = DummyModel()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(frame_dir / "sample-1.jpg"), frame)
+    assert cv2.imwrite(str(frame_dir / "sample-2.jpg"), frame)
+
+    stored_thresholds = {"low": 0.02, "high": 0.13}
+
+    monkeypatch.setattr(
+        "cloud_server.get_model_detection_thresholds",
+        lambda _model, _name: (stored_thresholds["low"], stored_thresholds["high"]),
+    )
+    monkeypatch.setattr(
+        "cloud_server.get_detection_thresholds",
+        lambda _name: (stored_thresholds["low"], 0.15),
+    )
+    monkeypatch.setattr(
+        "cloud_server.set_model_detection_thresholds",
+        lambda _model, *, threshold_low, threshold_high, model_name=None: stored_thresholds.update(
+            low=float(threshold_low),
+            high=float(threshold_high),
+        ),
+    )
+    monkeypatch.setattr(
+        "cloud_server.calculate_map",
+        lambda target, prediction, _iou: 1.0 if prediction.get("boxes") else 0.0,
+    )
+
+    metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+        model,
+        frame_dir=str(frame_dir),
+        gt_annotations={
+            "sample-1": {"boxes": [[1.0, 1.0, 6.0, 6.0]], "labels": [1]},
+            "sample-2": {"boxes": [[1.0, 1.0, 6.0, 6.0]], "labels": [1]},
+        },
+        device=torch.device("cpu"),
+        model_name="tinynext_s",
+        candidate_thresholds=[0.13, 0.15, 0.17],
+        inference_batch_size=2,
+    )
+
+    assert initial_high == pytest.approx(0.13)
+    assert calibrated_high == pytest.approx(0.15)
+    assert metrics["map"] == pytest.approx(1.0)
+    assert model.forward_calls == 1
 
 
 @pytest.mark.parametrize("model_name", NEW_DETECTORS)
@@ -2322,6 +2442,136 @@ def test_rfdetr_fixed_split_retrain_uses_effective_batch_size_for_proxy_eval_and
     assert float(returned_state["weight"][0]) == pytest.approx(0.9)
 
 
+def test_yolo_fixed_split_retrain_uses_effective_batch_size_for_proxy_eval_and_retrain(
+    tmp_path,
+    monkeypatch,
+):
+    class DummyModel(torch.nn.Module):
+        def __init__(self, weight: float):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([weight], dtype=torch.float32))
+
+        def forward(self, images):
+            score = float(self.weight.detach().cpu().item())
+            if score <= 0.0:
+                return [
+                    {
+                        "labels": torch.empty(0),
+                        "boxes": torch.empty((0, 4)),
+                        "scores": torch.empty(0),
+                    }
+                ]
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[1.0, 1.0, 6.0, 6.0]], dtype=torch.float32),
+                    "scores": torch.tensor([score], dtype=torch.float32),
+                }
+            ]
+
+    all_sample_ids = [f"sample-{index}" for index in range(12)]
+    manifest = {
+        "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+        "model": {"model_id": "yolo26n", "model_version": "0"},
+        "drift_sample_ids": ["sample-0"],
+        "samples": [
+            {
+                "sample_id": sample_id,
+                "confidence_bucket": LOW_CONFIDENCE,
+                "raw_relpath": f"frames/{sample_id}.jpg",
+                "input_tensor_shape": [1, 3, 384, 640],
+            }
+            for sample_id in all_sample_ids
+        ],
+    }
+
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(
+            batch_size=16,
+            num_epoch=2,
+            yolo_fixed_split_target_steps_per_round=4,
+        ),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "weights")
+    Path(learner.weight_folder).mkdir(parents=True, exist_ok=True)
+
+    model = DummyModel(weight=0.1)
+    prepare_runtime_batch_sizes: list[int] = []
+    proxy_batch_sizes: list[int] = []
+    retrain_batch_sizes: list[int] = []
+    epoch_weights = iter([0.9, 0.8])
+
+    monkeypatch.setattr("cloud_server.load_training_bundle_manifest", lambda *_: manifest)
+    monkeypatch.setattr(learner, "_load_edge_training_model", lambda **_: model)
+    monkeypatch.setattr("cloud_server.get_split_runtime_model", lambda current_model: current_model)
+    monkeypatch.setattr("cloud_server.build_split_training_loss", lambda *_: None)
+
+    def fake_prepare_cache(*args, runtime_batch_size=None, **kwargs):
+        prepare_runtime_batch_sizes.append(int(runtime_batch_size))
+        return (
+            {"all_sample_ids": list(all_sample_ids), "drift_sample_ids": ["sample-0"]},
+            str(tmp_path / "frames"),
+            "prepared-trace",
+            "prepared-splitter",
+            SimpleNamespace(
+                candidate_id="candidate-1",
+                legacy_layer_index=3,
+                boundary_tensor_labels=["layer3"],
+            ),
+        )
+
+    monkeypatch.setattr(learner, "_prepare_fixed_split_working_cache", fake_prepare_cache)
+    monkeypatch.setattr(
+        learner,
+        "_collect_teacher_annotations",
+        lambda *args, **kwargs: {"sample-0": {"boxes": [[1, 1, 6, 6]], "labels": [1]}},
+    )
+    monkeypatch.setattr(learner, "_load_cached_sample_metadata", lambda *args, **kwargs: {})
+    monkeypatch.setattr(learner, "_proxy_eval_frame_cache", lambda: None)
+
+    def fake_universal_split_retrain(*, model, num_epoch, **kwargs):
+        retrain_batch_sizes.append(int(kwargs["batch_size"]))
+        assert kwargs["optimizer_name"] == "adamw"
+        assert kwargs["weight_decay"] == pytest.approx(1e-4)
+        assert kwargs["grad_clip_norm"] == pytest.approx(1.0)
+        assert kwargs["shuffle_samples"] is True
+        with torch.no_grad():
+            model.weight.fill_(next(epoch_weights))
+        return [0.1]
+
+    monkeypatch.setattr("cloud_server.universal_split_retrain", fake_universal_split_retrain)
+
+    def fake_evaluate_proxy_map(model, **kwargs):
+        proxy_batch_sizes.append(int(kwargs["inference_batch_size"]))
+        return _proxy_metrics(float(model.weight.detach().cpu().item()))
+
+    monkeypatch.setattr("cloud_server._evaluate_detection_proxy_map", fake_evaluate_proxy_map)
+
+    success, model_data, message = learner.get_ground_truth_and_fixed_split_retrain(
+        edge_id=1,
+        bundle_cache_path=str(tmp_path),
+    )
+
+    assert prepare_runtime_batch_sizes == [3]
+    assert retrain_batch_sizes == [3, 3]
+    assert proxy_batch_sizes
+    assert set(proxy_batch_sizes) == {3}
+    assert success is True
+    assert "proxy_mAP@0.5 0.1000 -> 0.9000" in message
+    returned_state = torch.load(
+        io.BytesIO(base64.b64decode(model_data)),
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert float(returned_state["weight"][0]) == pytest.approx(0.9)
+
+
 def test_fixed_split_retrain_accepts_num_epoch_override(
     tmp_path,
     monkeypatch,
@@ -2839,7 +3089,7 @@ def test_fixed_split_retrain_rejects_proxy_map_regression_and_keeps_baseline(
             ]
 
     config = SimpleNamespace(
-        edge_model_name="yolo26n",
+        edge_model_name="rtdetr_x",
         continual_learning=SimpleNamespace(num_epoch=1),
         das=SimpleNamespace(enabled=False),
     )
@@ -2853,7 +3103,7 @@ def test_fixed_split_retrain_rejects_proxy_map_regression_and_keeps_baseline(
 
     manifest = {
         "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
-        "model": {"model_id": "yolo26n", "model_version": "0"},
+        "model": {"model_id": "rtdetr_x", "model_version": "0"},
         "split_plan": {"candidate_id": "c-1"},
         "drift_sample_ids": ["sample-1"],
         "samples": [
@@ -3006,7 +3256,7 @@ def test_fixed_split_retrain_rejects_dead_detector_and_keeps_baseline(
             ]
 
     config = SimpleNamespace(
-        edge_model_name="yolo26n",
+        edge_model_name="rtdetr_x",
         continual_learning=SimpleNamespace(num_epoch=1),
         das=SimpleNamespace(enabled=False),
     )
@@ -3020,7 +3270,7 @@ def test_fixed_split_retrain_rejects_dead_detector_and_keeps_baseline(
 
     manifest = {
         "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
-        "model": {"model_id": "yolo26n", "model_version": "0"},
+        "model": {"model_id": "rtdetr_x", "model_version": "0"},
         "split_plan": {"candidate_id": "c-1"},
         "drift_sample_ids": ["sample-1"],
         "samples": [

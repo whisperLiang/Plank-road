@@ -217,6 +217,26 @@ server:
     assert config.server.continual_learning.rfdetr_fixed_split_target_steps_per_round == 6
 
 
+def test_load_runtime_config_reads_yolo_target_steps_per_round(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 16
+    yolo_fixed_split_target_steps_per_round: 5
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.yolo_fixed_split_target_steps_per_round == 5
+
+
 def test_load_runtime_config_reads_cloud_proxy_eval_knobs(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -286,10 +306,30 @@ server:
     assert config.server.continual_learning.rfdetr_fixed_split_target_steps_per_round == 4
 
 
+def test_load_runtime_config_yolo_target_steps_per_round_defaults_to_four(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 7
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.yolo_fixed_split_target_steps_per_round == 4
+
+
 @pytest.mark.parametrize(
     ("field_name", "field_value"),
     [
         ("batch_size", 0),
+        ("yolo_fixed_split_target_steps_per_round", 0),
         ("rfdetr_fixed_split_target_steps_per_round", 0),
     ],
 )
