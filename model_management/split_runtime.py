@@ -361,6 +361,8 @@ class GraphSplitRuntime:
         self.runtime_state: RuntimeState = RuntimeState(values=OrderedDict())
         self.trainability_loss_fn = None
         self._validation_cache: dict[tuple[str, float, float], dict[str, Any]] = {}
+        self.trace_timings: dict[str, float] = {}
+        self.trace_used_output_fallback: bool = False
 
     def _invalidate_validation_cache(self) -> None:
         self._validation_cache.clear()
@@ -377,14 +379,32 @@ class GraphSplitRuntime:
             for name, parameter in model.named_parameters()
         }
         trainable_param_names = set(grad_state)
-        history, sample_args, sample_kwargs_dict, sample_output = trace_model(
+        trace_result = trace_model(
             model,
             sample_input,
             sample_kwargs=sample_kwargs,
         )
+        if isinstance(trace_result, tuple):
+            history, sample_args, sample_kwargs_dict, sample_output = trace_result
+            sample_output_spec = None
+            output_leaves = None
+            self.trace_timings = {}
+            self.trace_used_output_fallback = False
+        else:
+            history = trace_result.history
+            sample_args = trace_result.sample_args
+            sample_kwargs_dict = trace_result.sample_kwargs
+            sample_output = trace_result.sample_output
+            sample_output_spec = trace_result.sample_output_spec
+            output_leaves = trace_result.output_leaves
+            self.trace_timings = dict(trace_result.timings)
+            self.trace_used_output_fallback = bool(
+                getattr(trace_result, "used_output_fallback", False)
+            )
         try:
             for name, parameter in model.named_parameters():
                 parameter.requires_grad_(grad_state.get(name, parameter.requires_grad))
+            graph_build_started = time.perf_counter()
             self.graph = build_graph_from_trace(
                 model,
                 history,
@@ -392,7 +412,10 @@ class GraphSplitRuntime:
                 sample_kwargs_dict,
                 sample_output,
                 trainable_param_names=trainable_param_names,
+                sample_output_spec=sample_output_spec,
+                output_leaves=output_leaves,
             )
+            self.trace_timings["graph_build"] = time.perf_counter() - graph_build_started
         finally:
             # The runtime only needs the derived graph; retaining the raw
             # TorchLens history keeps large trace-time intermediates alive.
@@ -404,7 +427,11 @@ class GraphSplitRuntime:
             gc.collect()
             for name, parameter in model.named_parameters():
                 parameter.requires_grad_(grad_state.get(name, parameter.requires_grad))
+        candidate_started = time.perf_counter()
         self.candidates = enumerate_candidates(self.graph)
+        self.trace_timings["candidate_enumeration"] = (
+            time.perf_counter() - candidate_started
+        )
         self.current_candidate = self.candidates[0] if self.candidates else None
         self.reset_runtime_state()
         self._invalidate_validation_cache()

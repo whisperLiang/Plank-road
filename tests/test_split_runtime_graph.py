@@ -117,6 +117,17 @@ class ArangeCatNet(nn.Module):
         return torch.cat([base, grid], dim=1)
 
 
+class CountingNestedOutputNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, x: torch.Tensor):
+        self.forward_calls += 1
+        branch = x + 1
+        return {"a": branch, "b": [branch * 2, {"c": branch * 3}]}
+
+
 class AliasWrappedDetector(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -261,6 +272,67 @@ def test_runtime_trace_cleans_up_raw_torchlens_history(monkeypatch):
     assert cleanup_called
     assert runtime.history is None
     assert runtime.graph is fake_graph
+
+
+def test_trace_model_uses_single_forward_when_history_outputs_are_recoverable():
+    model = CountingNestedOutputNet().eval()
+    sample = torch.randn(2, 3)
+
+    artifacts = graph_ir.trace_model(model, sample)
+
+    assert model.forward_calls == 1
+    assert artifacts.used_output_fallback is False
+    assert isinstance(artifacts.sample_output, dict)
+    assert list(artifacts.output_leaves.keys()) == [
+        "output.a",
+        "output.b.0",
+        "output.b.1.c",
+    ]
+
+
+def test_trace_model_falls_back_to_explicit_forward_when_output_recovery_fails(monkeypatch):
+    model = CountingNestedOutputNet().eval()
+    sample = torch.randn(2, 3)
+
+    def _force_missing_capture(traced_model, traced_args, **trace_kwargs):
+        history = graph_ir.tl.log_forward_pass(traced_model, traced_args, **trace_kwargs)
+        return history, None
+
+    monkeypatch.setattr(
+        graph_ir,
+        "_log_forward_pass_with_output_capture",
+        _force_missing_capture,
+    )
+    monkeypatch.setattr(
+        graph_ir,
+        "_build_sample_output_artifacts_from_history",
+        lambda *_args, **_kwargs: None,
+    )
+
+    artifacts = graph_ir.trace_model(model, sample)
+
+    assert model.forward_calls == 2
+    assert artifacts.used_output_fallback is True
+    assert isinstance(artifacts.sample_output, dict)
+
+
+def test_trace_reconstructs_nested_output_spec_and_replay():
+    model = CountingNestedOutputNet().eval()
+    sample = torch.randn(2, 3)
+    splitter = UniversalModelSplitter(device="cpu")
+
+    splitter.trace(model, sample)
+
+    replayed = splitter.full_replay(sample)
+    expected = model(sample)
+    ok, max_diff = compare_outputs(expected, replayed)
+
+    assert ok, max_diff
+    assert list(splitter.graph.output_address_to_label.keys()) == [
+        "output.a",
+        "output.b.0",
+        "output.b.1.c",
+    ]
 
 
 def test_node_has_trainable_params_resolves_alias_wrapped_parameter_paths():

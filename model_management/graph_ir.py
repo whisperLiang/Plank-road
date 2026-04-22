@@ -3,16 +3,32 @@ from __future__ import annotations
 import copy
 import dataclasses
 import inspect
+import math
 import re
+import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 import torchlens as tl
+from torchlens.capture import trace as torchlens_trace
 
 
 SKIPPED_FUNCTION_NAMES = {"isinf", "isnan", "nantonum", "nan_to_num"}
+_IMMUTABLE_TRACE_METADATA_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    range,
+    slice,
+)
+_TORCHLENS_OUTPUT_CAPTURE_LOCK = threading.Lock()
 
 
 def _get_attr(obj: Any, *names: str, default: Any = None) -> Any:
@@ -29,6 +45,8 @@ def _normalize_path_key(path: Any) -> tuple[Any, ...]:
 
 
 def _safe_deepcopy(obj: Any) -> Any:
+    if isinstance(obj, _IMMUTABLE_TRACE_METADATA_TYPES):
+        return obj
     if isinstance(obj, torch.Tensor):
         return obj.detach().cpu()
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
@@ -59,7 +77,7 @@ def _safe_deepcopy(obj: Any) -> Any:
         except Exception:
             return values
     try:
-        return copy.deepcopy(obj)
+        return copy.copy(obj)
     except Exception:
         return obj
 
@@ -195,6 +213,142 @@ def _find_tensor_path(container: Any, target: torch.Tensor) -> tuple[Any, ...] |
     return None
 
 
+def _build_tensor_path_index(container: Any, prefix: tuple[Any, ...] = ()) -> dict[int, tuple[Any, ...]]:
+    paths: dict[int, tuple[Any, ...]] = {}
+    if isinstance(container, torch.Tensor):
+        paths[id(container)] = prefix
+        return paths
+    if dataclasses.is_dataclass(container) and not isinstance(container, type):
+        for field in dataclasses.fields(container):
+            paths.update(
+                _build_tensor_path_index(
+                    getattr(container, field.name),
+                    prefix + (field.name,),
+                )
+            )
+        return paths
+    if isinstance(container, (list, tuple)):
+        for index, value in enumerate(container):
+            paths.update(_build_tensor_path_index(value, prefix + (index,)))
+        return paths
+    if isinstance(container, dict):
+        for key, value in container.items():
+            paths.update(_build_tensor_path_index(value, prefix + (key,)))
+    return paths
+
+
+def _is_numeric_output_path_segment(segment: str) -> bool:
+    return bool(segment) and segment.isdigit()
+
+
+def _ensure_output_container(
+    current: Any | None,
+    *,
+    prefer_list: bool,
+) -> list[Any] | dict[str, Any] | None:
+    if current is None:
+        return [] if prefer_list else {}
+    if prefer_list and isinstance(current, list):
+        return current
+    if not prefer_list and isinstance(current, dict):
+        return current
+    return None
+
+
+def _assign_output_path(
+    root: Any | None,
+    path: Sequence[str],
+    tensor: torch.Tensor,
+) -> Any | None:
+    if not path:
+        return tensor if root is None else None
+
+    current = _ensure_output_container(
+        root,
+        prefer_list=_is_numeric_output_path_segment(str(path[0])),
+    )
+    if current is None:
+        return None
+    root = current
+
+    for index, segment in enumerate(path):
+        is_last = index == len(path) - 1
+        next_prefers_list = (
+            not is_last
+            and _is_numeric_output_path_segment(str(path[index + 1]))
+        )
+        if isinstance(current, list):
+            if not _is_numeric_output_path_segment(str(segment)):
+                return None
+            position = int(segment)
+            while len(current) <= position:
+                current.append(None)
+            if is_last:
+                current[position] = tensor
+                continue
+            child = _ensure_output_container(
+                current[position],
+                prefer_list=next_prefers_list,
+            )
+            if child is None:
+                return None
+            current[position] = child
+            current = child
+            continue
+
+        key = str(segment)
+        if is_last:
+            current[key] = tensor
+            continue
+        child = _ensure_output_container(
+            current.get(key),
+            prefer_list=next_prefers_list,
+        )
+        if child is None:
+            return None
+        current[key] = child
+        current = child
+
+    return root
+
+
+def _reconstruct_sample_output_from_history(history: Any) -> Any | None:
+    output_labels = list(_get_attr(history, "output_layers", default=[])) or []
+    if not output_labels:
+        return None
+
+    reconstructed: Any | None = None
+    for output_label in output_labels:
+        output_layer = history[output_label]
+        io_role = str(_get_attr(output_layer, "io_role", default="output") or "output")
+        if not io_role.startswith("output"):
+            return None
+        captured_args = list(_get_attr(output_layer, "captured_args", default=[])) or []
+        output_tensor = captured_args[0] if captured_args else None
+        if not isinstance(output_tensor, torch.Tensor):
+            output_tensor = _get_attr(output_layer, "activation", default=None)
+        if not isinstance(output_tensor, torch.Tensor):
+            return None
+        path = [segment for segment in io_role.split(".")[1:] if segment != ""]
+        reconstructed = _assign_output_path(reconstructed, path, output_tensor)
+        if reconstructed is None:
+            return None
+
+    return reconstructed
+
+
+@dataclass(frozen=True)
+class TraceModelArtifacts:
+    history: Any
+    sample_args: tuple[Any, ...]
+    sample_kwargs: dict[str, Any]
+    sample_output: Any
+    sample_output_spec: TreeSpec | None
+    output_leaves: "OrderedDict[str, torch.Tensor] | None"
+    timings: dict[str, float]
+    used_output_fallback: bool = False
+
+
 def _match_leaf_addresses_to_labels(
     labels: Sequence[str],
     leaves: Mapping[str, torch.Tensor],
@@ -259,9 +413,96 @@ def _find_parent_activation_ref(
     *,
     previous_layers: Sequence[Any],
     exclude_labels: set[str] | None = None,
+    previous_layer_indexes: Sequence[_TraceLayerIndex] | None = None,
+    previous_layer_count: int | None = None,
+) -> ParentTensorRef | None:
+    activation_match = _find_parent_activation_ref_fast(
+        target,
+        previous_layer_indexes=previous_layer_indexes,
+        exclude_labels=exclude_labels,
+        previous_layer_count=previous_layer_count,
+    )
+    if activation_match is not None:
+        return activation_match
+    return _find_parent_activation_ref_slow(
+        target,
+        previous_layers=previous_layers,
+        exclude_labels=exclude_labels,
+        previous_layer_count=previous_layer_count,
+    )
+
+
+def _build_trace_layer_indexes(
+    layer_list: Sequence[Any],
+) -> tuple[list[_TraceLayerIndex], dict[str, _TraceLayerIndex]]:
+    indexes: list[_TraceLayerIndex] = []
+    by_raw_label: dict[str, _TraceLayerIndex] = {}
+    for index, layer in enumerate(layer_list):
+        raw_label = str(_get_attr(layer, "layer_label", default=f"layer_{index}"))
+        activation_paths_by_tensor_id = _build_tensor_path_index(
+            _get_attr(layer, "activation", default=None),
+        )
+        child_versions = {
+            str(child_label): child_tensor
+            for child_label, child_tensor in (
+                _get_attr(layer, "children_tensor_versions", default={}) or {}
+            ).items()
+            if isinstance(child_tensor, torch.Tensor)
+        }
+        child_output_paths = {
+            child_label: activation_paths_by_tensor_id.get(id(child_tensor))
+            for child_label, child_tensor in child_versions.items()
+        }
+        layer_index = _TraceLayerIndex(
+            raw_label=raw_label,
+            activation_paths_by_tensor_id=activation_paths_by_tensor_id,
+            child_versions_by_label=child_versions,
+            child_output_paths_by_label=child_output_paths,
+        )
+        indexes.append(layer_index)
+        by_raw_label[raw_label] = layer_index
+    return indexes, by_raw_label
+
+
+def _find_parent_activation_ref_fast(
+    target: torch.Tensor,
+    *,
+    previous_layer_indexes: Sequence[_TraceLayerIndex] | None,
+    exclude_labels: set[str] | None = None,
+    previous_layer_count: int | None = None,
+) -> ParentTensorRef | None:
+    if not previous_layer_indexes:
+        return None
+    exclude_labels = exclude_labels or set()
+    limit = len(previous_layer_indexes) if previous_layer_count is None else min(
+        int(previous_layer_count),
+        len(previous_layer_indexes),
+    )
+    target_id = id(target)
+    for index in range(limit - 1, -1, -1):
+        layer_index = previous_layer_indexes[index]
+        if layer_index.raw_label in exclude_labels:
+            continue
+        path = layer_index.activation_paths_by_tensor_id.get(target_id)
+        if path is not None:
+            return ParentTensorRef(parent_label=layer_index.raw_label, path=path)
+    return None
+
+
+def _find_parent_activation_ref_slow(
+    target: torch.Tensor,
+    *,
+    previous_layers: Sequence[Any],
+    exclude_labels: set[str] | None = None,
+    previous_layer_count: int | None = None,
 ) -> ParentTensorRef | None:
     exclude_labels = exclude_labels or set()
-    for parent_layer in reversed(list(previous_layers)):
+    limit = len(previous_layers) if previous_layer_count is None else min(
+        int(previous_layer_count),
+        len(previous_layers),
+    )
+    for index in range(limit - 1, -1, -1):
+        parent_layer = previous_layers[index]
         parent_label = _get_attr(parent_layer, "layer_label", default=None)
         if parent_label is None or parent_label in exclude_labels:
             continue
@@ -327,6 +568,14 @@ class ConstantTensorRef:
 
 
 ArgPlaceholder = ParentTensorRef | ParameterTensorRef | BufferTensorRef | ConstantTensorRef
+
+
+@dataclass(frozen=True)
+class _TraceLayerIndex:
+    raw_label: str
+    activation_paths_by_tensor_id: dict[int, tuple[Any, ...]]
+    child_versions_by_label: dict[str, torch.Tensor]
+    child_output_paths_by_label: dict[str, tuple[Any, ...] | None]
 
 
 @dataclass
@@ -423,6 +672,41 @@ def materialize_tree_spec(spec: TreeSpec, tensor_map: Mapping[str, torch.Tensor]
         except Exception:
             return values
     raise ValueError(f"Unsupported TreeSpec kind: {spec.kind}")
+
+
+def _build_sample_output_artifacts_from_history(
+    history: Any,
+) -> tuple[Any, TreeSpec, "OrderedDict[str, torch.Tensor]"] | None:
+    sample_output = _reconstruct_sample_output_from_history(history)
+    if sample_output is None:
+        return None
+    output_spec, output_leaves = build_tree_spec(sample_output, "output")
+    output_labels = list(_get_attr(history, "output_layers", default=[])) or []
+    if len(output_leaves) != len(output_labels):
+        return None
+    return sample_output, output_spec, output_leaves
+
+
+def _log_forward_pass_with_output_capture(
+    model: torch.nn.Module,
+    args: tuple[Any, ...],
+    **trace_kwargs: Any,
+) -> tuple[Any, Any]:
+    captured_output: Any = None
+    original_extract = torchlens_trace._extract_and_mark_outputs
+
+    def _capturing_extract(self: Any, outputs: Any):
+        nonlocal captured_output
+        captured_output = outputs
+        return original_extract(self, outputs)
+
+    with _TORCHLENS_OUTPUT_CAPTURE_LOCK:
+        torchlens_trace._extract_and_mark_outputs = _capturing_extract
+        try:
+            history = tl.log_forward_pass(model, args, **trace_kwargs)
+        finally:
+            torchlens_trace._extract_and_mark_outputs = original_extract
+    return history, captured_output
 
 
 def _replace_placeholders(obj: Any, resolver) -> Any:
@@ -666,7 +950,7 @@ class GraphIR:
 def estimate_node_flops(layer_type: str, output_shape: tuple[int, ...] | None, creation_args: Sequence[Any]) -> float:
     if not output_shape:
         return 0.0
-    output_elements = float(int(torch.tensor(output_shape).prod().item())) if output_shape else 0.0
+    output_elements = float(math.prod(output_shape)) if output_shape else 0.0
     layer_type = (layer_type or "").lower()
     if layer_type in {"conv2d", "conv", "conv1d", "conv3d"} and len(creation_args) >= 2:
         weight = creation_args[1]
@@ -757,14 +1041,45 @@ def _find_matching_parent_ref(
     *,
     current_label: str,
     previous_layers: Sequence[Any],
+    previous_layer_indexes: Sequence[_TraceLayerIndex] | None = None,
+    previous_layer_count: int | None = None,
 ) -> ParentTensorRef | None:
-    activation_match = _find_parent_activation_ref(
+    activation_match = _find_parent_activation_ref_fast(
         target,
-        previous_layers=previous_layers,
+        previous_layer_indexes=previous_layer_indexes,
+        previous_layer_count=previous_layer_count,
     )
     if activation_match is not None:
         return activation_match
-    for parent_layer in reversed(list(previous_layers)):
+    if previous_layer_indexes:
+        limit = len(previous_layer_indexes) if previous_layer_count is None else min(
+            int(previous_layer_count),
+            len(previous_layer_indexes),
+        )
+        for index in range(limit - 1, -1, -1):
+            layer_index = previous_layer_indexes[index]
+            child_version = layer_index.child_versions_by_label.get(current_label)
+            if child_version is None:
+                continue
+            if child_version is target or _tensor_exact_match(child_version, target):
+                path = layer_index.child_output_paths_by_label.get(current_label)
+                frozen_value = None
+                if path is None and not child_version.requires_grad:
+                    frozen_value = _clone_tree_tensors(
+                        child_version.detach().cpu(),
+                        detach=True,
+                    )
+                return ParentTensorRef(
+                    parent_label=layer_index.raw_label,
+                    path=path,
+                    frozen_value=frozen_value,
+                )
+    limit = len(previous_layers) if previous_layer_count is None else min(
+        int(previous_layer_count),
+        len(previous_layers),
+    )
+    for index in range(limit - 1, -1, -1):
+        parent_layer = previous_layers[index]
         parent_label = _get_attr(parent_layer, "layer_label", default=None)
         if parent_label is None:
             continue
@@ -787,7 +1102,10 @@ def _build_arg_templates(
     layer: Any,
     *,
     previous_layers: Sequence[Any],
+    previous_layer_count: int | None,
     parent_layer_lookup: Mapping[str, Any],
+    previous_layer_indexes: Sequence[_TraceLayerIndex] | None = None,
+    parent_layer_indexes: Mapping[str, _TraceLayerIndex] | None = None,
 ) -> tuple[list[Any], dict[str, Any], list[ParameterTensorRef], list[str]]:
     creation_args = _layer_creation_args(layer)
     creation_kwargs = _layer_creation_kwargs(layer)
@@ -834,39 +1152,61 @@ def _build_arg_templates(
             parent_label = parent_arg_locations[location_kind].get(prefix)
             if parent_label is not None:
                 parent_layer = parent_layer_lookup.get(parent_label)
+                parent_layer_index = (
+                    parent_layer_indexes.get(parent_label)
+                    if parent_layer_indexes is not None
+                    else None
+                )
                 explicit_activation_match = _find_parent_activation_ref(
                     obj,
                     previous_layers=previous_layers,
                     exclude_labels=set(),
+                    previous_layer_indexes=previous_layer_indexes,
+                    previous_layer_count=previous_layer_count,
                 )
                 if explicit_activation_match is not None:
                     inferred_parent_labels.append(explicit_activation_match.parent_label)
                     return explicit_activation_match
 
                 explicit_path = (
-                    _infer_parent_output_path(parent_layer, current_label)
-                    if parent_layer is not None
-                    else None
-                )
-                frozen_value = (
-                    _infer_child_specific_frozen_value(
-                        parent_layer=parent_layer,
-                        child_label=current_label,
-                        captured_container=creation_args if location_kind == "args" else creation_kwargs,
-                        location=prefix,
+                    parent_layer_index.child_output_paths_by_label.get(current_label)
+                    if parent_layer_index is not None
+                    else (
+                        _infer_parent_output_path(parent_layer, current_label)
+                        if parent_layer is not None
+                        else None
                     )
-                    if parent_layer is not None
-                    else None
                 )
-                if frozen_value is not None:
+                child_version = (
+                    parent_layer_index.child_versions_by_label.get(current_label)
+                    if parent_layer_index is not None
+                    else (
+                        (_get_attr(parent_layer, "children_tensor_versions", default={}) or {}).get(current_label)
+                        if parent_layer is not None
+                        else None
+                    )
+                )
+                frozen_value = None
+                if (
+                    explicit_path is None
+                    and isinstance(child_version, torch.Tensor)
+                    and _tensor_exact_match(child_version, obj)
+                    and not child_version.requires_grad
+                ):
                     better_ref = _find_parent_activation_ref(
                         obj,
                         previous_layers=previous_layers,
                         exclude_labels={parent_label},
+                        previous_layer_indexes=previous_layer_indexes,
+                        previous_layer_count=previous_layer_count,
                     )
                     if better_ref is not None:
                         inferred_parent_labels.append(better_ref.parent_label)
                         return better_ref
+                    frozen_value = _clone_tree_tensors(
+                        child_version.detach().cpu(),
+                        detach=True,
+                    )
                 inferred_parent_labels.append(parent_label)
                 return ParentTensorRef(
                     parent_label=parent_label,
@@ -913,6 +1253,8 @@ def _build_arg_templates(
             tensor_const.tensor,
             current_label=current_label,
             previous_layers=previous_layers,
+            previous_layer_indexes=previous_layer_indexes,
+            previous_layer_count=previous_layer_count,
         )
         if parent_ref is None:
             continue
@@ -924,6 +1266,8 @@ def _build_arg_templates(
             tensor_const.tensor,
             current_label=current_label,
             previous_layers=previous_layers,
+            previous_layer_indexes=previous_layer_indexes,
+            previous_layer_count=previous_layer_count,
         )
         if parent_ref is None:
             continue
@@ -1122,8 +1466,11 @@ def build_graph_from_trace(
     sample_kwargs: dict[str, Any],
     sample_output: Any,
     trainable_param_names: set[str] | None = None,
+    sample_output_spec: TreeSpec | None = None,
+    output_leaves: Mapping[str, torch.Tensor] | None = None,
 ) -> GraphIR:
     layer_list = list(_get_attr(history, "layer_list", default=[])) or []
+    trace_layer_indexes, parent_layer_indexes = _build_trace_layer_indexes(layer_list)
     canonical_label_map = _build_canonical_label_map(layer_list)
     parent_layer_lookup = {
         str(_get_attr(layer, "layer_label", default=f"layer_{index}")): layer
@@ -1153,8 +1500,11 @@ def build_graph_from_trace(
             topo.append(label)
         arg_template, kwarg_template, param_refs, inferred_parent_labels = _build_arg_templates(
             layer,
-            previous_layers=layer_list[:index],
+            previous_layers=layer_list,
+            previous_layer_count=index,
             parent_layer_lookup=parent_layer_lookup,
+            previous_layer_indexes=trace_layer_indexes,
+            parent_layer_indexes=parent_layer_indexes,
         )
         arg_template = _remap_parent_refs(arg_template, canonical_label_map)
         kwarg_template = _remap_parent_refs(kwarg_template, canonical_label_map)
@@ -1165,7 +1515,7 @@ def build_graph_from_trace(
         buffer_refs = _buffer_ref_from_layer(layer)
         tensor_shape = tuple(_get_attr(layer, "tensor_shape", default=()) or ()) or None
         tensor_dtype = _get_attr(layer, "tensor_dtype", default=None)
-        numel = int(torch.tensor(tensor_shape).prod().item()) if tensor_shape else 0
+        numel = int(math.prod(tensor_shape)) if tensor_shape else 0
         estimated_bytes = 0
         if tensor_dtype is not None and tensor_shape:
             estimated_bytes = int(numel * torch.tensor([], dtype=tensor_dtype).element_size())
@@ -1235,7 +1585,11 @@ def build_graph_from_trace(
 
     signature = inspect.signature(model.forward)
     input_spec = _build_input_spec(signature, sample_args, sample_kwargs)
-    output_spec, output_leaves = build_tree_spec(sample_output, "output")
+    if sample_output_spec is None or output_leaves is None:
+        output_spec, output_leaves = build_tree_spec(sample_output, "output")
+    else:
+        output_spec = sample_output_spec
+        output_leaves = OrderedDict(output_leaves.items())
     input_bound = normalize_runtime_inputs(signature, *sample_args, partial=False, **sample_kwargs)
     input_leaves = flatten_bound_inputs(input_bound)
 
@@ -1297,10 +1651,8 @@ def trace_model(
     model: torch.nn.Module,
     sample_input: Any,
     sample_kwargs: Mapping[str, Any] | None = None,
-) -> tuple[Any, tuple[Any, ...], dict[str, Any], Any]:
+) -> TraceModelArtifacts:
     args, kwargs = _sample_args_kwargs(sample_input, sample_kwargs)
-    with torch.no_grad():
-        sample_output = model(*args, **kwargs)
     trace_kwargs = {
         "input_kwargs": kwargs or None,
         # TorchLens only captures the replay-critical per-layer call
@@ -1313,9 +1665,47 @@ def trace_model(
         "mark_input_output_distances": False,
         "detect_loops": False,
     }
+    trace_forward_started = time.perf_counter()
     try:
-        history = tl.log_forward_pass(model, args, **trace_kwargs)
+        history, captured_output = _log_forward_pass_with_output_capture(
+            model,
+            args,
+            **trace_kwargs,
+        )
     except Exception:
-        tl.log_forward_pass(model, args, **trace_kwargs)
-        history = tl.log_forward_pass(model, args, **trace_kwargs)
-    return history, args, kwargs, sample_output
+        _log_forward_pass_with_output_capture(
+            model,
+            args,
+            **trace_kwargs,
+        )
+        history, captured_output = _log_forward_pass_with_output_capture(
+            model,
+            args,
+            **trace_kwargs,
+        )
+    trace_forward_elapsed = time.perf_counter() - trace_forward_started
+
+    used_output_fallback = False
+    if captured_output is not None:
+        sample_output = captured_output
+        sample_output_spec, output_leaves = build_tree_spec(sample_output, "output")
+    else:
+        output_artifacts = _build_sample_output_artifacts_from_history(history)
+        if output_artifacts is not None:
+            sample_output, sample_output_spec, output_leaves = output_artifacts
+        else:
+            used_output_fallback = True
+            with torch.no_grad():
+                sample_output = model(*args, **kwargs)
+            sample_output_spec, output_leaves = build_tree_spec(sample_output, "output")
+
+    return TraceModelArtifacts(
+        history=history,
+        sample_args=args,
+        sample_kwargs=kwargs,
+        sample_output=sample_output,
+        sample_output_spec=sample_output_spec,
+        output_leaves=output_leaves,
+        timings={"torchlens_trace_forward": trace_forward_elapsed},
+        used_output_fallback=used_output_fallback,
+    )

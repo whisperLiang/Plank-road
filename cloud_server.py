@@ -1014,6 +1014,12 @@ class CloudContinualLearner:
         return elapsed
 
     @staticmethod
+    def _log_stage_elapsed(stage: str, elapsed: float | None) -> float:
+        duration = max(0.0, float(elapsed or 0.0))
+        logger.info("[FixedSplitCL] {} took {:.3f}s.", stage, duration)
+        return duration
+
+    @staticmethod
     def _build_teacher_targets_from_prediction(
         pred_boxes,
         pred_class,
@@ -1365,7 +1371,24 @@ class CloudContinualLearner:
                 manifest,
             )
         splitter.trace(split_model, sample_input)
+        self._log_stage_elapsed(
+            "TorchLens trace forward",
+            getattr(splitter, "trace_timings", {}).get("torchlens_trace_forward"),
+        )
+        self._log_stage_elapsed(
+            "graph build",
+            getattr(splitter, "trace_timings", {}).get("graph_build"),
+        )
+        apply_split_started = time.perf_counter()
         candidate = apply_split_plan(splitter, split_plan)
+        candidate_elapsed = (
+            float(getattr(splitter, "trace_timings", {}).get("candidate_enumeration", 0.0))
+            + (time.perf_counter() - apply_split_started)
+        )
+        self._log_stage_elapsed(
+            "candidate enumeration / apply split plan",
+            candidate_elapsed,
+        )
         return splitter, candidate
 
     @staticmethod
@@ -1497,11 +1520,13 @@ class CloudContinualLearner:
         ):
             shutil.rmtree(working_cache, ignore_errors=True)
 
+        stage_started = time.perf_counter()
         trace_sample_input = self._build_bundle_batch_trace_sample_input(
             model,
             bundle_cache_path,
             manifest,
         )
+        self._log_stage_duration("trace input build", stage_started)
         prepared_splitter, prepared_candidate = self._build_bundle_splitter(
             model,
             manifest,
@@ -1522,7 +1547,9 @@ class CloudContinualLearner:
                 ),
             )
 
+        stage_started = time.perf_counter()
         bundle_info = _prepare_cache()
+        self._log_stage_duration("cache prepare", stage_started)
         cache_valid, cache_error = self._validate_fixed_split_working_cache(
             working_cache=working_cache,
             bundle_info=bundle_info,
@@ -1535,7 +1562,9 @@ class CloudContinualLearner:
                 cache_error,
             )
             shutil.rmtree(working_cache, ignore_errors=True)
+            stage_started = time.perf_counter()
             bundle_info = _prepare_cache()
+            self._log_stage_duration("cache prepare", stage_started)
             cache_valid, cache_error = self._validate_fixed_split_working_cache(
                 working_cache=working_cache,
                 bundle_info=bundle_info,
