@@ -14,6 +14,13 @@ from model_management.candidate_generator import (
     generate_candidates_from_graph,
     prune_candidates,
 )
+from model_management.fixed_split_artifacts import (
+    build_graph_artifact_payload,
+    load_torch_artifact,
+    atomic_write_torch,
+    model_structure_fingerprint,
+    sample_input_signature,
+)
 from model_management.payload import SplitPayload
 from model_management.split_runtime import GraphSplitRuntime, compare_outputs
 from model_management.universal_model_split import (
@@ -282,6 +289,36 @@ def test_trace_wrapper_enumerates_candidates_only_when_requested():
     assert runtime.candidates
     assert runtime.current_candidate is not None
     assert runtime.trace_timings["candidate_enumeration"] >= 0.0
+
+
+def test_fixed_split_graph_artifact_round_trip_restores_runtime_callables(tmp_path):
+    model, sample = _make_sequential_model()
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.trace_graph(model, sample)
+
+    artifact_path = tmp_path / "fixed_split_runtime_graph.pt"
+    atomic_write_torch(
+        str(artifact_path),
+        build_graph_artifact_payload(
+            graph=splitter.graph,
+            trace_signature="sig",
+            model_fingerprint=model_structure_fingerprint(model),
+            sample_signature_value=sample_input_signature(sample, None),
+            trace_timings=splitter.trace_timings,
+        ),
+    )
+
+    payload = load_torch_artifact(str(artifact_path))
+    assert isinstance(payload, dict)
+    restored_graph = payload["graph"]
+    assert restored_graph is not None
+
+    cache_runtime = UniversalModelSplitter(device="cpu")
+    cache_runtime.bind_graph(model, restored_graph, trace_timings=payload.get("trace_timings"))
+    replayed = cache_runtime.full_replay(sample)
+    expected = model(sample)
+    ok, max_diff = compare_outputs(expected, replayed)
+    assert ok, max_diff
 
 
 def test_trace_model_uses_single_forward_when_history_outputs_are_recoverable():
