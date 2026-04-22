@@ -2074,6 +2074,16 @@ class CloudContinualLearner:
         return model_zoo.get_model_family(str(model_name)) in {"rfdetr", "tinynext"}
 
     @staticmethod
+    def _resolve_fixed_split_proxy_eval_inner_epochs(
+        model_name: str,
+        total_num_epoch: int,
+    ) -> int:
+        total_epochs = max(1, int(total_num_epoch))
+        if model_zoo.get_model_family(str(model_name)) != "tinynext":
+            return 1
+        return min(5, max(1, total_epochs // 10))
+
+    @staticmethod
     def _resolve_fixed_split_training_label(
         model_name: str,
     ) -> str:
@@ -2629,21 +2639,35 @@ class CloudContinualLearner:
             best_metrics = dict(proxy_metrics_before)
             split_retrain_elapsed = 0.0
             proxy_eval_elapsed = 0.0
-            logger.info(
-                "[FixedSplitCL] {} fixed-split retrain will run {} outer rounds with 1 inner epoch per round and evaluate proxy mAP after each round.",
-                training_label,
+            proxy_eval_inner_epochs = self._resolve_fixed_split_proxy_eval_inner_epochs(
+                current_model_name,
                 int(effective_num_epoch),
             )
-            for epoch_index in range(int(effective_num_epoch)):
+            total_outer_rounds = math.ceil(
+                int(effective_num_epoch) / max(1, int(proxy_eval_inner_epochs))
+            )
+            completed_inner_epochs = 0
+            logger.info(
+                "[FixedSplitCL] {} fixed-split retrain will run {} outer rounds with up to {} inner epoch(s) per round and evaluate proxy mAP after each round.",
+                training_label,
+                int(total_outer_rounds),
+                int(proxy_eval_inner_epochs),
+            )
+            for epoch_index in range(int(total_outer_rounds)):
+                inner_epochs_this_round = min(
+                    int(proxy_eval_inner_epochs),
+                    int(effective_num_epoch) - completed_inner_epochs,
+                )
                 outer_epoch_label = (
-                    f"{training_label} outer epoch {epoch_index + 1}/{int(effective_num_epoch)}"
+                    f"{training_label} outer round {epoch_index + 1}/{int(total_outer_rounds)}"
                 )
                 stage_started = time.perf_counter()
                 universal_split_retrain(
                     **split_retrain_kwargs,
-                    num_epoch=1,
+                    num_epoch=inner_epochs_this_round,
                     epoch_log_context=outer_epoch_label,
                 )
+                completed_inner_epochs += inner_epochs_this_round
                 split_retrain_elapsed += time.perf_counter() - stage_started
                 stage_started = time.perf_counter()
                 candidate_metrics = _evaluate_proxy_metrics_for_current_state()
@@ -2652,9 +2676,10 @@ class CloudContinualLearner:
                     best_state = _snapshot_model_state(model)
                     best_metrics = dict(candidate_metrics)
                     logger.info(
-                        "[FixedSplitCL] Kept {} candidate from outer epoch {} with proxy_mAP@0.5={:.4f}.",
+                        "[FixedSplitCL] Kept {} candidate from outer round {} (through inner epoch {}) with proxy_mAP@0.5={:.4f}.",
                         training_label,
                         epoch_index + 1,
+                        completed_inner_epochs,
                         float(candidate_metrics.get("map") or 0.0),
                     )
             logger.info("[FixedSplitCL] split retraining took {:.3f}s.", split_retrain_elapsed)
