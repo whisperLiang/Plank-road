@@ -3,6 +3,7 @@ import io
 import os
 import threading
 import time
+from typing import Mapping
 from queue import Empty, Full, Queue
 import grpc
 import torch
@@ -31,6 +32,13 @@ from model_management.fixed_split import (
     SplitConstraints,
     SplitPlan,
     load_or_compute_fixed_split_plan,
+)
+from model_management.fixed_split_artifacts import (
+    artifact_paths_from_plan_cache,
+    graph_artifact_matches,
+    load_torch_artifact,
+    model_structure_fingerprint,
+    sample_input_signature,
 )
 from model_management.object_detection import InferenceArtifacts, Object_Detection
 from model_management.split_model_adapters import build_split_training_loss
@@ -177,12 +185,47 @@ class EdgeWorker:
             else:
                 trace_image_size = image_size or (224, 224)
                 sample_input = self.small_object_detection.build_split_sample_input(trace_image_size)
-            self.universal_splitter.trace(
-                split_model,
-                sample_input,
-            )
             constraints = SplitConstraints.from_config(fixed_split_cfg)
             cache_path = os.path.join(self.config.retrain.cache_path, "fixed_split_plan.json")
+            graph_artifact_loaded = False
+            artifact_paths = artifact_paths_from_plan_cache(cache_path)
+            if artifact_paths is not None:
+                graph_payload = load_torch_artifact(artifact_paths.graph_path)
+                if isinstance(graph_payload, Mapping):
+                    model_fingerprint = model_structure_fingerprint(split_model)
+                    sample_signature_value = sample_input_signature(sample_input, None)
+                    if graph_artifact_matches(
+                        graph_payload,
+                        model_fingerprint=model_fingerprint,
+                        sample_signature_value=sample_signature_value,
+                    ) and hasattr(self.universal_splitter, "bind_graph"):
+                        self.universal_splitter.bind_graph(
+                            split_model,
+                            graph_payload["graph"],
+                            trace_timings=graph_payload.get("trace_timings"),
+                        )
+                        graph_artifact_loaded = True
+                        logger.info(
+                            "Fixed split startup using cached graph artifact (trace_signature={})",
+                            graph_payload.get("trace_signature"),
+                        )
+
+            if not graph_artifact_loaded:
+                if hasattr(self.universal_splitter, "trace_graph"):
+                    self.universal_splitter.trace_graph(
+                        split_model,
+                        sample_input,
+                    )
+                else:
+                    self.universal_splitter.trace(
+                        split_model,
+                        sample_input,
+                    )
+                logger.info(
+                    "Fixed split startup using cold graph build (trace_time={:.3f}s, graph_build={:.3f}s)",
+                    float(getattr(self.universal_splitter, "trace_timings", {}).get("torchlens_trace_forward", 0.0)),
+                    float(getattr(self.universal_splitter, "trace_timings", {}).get("graph_build", 0.0)),
+                )
             self.fixed_split_plan = load_or_compute_fixed_split_plan(
                 split_model,
                 constraints,

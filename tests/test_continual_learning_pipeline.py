@@ -12,6 +12,18 @@ import torch
 import model_management.continual_learning_bundle as continual_learning_bundle
 from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
 from edge.transmit import pack_continual_learning_bundle
+from model_management.candidate_generator import (
+    solve_best_candidate_exact,
+    solve_exact_candidates,
+)
+from model_management.fixed_split_artifacts import (
+    FIXED_SPLIT_EXACT_META_VERSION,
+    atomic_write_json,
+    atomic_write_torch,
+    build_graph_artifact_payload,
+    model_structure_fingerprint,
+    sample_input_signature,
+)
 from model_management.fixed_split import (
     compute_fixed_split_for_model,
     SplitConstraints,
@@ -55,6 +67,260 @@ def _dummy_plan() -> SplitPlan:
     )
 
 
+def _graph_node(
+    label: str,
+    *,
+    parents: list[str],
+    children: list[str],
+    estimated_bytes: int,
+    parameter_refs: list[ParameterTensorRef],
+    trainable: bool,
+    index: int,
+    is_input: bool = False,
+    is_output: bool = False,
+) -> GraphNode:
+    return GraphNode(
+        label=label,
+        node_type="input" if is_input else ("output" if is_output else "operation"),
+        func_name="none",
+        func=None,
+        parent_labels=parents,
+        child_labels=children,
+        parent_arg_locations={"args": {}, "kwargs": {}},
+        arg_template=[],
+        kwarg_template={},
+        non_tensor_args={},
+        parameter_refs=parameter_refs,
+        buffer_refs=[],
+        input_output_address=None,
+        containing_module=None,
+        containing_modules=[],
+        is_input=is_input,
+        is_output=is_output,
+        is_inplace=False,
+        is_multi_output=False,
+        multi_output_index=None,
+        aggregation_kind=None,
+        indexing_metadata=None,
+        tensor_shape=(1,),
+        tensor_dtype=torch.float32,
+        numel=1,
+        estimated_bytes=estimated_bytes,
+        estimated_flops=1.0,
+        has_trainable_params=trainable,
+        topological_index=index,
+    )
+
+
+def _shared_optimum_graph() -> GraphIR:
+    signature = inspect.signature(lambda input_1: input_1)
+    dummy_spec = TreeSpec(kind="const", value=None)
+    nodes = OrderedDict(
+        [
+            (
+                "input_1",
+                _graph_node(
+                    "input_1",
+                    parents=[],
+                    children=["left", "right"],
+                    estimated_bytes=1,
+                    parameter_refs=[],
+                    trainable=False,
+                    index=0,
+                    is_input=True,
+                ),
+            ),
+            (
+                "left",
+                _graph_node(
+                    "left",
+                    parents=["input_1"],
+                    children=["merge"],
+                    estimated_bytes=5,
+                    parameter_refs=[ParameterTensorRef("", "p_left", "p_left")],
+                    trainable=True,
+                    index=1,
+                ),
+            ),
+            (
+                "right",
+                _graph_node(
+                    "right",
+                    parents=["input_1"],
+                    children=["merge"],
+                    estimated_bytes=5,
+                    parameter_refs=[ParameterTensorRef("", "p_right", "p_right")],
+                    trainable=True,
+                    index=2,
+                ),
+            ),
+            (
+                "merge",
+                _graph_node(
+                    "merge",
+                    parents=["left", "right"],
+                    children=["output_1"],
+                    estimated_bytes=1,
+                    parameter_refs=[],
+                    trainable=True,
+                    index=3,
+                ),
+            ),
+            (
+                "output_1",
+                _graph_node(
+                    "output_1",
+                    parents=["merge"],
+                    children=[],
+                    estimated_bytes=1,
+                    parameter_refs=[],
+                    trainable=False,
+                    index=4,
+                    is_output=True,
+                ),
+            ),
+        ]
+    )
+    return GraphIR(
+        nodes=nodes,
+        input_labels=["input_1"],
+        output_labels=["output_1"],
+        topological_order=list(nodes.keys()),
+        relevant_labels=list(nodes.keys()),
+        input_spec=dummy_spec,
+        output_spec=dummy_spec,
+        input_address_to_label={},
+        output_address_to_label={},
+        forward_signature=signature,
+        sample_args=(torch.tensor([0.0]),),
+        sample_kwargs={},
+        sample_input_spec=dummy_spec,
+        sample_output_spec=dummy_spec,
+        parameter_numels={"p_left": 1, "p_right": 1},
+        total_parameter_numel=2,
+    )
+
+
+def _non_prefix_optimum_graph() -> GraphIR:
+    signature = inspect.signature(lambda input_1: input_1)
+    dummy_spec = TreeSpec(kind="const", value=None)
+    parameter_numels = {
+        "p_left_1": 40,
+        "p_left_2": 40,
+        "p_right_1": 1,
+        "p_right_2": 1,
+        "p_merge": 1,
+    }
+    nodes = OrderedDict(
+        [
+            (
+                "input_1",
+                _graph_node(
+                    "input_1",
+                    parents=[],
+                    children=["left_1", "right_1"],
+                    estimated_bytes=1,
+                    parameter_refs=[],
+                    trainable=False,
+                    index=0,
+                    is_input=True,
+                ),
+            ),
+            (
+                "left_1",
+                _graph_node(
+                    "left_1",
+                    parents=["input_1"],
+                    children=["left_2"],
+                    estimated_bytes=1,
+                    parameter_refs=[ParameterTensorRef("", "p_left_1", "p_left_1")],
+                    trainable=True,
+                    index=1,
+                ),
+            ),
+            (
+                "right_1",
+                _graph_node(
+                    "right_1",
+                    parents=["input_1"],
+                    children=["right_2"],
+                    estimated_bytes=100,
+                    parameter_refs=[ParameterTensorRef("", "p_right_1", "p_right_1")],
+                    trainable=True,
+                    index=2,
+                ),
+            ),
+            (
+                "left_2",
+                _graph_node(
+                    "left_2",
+                    parents=["left_1"],
+                    children=["merge"],
+                    estimated_bytes=1,
+                    parameter_refs=[ParameterTensorRef("", "p_left_2", "p_left_2")],
+                    trainable=True,
+                    index=3,
+                ),
+            ),
+            (
+                "right_2",
+                _graph_node(
+                    "right_2",
+                    parents=["right_1"],
+                    children=["merge"],
+                    estimated_bytes=100,
+                    parameter_refs=[ParameterTensorRef("", "p_right_2", "p_right_2")],
+                    trainable=True,
+                    index=4,
+                ),
+            ),
+            (
+                "merge",
+                _graph_node(
+                    "merge",
+                    parents=["left_2", "right_2"],
+                    children=["output_1"],
+                    estimated_bytes=1,
+                    parameter_refs=[ParameterTensorRef("", "p_merge", "p_merge")],
+                    trainable=True,
+                    index=5,
+                ),
+            ),
+            (
+                "output_1",
+                _graph_node(
+                    "output_1",
+                    parents=["merge"],
+                    children=[],
+                    estimated_bytes=1,
+                    parameter_refs=[],
+                    trainable=False,
+                    index=6,
+                    is_output=True,
+                ),
+            ),
+        ]
+    )
+    return GraphIR(
+        nodes=nodes,
+        input_labels=["input_1"],
+        output_labels=["output_1"],
+        topological_order=list(nodes.keys()),
+        relevant_labels=list(nodes.keys()),
+        input_spec=dummy_spec,
+        output_spec=dummy_spec,
+        input_address_to_label={},
+        output_address_to_label={},
+        forward_signature=signature,
+        sample_args=(torch.tensor([0.0]),),
+        sample_kwargs={},
+        sample_input_spec=dummy_spec,
+        sample_output_spec=dummy_spec,
+        parameter_numels=parameter_numels,
+        total_parameter_numel=sum(parameter_numels.values()),
+    )
+
+
 def _payload() -> SplitPayload:
     return SplitPayload.from_mapping({"payload": torch.ones(1, 2, 2)}, primary_label="payload")
 
@@ -74,14 +340,47 @@ def _planned_payload(plan: SplitPlan | None = None) -> SplitPayload:
 def test_fixed_split_is_computed_once_and_reused(tmp_path, monkeypatch):
     calls = {"count": 0}
     dummy_plan = _dummy_plan()
+    validation_calls = {"count": 0}
 
     class DummySplitter:
         def __init__(self):
             self.graph = object()
             self.model = object()
+            self.candidates = []
 
         def enumerate_candidates(self, **kwargs):
             return []
+
+        def split(
+            self,
+            *,
+            boundary_tensor_labels=None,
+            layer_label=None,
+            layer_index=None,
+            candidate_id=None,
+        ):
+            return SplitCandidate(
+                candidate_id="candidate-1",
+                edge_nodes=["layer3"],
+                cloud_nodes=["tail"],
+                boundary_edges=[("layer3", "tail")],
+                boundary_tensor_labels=["layer3"],
+                edge_input_labels=[],
+                cloud_input_labels=[],
+                cloud_output_labels=["tail"],
+                estimated_edge_flops=1.0,
+                estimated_cloud_flops=1.0,
+                estimated_payload_bytes=128,
+                estimated_privacy_risk=0.4,
+                estimated_latency=1.0,
+                is_trainable_tail=True,
+                legacy_layer_index=3,
+                boundary_count=1,
+            )
+
+        def validate_candidate(self, candidate):
+            validation_calls["count"] += 1
+            return {"success": True, "validation_passed": True}
 
     def _fake_compute(*args, **kwargs):
         calls["count"] += 1
@@ -89,10 +388,6 @@ def test_fixed_split_is_computed_once_and_reused(tmp_path, monkeypatch):
 
     monkeypatch.setattr("model_management.fixed_split._trace_signature", lambda splitter: "sig")
     monkeypatch.setattr("model_management.fixed_split.compute_fixed_split_for_model", _fake_compute)
-    monkeypatch.setattr(
-        "model_management.fixed_split.validate_split_plan",
-        lambda splitter, plan: {"success": True, "validation_passed": True},
-    )
 
     constraints = SplitConstraints()
     splitter = DummySplitter()
@@ -118,6 +413,177 @@ def test_fixed_split_is_computed_once_and_reused(tmp_path, monkeypatch):
 
     assert calls["count"] == 1
     assert first.split_config_id == second.split_config_id
+    assert validation_calls["count"] == 1
+
+
+def test_load_or_compute_fixed_split_plan_reuses_cached_graph_artifact(tmp_path, monkeypatch):
+    graph = _shared_optimum_graph()
+    model = torch.nn.Linear(1, 1)
+    sample_input = [torch.rand(1)]
+    cache_path = str(tmp_path / "fixed_split_plan.json")
+    persisted_plan = SplitPlan(
+        split_config_id="plan-graph-cache",
+        model_name="dummy-model",
+        candidate_id="candidate-left",
+        split_index=1,
+        split_label="left",
+        boundary_tensor_labels=["left"],
+        payload_bytes=5,
+        privacy_metric=1.0,
+        privacy_risk=1.0,
+        layer_freezing_ratio=0.5,
+        trace_signature="sig",
+        constraints={
+            "privacy_leakage_upper_bound": 0.0,
+            "privacy_leakage_epsilon": 1e-12,
+            "privacy_min_edge_parameter_count": 0,
+            "max_layer_freezing_ratio": 1.0,
+            "validate_candidates": True,
+            "max_candidates": 24,
+            "max_boundary_count": 8,
+            "max_payload_bytes": 32 * 1024 * 1024,
+        },
+    )
+    atomic_write_json(cache_path, persisted_plan.to_dict())
+    artifact_paths = tmp_path / "fixed_split_runtime_graph.pt"
+    atomic_write_torch(
+        str(artifact_paths),
+        build_graph_artifact_payload(
+            graph=graph,
+            trace_signature="sig",
+            model_fingerprint=model_structure_fingerprint(model),
+            sample_signature_value=sample_input_signature(sample_input, None),
+            trace_timings={"graph_build": 0.01},
+        ),
+    )
+
+    candidate = SplitCandidate(
+        candidate_id="candidate-left",
+        edge_nodes=["input_1", "left"],
+        cloud_nodes=["right", "merge", "output_1"],
+        boundary_edges=[("left", "merge"), ("input_1", "right")],
+        boundary_tensor_labels=["input_1", "left"],
+        edge_input_labels=["input_1"],
+        cloud_input_labels=[],
+        cloud_output_labels=["output_1"],
+        estimated_edge_flops=1.0,
+        estimated_cloud_flops=1.0,
+        estimated_payload_bytes=6,
+        estimated_privacy_risk=1.0,
+        estimated_latency=1.0,
+        is_trainable_tail=True,
+        legacy_layer_index=1,
+        boundary_count=2,
+    )
+
+    class DummySplitter:
+        def __init__(self):
+            self.graph = None
+            self.model = None
+            self.bind_calls = 0
+            self.trace_graph_calls = 0
+
+        def bind_graph(self, model, graph, **kwargs):
+            self.model = model
+            self.graph = graph
+            self.bind_calls += 1
+            self.trace_timings = dict(kwargs.get("trace_timings") or {})
+            return self
+
+        def trace_graph(self, model, sample_input, sample_kwargs=None):
+            self.trace_graph_calls += 1
+            raise AssertionError("trace_graph should not run when the graph artifact matches")
+
+        def split(self, **kwargs):
+            return candidate
+
+        def validate_candidate(self, chosen):
+            return {"success": True, "tail_trainability": True}
+
+    monkeypatch.setattr("model_management.fixed_split._trace_signature", lambda splitter: "sig")
+    monkeypatch.setattr(
+        "model_management.fixed_split.compute_fixed_split_for_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("compute_fixed_split_for_model should not run for a valid cached plan")
+        ),
+    )
+
+    splitter = DummySplitter()
+    plan = load_or_compute_fixed_split_plan(
+        model,
+        SplitConstraints(),
+        sample_input=sample_input,
+        splitter=splitter,
+        cache_path=cache_path,
+        model_name="dummy-model",
+    )
+
+    assert plan.split_config_id == "plan-graph-cache"
+    assert splitter.bind_calls == 1
+    assert splitter.trace_graph_calls == 0
+
+
+def test_compute_fixed_split_uses_previous_exact_metadata_as_warm_start(tmp_path, monkeypatch):
+    graph = _shared_optimum_graph()
+    model = torch.nn.Linear(1, 1)
+    sample_input = [torch.rand(1)]
+    cache_path = str(tmp_path / "fixed_split_plan.json")
+
+    class DummyRuntime:
+        def __init__(self):
+            self.graph = graph
+            self.model = model
+            self.trace_timings = {}
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+    warm_summary = {
+        "candidate_id": "candidate-left",
+        "edge_nodes": ["input_1", "left"],
+        "boundary_tensor_labels": ["input_1", "left"],
+        "split_index": 1,
+    }
+    atomic_write_json(
+        str(tmp_path / "fixed_split_exact_meta.json"),
+        {
+            "artifact_version": FIXED_SPLIT_EXACT_META_VERSION,
+            "trace_signature": "sig",
+            "model_structure_fingerprint": model_structure_fingerprint(model),
+            "sample_input_signature": sample_input_signature(sample_input, None),
+            "best_candidate": warm_summary,
+        },
+    )
+
+    captured: dict[str, SplitCandidate | None] = {"warm_candidate": None}
+
+    def _fake_solve_best_candidate_exact(*args, previous_exact_candidate=None, return_session=False, **kwargs):
+        captured["warm_candidate"] = previous_exact_candidate
+        result = SimpleNamespace(
+            candidate=previous_exact_candidate,
+            diagnostics={"warm_start_source": "previous_exact_optimum"},
+        )
+        session = SimpleNamespace()
+        return (result, session) if return_session else result
+
+    monkeypatch.setattr("model_management.fixed_split._trace_signature", lambda splitter: "sig")
+    monkeypatch.setattr(
+        "model_management.fixed_split.solve_best_candidate_exact",
+        _fake_solve_best_candidate_exact,
+    )
+
+    plan = compute_fixed_split_for_model(
+        model,
+        SplitConstraints(validate_candidates=False),
+        sample_input=sample_input,
+        splitter=DummyRuntime(),
+        model_name="dummy-model",
+        cache_path=cache_path,
+    )
+
+    assert captured["warm_candidate"] is not None
+    assert captured["warm_candidate"].edge_nodes == ["input_1", "left"]
+    assert plan.validation["exact_solver"]["warm_start_source"] == "previous_exact_optimum"
 
 
 def test_fixed_split_validates_only_lowest_payload_group_until_success():
@@ -322,6 +788,106 @@ def test_fixed_split_failure_reports_untrainable_replay_candidates():
         )
 
 
+def test_fixed_split_exact_validation_falls_back_to_next_same_objective_candidate():
+    constraints = SplitConstraints(
+        privacy_leakage_upper_bound=1.0,
+        max_layer_freezing_ratio=1.0,
+        validate_candidates=True,
+        max_candidates=8,
+        max_boundary_count=8,
+        max_payload_bytes=1024,
+    )
+
+    class DummyRuntime:
+        def __init__(self):
+            self.graph = _shared_optimum_graph()
+            self.model = object()
+            self.validation_calls: list[tuple[str, ...]] = []
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+        def validate_candidate(self, candidate):
+            edge_nodes = tuple(candidate.edge_nodes)
+            self.validation_calls.append(edge_nodes)
+            return {
+                "success": edge_nodes == ("input_1", "right"),
+                "edge_latency": 0.1,
+                "cloud_latency": 0.2,
+                "end_to_end_latency": 0.3,
+                "tail_trainability": True,
+                "stability_score": 1.0,
+                "error": None if edge_nodes == ("input_1", "right") else "mismatch",
+            }
+
+    runtime = DummyRuntime()
+    plan = compute_fixed_split_for_model(
+        torch.nn.Linear(1, 1),
+        constraints,
+        sample_input=[torch.rand(1)],
+        splitter=runtime,
+        model_name="dummy-model",
+    )
+
+    assert plan.payload_bytes == 6
+    assert len(runtime.validation_calls) == 2
+    assert set(runtime.validation_calls) == {
+        ("input_1", "left"),
+        ("input_1", "right"),
+    }
+    assert plan.validation["exact_solver"]["validation_fallback_count"] == 1
+
+
+def test_fixed_split_exact_validation_advances_after_exhausting_best_objective_face():
+    constraints = SplitConstraints(
+        privacy_leakage_upper_bound=1.0,
+        max_layer_freezing_ratio=1.0,
+        validate_candidates=True,
+        max_candidates=8,
+        max_boundary_count=8,
+        max_payload_bytes=1024,
+    )
+
+    class DummyRuntime:
+        def __init__(self):
+            self.graph = _shared_optimum_graph()
+            self.model = object()
+            self.validation_calls: list[tuple[str, ...]] = []
+
+        def _ensure_ready(self):
+            return self.model, self.graph
+
+        def validate_candidate(self, candidate):
+            edge_nodes = tuple(candidate.edge_nodes)
+            self.validation_calls.append(edge_nodes)
+            return {
+                "success": edge_nodes == ("input_1", "left", "right"),
+                "edge_latency": 0.1,
+                "cloud_latency": 0.2,
+                "end_to_end_latency": 0.3,
+                "tail_trainability": True,
+                "stability_score": 1.0,
+                "error": None if edge_nodes == ("input_1", "left", "right") else "mismatch",
+            }
+
+    runtime = DummyRuntime()
+    plan = compute_fixed_split_for_model(
+        torch.nn.Linear(1, 1),
+        constraints,
+        sample_input=[torch.rand(1)],
+        splitter=runtime,
+        model_name="dummy-model",
+    )
+
+    assert plan.payload_bytes == 10
+    assert runtime.validation_calls[:2] in (
+        [("input_1", "left"), ("input_1", "right")],
+        [("input_1", "right"), ("input_1", "left")],
+    )
+    assert runtime.validation_calls[2] == ("input_1", "left", "right")
+    assert plan.validation["exact_solver"]["validation_fallback_count"] == 2
+
+
 def test_fixed_split_exact_solver_finds_non_prefix_optimum_under_parameter_constraints():
     constraints = SplitConstraints(
         privacy_leakage_upper_bound=1.0 / 80.0,
@@ -517,6 +1083,53 @@ def test_fixed_split_exact_solver_finds_non_prefix_optimum_under_parameter_const
     assert chosen.estimated_payload_bytes == 2
     prefix = runtime.graph.relevant_labels[: chosen.legacy_layer_index + 1]
     assert chosen.edge_nodes != prefix
+
+
+def test_solve_best_candidate_exact_matches_multi_candidate_first_solution():
+    graph = _non_prefix_optimum_graph()
+    result = solve_best_candidate_exact(
+        graph,
+        max_boundary_count=8,
+        max_payload_bytes=32 * 1024 * 1024,
+        privacy_leakage_upper_bound=1.0 / 80.0,
+        max_layer_freezing_ratio=1.0,
+        require_trainable_tail=True,
+    )
+    candidates = solve_exact_candidates(
+        graph,
+        max_candidates=4,
+        max_boundary_count=8,
+        max_payload_bytes=32 * 1024 * 1024,
+        privacy_leakage_upper_bound=1.0 / 80.0,
+        max_layer_freezing_ratio=1.0,
+        require_trainable_tail=True,
+    )
+
+    assert result.candidate is not None
+    assert candidates
+    assert result.candidate.edge_nodes == candidates[0].edge_nodes
+    assert result.objective_payload_bytes == candidates[0].estimated_payload_bytes
+    assert result.objective_boundary_count == candidates[0].boundary_count
+
+
+def test_solve_best_candidate_exact_reports_safe_pruning_diagnostics():
+    graph = _non_prefix_optimum_graph()
+    result, session = solve_best_candidate_exact(
+        graph,
+        max_boundary_count=8,
+        max_payload_bytes=32 * 1024 * 1024,
+        privacy_leakage_upper_bound=1.0 / 80.0,
+        max_layer_freezing_ratio=1.0,
+        require_trainable_tail=True,
+        return_session=True,
+    )
+
+    assert result.candidate is not None
+    assert session.diagnostics["solver_variable_count_after_pruning"] < session.diagnostics[
+        "solver_variable_count_before_pruning"
+    ]
+    assert session.diagnostics["pruned_parameter_upper_bound_frontiers"] > 0
+    assert session.diagnostics["pruning_time_sec"] >= 0.0
 
 
 def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_available():

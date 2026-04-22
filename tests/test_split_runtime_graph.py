@@ -165,13 +165,14 @@ def _make_residual_model() -> tuple[nn.Module, torch.Tensor]:
 def test_graph_build_candidate_enumeration_pruning_and_replay(factory, minimum_nodes):
     model, sample = factory()
     splitter = UniversalModelSplitter(device="cpu")
-    splitter.trace(model, sample)
+    splitter.trace_graph(model, sample)
 
     assert splitter.graph is not None
     assert splitter.history is None
     assert splitter.graph.num_nodes >= minimum_nodes
     assert splitter.graph.input_labels
     assert splitter.graph.output_labels
+    assert splitter.candidates == []
 
     generated = generate_candidates_from_graph(splitter.graph, max_candidates=10)
     assert generated
@@ -183,15 +184,15 @@ def test_graph_build_candidate_enumeration_pruning_and_replay(factory, minimum_n
     valid = collect_valid_candidates(splitter, pruned[:6], minimum_valid=2)
 
     for candidate, _ in valid[:2]:
-        splitter.split(candidate_id=candidate.candidate_id)
+        splitter.split(candidate=candidate)
         payload = splitter.edge_forward(sample)
         replayed = splitter.cloud_forward(payload)
         ok, max_diff = compare_outputs(expected, replayed)
         assert ok, max_diff
 
         clean_runtime = UniversalModelSplitter(device="cpu")
-        clean_runtime.trace(model, sample)
-        clean_runtime.split(candidate_id=candidate.candidate_id)
+        clean_runtime.trace_graph(model, sample)
+        clean_runtime.split(candidate=candidate)
         cache_free = clean_runtime.cloud_forward(payload.detach())
         ok, max_diff = compare_outputs(expected, cache_free)
         assert ok, max_diff
@@ -261,17 +262,26 @@ def test_runtime_trace_cleans_up_raw_torchlens_history(monkeypatch):
         "model_management.split_runtime.build_graph_from_trace",
         lambda *args, **kwargs: fake_graph,
     )
-    monkeypatch.setattr(
-        "model_management.split_runtime.enumerate_candidates",
-        lambda graph: [],
-    )
-
     runtime = GraphSplitRuntime(device="cpu")
-    runtime.trace(model, sample)
+    runtime.trace_graph(model, sample)
 
     assert cleanup_called
     assert runtime.history is None
     assert runtime.graph is fake_graph
+    assert runtime.candidates == []
+
+
+def test_trace_wrapper_enumerates_candidates_only_when_requested():
+    model, sample = _make_sequential_model()
+    runtime = UniversalModelSplitter(device="cpu")
+
+    runtime.trace(model, sample)
+    assert runtime.candidates == []
+
+    runtime.trace(model, sample, enumerate_candidates=True, max_candidates=4)
+    assert runtime.candidates
+    assert runtime.current_candidate is not None
+    assert runtime.trace_timings["candidate_enumeration"] >= 0.0
 
 
 def test_trace_model_uses_single_forward_when_history_outputs_are_recoverable():

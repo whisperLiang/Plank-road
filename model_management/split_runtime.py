@@ -10,7 +10,7 @@ import os
 import torch
 from loguru import logger
 
-from model_management.candidate_generator import enumerate_candidates
+from model_management.candidate_generator import enumerate_candidates as enumerate_graph_candidates
 from model_management.graph_ir import (
     GraphIR,
     build_graph_from_trace,
@@ -22,6 +22,8 @@ from model_management.graph_ir import (
 )
 from model_management.payload import SplitPayload
 from model_management.split_candidate import SplitCandidate
+
+enumerate_candidates = enumerate_graph_candidates
 
 
 def _flatten_tensors(obj: Any) -> list[torch.Tensor]:
@@ -367,7 +369,27 @@ class GraphSplitRuntime:
     def _invalidate_validation_cache(self) -> None:
         self._validation_cache.clear()
 
-    def trace(
+    def bind_graph(
+        self,
+        model: torch.nn.Module,
+        graph: GraphIR,
+        *,
+        candidates: Iterable[SplitCandidate] | None = None,
+        current_candidate: SplitCandidate | None = None,
+        trace_timings: Mapping[str, float] | None = None,
+        trace_used_output_fallback: bool = False,
+    ) -> "GraphSplitRuntime":
+        self.model = model
+        self.graph = graph
+        self.candidates = list(candidates or [])
+        self.current_candidate = current_candidate or (self.candidates[0] if self.candidates else None)
+        self.trace_timings = dict(trace_timings or {})
+        self.trace_used_output_fallback = bool(trace_used_output_fallback)
+        self.reset_runtime_state()
+        self._invalidate_validation_cache()
+        return self
+
+    def trace_graph(
         self,
         model: torch.nn.Module,
         sample_input: Any,
@@ -427,14 +449,38 @@ class GraphSplitRuntime:
             gc.collect()
             for name, parameter in model.named_parameters():
                 parameter.requires_grad_(grad_state.get(name, parameter.requires_grad))
+        self.candidates = []
+        self.current_candidate = None
+        self.reset_runtime_state()
+        self._invalidate_validation_cache()
+        return self
+
+    def trace(
+        self,
+        model: torch.nn.Module,
+        sample_input: Any,
+        sample_kwargs: Mapping[str, Any] | None = None,
+        *,
+        enumerate_candidates: bool = False,
+        max_candidates: int = 24,
+        max_boundary_count: int = 8,
+        max_payload_bytes: int = 32 * 1024 * 1024,
+    ) -> "GraphSplitRuntime":
+        self.trace_graph(model, sample_input, sample_kwargs=sample_kwargs)
+        if not enumerate_candidates:
+            return self
+
         candidate_started = time.perf_counter()
-        self.candidates = enumerate_candidates(self.graph)
+        self.candidates = enumerate_graph_candidates(
+            self.graph,
+            max_candidates=max_candidates,
+            max_boundary_count=max_boundary_count,
+            max_payload_bytes=max_payload_bytes,
+        )
         self.trace_timings["candidate_enumeration"] = (
             time.perf_counter() - candidate_started
         )
         self.current_candidate = self.candidates[0] if self.candidates else None
-        self.reset_runtime_state()
-        self._invalidate_validation_cache()
         return self
 
     def reset_runtime_state(self) -> None:
@@ -442,7 +488,9 @@ class GraphSplitRuntime:
 
     def _ensure_ready(self) -> tuple[torch.nn.Module, GraphIR]:
         if self.model is None or self.graph is None:
-            raise RuntimeError("GraphSplitRuntime.trace() must be called first.")
+            raise RuntimeError(
+                "GraphSplitRuntime.trace_graph() or trace() must be called first."
+            )
         return self.model, self.graph
 
     def materialize_node(

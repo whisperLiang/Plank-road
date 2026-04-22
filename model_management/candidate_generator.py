@@ -3,19 +3,24 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import time
 from collections import OrderedDict
-from typing import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping, Sequence
 
 try:
     from ortools.sat.python import cp_model
 except ImportError:  # pragma: no cover - enforced by requirements in production.
     cp_model = None
 
+from loguru import logger
+
 from model_management.graph_ir import GraphIR
 from model_management.split_candidate import SplitCandidate
 
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
+EXACT_OBJECTIVE_VERSION = "payload_bytes_then_boundary_count.v1"
 
 
 def estimate_privacy_leakage_from_edge_params(
@@ -443,10 +448,175 @@ def _best_prefix_warm_start(
     return best
 
 
-def _parameter_owner_labels(graph: GraphIR) -> tuple[dict[str, int], dict[str, list[str]]]:
+def _ordered_relevant_subset(graph: GraphIR, labels: Iterable[str]) -> list[str]:
+    allowed = set(labels)
+    return [label for label in graph.relevant_labels if label in allowed]
+
+
+def _frontier_signature(candidate: SplitCandidate) -> tuple[Any, ...]:
+    return (
+        tuple(candidate.edge_nodes),
+        tuple(candidate.cloud_nodes),
+        tuple(candidate.boundary_tensor_labels),
+        tuple(candidate.boundary_edges),
+        int(candidate.estimated_payload_bytes),
+        int(candidate.boundary_count),
+        int(candidate.edge_parameter_count),
+        int(candidate.total_parameter_count),
+        bool(candidate.is_trainable_tail),
+    )
+
+
+def _candidate_is_session_feasible(
+    candidate: SplitCandidate,
+    *,
+    solver_label_set: set[str],
+    max_boundary_count: int,
+    max_payload_bytes: int,
+    privacy_leakage_upper_bound: float,
+    privacy_leakage_epsilon: float,
+    max_layer_freezing_ratio: float,
+    require_trainable_tail: bool,
+) -> bool:
+    return (
+        set(candidate.edge_nodes).issubset(solver_label_set)
+        and int(candidate.boundary_count) <= int(max_boundary_count)
+        and int(candidate.estimated_payload_bytes) <= int(max_payload_bytes)
+        and (not require_trainable_tail or bool(candidate.is_trainable_tail))
+        and _candidate_is_within_parameter_bounds(
+            candidate,
+            privacy_leakage_upper_bound=privacy_leakage_upper_bound,
+            privacy_leakage_epsilon=privacy_leakage_epsilon,
+            max_layer_freezing_ratio=max_layer_freezing_ratio,
+        )
+    )
+
+
+def _pruned_solver_labels(
+    graph: GraphIR,
+    *,
+    max_boundary_count: int,
+    max_payload_bytes: int,
+    privacy_leakage_upper_bound: float,
+    privacy_leakage_epsilon: float,
+    max_layer_freezing_ratio: float,
+    require_trainable_tail: bool,
+) -> tuple[list[str], tuple[int, int, int] | None, dict[str, Any]]:
+    relevant = list(graph.relevant_labels)
+    relevant_set = set(relevant)
+    relevant_inputs = _relevant_input_labels(graph)
+    relevant_outputs = set(_relevant_output_labels(graph))
+    trainable_labels = {
+        label for label in relevant if bool(graph.nodes[label].has_trainable_params)
+    }
+    parameter_bounds = _parameter_budget_bounds(
+        graph,
+        privacy_leakage_upper_bound=privacy_leakage_upper_bound,
+        privacy_leakage_epsilon=privacy_leakage_epsilon,
+        max_layer_freezing_ratio=max_layer_freezing_ratio,
+    )
+    diagnostics: dict[str, Any] = {
+        "objective_version": EXACT_OBJECTIVE_VERSION,
+        "solver_variable_count_before_pruning": len(relevant),
+        "frontier_count_before_pruning": 0,
+        "pruned_invalid_frontiers": 0,
+        "pruned_payload_overflow_frontiers": 0,
+        "pruned_untrainable_tail_frontiers": 0,
+        "pruned_parameter_upper_bound_frontiers": 0,
+        "pruned_dominated_frontiers": 0,
+    }
+    if parameter_bounds is None:
+        diagnostics["no_solution_reason"] = "parameter_bounds_infeasible"
+        diagnostics["solver_variable_count_after_pruning"] = 0
+        return [], None, diagnostics
+
+    total_parameter_count, lower_bound, upper_bound = parameter_bounds
+    diagnostics["parameter_lower_bound"] = int(lower_bound)
+    diagnostics["parameter_upper_bound"] = int(upper_bound)
+
+    frontier_labels: list[str] = []
+    frontier_closures: dict[str, set[str]] = {}
+    frontier_signatures: dict[tuple[Any, ...], str] = {}
+    dominated_frontiers: dict[str, str] = {}
+
+    for label in relevant:
+        if label in relevant_outputs:
+            diagnostics["pruned_invalid_frontiers"] += 1
+            continue
+        relevant_children = [
+            child for child in graph.nodes[label].child_labels if child in relevant_set
+        ]
+        if not relevant_children:
+            diagnostics["pruned_invalid_frontiers"] += 1
+            continue
+        diagnostics["frontier_count_before_pruning"] += 1
+        if int(graph.nodes[label].estimated_bytes) > int(max_payload_bytes):
+            diagnostics["pruned_payload_overflow_frontiers"] += 1
+            continue
+
+        closure = _ancestor_closure({label}, graph) & relevant_set
+        closure_ordered = _ordered_relevant_subset(graph, closure)
+        if require_trainable_tail and not any(
+            trainable_label not in closure for trainable_label in trainable_labels
+        ):
+            diagnostics["pruned_untrainable_tail_frontiers"] += 1
+            continue
+
+        closure_edge_parameter_count, _, _ = _candidate_parameter_stats(
+            closure_ordered,
+            graph,
+        )
+        if total_parameter_count > 0 and closure_edge_parameter_count > upper_bound:
+            # Safe: any feasible edge set containing this frontier must include the
+            # entire ancestor closure, so its edge-parameter count can never fall
+            # back below this lower bound.
+            diagnostics["pruned_parameter_upper_bound_frontiers"] += 1
+            continue
+
+        candidate = build_candidate_from_edge_seed(
+            graph,
+            candidate_id=f"frontier_{label}",
+            edge_seed_nodes=[label],
+            metadata={"source": "exact_frontier_probe"},
+        )
+        if candidate is None:
+            diagnostics["pruned_invalid_frontiers"] += 1
+            continue
+
+        signature = _frontier_signature(candidate)
+        canonical = frontier_signatures.get(signature)
+        if canonical is not None:
+            # Safe: identical single-frontier execution closures imply the same
+            # exact edge/cloud partition, so we only need one representative when
+            # building the solver frontier universe.
+            dominated_frontiers[label] = canonical
+            diagnostics["pruned_dominated_frontiers"] += 1
+            continue
+
+        frontier_signatures[signature] = label
+        frontier_labels.append(label)
+        frontier_closures[label] = closure
+
+    solver_label_set = set(relevant_inputs)
+    for label in frontier_labels:
+        solver_label_set.update(frontier_closures[label])
+
+    solver_labels = [label for label in relevant if label in solver_label_set]
+    diagnostics["solver_variable_count_after_pruning"] = len(solver_labels)
+    diagnostics["frontier_count_after_pruning"] = len(frontier_labels)
+    diagnostics["dominated_frontier_map"] = dominated_frontiers
+    diagnostics["solver_relevant_labels"] = list(solver_labels)
+    return solver_labels, parameter_bounds, diagnostics
+
+
+def _parameter_owner_labels(
+    graph: GraphIR,
+    *,
+    relevant_labels: Sequence[str],
+) -> tuple[dict[str, int], dict[str, list[str]]]:
     parameter_numels = dict(getattr(graph, "parameter_numels", {}) or {})
     owners: dict[str, list[str]] = {}
-    for label in graph.relevant_labels:
+    for label in relevant_labels:
         for ref in graph.nodes[label].parameter_refs:
             if ref.fq_name not in parameter_numels:
                 continue
@@ -507,16 +677,23 @@ def _add_boundary_constraints(
     graph: GraphIR,
     *,
     relevant: Sequence[str],
-    relevant_set: set[str],
+    all_relevant_set: set[str],
     edge_vars: Mapping[str, "cp_model.IntVar"],
     boundary_vars: Mapping[str, "cp_model.IntVar"],
 ) -> None:
+    relevant_set = set(relevant)
     for label in relevant:
-        children = [child for child in graph.nodes[label].child_labels if child in relevant_set]
+        children = [child for child in graph.nodes[label].child_labels if child in all_relevant_set]
         if not children:
             model.Add(boundary_vars[label] == 0)
             continue
         model.Add(boundary_vars[label] <= edge_vars[label])
+        if any(child not in relevant_set for child in children):
+            # Safe: a relevant child pruned from the solver universe is fixed to
+            # the cloud side, so any edge-side execution of this label must cross
+            # the split boundary.
+            model.Add(boundary_vars[label] == edge_vars[label])
+            continue
         model.Add(boundary_vars[label] <= sum(1 - edge_vars[child] for child in children))
         for child in children:
             model.Add(boundary_vars[label] >= edge_vars[label] - edge_vars[child])
@@ -526,12 +703,16 @@ def _add_parameter_constraints(
     model: "cp_model.CpModel",
     graph: GraphIR,
     *,
+    relevant_labels: Sequence[str],
     edge_vars: Mapping[str, "cp_model.IntVar"],
     total_parameter_count: int,
     lower_bound: int,
     upper_bound: int,
 ) -> dict[str, "cp_model.IntVar"] | None:
-    parameter_numels, parameter_owners = _parameter_owner_labels(graph)
+    parameter_numels, parameter_owners = _parameter_owner_labels(
+        graph,
+        relevant_labels=relevant_labels,
+    )
     parameter_vars = {
         name: model.NewBoolVar(f"param_{index}")
         for index, name in enumerate(parameter_numels)
@@ -614,6 +795,457 @@ def _candidate_from_edge_assignment(
     return edge_key, candidate
 
 
+@dataclass
+class ExactSolveResult:
+    candidate: SplitCandidate | None
+    status: str
+    solve_attempt: int
+    solve_time_sec: float
+    objective_payload_bytes: int | None = None
+    objective_boundary_count: int | None = None
+    objective_value: int | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class ExactCandidateSolveSession:
+    def __init__(
+        self,
+        graph: GraphIR,
+        *,
+        max_boundary_count: int,
+        max_payload_bytes: int,
+        privacy_leakage_upper_bound: float,
+        privacy_leakage_epsilon: float,
+        max_layer_freezing_ratio: float,
+        require_trainable_tail: bool,
+        previous_exact_candidate: SplitCandidate | None = None,
+        apply_warm_objective_upper_bound: bool = True,
+    ) -> None:
+        self.graph = graph
+        self.max_boundary_count = int(max_boundary_count)
+        self.max_payload_bytes = int(max_payload_bytes)
+        self.privacy_leakage_upper_bound = float(privacy_leakage_upper_bound)
+        self.privacy_leakage_epsilon = float(privacy_leakage_epsilon)
+        self.max_layer_freezing_ratio = float(max_layer_freezing_ratio)
+        self.require_trainable_tail = bool(require_trainable_tail)
+        self.apply_warm_objective_upper_bound = bool(apply_warm_objective_upper_bound)
+        self.all_relevant_labels = list(graph.relevant_labels)
+        self.all_relevant_set = set(self.all_relevant_labels)
+        self.objective_scale = len(self.all_relevant_labels) + 1
+        self.solve_attempts = 0
+        self.pending_assignment: dict[str, bool] | None = None
+        self.pending_result: ExactSolveResult | None = None
+        self.exhausted = False
+
+        prune_started = time.perf_counter()
+        self.solver_labels, self.parameter_bounds, self.diagnostics = _pruned_solver_labels(
+            graph,
+            max_boundary_count=self.max_boundary_count,
+            max_payload_bytes=self.max_payload_bytes,
+            privacy_leakage_upper_bound=self.privacy_leakage_upper_bound,
+            privacy_leakage_epsilon=self.privacy_leakage_epsilon,
+            max_layer_freezing_ratio=self.max_layer_freezing_ratio,
+            require_trainable_tail=self.require_trainable_tail,
+        )
+        self.diagnostics["pruning_time_sec"] = max(0.0, time.perf_counter() - prune_started)
+        self.solver_label_set = set(self.solver_labels)
+
+        if not self.solver_labels or self.parameter_bounds is None:
+            self.model = None
+            self.edge_vars = {}
+            self.boundary_vars = {}
+            self.parameter_vars = {}
+            self.payload_expr = None
+            self.boundary_count_expr = None
+            self.objective_expr = None
+            self.warm_candidate = None
+            self.warm_start_source = None
+            self.warm_objective_upper_bound = None
+            return
+
+        total_parameter_count, lower_bound, upper_bound = self.parameter_bounds
+        self.model = cp_model.CpModel()
+        self.edge_vars = {
+            label: self.model.NewBoolVar(f"edge_{index}")
+            for index, label in enumerate(self.solver_labels)
+        }
+        self.boundary_vars = {
+            label: self.model.NewBoolVar(f"boundary_{index}")
+            for index, label in enumerate(self.solver_labels)
+        }
+
+        _add_ancestor_closed_constraints(
+            self.model,
+            graph,
+            relevant=self.solver_labels,
+            relevant_set=self.solver_label_set,
+            edge_vars=self.edge_vars,
+        )
+
+        self.model.Add(sum(self.edge_vars.values()) >= 1)
+        self.model.Add(sum(self.boundary_vars.values()) >= 1)
+
+        for label in _relevant_input_labels(graph):
+            if label in self.edge_vars:
+                self.model.Add(self.edge_vars[label] == 1)
+        for label in _relevant_output_labels(graph):
+            if label in self.edge_vars:
+                self.model.Add(self.edge_vars[label] == 0)
+
+        _add_boundary_constraints(
+            self.model,
+            graph,
+            relevant=self.solver_labels,
+            all_relevant_set=self.all_relevant_set,
+            edge_vars=self.edge_vars,
+            boundary_vars=self.boundary_vars,
+        )
+
+        if self.require_trainable_tail:
+            all_trainable_labels = [
+                label
+                for label in self.all_relevant_labels
+                if bool(graph.nodes[label].has_trainable_params)
+            ]
+            if not all_trainable_labels:
+                self.model = None
+                self.diagnostics["no_solution_reason"] = "no_trainable_tail"
+                return
+            fixed_cloud_trainable_exists = any(
+                label not in self.solver_label_set for label in all_trainable_labels
+            )
+            if not fixed_cloud_trainable_exists:
+                solver_trainable_labels = [
+                    label for label in all_trainable_labels if label in self.edge_vars
+                ]
+                self.model.Add(
+                    sum(1 - self.edge_vars[label] for label in solver_trainable_labels) >= 1
+                )
+
+        self.parameter_vars = _add_parameter_constraints(
+            self.model,
+            graph,
+            relevant_labels=self.solver_labels,
+            edge_vars=self.edge_vars,
+            total_parameter_count=total_parameter_count,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+        )
+        if self.parameter_vars is None:
+            self.model = None
+            self.diagnostics["no_solution_reason"] = "parameter_constraints_infeasible"
+            return
+
+        self.payload_expr = sum(
+            int(graph.nodes[label].estimated_bytes) * self.boundary_vars[label]
+            for label in self.solver_labels
+        )
+        self.boundary_count_expr = sum(self.boundary_vars.values())
+        self.model.Add(self.boundary_count_expr <= self.max_boundary_count)
+        self.model.Add(self.payload_expr <= self.max_payload_bytes)
+
+        self.objective_expr = self.payload_expr * self.objective_scale + self.boundary_count_expr
+        self.model.Minimize(self.objective_expr)
+
+        self.warm_candidate, self.warm_start_source = self._resolve_warm_candidate(
+            previous_exact_candidate
+        )
+        self.warm_objective_upper_bound: int | None = None
+        if self.warm_candidate is not None:
+            _apply_exact_warm_start_hints(
+                self.model,
+                graph,
+                relevant=self.solver_labels,
+                edge_vars=self.edge_vars,
+                boundary_vars=self.boundary_vars,
+                parameter_vars=self.parameter_vars,
+                warm_candidate=self.warm_candidate,
+            )
+            if self.apply_warm_objective_upper_bound:
+                self.warm_objective_upper_bound = (
+                    int(self.warm_candidate.estimated_payload_bytes) * self.objective_scale
+                    + int(self.warm_candidate.boundary_count)
+                )
+                self.model.Add(self.objective_expr <= self.warm_objective_upper_bound)
+
+        self.diagnostics["warm_start_source"] = self.warm_start_source
+        self.diagnostics["warm_candidate_objective"] = (
+            {
+                "payload_bytes": int(self.warm_candidate.estimated_payload_bytes),
+                "boundary_count": int(self.warm_candidate.boundary_count),
+            }
+            if self.warm_candidate is not None
+            else None
+        )
+        self.diagnostics["objective_upper_bound_applied"] = (
+            self.warm_objective_upper_bound is not None
+        )
+        logger.info(
+            "Exact split solver prepared: vars {} -> {}, frontiers {} -> {}, warm_start={}, objective_upper_bound={}",
+            self.diagnostics.get("solver_variable_count_before_pruning", 0),
+            self.diagnostics.get("solver_variable_count_after_pruning", 0),
+            self.diagnostics.get("frontier_count_before_pruning", 0),
+            self.diagnostics.get("frontier_count_after_pruning", 0),
+            self.warm_start_source or "none",
+            self.warm_objective_upper_bound is not None,
+        )
+
+    def _resolve_warm_candidate(
+        self,
+        previous_exact_candidate: SplitCandidate | None,
+    ) -> tuple[SplitCandidate | None, str | None]:
+        warm_sources: list[tuple[str, SplitCandidate | None]] = [
+            ("previous_exact_optimum", previous_exact_candidate),
+            (
+                "prefix_warm_start",
+                _best_prefix_warm_start(
+                    self.graph,
+                    max_boundary_count=self.max_boundary_count,
+                    max_payload_bytes=self.max_payload_bytes,
+                    privacy_leakage_upper_bound=self.privacy_leakage_upper_bound,
+                    privacy_leakage_epsilon=self.privacy_leakage_epsilon,
+                    max_layer_freezing_ratio=self.max_layer_freezing_ratio,
+                    require_trainable_tail=self.require_trainable_tail,
+                ),
+            ),
+        ]
+        for source, candidate in warm_sources:
+            if candidate is None:
+                continue
+            if not _candidate_is_session_feasible(
+                candidate,
+                solver_label_set=self.solver_label_set,
+                max_boundary_count=self.max_boundary_count,
+                max_payload_bytes=self.max_payload_bytes,
+                privacy_leakage_upper_bound=self.privacy_leakage_upper_bound,
+                privacy_leakage_epsilon=self.privacy_leakage_epsilon,
+                max_layer_freezing_ratio=self.max_layer_freezing_ratio,
+                require_trainable_tail=self.require_trainable_tail,
+            ):
+                continue
+            return candidate, source
+        return None, None
+
+    def _status_name(self, status: int) -> str:
+        if cp_model is None:
+            return "unknown"
+        names = {
+            cp_model.OPTIMAL: "OPTIMAL",
+            cp_model.FEASIBLE: "FEASIBLE",
+            cp_model.INFEASIBLE: "INFEASIBLE",
+            cp_model.MODEL_INVALID: "MODEL_INVALID",
+            cp_model.UNKNOWN: "UNKNOWN",
+        }
+        return names.get(status, str(status))
+
+    def _build_result(
+        self,
+        *,
+        candidate: SplitCandidate | None,
+        status: str,
+        solve_time_sec: float,
+        objective_payload_bytes: int | None = None,
+        objective_boundary_count: int | None = None,
+        objective_value: int | None = None,
+    ) -> ExactSolveResult:
+        diagnostics = dict(self.diagnostics)
+        diagnostics.update(
+            {
+                "status": status,
+                "solve_time_sec": float(solve_time_sec),
+                "solve_attempt": int(self.solve_attempts),
+            }
+        )
+        if candidate is not None:
+            diagnostics["candidate_id"] = candidate.candidate_id
+        return ExactSolveResult(
+            candidate=candidate,
+            status=status,
+            solve_attempt=self.solve_attempts,
+            solve_time_sec=float(solve_time_sec),
+            objective_payload_bytes=objective_payload_bytes,
+            objective_boundary_count=objective_boundary_count,
+            objective_value=objective_value,
+            diagnostics=diagnostics,
+        )
+
+    def _exclude_assignment(
+        self,
+        assignment: Mapping[str, bool],
+        *,
+        reason: str,
+    ) -> None:
+        if self.model is None:
+            return
+        _add_solution_exclusion(self.model, assignment, self.edge_vars)
+        self.diagnostics["last_exclusion_reason"] = reason
+
+    def solve_next_candidate(self) -> ExactSolveResult:
+        if self.pending_assignment is not None:
+            raise RuntimeError(
+                "exclude_pending_candidate() must be called before requesting the next exact candidate."
+            )
+        if self.model is None or self.exhausted:
+            return self._build_result(
+                candidate=None,
+                status=str(self.diagnostics.get("no_solution_reason", "INFEASIBLE")),
+                solve_time_sec=0.0,
+            )
+
+        while True:
+            solver = _new_cp_sat_solver()
+            solve_started = time.perf_counter()
+            status = solver.Solve(self.model)
+            solve_elapsed = max(0.0, time.perf_counter() - solve_started)
+            self.solve_attempts += 1
+            status_name = self._status_name(status)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                self.exhausted = True
+                return self._build_result(
+                    candidate=None,
+                    status=status_name,
+                    solve_time_sec=solve_elapsed,
+                )
+
+            edge_assignment = {
+                label: bool(solver.Value(self.edge_vars[label]))
+                for label in self.solver_labels
+            }
+            full_edge_assignment = {
+                label: edge_assignment.get(label, False)
+                for label in self.all_relevant_labels
+            }
+            objective_payload_bytes = int(solver.Value(self.payload_expr))
+            objective_boundary_count = int(solver.Value(self.boundary_count_expr))
+            objective_value = int(solver.Value(self.objective_expr))
+            _, candidate = _candidate_from_edge_assignment(
+                self.graph,
+                relevant=self.all_relevant_labels,
+                edge_assignment=full_edge_assignment,
+                payload_bytes=objective_payload_bytes,
+                boundary_count=objective_boundary_count,
+            )
+            if candidate is None:
+                self._exclude_assignment(edge_assignment, reason="invalid_candidate_projection")
+                continue
+            if not _candidate_is_within_parameter_bounds(
+                candidate,
+                privacy_leakage_upper_bound=self.privacy_leakage_upper_bound,
+                privacy_leakage_epsilon=self.privacy_leakage_epsilon,
+                max_layer_freezing_ratio=self.max_layer_freezing_ratio,
+            ):
+                self._exclude_assignment(edge_assignment, reason="parameter_bounds_filter")
+                continue
+
+            candidate.metadata = {
+                **dict(candidate.metadata or {}),
+                "objective_payload_bytes": objective_payload_bytes,
+                "objective_boundary_count": objective_boundary_count,
+                "exact_objective_version": EXACT_OBJECTIVE_VERSION,
+                "solve_attempt": self.solve_attempts,
+                "solve_time_sec": solve_elapsed,
+            }
+            self.pending_assignment = edge_assignment
+            result = self._build_result(
+                candidate=candidate,
+                status=status_name,
+                solve_time_sec=solve_elapsed,
+                objective_payload_bytes=objective_payload_bytes,
+                objective_boundary_count=objective_boundary_count,
+                objective_value=objective_value,
+            )
+            self.pending_result = result
+            logger.info(
+                "Exact split solve attempt {} returned candidate {} (payload_bytes={}, boundary_count={}, solve_time={:.3f}s, warm_start={})",
+                self.solve_attempts,
+                candidate.candidate_id,
+                objective_payload_bytes,
+                objective_boundary_count,
+                solve_elapsed,
+                self.warm_start_source or "none",
+            )
+            return result
+
+    def exclude_pending_candidate(self, *, reason: str) -> None:
+        if self.pending_assignment is None:
+            return
+        self._exclude_assignment(self.pending_assignment, reason=reason)
+        self.pending_assignment = None
+        self.pending_result = None
+
+
+def create_exact_candidate_session(
+    graph: GraphIR,
+    *,
+    max_boundary_count: int,
+    max_payload_bytes: int,
+    privacy_leakage_upper_bound: float = 0.0,
+    privacy_leakage_epsilon: float = PRIVACY_LEAKAGE_EPSILON,
+    privacy_metric_lower_bound: float | None = None,
+    max_layer_freezing_ratio: float = 1.0,
+    require_trainable_tail: bool = True,
+    previous_exact_candidate: SplitCandidate | None = None,
+    apply_warm_objective_upper_bound: bool = True,
+) -> ExactCandidateSolveSession:
+    if (
+        privacy_metric_lower_bound is not None
+        and float(privacy_leakage_upper_bound) <= 0.0
+    ):
+        privacy_leakage_upper_bound = float(privacy_metric_lower_bound)
+
+    if cp_model is None:
+        raise RuntimeError(
+            "OR-Tools is required for exact split solving. Install the `ortools` package."
+        )
+    return ExactCandidateSolveSession(
+        graph,
+        max_boundary_count=max_boundary_count,
+        max_payload_bytes=max_payload_bytes,
+        privacy_leakage_upper_bound=privacy_leakage_upper_bound,
+        privacy_leakage_epsilon=privacy_leakage_epsilon,
+        max_layer_freezing_ratio=max_layer_freezing_ratio,
+        require_trainable_tail=require_trainable_tail,
+        previous_exact_candidate=previous_exact_candidate,
+        apply_warm_objective_upper_bound=apply_warm_objective_upper_bound,
+    )
+
+
+def solve_best_candidate_exact(
+    graph: GraphIR,
+    *,
+    max_boundary_count: int,
+    max_payload_bytes: int,
+    privacy_leakage_upper_bound: float = 0.0,
+    privacy_leakage_epsilon: float = PRIVACY_LEAKAGE_EPSILON,
+    privacy_metric_lower_bound: float | None = None,
+    max_layer_freezing_ratio: float = 1.0,
+    require_trainable_tail: bool = True,
+    previous_exact_candidate: SplitCandidate | None = None,
+    return_session: bool = False,
+    apply_warm_objective_upper_bound: bool = True,
+) -> ExactSolveResult | tuple[ExactSolveResult, ExactCandidateSolveSession]:
+    session = create_exact_candidate_session(
+        graph,
+        max_boundary_count=max_boundary_count,
+        max_payload_bytes=max_payload_bytes,
+        privacy_leakage_upper_bound=privacy_leakage_upper_bound,
+        privacy_leakage_epsilon=privacy_leakage_epsilon,
+        privacy_metric_lower_bound=privacy_metric_lower_bound,
+        max_layer_freezing_ratio=max_layer_freezing_ratio,
+        require_trainable_tail=require_trainable_tail,
+        previous_exact_candidate=previous_exact_candidate,
+        apply_warm_objective_upper_bound=apply_warm_objective_upper_bound,
+    )
+    result = session.solve_next_candidate()
+    if return_session:
+        return result, session
+    return result
+
+
+def solve_next_candidate_exact(session: ExactCandidateSolveSession) -> ExactSolveResult:
+    return session.solve_next_candidate()
+
+
 def solve_exact_candidates(
     graph: GraphIR,
     *,
@@ -625,148 +1257,32 @@ def solve_exact_candidates(
     privacy_metric_lower_bound: float | None = None,
     max_layer_freezing_ratio: float = 1.0,
     require_trainable_tail: bool = True,
+    previous_exact_candidate: SplitCandidate | None = None,
 ) -> list[SplitCandidate]:
-    if (
-        privacy_metric_lower_bound is not None
-        and float(privacy_leakage_upper_bound) <= 0.0
-    ):
-        privacy_leakage_upper_bound = float(privacy_metric_lower_bound)
-
     if max_candidates <= 0:
         return []
-    if cp_model is None:
-        raise RuntimeError(
-            "OR-Tools is required for exact split solving. Install the `ortools` package."
-        )
 
-    relevant = list(graph.relevant_labels)
-    relevant_set = set(relevant)
-    relevant_inputs = _relevant_input_labels(graph)
-    relevant_outputs = _relevant_output_labels(graph)
-    if len(relevant) < 2 or not relevant_outputs:
-        return []
-
-    parameter_bounds = _parameter_budget_bounds(
-        graph,
-        privacy_leakage_upper_bound=privacy_leakage_upper_bound,
-        privacy_leakage_epsilon=privacy_leakage_epsilon,
-        max_layer_freezing_ratio=max_layer_freezing_ratio,
-    )
-    if parameter_bounds is None:
-        return []
-    total_parameter_count, lower_bound, upper_bound = parameter_bounds
-
-    model = cp_model.CpModel()
-    edge_vars = {label: model.NewBoolVar(f"edge_{index}") for index, label in enumerate(relevant)}
-    boundary_vars = {
-        label: model.NewBoolVar(f"boundary_{index}") for index, label in enumerate(relevant)
-    }
-    _add_ancestor_closed_constraints(
-        model,
-        graph,
-        relevant=relevant,
-        relevant_set=relevant_set,
-        edge_vars=edge_vars,
-    )
-
-    model.Add(sum(edge_vars.values()) >= 1)
-    model.Add(sum(boundary_vars.values()) >= 1)
-
-    for label in relevant_inputs:
-        model.Add(edge_vars[label] == 1)
-    for label in relevant_outputs:
-        model.Add(edge_vars[label] == 0)
-    _add_boundary_constraints(
-        model,
-        graph,
-        relevant=relevant,
-        relevant_set=relevant_set,
-        edge_vars=edge_vars,
-        boundary_vars=boundary_vars,
-    )
-
-    if require_trainable_tail:
-        trainable_labels = [
-            label for label in relevant if bool(graph.nodes[label].has_trainable_params)
-        ]
-        if not trainable_labels:
-            return []
-        model.Add(sum(1 - edge_vars[label] for label in trainable_labels) >= 1)
-
-    parameter_vars = _add_parameter_constraints(
-        model,
-        graph,
-        edge_vars=edge_vars,
-        total_parameter_count=total_parameter_count,
-        lower_bound=lower_bound,
-        upper_bound=upper_bound,
-    )
-    if parameter_vars is None:
-        return []
-
-    payload_expr = sum(
-        int(graph.nodes[label].estimated_bytes) * boundary_vars[label]
-        for label in relevant
-    )
-    boundary_count_expr = sum(boundary_vars.values())
-    model.Add(boundary_count_expr <= int(max_boundary_count))
-    model.Add(payload_expr <= int(max_payload_bytes))
-
-    objective_scale = len(relevant) + 1
-    model.Minimize(payload_expr * objective_scale + boundary_count_expr)
-
-    warm_candidate = _best_prefix_warm_start(
+    first_result, session = solve_best_candidate_exact(
         graph,
         max_boundary_count=max_boundary_count,
         max_payload_bytes=max_payload_bytes,
         privacy_leakage_upper_bound=privacy_leakage_upper_bound,
         privacy_leakage_epsilon=privacy_leakage_epsilon,
+        privacy_metric_lower_bound=privacy_metric_lower_bound,
         max_layer_freezing_ratio=max_layer_freezing_ratio,
         require_trainable_tail=require_trainable_tail,
+        previous_exact_candidate=previous_exact_candidate,
+        return_session=True,
+        apply_warm_objective_upper_bound=False,
     )
-    _apply_exact_warm_start_hints(
-        model,
-        graph,
-        relevant=relevant,
-        edge_vars=edge_vars,
-        boundary_vars=boundary_vars,
-        parameter_vars=parameter_vars,
-        warm_candidate=warm_candidate,
-    )
-
     candidates: list[SplitCandidate] = []
-    seen_edge_sets: set[tuple[str, ...]] = set()
-
-    while len(candidates) < max_candidates:
-        solver = _new_cp_sat_solver()
-        status = solver.Solve(model)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+    result = first_result
+    while result.candidate is not None and len(candidates) < max_candidates:
+        candidates.append(result.candidate)
+        session.exclude_pending_candidate(reason="multi_candidate_enumeration")
+        if len(candidates) >= max_candidates:
             break
-
-        edge_assignment = {
-            label: bool(solver.Value(edge_vars[label]))
-            for label in relevant
-        }
-        edge_key, candidate = _candidate_from_edge_assignment(
-            graph,
-            relevant=relevant,
-            edge_assignment=edge_assignment,
-            payload_bytes=int(solver.Value(payload_expr)),
-            boundary_count=int(solver.Value(boundary_count_expr)),
-        )
-        _add_solution_exclusion(model, edge_assignment, edge_vars)
-
-        if candidate is None or edge_key in seen_edge_sets:
-            continue
-        if not _candidate_is_within_parameter_bounds(
-            candidate,
-            privacy_leakage_upper_bound=privacy_leakage_upper_bound,
-            privacy_leakage_epsilon=privacy_leakage_epsilon,
-            max_layer_freezing_ratio=max_layer_freezing_ratio,
-        ):
-            continue
-        seen_edge_sets.add(edge_key)
-        candidates.append(candidate)
+        result = solve_next_candidate_exact(session)
 
     candidates.sort(key=_candidate_sort_key)
     return candidates[:max_candidates]

@@ -3,17 +3,36 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
 import torch
+from loguru import logger
 
 from model_management.candidate_generator import (
+    EXACT_OBJECTIVE_VERSION,
     PRIVACY_LEAKAGE_EPSILON,
+    ExactCandidateSolveSession,
+    build_candidate_from_edge_seed,
     estimate_privacy_leakage_from_edge_params,
     min_edge_parameters_for_privacy,
+    solve_best_candidate_exact,
     solve_exact_candidates,
+    solve_next_candidate_exact,
+)
+from model_management.fixed_split_artifacts import (
+    FIXED_SPLIT_EXACT_META_VERSION,
+    artifact_paths_from_plan_cache,
+    atomic_write_json,
+    atomic_write_torch,
+    build_graph_artifact_payload,
+    graph_artifact_matches,
+    load_json_artifact,
+    load_torch_artifact,
+    model_structure_fingerprint,
+    sample_input_signature,
 )
 from model_management.graph_ir import GraphIR
 from model_management.split_candidate import CandidateProfile, SplitCandidate
@@ -21,6 +40,7 @@ from model_management.universal_model_split import UniversalModelSplitter
 
 
 FIXED_SPLIT_PLAN_VERSION = "fixed-split.v2"
+FIXED_SPLIT_EXACT_CANDIDATE_CACHE_KEY = "cp_sat_exact_fixed_single"
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
 
@@ -311,6 +331,180 @@ def _make_plan_id(
     return hashlib.sha1(raw).hexdigest()
 
 
+def _candidate_summary(candidate: SplitCandidate) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "edge_nodes": list(candidate.edge_nodes),
+        "cloud_nodes": list(candidate.cloud_nodes),
+        "boundary_tensor_labels": list(candidate.boundary_tensor_labels),
+        "boundary_edges": [list(edge) for edge in candidate.boundary_edges],
+        "split_index": candidate.legacy_layer_index,
+        "payload_bytes": int(candidate.estimated_payload_bytes),
+        "boundary_count": int(candidate.boundary_count),
+        "edge_parameter_count": int(getattr(candidate, "edge_parameter_count", 0)),
+        "total_parameter_count": int(getattr(candidate, "total_parameter_count", 0)),
+        "edge_parameter_ratio": float(getattr(candidate, "edge_parameter_ratio", 0.0)),
+        "is_trainable_tail": bool(candidate.is_trainable_tail),
+    }
+
+
+def _candidate_from_summary(
+    graph: GraphIR,
+    summary: Mapping[str, Any] | None,
+) -> SplitCandidate | None:
+    if not summary:
+        return None
+    edge_nodes = list(summary.get("edge_nodes", []))
+    if not edge_nodes:
+        return None
+    candidate_id = summary.get("candidate_id")
+    if candidate_id is None:
+        raw = "|".join(edge_nodes).encode("utf-8")
+        candidate_id = f"candidate_{hashlib.sha1(raw).hexdigest()[:12]}"
+    candidate = build_candidate_from_edge_seed(
+        graph,
+        candidate_id=str(candidate_id),
+        edge_seed_nodes=edge_nodes,
+        legacy_layer_index=summary.get("split_index"),
+        metadata={"source": "cached_exact_result"},
+    )
+    if candidate is None:
+        return None
+    return candidate
+
+
+def _artifact_fingerprints(
+    model: torch.nn.Module,
+    *,
+    sample_input: Any,
+    sample_kwargs: Mapping[str, Any] | None = None,
+) -> tuple[str, str]:
+    return (
+        model_structure_fingerprint(model),
+        sample_input_signature(sample_input, sample_kwargs),
+    )
+
+
+def _load_exact_meta(path: str | None) -> dict[str, Any] | None:
+    paths = artifact_paths_from_plan_cache(path)
+    if paths is None:
+        return None
+    return load_json_artifact(paths.exact_meta_path)
+
+
+def _load_compatible_graph_artifact(
+    *,
+    model: torch.nn.Module,
+    sample_input: Any,
+    sample_kwargs: Mapping[str, Any] | None,
+    cache_path: str | None,
+) -> dict[str, Any] | None:
+    paths = artifact_paths_from_plan_cache(cache_path)
+    if paths is None:
+        return None
+    payload = load_torch_artifact(paths.graph_path)
+    if not isinstance(payload, Mapping):
+        return None
+    model_fingerprint, sample_signature_value = _artifact_fingerprints(
+        model,
+        sample_input=sample_input,
+        sample_kwargs=sample_kwargs,
+    )
+    if not graph_artifact_matches(
+        payload,
+        model_fingerprint=model_fingerprint,
+        sample_signature_value=sample_signature_value,
+    ):
+        return None
+    if not isinstance(payload.get("graph"), GraphIR):
+        return None
+    return dict(payload)
+
+
+def _load_previous_exact_candidate(
+    runtime: UniversalModelSplitter,
+    *,
+    model: torch.nn.Module,
+    sample_input: Any,
+    sample_kwargs: Mapping[str, Any] | None,
+    cache_path: str | None,
+    trace_signature: str,
+) -> tuple[SplitCandidate | None, dict[str, Any] | None]:
+    meta = _load_exact_meta(cache_path)
+    graph = _runtime_graph(runtime)
+    if not isinstance(graph, GraphIR) or not meta:
+        return None, meta
+    model_fingerprint, sample_signature_value = _artifact_fingerprints(
+        model,
+        sample_input=sample_input,
+        sample_kwargs=sample_kwargs,
+    )
+    if (
+        str(meta.get("artifact_version")) != FIXED_SPLIT_EXACT_META_VERSION
+        or str(meta.get("trace_signature")) != str(trace_signature)
+        or str(meta.get("model_structure_fingerprint")) != str(model_fingerprint)
+        or str(meta.get("sample_input_signature")) != str(sample_signature_value)
+    ):
+        return None, meta
+    summary = meta.get("best_candidate") or meta.get("previous_exact_candidate")
+    return _candidate_from_summary(graph, summary), meta
+
+
+def _persist_runtime_artifacts(
+    *,
+    runtime: UniversalModelSplitter,
+    model: torch.nn.Module,
+    sample_input: Any,
+    sample_kwargs: Mapping[str, Any] | None,
+    cache_path: str | None,
+    plan: SplitPlan,
+    constraints: SplitConstraints,
+    exact_diagnostics: Mapping[str, Any] | None = None,
+    chosen_candidate: SplitCandidate | None = None,
+) -> None:
+    paths = artifact_paths_from_plan_cache(cache_path)
+    if paths is None:
+        return
+    graph = _runtime_graph(runtime)
+    model_fingerprint, sample_signature_value = _artifact_fingerprints(
+        model,
+        sample_input=sample_input,
+        sample_kwargs=sample_kwargs,
+    )
+    if isinstance(graph, GraphIR):
+        graph_payload = build_graph_artifact_payload(
+            graph=graph,
+            trace_signature=plan.trace_signature or _trace_signature(runtime),
+            model_fingerprint=model_fingerprint,
+            sample_signature_value=sample_signature_value,
+            trace_timings=getattr(runtime, "trace_timings", None),
+        )
+        atomic_write_torch(paths.graph_path, graph_payload)
+
+    exact_meta = {
+        "artifact_version": FIXED_SPLIT_EXACT_META_VERSION,
+        "objective_version": EXACT_OBJECTIVE_VERSION,
+        "trace_signature": plan.trace_signature,
+        "model_structure_fingerprint": model_fingerprint,
+        "sample_input_signature": sample_signature_value,
+        "constraints": _constraints_payload(constraints),
+        "plan_split_config_id": plan.split_config_id,
+        "best_candidate": _candidate_summary(chosen_candidate)
+        if chosen_candidate is not None
+        else {
+            "candidate_id": plan.candidate_id,
+            "boundary_tensor_labels": list(plan.boundary_tensor_labels),
+            "split_index": plan.split_index,
+            "payload_bytes": int(plan.payload_bytes),
+            "boundary_count": int(plan.boundary_count),
+        },
+        "trace_timings": dict(getattr(runtime, "trace_timings", {}) or {}),
+        "validation": dict(plan.validation or {}),
+        "solver_diagnostics": dict(exact_diagnostics or {}),
+    }
+    atomic_write_json(paths.exact_meta_path, exact_meta)
+
+
 def _fallback_candidate_pool(
     runtime: UniversalModelSplitter,
     constraints: SplitConstraints,
@@ -321,9 +515,15 @@ def _fallback_candidate_pool(
         int(constraints.max_payload_bytes),
     )
     current_candidates = getattr(runtime, "candidates", None)
+    current_config = getattr(runtime, "_candidate_enumeration_config", None)
+    exact_fixed_config = (
+        isinstance(current_config, tuple)
+        and bool(current_config)
+        and str(current_config[0]) == FIXED_SPLIT_EXACT_CANDIDATE_CACHE_KEY
+    )
     if (
         not current_candidates
-        or getattr(runtime, "_candidate_enumeration_config", None) != expected
+        or (current_config != expected and not exact_fixed_config)
     ) and hasattr(runtime, "enumerate_candidates"):
         enumerated = list(
             runtime.enumerate_candidates(
@@ -615,6 +815,102 @@ def _profile_from_report(
     )
 
 
+def _record_exact_candidates(
+    runtime: UniversalModelSplitter,
+    constraints: SplitConstraints,
+    candidates: list[SplitCandidate],
+) -> None:
+    setattr(runtime, "candidates", list(candidates))
+    setattr(
+        runtime,
+        "_candidate_enumeration_config",
+        (
+            FIXED_SPLIT_EXACT_CANDIDATE_CACHE_KEY,
+            int(constraints.max_candidates),
+            int(constraints.max_boundary_count),
+            int(constraints.max_payload_bytes),
+            float(constraints.privacy_leakage_upper_bound),
+            float(constraints.privacy_leakage_epsilon),
+            float(constraints.max_layer_freezing_ratio),
+        ),
+    )
+
+
+def _select_replay_valid_exact_candidate(
+    runtime: UniversalModelSplitter,
+    constraints: SplitConstraints,
+    *,
+    session: ExactCandidateSolveSession,
+    first_result,
+) -> tuple[CandidateProfile, SplitCandidate, float, float, dict[str, Any], list[SplitCandidate]]:
+    replay_validation_failures = 0
+    replay_success_but_untrainable = 0
+    validation_error_counts: dict[str, int] = defaultdict(int)
+    attempted_candidates: list[SplitCandidate] = []
+    validation_fallback_count = 0
+    result = first_result
+
+    while result.candidate is not None:
+        candidate = result.candidate
+        attempted_candidates.append(candidate)
+        validation_started = time.perf_counter()
+        report = runtime.validate_candidate(candidate)
+        validation_elapsed = time.perf_counter() - validation_started
+        logger.info(
+            "Fixed split validation candidate {} (payload_bytes={}, boundary_count={}, validation_time={:.3f}s)",
+            candidate.candidate_id,
+            int(candidate.estimated_payload_bytes),
+            int(candidate.boundary_count),
+            validation_elapsed,
+        )
+        if bool(report.get("success", False)) and bool(
+            report.get("tail_trainability", candidate.is_trainable_tail)
+        ):
+            privacy_leakage = _privacy_leakage(candidate, constraints)
+            freezing_ratio = _layer_freezing_ratio(
+                runtime,
+                candidate,
+                total_trainable_layers=_total_trainable_layers(runtime),
+            )
+            profile = _profile_from_report(runtime, candidate, report)
+            diagnostics = dict(result.diagnostics)
+            diagnostics.update(
+                {
+                    "validation_time_sec": float(validation_elapsed),
+                    "validation_fallback_count": int(validation_fallback_count),
+                    "validation_used_next_exact_candidate": validation_fallback_count > 0,
+                }
+            )
+            return (
+                profile,
+                candidate,
+                privacy_leakage,
+                freezing_ratio,
+                diagnostics,
+                attempted_candidates,
+            )
+
+        if not bool(report.get("success", False)):
+            replay_validation_failures += 1
+            error_text = str(report.get("error") or "unknown")
+            validation_error_counts[error_text] += 1
+            session.exclude_pending_candidate(reason="replay_validation_failed")
+        else:
+            replay_success_but_untrainable += 1
+            session.exclude_pending_candidate(reason="tail_untrainable")
+
+        validation_fallback_count += 1
+        result = solve_next_candidate_exact(session)
+
+    _raise_no_replayable_candidate(
+        constraints,
+        eligible_count=len(attempted_candidates),
+        replay_validation_failures=replay_validation_failures,
+        replay_success_but_untrainable=replay_success_but_untrainable,
+        validation_error_counts=validation_error_counts,
+    )
+
+
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
     attempts: list[str] = []
     candidate_pool = _plan_candidate_pool(splitter, plan)
@@ -682,31 +978,105 @@ def compute_fixed_split_for_model(
     device: str | torch.device = "cpu",
     model_name: str | None = None,
     splitter: UniversalModelSplitter | None = None,
+    cache_path: str | None = None,
 ) -> SplitPlan:
     runtime = splitter or UniversalModelSplitter(device=device)
     if runtime.graph is None or runtime.model is None:
-        runtime.trace(model, sample_input, sample_kwargs=sample_kwargs)
+        runtime.trace_graph(model, sample_input, sample_kwargs=sample_kwargs)
 
-    eligible = _enumerate_feasible_candidates(runtime, constraints)
-    if not eligible:
-        raise RuntimeError(
-            "No split candidate satisfies the fixed split constraints. "
-            f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
-            f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
-            f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
-        )
+    graph = _runtime_graph(runtime)
+    chosen: SplitCandidate
+    profile: CandidateProfile | None
+    privacy_leakage: float
+    freezing_ratio: float
+    exact_diagnostics: dict[str, Any] | None = None
 
-    if not constraints.validate_candidates:
-        chosen, privacy_leakage, freezing_ratio = min(eligible, key=_eligible_candidate_key)
-        profile = None
-    else:
-        profile, chosen, privacy_leakage, freezing_ratio = _select_validated_candidate(
+    if isinstance(graph, GraphIR):
+        trace_signature = _trace_signature(runtime)
+        warm_candidate, _ = _load_previous_exact_candidate(
             runtime,
-            eligible,
-            constraints,
+            model=model,
+            sample_input=sample_input,
+            sample_kwargs=sample_kwargs,
+            cache_path=cache_path,
+            trace_signature=trace_signature,
         )
+        first_result, session = solve_best_candidate_exact(
+            graph,
+            max_boundary_count=constraints.max_boundary_count,
+            max_payload_bytes=constraints.max_payload_bytes,
+            privacy_leakage_upper_bound=constraints.privacy_leakage_upper_bound,
+            privacy_leakage_epsilon=constraints.privacy_leakage_epsilon,
+            max_layer_freezing_ratio=constraints.max_layer_freezing_ratio,
+            require_trainable_tail=True,
+            previous_exact_candidate=warm_candidate,
+            return_session=True,
+        )
+        if first_result.candidate is None:
+            raise RuntimeError(
+                "No split candidate satisfies the fixed split constraints. "
+                f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
+                f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
+                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}, "
+                f"reason={first_result.status}"
+            )
+
+        if not constraints.validate_candidates:
+            chosen = first_result.candidate
+            profile = None
+            privacy_leakage = _privacy_leakage(chosen, constraints)
+            freezing_ratio = _layer_freezing_ratio(
+                runtime,
+                chosen,
+                total_trainable_layers=_total_trainable_layers(runtime),
+            )
+            exact_diagnostics = dict(first_result.diagnostics)
+            exact_diagnostics.update(
+                {
+                    "validation_time_sec": 0.0,
+                    "validation_fallback_count": 0,
+                    "validation_used_next_exact_candidate": False,
+                }
+            )
+            attempted_candidates = [chosen]
+        else:
+            (
+                profile,
+                chosen,
+                privacy_leakage,
+                freezing_ratio,
+                exact_diagnostics,
+                attempted_candidates,
+            ) = _select_replay_valid_exact_candidate(
+                runtime,
+                constraints,
+                session=session,
+                first_result=first_result,
+            )
+        _record_exact_candidates(runtime, constraints, attempted_candidates)
+    else:
+        eligible = _enumerate_feasible_candidates(runtime, constraints)
+        if not eligible:
+            raise RuntimeError(
+                "No split candidate satisfies the fixed split constraints. "
+                f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
+                f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
+                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
+            )
+
+        if not constraints.validate_candidates:
+            chosen, privacy_leakage, freezing_ratio = min(eligible, key=_eligible_candidate_key)
+            profile = None
+        else:
+            profile, chosen, privacy_leakage, freezing_ratio = _select_validated_candidate(
+                runtime,
+                eligible,
+                constraints,
+            )
 
     validation = _build_validation_payload(chosen, profile)
+    if exact_diagnostics:
+        validation["exact_solver"] = dict(exact_diagnostics)
 
     return SplitPlan(
         split_config_id=_make_plan_id(
@@ -735,17 +1105,14 @@ def compute_fixed_split_for_model(
 
 
 def load_split_plan(path: str) -> SplitPlan | None:
-    if not path or not os.path.exists(path):
+    payload = load_json_artifact(path)
+    if payload is None:
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
     return SplitPlan.from_dict(payload)
 
 
 def persist_split_plan(path: str, plan: SplitPlan) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(plan.to_dict(), handle, indent=2, sort_keys=True)
+    atomic_write_json(path, plan.to_dict())
 
 
 def load_or_compute_fixed_split_plan(
@@ -762,7 +1129,29 @@ def load_or_compute_fixed_split_plan(
 ) -> SplitPlan:
     runtime = splitter or UniversalModelSplitter(device=device)
     if runtime.graph is None or runtime.model is None:
-        runtime.trace(model, sample_input, sample_kwargs=sample_kwargs)
+        graph_artifact = _load_compatible_graph_artifact(
+            model=model,
+            sample_input=sample_input,
+            sample_kwargs=sample_kwargs,
+            cache_path=cache_path,
+        )
+        if graph_artifact is not None:
+            runtime.bind_graph(
+                model,
+                graph_artifact["graph"],
+                trace_timings=graph_artifact.get("trace_timings"),
+            )
+            logger.info(
+                "Fixed split startup using cached graph artifact (trace_signature={})",
+                graph_artifact.get("trace_signature"),
+            )
+        else:
+            runtime.trace_graph(model, sample_input, sample_kwargs=sample_kwargs)
+            logger.info(
+                "Fixed split startup using cold graph build (trace_time={:.3f}s, graph_build={:.3f}s)",
+                float(runtime.trace_timings.get("torchlens_trace_forward", 0.0)),
+                float(runtime.trace_timings.get("graph_build", 0.0)),
+            )
     trace_signature = _trace_signature(runtime)
     model_key = model_name or model.__class__.__name__
 
@@ -773,12 +1162,39 @@ def load_or_compute_fixed_split_plan(
             constraints=constraints,
             trace_signature=trace_signature,
         ):
-            if validate_cached_plan:
-                report = validate_split_plan(runtime, cached)
-                cached.validation = {**cached.validation, **report}
-            else:
-                apply_split_plan(runtime, cached)
-            return cached
+            try:
+                cached_candidate = apply_split_plan(runtime, cached)
+                if validate_cached_plan:
+                    validation_started = time.perf_counter()
+                    report = runtime.validate_candidate(cached_candidate)
+                    validation_elapsed = time.perf_counter() - validation_started
+                    if not bool(report.get("success", False)):
+                        raise RuntimeError(
+                            "Persisted split plan is no longer replayable. "
+                            f"candidate_id={cached_candidate.candidate_id}, error={report.get('error')}"
+                        )
+                    cached.validation = {
+                        **cached.validation,
+                        **report,
+                        "cached_validation_time_sec": float(validation_elapsed),
+                    }
+                _persist_runtime_artifacts(
+                    runtime=runtime,
+                    model=model,
+                    sample_input=sample_input,
+                    sample_kwargs=sample_kwargs,
+                    cache_path=cache_path,
+                    plan=cached,
+                    constraints=constraints,
+                    exact_diagnostics={
+                        "cache_source": "cached_plan_reuse",
+                        "trace_signature": trace_signature,
+                    },
+                    chosen_candidate=cached_candidate,
+                )
+                return cached
+            except RuntimeError as exc:
+                logger.info("Cached fixed split plan invalidated; recomputing. {}", exc)
 
     plan = compute_fixed_split_for_model(
         model,
@@ -788,9 +1204,20 @@ def load_or_compute_fixed_split_plan(
         device=device,
         model_name=model_key,
         splitter=runtime,
+        cache_path=cache_path,
     )
-    report = validate_split_plan(runtime, plan)
-    plan.validation = {**plan.validation, **report}
     if cache_path:
         persist_split_plan(cache_path, plan)
+        chosen_candidate = apply_split_plan(runtime, plan)
+        _persist_runtime_artifacts(
+            runtime=runtime,
+            model=model,
+            sample_input=sample_input,
+            sample_kwargs=sample_kwargs,
+            cache_path=cache_path,
+            plan=plan,
+            constraints=constraints,
+            exact_diagnostics=plan.validation.get("exact_solver", {}),
+            chosen_candidate=chosen_candidate,
+        )
     return plan

@@ -29,6 +29,7 @@ from model_management.candidate_generator import (
 )
 from model_management.candidate_profiler import profile_candidates
 from model_management.candidate_selector import SplitCandidateSelector, SplitPointSelector
+from model_management.graph_ir import GraphIR
 from model_management.payload import SplitPayload
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_runtime import GraphSplitRuntime, _call_loss_fn
@@ -343,16 +344,71 @@ class UniversalModelSplitter(GraphSplitRuntime):
         self.selected_candidate_id: str | None = None
         self._candidate_enumeration_config: tuple[int, int, int] | None = None
 
-    def trace(
+    def bind_graph(
+        self,
+        model: torch.nn.Module,
+        graph: GraphIR,
+        *,
+        candidates: Sequence[SplitCandidate] | None = None,
+        current_candidate: SplitCandidate | None = None,
+        trace_timings: Mapping[str, float] | None = None,
+        trace_used_output_fallback: bool = False,
+        candidate_enumeration_config: tuple[int, int, int] | None = None,
+    ) -> "UniversalModelSplitter":
+        super().bind_graph(
+            model,
+            graph,
+            candidates=candidates,
+            current_candidate=current_candidate,
+            trace_timings=trace_timings,
+            trace_used_output_fallback=trace_used_output_fallback,
+        )
+        self._candidate_enumeration_config = candidate_enumeration_config
+        self.selected_candidate_id = (
+            self.current_candidate.candidate_id if self.current_candidate is not None else None
+        )
+        return self
+
+    def trace_graph(
         self,
         model: torch.nn.Module,
         sample_input: Any,
         sample_kwargs: Mapping[str, Any] | None = None,
     ) -> "UniversalModelSplitter":
-        super().trace(model, sample_input, sample_kwargs=sample_kwargs)
+        super().trace_graph(model, sample_input, sample_kwargs=sample_kwargs)
         self._candidate_enumeration_config = None
+        self.selected_candidate_id = None
+        return self
+
+    def trace(
+        self,
+        model: torch.nn.Module,
+        sample_input: Any,
+        sample_kwargs: Mapping[str, Any] | None = None,
+        *,
+        enumerate_candidates: bool = False,
+        max_candidates: int = 24,
+        max_boundary_count: int = 8,
+        max_payload_bytes: int = 32 * 1024 * 1024,
+    ) -> "UniversalModelSplitter":
+        super().trace(
+            model,
+            sample_input,
+            sample_kwargs=sample_kwargs,
+            enumerate_candidates=enumerate_candidates,
+            max_candidates=max_candidates,
+            max_boundary_count=max_boundary_count,
+            max_payload_bytes=max_payload_bytes,
+        )
+        self._candidate_enumeration_config = (
+            (int(max_candidates), int(max_boundary_count), int(max_payload_bytes))
+            if enumerate_candidates
+            else None
+        )
         if self.current_candidate is not None:
             self.selected_candidate_id = self.current_candidate.candidate_id
+        else:
+            self.selected_candidate_id = None
         return self
 
     def list_layers(self) -> list[LayerInfo]:
