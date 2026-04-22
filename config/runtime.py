@@ -109,7 +109,9 @@ class ContinualLearningConfig(ConfigSection):
     proxy_eval_frame_cache_enabled: bool = True
     split_learning_rate: float = 1e-3
     wrapper_fixed_split_learning_rate: float = 3e-5
+    tinynext_fixed_split_learning_rate: float = 1e-3
     rfdetr_fixed_split_learning_rate: float = 1e-4
+    tinynext_fixed_split_target_steps_per_round: int = 4
     yolo_fixed_split_target_steps_per_round: int = 4
     rfdetr_fixed_split_target_steps_per_round: int = 4
     max_concurrent_jobs: int = 2
@@ -328,6 +330,14 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive(
         "server.continual_learning.batch_size",
         int(config.server.continual_learning.batch_size),
+    )
+    _validate_positive(
+        "server.continual_learning.tinynext_fixed_split_learning_rate",
+        float(config.server.continual_learning.tinynext_fixed_split_learning_rate),
+    )
+    _validate_positive(
+        "server.continual_learning.tinynext_fixed_split_target_steps_per_round",
+        int(config.server.continual_learning.tinynext_fixed_split_target_steps_per_round),
     )
     _validate_positive(
         "server.continual_learning.yolo_fixed_split_target_steps_per_round",

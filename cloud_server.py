@@ -887,9 +887,17 @@ class CloudContinualLearner:
             float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
             if cl_cfg else 3e-5
         )
+        self.tinynext_fixed_split_learning_rate = (
+            float(getattr(cl_cfg, "tinynext_fixed_split_learning_rate", 1e-3))
+            if cl_cfg else 1e-3
+        )
         self.rfdetr_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
             if cl_cfg else 1e-4
+        )
+        self.tinynext_fixed_split_target_steps_per_round = (
+            int(getattr(cl_cfg, "tinynext_fixed_split_target_steps_per_round", 4))
+            if cl_cfg else 4
         )
         self.yolo_fixed_split_target_steps_per_round = (
             int(getattr(cl_cfg, "yolo_fixed_split_target_steps_per_round", 4))
@@ -2036,8 +2044,10 @@ class CloudContinualLearner:
         self,
         model_name: str,
     ) -> float:
-        name_lower = str(model_name).lower()
-        if name_lower.startswith("rfdetr_"):
+        model_family = model_zoo.get_model_family(str(model_name))
+        if model_family == "tinynext":
+            learning_rate = self.tinynext_fixed_split_learning_rate
+        elif model_family == "rfdetr":
             learning_rate = self.rfdetr_fixed_split_learning_rate
         else:
             learning_rate = self.wrapper_fixed_split_learning_rate
@@ -2049,6 +2059,8 @@ class CloudContinualLearner:
         model_name: str,
     ) -> int | None:
         model_family = model_zoo.get_model_family(str(model_name))
+        if model_family == "tinynext":
+            return max(1, int(self.tinynext_fixed_split_target_steps_per_round))
         if model_family == "rfdetr":
             return max(1, int(self.rfdetr_fixed_split_target_steps_per_round))
         if model_family == "yolo":
@@ -2059,13 +2071,15 @@ class CloudContinualLearner:
     def _uses_proxy_selected_fixed_split_epochs(
         model_name: str,
     ) -> bool:
-        return model_zoo.get_model_family(str(model_name)) in {"rfdetr", "yolo"}
+        return model_zoo.get_model_family(str(model_name)) in {"rfdetr", "tinynext"}
 
     @staticmethod
     def _resolve_fixed_split_training_label(
         model_name: str,
     ) -> str:
         model_family = model_zoo.get_model_family(str(model_name))
+        if model_family == "tinynext":
+            return "TinyNeXt"
         if model_family == "rfdetr":
             return "RF-DETR"
         if model_family == "yolo":
@@ -2077,7 +2091,7 @@ class CloudContinualLearner:
         model_name: str,
     ) -> dict[str, object]:
         model_family = model_zoo.get_model_family(str(model_name))
-        if model_family in {"rfdetr", "yolo"}:
+        if model_family in {"rfdetr", "yolo", "tinynext"}:
             return {
                 "optimizer_name": "adamw",
                 "weight_decay": 1e-4,
@@ -2504,16 +2518,21 @@ class CloudContinualLearner:
         baseline_proxy_state_key = _model_state_fingerprint(model)
         effective_num_epoch = num_epoch
         effective_learning_rate = self.default_split_learning_rate
-        if gt_annotations and model_zoo.is_wrapper_model(current_model_name):
+        if gt_annotations and (
+            model_zoo.is_wrapper_model(current_model_name)
+            or model_zoo.get_model_family(current_model_name) == "tinynext"
+        ):
             effective_learning_rate = self._resolve_fixed_split_learning_rate(
                 current_model_name,
             )
             logger.info(
-                "[FixedSplitCL] Using wrapper fixed-split learning rate {}.",
+                "[FixedSplitCL] Using {} fixed-split learning rate {}.",
+                self._resolve_fixed_split_training_label(current_model_name),
                 effective_learning_rate,
             )
 
         bs = max(1, int(effective_batch_size))
+        model_family = model_zoo.get_model_family(current_model_name)
         training_label = self._resolve_fixed_split_training_label(current_model_name)
         target_steps_per_round = self._resolve_fixed_split_target_steps_per_round(
             current_model_name,
@@ -2568,6 +2587,26 @@ class CloudContinualLearner:
             proxy_metrics_cache[baseline_proxy_state_key] = dict(proxy_metrics_before)
 
         def _evaluate_proxy_metrics_for_current_state() -> dict[str, float | int | None]:
+            if model_family == "tinynext":
+                metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                    model,
+                    frame_dir=frame_dir,
+                    gt_annotations=gt_annotations,
+                    device=self.device,
+                    model_name=current_model_name,
+                    frame_cache=proxy_eval_frame_cache,
+                    max_samples=self.proxy_eval_max_samples,
+                    candidate_thresholds=self.proxy_eval_threshold_candidates,
+                    inference_batch_size=bs,
+                )
+                if abs(calibrated_high - initial_high) > 1e-6:
+                    logger.info(
+                        "[FixedSplitCL] Calibrated {} threshold_high {} -> {} during proxy selection.",
+                        current_model_name,
+                        initial_high,
+                        calibrated_high,
+                    )
+                return dict(metrics)
             state_key = _model_state_fingerprint(model)
             cached_metrics = proxy_metrics_cache.get(state_key)
             if cached_metrics is not None:

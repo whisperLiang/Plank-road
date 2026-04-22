@@ -237,6 +237,30 @@ server:
     assert config.server.continual_learning.yolo_fixed_split_target_steps_per_round == 5
 
 
+def test_load_runtime_config_reads_tinynext_fixed_split_knobs(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 16
+    tinynext_fixed_split_learning_rate: 7.5e-5
+    tinynext_fixed_split_target_steps_per_round: 5
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.tinynext_fixed_split_learning_rate == pytest.approx(
+        7.5e-5
+    )
+    assert config.server.continual_learning.tinynext_fixed_split_target_steps_per_round == 5
+
+
 def test_load_runtime_config_reads_cloud_proxy_eval_knobs(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -325,10 +349,33 @@ server:
     assert config.server.continual_learning.yolo_fixed_split_target_steps_per_round == 4
 
 
+def test_load_runtime_config_tinynext_fixed_split_knobs_default(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    batch_size: 7
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.server.continual_learning.tinynext_fixed_split_learning_rate == pytest.approx(
+        1e-3
+    )
+    assert config.server.continual_learning.tinynext_fixed_split_target_steps_per_round == 4
+
+
 @pytest.mark.parametrize(
     ("field_name", "field_value"),
     [
         ("batch_size", 0),
+        ("tinynext_fixed_split_target_steps_per_round", 0),
         ("yolo_fixed_split_target_steps_per_round", 0),
         ("rfdetr_fixed_split_target_steps_per_round", 0),
     ],
@@ -352,6 +399,27 @@ server:
     )
 
     with pytest.raises(ValueError, match=f"server.continual_learning.{field_name}"):
+        load_runtime_config(config_path)
+
+
+def test_load_runtime_config_rejects_invalid_tinynext_fixed_split_learning_rate(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+  continual_learning:
+    tinynext_fixed_split_learning_rate: 0
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="server.continual_learning.tinynext_fixed_split_learning_rate",
+    ):
         load_runtime_config(config_path)
 
 
