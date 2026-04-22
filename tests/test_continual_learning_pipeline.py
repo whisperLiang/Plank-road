@@ -1246,6 +1246,9 @@ def test_apply_split_plan_prefers_canonical_split_selectors_before_candidate_id(
         def __init__(self):
             self.calls = []
 
+        def enumerate_candidates(self, **kwargs):
+            raise AssertionError("Direct split recovery should not enumerate candidates.")
+
         def split(
             self,
             *,
@@ -1288,6 +1291,9 @@ def test_apply_split_plan_prefers_canonical_split_selectors_before_candidate_id(
     class SplitIndexRuntime:
         def __init__(self):
             self.calls = []
+
+        def enumerate_candidates(self, **kwargs):
+            raise AssertionError("Direct split recovery should not enumerate candidates.")
 
         def split(
             self,
@@ -1337,6 +1343,9 @@ def test_apply_split_plan_prefers_canonical_split_selectors_before_candidate_id(
     class CandidateRuntime:
         def __init__(self):
             self.calls = []
+
+        def enumerate_candidates(self, **kwargs):
+            raise AssertionError("Direct split recovery should not enumerate candidates.")
 
         def split(
             self,
@@ -1394,7 +1403,7 @@ def test_apply_split_plan_prefers_canonical_split_selectors_before_candidate_id(
     ]
 
 
-def test_apply_split_plan_prefers_enumerated_split_index_candidate_over_legacy_fallback():
+def test_apply_split_plan_uses_candidate_pool_only_after_direct_recovery_fails():
     plan = SplitPlan(
         split_config_id="plan-legacy",
         model_name="dummy-model",
@@ -1454,6 +1463,7 @@ def test_apply_split_plan_prefers_enumerated_split_index_candidate_over_legacy_f
     class EnumeratedRuntime:
         def __init__(self):
             self.calls = []
+            self.split_calls = []
             self.candidates = []
             self._candidate_enumeration_config = None
 
@@ -1481,17 +1491,151 @@ def test_apply_split_plan_prefers_enumerated_split_index_candidate_over_legacy_f
             layer_index=None,
             candidate_id=None,
         ):
+            self.split_calls.append(
+                {
+                    "boundary_tensor_labels": boundary_tensor_labels,
+                    "layer_label": layer_label,
+                    "layer_index": layer_index,
+                    "candidate_id": candidate_id,
+                }
+            )
             if boundary_tensor_labels is not None or layer_label is not None:
                 raise KeyError("fallback")
             if layer_index is not None:
-                return "legacy-fallback"
+                raise KeyError("legacy-fallback")
             if candidate_id is not None:
-                return "candidate-fallback"
+                raise KeyError("candidate-fallback")
             raise AssertionError("Unexpected split selector.")
 
     runtime = EnumeratedRuntime()
     assert apply_split_plan(runtime, plan) is best_match
     assert runtime.calls == [(8, 4, 1024)]
+    assert runtime.split_calls == [
+        {
+            "boundary_tensor_labels": ["missing-boundary"],
+            "layer_label": None,
+            "layer_index": None,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": "edge-boundary",
+            "layer_index": None,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": None,
+            "layer_index": 7,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": None,
+            "layer_index": None,
+            "candidate_id": "candidate-edge",
+        },
+    ]
+
+
+def test_apply_split_plan_keeps_candidate_id_reachable_after_split_index_mismatch():
+    plan = SplitPlan(
+        split_config_id="plan-legacy-candidate-id",
+        model_name="dummy-model",
+        candidate_id="candidate-edge",
+        split_index=7,
+        split_label=None,
+        boundary_tensor_labels=[],
+        payload_bytes=128,
+        privacy_metric=0.4,
+        privacy_risk=0.6,
+        layer_freezing_ratio=0.5,
+        constraints={},
+        trace_signature="sig",
+    )
+
+    split_index_candidate = SplitCandidate(
+        candidate_id="legacy_7",
+        edge_nodes=["edge-a"],
+        cloud_nodes=["cloud"],
+        boundary_edges=[("edge-a", "cloud")],
+        boundary_tensor_labels=["edge-a"],
+        edge_input_labels=["input"],
+        cloud_input_labels=[],
+        cloud_output_labels=["cloud"],
+        estimated_edge_flops=1.0,
+        estimated_cloud_flops=1.0,
+        estimated_payload_bytes=64,
+        estimated_privacy_risk=0.2,
+        estimated_latency=1.0,
+        is_trainable_tail=True,
+        legacy_layer_index=7,
+        boundary_count=1,
+    )
+    candidate_id_match = SplitCandidate(
+        candidate_id="candidate-edge",
+        edge_nodes=["edge-b"],
+        cloud_nodes=["cloud"],
+        boundary_edges=[("edge-b", "cloud")],
+        boundary_tensor_labels=["edge-b"],
+        edge_input_labels=["input"],
+        cloud_input_labels=[],
+        cloud_output_labels=["cloud"],
+        estimated_edge_flops=1.0,
+        estimated_cloud_flops=1.0,
+        estimated_payload_bytes=64,
+        estimated_privacy_risk=0.2,
+        estimated_latency=1.0,
+        is_trainable_tail=True,
+        legacy_layer_index=7,
+        boundary_count=1,
+    )
+
+    class CandidateIdReachableRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def enumerate_candidates(self, **kwargs):
+            raise AssertionError("candidate_id should stay reachable before candidate enumeration.")
+
+        def split(
+            self,
+            *,
+            boundary_tensor_labels=None,
+            layer_label=None,
+            layer_index=None,
+            candidate_id=None,
+        ):
+            self.calls.append(
+                {
+                    "boundary_tensor_labels": boundary_tensor_labels,
+                    "layer_label": layer_label,
+                    "layer_index": layer_index,
+                    "candidate_id": candidate_id,
+                }
+            )
+            if layer_index is not None:
+                return split_index_candidate
+            if candidate_id is not None:
+                return candidate_id_match
+            raise AssertionError("Unexpected split selector.")
+
+    runtime = CandidateIdReachableRuntime()
+    assert apply_split_plan(runtime, plan) is candidate_id_match
+    assert runtime.calls == [
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": None,
+            "layer_index": 7,
+            "candidate_id": None,
+        },
+        {
+            "boundary_tensor_labels": None,
+            "layer_label": None,
+            "layer_index": None,
+            "candidate_id": "candidate-edge",
+        },
+    ]
 
 
 def test_high_confidence_sample_saves_feature_and_result_without_raw(tmp_path):

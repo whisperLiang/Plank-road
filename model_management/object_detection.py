@@ -378,9 +378,6 @@ class Object_Detection:
         if not frames:
             return []
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         prepared_images = [self._prepare_image_tensor(frame) for frame in frames]
         outputs = self.model(prepared_images)
         if isinstance(outputs, tuple):
@@ -402,8 +399,6 @@ class Object_Detection:
         return predictions
 
     def get_model_prediction(self, img, threshold, model=None):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         img = self._prepare_image_tensor(img)
         #get the inference result
         if model is None:

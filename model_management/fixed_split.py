@@ -36,7 +36,11 @@ from model_management.fixed_split_artifacts import (
 )
 from model_management.graph_ir import GraphIR
 from model_management.split_candidate import CandidateProfile, SplitCandidate
-from model_management.universal_model_split import UniversalModelSplitter
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
+    build_candidate_descriptor,
+    reconstruct_candidate_from_descriptor,
+)
 
 
 FIXED_SPLIT_PLAN_VERSION = "fixed-split.v2"
@@ -333,12 +337,9 @@ def _make_plan_id(
 
 def _candidate_summary(candidate: SplitCandidate) -> dict[str, Any]:
     return {
-        "candidate_id": candidate.candidate_id,
-        "edge_nodes": list(candidate.edge_nodes),
+        **build_candidate_descriptor(candidate),
         "cloud_nodes": list(candidate.cloud_nodes),
-        "boundary_tensor_labels": list(candidate.boundary_tensor_labels),
         "boundary_edges": [list(edge) for edge in candidate.boundary_edges],
-        "split_index": candidate.legacy_layer_index,
         "payload_bytes": int(candidate.estimated_payload_bytes),
         "boundary_count": int(candidate.boundary_count),
         "edge_parameter_count": int(getattr(candidate, "edge_parameter_count", 0)),
@@ -352,25 +353,11 @@ def _candidate_from_summary(
     graph: GraphIR,
     summary: Mapping[str, Any] | None,
 ) -> SplitCandidate | None:
-    if not summary:
-        return None
-    edge_nodes = list(summary.get("edge_nodes", []))
-    if not edge_nodes:
-        return None
-    candidate_id = summary.get("candidate_id")
-    if candidate_id is None:
-        raw = "|".join(edge_nodes).encode("utf-8")
-        candidate_id = f"candidate_{hashlib.sha1(raw).hexdigest()[:12]}"
-    candidate = build_candidate_from_edge_seed(
+    return reconstruct_candidate_from_descriptor(
         graph,
-        candidate_id=str(candidate_id),
-        edge_seed_nodes=edge_nodes,
-        legacy_layer_index=summary.get("split_index"),
-        metadata={"source": "cached_exact_result"},
+        summary,
+        source="cached_exact_result",
     )
-    if candidate is None:
-        return None
-    return candidate
 
 
 def _artifact_fingerprints(
@@ -557,6 +544,56 @@ def _plan_candidate_pool(
 ) -> list[SplitCandidate]:
     constraints = _constraints_from_plan(plan)
     return _fallback_candidate_pool(runtime, constraints)
+
+
+def _recover_split_candidate_from_pool(
+    candidate_pool: list[SplitCandidate],
+    plan: SplitPlan,
+) -> tuple[SplitCandidate | None, str | None]:
+    if plan.boundary_tensor_labels:
+        boundary_list = list(plan.boundary_tensor_labels)
+        boundary_set = set(boundary_list)
+        matches = [
+            item
+            for item in candidate_pool
+            if item.boundary_tensor_labels == boundary_list
+            or set(item.boundary_tensor_labels) == boundary_set
+        ]
+        if matches:
+            matches.sort(key=lambda item: _split_index_candidate_key(item, plan))
+            return matches[0], "candidate_pool_boundary_tensor_labels"
+
+    if plan.split_label is not None:
+        matches = [
+            item
+            for item in candidate_pool
+            if plan.split_label in item.boundary_tensor_labels
+            or plan.split_label in item.edge_nodes
+        ]
+        if matches:
+            matches.sort(key=lambda item: _split_index_candidate_key(item, plan))
+            return matches[0], "candidate_pool_split_label"
+
+    if plan.split_index is not None:
+        matches = [
+            item
+            for item in candidate_pool
+            if item.legacy_layer_index is not None
+            and int(item.legacy_layer_index) == int(plan.split_index)
+        ]
+        if matches:
+            matches.sort(key=lambda item: _split_index_candidate_key(item, plan))
+            return matches[0], "candidate_pool_split_index"
+
+    if plan.candidate_id is not None:
+        matches = [
+            item for item in candidate_pool if str(item.candidate_id) == str(plan.candidate_id)
+        ]
+        if matches:
+            matches.sort(key=lambda item: _split_index_candidate_key(item, plan))
+            return matches[0], "candidate_pool_candidate_id"
+
+    return None, None
 
 
 def _split_index_candidate_key(
@@ -933,51 +970,84 @@ def _select_replay_valid_exact_candidate(
     )
 
 
-def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
+def _recover_split_plan_candidate(
+    splitter: UniversalModelSplitter,
+    plan: SplitPlan,
+) -> tuple[SplitCandidate, str]:
     attempts: list[str] = []
-    candidate_pool = _plan_candidate_pool(splitter, plan)
+    has_selector = False
+
+    def _matches_manifest_candidate_id(candidate: SplitCandidate | object) -> bool:
+        expected_candidate_id = getattr(plan, "candidate_id", None)
+        if expected_candidate_id is None:
+            return True
+        actual_candidate_id = getattr(candidate, "candidate_id", None)
+        if actual_candidate_id is None:
+            return True
+        return str(actual_candidate_id) == str(expected_candidate_id)
 
     if plan.boundary_tensor_labels:
+        has_selector = True
         try:
-            return splitter.split(boundary_tensor_labels=plan.boundary_tensor_labels)
+            return splitter.split(boundary_tensor_labels=plan.boundary_tensor_labels), "boundary_tensor_labels"
         except KeyError as exc:
             attempts.append(
                 "boundary_tensor_labels="
                 f"{_format_boundary_labels(plan.boundary_tensor_labels)} ({exc})"
             )
     if plan.split_label is not None:
+        has_selector = True
         try:
-            return splitter.split(layer_label=plan.split_label)
+            candidate = splitter.split(layer_label=plan.split_label)
+            if _matches_manifest_candidate_id(candidate):
+                return candidate, "split_label"
+            attempts.append(
+                "split_label="
+                f"{plan.split_label!r} (candidate_id mismatch: "
+                f"{getattr(candidate, 'candidate_id', None)!r} != {plan.candidate_id!r})"
+            )
         except KeyError as exc:
             attempts.append(f"split_label={plan.split_label!r} ({exc})")
     if plan.split_index is not None:
-        indexed_matches = [
-            item
-            for item in candidate_pool
-            if item.legacy_layer_index is not None
-            and int(item.legacy_layer_index) == int(plan.split_index)
-        ]
-        if indexed_matches:
-            indexed_matches.sort(key=lambda item: _split_index_candidate_key(item, plan))
-            return indexed_matches[0]
+        has_selector = True
         try:
-            return splitter.split(layer_index=plan.split_index)
+            candidate = splitter.split(layer_index=plan.split_index)
+            if _matches_manifest_candidate_id(candidate):
+                return candidate, "split_index"
+            attempts.append(
+                "split_index="
+                f"{plan.split_index!r} (candidate_id mismatch: "
+                f"{getattr(candidate, 'candidate_id', None)!r} != {plan.candidate_id!r})"
+            )
         except KeyError as exc:
             attempts.append(f"split_index={plan.split_index!r} ({exc})")
     if plan.candidate_id is not None:
+        has_selector = True
         try:
-            return splitter.split(candidate_id=plan.candidate_id)
+            return splitter.split(candidate_id=plan.candidate_id), "candidate_id"
         except KeyError as exc:
             attempts.append(f"candidate_id={plan.candidate_id!r} ({exc})")
-    if not attempts:
+    if not has_selector:
         raise RuntimeError(
             "Split plan does not contain any canonical selector fields. "
             f"split_config_id={plan.split_config_id!r}"
         )
+    candidate_pool = _plan_candidate_pool(splitter, plan)
+    recovered_candidate, recovery_mode = _recover_split_candidate_from_pool(
+        candidate_pool,
+        plan,
+    )
+    if recovered_candidate is not None and recovery_mode is not None:
+        return recovered_candidate, recovery_mode
     raise RuntimeError(
         "Could not recover a split candidate from the canonical split plan. "
         f"split_config_id={plan.split_config_id!r}, attempts={'; '.join(attempts)}"
     )
+
+
+def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
+    candidate, _ = _recover_split_plan_candidate(splitter, plan)
+    return candidate
 
 
 def validate_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> dict[str, Any]:

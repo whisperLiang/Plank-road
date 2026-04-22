@@ -60,7 +60,18 @@ from model_management.continual_learning_bundle import (
     load_training_bundle_manifest,
     prepare_split_training_cache,
 )
-from model_management.fixed_split import SplitPlan, apply_split_plan
+from model_management.fixed_split import SplitPlan, _recover_split_plan_candidate
+from model_management.fixed_split_runtime_template import (
+    FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION,
+    FixedSplitRuntimeTemplate,
+    FixedSplitRuntimeTemplateKey,
+    FixedSplitRuntimeTemplateLookup,
+    bind_request_splitter_from_template,
+    compute_graph_trace_signature,
+    describe_split_candidate,
+    freeze_trace_timings,
+    get_fixed_split_runtime_template_cache,
+)
 from model_management.payload import SplitPayload
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
@@ -71,6 +82,19 @@ def _collate_fn(batch):
 
 
 _FIXED_SPLIT_WORKING_CACHE_VERSION = 1
+
+
+class _TeacherAnnotationQueueState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.next_ticket = 0
+        self.serving_ticket = 0
+        self.ticket_states: dict[int, str] = {}
+        self.ticket_local = threading.local()
+
+
+_GLOBAL_TEACHER_ANNOTATION_QUEUE = _TeacherAnnotationQueueState()
 
 
 def _stable_json_dumps(payload: object) -> str:
@@ -773,6 +797,9 @@ class CloudContinualLearner:
             "fixed_split_working_cache",
         )
         os.makedirs(self.fixed_split_cache_root, exist_ok=True)
+        self._fixed_split_runtime_template_cache = (
+            get_fixed_split_runtime_template_cache()
+        )
 
         # Dynamic Activation Sparsity (SURGEON) config
         das_cfg = getattr(config, "das", None)
@@ -789,6 +816,7 @@ class CloudContinualLearner:
         self._queued_jobs = 0
         self._active_jobs = 0
         self._training_slots = threading.BoundedSemaphore(self.max_concurrent_jobs)
+        self._teacher_queue_state = _GLOBAL_TEACHER_ANNOTATION_QUEUE
 
     def _edge_lock(self, edge_id: int | str) -> threading.Lock:
         edge_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(edge_id).strip()) or "unknown"
@@ -826,8 +854,23 @@ class CloudContinualLearner:
                 with self._job_state_lock:
                     self._queued_jobs = max(0, self._queued_jobs - 1)
                     self._active_jobs += 1
+                # Reserve the teacher ticket at job start so all annotation work
+                # across edges is globally serialized in request order.
+                teacher_ticket = self._reserve_teacher_ticket()
+                self._set_current_teacher_ticket(teacher_ticket)
+                logger.info(
+                    "[FixedSplitCL] Reserved teacher ticket {} at job start for edge {}.",
+                    teacher_ticket,
+                    edge_id,
+                )
                 yield
             finally:
+                self._finalize_teacher_ticket(
+                    teacher_ticket if "teacher_ticket" in locals() else None,
+                    stage_label="teacher annotation",
+                    reason="training job completed without consuming the reserved teacher ticket",
+                )
+                self._set_current_teacher_ticket(None)
                 if acquired_slot:
                     with self._job_state_lock:
                         self._active_jobs = max(0, self._active_jobs - 1)
@@ -839,6 +882,123 @@ class CloudContinualLearner:
     def training_queue_state(self) -> tuple[int, int]:
         with self._job_state_lock:
             return self._queued_jobs + self._active_jobs, self.max_concurrent_jobs
+
+    def _reserve_teacher_ticket(self) -> int:
+        queue_state = self._teacher_queue_state
+        with queue_state.condition:
+            ticket = int(queue_state.next_ticket)
+            queue_state.next_ticket += 1
+            queue_state.ticket_states[ticket] = "reserved"
+            return ticket
+
+    def _advance_teacher_queue_locked(self) -> None:
+        queue_state = self._teacher_queue_state
+        while queue_state.ticket_states.get(int(queue_state.serving_ticket)) in {"done", "skipped"}:
+            queue_state.ticket_states.pop(int(queue_state.serving_ticket), None)
+            queue_state.serving_ticket = int(queue_state.serving_ticket) + 1
+
+    def _set_current_teacher_ticket(self, ticket: int | None) -> None:
+        queue_state = self._teacher_queue_state
+        if ticket is None:
+            if hasattr(queue_state.ticket_local, "ticket"):
+                delattr(queue_state.ticket_local, "ticket")
+            return
+        queue_state.ticket_local.ticket = int(ticket)
+
+    def _current_teacher_ticket(self) -> int:
+        queue_state = self._teacher_queue_state
+        ticket = getattr(queue_state.ticket_local, "ticket", None)
+        if ticket is not None:
+            with queue_state.condition:
+                state = queue_state.ticket_states.get(int(ticket))
+            if state in {"reserved", "active"}:
+                return int(ticket)
+            delattr(queue_state.ticket_local, "ticket")
+        ticket = self._reserve_teacher_ticket()
+        queue_state.ticket_local.ticket = int(ticket)
+        logger.warning(
+            "[FixedSplitCL] Reserved ad-hoc teacher ticket {} outside training-job scope.",
+            ticket,
+        )
+        return int(ticket)
+
+    def _finalize_teacher_ticket(
+        self,
+        ticket: int | None,
+        *,
+        stage_label: str,
+        reason: str,
+    ) -> None:
+        if ticket is None:
+            return
+        queue_state = self._teacher_queue_state
+        with queue_state.condition:
+            state = queue_state.ticket_states.get(int(ticket))
+            if state in {None, "done", "skipped", "active"}:
+                return
+            queue_state.ticket_states[int(ticket)] = "skipped"
+            self._advance_teacher_queue_locked()
+            queue_state.condition.notify_all()
+        logger.info(
+            "[FixedSplitCL] released teacher slot without annotation (ticket={}, stage={}, reason={}).",
+            ticket,
+            stage_label,
+            reason,
+        )
+
+    @contextmanager
+    def _teacher_annotation_scope(
+        self,
+        stage_label: str,
+        *,
+        sample_count: int | None = None,
+    ):
+        """Serialize only teacher inference globally while preserving batched requests."""
+        queue_state = self._teacher_queue_state
+        ticket = self._current_teacher_ticket()
+        wait_started = time.perf_counter()
+        logger.info(
+            "[FixedSplitCL] waiting for teacher slot (ticket={}, stage={}, samples={}).",
+            ticket,
+            stage_label,
+            sample_count,
+        )
+        with queue_state.condition:
+            while True:
+                self._advance_teacher_queue_locked()
+                state = queue_state.ticket_states.get(int(ticket))
+                if state is None:
+                    raise RuntimeError(
+                        f"Teacher ticket {ticket} is no longer pending for stage {stage_label!r}."
+                    )
+                if int(ticket) == int(queue_state.serving_ticket) and state == "reserved":
+                    queue_state.ticket_states[int(ticket)] = "active"
+                    break
+                queue_state.condition.wait()
+        wait_elapsed = time.perf_counter() - wait_started
+        logger.info(
+            "[FixedSplitCL] acquired teacher slot (ticket={}, stage={}, wait_time={:.3f}s).",
+            ticket,
+            stage_label,
+            wait_elapsed,
+        )
+        execution_started = time.perf_counter()
+        try:
+            yield
+        finally:
+            execution_elapsed = time.perf_counter() - execution_started
+            with queue_state.condition:
+                if queue_state.ticket_states.get(int(ticket)) == "active":
+                    queue_state.ticket_states[int(ticket)] = "done"
+                self._advance_teacher_queue_locked()
+                queue_state.condition.notify_all()
+            logger.info(
+                "[FixedSplitCL] released teacher slot (ticket={}, stage={}, wait_time={:.3f}s, execution_time={:.3f}s).",
+                ticket,
+                stage_label,
+                wait_elapsed,
+                execution_elapsed,
+            )
 
     def _edge_weights_path(self, model_name: str, *, edge_id: int | str | None = None) -> str:
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(model_name).strip())
@@ -1352,14 +1512,40 @@ class CloudContinualLearner:
 
         return _batch_provider
 
-    def _build_bundle_splitter(
+    def _fixed_split_runtime_template_key(
+        self,
+        *,
+        model_name: str,
+        manifest: Mapping[str, object],
+    ) -> FixedSplitRuntimeTemplateKey:
+        split_plan = dict(manifest.get("split_plan", {}))
+        trace_image_size = self._infer_bundle_trace_image_size(dict(manifest))
+        trace_input_shape = None
+        if trace_image_size is not None:
+            trace_input_shape = (
+                max(1, int(self.batch_size)),
+                3,
+                int(trace_image_size[0]),
+                int(trace_image_size[1]),
+            )
+        return FixedSplitRuntimeTemplateKey(
+            model_name=str(model_name),
+            trace_image_size=trace_image_size,
+            trace_input_shape=trace_input_shape,
+            trace_batch_size=max(1, int(self.batch_size)),
+            split_plan_hash=_json_fingerprint(split_plan),
+            version=FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION,
+        )
+
+    def _build_fixed_split_runtime_template(
         self,
         model: torch.nn.Module,
         manifest: dict[str, object],
         *,
         bundle_root: str,
+        template_key: FixedSplitRuntimeTemplateKey,
         trace_sample_input: torch.Tensor | None = None,
-    ):
+    ) -> FixedSplitRuntimeTemplate:
         split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
         splitter = UniversalModelSplitter(device=self.device)
         split_model = get_split_runtime_model(model)
@@ -1370,7 +1556,9 @@ class CloudContinualLearner:
                 bundle_root,
                 manifest,
             )
-        splitter.trace(split_model, sample_input)
+        splitter.trace_graph(split_model, sample_input)
+        if splitter.graph is None:
+            raise RuntimeError("Fixed split runtime template tracing did not produce a graph.")
         self._log_stage_elapsed(
             "TorchLens trace forward",
             getattr(splitter, "trace_timings", {}).get("torchlens_trace_forward"),
@@ -1379,17 +1567,131 @@ class CloudContinualLearner:
             "graph build",
             getattr(splitter, "trace_timings", {}).get("graph_build"),
         )
-        apply_split_started = time.perf_counter()
-        candidate = apply_split_plan(splitter, split_plan)
-        candidate_elapsed = (
-            float(getattr(splitter, "trace_timings", {}).get("candidate_enumeration", 0.0))
-            + (time.perf_counter() - apply_split_started)
+        recovery_started = time.perf_counter()
+        candidate, recovery_mode = _recover_split_plan_candidate(splitter, split_plan)
+        recovery_elapsed = time.perf_counter() - recovery_started
+        candidate_enumeration_elapsed = float(
+            getattr(splitter, "trace_timings", {}).get("candidate_enumeration", 0.0)
         )
-        self._log_stage_elapsed(
-            "candidate enumeration / apply split plan",
-            candidate_elapsed,
+        if recovery_mode == "candidate_pool" or candidate_enumeration_elapsed > 0.0:
+            self._log_stage_elapsed(
+                "candidate enumeration / apply split plan",
+                candidate_enumeration_elapsed + recovery_elapsed,
+            )
+        else:
+            logger.info(
+                "[FixedSplitCL] runtime template resolved fixed split via {} without candidate enumeration (recovery_time={:.3f}s, key={}).",
+                recovery_mode,
+                recovery_elapsed,
+                template_key.to_log_payload(),
+            )
+        trace_signature = (
+            str(split_plan.trace_signature).strip()
+            if split_plan.trace_signature is not None and str(split_plan.trace_signature).strip()
+            else compute_graph_trace_signature(splitter.graph)
+        )
+        trace_input_shape = (
+            tuple(int(dim) for dim in sample_input.shape)
+            if isinstance(sample_input, torch.Tensor)
+            else None
+        )
+        logger.info(
+            "[FixedSplitCL] runtime template resolved fixed split using {} recovery (recovery_time={:.3f}s, trace_signature={}, key={}).",
+            recovery_mode,
+            recovery_elapsed,
+            trace_signature,
+            template_key.to_log_payload(),
+        )
+        return FixedSplitRuntimeTemplate(
+            cache_key=template_key,
+            graph=splitter.graph,
+            candidate_descriptor=describe_split_candidate(candidate),
+            candidate_recovery_mode=recovery_mode,
+            trace_signature=trace_signature,
+            trace_timings=freeze_trace_timings(getattr(splitter, "trace_timings", {}) or {}),
+            trace_used_output_fallback=bool(
+                getattr(splitter, "trace_used_output_fallback", False)
+            ),
+            trace_image_size=(
+                tuple(int(dim) for dim in template_key.trace_image_size)
+                if template_key.trace_image_size is not None
+                else None
+            ),
+            trace_input_shape=trace_input_shape,
+            trace_batch_size=int(template_key.trace_batch_size),
+            split_plan_hash=str(template_key.split_plan_hash),
+        )
+
+    def _get_or_create_fixed_split_runtime_template(
+        self,
+        model: torch.nn.Module,
+        manifest: dict[str, object],
+        *,
+        bundle_root: str,
+        trace_sample_input: torch.Tensor | None = None,
+    ) -> FixedSplitRuntimeTemplateLookup:
+        model_name = self._resolve_fixed_split_model_name(manifest)
+        template_key = self._fixed_split_runtime_template_key(
+            model_name=model_name,
+            manifest=manifest,
+        )
+        logger.info(
+            "[FixedSplitCL] runtime template cache key={}.",
+            template_key.to_log_payload(),
+        )
+        return self._fixed_split_runtime_template_cache.get_or_create_lookup(
+            template_key,
+            lambda: self._build_fixed_split_runtime_template(
+                model,
+                manifest,
+                bundle_root=bundle_root,
+                template_key=template_key,
+                trace_sample_input=trace_sample_input,
+            ),
+        )
+
+    def _bind_bundle_splitter_from_template(
+        self,
+        model: torch.nn.Module,
+        template: FixedSplitRuntimeTemplate,
+    ) -> tuple[UniversalModelSplitter, object]:
+        bind_started = time.perf_counter()
+        split_model = get_split_runtime_model(model)
+        splitter, candidate = bind_request_splitter_from_template(
+            split_model,
+            template,
+            device=self.device,
+        )
+        bind_elapsed = time.perf_counter() - bind_started
+        logger.info(
+            "[FixedSplitCL] request-local runtime bind took {:.3f}s (recovery_mode={}, key={}).",
+            bind_elapsed,
+            template.candidate_recovery_mode,
+            template.cache_key.to_log_payload(),
         )
         return splitter, candidate
+
+    def _build_bundle_splitter(
+        self,
+        model: torch.nn.Module,
+        manifest: dict[str, object],
+        *,
+        bundle_root: str,
+        trace_sample_input: torch.Tensor | None = None,
+    ):
+        template_lookup = self._get_or_create_fixed_split_runtime_template(
+            model,
+            manifest,
+            bundle_root=bundle_root,
+            trace_sample_input=trace_sample_input,
+        )
+        if template_lookup.cache_status in {"hit", "wait"}:
+            logger.info(
+                "[FixedSplitCL] hot path skipped trace input build / graph build / candidate recovery (cache_status={}, key={}).",
+                template_lookup.cache_status,
+                template_lookup.template.cache_key.to_log_payload(),
+            )
+        return self._bind_bundle_splitter_from_template(model, template_lookup.template)
 
     @staticmethod
     def _working_cache_manifest_matches(
@@ -1506,7 +1808,7 @@ class CloudContinualLearner:
         bundle_cache_path: str,
         working_cache: str,
         force_rebuild: bool = False,
-    ) -> tuple[dict[str, object], str, torch.Tensor, UniversalModelSplitter | None, object | None]:
+    ) -> tuple[dict[str, object], str, torch.Tensor | None, UniversalModelSplitter | None, object | None]:
         cache_identity = _build_fixed_split_cache_identity(manifest)
         cached_manifest = _read_json_file(_working_cache_manifest_path(working_cache))
         can_attempt_reuse = (
@@ -1521,18 +1823,12 @@ class CloudContinualLearner:
             shutil.rmtree(working_cache, ignore_errors=True)
 
         stage_started = time.perf_counter()
-        trace_sample_input = self._build_bundle_batch_trace_sample_input(
-            model,
-            bundle_cache_path,
-            manifest,
-        )
-        self._log_stage_duration("trace input build", stage_started)
         prepared_splitter, prepared_candidate = self._build_bundle_splitter(
             model,
             manifest,
             bundle_root=bundle_cache_path,
-            trace_sample_input=trace_sample_input,
         )
+        self._log_stage_duration("runtime template load / bind", stage_started)
 
         def _prepare_cache() -> dict[str, object]:
             return prepare_split_training_cache(
@@ -1586,7 +1882,7 @@ class CloudContinualLearner:
         return (
             bundle_info,
             os.path.join(working_cache, "frames"),
-            trace_sample_input,
+            None,
             prepared_splitter,
             prepared_candidate,
         )
@@ -1614,31 +1910,43 @@ class CloudContinualLearner:
                 continue
             pending_samples.append((sample_id, frame))
 
-        batch_size = max(1, int(self.teacher_batch_size))
-        for start in range(0, len(pending_samples), batch_size):
-            batch = pending_samples[start : start + batch_size]
-            batch_frames = [frame for _, frame in batch]
-            predictions = self._teacher_inference_batch(batch_frames)
-            if not isinstance(predictions, (list, tuple)) or len(predictions) != len(batch):
-                predictions = [self._teacher_inference(frame) for _, frame in batch]
+        if not pending_samples:
+            self._finalize_teacher_ticket(
+                self._current_teacher_ticket(),
+                stage_label="teacher annotation batch",
+                reason="no samples were available for teacher annotation",
+            )
+            return annotations
 
-            for (sample_id, _), prediction in zip(batch, predictions):
-                pred_boxes = pred_class = pred_score = None
-                if isinstance(prediction, (list, tuple)):
-                    if len(prediction) >= 1:
-                        pred_boxes = prediction[0]
-                    if len(prediction) >= 2:
-                        pred_class = prediction[1]
-                    if len(prediction) >= 3:
-                        pred_score = prediction[2]
-                teacher_targets = self._build_teacher_targets_from_prediction(
-                    pred_boxes,
-                    pred_class,
-                    pred_score,
-                )
-                if teacher_targets is None:
-                    continue
-                annotations[transform(sample_id)] = teacher_targets
+        batch_size = max(1, int(self.teacher_batch_size))
+        with self._teacher_annotation_scope(
+            "teacher annotation batch",
+            sample_count=len(pending_samples),
+        ):
+            for start in range(0, len(pending_samples), batch_size):
+                batch = pending_samples[start : start + batch_size]
+                batch_frames = [frame for _, frame in batch]
+                predictions = self._teacher_inference_batch(batch_frames)
+                if not isinstance(predictions, (list, tuple)) or len(predictions) != len(batch):
+                    predictions = [self._teacher_inference(frame) for _, frame in batch]
+
+                for (sample_id, _), prediction in zip(batch, predictions):
+                    pred_boxes = pred_class = pred_score = None
+                    if isinstance(prediction, (list, tuple)):
+                        if len(prediction) >= 1:
+                            pred_boxes = prediction[0]
+                        if len(prediction) >= 2:
+                            pred_class = prediction[1]
+                        if len(prediction) >= 3:
+                            pred_score = prediction[2]
+                    teacher_targets = self._build_teacher_targets_from_prediction(
+                        pred_boxes,
+                        pred_class,
+                        pred_score,
+                    )
+                    if teacher_targets is None:
+                        continue
+                    annotations[transform(sample_id)] = teacher_targets
         return annotations
 
     @staticmethod
@@ -1860,7 +2168,7 @@ class CloudContinualLearner:
         gt_annotations: dict[str, dict],
         num_epoch: int,
         proxy_metrics_before: dict[str, float | int | None],
-        prepared_trace_sample_input: torch.Tensor,
+        prepared_trace_sample_input: object | None,
         prepared_splitter: UniversalModelSplitter | None,
         prepared_candidate,
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
@@ -1887,6 +2195,10 @@ class CloudContinualLearner:
             bs,
             len(bundle_info["all_sample_ids"])
         )
+        if prepared_trace_sample_input is None and prepared_splitter is not None:
+            logger.info(
+                "[FixedSplitCL] Split retrain will reuse the bound runtime template and skip retracing inside universal_split_retrain."
+            )
 
         split_retrain_kwargs = {
             "model": get_split_runtime_model(model),
@@ -2448,6 +2760,7 @@ class CloudContinualLearner:
         import cv2
 
         rows: list[tuple] = []
+        pending_frames: list[tuple[int, np.ndarray]] = []
         for idx in frame_indices:
             img_path = os.path.join(frame_dir, f"{idx}.jpg")
             if not os.path.exists(img_path):
@@ -2456,11 +2769,25 @@ class CloudContinualLearner:
             frame = cv2.imread(img_path)
             if frame is None:
                 continue
-            pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
-            if pred_boxes is None:
-                pred_boxes, pred_class, pred_score = [], [], []
-            for box, label, score in zip(pred_boxes, pred_class, pred_score):
-                rows.append((idx, label, box[0], box[1], box[2], box[3], score, ""))
+            pending_frames.append((idx, frame))
+
+        if not pending_frames:
+            self._finalize_teacher_ticket(
+                self._current_teacher_ticket(),
+                stage_label="legacy teacher annotation",
+                reason="no frames were available for teacher annotation",
+            )
+        else:
+            with self._teacher_annotation_scope(
+                "legacy teacher annotation",
+                sample_count=len(pending_frames),
+            ):
+                for idx, frame in pending_frames:
+                    pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
+                    if pred_boxes is None:
+                        pred_boxes, pred_class, pred_score = [], [], []
+                    for box, label, score in zip(pred_boxes, pred_class, pred_score):
+                        rows.append((idx, label, box[0], box[1], box[2], box[3], score, ""))
 
         with open(annotation_path, "w", encoding="utf-8") as handle:
             for row in rows:

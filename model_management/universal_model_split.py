@@ -338,6 +338,63 @@ def _infer_cached_split_choice(
     return None, None, None
 
 
+def build_candidate_descriptor(candidate: SplitCandidate) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "edge_nodes": list(candidate.edge_nodes),
+        "boundary_tensor_labels": list(candidate.boundary_tensor_labels),
+        "split_index": candidate.legacy_layer_index,
+    }
+
+
+def reconstruct_candidate_from_descriptor(
+    graph: GraphIR,
+    descriptor: Mapping[str, Any] | None,
+    *,
+    source: str = "candidate_descriptor",
+) -> SplitCandidate | None:
+    if not descriptor:
+        return None
+
+    edge_nodes = list(descriptor.get("edge_nodes", []))
+    candidate_id = descriptor.get("candidate_id")
+    split_index = descriptor.get("split_index")
+    metadata = {"source": source}
+
+    if edge_nodes:
+        if candidate_id is None:
+            raw = "|".join(edge_nodes).encode("utf-8")
+            candidate_id = f"candidate_{hashlib.sha1(raw).hexdigest()[:12]}"
+        return build_candidate_from_edge_seed(
+            graph,
+            candidate_id=str(candidate_id),
+            edge_seed_nodes=edge_nodes,
+            legacy_layer_index=split_index,
+            metadata=metadata,
+        )
+
+    boundary_tensor_labels = list(descriptor.get("boundary_tensor_labels", []))
+    if not boundary_tensor_labels:
+        return None
+
+    if candidate_id is None:
+        raw = ",".join(boundary_tensor_labels).encode("utf-8")
+        candidate_id = f"boundary_{hashlib.sha1(raw).hexdigest()[:12]}"
+
+    candidate = build_candidate_from_edge_seed(
+        graph,
+        candidate_id=str(candidate_id),
+        edge_seed_nodes=boundary_tensor_labels,
+        legacy_layer_index=split_index,
+        metadata=metadata,
+    )
+    if candidate is None:
+        return None
+    if set(candidate.boundary_tensor_labels) != set(boundary_tensor_labels):
+        return None
+    return candidate
+
+
 class UniversalModelSplitter(GraphSplitRuntime):
     def __init__(self, *, device: str | torch.device = "cpu") -> None:
         super().__init__(device=device)
@@ -539,19 +596,70 @@ class UniversalModelSplitter(GraphSplitRuntime):
     def _candidate_from_boundary_labels(self, boundary_tensor_labels: Sequence[str]) -> SplitCandidate:
         _, graph = self._ensure_ready()
         boundary_list = list(boundary_tensor_labels)
-        raw = ",".join(boundary_list).encode("utf-8")
-        candidate = build_candidate_from_edge_seed(
+        candidate = reconstruct_candidate_from_descriptor(
             graph,
-            candidate_id=f"boundary_{hashlib.sha1(raw).hexdigest()[:12]}",
-            edge_seed_nodes=boundary_list,
-            metadata={"source": "boundary_tensor_labels"},
+            {"boundary_tensor_labels": boundary_list},
+            source="boundary_tensor_labels",
         )
         if candidate is None:
             raise KeyError(f"No candidate matches boundary tensor labels {boundary_list!r}.")
-        if set(candidate.boundary_tensor_labels) != set(boundary_list):
-            raise KeyError(f"No candidate matches boundary tensor labels {boundary_list!r}.")
         if all(item.candidate_id != candidate.candidate_id for item in self.candidates):
             self.candidates.append(candidate)
+        return candidate
+
+    def _candidate_from_layer_label(self, layer_label: str) -> SplitCandidate:
+        _, graph = self._ensure_ready()
+        direct_boundary = reconstruct_candidate_from_descriptor(
+            graph,
+            {"boundary_tensor_labels": [layer_label]},
+            source="layer_label",
+        )
+        if (
+            direct_boundary is not None
+            and layer_label in direct_boundary.boundary_tensor_labels
+        ):
+            if all(item.candidate_id != direct_boundary.candidate_id for item in self.candidates):
+                self.candidates.append(direct_boundary)
+            return direct_boundary
+
+        direct_seed = reconstruct_candidate_from_descriptor(
+            graph,
+            {"edge_nodes": [layer_label]},
+            source="layer_label",
+        )
+        if (
+            direct_seed is not None
+            and (
+                layer_label in direct_seed.boundary_tensor_labels
+                or layer_label in direct_seed.edge_nodes
+            )
+        ):
+            if all(item.candidate_id != direct_seed.candidate_id for item in self.candidates):
+                self.candidates.append(direct_seed)
+            return direct_seed
+
+        raise KeyError(f"No candidate references layer label {layer_label!r}.")
+
+    def bind_candidate_descriptor(
+        self,
+        descriptor: Mapping[str, Any],
+        *,
+        include_in_candidates: bool = True,
+    ) -> SplitCandidate:
+        _, graph = self._ensure_ready()
+        candidate = reconstruct_candidate_from_descriptor(
+            graph,
+            descriptor,
+            source="request_local_bind",
+        )
+        if candidate is None:
+            raise KeyError("Could not reconstruct split candidate from descriptor.")
+        if include_in_candidates and all(
+            item.candidate_id != candidate.candidate_id for item in self.candidates
+        ):
+            self.candidates.append(candidate)
+        self.current_candidate = candidate
+        self.selected_candidate_id = candidate.candidate_id
         return candidate
 
     def split(
@@ -586,9 +694,7 @@ class UniversalModelSplitter(GraphSplitRuntime):
                 for item in self.candidates
                 if layer_label in item.boundary_tensor_labels or layer_label in item.edge_nodes
             ]
-            if not matches:
-                raise KeyError(f"No candidate references layer label {layer_label!r}.")
-            self.current_candidate = matches[0]
+            self.current_candidate = matches[0] if matches else self._candidate_from_layer_label(layer_label)
         elif layer_index is not None:
             self.current_candidate = self._candidate_from_layer_index(layer_index)
         elif self.current_candidate is None and self.candidates:
@@ -812,7 +918,7 @@ def load_split_feature_cache(cache_path: str, frame_index: int) -> dict[str, Any
 def universal_split_retrain(
     *,
     model: torch.nn.Module,
-    sample_input: Any,
+    sample_input: Any | None,
     cache_path: str,
     all_indices: Sequence[int],
     gt_annotations: Mapping[int, Any],
@@ -834,6 +940,10 @@ def universal_split_retrain(
 ) -> list[float]:
     splitter = splitter or UniversalModelSplitter(device=device)
     if splitter.graph is None or splitter.model is None:
+        if sample_input is None:
+            raise ValueError(
+                "sample_input is required when universal_split_retrain must trace a splitter."
+            )
         splitter.trace(
             model,
             _move_nested(sample_input, splitter.device),

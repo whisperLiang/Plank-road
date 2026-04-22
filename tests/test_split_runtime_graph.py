@@ -25,6 +25,7 @@ from model_management.payload import SplitPayload
 from model_management.split_runtime import GraphSplitRuntime, compare_outputs
 from model_management.universal_model_split import (
     UniversalModelSplitter,
+    build_candidate_descriptor,
     extract_split_features,
     load_split_feature_cache,
     save_split_feature_cache,
@@ -289,6 +290,41 @@ def test_trace_wrapper_enumerates_candidates_only_when_requested():
     assert runtime.candidates
     assert runtime.current_candidate is not None
     assert runtime.trace_timings["candidate_enumeration"] >= 0.0
+
+
+def test_bind_candidate_descriptor_reconstructs_request_local_candidate():
+    model, sample = _make_sequential_model()
+    template = UniversalModelSplitter(device="cpu")
+    template.trace_graph(model, sample)
+    template_candidate = template.enumerate_candidates(max_candidates=4)[0]
+    descriptor = build_candidate_descriptor(template_candidate)
+
+    runtime_a = UniversalModelSplitter(device="cpu")
+    runtime_a.bind_graph(model, template.graph, trace_timings=template.trace_timings)
+    chosen_a = runtime_a.bind_candidate_descriptor(descriptor)
+
+    runtime_b = UniversalModelSplitter(device="cpu")
+    runtime_b.bind_graph(model, template.graph, trace_timings=template.trace_timings)
+    chosen_b = runtime_b.bind_candidate_descriptor(descriptor)
+
+    assert chosen_a.candidate_id == template_candidate.candidate_id
+    assert chosen_a.edge_nodes == template_candidate.edge_nodes
+    assert chosen_a is not chosen_b
+    assert runtime_a.current_candidate is chosen_a
+    assert runtime_b.current_candidate is chosen_b
+
+
+def test_split_layer_label_recovers_candidate_without_pre_enumeration():
+    model, sample = _make_sequential_model()
+    runtime = UniversalModelSplitter(device="cpu")
+    runtime.trace_graph(model, sample)
+
+    layer_label = runtime.graph.relevant_labels[1]
+    chosen = runtime.split(layer_label=layer_label)
+
+    assert layer_label in chosen.boundary_tensor_labels or layer_label in chosen.edge_nodes
+    assert runtime.current_candidate is chosen
+    assert runtime.candidates
 
 
 def test_fixed_split_graph_artifact_round_trip_restores_runtime_callables(tmp_path):
@@ -569,6 +605,71 @@ def test_payload_cache_and_universal_split_retrain(tmp_path):
     )
     assert len(losses) == 1
     assert torch.isfinite(torch.tensor(losses[0]))
+
+
+def test_universal_split_retrain_skips_trace_when_bound_splitter_is_supplied(tmp_path):
+    candidate = SimpleNamespace(
+        candidate_id="selected-candidate",
+        legacy_layer_index=3,
+        boundary_tensor_labels=["selected-boundary"],
+        cloud_nodes=[],
+    )
+
+    class _BoundSplitter(_StaticSplitter):
+        def __init__(self, chosen_candidate) -> None:
+            super().__init__(chosen_candidate)
+            self.trace_calls = 0
+
+        def trace(self, model, sample_input):
+            self.trace_calls += 1
+            super().trace(model, sample_input)
+
+        def cloud_train_step(self, payload, targets=None, **kwargs):
+            assert isinstance(payload, SplitPayload)
+            return None, torch.tensor(1.0)
+
+        def _invalidate_validation_cache(self) -> None:
+            return None
+
+    splitter = _BoundSplitter(candidate)
+    feature_dir = tmp_path / "features"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    cached_payload = SplitPayload(
+        tensors={"selected-boundary": torch.ones(1, 2)},
+        candidate_id="selected-candidate",
+        boundary_tensor_labels=["selected-boundary"],
+        primary_label="selected-boundary",
+        split_index=3,
+        split_label="selected-boundary",
+    )
+    torch.save(
+        {
+            "intermediate": cached_payload,
+            "candidate_id": cached_payload.candidate_id,
+            "boundary_tensor_labels": list(cached_payload.boundary_tensor_labels),
+            "split_index": cached_payload.split_index,
+            "split_label": cached_payload.split_label,
+            "pseudo_boxes": [],
+            "pseudo_labels": [],
+            "pseudo_scores": [],
+        },
+        feature_dir / "0.pt",
+    )
+
+    losses = universal_split_retrain(
+        model=nn.Identity(),
+        sample_input=None,
+        cache_path=str(tmp_path),
+        all_indices=[0],
+        gt_annotations={},
+        splitter=splitter,
+        chosen_candidate=candidate,
+        batch_size=1,
+        loss_fn=lambda output, _: torch.tensor(1.0),
+    )
+
+    assert losses == [pytest.approx(1.0)]
+    assert splitter.trace_calls == 0
 
 
 @pytest.mark.parametrize("das_strategy", ["tgi", "entropy"])
