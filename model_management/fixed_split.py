@@ -848,9 +848,30 @@ def _select_replay_valid_exact_candidate(
     validation_error_counts: dict[str, int] = defaultdict(int)
     attempted_candidates: list[SplitCandidate] = []
     validation_fallback_count = 0
+    objective_upper_bound_relaxed = False
     result = first_result
 
-    while result.candidate is not None:
+    while True:
+        if result.candidate is None:
+            if (
+                not objective_upper_bound_relaxed
+                and bool(session.diagnostics.get("objective_upper_bound_applied"))
+                and attempted_candidates
+            ):
+                # Safe: dropping the warm-start upper bound only widens the exact
+                # search after we have already excluded every replay-invalid
+                # candidate seen under that bound. We keep the same exact solver
+                # session and no-good cuts, so correctness is preserved while
+                # allowing fallback to the next exact objective face.
+                logger.info(
+                    "Fixed split validation exhausted the warm-start objective bound; continuing exact search without the bound"
+                )
+                if session.relax_objective_upper_bound():
+                    objective_upper_bound_relaxed = True
+                    result = solve_next_candidate_exact(session)
+                    continue
+            break
+
         candidate = result.candidate
         attempted_candidates.append(candidate)
         validation_started = time.perf_counter()
@@ -879,6 +900,7 @@ def _select_replay_valid_exact_candidate(
                     "validation_time_sec": float(validation_elapsed),
                     "validation_fallback_count": int(validation_fallback_count),
                     "validation_used_next_exact_candidate": validation_fallback_count > 0,
+                    "validation_relaxed_objective_upper_bound": objective_upper_bound_relaxed,
                 }
             )
             return (

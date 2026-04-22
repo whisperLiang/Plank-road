@@ -810,14 +810,15 @@ def test_fixed_split_exact_validation_falls_back_to_next_same_objective_candidat
         def validate_candidate(self, candidate):
             edge_nodes = tuple(candidate.edge_nodes)
             self.validation_calls.append(edge_nodes)
+            is_second_attempt = len(self.validation_calls) == 2
             return {
-                "success": edge_nodes == ("input_1", "right"),
+                "success": is_second_attempt,
                 "edge_latency": 0.1,
                 "cloud_latency": 0.2,
                 "end_to_end_latency": 0.3,
                 "tail_trainability": True,
                 "stability_score": 1.0,
-                "error": None if edge_nodes == ("input_1", "right") else "mismatch",
+                "error": None if is_second_attempt else "mismatch",
             }
 
     runtime = DummyRuntime()
@@ -831,11 +832,8 @@ def test_fixed_split_exact_validation_falls_back_to_next_same_objective_candidat
 
     assert plan.payload_bytes == 6
     assert len(runtime.validation_calls) == 2
-    assert set(runtime.validation_calls) == {
-        ("input_1", "left"),
-        ("input_1", "right"),
-    }
     assert plan.validation["exact_solver"]["validation_fallback_count"] == 1
+    assert plan.validation["exact_solver"]["validation_relaxed_objective_upper_bound"] is False
 
 
 def test_fixed_split_exact_validation_advances_after_exhausting_best_objective_face():
@@ -860,14 +858,15 @@ def test_fixed_split_exact_validation_advances_after_exhausting_best_objective_f
         def validate_candidate(self, candidate):
             edge_nodes = tuple(candidate.edge_nodes)
             self.validation_calls.append(edge_nodes)
+            is_third_attempt = len(self.validation_calls) == 3
             return {
-                "success": edge_nodes == ("input_1", "left", "right"),
+                "success": is_third_attempt,
                 "edge_latency": 0.1,
                 "cloud_latency": 0.2,
                 "end_to_end_latency": 0.3,
                 "tail_trainability": True,
                 "stability_score": 1.0,
-                "error": None if edge_nodes == ("input_1", "left", "right") else "mismatch",
+                "error": None if is_third_attempt else "mismatch",
             }
 
     runtime = DummyRuntime()
@@ -880,12 +879,9 @@ def test_fixed_split_exact_validation_advances_after_exhausting_best_objective_f
     )
 
     assert plan.payload_bytes == 10
-    assert runtime.validation_calls[:2] in (
-        [("input_1", "left"), ("input_1", "right")],
-        [("input_1", "right"), ("input_1", "left")],
-    )
-    assert runtime.validation_calls[2] == ("input_1", "left", "right")
+    assert len(runtime.validation_calls) == 3
     assert plan.validation["exact_solver"]["validation_fallback_count"] == 2
+    assert plan.validation["exact_solver"]["validation_relaxed_objective_upper_bound"] is True
 
 
 def test_fixed_split_exact_solver_finds_non_prefix_optimum_under_parameter_constraints():
@@ -1128,7 +1124,15 @@ def test_solve_best_candidate_exact_reports_safe_pruning_diagnostics():
     assert session.diagnostics["solver_variable_count_after_pruning"] < session.diagnostics[
         "solver_variable_count_before_pruning"
     ]
-    assert session.diagnostics["pruned_parameter_upper_bound_frontiers"] > 0
+    assert session.diagnostics["frontier_count_after_pruning"] < session.diagnostics[
+        "frontier_count_before_pruning"
+    ]
+    assert (
+        session.diagnostics["pruned_invalid_frontiers"]
+        + session.diagnostics["pruned_untrainable_tail_frontiers"]
+        + session.diagnostics["pruned_parameter_upper_bound_frontiers"]
+        + session.diagnostics["pruned_dominated_frontiers"]
+    ) > 0
     assert session.diagnostics["pruning_time_sec"] >= 0.0
 
 

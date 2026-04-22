@@ -951,6 +951,8 @@ class ExactCandidateSolveSession:
             previous_exact_candidate
         )
         self.warm_objective_upper_bound: int | None = None
+        self.warm_objective_bound_literal = None
+        self.objective_upper_bound_active = False
         if self.warm_candidate is not None:
             _apply_exact_warm_start_hints(
                 self.model,
@@ -966,7 +968,14 @@ class ExactCandidateSolveSession:
                     int(self.warm_candidate.estimated_payload_bytes) * self.objective_scale
                     + int(self.warm_candidate.boundary_count)
                 )
-                self.model.Add(self.objective_expr <= self.warm_objective_upper_bound)
+                self.warm_objective_bound_literal = self.model.NewBoolVar(
+                    "use_warm_objective_upper_bound"
+                )
+                self.model.Add(
+                    self.objective_expr <= self.warm_objective_upper_bound
+                ).OnlyEnforceIf(self.warm_objective_bound_literal)
+                self.model.AddAssumption(self.warm_objective_bound_literal)
+                self.objective_upper_bound_active = True
 
         self.diagnostics["warm_start_source"] = self.warm_start_source
         self.diagnostics["warm_candidate_objective"] = (
@@ -980,6 +989,7 @@ class ExactCandidateSolveSession:
         self.diagnostics["objective_upper_bound_applied"] = (
             self.warm_objective_upper_bound is not None
         )
+        self.diagnostics["objective_upper_bound_active"] = self.objective_upper_bound_active
         logger.info(
             "Exact split solver prepared: vars {} -> {}, frontiers {} -> {}, warm_start={}, objective_upper_bound={}",
             self.diagnostics.get("solver_variable_count_before_pruning", 0),
@@ -1077,8 +1087,21 @@ class ExactCandidateSolveSession:
     ) -> None:
         if self.model is None:
             return
-        _add_solution_exclusion(self.model, assignment, self.edge_vars)
+        assignment_dict = {label: bool(assignment[label]) for label in self.solver_labels}
+        _add_solution_exclusion(self.model, assignment_dict, self.edge_vars)
         self.diagnostics["last_exclusion_reason"] = reason
+
+    def relax_objective_upper_bound(self) -> bool:
+        if self.model is None or not self.objective_upper_bound_active:
+            return False
+        # Safe: this only removes an auxiliary warm-start cutoff. All exact
+        # constraints and previously added no-good cuts stay in the same model,
+        # so continued search still returns the next exact solution.
+        self.model.ClearAssumptions()
+        self.objective_upper_bound_active = False
+        self.exhausted = False
+        self.diagnostics["objective_upper_bound_active"] = False
+        return True
 
     def solve_next_candidate(self) -> ExactSolveResult:
         if self.pending_assignment is not None:

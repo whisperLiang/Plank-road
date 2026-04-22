@@ -834,7 +834,11 @@ def universal_split_retrain(
 ) -> list[float]:
     splitter = splitter or UniversalModelSplitter(device=device)
     if splitter.graph is None or splitter.model is None:
-        splitter.trace(model, _move_nested(sample_input, splitter.device))
+        splitter.trace(
+            model,
+            _move_nested(sample_input, splitter.device),
+            enumerate_candidates=True,
+        )
 
     unique_indices = list(OrderedDict.fromkeys(all_indices))
     preloaded_records: OrderedDict[int, dict[str, Any]] = OrderedDict()

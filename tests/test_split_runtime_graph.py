@@ -275,7 +275,7 @@ def test_trace_wrapper_enumerates_candidates_only_when_requested():
     model, sample = _make_sequential_model()
     runtime = UniversalModelSplitter(device="cpu")
 
-    runtime.trace(model, sample)
+    runtime.trace(model, sample, enumerate_candidates=False)
     assert runtime.candidates == []
 
     runtime.trace(model, sample, enumerate_candidates=True, max_candidates=4)
