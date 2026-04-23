@@ -3015,11 +3015,85 @@ def test_tinynext_fixed_split_retrain_uses_subset_proxy_selection_before_final_f
 
     assert success is True
     assert retrain_num_epochs == [5] * 10
-    assert selection_max_samples == [24] * 11
-    assert selection_batch_sizes == [10] * 11
-    assert calibration_max_samples == [None, None]
+    assert selection_max_samples == [None] + ([24] * 11) + [None]
+    assert selection_batch_sizes == [10] * 13
+    assert calibration_max_samples == [24, 24]
     assert calibration_batch_sizes == [10] * 2
     assert "proxy_mAP@0.5 0.1400 -> 1.1400" in message
+
+
+def test_fixed_split_proxy_eval_reuses_cached_split_features(
+    tmp_path,
+    monkeypatch,
+):
+    config = SimpleNamespace(
+        edge_model_name="tinynext_s",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    class FakeSplitter:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def cloud_forward(self, payload, *args, candidate=None, **kwargs):
+            if isinstance(payload, SplitPayload):
+                batch_size = int(payload.primary_tensor().shape[0])
+            else:
+                batch_size = int(payload.shape[0])
+            self.batch_sizes.append(batch_size)
+            return [
+                {
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]], dtype=torch.float32),
+                    "scores": torch.tensor([0.95], dtype=torch.float32),
+                }
+                for _ in range(batch_size)
+            ]
+
+    load_calls: list[tuple[str, str]] = []
+
+    def fake_load_split_feature_cache(cache_path, frame_index):
+        load_calls.append((str(cache_path), str(frame_index)))
+        return {
+            "intermediate": SplitPayload.from_mapping(
+                {"layer3": torch.ones((1, 1, 2, 2), dtype=torch.float32)}
+            )
+        }
+
+    monkeypatch.setattr("cloud_server.load_split_feature_cache", fake_load_split_feature_cache)
+
+    fake_splitter = FakeSplitter()
+
+    metrics = learner._evaluate_fixed_split_proxy_map(
+        torch.nn.Identity(),
+        frame_dir=str(tmp_path),
+        gt_annotations={
+            "sample-0": {"boxes": [[0.0, 0.0, 10.0, 10.0]], "labels": [1]},
+            "sample-1": {"boxes": [[0.0, 0.0, 10.0, 10.0]], "labels": [1]},
+        },
+        model_name="tinynext_s",
+        split_cache_path=str(tmp_path),
+        splitter=fake_splitter,
+        split_candidate=SimpleNamespace(
+            candidate_id="candidate-1",
+            boundary_tensor_labels=["layer3"],
+        ),
+        inference_batch_size=2,
+    )
+
+    assert load_calls == [
+        (str(tmp_path), "sample-0"),
+        (str(tmp_path), "sample-1"),
+    ]
+    assert fake_splitter.batch_sizes == [2]
+    assert metrics["evaluated_samples"] == 2
+    assert metrics["map"] == pytest.approx(1.0)
+    assert metrics["skipped_missing_frame"] == 0
 
 
 def test_fixed_split_retrain_accepts_num_epoch_override(

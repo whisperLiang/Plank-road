@@ -53,6 +53,7 @@ from model_management.split_model_adapters import (
 )
 from model_management.universal_model_split import (
     UniversalModelSplitter,
+    _batch_payloads,
     universal_split_retrain,
     load_split_feature_cache,
 )
@@ -470,6 +471,9 @@ def _build_detection_proxy_prediction_cache(
     frame_cache: dict[str, np.ndarray | None] | None = None,
     max_samples: int | None = None,
     inference_batch_size: int = 1,
+    split_cache_path: str | None = None,
+    splitter: UniversalModelSplitter | None = None,
+    split_candidate=None,
 ) -> dict[str, object]:
     sample_ids = _normalize_proxy_sample_ids(
         gt_annotations,
@@ -477,6 +481,79 @@ def _build_detection_proxy_prediction_cache(
     )
     skipped_empty_gt = 0
     skipped_missing_frame = 0
+
+    if (
+        split_cache_path is not None
+        and splitter is not None
+        and split_candidate is not None
+    ):
+        pending_samples: list[
+            tuple[list[object], list[object], SplitPayload | torch.Tensor]
+        ] = []
+        for sample_id in sample_ids:
+            target = gt_annotations.get(sample_id) or {}
+            gt_boxes = list(target.get("boxes") or [])
+            gt_labels = list(target.get("labels") or [])
+            if not gt_boxes or not gt_labels:
+                skipped_empty_gt += 1
+                continue
+
+            try:
+                record = load_split_feature_cache(split_cache_path, sample_id)
+            except FileNotFoundError:
+                skipped_missing_frame += 1
+                continue
+            payload = record.get("intermediate")
+            if not isinstance(payload, (SplitPayload, torch.Tensor)):
+                skipped_missing_frame += 1
+                continue
+            pending_samples.append((gt_boxes, gt_labels, payload))
+
+        prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
+        candidate_id = getattr(split_candidate, "candidate_id", None)
+        boundary_tensor_labels = getattr(
+            split_candidate,
+            "boundary_tensor_labels",
+            None,
+        )
+        _set_detection_model_eval_mode(model)
+        with torch.no_grad():
+            batch_size = max(1, int(inference_batch_size))
+            for start in range(0, len(pending_samples), batch_size):
+                batch = pending_samples[start : start + batch_size]
+                batch_payloads = [payload for _, _, payload in batch]
+                batched_payload = (
+                    batch_payloads[0]
+                    if len(batch_payloads) == 1
+                    else _batch_payloads(
+                        batch_payloads,
+                        boundary_tensor_labels=boundary_tensor_labels,
+                        candidate_id=candidate_id,
+                    )
+                )
+                low_threshold_predictions = _batched_predictions_from_model_output(
+                    splitter.cloud_forward(
+                        batched_payload,
+                        candidate=split_candidate,
+                    ),
+                    batch_size=len(batch),
+                    threshold_low=threshold_low,
+                    threshold_high=threshold_low,
+                )
+                for (gt_boxes, gt_labels, _), prediction in zip(
+                    batch,
+                    low_threshold_predictions,
+                ):
+                    prediction_rows.append((gt_boxes, gt_labels, prediction))
+
+        return {
+            "prediction_rows": prediction_rows,
+            "skipped_empty_gt": skipped_empty_gt,
+            "skipped_missing_frame": skipped_missing_frame,
+            "total_gt_samples": len(sample_ids),
+            "threshold_low": float(threshold_low),
+        }
+
     pending_samples: list[tuple[list[object], list[object], np.ndarray]] = []
 
     for sample_id in sample_ids:
@@ -581,6 +658,9 @@ def _evaluate_detection_proxy_map(
     max_samples: int | None = None,
     inference_batch_size: int = 1,
     prediction_cache: Mapping[str, object] | None = None,
+    split_cache_path: str | None = None,
+    splitter: UniversalModelSplitter | None = None,
+    split_candidate=None,
 ) -> dict[str, float | int | None]:
     if threshold_low is None or threshold_high is None:
         threshold_low, threshold_high = get_model_detection_thresholds(
@@ -599,6 +679,9 @@ def _evaluate_detection_proxy_map(
             frame_cache=frame_cache,
             max_samples=max_samples,
             inference_batch_size=inference_batch_size,
+            split_cache_path=split_cache_path,
+            splitter=splitter,
+            split_candidate=split_candidate,
         )
 
     return _evaluate_detection_proxy_map_from_cache(
@@ -690,6 +773,9 @@ def _calibrate_tinynext_proxy_thresholds(
     max_samples: int | None = None,
     candidate_thresholds: list[float] | None = None,
     inference_batch_size: int = 1,
+    split_cache_path: str | None = None,
+    splitter: UniversalModelSplitter | None = None,
+    split_candidate=None,
 ) -> tuple[dict[str, float | int | None], float, float]:
     current_low, current_high = get_model_detection_thresholds(model, model_name)
     _, default_high = get_detection_thresholds(model_name)
@@ -709,6 +795,9 @@ def _calibrate_tinynext_proxy_thresholds(
         frame_cache=frame_cache,
         max_samples=max_samples,
         inference_batch_size=inference_batch_size,
+        split_cache_path=split_cache_path,
+        splitter=splitter,
+        split_candidate=split_candidate,
     )
     metrics_by_threshold: dict[float, dict[str, float | int | None]] = {}
 
@@ -2356,6 +2445,9 @@ class CloudContinualLearner:
         frame_cache: dict[str, np.ndarray | None] | None = None,
         max_samples: int | None = None,
         inference_batch_size: int | None = None,
+        split_cache_path: str | None = None,
+        splitter: UniversalModelSplitter | None = None,
+        split_candidate=None,
     ) -> dict[str, float | int | None]:
         return _evaluate_detection_proxy_map(
             model,
@@ -2371,7 +2463,111 @@ class CloudContinualLearner:
                 if inference_batch_size is None
                 else inference_batch_size
             ),
+            split_cache_path=split_cache_path,
+            splitter=splitter,
+            split_candidate=split_candidate,
         )
+
+    def _evaluate_tinynext_proxy_map(
+        self,
+        model: torch.nn.Module,
+        *,
+        frame_dir: str,
+        gt_annotations: Mapping[str, Mapping[str, object]],
+        model_name: str,
+        sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
+        frame_cache: dict[str, np.ndarray | None] | None = None,
+        max_samples: int | None = None,
+        candidate_thresholds: list[float] | None = None,
+        inference_batch_size: int | None = None,
+        stage_label: str,
+        split_cache_path: str | None = None,
+        splitter: UniversalModelSplitter | None = None,
+        split_candidate=None,
+    ) -> dict[str, float | int | None]:
+        full_proxy_sample_count = len(
+            _normalize_proxy_sample_ids(
+                gt_annotations,
+                max_samples=max_samples,
+            )
+        )
+        calibration_max_samples = self._resolve_tinynext_proxy_selection_max_samples(
+            available_samples=len(gt_annotations),
+            full_eval_max_samples=max_samples,
+        )
+        use_subset_calibration = (
+            calibration_max_samples is not None
+            and calibration_max_samples < full_proxy_sample_count
+        )
+        if use_subset_calibration:
+            _, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                device=self.device,
+                model_name=model_name,
+                frame_cache=frame_cache,
+                max_samples=calibration_max_samples,
+                candidate_thresholds=candidate_thresholds,
+                inference_batch_size=(
+                    self.batch_size
+                    if inference_batch_size is None
+                    else inference_batch_size
+                ),
+                split_cache_path=split_cache_path,
+                splitter=splitter,
+                split_candidate=split_candidate,
+            )
+            if abs(calibrated_high - initial_high) > 1e-6:
+                logger.info(
+                    "[FixedSplitCL] Calibrated {} threshold_high {} -> {} on {}-sample proxy subset during {}.",
+                    model_name,
+                    initial_high,
+                    calibrated_high,
+                    calibration_max_samples,
+                    stage_label,
+                )
+            return self._evaluate_fixed_split_proxy_map(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                model_name=model_name,
+                sample_metadata_by_id=sample_metadata_by_id,
+                frame_cache=frame_cache,
+                max_samples=max_samples,
+                inference_batch_size=inference_batch_size,
+                split_cache_path=split_cache_path,
+                splitter=splitter,
+                split_candidate=split_candidate,
+            )
+
+        metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+            model,
+            frame_dir=frame_dir,
+            gt_annotations=gt_annotations,
+            device=self.device,
+            model_name=model_name,
+            frame_cache=frame_cache,
+            max_samples=max_samples,
+            candidate_thresholds=candidate_thresholds,
+            inference_batch_size=(
+                self.batch_size
+                if inference_batch_size is None
+                else inference_batch_size
+            ),
+            split_cache_path=split_cache_path,
+            splitter=splitter,
+            split_candidate=split_candidate,
+        )
+        if abs(calibrated_high - initial_high) > 1e-6:
+            logger.info(
+                "[FixedSplitCL] Calibrated {} threshold_high {} -> {} during {}.",
+                model_name,
+                initial_high,
+                calibrated_high,
+                stage_label,
+            )
+        return dict(metrics)
 
     @staticmethod
     def _build_training_frames(
@@ -2652,30 +2848,28 @@ class CloudContinualLearner:
                         frame_cache=proxy_eval_frame_cache,
                         max_samples=tinynext_proxy_selection_max_samples,
                         inference_batch_size=bs,
+                        split_cache_path=working_cache,
+                        splitter=prepared_splitter,
+                        split_candidate=prepared_candidate,
                     )
                 max_samples = self.proxy_eval_max_samples
                 if selection_eval:
                     max_samples = tinynext_proxy_selection_max_samples
-                metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                return self._evaluate_tinynext_proxy_map(
                     model,
                     frame_dir=frame_dir,
                     gt_annotations=gt_annotations,
-                    device=self.device,
                     model_name=current_model_name,
+                    sample_metadata_by_id=sample_metadata_by_id,
                     frame_cache=proxy_eval_frame_cache,
                     max_samples=max_samples,
                     candidate_thresholds=self.proxy_eval_threshold_candidates,
                     inference_batch_size=bs,
+                    stage_label="proxy selection" if selection_eval else "proxy evaluation",
+                    split_cache_path=working_cache,
+                    splitter=prepared_splitter,
+                    split_candidate=prepared_candidate,
                 )
-                if abs(calibrated_high - initial_high) > 1e-6:
-                    logger.info(
-                        "[FixedSplitCL] Calibrated {} threshold_high {} -> {} during {}.",
-                        current_model_name,
-                        initial_high,
-                        calibrated_high,
-                        "proxy selection" if selection_eval else "proxy evaluation",
-                    )
-                return dict(metrics)
             state_key = _model_state_fingerprint(model)
             cached_metrics = proxy_metrics_cache.get(state_key)
             if cached_metrics is not None:
@@ -2689,6 +2883,9 @@ class CloudContinualLearner:
                 frame_cache=proxy_eval_frame_cache,
                 max_samples=self.proxy_eval_max_samples,
                 inference_batch_size=bs,
+                split_cache_path=working_cache,
+                splitter=prepared_splitter,
+                split_candidate=prepared_candidate,
             )
             proxy_metrics_cache[state_key] = dict(metrics)
             return dict(metrics)
@@ -2782,24 +2979,21 @@ class CloudContinualLearner:
             proxy_metrics_after = dict(proxy_metrics_before)
         if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
             if current_proxy_state_key != baseline_proxy_state_key:
-                proxy_metrics_after, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                proxy_metrics_after = self._evaluate_tinynext_proxy_map(
                     model,
                     frame_dir=frame_dir,
                     gt_annotations=gt_annotations,
-                    device=self.device,
                     model_name=current_model_name,
+                    sample_metadata_by_id=sample_metadata_by_id,
                     frame_cache=proxy_eval_frame_cache,
                     max_samples=self.proxy_eval_max_samples,
                     candidate_thresholds=self.proxy_eval_threshold_candidates,
                     inference_batch_size=bs,
+                    stage_label="proxy evaluation after retrain",
+                    split_cache_path=working_cache,
+                    splitter=prepared_splitter,
+                    split_candidate=prepared_candidate,
                 )
-                if abs(calibrated_high - initial_high) > 1e-6:
-                    logger.info(
-                        "[FixedSplitCL] Calibrated {} threshold_high {} -> {} after split retrain.",
-                        current_model_name,
-                        initial_high,
-                        calibrated_high,
-                    )
         else:
             if current_proxy_state_key != baseline_proxy_state_key:
                 proxy_metrics_after = _evaluate_proxy_metrics_for_current_state()
@@ -3034,24 +3228,21 @@ class CloudContinualLearner:
 
                 stage_started = time.perf_counter()
                 if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
-                    proxy_metrics_before, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                    proxy_metrics_before = self._evaluate_tinynext_proxy_map(
                         tmp_model,
                         frame_dir=frame_dir,
                         gt_annotations=gt_annotations,
-                        device=self.device,
                         model_name=current_model_name,
+                        sample_metadata_by_id=sample_metadata_by_id,
                         frame_cache=proxy_eval_frame_cache,
                         max_samples=self.proxy_eval_max_samples,
                         candidate_thresholds=self.proxy_eval_threshold_candidates,
                         inference_batch_size=effective_batch_size,
+                        stage_label="proxy evaluation before retrain",
+                        split_cache_path=working_cache,
+                        splitter=prepared_splitter,
+                        split_candidate=prepared_candidate,
                     )
-                    if abs(calibrated_high - initial_high) > 1e-6:
-                        logger.info(
-                            "[FixedSplitCL] Calibrated {} threshold_high {} -> {} before split retrain.",
-                            current_model_name,
-                            initial_high,
-                            calibrated_high,
-                        )
                 else:
                     proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
                         tmp_model,
@@ -3062,6 +3253,9 @@ class CloudContinualLearner:
                         frame_cache=proxy_eval_frame_cache,
                         max_samples=self.proxy_eval_max_samples,
                         inference_batch_size=effective_batch_size,
+                        split_cache_path=working_cache,
+                        splitter=prepared_splitter,
+                        split_candidate=prepared_candidate,
                     )
                 self._log_stage_duration("proxy evaluation before retrain", stage_started)
                 is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
@@ -3114,24 +3308,21 @@ class CloudContinualLearner:
                         )
                         stage_started = time.perf_counter()
                         if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
-                            proxy_metrics_before, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                            proxy_metrics_before = self._evaluate_tinynext_proxy_map(
                                 tmp_model,
                                 frame_dir=frame_dir,
                                 gt_annotations=gt_annotations,
-                                device=self.device,
                                 model_name=current_model_name,
+                                sample_metadata_by_id=sample_metadata_by_id,
                                 frame_cache=proxy_eval_frame_cache,
                                 max_samples=self.proxy_eval_max_samples,
                                 candidate_thresholds=self.proxy_eval_threshold_candidates,
                                 inference_batch_size=effective_batch_size,
+                                stage_label="proxy evaluation before retrain",
+                                split_cache_path=working_cache,
+                                splitter=prepared_splitter,
+                                split_candidate=prepared_candidate,
                             )
-                            if abs(calibrated_high - initial_high) > 1e-6:
-                                logger.info(
-                                    "[FixedSplitCL] Calibrated {} threshold_high {} -> {} after resetting to native pretrained weights.",
-                                    current_model_name,
-                                    initial_high,
-                                    calibrated_high,
-                                )
                         else:
                             proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
                                 tmp_model,
@@ -3142,6 +3333,9 @@ class CloudContinualLearner:
                                 frame_cache=proxy_eval_frame_cache,
                                 max_samples=self.proxy_eval_max_samples,
                                 inference_batch_size=effective_batch_size,
+                                split_cache_path=working_cache,
+                                splitter=prepared_splitter,
+                                split_candidate=prepared_candidate,
                             )
                         self._log_stage_duration("proxy evaluation before retrain", stage_started)
 
