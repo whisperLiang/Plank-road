@@ -3335,6 +3335,123 @@ def test_yolo_cached_split_proxy_eval_postprocesses_nested_tail_outputs(
     assert metrics["nonempty_predictions"] == 2
 
 
+def test_yolo_cached_split_proxy_eval_pads_to_trace_batch_size(
+    tmp_path,
+    monkeypatch,
+):
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    class DummyModel(torch.nn.Module):
+        pass
+
+    class FakeSplitter:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+            self.graph = SimpleNamespace(
+                sample_args=(torch.zeros((16, 1, 1, 1), dtype=torch.float32),),
+                sample_kwargs={},
+            )
+
+        def cloud_forward(self, payload, *args, candidate=None, **kwargs):
+            del args, candidate, kwargs
+            batch_size = int(payload.primary_tensor().shape[0])
+            self.batch_sizes.append(batch_size)
+            assert batch_size == 16
+            markers = torch.arange(batch_size, dtype=torch.float32).view(batch_size, 1, 1, 1)
+            return (
+                torch.arange(batch_size, dtype=torch.float32).view(batch_size, 1, 1),
+                {
+                    "one2many": {
+                        "scores": torch.stack(
+                            [
+                                torch.tensor([[0.1, 9.0]], dtype=torch.float32)
+                                for _ in range(batch_size)
+                            ],
+                            dim=0,
+                        ),
+                        "feats": [markers],
+                    },
+                    "one2one": {
+                        "scores": torch.stack(
+                            [
+                                torch.tensor([[0.3, 9.5]], dtype=torch.float32)
+                                for _ in range(batch_size)
+                            ],
+                            dim=0,
+                        ),
+                    },
+                },
+            )
+
+    def fake_load_split_feature_cache(cache_path, frame_index):
+        del cache_path, frame_index
+        return {
+            "intermediate": SplitPayload.from_mapping(
+                {"layer3": torch.ones((1, 1, 2, 2), dtype=torch.float32)}
+            ),
+            "input_image_size": [8, 12],
+            "input_tensor_shape": [1, 3, 4, 6],
+        }
+
+    observed_markers: list[float] = []
+
+    def fake_postprocess(model, outputs, *, threshold, model_input=None, orig_image=None):
+        del model, threshold
+        assert isinstance(model_input, torch.Tensor)
+        assert isinstance(orig_image, np.ndarray)
+        observed_markers.append(float(outputs[1]["one2many"]["feats"][0][0, 0, 0, 0].item()))
+        return [{
+            "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]], dtype=torch.float32),
+            "labels": torch.tensor([1], dtype=torch.int64),
+            "scores": torch.tensor([0.95], dtype=torch.float32),
+        }]
+
+    monkeypatch.setattr("cloud_server.load_split_feature_cache", fake_load_split_feature_cache)
+    monkeypatch.setattr("cloud_server.postprocess_split_runtime_output", fake_postprocess)
+
+    gt_annotations = {
+        f"sample-{index}": {"boxes": [[0.0, 0.0, 10.0, 10.0]], "labels": [1]}
+        for index in range(8)
+    }
+    sample_metadata_by_id = {
+        sample_id: {
+            "input_image_size": [8, 12],
+            "input_tensor_shape": [1, 3, 4, 6],
+        }
+        for sample_id in gt_annotations
+    }
+
+    splitter = FakeSplitter()
+    metrics = learner._evaluate_fixed_split_proxy_map(
+        DummyModel(),
+        frame_dir=str(tmp_path),
+        gt_annotations=gt_annotations,
+        model_name="yolo26n",
+        sample_metadata_by_id=sample_metadata_by_id,
+        split_cache_path=str(tmp_path),
+        splitter=splitter,
+        split_candidate=SimpleNamespace(
+            candidate_id="candidate-1",
+            boundary_tensor_labels=["layer3"],
+        ),
+        inference_batch_size=16,
+    )
+
+    assert splitter.batch_sizes == [16]
+    assert observed_markers == [float(index) for index in range(8)]
+    assert metrics["evaluated_samples"] == 8
+    assert metrics["map"] == pytest.approx(1.0)
+    assert metrics["nonempty_predictions"] == 8
+
+
 def test_rfdetr_cached_split_proxy_eval_postprocesses_nested_tail_outputs(
     tmp_path,
     monkeypatch,

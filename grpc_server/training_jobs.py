@@ -275,6 +275,13 @@ class TrainingJobManager:
             all_frame_indices = list(job.all_frame_indices)
             drift_frame_indices = list(job.drift_frame_indices)
             send_low_conf_features = job.send_low_conf_features
+        logger.info(
+            "Async training job {} started: edge_id={} job_type={} workspace={}",
+            job_id,
+            edge_id,
+            job_type,
+            workspace,
+        )
 
         try:
             success, model_data, message = self._execute_job(
@@ -339,6 +346,15 @@ class TrainingJobManager:
                     job.edge_id,
                     success=job.status == JOB_STATUS_SUCCEEDED,
                 )
+
+            logger.info(
+                "Async training job {} completed: edge_id={} status={} model_data_len={} message={}",
+                job_id,
+                job.edge_id,
+                job.status,
+                len(job.model_data or ""),
+                job.message,
+            )
 
             self._cv.notify_all()
 

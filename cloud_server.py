@@ -55,6 +55,7 @@ from model_management.split_model_adapters import (
 from model_management.universal_model_split import (
     UniversalModelSplitter,
     _batch_payloads,
+    _clone_payload_for_padding,
     universal_split_retrain,
     load_split_feature_cache,
 )
@@ -412,6 +413,95 @@ def _build_synthetic_original_frame(
         return None
     height, width = original_image_size
     return np.zeros((height, width, 3), dtype=np.uint8)
+
+
+def _flatten_tensors_for_trace_batch_size(obj: object) -> list[torch.Tensor]:
+    tensors: list[torch.Tensor] = []
+    if isinstance(obj, torch.Tensor):
+        tensors.append(obj)
+        return tensors
+    if isinstance(obj, Mapping):
+        for value in obj.values():
+            tensors.extend(_flatten_tensors_for_trace_batch_size(value))
+        return tensors
+    if isinstance(obj, (list, tuple)):
+        for value in obj:
+            tensors.extend(_flatten_tensors_for_trace_batch_size(value))
+    return tensors
+
+
+def _infer_splitter_trace_batch_size(splitter: UniversalModelSplitter | None) -> int:
+    graph = getattr(splitter, "graph", None)
+    if graph is None:
+        return 1
+    try:
+        sample_args = tuple(getattr(graph, "sample_args", ()) or ())
+        sample_kwargs = tuple((getattr(graph, "sample_kwargs", {}) or {}).values())
+        for sample in sample_args + sample_kwargs:
+            for tensor in _flatten_tensors_for_trace_batch_size(sample):
+                if tensor.ndim > 0:
+                    return max(1, int(tensor.shape[0]))
+    except Exception:
+        return 1
+    return 1
+
+
+def _trim_batched_runtime_outputs(
+    outputs: object,
+    *,
+    source_batch_size: int,
+    target_batch_size: int,
+) -> object:
+    if int(target_batch_size) >= int(source_batch_size):
+        return outputs
+    if isinstance(outputs, torch.Tensor):
+        if outputs.ndim > 0 and int(outputs.shape[0]) == int(source_batch_size):
+            return outputs[:target_batch_size]
+        return outputs
+    if isinstance(outputs, OrderedDict):
+        return OrderedDict(
+            (
+                key,
+                _trim_batched_runtime_outputs(
+                    value,
+                    source_batch_size=source_batch_size,
+                    target_batch_size=target_batch_size,
+                ),
+            )
+            for key, value in outputs.items()
+        )
+    if isinstance(outputs, Mapping):
+        return {
+            key: _trim_batched_runtime_outputs(
+                value,
+                source_batch_size=source_batch_size,
+                target_batch_size=target_batch_size,
+            )
+            for key, value in outputs.items()
+        }
+    if isinstance(outputs, tuple):
+        if len(outputs) == int(source_batch_size):
+            return tuple(outputs[:target_batch_size])
+        return tuple(
+            _trim_batched_runtime_outputs(
+                value,
+                source_batch_size=source_batch_size,
+                target_batch_size=target_batch_size,
+            )
+            for value in outputs
+        )
+    if isinstance(outputs, list):
+        if len(outputs) == int(source_batch_size):
+            return list(outputs[:target_batch_size])
+        return [
+            _trim_batched_runtime_outputs(
+                value,
+                source_batch_size=source_batch_size,
+                target_batch_size=target_batch_size,
+            )
+            for value in outputs
+        ]
+    return outputs
 
 
 def _is_detection_mapping(output: object) -> bool:
@@ -924,11 +1014,22 @@ def _build_detection_proxy_prediction_cache(
             for start in range(0, len(pending_samples), batch_size):
                 batch = pending_samples[start : start + batch_size]
                 batch_payloads = [payload for _, _, payload, _ in batch]
+                actual_batch_size = len(batch_payloads)
+                trace_batch_size = max(
+                    1,
+                    int(_infer_splitter_trace_batch_size(splitter)),
+                )
+                batched_payloads = list(batch_payloads)
+                if actual_batch_size < trace_batch_size:
+                    while len(batched_payloads) < trace_batch_size:
+                        batched_payloads.append(
+                            _clone_payload_for_padding(batched_payloads[-1])
+                        )
                 batched_payload = (
-                    batch_payloads[0]
-                    if len(batch_payloads) == 1
+                    batched_payloads[0]
+                    if len(batched_payloads) == 1
                     else _batch_payloads(
-                        batch_payloads,
+                        batched_payloads,
                         boundary_tensor_labels=boundary_tensor_labels,
                         candidate_id=candidate_id,
                     )
@@ -937,6 +1038,12 @@ def _build_detection_proxy_prediction_cache(
                     batched_payload,
                     candidate=split_candidate,
                 )
+                if len(batched_payloads) != actual_batch_size:
+                    raw_outputs = _trim_batched_runtime_outputs(
+                        raw_outputs,
+                        source_batch_size=len(batched_payloads),
+                        target_batch_size=actual_batch_size,
+                    )
                 low_threshold_predictions = _postprocess_cached_split_proxy_outputs(
                     model,
                     raw_outputs,
