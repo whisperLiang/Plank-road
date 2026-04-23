@@ -2084,6 +2084,23 @@ class CloudContinualLearner:
         return min(5, max(1, total_epochs // 10))
 
     @staticmethod
+    def _resolve_tinynext_proxy_selection_max_samples(
+        *,
+        available_samples: int,
+        full_eval_max_samples: int | None,
+    ) -> int | None:
+        full_eval_budget = max(0, int(available_samples))
+        if full_eval_max_samples is not None:
+            full_eval_budget = min(full_eval_budget, max(0, int(full_eval_max_samples)))
+        if full_eval_budget <= 0:
+            return None
+        if full_eval_budget <= 24:
+            if full_eval_max_samples is None or full_eval_budget == int(available_samples):
+                return None
+            return int(full_eval_budget)
+        return 24
+
+    @staticmethod
     def _resolve_fixed_split_training_label(
         model_name: str,
     ) -> str:
@@ -2596,8 +2613,49 @@ class CloudContinualLearner:
         if proxy_metrics_before:
             proxy_metrics_cache[baseline_proxy_state_key] = dict(proxy_metrics_before)
 
-        def _evaluate_proxy_metrics_for_current_state() -> dict[str, float | int | None]:
+        full_proxy_eval_sample_count = len(
+            _normalize_proxy_sample_ids(
+                gt_annotations,
+                max_samples=self.proxy_eval_max_samples,
+            )
+        )
+        tinynext_proxy_selection_max_samples = None
+        tinynext_selection_uses_subset = False
+        if model_family == "tinynext" and gt_annotations:
+            tinynext_proxy_selection_max_samples = self._resolve_tinynext_proxy_selection_max_samples(
+                available_samples=len(gt_annotations),
+                full_eval_max_samples=self.proxy_eval_max_samples,
+            )
+            selection_proxy_eval_sample_count = len(
+                _normalize_proxy_sample_ids(
+                    gt_annotations,
+                    max_samples=tinynext_proxy_selection_max_samples,
+                )
+            )
+            tinynext_selection_uses_subset = (
+                selection_proxy_eval_sample_count > 0
+                and selection_proxy_eval_sample_count < full_proxy_eval_sample_count
+            )
+
+        def _evaluate_proxy_metrics_for_current_state(
+            *,
+            selection_eval: bool = False,
+        ) -> dict[str, float | int | None]:
             if model_family == "tinynext":
+                if selection_eval and tinynext_selection_uses_subset:
+                    return self._evaluate_fixed_split_proxy_map(
+                        model,
+                        frame_dir=frame_dir,
+                        gt_annotations=gt_annotations,
+                        model_name=current_model_name,
+                        sample_metadata_by_id=sample_metadata_by_id,
+                        frame_cache=proxy_eval_frame_cache,
+                        max_samples=tinynext_proxy_selection_max_samples,
+                        inference_batch_size=bs,
+                    )
+                max_samples = self.proxy_eval_max_samples
+                if selection_eval:
+                    max_samples = tinynext_proxy_selection_max_samples
                 metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
                     model,
                     frame_dir=frame_dir,
@@ -2605,16 +2663,17 @@ class CloudContinualLearner:
                     device=self.device,
                     model_name=current_model_name,
                     frame_cache=proxy_eval_frame_cache,
-                    max_samples=self.proxy_eval_max_samples,
+                    max_samples=max_samples,
                     candidate_thresholds=self.proxy_eval_threshold_candidates,
                     inference_batch_size=bs,
                 )
                 if abs(calibrated_high - initial_high) > 1e-6:
                     logger.info(
-                        "[FixedSplitCL] Calibrated {} threshold_high {} -> {} during proxy selection.",
+                        "[FixedSplitCL] Calibrated {} threshold_high {} -> {} during {}.",
                         current_model_name,
                         initial_high,
                         calibrated_high,
+                        "proxy selection" if selection_eval else "proxy evaluation",
                     )
                 return dict(metrics)
             state_key = _model_state_fingerprint(model)
@@ -2637,6 +2696,7 @@ class CloudContinualLearner:
         if uses_proxy_selected_epochs:
             best_state = baseline_state
             best_metrics = dict(proxy_metrics_before)
+            best_state_is_baseline = True
             split_retrain_elapsed = 0.0
             proxy_eval_elapsed = 0.0
             proxy_eval_inner_epochs = self._resolve_fixed_split_proxy_eval_inner_epochs(
@@ -2653,6 +2713,15 @@ class CloudContinualLearner:
                 int(total_outer_rounds),
                 int(proxy_eval_inner_epochs),
             )
+            if tinynext_selection_uses_subset:
+                logger.info(
+                    "[FixedSplitCL] TinyNeXt proxy selection will evaluate up to {} / {} GT proxy samples per outer round before one final full proxy evaluation.",
+                    selection_proxy_eval_sample_count,
+                    full_proxy_eval_sample_count,
+                )
+                stage_started = time.perf_counter()
+                best_metrics = _evaluate_proxy_metrics_for_current_state(selection_eval=True)
+                proxy_eval_elapsed += time.perf_counter() - stage_started
             for epoch_index in range(int(total_outer_rounds)):
                 inner_epochs_this_round = min(
                     int(proxy_eval_inner_epochs),
@@ -2670,18 +2739,31 @@ class CloudContinualLearner:
                 completed_inner_epochs += inner_epochs_this_round
                 split_retrain_elapsed += time.perf_counter() - stage_started
                 stage_started = time.perf_counter()
-                candidate_metrics = _evaluate_proxy_metrics_for_current_state()
+                candidate_metrics = _evaluate_proxy_metrics_for_current_state(
+                    selection_eval=tinynext_selection_uses_subset,
+                )
                 proxy_eval_elapsed += time.perf_counter() - stage_started
                 if _proxy_metrics_are_better(candidate_metrics, best_metrics):
                     best_state = _snapshot_model_state(model)
                     best_metrics = dict(candidate_metrics)
+                    best_state_is_baseline = False
                     logger.info(
-                        "[FixedSplitCL] Kept {} candidate from outer round {} (through inner epoch {}) with proxy_mAP@0.5={:.4f}.",
+                        "[FixedSplitCL] Kept {} candidate from outer round {} (through inner epoch {}) with {}={:.4f}.",
                         training_label,
                         epoch_index + 1,
                         completed_inner_epochs,
+                        "selection_proxy_mAP@0.5" if tinynext_selection_uses_subset else "proxy_mAP@0.5",
                         float(candidate_metrics.get("map") or 0.0),
                     )
+            if tinynext_selection_uses_subset:
+                model.load_state_dict(best_state)
+                _set_detection_model_eval_mode(model)
+                if best_state_is_baseline:
+                    best_metrics = dict(proxy_metrics_before)
+                else:
+                    stage_started = time.perf_counter()
+                    best_metrics = _evaluate_proxy_metrics_for_current_state(selection_eval=False)
+                    proxy_eval_elapsed += time.perf_counter() - stage_started
             logger.info("[FixedSplitCL] split retraining took {:.3f}s.", split_retrain_elapsed)
             logger.info("[FixedSplitCL] proxy evaluation after retrain took {:.3f}s.", proxy_eval_elapsed)
             model.load_state_dict(best_state)
