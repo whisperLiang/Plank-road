@@ -49,6 +49,7 @@ from model_management.split_model_adapters import (
     build_split_runtime_sample_input,
     build_split_training_loss,
     get_split_runtime_model,
+    postprocess_split_runtime_output,
     prepare_split_runtime_input,
 )
 from model_management.universal_model_split import (
@@ -75,6 +76,7 @@ from model_management.fixed_split_runtime_template import (
     get_fixed_split_runtime_template_cache,
 )
 from model_management.payload import SplitPayload
+from torchvision.models.detection.image_list import ImageList
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 
@@ -84,6 +86,7 @@ def _collate_fn(batch):
 
 
 _FIXED_SPLIT_WORKING_CACHE_VERSION = 1
+_CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
 
 
 class _TeacherAnnotationQueueState:
@@ -358,6 +361,389 @@ def _runtime_image_size_from_metadata(
     return None
 
 
+def _original_image_size_from_metadata(
+    metadata: Mapping[str, object] | None,
+) -> tuple[int, int] | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    input_image_size = metadata.get("input_image_size")
+    if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
+        height = int(input_image_size[0])
+        width = int(input_image_size[1])
+        if height > 0 and width > 0:
+            return height, width
+    return _runtime_image_size_from_metadata(metadata)
+
+
+def _runtime_input_tensor_shape_from_metadata(
+    metadata: Mapping[str, object] | None,
+) -> tuple[int, int, int, int] | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    input_tensor_shape = metadata.get("input_tensor_shape")
+    if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 4:
+        channels = int(input_tensor_shape[-3])
+        height = int(input_tensor_shape[-2])
+        width = int(input_tensor_shape[-1])
+        if channels > 0 and height > 0 and width > 0:
+            return (1, channels, height, width)
+    runtime_image_size = _runtime_image_size_from_metadata(metadata)
+    if runtime_image_size is None:
+        return None
+    return (1, 3, runtime_image_size[0], runtime_image_size[1])
+
+
+def _build_synthetic_runtime_input(
+    metadata: Mapping[str, object] | None,
+    *,
+    device: torch.device,
+) -> torch.Tensor | None:
+    runtime_input_shape = _runtime_input_tensor_shape_from_metadata(metadata)
+    if runtime_input_shape is None:
+        return None
+    return torch.zeros(runtime_input_shape, dtype=torch.float32, device=device)
+
+
+def _build_synthetic_original_frame(
+    metadata: Mapping[str, object] | None,
+) -> np.ndarray | None:
+    original_image_size = _original_image_size_from_metadata(metadata)
+    if original_image_size is None:
+        return None
+    height, width = original_image_size
+    return np.zeros((height, width, 3), dtype=np.uint8)
+
+
+def _is_detection_mapping(output: object) -> bool:
+    return (
+        isinstance(output, Mapping)
+        and output.get("boxes") is not None
+        and output.get("labels") is not None
+        and output.get("scores") is not None
+    )
+
+
+def _extract_anchor_replay_outputs(outputs: object) -> dict[str, torch.Tensor] | None:
+    if isinstance(outputs, Mapping):
+        cls_logits = outputs.get("cls_logits")
+        bbox_regression = outputs.get("bbox_regression")
+        if isinstance(cls_logits, torch.Tensor) and isinstance(bbox_regression, torch.Tensor):
+            extracted = {
+                str(key): value
+                for key, value in outputs.items()
+                if isinstance(value, torch.Tensor)
+            }
+            if extracted:
+                return extracted
+    if isinstance(outputs, (list, tuple)) and len(outputs) >= 2:
+        cls_logits = outputs[0]
+        bbox_regression = outputs[1]
+        if isinstance(cls_logits, torch.Tensor) and isinstance(bbox_regression, torch.Tensor):
+            extracted = {
+                "cls_logits": cls_logits,
+                "bbox_regression": bbox_regression,
+            }
+            if len(outputs) >= 3 and isinstance(outputs[2], torch.Tensor):
+                extracted["bbox_ctrness"] = outputs[2]
+            return extracted
+    return None
+
+
+def _slice_batched_runtime_outputs(
+    outputs: object,
+    index: int,
+    *,
+    batch_size: int,
+) -> object:
+    if isinstance(outputs, torch.Tensor):
+        if outputs.ndim > 0 and int(outputs.shape[0]) == int(batch_size):
+            return outputs[index : index + 1]
+        return outputs
+    if isinstance(outputs, OrderedDict):
+        return OrderedDict(
+            (
+                key,
+                _slice_batched_runtime_outputs(
+                    value,
+                    index,
+                    batch_size=batch_size,
+                ),
+            )
+            for key, value in outputs.items()
+        )
+    if isinstance(outputs, Mapping):
+        return {
+            key: _slice_batched_runtime_outputs(
+                value,
+                index,
+                batch_size=batch_size,
+            )
+            for key, value in outputs.items()
+        }
+    if isinstance(outputs, tuple):
+        return tuple(
+            _slice_batched_runtime_outputs(
+                value,
+                index,
+                batch_size=batch_size,
+            )
+            for value in outputs
+        )
+    if isinstance(outputs, list):
+        return [
+            _slice_batched_runtime_outputs(
+                value,
+                index,
+                batch_size=batch_size,
+            )
+            for value in outputs
+        ]
+    return outputs
+
+
+def _postprocess_cached_wrapper_outputs(
+    model: torch.nn.Module,
+    outputs: object,
+    *,
+    model_name: str | None,
+    batch_metadata: list[Mapping[str, object] | None],
+    threshold_low: float,
+    device: torch.device,
+) -> list[dict[str, list]] | None:
+    model_family = model_zoo.get_model_family(str(model_name or ""))
+    if model_family not in {"yolo", "rfdetr"}:
+        return None
+
+    predictions: list[dict[str, list]] = []
+    batch_size = len(batch_metadata)
+    for index, metadata in enumerate(batch_metadata):
+        single_outputs = _slice_batched_runtime_outputs(
+            outputs,
+            index,
+            batch_size=batch_size,
+        )
+        original_frame = _build_synthetic_original_frame(metadata)
+        if original_frame is None:
+            return None
+        runtime_input = None
+        if model_family == "yolo":
+            runtime_input = _build_synthetic_runtime_input(
+                metadata,
+                device=device,
+            )
+            if runtime_input is None:
+                return None
+        processed = postprocess_split_runtime_output(
+            model,
+            single_outputs,
+            threshold=threshold_low,
+            model_input=runtime_input,
+            orig_image=original_frame,
+        )
+        single_predictions = _batched_predictions_from_model_output(
+            processed,
+            batch_size=1,
+            threshold_low=threshold_low,
+            threshold_high=threshold_low,
+        )
+        predictions.append(
+            dict(single_predictions[0])
+            if single_predictions
+            else {"labels": [], "boxes": [], "scores": []}
+        )
+    return predictions
+
+
+def _postprocess_cached_tinynext_outputs(
+    model: torch.nn.Module,
+    outputs: object,
+    *,
+    batch_metadata: list[Mapping[str, object] | None],
+    threshold_low: float,
+    device: torch.device,
+) -> list[dict[str, list]] | None:
+    head_outputs = _extract_anchor_replay_outputs(outputs)
+    if head_outputs is None:
+        return None
+
+    model_input_sizes = [
+        _runtime_image_size_from_metadata(metadata)
+        for metadata in batch_metadata
+    ]
+    if any(size is None for size in model_input_sizes):
+        return None
+
+    if any(size != model_input_sizes[0] for size in model_input_sizes[1:]):
+        predictions: list[dict[str, list]] = []
+        for index, metadata in enumerate(batch_metadata):
+            single_predictions = _postprocess_cached_tinynext_outputs(
+                model,
+                _slice_batched_runtime_outputs(
+                    outputs,
+                    index,
+                    batch_size=len(batch_metadata),
+                ),
+                batch_metadata=[metadata],
+                threshold_low=threshold_low,
+                device=device,
+            )
+            if single_predictions is None or not single_predictions:
+                predictions.append({"labels": [], "boxes": [], "scores": []})
+                continue
+            predictions.append(dict(single_predictions[0]))
+        return predictions
+
+    batch_size = len(batch_metadata)
+    model_height, model_width = model_input_sizes[0]
+    transformed_sizes = [(model_height, model_width)] * batch_size
+    original_image_sizes = [
+        _original_image_size_from_metadata(metadata) or (model_height, model_width)
+        for metadata in batch_metadata
+    ]
+    transformed_batch = torch.zeros(
+        (batch_size, 3, model_height, model_width),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    bbox_regression = head_outputs.get("bbox_regression")
+    if not isinstance(bbox_regression, torch.Tensor) or bbox_regression.ndim < 3:
+        return None
+
+    steps = getattr(getattr(model, "anchor_generator", None), "steps", None)
+    num_anchors_per_location = getattr(
+        getattr(model, "anchor_generator", None),
+        "num_anchors_per_location",
+        None,
+    )
+    if not callable(num_anchors_per_location):
+        return None
+    anchors_per_level = list(num_anchors_per_location())
+    if not isinstance(steps, (list, tuple)) or len(steps) != len(anchors_per_level):
+        processed = postprocess_split_runtime_output(
+            model,
+            outputs,
+            threshold=threshold_low,
+            model_input=transformed_batch,
+        )
+        return _batched_predictions_from_model_output(
+            processed,
+            batch_size=batch_size,
+            threshold_low=threshold_low,
+            threshold_high=threshold_low,
+        )
+
+    grid_sizes: list[tuple[int, int]] = []
+    for step in steps:
+        if isinstance(step, (list, tuple)) and len(step) >= 2:
+            step_h = max(1.0, float(step[0]))
+            step_w = max(1.0, float(step[1]))
+        else:
+            step_h = step_w = max(1.0, float(step))
+        grid_sizes.append(
+            (
+                max(1, int(math.ceil(float(model_height) / step_h))),
+                max(1, int(math.ceil(float(model_width) / step_w))),
+            )
+        )
+
+    expected_anchor_count = sum(
+        int(grid_h) * int(grid_w) * int(anchor_count)
+        for (grid_h, grid_w), anchor_count in zip(grid_sizes, anchors_per_level)
+    )
+    actual_anchor_count = int(bbox_regression.shape[1])
+    if actual_anchor_count != expected_anchor_count:
+        processed = postprocess_split_runtime_output(
+            model,
+            outputs,
+            threshold=threshold_low,
+            model_input=transformed_batch,
+        )
+        return _batched_predictions_from_model_output(
+            processed,
+            batch_size=batch_size,
+            threshold_low=threshold_low,
+            threshold_high=threshold_low,
+        )
+
+    dummy_feature_maps = [
+        torch.zeros(
+            (batch_size, 1, grid_h, grid_w),
+            dtype=bbox_regression.dtype,
+            device=device,
+        )
+        for grid_h, grid_w in grid_sizes
+    ]
+    image_list = ImageList(transformed_batch, transformed_sizes)
+    anchors = model.anchor_generator(image_list, dummy_feature_maps)
+    detections = model.postprocess_detections(
+        head_outputs,
+        anchors,
+        transformed_sizes,
+    )
+    processed = model.transform.postprocess(
+        detections,
+        transformed_sizes,
+        original_image_sizes,
+    )
+    return _batched_predictions_from_model_output(
+        processed,
+        batch_size=batch_size,
+        threshold_low=threshold_low,
+        threshold_high=threshold_low,
+    )
+
+
+def _postprocess_cached_split_proxy_outputs(
+    model: torch.nn.Module,
+    outputs: object,
+    *,
+    model_name: str | None,
+    batch_metadata: list[Mapping[str, object] | None],
+    threshold_low: float,
+    device: torch.device,
+) -> list[dict[str, list]] | None:
+    batch_size = len(batch_metadata)
+    if isinstance(outputs, Mapping) and _is_detection_mapping(outputs):
+        return _batched_predictions_from_model_output(
+            outputs,
+            batch_size=1,
+            threshold_low=threshold_low,
+            threshold_high=threshold_low,
+        )
+    if (
+        isinstance(outputs, (list, tuple))
+        and len(outputs) == batch_size
+        and all(_is_detection_mapping(item) for item in outputs)
+    ):
+        return _batched_predictions_from_model_output(
+            outputs,
+            batch_size=batch_size,
+            threshold_low=threshold_low,
+            threshold_high=threshold_low,
+        )
+
+    model_family = model_zoo.get_model_family(str(model_name or ""))
+    if model_family == "tinynext":
+        return _postprocess_cached_tinynext_outputs(
+            model,
+            outputs,
+            batch_metadata=batch_metadata,
+            threshold_low=threshold_low,
+            device=device,
+        )
+    if model_family in {"yolo", "rfdetr"}:
+        return _postprocess_cached_wrapper_outputs(
+            model,
+            outputs,
+            model_name=model_name,
+            batch_metadata=batch_metadata,
+            threshold_low=threshold_low,
+            device=device,
+        )
+    return None
+
+
 def _prediction_from_model_output(
     output: object,
     *,
@@ -468,6 +854,8 @@ def _build_detection_proxy_prediction_cache(
     gt_annotations: Mapping[str, Mapping[str, object]],
     device: torch.device,
     threshold_low: float,
+    model_name: str | None = None,
+    sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
     frame_cache: dict[str, np.ndarray | None] | None = None,
     max_samples: int | None = None,
     inference_batch_size: int = 1,
@@ -481,14 +869,21 @@ def _build_detection_proxy_prediction_cache(
     )
     skipped_empty_gt = 0
     skipped_missing_frame = 0
+    model_family = model_zoo.get_model_family(str(model_name or ""))
 
     if (
         split_cache_path is not None
         and splitter is not None
         and split_candidate is not None
+        and model_family in _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES
     ):
         pending_samples: list[
-            tuple[list[object], list[object], SplitPayload | torch.Tensor]
+            tuple[
+                list[object],
+                list[object],
+                SplitPayload | torch.Tensor,
+                Mapping[str, object] | None,
+            ]
         ] = []
         for sample_id in sample_ids:
             target = gt_annotations.get(sample_id) or {}
@@ -507,7 +902,14 @@ def _build_detection_proxy_prediction_cache(
             if not isinstance(payload, (SplitPayload, torch.Tensor)):
                 skipped_missing_frame += 1
                 continue
-            pending_samples.append((gt_boxes, gt_labels, payload))
+            sample_metadata = (
+                sample_metadata_by_id.get(sample_id)
+                if isinstance(sample_metadata_by_id, Mapping)
+                else None
+            )
+            if not isinstance(sample_metadata, Mapping):
+                sample_metadata = record if isinstance(record, Mapping) else None
+            pending_samples.append((gt_boxes, gt_labels, payload, sample_metadata))
 
         prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
         candidate_id = getattr(split_candidate, "candidate_id", None)
@@ -521,7 +923,7 @@ def _build_detection_proxy_prediction_cache(
             batch_size = max(1, int(inference_batch_size))
             for start in range(0, len(pending_samples), batch_size):
                 batch = pending_samples[start : start + batch_size]
-                batch_payloads = [payload for _, _, payload in batch]
+                batch_payloads = [payload for _, _, payload, _ in batch]
                 batched_payload = (
                     batch_payloads[0]
                     if len(batch_payloads) == 1
@@ -531,16 +933,26 @@ def _build_detection_proxy_prediction_cache(
                         candidate_id=candidate_id,
                     )
                 )
-                low_threshold_predictions = _batched_predictions_from_model_output(
-                    splitter.cloud_forward(
-                        batched_payload,
-                        candidate=split_candidate,
-                    ),
-                    batch_size=len(batch),
-                    threshold_low=threshold_low,
-                    threshold_high=threshold_low,
+                raw_outputs = splitter.cloud_forward(
+                    batched_payload,
+                    candidate=split_candidate,
                 )
-                for (gt_boxes, gt_labels, _), prediction in zip(
+                low_threshold_predictions = _postprocess_cached_split_proxy_outputs(
+                    model,
+                    raw_outputs,
+                    model_name=model_name,
+                    batch_metadata=[metadata for _, _, _, metadata in batch],
+                    threshold_low=threshold_low,
+                    device=device,
+                )
+                if low_threshold_predictions is None:
+                    low_threshold_predictions = _batched_predictions_from_model_output(
+                        raw_outputs,
+                        batch_size=len(batch),
+                        threshold_low=threshold_low,
+                        threshold_high=threshold_low,
+                    )
+                for (gt_boxes, gt_labels, _, _), prediction in zip(
                     batch,
                     low_threshold_predictions,
                 ):
@@ -676,6 +1088,8 @@ def _evaluate_detection_proxy_map(
             gt_annotations=gt_annotations,
             device=device,
             threshold_low=float(threshold_low),
+            model_name=model_name,
+            sample_metadata_by_id=sample_metadata_by_id,
             frame_cache=frame_cache,
             max_samples=max_samples,
             inference_batch_size=inference_batch_size,

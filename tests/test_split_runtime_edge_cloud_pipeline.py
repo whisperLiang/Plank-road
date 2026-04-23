@@ -3096,6 +3096,388 @@ def test_fixed_split_proxy_eval_reuses_cached_split_features(
     assert metrics["skipped_missing_frame"] == 0
 
 
+def test_tinynext_cached_split_proxy_eval_postprocesses_raw_tail_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    config = SimpleNamespace(
+        edge_model_name="tinynext_s",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    class FakeAnchorGenerator:
+        def __init__(self) -> None:
+            self.steps = [4]
+            self.calls: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = []
+
+        def num_anchors_per_location(self):
+            return [1]
+
+        def __call__(self, image_list, feature_maps):
+            self.calls.append(
+                (
+                    list(image_list.image_sizes),
+                    [tuple(feature.shape[-2:]) for feature in feature_maps],
+                )
+            )
+            return [
+                torch.tensor([[0.0, 0.0, 10.0, 10.0]], dtype=torch.float32)
+                for _ in image_list.image_sizes
+            ]
+
+    class FakeTransform:
+        def __init__(self) -> None:
+            self.calls: list[list[tuple[int, int]]] = []
+
+        def postprocess(self, detections, image_sizes, original_image_sizes):
+            self.calls.append(list(original_image_sizes))
+            return detections
+
+    class FakeTinyNeXt(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor_generator = FakeAnchorGenerator()
+            self.transform = FakeTransform()
+            self.eval_called = 0
+
+        def eval(self):
+            self.eval_called += 1
+            return self
+
+        def postprocess_detections(self, head_outputs, anchors, image_shapes):
+            batch_size = int(head_outputs["bbox_regression"].shape[0])
+            return [
+                {
+                    "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]], dtype=torch.float32),
+                    "labels": torch.tensor([1], dtype=torch.int64),
+                    "scores": torch.tensor([0.95], dtype=torch.float32),
+                }
+                for _ in range(batch_size)
+            ]
+
+    class FakeSplitter:
+        def cloud_forward(self, payload, *args, candidate=None, **kwargs):
+            batch_size = int(payload.primary_tensor().shape[0])
+            return {
+                "bbox_regression": torch.zeros((batch_size, 1, 4), dtype=torch.float32),
+                "cls_logits": torch.tensor(
+                    [[[0.0, 10.0]]] * batch_size,
+                    dtype=torch.float32,
+                ),
+            }
+
+    def fake_load_split_feature_cache(cache_path, frame_index):
+        return {
+            "intermediate": SplitPayload.from_mapping(
+                {"layer3": torch.ones((1, 1, 2, 2), dtype=torch.float32)}
+            ),
+            "input_image_size": [10, 10],
+            "input_tensor_shape": [1, 3, 4, 4],
+        }
+
+    monkeypatch.setattr("cloud_server.load_split_feature_cache", fake_load_split_feature_cache)
+
+    model = FakeTinyNeXt()
+    metrics = learner._evaluate_fixed_split_proxy_map(
+        model,
+        frame_dir=str(tmp_path),
+        gt_annotations={
+            "sample-0": {"boxes": [[0.0, 0.0, 10.0, 10.0]], "labels": [1]},
+            "sample-1": {"boxes": [[0.0, 0.0, 10.0, 10.0]], "labels": [1]},
+        },
+        model_name="tinynext_s",
+        split_cache_path=str(tmp_path),
+        splitter=FakeSplitter(),
+        split_candidate=SimpleNamespace(
+            candidate_id="candidate-1",
+            boundary_tensor_labels=["layer3"],
+        ),
+        inference_batch_size=2,
+    )
+
+    assert model.anchor_generator.calls == [([(4, 4), (4, 4)], [(1, 1)])]
+    assert model.transform.calls == [[(10, 10), (10, 10)]]
+    assert metrics["evaluated_samples"] == 2
+    assert metrics["map"] == pytest.approx(1.0)
+    assert metrics["nonempty_predictions"] == 2
+
+
+def test_yolo_cached_split_proxy_eval_postprocesses_nested_tail_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    config = SimpleNamespace(
+        edge_model_name="yolo26n",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    class DummyModel(torch.nn.Module):
+        pass
+
+    class FakeSplitter:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def cloud_forward(self, payload, *args, candidate=None, **kwargs):
+            batch_size = int(payload.primary_tensor().shape[0])
+            self.batch_sizes.append(batch_size)
+            return (
+                torch.tensor(
+                    [[[0.0]], [[1.0]]],
+                    dtype=torch.float32,
+                ),
+                {
+                    "one2many": {
+                        "scores": torch.tensor(
+                            [
+                                [[0.1, 9.0]],
+                                [[0.2, 10.0]],
+                            ],
+                            dtype=torch.float32,
+                        ),
+                        "feats": [
+                            torch.tensor(
+                                [[[[11.0]]], [[[22.0]]]],
+                                dtype=torch.float32,
+                            )
+                        ],
+                    },
+                    "one2one": {
+                        "scores": torch.tensor(
+                            [
+                                [[0.3, 9.5]],
+                                [[0.4, 10.5]],
+                            ],
+                            dtype=torch.float32,
+                        ),
+                    },
+                },
+            )
+
+    def fake_load_split_feature_cache(cache_path, frame_index):
+        return {
+            "intermediate": SplitPayload.from_mapping(
+                {"layer3": torch.ones((1, 1, 2, 2), dtype=torch.float32)}
+            ),
+            "input_image_size": [999, 999],
+            "input_tensor_shape": [1, 3, 999, 999],
+        }
+
+    observed_markers: list[tuple[float, float, tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_postprocess(model, outputs, *, threshold, model_input=None, orig_image=None):
+        del model, threshold
+        assert isinstance(model_input, torch.Tensor)
+        assert isinstance(orig_image, np.ndarray)
+        marker = float(outputs[1]["one2many"]["feats"][0][0, 0, 0, 0].item())
+        nested_score = float(outputs[1]["one2one"]["scores"][0, 0, 1].item())
+        observed_markers.append(
+            (marker, nested_score, tuple(model_input.shape), tuple(orig_image.shape))
+        )
+        if marker < 20.0:
+            boxes = torch.tensor([[0.0, 0.0, 10.0, 10.0]], dtype=torch.float32)
+        else:
+            boxes = torch.tensor([[1.0, 1.0, 9.0, 9.0]], dtype=torch.float32)
+        return [{
+            "boxes": boxes,
+            "labels": torch.tensor([1], dtype=torch.int64),
+            "scores": torch.tensor([0.95], dtype=torch.float32),
+        }]
+
+    monkeypatch.setattr("cloud_server.load_split_feature_cache", fake_load_split_feature_cache)
+    monkeypatch.setattr("cloud_server.postprocess_split_runtime_output", fake_postprocess)
+
+    splitter = FakeSplitter()
+    metrics = learner._evaluate_fixed_split_proxy_map(
+        DummyModel(),
+        frame_dir=str(tmp_path),
+        gt_annotations={
+            "sample-0": {"boxes": [[0.0, 0.0, 10.0, 10.0]], "labels": [1]},
+            "sample-1": {"boxes": [[1.0, 1.0, 9.0, 9.0]], "labels": [1]},
+        },
+        model_name="yolo26n",
+        sample_metadata_by_id={
+            "sample-0": {
+                "input_image_size": [8, 12],
+                "input_tensor_shape": [1, 3, 4, 6],
+            },
+            "sample-1": {
+                "input_image_size": [8, 12],
+                "input_tensor_shape": [1, 3, 4, 6],
+            },
+        },
+        split_cache_path=str(tmp_path),
+        splitter=splitter,
+        split_candidate=SimpleNamespace(
+            candidate_id="candidate-1",
+            boundary_tensor_labels=["layer3"],
+        ),
+        inference_batch_size=2,
+    )
+
+    assert splitter.batch_sizes == [2]
+    assert observed_markers == [
+        (11.0, 9.5, (1, 3, 4, 6), (8, 12, 3)),
+        (22.0, 10.5, (1, 3, 4, 6), (8, 12, 3)),
+    ]
+    assert metrics["evaluated_samples"] == 2
+    assert metrics["map"] == pytest.approx(1.0)
+    assert metrics["nonempty_predictions"] == 2
+
+
+def test_rfdetr_cached_split_proxy_eval_postprocesses_nested_tail_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    config = SimpleNamespace(
+        edge_model_name="rfdetr_nano",
+        continual_learning=SimpleNamespace(num_epoch=1),
+        das=SimpleNamespace(enabled=False),
+    )
+    learner = CloudContinualLearner(
+        config=config,
+        large_object_detection=SimpleNamespace(),
+    )
+
+    class DummyModel(torch.nn.Module):
+        pass
+
+    class FakeSplitter:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def cloud_forward(self, payload, *args, candidate=None, **kwargs):
+            batch_size = int(payload.primary_tensor().shape[0])
+            self.batch_sizes.append(batch_size)
+            return {
+                "pred_logits": torch.tensor(
+                    [
+                        [[1.0, 0.0]],
+                        [[2.0, 0.0]],
+                    ],
+                    dtype=torch.float32,
+                ),
+                "pred_boxes": torch.tensor(
+                    [
+                        [[0.0, 0.0, 10.0, 10.0]],
+                        [[1.0, 1.0, 9.0, 9.0]],
+                    ],
+                    dtype=torch.float32,
+                ),
+                "aux_outputs": [
+                    {
+                        "pred_logits": torch.tensor(
+                            [
+                                [[11.0, 0.0]],
+                                [[22.0, 0.0]],
+                            ],
+                            dtype=torch.float32,
+                        ),
+                        "pred_boxes": torch.tensor(
+                            [
+                                [[0.0, 0.0, 10.0, 10.0]],
+                                [[1.0, 1.0, 9.0, 9.0]],
+                            ],
+                            dtype=torch.float32,
+                        ),
+                    }
+                ],
+                "enc_outputs": {
+                    "pred_logits": torch.tensor(
+                        [
+                            [[101.0, 0.0]],
+                            [[202.0, 0.0]],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                    "pred_boxes": torch.tensor(
+                        [
+                            [[0.0, 0.0, 10.0, 10.0]],
+                            [[1.0, 1.0, 9.0, 9.0]],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                },
+            }
+
+    def fake_load_split_feature_cache(cache_path, frame_index):
+        return {
+            "intermediate": SplitPayload.from_mapping(
+                {"layer3": torch.ones((1, 1, 2, 2), dtype=torch.float32)}
+            ),
+            "input_image_size": [777, 777],
+        }
+
+    observed_markers: list[tuple[float, float, tuple[int, ...]]] = []
+
+    def fake_postprocess(model, outputs, *, threshold, model_input=None, orig_image=None):
+        del model, threshold
+        assert model_input is None
+        assert isinstance(orig_image, np.ndarray)
+        aux_marker = float(outputs["aux_outputs"][0]["pred_logits"][0, 0, 0].item())
+        enc_marker = float(outputs["enc_outputs"]["pred_logits"][0, 0, 0].item())
+        observed_markers.append((aux_marker, enc_marker, tuple(orig_image.shape)))
+        if aux_marker < 20.0:
+            boxes = torch.tensor([[0.0, 0.0, 10.0, 10.0]], dtype=torch.float32)
+        else:
+            boxes = torch.tensor([[1.0, 1.0, 9.0, 9.0]], dtype=torch.float32)
+        return [{
+            "boxes": boxes,
+            "labels": torch.tensor([1], dtype=torch.int64),
+            "scores": torch.tensor([0.97], dtype=torch.float32),
+        }]
+
+    monkeypatch.setattr("cloud_server.load_split_feature_cache", fake_load_split_feature_cache)
+    monkeypatch.setattr("cloud_server.postprocess_split_runtime_output", fake_postprocess)
+
+    splitter = FakeSplitter()
+    metrics = learner._evaluate_fixed_split_proxy_map(
+        DummyModel(),
+        frame_dir=str(tmp_path),
+        gt_annotations={
+            "sample-0": {"boxes": [[0.0, 0.0, 10.0, 10.0]], "labels": [1]},
+            "sample-1": {"boxes": [[1.0, 1.0, 9.0, 9.0]], "labels": [1]},
+        },
+        model_name="rfdetr_nano",
+        sample_metadata_by_id={
+            "sample-0": {
+                "input_image_size": [10, 14],
+                "input_tensor_shape": [1, 3, 6, 8],
+            },
+            "sample-1": {
+                "input_image_size": [10, 14],
+                "input_tensor_shape": [1, 3, 6, 8],
+            },
+        },
+        split_cache_path=str(tmp_path),
+        splitter=splitter,
+        split_candidate=SimpleNamespace(
+            candidate_id="candidate-1",
+            boundary_tensor_labels=["layer3"],
+        ),
+        inference_batch_size=2,
+    )
+
+    assert splitter.batch_sizes == [2]
+    assert observed_markers == [
+        (11.0, 101.0, (10, 14, 3)),
+        (22.0, 202.0, (10, 14, 3)),
+    ]
+    assert metrics["evaluated_samples"] == 2
+    assert metrics["map"] == pytest.approx(1.0)
+    assert metrics["nonempty_predictions"] == 2
+
+
 def test_fixed_split_retrain_accepts_num_epoch_override(
     tmp_path,
     monkeypatch,
