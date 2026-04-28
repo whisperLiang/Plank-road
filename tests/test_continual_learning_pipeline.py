@@ -35,7 +35,10 @@ from model_management.payload import SplitPayload
 from model_management.continual_learning_bundle import prepare_split_training_cache
 from model_management.graph_ir import GraphIR, GraphNode, ParameterTensorRef, TreeSpec
 from model_management.split_candidate import SplitCandidate
-from model_management.universal_model_split import load_split_feature_cache
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
+    load_split_feature_cache,
+)
 
 
 def _dummy_plan() -> SplitPlan:
@@ -786,6 +789,86 @@ def test_fixed_split_failure_reports_untrainable_replay_candidates():
             splitter=DummyRuntime(),
             model_name="dummy-model",
         )
+
+
+def test_ariadne_fixed_split_rejects_failed_replay_validation():
+    candidate = SplitCandidate(
+        candidate_id="after:bad",
+        edge_nodes=["after:bad"],
+        cloud_nodes=[],
+        boundary_edges=[],
+        boundary_tensor_labels=["bad"],
+        edge_input_labels=[],
+        cloud_input_labels=[],
+        cloud_output_labels=[],
+        estimated_edge_flops=0.0,
+        estimated_cloud_flops=0.0,
+        estimated_payload_bytes=1,
+        estimated_privacy_risk=0.0,
+        estimated_latency=0.0,
+        is_trainable_tail=True,
+    )
+
+    class FailedAriadneRuntime:
+        graph = "trace-sig"
+        model = object()
+        runtime = object()
+
+        def split(self):
+            return candidate
+
+        def validate_candidate(self, chosen):
+            assert chosen is candidate
+            return {"success": False, "error": "suffix replay failed"}
+
+    with pytest.raises(RuntimeError, match="No replayable Ariadne split candidate"):
+        compute_fixed_split_for_model(
+            torch.nn.Linear(1, 1),
+            SplitConstraints(validate_candidates=True),
+            sample_input=torch.rand(1, 1),
+            splitter=FailedAriadneRuntime(),
+            model_name="dummy-model",
+        )
+
+
+def test_ariadne_fixed_split_solves_candidate_from_constraints_instead_of_auto():
+    class PrivacyToy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc1 = torch.nn.Linear(4, 8)
+            self.fc2 = torch.nn.Linear(8, 2)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = x + 1.0
+            x = torch.relu(self.fc1(x))
+            return self.fc2(x)
+
+    model = PrivacyToy().eval()
+    sample_input = torch.randn(2, 4)
+    runtime = UniversalModelSplitter().trace(model, sample_input)
+    auto_candidate = runtime.current_candidate
+    constraints = SplitConstraints(
+        privacy_leakage_upper_bound=1.0,
+        max_layer_freezing_ratio=1.0,
+        validate_candidates=True,
+        max_boundary_count=8,
+        max_payload_bytes=32 * 1024 * 1024,
+    )
+
+    plan = compute_fixed_split_for_model(
+        model,
+        constraints,
+        sample_input=sample_input,
+        splitter=runtime,
+        model_name="privacy-toy",
+    )
+
+    assert auto_candidate is not None
+    assert plan.candidate_id != auto_candidate.candidate_id
+    assert auto_candidate.edge_parameter_count == 0
+    assert plan.edge_parameter_count > 0
+    assert plan.privacy_leakage <= constraints.privacy_leakage_upper_bound
+    assert plan.validation["selection"] == "constraints"
 
 
 def test_fixed_split_exact_validation_falls_back_to_next_same_objective_candidate():

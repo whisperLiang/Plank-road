@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
+from ariadne.codegen.segment_builder import build_segments
+from ariadne.planner.frontier import enumerate_frontier_splits
 
 from model_management.payload import deserialize_boundary_payload, serialize_boundary_payload
 from model_management.split_candidate import CandidateProfile, SplitCandidate
@@ -34,6 +36,178 @@ def _first_tensor_batch_size(value: Any) -> int | None:
             if found is not None:
                 return found
     return None
+
+
+def _runtime_args(sample_input: Any) -> tuple[Any, ...]:
+    if isinstance(sample_input, tuple):
+        return sample_input
+    return (sample_input,)
+
+
+def _runtime_replay_report(
+    runtime: SplitRuntime,
+    model: torch.nn.Module,
+    sample_input: Any,
+    *,
+    require_trainable: bool,
+) -> dict[str, Any]:
+    tail_trainability = bool(getattr(getattr(runtime, "candidate", None), "trainable_suffix", True))
+    if require_trainable and not tail_trainability:
+        return {
+            "success": False,
+            "tail_trainability": False,
+            "error": "selected split does not have trainable suffix parameters",
+        }
+
+    inputs = _runtime_args(sample_input)
+    try:
+        with torch.no_grad():
+            boundary = runtime.run_prefix(*inputs)
+            replayed = runtime.run_suffix(boundary)
+            expected = model(*inputs)
+        ok, max_diff = compare_outputs(expected, replayed)
+    except Exception as exc:  # noqa: BLE001 - report the replay failure to fixed-split validation
+        return {
+            "success": False,
+            "tail_trainability": tail_trainability,
+            "error": str(exc),
+        }
+
+    return {
+        "success": bool(ok),
+        "tail_trainability": tail_trainability,
+        "max_diff": float(max_diff),
+        "error": None if ok else f"split replay output mismatch (max_diff={max_diff})",
+    }
+
+
+def _candidate_payload_bytes(candidate: Any) -> int:
+    return int(getattr(getattr(candidate, "cost", None), "boundary_bytes", 0) or 0)
+
+
+def _shape_numel(shape: Iterable[int]) -> int:
+    total = 1
+    for dim in shape:
+        total *= int(dim)
+    return int(total)
+
+
+def _parameter_count_for_nodes(plan: Any, node_names: Iterable[str]) -> int:
+    selected = set(node_names)
+    seen: set[str] = set()
+    total = 0
+    for node in getattr(plan, "nodes", ()):
+        if node.name not in selected:
+            continue
+        for ref in getattr(node, "param_refs", ()) or ():
+            ref_name = str(getattr(ref, "name", ""))
+            if not ref_name or ref_name in seen:
+                continue
+            seen.add(ref_name)
+            total += _shape_numel(getattr(ref, "shape", ()) or ())
+    return int(total)
+
+
+def _boundary_shape_summary(candidate: Any) -> list[tuple[str, list[str]]]:
+    summary: list[tuple[str, list[str]]] = []
+    for label, spec in (getattr(candidate, "boundary_schema", {}) or {}).items():
+        shape = [str(dim) for dim in getattr(spec, "symbolic_shape", ()) or ()]
+        summary.append((str(label), shape))
+    return summary
+
+
+def _candidate_boundary_edges(plan: Any, candidate: Any) -> list[tuple[str, str]]:
+    boundary = set(getattr(candidate, "boundary_nodes", ()) or ())
+    suffix = set(getattr(candidate, "suffix_nodes", ()) or ())
+    edges: list[tuple[str, str]] = []
+    for node in getattr(plan, "nodes", ()):
+        if node.name not in suffix:
+            continue
+        for parent in getattr(node, "parents", ()) or ():
+            if parent in boundary:
+                edges.append((str(parent), str(node.name)))
+    return edges
+
+
+def _candidate_legacy_index(plan: Any, candidate: Any) -> int | None:
+    indexes: list[int] = []
+    for label in getattr(candidate, "prefix_nodes", ()) or ():
+        try:
+            indexes.append(int(plan.index_of(label)))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+    return max(indexes) if indexes else None
+
+
+def _candidate_from_ariadne_candidate(
+    runtime: SplitRuntime,
+    split_spec: SplitSpec,
+    candidate: Any,
+) -> SplitCandidate:
+    plan = getattr(runtime, "trace_plan", None)
+    prefix_nodes = list(getattr(candidate, "prefix_nodes", ()) or ())
+    suffix_nodes = list(getattr(candidate, "suffix_nodes", ()) or ())
+    boundary_labels = list(getattr(candidate, "boundary_nodes", ()) or [])
+    payload_bytes = _candidate_payload_bytes(candidate)
+    edge_parameter_count = _parameter_count_for_nodes(plan, prefix_nodes)
+    total_parameter_count = _parameter_count_for_nodes(
+        plan,
+        [node.name for node in getattr(plan, "nodes", ())],
+    )
+    edge_parameter_ratio = (
+        float(edge_parameter_count) / float(total_parameter_count)
+        if total_parameter_count > 0
+        else 0.0
+    )
+    privacy_risk = (
+        1.0 / float(edge_parameter_count)
+        if edge_parameter_count > 0
+        else float("inf")
+    )
+    cost = getattr(candidate, "cost", None)
+    return SplitCandidate(
+        candidate_id=str(getattr(candidate, "split_id", split_spec.boundary)),
+        edge_nodes=prefix_nodes,
+        cloud_nodes=suffix_nodes,
+        boundary_edges=_candidate_boundary_edges(plan, candidate),
+        boundary_tensor_labels=boundary_labels,
+        edge_input_labels=list(getattr(plan, "input_node_names", ()) or ()),
+        cloud_input_labels=[
+            *boundary_labels,
+            *list(getattr(candidate, "passthrough_inputs", ()) or ()),
+        ],
+        cloud_output_labels=[
+            str(node.name)
+            for node in getattr(plan, "nodes", ())
+            if bool(getattr(node, "is_output", False))
+        ],
+        estimated_edge_flops=0.0,
+        estimated_cloud_flops=0.0,
+        estimated_payload_bytes=payload_bytes,
+        estimated_privacy_risk=privacy_risk,
+        estimated_latency=float(payload_bytes),
+        is_trainable_tail=bool(getattr(candidate, "trainable_suffix", True)),
+        is_validated=True,
+        legacy_layer_index=_candidate_legacy_index(plan, candidate),
+        boundary_count=len(boundary_labels),
+        edge_parameter_count=edge_parameter_count,
+        total_parameter_count=total_parameter_count,
+        edge_parameter_ratio=edge_parameter_ratio,
+        metadata={
+            "runtime": "ariadne",
+            "graph_signature": getattr(runtime, "graph_signature", None),
+            "ariadne_boundary_after": getattr(candidate, "boundary_after", None),
+            "ariadne_trainable_suffix": bool(getattr(candidate, "trainable_suffix", True)),
+            "ariadne_prefix_node_count": int(getattr(cost, "prefix_node_count", 0) or 0),
+            "ariadne_suffix_node_count": int(getattr(cost, "suffix_node_count", 0) or 0),
+            "boundary_shape_summary": _boundary_shape_summary(candidate),
+            "split_spec": {
+                "boundary": split_spec.boundary,
+                "dynamic_batch": split_spec.dynamic_batch,
+                "trace_batch_mode": split_spec.trace_batch_mode,
+            },
+        },
+    )
 
 
 @dataclass
@@ -67,27 +241,37 @@ class SplitCandidateSelector(SplitPointSelector):
 
 def _candidate_from_runtime(runtime: SplitRuntime, split_spec: SplitSpec) -> SplitCandidate:
     split_id = str(getattr(runtime, "split_id", split_spec.boundary))
+    ariadne_candidate = getattr(runtime, "candidate", None)
+    if ariadne_candidate is not None and getattr(runtime, "trace_plan", None) is not None:
+        return _candidate_from_ariadne_candidate(runtime, split_spec, ariadne_candidate)
+    boundary_labels = list(getattr(getattr(runtime, "segments", None), "boundary_order", ()) or [])
+    if not boundary_labels:
+        boundary_labels = list(getattr(ariadne_candidate, "boundary_nodes", ()) or [split_id])
+    payload_bytes = _candidate_payload_bytes(ariadne_candidate)
+    is_trainable_tail = bool(getattr(ariadne_candidate, "trainable_suffix", True))
     return SplitCandidate(
         candidate_id=split_id,
         edge_nodes=[split_id],
         cloud_nodes=[],
         boundary_edges=[],
-        boundary_tensor_labels=[split_id],
+        boundary_tensor_labels=boundary_labels,
         edge_input_labels=[],
         cloud_input_labels=[],
         cloud_output_labels=[],
         estimated_edge_flops=0.0,
         estimated_cloud_flops=0.0,
-        estimated_payload_bytes=0,
+        estimated_payload_bytes=payload_bytes,
         estimated_privacy_risk=0.0,
         estimated_latency=0.0,
-        is_trainable_tail=True,
+        is_trainable_tail=is_trainable_tail,
         is_validated=True,
         legacy_layer_index=None,
-        boundary_count=1,
+        boundary_count=len(boundary_labels),
         metadata={
             "runtime": "ariadne",
             "graph_signature": getattr(runtime, "graph_signature", None),
+            "ariadne_boundary_after": getattr(ariadne_candidate, "boundary_after", None),
+            "ariadne_trainable_suffix": is_trainable_tail,
             "split_spec": {
                 "boundary": split_spec.boundary,
                 "dynamic_batch": split_spec.dynamic_batch,
@@ -161,6 +345,68 @@ class UniversalModelSplitter:
         self.trainability_loss_fn = None
         self.model_name: str | None = None
         self.model_family: str | None = None
+        self._trace_sample_input: Any = None
+        self._last_replay_validation: dict[str, Any] | None = None
+
+    def _select_replayable_auto_runtime(
+        self,
+        runtime: SplitRuntime,
+        model: torch.nn.Module,
+        sample_input: Any,
+        *,
+        mode: str,
+        require_trainable: bool,
+    ) -> SplitRuntime:
+        report = _runtime_replay_report(
+            runtime,
+            model,
+            sample_input,
+            require_trainable=require_trainable,
+        )
+        if bool(report.get("success", False)):
+            self._last_replay_validation = report
+            return runtime
+
+        if getattr(getattr(runtime, "split_spec", None), "boundary", None) != "auto":
+            self._last_replay_validation = report
+            return runtime
+
+        failures: list[str] = [str(report.get("error") or "unknown")]
+        candidates = sorted(
+            enumerate_frontier_splits(runtime.trace_plan),
+            key=lambda candidate: (
+                0 if bool(getattr(candidate, "trainable_suffix", False)) else 1,
+                _candidate_payload_bytes(candidate),
+                str(getattr(candidate, "split_id", "")),
+            ),
+        )
+        for candidate in candidates:
+            if require_trainable and not bool(getattr(candidate, "trainable_suffix", False)):
+                continue
+            candidate_runtime = SplitRuntime(
+                trace_plan=runtime.trace_plan,
+                split_spec=runtime.split_spec,
+                candidate=candidate,
+                segments=build_segments(runtime.trace_plan, candidate),
+                mode=mode,
+            )
+            candidate_report = _runtime_replay_report(
+                candidate_runtime,
+                model,
+                sample_input,
+                require_trainable=require_trainable,
+            )
+            if bool(candidate_report.get("success", False)):
+                self._last_replay_validation = candidate_report
+                return candidate_runtime
+            failures.append(str(candidate_report.get("error") or "unknown"))
+
+        self._last_replay_validation = report
+        detail = "; ".join(dict.fromkeys(failures[:4]))
+        raise RuntimeError(
+            "No replayable Ariadne split candidate satisfied the fixed split request"
+            + (f": {detail}" if detail else ".")
+        )
 
     def trace(
         self,
@@ -196,9 +442,17 @@ class UniversalModelSplitter:
             self.split_spec,
             mode=mode,
         )
+        self.runtime = self._select_replayable_auto_runtime(
+            self.runtime,
+            model,
+            sample_input,
+            mode=mode,
+            require_trainable=bool(self.split_spec.trainable),
+        )
         self.graph = str(getattr(self.runtime, "graph_signature", ""))
         self.current_candidate = _candidate_from_runtime(self.runtime, self.split_spec)
         self.candidates = [self.current_candidate]
+        self._trace_sample_input = sample_input
         return self
 
     def trace_graph(
@@ -223,6 +477,8 @@ class UniversalModelSplitter:
         self.graph = str(getattr(runtime, "graph_signature", ""))
         self.current_candidate = _candidate_from_runtime(runtime, self.split_spec)
         self.candidates = [self.current_candidate]
+        self._trace_sample_input = None
+        self._last_replay_validation = None
         return self
 
     def bind_graph(self, model: torch.nn.Module, graph: Any, **_: Any) -> "UniversalModelSplitter":
@@ -237,6 +493,86 @@ class UniversalModelSplitter:
             )
         return self.runtime
 
+    def _find_ariadne_candidate(
+        self,
+        *,
+        candidate: SplitCandidate | None = None,
+        candidate_id: str | None = None,
+        layer_label: str | None = None,
+        boundary_tensor_labels: list[str] | None = None,
+    ):
+        runtime = self._ensure_runtime()
+        plan = getattr(runtime, "trace_plan", None)
+        if plan is None:
+            raise KeyError("Ariadne runtime does not expose a trace plan.")
+
+        expected_ids = {
+            str(value)
+            for value in (
+                candidate_id,
+                getattr(candidate, "candidate_id", None),
+                layer_label,
+                (candidate.metadata or {}).get("ariadne_boundary_after")
+                if candidate is not None
+                else None,
+            )
+            if value is not None
+        }
+        expected_boundaries = list(
+            boundary_tensor_labels
+            or (getattr(candidate, "boundary_tensor_labels", None) if candidate else None)
+            or []
+        )
+        expected_boundary_set = set(expected_boundaries)
+
+        for item in enumerate_frontier_splits(plan):
+            aliases = {
+                str(getattr(item, "split_id", "")),
+                str(getattr(item, "boundary_after", "")),
+                f"after:{getattr(item, 'boundary_after', '')}",
+            }
+            if expected_ids and aliases.intersection(expected_ids):
+                return item
+            item_boundaries = list(getattr(item, "boundary_nodes", ()) or ())
+            if expected_boundaries and (
+                item_boundaries == expected_boundaries
+                or set(item_boundaries) == expected_boundary_set
+            ):
+                return item
+
+        requested = candidate_id or getattr(candidate, "candidate_id", None) or layer_label
+        raise KeyError(f"Ariadne split candidate {requested!r} is not available.")
+
+    def _bind_ariadne_candidate(
+        self,
+        *,
+        candidate: SplitCandidate | None = None,
+        candidate_id: str | None = None,
+        layer_label: str | None = None,
+        boundary_tensor_labels: list[str] | None = None,
+    ) -> SplitCandidate:
+        runtime = self._ensure_runtime()
+        ariadne_candidate = self._find_ariadne_candidate(
+            candidate=candidate,
+            candidate_id=candidate_id,
+            layer_label=layer_label,
+            boundary_tensor_labels=boundary_tensor_labels,
+        )
+        split_spec = self.split_spec or getattr(runtime, "split_spec", None) or SplitSpec(
+            boundary=getattr(ariadne_candidate, "split_id", "auto")
+        )
+        rebound = SplitRuntime(
+            trace_plan=runtime.trace_plan,
+            split_spec=split_spec,
+            candidate=ariadne_candidate,
+            segments=build_segments(runtime.trace_plan, ariadne_candidate),
+            mode=runtime.mode,
+        )
+        self.runtime = rebound
+        self.graph = str(getattr(rebound, "graph_signature", ""))
+        self.current_candidate = _candidate_from_runtime(rebound, split_spec)
+        return self.current_candidate
+
     def split(
         self,
         *,
@@ -246,24 +582,64 @@ class UniversalModelSplitter:
         layer_label: str | None = None,
         boundary_tensor_labels: list[str] | None = None,
     ) -> SplitCandidate:
-        del layer_index, layer_label, boundary_tensor_labels
+        del layer_index
         if candidate is not None:
-            self.current_candidate = candidate
-            return candidate
+            try:
+                return self._bind_ariadne_candidate(candidate=candidate)
+            except KeyError:
+                self.current_candidate = candidate
+                return candidate
         chosen = self.current_candidate
         if chosen is None:
             runtime = self._ensure_runtime()
             chosen = _candidate_from_runtime(runtime, self.split_spec or SplitSpec(boundary="auto"))
             self.current_candidate = chosen
         if candidate_id is not None and chosen.candidate_id != candidate_id:
-            raise KeyError(
-                "Ariadne runtime exposes "
-                f"split_id={chosen.candidate_id!r}, not {candidate_id!r}."
+            return self._bind_ariadne_candidate(candidate_id=candidate_id)
+        if layer_label is not None or boundary_tensor_labels:
+            return self._bind_ariadne_candidate(
+                layer_label=layer_label,
+                boundary_tensor_labels=boundary_tensor_labels,
             )
         return chosen
 
-    def enumerate_candidates(self, **_: Any) -> list[SplitCandidate]:
-        return list(self.candidates or [self.split()])
+    def enumerate_candidates(self, **kwargs: Any) -> list[SplitCandidate]:
+        runtime = self._ensure_runtime()
+        plan = getattr(runtime, "trace_plan", None)
+        if plan is None:
+            return list(self.candidates or [self.split()])
+
+        max_boundary_count = kwargs.get("max_boundary_count")
+        max_payload_bytes = kwargs.get("max_payload_bytes")
+        split_spec = self.split_spec or getattr(runtime, "split_spec", None) or SplitSpec(
+            boundary="auto"
+        )
+        candidates = [
+            _candidate_from_ariadne_candidate(runtime, split_spec, item)
+            for item in enumerate_frontier_splits(plan)
+        ]
+        if max_boundary_count is not None:
+            candidates = [
+                item
+                for item in candidates
+                if int(item.boundary_count) <= int(max_boundary_count)
+            ]
+        if max_payload_bytes is not None:
+            candidates = [
+                item
+                for item in candidates
+                if int(item.estimated_payload_bytes) <= int(max_payload_bytes)
+            ]
+        candidates.sort(
+            key=lambda item: (
+                int(item.estimated_payload_bytes),
+                int(item.boundary_count),
+                item.legacy_layer_index if item.legacy_layer_index is not None else 10**9,
+                item.candidate_id,
+            )
+        )
+        self.candidates = list(candidates)
+        return list(candidates)
 
     def bind_candidate_descriptor(
         self,
@@ -372,8 +748,37 @@ class UniversalModelSplitter:
         **_: Any,
     ) -> dict[str, Any]:
         chosen = candidate or self.current_candidate
+        if self.runtime is None:
+            return {
+                "success": False,
+                "candidate_id": getattr(chosen, "candidate_id", None),
+                "runtime": "ariadne",
+                "error": "runtime is not prepared",
+            }
+        if candidate is not None:
+            try:
+                chosen = self._bind_ariadne_candidate(candidate=candidate)
+            except KeyError as exc:
+                return {
+                    "success": False,
+                    "tail_trainability": bool(getattr(chosen, "is_trainable_tail", False)),
+                    "candidate_id": getattr(chosen, "candidate_id", None),
+                    "runtime": "ariadne",
+                    "error": str(exc),
+                }
+        if self.model is not None and self._trace_sample_input is not None:
+            report = _runtime_replay_report(
+                self.runtime,
+                self.model,
+                self._trace_sample_input,
+                require_trainable=bool(getattr(chosen, "is_trainable_tail", False)),
+            )
+            self._last_replay_validation = report
+        else:
+            report = dict(self._last_replay_validation or {"success": True})
+
         return {
-            "success": self.runtime is not None,
+            **report,
             "candidate_id": getattr(chosen, "candidate_id", None),
             "runtime": "ariadne",
         }

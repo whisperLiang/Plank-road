@@ -40,7 +40,7 @@ from model_management.universal_model_split import (
     reconstruct_candidate_from_descriptor,
 )
 
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v2"
+FIXED_SPLIT_PLAN_VERSION = "fixed-split.v3"
 FIXED_SPLIT_EXACT_CANDIDATE_CACHE_KEY = "cp_sat_exact_fixed_single"
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
@@ -864,18 +864,27 @@ def _profile_from_report(
     candidate: SplitCandidate,
     report: Mapping[str, Any],
 ) -> CandidateProfile:
-    _, graph = runtime._ensure_ready()
+    graph = _runtime_graph(runtime)
     error = report.get("error")
+    if _graph_has_candidate_shape(graph):
+        boundary_shape_summary = [
+            (label, graph.nodes[label].tensor_shape)
+            for label in candidate.boundary_tensor_labels
+        ]
+    else:
+        boundary_shape_summary = [
+            (str(label), None)
+            for label, _shape in list(
+                (candidate.metadata or {}).get("boundary_shape_summary", [])
+            )
+        ] or [(label, None) for label in candidate.boundary_tensor_labels]
     return CandidateProfile(
         candidate_id=candidate.candidate_id,
         edge_flops=candidate.estimated_edge_flops,
         cloud_flops=candidate.estimated_cloud_flops,
         payload_bytes=candidate.estimated_payload_bytes,
         boundary_tensor_count=candidate.boundary_count,
-        boundary_shape_summary=[
-            (label, graph.nodes[label].tensor_shape)
-            for label in candidate.boundary_tensor_labels
-        ],
+        boundary_shape_summary=boundary_shape_summary,
         estimated_privacy_leakage=candidate.estimated_privacy_risk,
         measured_edge_latency=float(report.get("edge_latency", 0.0)),
         measured_cloud_latency=float(report.get("cloud_latency", 0.0)),
@@ -1127,8 +1136,74 @@ def compute_fixed_split_for_model(
     exact_diagnostics: dict[str, Any] | None = None
 
     if _is_ariadne_runtime(runtime):
+        eligible = _enumerate_feasible_candidates(runtime, constraints)
+        candidate_pool = list(getattr(runtime, "candidates", None) or [])
+        if eligible:
+            if not constraints.validate_candidates:
+                chosen, privacy_leakage, freezing_ratio = min(
+                    eligible,
+                    key=_eligible_candidate_key,
+                )
+                profile = None
+                runtime.split(candidate=chosen)
+            else:
+                profile, chosen, privacy_leakage, freezing_ratio = _select_validated_candidate(
+                    runtime,
+                    eligible,
+                    constraints,
+                )
+            validation = _build_validation_payload(chosen, profile)
+            validation.update(
+                {
+                    "runtime": "ariadne",
+                    "selection": "constraints",
+                    "split_id": chosen.candidate_id,
+                    "candidate_pool_size": len(candidate_pool),
+                }
+            )
+            trace_signature = _trace_signature(runtime)
+            return SplitPlan(
+                split_config_id=_make_plan_id(
+                    model_name=model_name or model.__class__.__name__,
+                    candidate=chosen,
+                    constraints=constraints,
+                ),
+                model_name=model_name or model.__class__.__name__,
+                candidate_id=chosen.candidate_id,
+                split_index=chosen.legacy_layer_index,
+                split_label=chosen.candidate_id,
+                boundary_tensor_labels=list(chosen.boundary_tensor_labels),
+                payload_bytes=int(chosen.estimated_payload_bytes),
+                privacy_metric=float(privacy_leakage),
+                privacy_risk=float(privacy_leakage),
+                layer_freezing_ratio=float(freezing_ratio),
+                privacy_leakage=float(privacy_leakage),
+                edge_parameter_count=int(getattr(chosen, "edge_parameter_count", 0)),
+                total_parameter_count=int(getattr(chosen, "total_parameter_count", 0)),
+                validation=validation,
+                constraints=_constraints_payload(constraints),
+                trace_signature=trace_signature,
+            )
+
+        if candidate_pool:
+            raise RuntimeError(
+                "No split candidate satisfies the fixed split constraints. "
+                f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
+                "privacy_min_edge_parameter_count="
+                f"{_privacy_min_edge_parameter_count(constraints)}, "
+                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
+            )
+
         chosen = runtime.split()
         validation = runtime.validate_candidate(chosen) if constraints.validate_candidates else {}
+        if constraints.validate_candidates and (
+            not bool(validation.get("success", False))
+            or not bool(validation.get("tail_trainability", chosen.is_trainable_tail))
+        ):
+            raise RuntimeError(
+                "No replayable Ariadne split candidate satisfies the fixed split constraints. "
+                f"candidate_id={chosen.candidate_id}, error={validation.get('error')}"
+            )
         trace_signature = _trace_signature(runtime)
         return SplitPlan(
             split_config_id=_make_plan_id(
@@ -1138,19 +1213,26 @@ def compute_fixed_split_for_model(
             ),
             model_name=model_name or model.__class__.__name__,
             candidate_id=chosen.candidate_id,
-            split_index=None,
+            split_index=chosen.legacy_layer_index,
             split_label=chosen.candidate_id,
             boundary_tensor_labels=list(chosen.boundary_tensor_labels),
             payload_bytes=int(chosen.estimated_payload_bytes),
-            privacy_metric=0.0,
-            privacy_risk=0.0,
-            layer_freezing_ratio=0.0,
-            privacy_leakage=0.0,
-            edge_parameter_count=0,
-            total_parameter_count=0,
+            privacy_metric=float(_privacy_leakage(chosen, constraints)),
+            privacy_risk=float(_privacy_leakage(chosen, constraints)),
+            layer_freezing_ratio=float(
+                _layer_freezing_ratio(
+                    runtime,
+                    chosen,
+                    total_trainable_layers=_total_trainable_layers(runtime),
+                )
+            ),
+            privacy_leakage=float(_privacy_leakage(chosen, constraints)),
+            edge_parameter_count=int(getattr(chosen, "edge_parameter_count", 0)),
+            total_parameter_count=int(getattr(chosen, "total_parameter_count", 0)),
             validation={
                 **dict(validation),
                 "runtime": "ariadne",
+                "selection": "current_candidate_fallback",
                 "split_id": chosen.candidate_id,
             },
             constraints=_constraints_payload(constraints),
@@ -1367,7 +1449,7 @@ def load_or_compute_fixed_split_plan(
                     chosen_candidate=cached_candidate,
                 )
                 return cached
-            except RuntimeError as exc:
+            except (KeyError, RuntimeError) as exc:
                 logger.info("Cached fixed split plan invalidated; recomputing. {}", exc)
 
     plan = compute_fixed_split_for_model(
