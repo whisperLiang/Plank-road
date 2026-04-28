@@ -9,12 +9,12 @@ from model_management.universal_model_split import (  # noqa: F401
     universal_split_retrain,
     LayerInfo,
     LayerProfile,
-    SplitPayload,
     SplitCandidate,
     CandidateProfile,
     SplitCandidateSelector,
     SplitPointSelector,
 )
+from model_management.payload import BoundaryPayload  # noqa: F401
 
 # Re-export Dynamic Activation Sparsity (SURGEON-style) API
 from model_management.activation_sparsity import (  # noqa: F401
@@ -30,11 +30,6 @@ from model_management.activation_sparsity import (  # noqa: F401
     compute_tgi,
 )
 
-# Re-export Model Zoo (unified detection model factory)
-from model_management.model_zoo import (  # noqa: F401
-    build_detection_model,
-    list_available_models,
-    is_wrapper_model,
-    model_has_roi_heads,
-    get_model_family,
-)
+# Model-zoo imports pull optional detector runtimes such as torchvision and
+# ultralytics. Keep package import lightweight; callers that need model-zoo
+# APIs should import model_management.model_zoo directly.

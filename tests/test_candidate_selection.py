@@ -1,29 +1,56 @@
 from __future__ import annotations
 
-import torch
-import torchvision.models as tv_models
-
-from model_management.candidate_profiler import profile_candidates
 from model_management.candidate_selector import SplitCandidateSelector
-from model_management.universal_model_split import UniversalModelSplitter
+from model_management.split_candidate import CandidateProfile, SplitCandidate
 
 
-def test_candidate_profiler_and_selector_operate_on_candidate_sets():
-    model = tv_models.resnet18(weights=None).eval()
-    sample = torch.randn(1, 3, 32, 32)
+def _candidate(index: int) -> SplitCandidate:
+    return SplitCandidate(
+        candidate_id=f"after:layer{index}",
+        edge_nodes=[f"layer{index}"],
+        cloud_nodes=[],
+        boundary_edges=[],
+        boundary_tensor_labels=[f"node_{index}"],
+        edge_input_labels=[],
+        cloud_input_labels=[],
+        cloud_output_labels=[],
+        estimated_edge_flops=float(index),
+        estimated_cloud_flops=float(10 - index),
+        estimated_payload_bytes=1024 * index,
+        estimated_privacy_risk=0.1 * index,
+        estimated_latency=float(index),
+        is_trainable_tail=True,
+        is_validated=True,
+        boundary_count=1,
+    )
 
-    splitter = UniversalModelSplitter(device="cpu")
-    splitter.trace(model, sample)
-    candidates = splitter.enumerate_candidates(max_candidates=6)
-    assert len(candidates) >= 2
 
-    profiles = profile_candidates(splitter, candidates[:3], validate=True, validation_runs=1)
-    assert len(profiles) == 3
-    assert all(profile.validation_passed for profile in profiles)
+def _profile(candidate: SplitCandidate) -> CandidateProfile:
+    return CandidateProfile(
+        candidate_id=candidate.candidate_id,
+        edge_flops=candidate.estimated_edge_flops,
+        cloud_flops=candidate.estimated_cloud_flops,
+        payload_bytes=candidate.estimated_payload_bytes,
+        boundary_tensor_count=candidate.boundary_count,
+        boundary_shape_summary=[(candidate.boundary_tensor_labels[0], ("B", 8))],
+        estimated_privacy_leakage=candidate.estimated_privacy_risk,
+        measured_edge_latency=0.01,
+        measured_cloud_latency=0.02,
+        measured_end_to_end_latency=candidate.estimated_latency,
+        replay_success_rate=1.0,
+        tail_trainability=True,
+        stability_score=1.0,
+        validation_passed=True,
+    )
 
-    selector = SplitCandidateSelector(candidates[:3], profiles, alpha=0.2, epsilon=0.0)
+
+def test_candidate_selector_operates_on_profiled_candidate_sets():
+    candidates = [_candidate(index) for index in range(1, 4)]
+    profiles = [_profile(candidate) for candidate in candidates]
+
+    selector = SplitCandidateSelector(candidates, profiles, alpha=0.2, epsilon=0.0)
     chosen = selector.select_candidate(bandwidth=12.0, edge_load=0.25, cloud_load=0.15)
-    assert chosen in {candidate.candidate_id for candidate in candidates[:3]}
+    assert chosen in {candidate.candidate_id for candidate in candidates}
 
     context = selector.fit_context(chosen, bandwidth=12.0, edge_load=0.25, cloud_load=0.15)
     assert context.shape[0] == selector.feature_dim
@@ -35,7 +62,3 @@ def test_candidate_profiler_and_selector_operate_on_candidate_sets():
     selector.invalidate_candidate(chosen)
     fallback = selector.select_candidate(bandwidth=8.0, edge_load=0.4, cloud_load=0.2)
     assert fallback != chosen
-
-    splitter_selector = splitter.create_split_selector(profiles)
-    pick = splitter_selector.select_candidate(bandwidth=10.0, edge_load=0.1, cloud_load=0.1)
-    assert pick in {candidate.candidate_id for candidate in splitter.candidates}

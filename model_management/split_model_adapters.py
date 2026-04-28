@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any
 
 import cv2
 import numpy as np
@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from ultralytics.models.utils.loss import RTDETRDetectionLoss
-from ultralytics.utils import ops
 from torchvision.models.detection.fcos import FCOS
 from torchvision.models.detection.image_list import ImageList
 from torchvision.models.detection.retinanet import RetinaNet
@@ -30,7 +29,7 @@ from model_management.ultralytics_parity import (
     postprocess_predictions,
     preprocess_bgr_images,
 )
-from model_management.payload import SplitPayload
+from model_management.payload import BoundaryPayload
 
 try:
     from rfdetr.models.lwdetr import build_criterion_and_postprocessors
@@ -318,7 +317,7 @@ def postprocess_split_runtime_output(
 def summarize_split_runtime_observables(
     model: torch.nn.Module,
     outputs: Any,
-    split_payload: SplitPayload | torch.Tensor | dict[str, torch.Tensor] | None = None,
+    split_payload: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float | None]:
     observables: dict[str, float | None] = {
         "feature_spectral_entropy": _summarize_payload_spectral_entropy(split_payload),
@@ -740,12 +739,12 @@ def _postprocess_anchor_detector_output(
 
 
 def _iter_payload_tensors(
-    split_payload: SplitPayload | torch.Tensor | dict[str, torch.Tensor] | None,
+    split_payload: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor] | None,
 ):
     if split_payload is None:
         return
-    if isinstance(split_payload, SplitPayload):
-        primary_label = split_payload.primary_label
+    if isinstance(split_payload, BoundaryPayload):
+        primary_label = getattr(split_payload, "primary_label", None)
         if primary_label and primary_label in split_payload.tensors:
             yield split_payload.tensors[primary_label]
         for label, tensor in split_payload.tensors.items():
@@ -830,7 +829,7 @@ def _spectral_entropy_from_matrix(matrix: torch.Tensor) -> float | None:
 
 
 def _summarize_payload_spectral_entropy(
-    split_payload: SplitPayload | torch.Tensor | dict[str, torch.Tensor] | None,
+    split_payload: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor] | None,
 ) -> float | None:
     for tensor in _iter_payload_tensors(split_payload):
         matrix = _feature_matrix_from_tensor(tensor)

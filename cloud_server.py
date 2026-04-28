@@ -7,7 +7,6 @@ import io
 import json
 import math
 import os
-import random
 import re
 import shutil
 import threading
@@ -54,8 +53,6 @@ from model_management.split_model_adapters import (
 )
 from model_management.universal_model_split import (
     UniversalModelSplitter,
-    _batch_payloads,
-    _clone_payload_for_padding,
     universal_split_retrain,
     load_split_feature_cache,
 )
@@ -64,22 +61,19 @@ from model_management.continual_learning_bundle import (
     load_training_bundle_manifest,
     prepare_split_training_cache,
 )
-from model_management.fixed_split import SplitPlan, _recover_split_plan_candidate
 from model_management.fixed_split_runtime_template import (
-    FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION,
     FixedSplitRuntimeTemplate,
     FixedSplitRuntimeTemplateKey,
     FixedSplitRuntimeTemplateLookup,
     bind_request_splitter_from_template,
-    compute_graph_trace_signature,
-    describe_split_candidate,
-    freeze_trace_timings,
+    fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
 )
-from model_management.payload import SplitPayload
+from model_management.split_runtime import make_split_spec, prepare_split_runtime
+from model_management.payload import BoundaryPayload
 from torchvision.models.detection.image_list import ImageList
 
-from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
+from grpc_server import message_transmission_pb2_grpc
 
 
 def _collate_fn(batch):
@@ -971,7 +965,7 @@ def _build_detection_proxy_prediction_cache(
             tuple[
                 list[object],
                 list[object],
-                SplitPayload | torch.Tensor,
+                BoundaryPayload | torch.Tensor,
                 Mapping[str, object] | None,
             ]
         ] = []
@@ -989,7 +983,7 @@ def _build_detection_proxy_prediction_cache(
                 skipped_missing_frame += 1
                 continue
             payload = record.get("intermediate")
-            if not isinstance(payload, (SplitPayload, torch.Tensor)):
+            if not isinstance(payload, (BoundaryPayload, torch.Tensor)):
                 skipped_missing_frame += 1
                 continue
             sample_metadata = (
@@ -1002,12 +996,6 @@ def _build_detection_proxy_prediction_cache(
             pending_samples.append((gt_boxes, gt_labels, payload, sample_metadata))
 
         prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
-        candidate_id = getattr(split_candidate, "candidate_id", None)
-        boundary_tensor_labels = getattr(
-            split_candidate,
-            "boundary_tensor_labels",
-            None,
-        )
         _set_detection_model_eval_mode(model)
         with torch.no_grad():
             batch_size = max(1, int(inference_batch_size))
@@ -1015,35 +1003,20 @@ def _build_detection_proxy_prediction_cache(
                 batch = pending_samples[start : start + batch_size]
                 batch_payloads = [payload for _, _, payload, _ in batch]
                 actual_batch_size = len(batch_payloads)
-                trace_batch_size = max(
-                    1,
-                    int(_infer_splitter_trace_batch_size(splitter)),
-                )
-                batched_payloads = list(batch_payloads)
-                if actual_batch_size < trace_batch_size:
-                    while len(batched_payloads) < trace_batch_size:
-                        batched_payloads.append(
-                            _clone_payload_for_padding(batched_payloads[-1])
-                        )
-                batched_payload = (
-                    batched_payloads[0]
-                    if len(batched_payloads) == 1
-                    else _batch_payloads(
-                        batched_payloads,
-                        boundary_tensor_labels=boundary_tensor_labels,
-                        candidate_id=candidate_id,
+                batched_payload = batch_payloads[0]
+                if not isinstance(batched_payload, BoundaryPayload):
+                    raise RuntimeError(
+                        "Cached split proxy evaluation requires Ariadne BoundaryPayload records."
                     )
-                )
+                if int(getattr(batched_payload, "batch_size", 0)) != actual_batch_size:
+                    raise RuntimeError(
+                        "Cached split proxy evaluation received per-sample payloads. "
+                        "Plank-road no longer guesses batched cat/stack payloads without Ariadne schema."
+                    )
                 raw_outputs = splitter.cloud_forward(
                     batched_payload,
                     candidate=split_candidate,
                 )
-                if len(batched_payloads) != actual_batch_size:
-                    raw_outputs = _trim_batched_runtime_outputs(
-                        raw_outputs,
-                        source_batch_size=len(batched_payloads),
-                        target_batch_size=actual_batch_size,
-                    )
                 low_threshold_predictions = _postprocess_cached_split_proxy_outputs(
                     model,
                     raw_outputs,
@@ -2248,42 +2221,21 @@ class CloudContinualLearner:
 
     def _split_batched_payload(
         self,
-        batch_payload: SplitPayload,
+        batch_payload: BoundaryPayload,
         *,
         batch_size: int,
-    ) -> list[SplitPayload]:
-        if not isinstance(batch_payload, SplitPayload):
+    ) -> list[BoundaryPayload]:
+        if not isinstance(batch_payload, BoundaryPayload):
             raise TypeError(
-                "Cloud batch reconstruction expected SplitPayload output, "
+                "Cloud batch reconstruction expected Ariadne BoundaryPayload output, "
                 f"got {type(batch_payload).__name__}."
             )
-
-        unbound_tensors: dict[str, tuple[torch.Tensor, ...]] = {}
-        for label, tensor in batch_payload.tensors.items():
-            if tensor.ndim == 0 or tensor.shape[0] != batch_size:
-                raise RuntimeError(
-                    "Could not unbind batched split payload tensor along the batch dimension. "
-                    f"label={label!r}, expected_batch_size={batch_size}, shape={tuple(tensor.shape)}."
-                )
-            unbound_tensors[label] = tensor.unbind(dim=0)
-
-        payloads: list[SplitPayload] = []
-        for index in range(batch_size):
-            payloads.append(
-                SplitPayload(
-                    tensors=OrderedDict(
-                        (label, tensor_slices[index].unsqueeze(0))
-                        for label, tensor_slices in unbound_tensors.items()
-                    ),
-                    metadata=dict(batch_payload.metadata),
-                    candidate_id=batch_payload.candidate_id,
-                    boundary_tensor_labels=list(batch_payload.boundary_tensor_labels),
-                    primary_label=batch_payload.primary_label,
-                    split_index=batch_payload.split_index,
-                    split_label=batch_payload.split_label,
-                )
+        if int(getattr(batch_payload, "batch_size", 0)) != int(batch_size):
+            raise RuntimeError(
+                "Cloud batch reconstruction produced a BoundaryPayload with the wrong batch size "
+                f"(payload_batch={getattr(batch_payload, 'batch_size', None)}, expected={batch_size})."
             )
-        return payloads
+        return [batch_payload for _ in range(batch_size)]
 
     @staticmethod
     def _pad_runtime_batch_inputs(
@@ -2324,7 +2276,7 @@ class CloudContinualLearner:
                     "Cloud batch reconstruction expects one sample metadata record per raw path."
                 )
 
-            payloads: list[SplitPayload] = []
+            payloads: list[BoundaryPayload] = []
             chunk_size = max(
                 1,
                 int(self.batch_size if runtime_batch_size is None else runtime_batch_size),
@@ -2346,14 +2298,11 @@ class CloudContinualLearner:
                         )
                     )
 
-                inputs = self._pad_runtime_batch_inputs(
-                    prepared_inputs,
-                    target_batch_size=chunk_size,
-                )
+                inputs = torch.cat(prepared_inputs, dim=0)
                 batch_payload = splitter.edge_forward(inputs, candidate=candidate)
                 chunk_payloads = self._split_batched_payload(
                     batch_payload,
-                    batch_size=chunk_size,
+                    batch_size=len(chunk_paths),
                 )
                 payloads.extend(
                     chunk_payloads[:len(chunk_paths)]
@@ -2371,25 +2320,33 @@ class CloudContinualLearner:
     ) -> FixedSplitRuntimeTemplateKey:
         split_plan = dict(manifest.get("split_plan", {}))
         trace_image_size = self._infer_bundle_trace_image_size(dict(manifest))
-        batch_size = max(
-            1,
-            int(self.batch_size if runtime_batch_size is None else runtime_batch_size),
+        image_size = trace_image_size or (640, 640)
+        boundary = (
+            split_plan.get("split_label")
+            or (list(split_plan.get("boundary_tensor_labels") or [])[-1]
+                if split_plan.get("boundary_tensor_labels")
+                else "auto")
         )
-        trace_input_shape = None
-        if trace_image_size is not None:
-            trace_input_shape = (
-                batch_size,
-                3,
-                int(trace_image_size[0]),
-                int(trace_image_size[1]),
-            )
-        return FixedSplitRuntimeTemplateKey(
+        boundary = str(boundary)
+        if boundary != "auto" and not boundary.startswith("after:"):
+            boundary = f"after:{boundary}"
+        model_family = model_zoo.get_model_family(str(model_name))
+        split_spec = make_split_spec(
+            boundary,
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+            model_family=model_family,
+        )
+        symbolic_example = torch.empty((2, 3, int(image_size[0]), int(image_size[1])))
+        return fixed_split_runtime_template_key(
             model_name=str(model_name),
-            trace_image_size=trace_image_size,
-            trace_input_shape=trace_input_shape,
-            trace_batch_size=batch_size,
+            model_family=model_family,
+            split_spec=split_spec,
+            example_inputs=symbolic_example,
+            graph_signature=str(split_plan.get("trace_signature") or "") or None,
             split_plan_hash=_json_fingerprint(split_plan),
-            version=FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION,
+            mode="generated_eager",
         )
 
     def _build_fixed_split_runtime_template(
@@ -2402,8 +2359,7 @@ class CloudContinualLearner:
         trace_sample_input: torch.Tensor | None = None,
         runtime_batch_size: int | None = None,
     ) -> FixedSplitRuntimeTemplate:
-        split_plan = SplitPlan.from_dict(dict(manifest.get("split_plan", {})))
-        splitter = UniversalModelSplitter(device=self.device)
+        split_plan_payload = dict(manifest.get("split_plan", {}))
         split_model = get_split_runtime_model(model)
         sample_input = trace_sample_input
         if sample_input is None:
@@ -2411,72 +2367,53 @@ class CloudContinualLearner:
                 model,
                 bundle_root,
                 manifest,
-                runtime_batch_size=runtime_batch_size,
+                runtime_batch_size=2,
             )
-        splitter.trace_graph(split_model, sample_input)
-        if splitter.graph is None:
-            raise RuntimeError("Fixed split runtime template tracing did not produce a graph.")
-        self._log_stage_elapsed(
-            "TorchLens trace forward",
-            getattr(splitter, "trace_timings", {}).get("torchlens_trace_forward"),
+        boundary = (
+            split_plan_payload.get("split_label")
+            or (list(split_plan_payload.get("boundary_tensor_labels") or [])[-1]
+                if split_plan_payload.get("boundary_tensor_labels")
+                else "auto")
         )
-        self._log_stage_elapsed(
-            "graph build",
-            getattr(splitter, "trace_timings", {}).get("graph_build"),
+        boundary = str(boundary)
+        if boundary != "auto" and not boundary.startswith("after:"):
+            boundary = f"after:{boundary}"
+        model_name = self._resolve_fixed_split_model_name(manifest)
+        model_family = model_zoo.get_model_family(model_name)
+        split_spec = make_split_spec(
+            boundary,
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+            model_family=model_family,
         )
-        recovery_started = time.perf_counter()
-        candidate, recovery_mode = _recover_split_plan_candidate(splitter, split_plan)
-        recovery_elapsed = time.perf_counter() - recovery_started
-        candidate_enumeration_elapsed = float(
-            getattr(splitter, "trace_timings", {}).get("candidate_enumeration", 0.0)
+        trace_started = time.perf_counter()
+        runtime = prepare_split_runtime(
+            split_model,
+            sample_input,
+            split_spec,
+            mode="generated_eager",
         )
-        if recovery_mode == "candidate_pool" or candidate_enumeration_elapsed > 0.0:
-            self._log_stage_elapsed(
-                "candidate enumeration / apply split plan",
-                candidate_enumeration_elapsed + recovery_elapsed,
-            )
-        else:
-            logger.info(
-                "[FixedSplitCL] runtime template resolved fixed split via {} without candidate enumeration (recovery_time={:.3f}s, key={}).",
-                recovery_mode,
-                recovery_elapsed,
-                template_key.to_log_payload(),
-            )
-        trace_signature = (
-            str(split_plan.trace_signature).strip()
-            if split_plan.trace_signature is not None and str(split_plan.trace_signature).strip()
-            else compute_graph_trace_signature(splitter.graph)
-        )
-        trace_input_shape = (
-            tuple(int(dim) for dim in sample_input.shape)
-            if isinstance(sample_input, torch.Tensor)
-            else None
-        )
+        self._log_stage_elapsed("Ariadne prepare_split", time.perf_counter() - trace_started)
+        trace_signature = str(getattr(runtime, "graph_signature", "") or "")
         logger.info(
-            "[FixedSplitCL] runtime template resolved fixed split using {} recovery (recovery_time={:.3f}s, trace_signature={}, key={}).",
-            recovery_mode,
-            recovery_elapsed,
+            "[FixedSplitCL] runtime template prepared Ariadne split (model_name={}, model_family={}, split_id={}, trace_signature={}, key={}).",
+            model_name,
+            model_family,
+            getattr(runtime, "split_id", None),
             trace_signature,
             template_key.to_log_payload(),
         )
         return FixedSplitRuntimeTemplate(
             cache_key=template_key,
-            graph=splitter.graph,
-            candidate_descriptor=describe_split_candidate(candidate),
-            candidate_recovery_mode=recovery_mode,
-            trace_signature=trace_signature,
-            trace_timings=freeze_trace_timings(getattr(splitter, "trace_timings", {}) or {}),
-            trace_used_output_fallback=bool(
-                getattr(splitter, "trace_used_output_fallback", False)
-            ),
-            trace_image_size=(
-                tuple(int(dim) for dim in template_key.trace_image_size)
-                if template_key.trace_image_size is not None
-                else None
-            ),
-            trace_input_shape=trace_input_shape,
-            trace_batch_size=int(template_key.trace_batch_size),
+            runtime=runtime,
+            split_spec=split_spec,
+            model_name=model_name,
+            model_family=model_family,
+            graph_signature=trace_signature,
+            symbolic_input_schema_hash=template_key.symbolic_input_schema_hash,
             split_plan_hash=str(template_key.split_plan_hash),
+            mode="generated_eager",
         )
 
     def _get_or_create_fixed_split_runtime_template(
@@ -2524,9 +2461,9 @@ class CloudContinualLearner:
         )
         bind_elapsed = time.perf_counter() - bind_started
         logger.info(
-            "[FixedSplitCL] request-local runtime bind took {:.3f}s (recovery_mode={}, key={}).",
+            "[FixedSplitCL] request-local Ariadne runtime bind took {:.3f}s (split_id={}, key={}).",
             bind_elapsed,
-            template.candidate_recovery_mode,
+            getattr(splitter.runtime, "split_id", None),
             template.cache_key.to_log_payload(),
         )
         return splitter, candidate
@@ -3548,7 +3485,7 @@ class CloudContinualLearner:
                     f"[CL] Starting cloud retraining for edge {edge_id}: "
                     f"{len(frame_indices)} frames, {num_epoch} epochs."
                 )
-                annotation_path = self._generate_annotations(
+                self._generate_annotations(
                     edge_id, frame_indices, cache_path
                 )
                 model_bytes = self._retrain_edge_model(
@@ -3996,7 +3933,7 @@ class CloudContinualLearner:
                     break
 
             # The graph-based split runtime now infers the selected candidate
-            # directly from cached SplitPayload records.
+            # directly from cached Ariadne BoundaryPayload records.
             sample_input = build_split_runtime_sample_input(
                 tmp_model,
                 image_size=runtime_image_size or (224, 224),

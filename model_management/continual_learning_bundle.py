@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 from loguru import logger
 
-from model_management.payload import SplitPayload
+from model_management.payload import BoundaryPayload, SplitPayload
 from model_management.universal_model_split import save_split_feature_cache
 
 
@@ -259,10 +259,10 @@ def load_training_bundle_manifest(bundle_root: str) -> dict[str, Any]:
     return manifest
 
 
-def _load_intermediate(feature_path: str) -> SplitPayload:
+def _load_intermediate(feature_path: str) -> BoundaryPayload:
     payload = torch.load(feature_path, map_location="cpu", weights_only=False)
     intermediate = payload.get("intermediate")
-    if isinstance(intermediate, SplitPayload):
+    if isinstance(intermediate, BoundaryPayload):
         return intermediate
     if isinstance(intermediate, dict):
         return SplitPayload.from_mapping(intermediate)
@@ -321,20 +321,23 @@ def _infer_input_image_size(
 
 
 def _payload_matches_split_plan(payload: Any, split_plan: dict[str, Any]) -> bool:
-    if not isinstance(payload, SplitPayload):
+    if not isinstance(payload, BoundaryPayload):
         return True
     expected_boundary = split_plan.get("boundary_tensor_labels") or []
     if expected_boundary:
-        return list(payload.boundary_tensor_labels) == list(expected_boundary)
+        return list(getattr(payload, "boundary_tensor_labels", list(payload.tensors.keys()))) == list(expected_boundary)
     expected_split_label = split_plan.get("split_label")
-    if expected_split_label is not None and payload.split_label is not None:
-        return str(payload.split_label) == str(expected_split_label)
+    payload_split_label = getattr(payload, "split_label", None)
+    if expected_split_label is not None and payload_split_label is not None:
+        return str(payload_split_label) == str(expected_split_label)
     expected_split_index = split_plan.get("split_index")
-    if expected_split_index is not None and payload.split_index is not None:
-        return int(payload.split_index) == int(expected_split_index)
+    payload_split_index = getattr(payload, "split_index", None)
+    if expected_split_index is not None and payload_split_index is not None:
+        return int(payload_split_index) == int(expected_split_index)
     expected_candidate_id = split_plan.get("candidate_id")
-    if expected_candidate_id and payload.candidate_id is not None:
-        return str(payload.candidate_id) == str(expected_candidate_id)
+    payload_candidate_id = getattr(payload, "candidate_id", None) or getattr(payload, "split_id", None)
+    if expected_candidate_id and payload_candidate_id is not None:
+        return str(payload_candidate_id) == str(expected_candidate_id)
     return True
 
 
@@ -396,7 +399,6 @@ def prepare_split_training_cache(
             else None
         )
         feature_path = _feature_record_path(target_cache_path, sample_id)
-        frame_path = _frame_cache_path(target_cache_path, sample_id) if raw_relpath is not None else None
         existing_entry = previous_metadata_samples.get(sample_id)
         source_feature_digest = _hash_file(
             os.path.join(bundle_root, bundled_feature.replace("/", os.sep))
