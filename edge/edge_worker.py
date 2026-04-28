@@ -3,8 +3,9 @@ import io
 import os
 import threading
 import time
-from typing import Mapping
 from queue import Empty, Full, Queue
+from typing import Mapping
+
 import grpc
 import torch
 from loguru import logger
@@ -21,7 +22,7 @@ from edge.resource_aware_trigger import (
     estimate_bandwidth,
     query_cloud_resource,
 )
-from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
+from edge.sample_store import HIGH_CONFIDENCE, LOW_CONFIDENCE, EdgeSampleStore
 from edge.task import Task
 from edge.transmit import (
     download_trained_model,
@@ -44,7 +45,6 @@ from model_management.object_detection import InferenceArtifacts, Object_Detecti
 from model_management.split_model_adapters import build_split_training_loss
 from model_management.universal_model_split import UniversalModelSplitter
 from tools.grpc_options import grpc_message_options
-
 
 _QUEUE_STOP = object()
 
@@ -184,12 +184,18 @@ class EdgeWorker:
                 sample_input = self.small_object_detection.prepare_splitter_input(frame)
             else:
                 trace_image_size = image_size or (224, 224)
-                sample_input = self.small_object_detection.build_split_sample_input(trace_image_size)
+                sample_input = self.small_object_detection.build_split_sample_input(
+                    trace_image_size
+                )
             constraints = SplitConstraints.from_config(fixed_split_cfg)
             cache_path = os.path.join(self.config.retrain.cache_path, "fixed_split_plan.json")
             graph_artifact_loaded = False
             artifact_paths = artifact_paths_from_plan_cache(cache_path)
-            if artifact_paths is not None:
+            legacy_graph_runtime = hasattr(self.universal_splitter, "bind_graph") and not hasattr(
+                self.universal_splitter,
+                "runtime",
+            )
+            if artifact_paths is not None and legacy_graph_runtime:
                 graph_payload = load_torch_artifact(artifact_paths.graph_path)
                 if isinstance(graph_payload, Mapping):
                     model_fingerprint = model_structure_fingerprint(split_model)
@@ -222,9 +228,20 @@ class EdgeWorker:
                         sample_input,
                     )
                 logger.info(
-                    "Fixed split startup using cold graph build (trace_time={:.3f}s, graph_build={:.3f}s)",
-                    float(getattr(self.universal_splitter, "trace_timings", {}).get("torchlens_trace_forward", 0.0)),
-                    float(getattr(self.universal_splitter, "trace_timings", {}).get("graph_build", 0.0)),
+                    "Fixed split startup using cold graph build "
+                    "(trace_time={:.3f}s, graph_build={:.3f}s)",
+                    float(
+                        getattr(self.universal_splitter, "trace_timings", {}).get(
+                            "torchlens_trace_forward",
+                            0.0,
+                        )
+                    ),
+                    float(
+                        getattr(self.universal_splitter, "trace_timings", {}).get(
+                            "graph_build",
+                            0.0,
+                        )
+                    ),
                 )
             self.fixed_split_plan = load_or_compute_fixed_split_plan(
                 split_model,
@@ -237,10 +254,18 @@ class EdgeWorker:
             )
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
+            plan_description = (
+                self.fixed_split_plan.describe()
+                if hasattr(self.fixed_split_plan, "describe")
+                else (
+                    f"split_index={getattr(self.fixed_split_plan, 'split_index', None)}, "
+                    f"payload_bytes={getattr(self.fixed_split_plan, 'payload_bytes', None)}"
+                )
+            )
             logger.info(
                 "Fixed split plan ready (split_config_id={}, {}, image_size={})",
                 self.fixed_split_plan.split_config_id,
-                self.fixed_split_plan.describe(),
+                plan_description,
                 self.split_trace_image_size,
             )
         except RuntimeError as exc:
@@ -318,7 +343,8 @@ class EdgeWorker:
     def _log_split_collection_disabled(self) -> None:
         if self.split_learning_disable_reason == "disabled_in_config":
             logger.info(
-                "Continual learning sample collection disabled because split_learning.enabled is false."
+                "Continual learning sample collection disabled because "
+                "split_learning.enabled is false."
             )
             return
         logger.warning(
@@ -594,7 +620,9 @@ class EdgeWorker:
                             )
                         break
 
-                    terminal_message = str(reply.message or f"Training job ended with status {status}")
+                    terminal_message = str(
+                        reply.message or f"Training job ended with status {status}"
+                    )
                     logger.error(
                         "Cloud continual learning failed for job {}: {}",
                         job_id,

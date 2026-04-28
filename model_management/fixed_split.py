@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -15,7 +14,6 @@ from model_management.candidate_generator import (
     EXACT_OBJECTIVE_VERSION,
     PRIVACY_LEAKAGE_EPSILON,
     ExactCandidateSolveSession,
-    build_candidate_from_edge_seed,
     estimate_privacy_leakage_from_edge_params,
     min_edge_parameters_for_privacy,
     solve_best_candidate_exact,
@@ -41,7 +39,6 @@ from model_management.universal_model_split import (
     build_candidate_descriptor,
     reconstruct_candidate_from_descriptor,
 )
-
 
 FIXED_SPLIT_PLAN_VERSION = "fixed-split.v2"
 FIXED_SPLIT_EXACT_CANDIDATE_CACHE_KEY = "cp_sat_exact_fixed_single"
@@ -246,9 +243,28 @@ def _runtime_graph(splitter: UniversalModelSplitter) -> Any | None:
     return getattr(splitter, "graph", None)
 
 
+def _graph_has_candidate_shape(graph: Any | None) -> bool:
+    return graph is not None and hasattr(graph, "relevant_labels") and hasattr(graph, "nodes")
+
+
+def _is_ariadne_runtime(splitter: UniversalModelSplitter) -> bool:
+    if hasattr(splitter, "_ensure_ready"):
+        return False
+    return getattr(splitter, "runtime", None) is not None or isinstance(
+        getattr(splitter, "graph", None),
+        str,
+    )
+
+
 def _trace_signature(splitter: UniversalModelSplitter) -> str:
+    runtime = getattr(splitter, "runtime", None)
+    graph_signature = getattr(runtime, "graph_signature", None)
+    if graph_signature:
+        return str(graph_signature)
     graph = _runtime_graph(splitter)
-    if graph is None or not hasattr(graph, "relevant_labels") or not hasattr(graph, "nodes"):
+    if isinstance(graph, str) and graph:
+        return graph
+    if not _graph_has_candidate_shape(graph):
         return "unavailable"
     digest: list[dict[str, Any]] = []
     for label in graph.relevant_labels:
@@ -266,8 +282,14 @@ def _trace_signature(splitter: UniversalModelSplitter) -> str:
 
 
 def _total_trainable_layers(splitter: UniversalModelSplitter) -> int:
-    _, graph = splitter._ensure_ready()
-    return sum(1 for label in graph.relevant_labels if graph.nodes[label].has_trainable_params)
+    graph = _runtime_graph(splitter)
+    if not _graph_has_candidate_shape(graph):
+        return 1
+    return sum(
+        1
+        for label in graph.relevant_labels
+        if bool(getattr(graph.nodes[label], "has_trainable_params", False))
+    )
 
 
 def _layer_freezing_ratio(
@@ -280,8 +302,14 @@ def _layer_freezing_ratio(
         return max(0.0, min(1.0, float(getattr(candidate, "edge_parameter_ratio", 0.0))))
     if total_trainable_layers <= 0:
         return 0.0
-    _, graph = splitter._ensure_ready()
-    frozen = sum(1 for label in candidate.edge_nodes if graph.nodes[label].has_trainable_params)
+    graph = _runtime_graph(splitter)
+    if not _graph_has_candidate_shape(graph):
+        return 0.0
+    frozen = sum(
+        1
+        for label in candidate.edge_nodes
+        if label in graph.nodes and bool(getattr(graph.nodes[label], "has_trainable_params", False))
+    )
     return frozen / float(total_trainable_layers)
 
 
@@ -402,8 +430,6 @@ def _load_compatible_graph_artifact(
         model_fingerprint=model_fingerprint,
         sample_signature_value=sample_signature_value,
     ):
-        return None
-    if not isinstance(payload.get("graph"), GraphIR):
         return None
     return dict(payload)
 
@@ -605,11 +631,21 @@ def _split_index_candidate_key(
         if candidate.boundary_tensor_labels
         else None
     )
+    payload_matches = (
+        int(plan.payload_bytes or 0) > 0
+        and int(candidate.estimated_payload_bytes) == int(plan.payload_bytes)
+    )
     return (
-        0 if plan.boundary_count and int(candidate.boundary_count) == int(plan.boundary_count) else 1,
-        0 if int(plan.payload_bytes or 0) > 0 and int(candidate.estimated_payload_bytes) == int(plan.payload_bytes) else 1,
-        0 if plan.split_label is not None and str(candidate_split_label) == str(plan.split_label) else 1,
-        0 if plan.candidate_id is not None and str(candidate.candidate_id) == str(plan.candidate_id) else 1,
+        0
+        if plan.boundary_count and int(candidate.boundary_count) == int(plan.boundary_count)
+        else 1,
+        0 if payload_matches else 1,
+        0
+        if plan.split_label is not None and str(candidate_split_label) == str(plan.split_label)
+        else 1,
+        0
+        if plan.candidate_id is not None and str(candidate.candidate_id) == str(plan.candidate_id)
+        else 1,
         int(candidate.estimated_payload_bytes),
         int(candidate.boundary_count),
         str(candidate.candidate_id),
@@ -901,7 +937,8 @@ def _select_replay_valid_exact_candidate(
                 # session and no-good cuts, so correctness is preserved while
                 # allowing fallback to the next exact objective face.
                 logger.info(
-                    "Fixed split validation exhausted the warm-start objective bound; continuing exact search without the bound"
+                    "Fixed split validation exhausted the warm-start objective bound; "
+                    "continuing exact search without the bound"
                 )
                 if session.relax_objective_upper_bound():
                     objective_upper_bound_relaxed = True
@@ -915,7 +952,8 @@ def _select_replay_valid_exact_candidate(
         report = runtime.validate_candidate(candidate)
         validation_elapsed = time.perf_counter() - validation_started
         logger.info(
-            "Fixed split validation candidate {} (payload_bytes={}, boundary_count={}, validation_time={:.3f}s)",
+            "Fixed split validation candidate {} "
+            "(payload_bytes={}, boundary_count={}, validation_time={:.3f}s)",
             candidate.candidate_id,
             int(candidate.estimated_payload_bytes),
             int(candidate.boundary_count),
@@ -989,7 +1027,10 @@ def _recover_split_plan_candidate(
     if plan.boundary_tensor_labels:
         has_selector = True
         try:
-            return splitter.split(boundary_tensor_labels=plan.boundary_tensor_labels), "boundary_tensor_labels"
+            return (
+                splitter.split(boundary_tensor_labels=plan.boundary_tensor_labels),
+                "boundary_tensor_labels",
+            )
         except KeyError as exc:
             attempts.append(
                 "boundary_tensor_labels="
@@ -1046,6 +1087,8 @@ def _recover_split_plan_candidate(
 
 
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
+    if _is_ariadne_runtime(splitter):
+        return splitter.split(candidate_id=plan.candidate_id)
     candidate, _ = _recover_split_plan_candidate(splitter, plan)
     return candidate
 
@@ -1083,6 +1126,37 @@ def compute_fixed_split_for_model(
     freezing_ratio: float
     exact_diagnostics: dict[str, Any] | None = None
 
+    if _is_ariadne_runtime(runtime):
+        chosen = runtime.split()
+        validation = runtime.validate_candidate(chosen) if constraints.validate_candidates else {}
+        trace_signature = _trace_signature(runtime)
+        return SplitPlan(
+            split_config_id=_make_plan_id(
+                model_name=model_name or model.__class__.__name__,
+                candidate=chosen,
+                constraints=constraints,
+            ),
+            model_name=model_name or model.__class__.__name__,
+            candidate_id=chosen.candidate_id,
+            split_index=None,
+            split_label=chosen.candidate_id,
+            boundary_tensor_labels=list(chosen.boundary_tensor_labels),
+            payload_bytes=int(chosen.estimated_payload_bytes),
+            privacy_metric=0.0,
+            privacy_risk=0.0,
+            layer_freezing_ratio=0.0,
+            privacy_leakage=0.0,
+            edge_parameter_count=0,
+            total_parameter_count=0,
+            validation={
+                **dict(validation),
+                "runtime": "ariadne",
+                "split_id": chosen.candidate_id,
+            },
+            constraints=_constraints_payload(constraints),
+            trace_signature=trace_signature,
+        )
+
     if isinstance(graph, GraphIR):
         trace_signature = _trace_signature(runtime)
         warm_candidate, _ = _load_previous_exact_candidate(
@@ -1108,7 +1182,8 @@ def compute_fixed_split_for_model(
             raise RuntimeError(
                 "No split candidate satisfies the fixed split constraints. "
                 f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
-                f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
+                "privacy_min_edge_parameter_count="
+                f"{_privacy_min_edge_parameter_count(constraints)}, "
                 f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}, "
                 f"reason={first_result.status}"
             )
@@ -1152,7 +1227,8 @@ def compute_fixed_split_for_model(
             raise RuntimeError(
                 "No split candidate satisfies the fixed split constraints. "
                 f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
-                f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
+                "privacy_min_edge_parameter_count="
+                f"{_privacy_min_edge_parameter_count(constraints)}, "
                 f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
             )
 
@@ -1221,12 +1297,15 @@ def load_or_compute_fixed_split_plan(
 ) -> SplitPlan:
     runtime = splitter or UniversalModelSplitter(device=device)
     if runtime.graph is None or runtime.model is None:
-        graph_artifact = _load_compatible_graph_artifact(
-            model=model,
-            sample_input=sample_input,
-            sample_kwargs=sample_kwargs,
-            cache_path=cache_path,
-        )
+        graph_artifact = None
+        legacy_graph_runtime = hasattr(runtime, "bind_graph") and not hasattr(runtime, "runtime")
+        if legacy_graph_runtime:
+            graph_artifact = _load_compatible_graph_artifact(
+                model=model,
+                sample_input=sample_input,
+                sample_kwargs=sample_kwargs,
+                cache_path=cache_path,
+            )
         if graph_artifact is not None:
             runtime.bind_graph(
                 model,
@@ -1239,10 +1318,12 @@ def load_or_compute_fixed_split_plan(
             )
         else:
             runtime.trace_graph(model, sample_input, sample_kwargs=sample_kwargs)
+            trace_timings = getattr(runtime, "trace_timings", {})
             logger.info(
-                "Fixed split startup using cold graph build (trace_time={:.3f}s, graph_build={:.3f}s)",
-                float(runtime.trace_timings.get("torchlens_trace_forward", 0.0)),
-                float(runtime.trace_timings.get("graph_build", 0.0)),
+                "Fixed split startup using cold graph build "
+                "(trace_time={:.3f}s, graph_build={:.3f}s)",
+                float(trace_timings.get("torchlens_trace_forward", 0.0)),
+                float(trace_timings.get("graph_build", 0.0)),
             )
     trace_signature = _trace_signature(runtime)
     model_key = model_name or model.__class__.__name__
@@ -1263,7 +1344,8 @@ def load_or_compute_fixed_split_plan(
                     if not bool(report.get("success", False)):
                         raise RuntimeError(
                             "Persisted split plan is no longer replayable. "
-                            f"candidate_id={cached_candidate.candidate_id}, error={report.get('error')}"
+                            f"candidate_id={cached_candidate.candidate_id}, "
+                            f"error={report.get('error')}"
                         )
                     cached.validation = {
                         **cached.validation,

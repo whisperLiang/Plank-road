@@ -118,7 +118,8 @@ class FixedSplitRuntimeTemplateCache:
                 raise inflight.error
             if inflight.template is None:
                 raise RuntimeError(
-                    f"Ariadne runtime template build completed without a template (key={cache_key})."
+                    "Ariadne runtime template build completed without a template "
+                    f"(key={cache_key})."
                 )
             return FixedSplitRuntimeTemplateLookup(
                 template=inflight.template,

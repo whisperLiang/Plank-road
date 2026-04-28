@@ -67,13 +67,12 @@ class SplitCandidateSelector(SplitPointSelector):
 
 def _candidate_from_runtime(runtime: SplitRuntime, split_spec: SplitSpec) -> SplitCandidate:
     split_id = str(getattr(runtime, "split_id", split_spec.boundary))
-    boundary = split_id.split("after:", 1)[-1]
     return SplitCandidate(
         candidate_id=split_id,
-        edge_nodes=[boundary],
+        edge_nodes=[split_id],
         cloud_nodes=[],
         boundary_edges=[],
-        boundary_tensor_labels=[boundary],
+        boundary_tensor_labels=[split_id],
         edge_input_labels=[],
         cloud_input_labels=[],
         cloud_output_labels=[],
