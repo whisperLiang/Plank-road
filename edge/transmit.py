@@ -182,7 +182,7 @@ def _select_bundle_records(
                 record,
                 include_feature=True,
                 include_raw=False,
-                protected=True,
+                protected=bool(record.drift_flag),
             )
 
     for record in records:
@@ -228,7 +228,7 @@ def _select_bundle_records(
     ]
     samples = [entry["sample"] for entry in selected]
     policy = {
-        "policy": "latency_first_high_features_drift_raw_low_quality_raw",
+        "policy": "latency_first_capped_high_features_drift_raw_low_quality_raw",
         "bundle_cap_bytes": cap,
         "selected_sample_count": len(selected),
         "omitted_sample_count": max(0, len(records) - len(selected)),
@@ -844,6 +844,16 @@ def submit_continual_learning_job(
             if upload_elapsed > 0.0 and zip_payload_bytes > 0
             else 0.0
         )
+        if reply is None:
+            logger.error(
+                "Continual learning upload failed for edge {} "
+                "(elapsed={:.3f}s, average_speed={:.3f} Mbps, zip_payload={}).",
+                edge_id,
+                upload_elapsed,
+                upload_mbps,
+                _format_bytes(zip_payload_bytes),
+            )
+            return False, "", "submit_training_job failed"
         logger.info(
             "Continual learning upload completed for edge {} "
             "(actual_upload_time={:.3f}s, upload_speed={:.3f} Mbps, zip_payload={}).",
@@ -852,8 +862,6 @@ def submit_continual_learning_job(
             upload_mbps,
             _format_bytes(zip_payload_bytes),
         )
-        if reply is None:
-            return False, "", "submit_training_job failed"
         return bool(reply.accepted), str(reply.job_id), str(reply.message)
     except Exception as exc:
         logger.exception("submit_continual_learning_job failed: {}", exc)

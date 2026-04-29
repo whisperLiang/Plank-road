@@ -1189,6 +1189,57 @@ def test_bundle_budget_keeps_drift_raw_and_omits_lowest_priority_raw(
     assert manifest["selection_policy"]["bundle_cap_bytes"] == cap
 
 
+def test_bundle_budget_caps_non_drift_high_confidence_features(tmp_path):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    records = []
+    for index in range(3):
+        record = store.store_sample(
+            sample_id=f"high-{index}",
+            frame_index=index,
+            confidence=0.9,
+            split_config_id="plan-1",
+            model_id="model-a",
+            model_version="0",
+            confidence_bucket=HIGH_CONFIDENCE,
+            inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+            intermediate=_planned_payload(plan),
+        )
+        feature_path = tmp_path / "store" / record.feature_relpath
+        feature_path.write_bytes(bytes([index + 1]) * 256_000)
+        records.append(record)
+
+    first_cost = sum(
+        (tmp_path / "store" / relpath).stat().st_size
+        for relpath in (
+            records[0].result_relpath,
+            records[0].metadata_relpath,
+            records[0].feature_relpath,
+        )
+    )
+    cap = first_cost + 30_000
+
+    payload_zip, manifest = pack_continual_learning_bundle(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="0",
+        bundle_cap_bytes=cap,
+    )
+    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
+        bundle_manifest = json.loads(zf.read("bundle_manifest.json"))
+        names = set(zf.namelist())
+
+    sample_ids = [sample["sample_id"] for sample in bundle_manifest["samples"]]
+    assert sample_ids == ["high-0"]
+    assert records[0].feature_relpath in names
+    assert records[1].feature_relpath not in names
+    assert bundle_manifest["selection_policy"]["omitted_sample_count"] == 2
+    assert manifest["selection_policy"]["zip_payload_bytes"] <= cap
+
+
 def test_bundle_includes_low_conf_features_when_decision_requests_them(tmp_path, sample_bgr_frame):
     store = EdgeSampleStore(str(tmp_path))
     low = store.store_sample(
