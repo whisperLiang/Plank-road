@@ -1039,6 +1039,63 @@ def _splitter_dynamic_batch_min(splitter: UniversalModelSplitter) -> int:
     return 1
 
 
+class _GradClippingOptimizer:
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        params: list[torch.nn.Parameter],
+        max_norm: float,
+    ) -> None:
+        self._optimizer = optimizer
+        self._params = list(params)
+        self._max_norm = float(max_norm)
+
+    def zero_grad(self, *args: Any, **kwargs: Any) -> Any:
+        return self._optimizer.zero_grad(*args, **kwargs)
+
+    def step(self, *args: Any, **kwargs: Any) -> Any:
+        torch.nn.utils.clip_grad_norm_(self._params, self._max_norm)
+        return self._optimizer.step(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._optimizer, name)
+
+
+def build_split_retrain_optimizer(
+    model: torch.nn.Module,
+    *,
+    learning_rate: float = 1e-4,
+    optimizer_name: str = "adam",
+    weight_decay: float = 0.0,
+    grad_clip_norm: float | None = None,
+) -> torch.optim.Optimizer | _GradClippingOptimizer | None:
+    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not params:
+        return None
+    normalized_name = str(optimizer_name or "adam").strip().lower()
+    if normalized_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=float(learning_rate),
+            weight_decay=float(weight_decay),
+        )
+    elif normalized_name == "sgd":
+        optimizer = torch.optim.SGD(
+            params,
+            lr=float(learning_rate),
+            weight_decay=float(weight_decay),
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            params,
+            lr=float(learning_rate),
+            weight_decay=float(weight_decay),
+        )
+    if grad_clip_norm is not None and float(grad_clip_norm) > 0.0:
+        return _GradClippingOptimizer(optimizer, params, float(grad_clip_norm))
+    return optimizer
+
+
 def universal_split_retrain(
     *,
     model: torch.nn.Module,
@@ -1053,21 +1110,36 @@ def universal_split_retrain(
     splitter: UniversalModelSplitter | None = None,
     batch_size: int = 2,
     preloaded_records: Mapping[Any, Mapping[str, Any]] | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+    optimizer_name: str = "adam",
+    weight_decay: float = 0.0,
+    grad_clip_norm: float | None = None,
+    shuffle_samples: bool = False,
     **_: Any,
 ) -> list[float]:
     if loss_fn is None:
         raise RuntimeError("Split-tail training requires an explicit loss function.")
     runtime = splitter or UniversalModelSplitter(device=device).trace(model, sample_input)
-    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.Adam(params, lr=float(learning_rate)) if params else None
+    if optimizer is None:
+        optimizer = build_split_retrain_optimizer(
+            model,
+            learning_rate=float(learning_rate),
+            optimizer_name=optimizer_name,
+            weight_decay=float(weight_decay),
+            grad_clip_norm=grad_clip_norm,
+        )
     losses: list[float] = []
     annotations = dict(gt_annotations or {})
     runtime_min_batch = _splitter_dynamic_batch_min(runtime)
 
     for _epoch in range(int(num_epoch)):
         epoch_losses: list[float] = []
-        for start in range(0, len(all_indices), int(batch_size)):
-            batch_indices = list(all_indices[start : start + int(batch_size)])
+        epoch_indices = list(all_indices)
+        if shuffle_samples and len(epoch_indices) > 1:
+            order = torch.randperm(len(epoch_indices)).tolist()
+            epoch_indices = [epoch_indices[index] for index in order]
+        for start in range(0, len(epoch_indices), int(batch_size)):
+            batch_indices = list(epoch_indices[start : start + int(batch_size)])
             if not batch_indices:
                 continue
             records = [
@@ -1123,6 +1195,7 @@ __all__ = [
     "SplitSpec",
     "UniversalModelSplitter",
     "build_candidate_descriptor",
+    "build_split_retrain_optimizer",
     "compare_outputs",
     "deserialize_boundary_payload",
     "extract_split_features",

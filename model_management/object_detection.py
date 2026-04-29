@@ -394,7 +394,8 @@ class Object_Detection:
             return []
 
         prepared_images = [self._prepare_image_tensor(frame) for frame in frames]
-        outputs = self.model(prepared_images)
+        with torch.inference_mode():
+            outputs = self.model(prepared_images)
         if isinstance(outputs, tuple):
             outputs = outputs[0]
         if isinstance(outputs, dict):
@@ -416,10 +417,11 @@ class Object_Detection:
     def get_model_prediction(self, img, threshold, model=None):
         img = self._prepare_image_tensor(img)
         #get the inference result
-        if model is None:
-            res = self.model([img])
-        else:
-            res = model([img])
+        with torch.inference_mode():
+            if model is None:
+                res = self.model([img])
+            else:
+                res = model([img])
         return self._parse_prediction_output(res, threshold)
 
     def _prepare_image_tensor(self, img):

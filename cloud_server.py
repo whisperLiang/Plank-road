@@ -54,6 +54,7 @@ from model_management.split_model_adapters import (
 from model_management.universal_model_split import (
     UniversalModelSplitter,
     _combine_boundary_payload_batch,
+    build_split_retrain_optimizer,
     universal_split_retrain,
     load_split_feature_cache,
 )
@@ -3635,6 +3636,13 @@ class CloudContinualLearner:
             return dict(metrics)
 
         if uses_proxy_selected_epochs:
+            split_retrain_kwargs["optimizer"] = build_split_retrain_optimizer(
+                get_split_runtime_model(model),
+                learning_rate=effective_learning_rate,
+                optimizer_name=str(split_retrain_kwargs.get("optimizer_name", "adam")),
+                weight_decay=float(split_retrain_kwargs.get("weight_decay", 0.0)),
+                grad_clip_norm=split_retrain_kwargs.get("grad_clip_norm"),
+            )
             best_state = baseline_state
             best_metrics = dict(proxy_metrics_before)
             best_state_is_baseline = True

@@ -814,6 +814,101 @@ def test_split_retrain_uses_cached_pseudo_targets_and_pads_singleton_dynamic_bat
     assert splitter.seen_targets is not None
 
 
+def test_proxy_selected_fixed_split_reuses_optimizer_across_outer_rounds(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(
+                batch_size=2,
+                proxy_eval_interval_rounds=1,
+                proxy_eval_patience=0,
+            ),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    model = torch.nn.Linear(1, 1)
+    optimizer_ids: list[int] = []
+
+    def fake_universal_split_retrain(**kwargs):
+        optimizer = kwargs.get("optimizer")
+        assert optimizer is not None
+        optimizer_ids.append(id(optimizer))
+        return [0.1]
+
+    monkeypatch.setattr(cloud_server, "universal_split_retrain", fake_universal_split_retrain)
+
+    proxy_metrics_after, baseline_state = learner._run_fixed_split_retrain(
+        model,
+        current_model_name="rfdetr_nano",
+        bundle_info={"all_sample_ids": ["s1", "s2"]},
+        manifest={"samples": [{"sample_id": "s1"}, {"sample_id": "s2"}]},
+        bundle_cache_path=str(tmp_path / "bundle"),
+        working_cache=str(tmp_path / "working"),
+        frame_dir=str(tmp_path / "frames"),
+        gt_annotations={"s1": {"boxes": [[0, 0, 1, 1]], "labels": [1]}},
+        num_epoch=2,
+        proxy_metrics_before={"map": 0.1, "evaluated_samples": 1},
+        prepared_trace_sample_input=None,
+        prepared_splitter=SimpleNamespace(split_spec=SimpleNamespace(dynamic_batch=(1, 64))),
+        prepared_candidate=object(),
+        effective_batch_size=2,
+        sample_metadata_by_id={},
+    )
+
+    assert len(optimizer_ids) == 2
+    assert len(set(optimizer_ids)) == 1
+    assert proxy_metrics_after["map"] == 0.1
+    assert set(baseline_state) == set(model.state_dict())
+
+
+def test_split_retrain_honors_optimizer_overrides(tmp_path):
+    cache_path = str(tmp_path / "cache")
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    save_split_feature_cache(cache_path, "s1", payload)
+
+    class DummySplitter:
+        def __init__(self):
+            self.optimizer = None
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del boundary, targets, loss_fn
+            self.optimizer = optimizer
+            return torch.tensor(0.25), {}
+
+    splitter = DummySplitter()
+    losses = universal_split_retrain(
+        model=torch.nn.Linear(1, 1),
+        sample_input=torch.ones(1, 1),
+        cache_path=cache_path,
+        all_indices=["s1"],
+        gt_annotations={"s1": {"label": 1}},
+        loss_fn=lambda outputs, targets: torch.tensor(0.25),
+        splitter=splitter,
+        batch_size=1,
+        optimizer_name="adamw",
+        weight_decay=1e-4,
+        grad_clip_norm=1.0,
+    )
+
+    assert losses == [0.25]
+    assert splitter.optimizer is not None
+    base_optimizer = getattr(splitter.optimizer, "_optimizer", splitter.optimizer)
+    assert isinstance(base_optimizer, torch.optim.AdamW)
+    assert base_optimizer.param_groups[0]["weight_decay"] == pytest.approx(1e-4)
+
+
 def test_split_retrain_attaches_cache_metadata_to_targets(tmp_path):
     cache_path = str(tmp_path / "cache")
     first = boundary_payload_from_tensors(
