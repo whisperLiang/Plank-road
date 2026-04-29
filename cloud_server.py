@@ -53,6 +53,7 @@ from model_management.split_model_adapters import (
 )
 from model_management.universal_model_split import (
     UniversalModelSplitter,
+    _combine_boundary_payload_batch,
     universal_split_retrain,
     load_split_feature_cache,
 )
@@ -1023,6 +1024,20 @@ def _build_detection_proxy_prediction_cache(
                 if not isinstance(batched_payload, BoundaryPayload):
                     raise RuntimeError(
                         "Cached split proxy evaluation requires Ariadne BoundaryPayload records."
+                    )
+                if int(getattr(batched_payload, "batch_size", 0)) != actual_batch_size:
+                    if not all(
+                        isinstance(payload, BoundaryPayload)
+                        and bool(getattr(payload, "schema", None))
+                        for payload in batch_payloads
+                    ):
+                        raise RuntimeError(
+                            "Cached split proxy evaluation received per-sample payloads. "
+                            "Plank-road no longer guesses batched cat/stack payloads without Ariadne schema."
+                        )
+                    batched_payload = _combine_boundary_payload_batch(
+                        batch_payloads,
+                        expected_batch_size=actual_batch_size,
                     )
                 if int(getattr(batched_payload, "batch_size", 0)) != actual_batch_size:
                     raise RuntimeError(

@@ -687,6 +687,70 @@ def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
     assert splitter.seen_boundary is not None
 
 
+def test_cached_split_proxy_eval_batches_schema_payloads(tmp_path):
+    from cloud_server import _build_detection_proxy_prediction_cache
+
+    cache_path = str(tmp_path / "cache")
+    first = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.ones(1, 3)},
+    )
+    second = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[3.0, 4.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.full((1, 3), 2.0)},
+    )
+    save_split_feature_cache(cache_path, "s1", first)
+    save_split_feature_cache(cache_path, "s2", second)
+
+    class DummySplitter:
+        def __init__(self):
+            self.seen_boundary = None
+
+        def cloud_forward(self, boundary, *, candidate=None):
+            self.seen_boundary = boundary
+            assert candidate == "candidate-1"
+            assert boundary.batch_size == 2
+            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+            assert boundary.passthrough_inputs["input"].shape == (2, 3)
+            return [
+                {
+                    "boxes": torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+                    "labels": torch.tensor([1]),
+                    "scores": torch.tensor([0.9]),
+                },
+                {
+                    "boxes": torch.tensor([[1.0, 1.0, 2.0, 2.0]]),
+                    "labels": torch.tensor([2]),
+                    "scores": torch.tensor([0.8]),
+                },
+            ]
+
+    splitter = DummySplitter()
+    prediction_cache = _build_detection_proxy_prediction_cache(
+        torch.nn.Identity(),
+        frame_dir=str(tmp_path),
+        gt_annotations={
+            "s1": {"boxes": [[0.0, 0.0, 1.0, 1.0]], "labels": [1]},
+            "s2": {"boxes": [[1.0, 1.0, 2.0, 2.0]], "labels": [2]},
+        },
+        device=torch.device("cpu"),
+        threshold_low=0.1,
+        model_name="rfdetr_nano",
+        inference_batch_size=2,
+        split_cache_path=cache_path,
+        splitter=splitter,
+        split_candidate="candidate-1",
+    )
+
+    assert splitter.seen_boundary is not None
+    assert len(prediction_cache["prediction_rows"]) == 2
+    assert prediction_cache["prediction_rows"][0][2]["scores"] == pytest.approx([0.9])
+
+
 def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_bgr_frame):
     store = EdgeSampleStore(str(tmp_path))
     high = store.store_sample(
