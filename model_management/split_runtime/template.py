@@ -3,9 +3,10 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Hashable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
+from ariadne.codegen.segment_builder import build_segments
 from loguru import logger
 
 from .ariadne_runtime import SplitRuntime, SplitSpec
@@ -181,10 +182,29 @@ def bind_request_runtime_from_template(
         device: Reserved for future use (device-specific binding).
     
     Returns:
-        The split runtime from the template.
+        A split runtime bound to the request model.
     """
-    _ = model, device  # Reserved parameters for future extensibility
-    return template.runtime
+    _ = device  # The request model already carries the desired device.
+    if model is None:
+        return template.runtime
+    return _rebind_runtime_to_model(template.runtime, model)
+
+
+def _rebind_runtime_to_model(runtime: SplitRuntime, model: Any) -> SplitRuntime:
+    trace_plan = replace(runtime.trace_plan, root_module=model)
+    variants = tuple(
+        _rebind_runtime_to_model(variant, model)
+        for variant in tuple(getattr(runtime, "variants", ()) or ())
+    )
+    return SplitRuntime(
+        trace_plan=trace_plan,
+        split_spec=runtime.split_spec,
+        candidate=runtime.candidate,
+        segments=build_segments(trace_plan, runtime.candidate),
+        mode=runtime.mode,
+        variants=variants,
+        batch_range=getattr(runtime, "batch_range", None),
+    )
 
 
 _PROCESS_FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE = FixedSplitRuntimeTemplateCache()
