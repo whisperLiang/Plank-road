@@ -52,9 +52,11 @@ from model_management.split_model_adapters import (
     prepare_split_runtime_input,
 )
 from model_management.universal_model_split import (
+    SplitRetrainProfile,
     UniversalModelSplitter,
     _combine_boundary_payload_batch,
     build_split_retrain_optimizer,
+    log_split_retrain_profile,
     universal_split_retrain,
     load_split_feature_cache,
 )
@@ -2116,7 +2118,10 @@ class CloudContinualLearner:
     def _teacher_inference_batch(self, frames):
         batch_inference = getattr(self.large_od, "large_inference_batch", None)
         if batch_inference is None:
-            return [self._teacher_inference(frame) for frame in frames]
+            raise RuntimeError(
+                "Teacher annotation requires large_inference_batch; "
+                "single-sample inference fallback is disabled."
+            )
         try:
             return batch_inference(
                 frames,
@@ -3113,7 +3118,11 @@ class CloudContinualLearner:
                 batch_frames = [frame for _, frame in batch]
                 predictions = self._teacher_inference_batch(batch_frames)
                 if not isinstance(predictions, (list, tuple)) or len(predictions) != len(batch):
-                    predictions = [self._teacher_inference(frame) for _, frame in batch]
+                    raise RuntimeError(
+                        "Teacher annotation batch inference returned an invalid "
+                        f"result count (expected={len(batch)}, got="
+                        f"{len(predictions) if isinstance(predictions, (list, tuple)) else type(predictions).__name__})."
+                    )
 
                 for (sample_id, _), prediction in zip(batch, predictions):
                     pred_boxes = pred_class = pred_score = None
@@ -3479,6 +3488,21 @@ class CloudContinualLearner:
         proxy_eval_frame_cache: dict[str, np.ndarray | None] | None = None,
         preloaded_records: Mapping[str, Mapping[str, object]] | None = None,
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
+        model_zoo.set_detection_trainable_params(model, current_model_name)
+        trainable_param_count = sum(
+            int(parameter.numel())
+            for parameter in get_split_runtime_model(model).parameters()
+            if parameter.requires_grad
+        )
+        if trainable_param_count <= 0:
+            raise RuntimeError(
+                f"[FixedSplitCL] {current_model_name} has no trainable split-tail parameters."
+            )
+        logger.info(
+            "[FixedSplitCL] {} split retrain enabled {} trainable parameter(s).",
+            self._resolve_fixed_split_training_label(current_model_name),
+            trainable_param_count,
+        )
         baseline_state = _snapshot_model_state(model)
         baseline_proxy_state_key = _model_state_fingerprint(model)
         effective_num_epoch = num_epoch
@@ -3527,6 +3551,7 @@ class CloudContinualLearner:
                 "[FixedSplitCL] Split retrain will reuse the bound runtime template and skip retracing inside universal_split_retrain."
             )
 
+        retrain_profile = SplitRetrainProfile()
         split_retrain_kwargs = {
             "model": get_split_runtime_model(model),
             "sample_input": prepared_trace_sample_input,
@@ -3544,6 +3569,7 @@ class CloudContinualLearner:
             "chosen_candidate": prepared_candidate,
             "batch_size": bs,
             "preloaded_records": preloaded_records,
+            "retrain_profile": retrain_profile,
         }
         split_retrain_kwargs.update(
             self._fixed_split_optimizer_overrides(current_model_name)
@@ -3639,6 +3665,7 @@ class CloudContinualLearner:
         if uses_proxy_selected_epochs:
             split_retrain_kwargs["optimizer"] = build_split_retrain_optimizer(
                 get_split_runtime_model(model),
+                runtime=prepared_splitter,
                 learning_rate=effective_learning_rate,
                 optimizer_name=str(split_retrain_kwargs.get("optimizer_name", "adam")),
                 weight_decay=float(split_retrain_kwargs.get("weight_decay", 0.0)),
@@ -3751,6 +3778,7 @@ class CloudContinualLearner:
                     best_metrics = _evaluate_proxy_metrics_for_current_state(selection_eval=False)
                     proxy_eval_elapsed += time.perf_counter() - stage_started
             logger.info("[FixedSplitCL] split retraining took {:.3f}s.", split_retrain_elapsed)
+            log_split_retrain_profile(retrain_profile)
             logger.info("[FixedSplitCL] proxy evaluation after retrain took {:.3f}s.", proxy_eval_elapsed)
             model.load_state_dict(best_state)
             _set_detection_model_eval_mode(model)
@@ -3763,6 +3791,7 @@ class CloudContinualLearner:
             epoch_log_context=training_label,
         )
         self._log_stage_duration("split retraining", split_retrain_started)
+        log_split_retrain_profile(retrain_profile)
         proxy_eval_started = time.perf_counter()
         current_proxy_state_key = _model_state_fingerprint(model)
         if current_proxy_state_key == baseline_proxy_state_key:

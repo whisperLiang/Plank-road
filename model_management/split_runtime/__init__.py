@@ -39,9 +39,11 @@ from .template import (
     get_fixed_split_runtime_template_cache,
 )
 from .validators import (
+    prepare_validated_boundary_payload,
     run_batch_prefix,
     run_batch_suffix,
     train_batch_suffix,
+    train_batch_suffix_fast,
     validate_boundary_payload,
 )
 
@@ -135,10 +137,12 @@ __all__ = [
     "make_runtime_cache_key",
     "make_split_spec",
     "prepare_split_runtime",
+    "prepare_validated_boundary_payload",
     "reduce_output_to_loss",
     "run_batch_prefix",
     "run_batch_suffix",
     "select_detection_adapter",
     "train_batch_suffix",
+    "train_batch_suffix_fast",
     "validate_boundary_payload",
 ]

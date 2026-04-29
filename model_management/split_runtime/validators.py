@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 import torch
@@ -192,6 +193,21 @@ def validate_boundary_payload(
     model_name: str | None = None,
     model_family: str | None = None,
 ) -> None:
+    prepare_validated_boundary_payload(
+        runtime,
+        boundary,
+        model_name=model_name,
+        model_family=model_family,
+    )
+
+
+def prepare_validated_boundary_payload(
+    runtime: SplitRuntime,
+    boundary: BoundaryPayload,
+    *,
+    model_name: str | None = None,
+    model_family: str | None = None,
+) -> BoundaryPayload:
     boundary = _align_boundary_payload_schema(runtime, boundary)
     boundary = _align_boundary_payload_device(runtime, boundary)
     try:
@@ -205,6 +221,7 @@ def validate_boundary_payload(
         raise BoundaryPayloadValidationError(
             f"Boundary payload validation failed ({context}): {exc}"
         ) from exc
+    return boundary
 
 
 def run_batch_prefix(
@@ -241,9 +258,7 @@ def run_batch_suffix(
     model_name: str | None = None,
     model_family: str | None = None,
 ) -> Any:
-    boundary = _align_boundary_payload_schema(runtime, boundary)
-    boundary = _align_boundary_payload_device(runtime, boundary)
-    validate_boundary_payload(
+    boundary = prepare_validated_boundary_payload(
         runtime,
         boundary,
         model_name=model_name,
@@ -282,9 +297,7 @@ def train_batch_suffix(
         raise MissingLossFunctionError(
             f"Split-tail training requires an adapter loss function ({context})."
         )
-    boundary = _align_boundary_payload_schema(runtime, boundary)
-    boundary = _align_boundary_payload_device(runtime, boundary)
-    validate_boundary_payload(
+    boundary = prepare_validated_boundary_payload(
         runtime,
         boundary,
         model_name=model_name,
@@ -319,9 +332,79 @@ def train_batch_suffix(
     return loss, dict(gradients or {})
 
 
+def train_batch_suffix_fast(
+    runtime: SplitRuntime,
+    boundary: BoundaryPayload,
+    targets: Any,
+    *,
+    loss_fn: Callable[[Any, Any], torch.Tensor] | None,
+    optimizer: torch.optim.Optimizer | None = None,
+    model_name: str | None = None,
+    model_family: str | None = None,
+    profile: dict[str, float] | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
+    if loss_fn is None:
+        context = error_context(
+            model_name=model_name,
+            model_family=model_family,
+            split_id=getattr(boundary, "split_id", None),
+            batch_size=getattr(boundary, "batch_size", None),
+        )
+        raise MissingLossFunctionError(
+            f"Split-tail training requires an adapter loss function ({context})."
+        )
+    try:
+        if optimizer is not None:
+            optimizer.zero_grad()
+        forward_backward_started = time.perf_counter()
+        outputs = runtime.run_suffix(boundary)
+        loss = loss_fn(outputs, targets)
+        if not isinstance(loss, torch.Tensor):
+            raise TypeError(f"Split-tail loss function returned {type(loss)!r}.")
+        if loss.requires_grad:
+            loss.backward()
+        if profile is not None:
+            profile["suffix_forward_backward_time"] = (
+                float(profile.get("suffix_forward_backward_time", 0.0))
+                + time.perf_counter()
+                - forward_backward_started
+            )
+        step_started = time.perf_counter()
+        if optimizer is not None:
+            optimizer.step()
+        if profile is not None:
+            profile["optimizer_step_time"] = (
+                float(profile.get("optimizer_step_time", 0.0))
+                + time.perf_counter()
+                - step_started
+            )
+    except Exception as exc:  # noqa: BLE001
+        context = _boundary_context(
+            boundary,
+            model_name=model_name,
+            model_family=model_family,
+        )
+        raise SplitTailTrainingError(
+            f"Fast split-tail training failed ({context}): {exc}"
+        ) from exc
+    if not torch.isfinite(loss.detach()):
+        context = error_context(
+            model_name=model_name,
+            model_family=model_family,
+            split_id=getattr(boundary, "split_id", None),
+            batch_size=getattr(boundary, "batch_size", None),
+        )
+        raise SplitTailTrainingError(
+            f"Split-tail training produced a non-finite loss ({context})."
+        )
+    return loss, {}
+
+
 __all__ = [
+    "prepare_validated_boundary_payload",
     "run_batch_prefix",
     "run_batch_suffix",
     "train_batch_suffix",
+    "train_batch_suffix_fast",
     "validate_boundary_payload",
 ]

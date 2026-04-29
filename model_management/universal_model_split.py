@@ -17,10 +17,12 @@ from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_runtime import (
     compare_outputs,
     make_split_spec,
+    prepare_validated_boundary_payload,
     prepare_split_runtime,
     run_batch_prefix,
     run_batch_suffix,
     train_batch_suffix,
+    train_batch_suffix_fast,
 )
 
 
@@ -726,6 +728,26 @@ class UniversalModelSplitter:
             model_family=self.model_family,
         )
 
+    def train_suffix_fast(
+        self,
+        boundary: BoundaryPayload,
+        targets: Any,
+        *,
+        loss_fn=None,
+        optimizer=None,
+        profile: dict[str, float] | None = None,
+    ):
+        return train_batch_suffix_fast(
+            self._ensure_runtime(),
+            boundary,
+            targets,
+            loss_fn=loss_fn or self.trainability_loss_fn,
+            optimizer=optimizer,
+            model_name=self.model_name,
+            model_family=self.model_family,
+            profile=profile,
+        )
+
     def replay_inference(self, sample_input: Any, *, return_split_output: bool = False):
         payload = self.edge_forward(sample_input)
         outputs = self.cloud_forward(payload)
@@ -1102,6 +1124,216 @@ def _splitter_dynamic_batch_min(splitter: UniversalModelSplitter) -> int:
     return 1
 
 
+@dataclass
+class SplitRetrainProfile:
+    training_batch_preparation_time: float = 0.0
+    target_construction_time: float = 0.0
+    boundary_payload_batching_time: float = 0.0
+    device_transfer_time: float = 0.0
+    validation_time: float = 0.0
+    suffix_forward_backward_time: float = 0.0
+    optimizer_step_time: float = 0.0
+    total_retraining_time: float = 0.0
+
+    def add(self, field_name: str, elapsed: float) -> None:
+        setattr(
+            self,
+            field_name,
+            float(getattr(self, field_name)) + max(0.0, float(elapsed)),
+        )
+
+
+@dataclass
+class PreparedSplitTrainBatch:
+    sample_ids: list[Any]
+    boundary: BoundaryPayload
+    targets: list[Any]
+    is_padded: bool
+    original_batch_size: int
+    validated: bool
+
+
+def log_split_retrain_profile(profile: SplitRetrainProfile) -> None:
+    logger.info(
+        "[FixedSplitCL][RetrainProfile] "
+        "training_batch_preparation_time={:.3f}s "
+        "target_construction_time={:.3f}s "
+        "boundary_payload_batching_time={:.3f}s "
+        "device_transfer_time={:.3f}s "
+        "validation_time={:.3f}s "
+        "suffix_forward_backward_time={:.3f}s "
+        "optimizer_step_time={:.3f}s "
+        "total_retraining_time={:.3f}s.",
+        profile.training_batch_preparation_time,
+        profile.target_construction_time,
+        profile.boundary_payload_batching_time,
+        profile.device_transfer_time,
+        profile.validation_time,
+        profile.suffix_forward_backward_time,
+        profile.optimizer_step_time,
+        profile.total_retraining_time,
+    )
+
+
+def _add_profile_time(
+    profile: SplitRetrainProfile | None,
+    field_name: str,
+    elapsed: float,
+) -> None:
+    if profile is not None:
+        profile.add(field_name, elapsed)
+
+
+def _ariadne_runtime_from_splitter(splitter: Any) -> Any:
+    ensure_runtime = getattr(splitter, "_ensure_runtime", None)
+    if callable(ensure_runtime):
+        return ensure_runtime()
+    return splitter
+
+
+def _splitter_supports_preparation_validation(splitter: Any) -> bool:
+    runtime = _ariadne_runtime_from_splitter(splitter)
+    return callable(getattr(runtime, "validate_boundary", None)) and callable(
+        getattr(runtime, "run_suffix", None)
+    )
+
+
+def _splitter_model_context(splitter: Any) -> tuple[str | None, str | None]:
+    return (
+        getattr(splitter, "model_name", None),
+        getattr(splitter, "model_family", None),
+    )
+
+
+def _move_target_to_device(target: Any, device: torch.device) -> Any:
+    return _move_boundary_value_to_device(target, device)
+
+
+def prepare_split_train_batches_once(
+    *,
+    splitter: Any,
+    cache_path: str,
+    all_indices: list[Any],
+    annotations: Mapping[Any, Any],
+    batch_size: int,
+    device: str | torch.device,
+    preloaded_records: Mapping[Any, Mapping[str, Any]] | None = None,
+    move_to_device: bool = True,
+    validate: bool = True,
+    profile: SplitRetrainProfile | None = None,
+) -> list[PreparedSplitTrainBatch]:
+    prepare_started = time.perf_counter()
+    prepared_batches: list[PreparedSplitTrainBatch] = []
+    runtime_min_batch = _splitter_dynamic_batch_min(splitter)
+    target_device = torch.device(device)
+    epoch_batch_size = max(1, int(batch_size))
+    ariadne_runtime = _ariadne_runtime_from_splitter(splitter)
+    model_name, model_family = _splitter_model_context(splitter)
+
+    try:
+        for start in range(0, len(all_indices), epoch_batch_size):
+            batch_indices = list(all_indices[start : start + epoch_batch_size])
+            if not batch_indices:
+                continue
+            records = [
+                _get_preloaded_split_feature_record(preloaded_records, index)
+                or load_split_feature_cache(cache_path, index)
+                for index in batch_indices
+            ]
+            boundaries = [record.get("intermediate") for record in records]
+            if not boundaries or not all(
+                isinstance(boundary, BoundaryPayload) for boundary in boundaries
+            ):
+                raise RuntimeError(
+                    "Split-tail training requires cached BoundaryPayload records."
+                )
+
+            target_started = time.perf_counter()
+            targets = [
+                _target_for_split_training(index, annotations, record)
+                for index, record in zip(batch_indices, records)
+            ]
+            _add_profile_time(
+                profile,
+                "target_construction_time",
+                time.perf_counter() - target_started,
+            )
+
+            execution_boundaries = list(boundaries)
+            execution_targets = list(targets)
+            original_batch_size = len(batch_indices)
+            execution_batch_size = original_batch_size
+            is_padded = False
+            if execution_batch_size < runtime_min_batch:
+                pad_count = runtime_min_batch - execution_batch_size
+                execution_boundaries.extend([boundaries[-1]] * pad_count)
+                execution_targets.extend([targets[-1]] * pad_count)
+                execution_batch_size = runtime_min_batch
+                is_padded = True
+
+            if move_to_device:
+                device_started = time.perf_counter()
+                execution_boundaries = [
+                    _boundary_payload_to_device(boundary, target_device)
+                    for boundary in execution_boundaries
+                ]
+                execution_targets = [
+                    _move_target_to_device(target, target_device)
+                    for target in execution_targets
+                ]
+                _add_profile_time(
+                    profile,
+                    "device_transfer_time",
+                    time.perf_counter() - device_started,
+                )
+
+            batching_started = time.perf_counter()
+            boundary = _combine_boundary_payload_batch(
+                execution_boundaries,
+                expected_batch_size=execution_batch_size,
+                device=None,
+            )
+            _add_profile_time(
+                profile,
+                "boundary_payload_batching_time",
+                time.perf_counter() - batching_started,
+            )
+
+            validated = False
+            if validate and _splitter_supports_preparation_validation(splitter):
+                validation_started = time.perf_counter()
+                boundary = prepare_validated_boundary_payload(
+                    ariadne_runtime,
+                    boundary,
+                    model_name=model_name,
+                    model_family=model_family,
+                )
+                _add_profile_time(
+                    profile,
+                    "validation_time",
+                    time.perf_counter() - validation_started,
+                )
+                validated = True
+
+            prepared_batches.append(
+                PreparedSplitTrainBatch(
+                    sample_ids=batch_indices,
+                    boundary=boundary,
+                    targets=execution_targets,
+                    is_padded=is_padded,
+                    original_batch_size=original_batch_size,
+                    validated=validated,
+                )
+            )
+    finally:
+        _add_profile_time(
+            profile,
+            "training_batch_preparation_time",
+            time.perf_counter() - prepare_started,
+        )
+    return prepared_batches
+
+
 class _GradClippingOptimizer:
     def __init__(
         self,
@@ -1124,15 +1356,88 @@ class _GradClippingOptimizer:
         return getattr(self._optimizer, name)
 
 
+def _runtime_has_suffix_parameter_metadata(runtime: Any) -> bool:
+    if runtime is None:
+        return False
+    ariadne_runtime = _ariadne_runtime_from_splitter(runtime)
+    return (
+        getattr(ariadne_runtime, "trace_plan", None) is not None
+        and getattr(ariadne_runtime, "candidate", None) is not None
+    )
+
+
+def _suffix_parameter_names(runtime: Any) -> list[str]:
+    ariadne_runtime = _ariadne_runtime_from_splitter(runtime)
+    trace_plan = getattr(ariadne_runtime, "trace_plan", None)
+    candidate = getattr(ariadne_runtime, "candidate", None)
+    if trace_plan is None:
+        raise RuntimeError("Ariadne suffix optimizer requires runtime.trace_plan.")
+    if candidate is None:
+        raise RuntimeError("Ariadne suffix optimizer requires runtime.candidate.")
+    suffix_nodes = set(getattr(candidate, "suffix_nodes", ()) or ())
+    if not suffix_nodes:
+        raise RuntimeError("Ariadne suffix optimizer found no suffix nodes.")
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for node in getattr(trace_plan, "nodes", ()) or ():
+        if getattr(node, "name", None) not in suffix_nodes:
+            continue
+        for ref in getattr(node, "param_refs", ()) or ():
+            ref_name = str(getattr(ref, "name", "") or "")
+            if ref_name and ref_name not in seen:
+                seen.add(ref_name)
+                names.append(ref_name)
+    if not names:
+        raise RuntimeError("Ariadne suffix optimizer found no suffix parameter refs.")
+    return names
+
+
+def collect_suffix_trainable_parameters(runtime: Any) -> list[torch.nn.Parameter]:
+    ariadne_runtime = _ariadne_runtime_from_splitter(runtime)
+    trace_plan = getattr(ariadne_runtime, "trace_plan", None)
+    if trace_plan is None:
+        raise RuntimeError("Ariadne suffix optimizer requires runtime.trace_plan.")
+    root_module = getattr(trace_plan, "root_module", None)
+    if root_module is None:
+        raise RuntimeError("Ariadne suffix optimizer requires trace_plan.root_module.")
+
+    suffix_names = _suffix_parameter_names(ariadne_runtime)
+    named_parameters = dict(root_module.named_parameters())
+    missing = [name for name in suffix_names if name not in named_parameters]
+    if missing:
+        raise RuntimeError(
+            "Ariadne suffix optimizer could not map suffix parameter refs: "
+            + ", ".join(missing)
+        )
+
+    suffix_name_set = set(suffix_names)
+    params: list[torch.nn.Parameter] = []
+    seen_params: set[int] = set()
+    for name, parameter in named_parameters.items():
+        parameter.requires_grad_(name in suffix_name_set)
+        if name in suffix_name_set and id(parameter) not in seen_params:
+            seen_params.add(id(parameter))
+            params.append(parameter)
+    if not params:
+        raise RuntimeError("Ariadne suffix optimizer found no trainable suffix parameters.")
+    return params
+
+
 def build_split_retrain_optimizer(
     model: torch.nn.Module,
     *,
+    runtime: Any = None,
     learning_rate: float = 1e-4,
     optimizer_name: str = "adam",
     weight_decay: float = 0.0,
     grad_clip_norm: float | None = None,
 ) -> torch.optim.Optimizer | _GradClippingOptimizer | None:
-    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    params = (
+        collect_suffix_trainable_parameters(runtime)
+        if _runtime_has_suffix_parameter_metadata(runtime)
+        else [parameter for parameter in model.parameters() if parameter.requires_grad]
+    )
     if not params:
         return None
     normalized_name = str(optimizer_name or "adam").strip().lower()
@@ -1180,122 +1485,145 @@ def universal_split_retrain(
     shuffle_samples: bool = False,
     epoch_log_context: str | None = None,
     log_every_n_batches: int = 1,
+    retrain_profile: SplitRetrainProfile | None = None,
     **_: Any,
 ) -> list[float]:
+    retrain_started = time.perf_counter()
     if loss_fn is None:
         raise RuntimeError("Split-tail training requires an explicit loss function.")
     runtime = splitter or UniversalModelSplitter(device=device).trace(model, sample_input)
     if optimizer is None:
         optimizer = build_split_retrain_optimizer(
             model,
+            runtime=runtime,
             learning_rate=float(learning_rate),
             optimizer_name=optimizer_name,
             weight_decay=float(weight_decay),
             grad_clip_norm=grad_clip_norm,
         )
+    if optimizer is None and (
+        _runtime_has_suffix_parameter_metadata(runtime)
+        or any(True for _parameter in model.parameters())
+    ):
+        raise RuntimeError(
+            "Split-tail training found no trainable parameters; enable trainable "
+            "suffix parameters before retraining."
+        )
     losses: list[float] = []
     annotations = dict(gt_annotations or {})
-    runtime_min_batch = _splitter_dynamic_batch_min(runtime)
 
     total_epochs = int(num_epoch)
     should_log_training = bool(epoch_log_context)
     log_interval = max(1, int(log_every_n_batches))
+    epoch_batch_size = max(1, int(batch_size))
+    prepared_batches = prepare_split_train_batches_once(
+        splitter=runtime,
+        cache_path=cache_path,
+        all_indices=list(all_indices),
+        annotations=annotations,
+        batch_size=epoch_batch_size,
+        device=device,
+        preloaded_records=preloaded_records,
+        move_to_device=True,
+        validate=_splitter_supports_preparation_validation(runtime),
+        profile=retrain_profile,
+    )
+    if not prepared_batches:
+        raise RuntimeError("Split retraining did not prepare any batches.")
+    total_batches = len(prepared_batches)
 
-    for _epoch in range(total_epochs):
-        epoch_losses: list[float] = []
-        epoch_indices = list(all_indices)
-        if shuffle_samples and len(epoch_indices) > 1:
-            order = torch.randperm(len(epoch_indices)).tolist()
-            epoch_indices = [epoch_indices[index] for index in order]
-        epoch_batch_size = int(batch_size)
-        total_batches = (len(epoch_indices) + epoch_batch_size - 1) // epoch_batch_size
-        epoch_label = f"{epoch_log_context} epoch {_epoch + 1}/{total_epochs}"
-        if should_log_training:
-            logger.info(
-                "[FixedSplitCL] {} started (batches={}, samples={}, batch_size={}).",
-                epoch_label,
-                total_batches,
-                len(epoch_indices),
-                epoch_batch_size,
-            )
-        epoch_started = time.perf_counter()
-        data_load_time: list[float] = []
-        train_process_time: list[float] = []
-        for batch_number, start in enumerate(range(0, len(epoch_indices), epoch_batch_size), 1):
-            batch_indices = list(epoch_indices[start : start + int(batch_size)])
-            if not batch_indices:
-                continue
-            load_started = time.perf_counter()
-            records = [
-                _get_preloaded_split_feature_record(preloaded_records, index)
-                or load_split_feature_cache(cache_path, index)
-                for index in batch_indices
-            ]
-            data_load_time.append(time.perf_counter() - load_started)
-            boundaries = [record.get("intermediate") for record in records]
-            if not boundaries or not all(
-                isinstance(boundary, BoundaryPayload) for boundary in boundaries
-            ):
-                raise RuntimeError(
-                    "Split-tail training requires cached BoundaryPayload records."
-                )
-            targets = [
-                _target_for_split_training(index, annotations, record)
-                for index, record in zip(batch_indices, records)
-            ]
-            execution_boundaries = list(boundaries)
-            execution_targets = list(targets)
-            execution_batch_size = len(batch_indices)
-            if execution_batch_size < runtime_min_batch:
-                pad_count = runtime_min_batch - execution_batch_size
-                execution_boundaries.extend([boundaries[-1]] * pad_count)
-                execution_targets.extend([targets[-1]] * pad_count)
-                execution_batch_size = runtime_min_batch
-            boundary = _combine_boundary_payload_batch(
-                execution_boundaries,
-                expected_batch_size=execution_batch_size,
-                device=device,
-            )
-            train_started = time.perf_counter()
-            loss, _grads = runtime.train_suffix(
-                boundary,
-                execution_targets,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-            )
-            train_process_time.append(time.perf_counter() - train_started)
-            loss_value = float(loss.detach().cpu().item())
-            epoch_losses.append(loss_value)
-            if should_log_training and (
-                batch_number == 1
-                or batch_number % log_interval == 0
-                or batch_number == total_batches
-            ):
+    try:
+        for _epoch in range(total_epochs):
+            epoch_losses: list[float] = []
+            epoch_batches = list(prepared_batches)
+            if shuffle_samples and len(epoch_batches) > 1:
+                order = torch.randperm(len(epoch_batches)).tolist()
+                epoch_batches = [epoch_batches[index] for index in order]
+            epoch_label = f"{epoch_log_context} epoch {_epoch + 1}/{total_epochs}"
+            if should_log_training:
                 logger.info(
-                    "[FixedSplitCL] {} batch {}/{} loss={:.6f} avg_loss={:.6f} data={:.3f}s/it train={:.3f}s/it.",
+                    "[FixedSplitCL] {} started (batches={}, samples={}, batch_size={}).",
                     epoch_label,
-                    batch_number,
                     total_batches,
-                    loss_value,
-                    sum(epoch_losses) / len(epoch_losses),
-                    sum(data_load_time) / len(data_load_time),
-                    sum(train_process_time) / len(train_process_time),
+                    len(all_indices),
+                    epoch_batch_size,
                 )
-        if not epoch_losses:
-            raise RuntimeError("Split retraining did not produce any finite batch loss.")
-        epoch_loss = sum(epoch_losses) / len(epoch_losses)
-        losses.append(epoch_loss)
-        if should_log_training:
-            logger.info(
-                "[FixedSplitCL] {} finished avg_loss={:.6f} min_loss={:.6f} max_loss={:.6f} batches={} elapsed={:.3f}s.",
-                epoch_label,
-                epoch_loss,
-                min(epoch_losses),
-                max(epoch_losses),
-                len(epoch_losses),
-                time.perf_counter() - epoch_started,
-            )
-    return losses
+            epoch_started = time.perf_counter()
+            data_load_time: list[float] = []
+            train_process_time: list[float] = []
+            for batch_number, prepared_batch in enumerate(epoch_batches, 1):
+                data_load_time.append(0.0)
+                train_started = time.perf_counter()
+                if prepared_batch.validated and hasattr(runtime, "train_suffix_fast"):
+                    fast_profile: dict[str, float] = {}
+                    loss, _grads = runtime.train_suffix_fast(
+                        prepared_batch.boundary,
+                        prepared_batch.targets,
+                        loss_fn=loss_fn,
+                        optimizer=optimizer,
+                        profile=fast_profile,
+                    )
+                    _add_profile_time(
+                        retrain_profile,
+                        "suffix_forward_backward_time",
+                        float(fast_profile.get("suffix_forward_backward_time", 0.0)),
+                    )
+                    _add_profile_time(
+                        retrain_profile,
+                        "optimizer_step_time",
+                        float(fast_profile.get("optimizer_step_time", 0.0)),
+                    )
+                else:
+                    loss, _grads = runtime.train_suffix(
+                        prepared_batch.boundary,
+                        prepared_batch.targets,
+                        loss_fn=loss_fn,
+                        optimizer=optimizer,
+                    )
+                    _add_profile_time(
+                        retrain_profile,
+                        "suffix_forward_backward_time",
+                        time.perf_counter() - train_started,
+                    )
+                train_process_time.append(time.perf_counter() - train_started)
+                loss_value = float(loss.detach().cpu().item())
+                epoch_losses.append(loss_value)
+                if should_log_training and (
+                    batch_number == 1
+                    or batch_number % log_interval == 0
+                    or batch_number == total_batches
+                ):
+                    logger.info(
+                        "[FixedSplitCL] {} batch {}/{} loss={:.6f} avg_loss={:.6f} data={:.3f}s/it train={:.3f}s/it.",
+                        epoch_label,
+                        batch_number,
+                        total_batches,
+                        loss_value,
+                        sum(epoch_losses) / len(epoch_losses),
+                        sum(data_load_time) / len(data_load_time),
+                        sum(train_process_time) / len(train_process_time),
+                    )
+            if not epoch_losses:
+                raise RuntimeError("Split retraining did not produce any finite batch loss.")
+            epoch_loss = sum(epoch_losses) / len(epoch_losses)
+            losses.append(epoch_loss)
+            if should_log_training:
+                logger.info(
+                    "[FixedSplitCL] {} finished avg_loss={:.6f} min_loss={:.6f} max_loss={:.6f} batches={} elapsed={:.3f}s.",
+                    epoch_label,
+                    epoch_loss,
+                    min(epoch_losses),
+                    max(epoch_losses),
+                    len(epoch_losses),
+                    time.perf_counter() - epoch_started,
+                )
+        return losses
+    finally:
+        _add_profile_time(
+            retrain_profile,
+            "total_retraining_time",
+            time.perf_counter() - retrain_started,
+        )
 
 
 __all__ = [
@@ -1303,19 +1631,24 @@ __all__ = [
     "CandidateProfile",
     "LayerInfo",
     "LayerProfile",
+    "PreparedSplitTrainBatch",
     "SplitCandidate",
     "SplitCandidateSelector",
     "SplitPointSelector",
+    "SplitRetrainProfile",
     "SplitRuntime",
     "SplitSpec",
     "UniversalModelSplitter",
     "build_candidate_descriptor",
     "build_split_retrain_optimizer",
+    "collect_suffix_trainable_parameters",
     "compare_outputs",
     "deserialize_boundary_payload",
     "extract_split_features",
     "load_split_feature_cache",
+    "log_split_retrain_profile",
     "reconstruct_candidate_from_descriptor",
+    "prepare_split_train_batches_once",
     "save_split_feature_cache",
     "serialize_boundary_payload",
     "universal_split_retrain",

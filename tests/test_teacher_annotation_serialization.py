@@ -247,6 +247,42 @@ def test_collect_teacher_annotations_keeps_request_level_batching(tmp_path, monk
     assert sorted(annotations) == ["0", "1", "2"]
 
 
+def test_collect_teacher_annotations_rejects_invalid_batch_without_single_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    learner = _build_learner(tmp_path / "invalid-batch", teacher_batch_size=2)
+    frame_dir = tmp_path / "invalid-batch-frames"
+    _write_frames(frame_dir, ["0", "1"])
+
+    monkeypatch.setattr(learner, "_teacher_inference_batch", lambda frames: [_prediction(1)])
+    monkeypatch.setattr(
+        learner,
+        "_teacher_inference",
+        lambda _frame: pytest.fail("Expected batch-level failure, not per-image fallback."),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid result count"):
+        learner._collect_teacher_annotations(str(frame_dir), ["0", "1"])
+
+
+def test_collect_teacher_annotations_requires_batch_teacher_without_single_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    learner = _build_learner(tmp_path / "missing-batch", teacher_batch_size=2)
+    frame_dir = tmp_path / "missing-batch-frames"
+    _write_frames(frame_dir, ["0", "1"])
+    learner.large_od = SimpleNamespace(
+        large_inference=lambda _frame, **_kwargs: pytest.fail(
+            "Expected missing batch inference to fail, not run single-sample inference."
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="large_inference_batch"):
+        learner._collect_teacher_annotations(str(frame_dir), ["0", "1"])
+
+
 def test_hot_teacher_inference_paths_do_not_clear_cuda_cache(monkeypatch):
     detector = Object_Detection.__new__(Object_Detection)
     detector.threshold_high = 0.6

@@ -30,7 +30,9 @@ from model_management.continual_learning_bundle import prepare_split_training_ca
 from model_management.split_candidate import SplitCandidate
 from model_management.universal_model_split import (
     UniversalModelSplitter,
+    build_split_retrain_optimizer,
     load_split_feature_cache,
+    prepare_split_train_batches_once,
     save_split_feature_cache,
     universal_split_retrain,
 )
@@ -758,6 +760,235 @@ def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
     assert splitter.seen_batch_sizes == [16]
 
 
+def test_split_retrain_prepares_batches_once_and_reuses_across_epochs(
+    tmp_path,
+    monkeypatch,
+):
+    cache_path = str(tmp_path / "cache")
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    preloaded_records = {"s1": {"intermediate": payload}}
+    combine_calls = 0
+    original_combine = __import__(
+        "model_management.universal_model_split",
+        fromlist=["_combine_boundary_payload_batch"],
+    )._combine_boundary_payload_batch
+
+    def counting_combine(*args, **kwargs):
+        nonlocal combine_calls
+        combine_calls += 1
+        return original_combine(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "model_management.universal_model_split._combine_boundary_payload_batch",
+        counting_combine,
+    )
+
+    class DummySplitter:
+        def __init__(self):
+            self.boundary_ids = []
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del targets, loss_fn, optimizer
+            self.boundary_ids.append(id(boundary))
+            return torch.tensor(0.5), {}
+
+    splitter = DummySplitter()
+    losses = universal_split_retrain(
+        model=torch.nn.Linear(1, 1),
+        sample_input=torch.ones(1, 1),
+        cache_path=cache_path,
+        all_indices=["s1"],
+        gt_annotations={},
+        loss_fn=lambda outputs, targets: torch.tensor(0.5),
+        splitter=splitter,
+        batch_size=1,
+        num_epoch=3,
+        preloaded_records=preloaded_records,
+    )
+
+    assert losses == [0.5, 0.5, 0.5]
+    assert combine_calls == 1
+    assert len(set(splitter.boundary_ids)) == 1
+
+
+def test_prepare_split_train_batches_once_prefers_preloaded_records(
+    tmp_path,
+    monkeypatch,
+):
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    preloaded_records = {"s1": {"intermediate": payload}}
+
+    monkeypatch.setattr(
+        "model_management.universal_model_split.load_split_feature_cache",
+        lambda *args, **kwargs: pytest.fail("disk cache should not be loaded"),
+    )
+
+    class DummySplitter:
+        pass
+
+    batches = prepare_split_train_batches_once(
+        splitter=DummySplitter(),
+        cache_path=str(tmp_path / "cache"),
+        all_indices=["s1"],
+        annotations={},
+        batch_size=1,
+        device="cpu",
+        preloaded_records=preloaded_records,
+        validate=False,
+    )
+
+    assert len(batches) == 1
+    assert batches[0].sample_ids == ["s1"]
+    assert batches[0].boundary.tensors["node_1"].tolist() == [[2.0]]
+
+
+def test_split_retrain_fast_path_validates_once_not_every_epoch(tmp_path):
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    preloaded_records = {"s1": {"intermediate": payload}}
+
+    class Runtime:
+        split_id = "after:node_1"
+        graph_signature = "graph-sig"
+        candidate = SimpleNamespace(boundary_schema={})
+        trace_plan = None
+
+        def __init__(self):
+            self.validation_calls = 0
+
+        def validate_boundary(self, boundary):
+            del boundary
+            self.validation_calls += 1
+
+        def run_suffix(self, boundary):
+            return next(iter(boundary.tensors.values()))
+
+    class FastSplitter:
+        split_spec = None
+        model_name = "toy"
+        model_family = "yolo"
+
+        def __init__(self):
+            self.runtime = Runtime()
+            self.fast_calls = 0
+
+        def _ensure_runtime(self):
+            return self.runtime
+
+        def train_suffix_fast(self, boundary, targets, *, loss_fn, optimizer, profile):
+            del boundary, targets, loss_fn, optimizer
+            self.fast_calls += 1
+            profile["suffix_forward_backward_time"] = profile.get(
+                "suffix_forward_backward_time",
+                0.0,
+            )
+            return torch.tensor(0.25), {}
+
+        def train_suffix(self, *args, **kwargs):
+            raise AssertionError("validated batches should use the fast path")
+
+    splitter = FastSplitter()
+    losses = universal_split_retrain(
+        model=torch.nn.Linear(1, 1),
+        sample_input=torch.ones(1, 1),
+        cache_path=str(tmp_path / "cache"),
+        all_indices=["s1"],
+        gt_annotations={},
+        loss_fn=lambda outputs, targets: torch.tensor(0.25),
+        splitter=splitter,
+        batch_size=1,
+        num_epoch=3,
+        preloaded_records=preloaded_records,
+    )
+
+    assert losses == [0.25, 0.25, 0.25]
+    assert splitter.fast_calls == 3
+    assert splitter.runtime.validation_calls == 1
+
+
+def test_split_retrain_optimizer_uses_only_suffix_parameters():
+    model = torch.nn.Sequential(OrderedDict([
+        ("prefix", torch.nn.Linear(2, 2)),
+        ("suffix", torch.nn.Linear(2, 1)),
+    ]))
+    suffix_node = SimpleNamespace(
+        name="suffix_node",
+        param_refs=[
+            SimpleNamespace(name="suffix.weight"),
+            SimpleNamespace(name="suffix.bias"),
+        ],
+    )
+    prefix_node = SimpleNamespace(
+        name="prefix_node",
+        param_refs=[SimpleNamespace(name="prefix.weight")],
+    )
+    runtime = SimpleNamespace(
+        trace_plan=SimpleNamespace(root_module=model, nodes=[prefix_node, suffix_node]),
+        candidate=SimpleNamespace(suffix_nodes=["suffix_node"]),
+    )
+
+    optimizer = build_split_retrain_optimizer(model, runtime=runtime)
+
+    assert optimizer is not None
+    optimized_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert optimized_ids == {id(model.suffix.weight), id(model.suffix.bias)}
+    assert model.prefix.weight.requires_grad is False
+    assert model.prefix.bias.requires_grad is False
+    assert model.suffix.weight.requires_grad is True
+    assert model.suffix.bias.requires_grad is True
+
+
+def test_fixed_split_retrain_does_not_execute_full_model_forward(tmp_path):
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    preloaded_records = {"s1": {"intermediate": payload}}
+
+    class FullModelShouldNotRun(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("fixed-split retraining must not run the full model")
+
+    class DummySplitter:
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del boundary, targets, loss_fn, optimizer
+            return torch.tensor(0.5), {}
+
+    losses = universal_split_retrain(
+        model=FullModelShouldNotRun(),
+        sample_input=torch.ones(1, 1),
+        cache_path=str(tmp_path / "cache"),
+        all_indices=["s1"],
+        gt_annotations={},
+        loss_fn=lambda outputs, targets: torch.tensor(0.5),
+        splitter=DummySplitter(),
+        batch_size=1,
+        preloaded_records=preloaded_records,
+    )
+
+    assert losses == [0.5]
+
+
 def test_split_retrain_logs_epoch_and_batch_losses_when_context_is_provided(tmp_path):
     cache_path = str(tmp_path / "cache")
     sample_ids = ["s1", "s2"]
@@ -800,6 +1031,24 @@ def test_split_retrain_logs_epoch_and_batch_losses_when_context_is_provided(tmp_
     joined_messages = "\n".join(messages)
     assert "unit split epoch 1/2 batch 1/2 loss=1.000000 avg_loss=1.000000" in joined_messages
     assert "unit split epoch 2/2 finished avg_loss=3.500000" in joined_messages
+
+
+def test_split_retrain_raises_when_no_trainable_parameters(tmp_path):
+    model = torch.nn.Linear(1, 1)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    with pytest.raises(RuntimeError, match="no trainable parameters"):
+        universal_split_retrain(
+            model=model,
+            sample_input=torch.ones(1, 1),
+            cache_path=str(tmp_path / "cache"),
+            all_indices=["s1"],
+            gt_annotations={},
+            loss_fn=lambda outputs, targets: torch.tensor(1.0),
+            splitter=SimpleNamespace(),
+            batch_size=1,
+        )
 
 
 def test_split_retrain_moves_mixed_preloaded_boundary_devices_to_training_device(
