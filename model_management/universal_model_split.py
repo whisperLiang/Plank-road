@@ -1206,7 +1206,40 @@ def _splitter_model_context(splitter: Any) -> tuple[str | None, str | None]:
 
 
 def _move_target_to_device(target: Any, device: torch.device) -> Any:
-    return _move_boundary_value_to_device(target, device)
+    return _detach_boundary_value(_move_boundary_value_to_device(target, device))
+
+
+def _detach_boundary_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {
+            key: _detach_boundary_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_detach_boundary_value(item) for item in value)
+    if isinstance(value, list):
+        return [_detach_boundary_value(item) for item in value]
+    return value
+
+
+def _detach_boundary_payload(boundary: BoundaryPayload) -> BoundaryPayload:
+    return BoundaryPayload(
+        split_id=boundary.split_id,
+        graph_signature=boundary.graph_signature,
+        batch_size=boundary.batch_size,
+        tensors={
+            label: _detach_boundary_value(tensor)
+            for label, tensor in dict(boundary.tensors).items()
+        },
+        schema=boundary.schema,
+        requires_grad=boundary.requires_grad,
+        weight_version=boundary.weight_version,
+        passthrough_inputs=_detach_boundary_value(
+            dict(boundary.passthrough_inputs or {})
+        ),
+    )
 
 
 def prepare_split_train_batches_once(
@@ -1270,6 +1303,15 @@ def prepare_split_train_batches_once(
                 execution_targets.extend([targets[-1]] * pad_count)
                 execution_batch_size = runtime_min_batch
                 is_padded = True
+
+            execution_boundaries = [
+                _detach_boundary_payload(boundary)
+                for boundary in execution_boundaries
+            ]
+            execution_targets = [
+                _detach_boundary_value(target)
+                for target in execution_targets
+            ]
 
             if move_to_device:
                 device_started = time.perf_counter()

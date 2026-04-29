@@ -917,6 +917,53 @@ def test_split_retrain_fast_path_validates_once_not_every_epoch(tmp_path):
     assert splitter.runtime.validation_calls == 1
 
 
+def test_split_retrain_detaches_prepared_boundary_graph_for_reuse(tmp_path):
+    base = torch.ones(1, 1, requires_grad=True)
+    payload = boundary_payload_from_tensors(
+        {"node_1": base * 2.0},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": base * 3.0},
+    )
+    preloaded_records = {"s1": {"intermediate": payload}}
+    model = torch.nn.Linear(1, 1, bias=False)
+
+    class Runtime:
+        split_id = "after:node_1"
+        graph_signature = "graph-sig"
+        candidate = SimpleNamespace(boundary_schema={})
+        trace_plan = None
+
+        def __init__(self, tail):
+            self.tail = tail
+
+        def validate_boundary(self, boundary):
+            assert boundary.tensors["node_1"].grad_fn is None
+            assert boundary.passthrough_inputs["input"].grad_fn is None
+
+        def run_suffix(self, boundary):
+            return self.tail(boundary.tensors["node_1"])
+
+    splitter = UniversalModelSplitter()
+    splitter.runtime = Runtime(model)
+
+    losses = universal_split_retrain(
+        model=model,
+        sample_input=torch.ones(1, 1),
+        cache_path=str(tmp_path / "cache"),
+        all_indices=["s1"],
+        gt_annotations={},
+        loss_fn=lambda outputs, targets: outputs.square().mean(),
+        splitter=splitter,
+        batch_size=1,
+        num_epoch=2,
+        preloaded_records=preloaded_records,
+    )
+
+    assert len(losses) == 2
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in losses)
+
+
 def test_split_retrain_optimizer_uses_only_suffix_parameters():
     model = torch.nn.Sequential(OrderedDict([
         ("prefix", torch.nn.Linear(2, 2)),
