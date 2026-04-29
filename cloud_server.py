@@ -82,6 +82,9 @@ def _collate_fn(batch):
 
 
 _FIXED_SPLIT_WORKING_CACHE_VERSION = 2
+_FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
+_FIXED_SPLIT_DYNAMIC_BATCH_MIN = _FIXED_SPLIT_DYNAMIC_BATCH[0]
+_FIXED_SPLIT_DYNAMIC_BATCH_MAX = _FIXED_SPLIT_DYNAMIC_BATCH[1]
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
 
 
@@ -241,6 +244,18 @@ def _normalize_proxy_sample_ids(
     if max_samples is None or int(max_samples) <= 0:
         return sample_ids
     return sample_ids[: int(max_samples)]
+
+
+def _lookup_preloaded_record(
+    preloaded_records: Mapping[object, Mapping[str, object]] | None,
+    sample_id: object,
+) -> Mapping[str, object] | None:
+    if preloaded_records is None:
+        return None
+    record = preloaded_records.get(sample_id)
+    if record is None:
+        record = preloaded_records.get(str(sample_id))
+    return record if isinstance(record, Mapping) else None
 
 
 def _build_tinynext_threshold_candidates(
@@ -963,6 +978,7 @@ def _build_detection_proxy_prediction_cache(
     split_cache_path: str | None = None,
     splitter: UniversalModelSplitter | None = None,
     split_candidate=None,
+    preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     sample_ids = _normalize_proxy_sample_ids(
         gt_annotations,
@@ -994,11 +1010,13 @@ def _build_detection_proxy_prediction_cache(
                 skipped_empty_gt += 1
                 continue
 
-            try:
-                record = load_split_feature_cache(split_cache_path, sample_id)
-            except FileNotFoundError:
-                skipped_missing_frame += 1
-                continue
+            record = _lookup_preloaded_record(preloaded_records, sample_id)
+            if record is None:
+                try:
+                    record = load_split_feature_cache(split_cache_path, sample_id)
+                except FileNotFoundError:
+                    skipped_missing_frame += 1
+                    continue
             payload = record.get("intermediate")
             if not isinstance(payload, (BoundaryPayload, torch.Tensor)):
                 skipped_missing_frame += 1
@@ -1184,6 +1202,7 @@ def _evaluate_detection_proxy_map(
     split_cache_path: str | None = None,
     splitter: UniversalModelSplitter | None = None,
     split_candidate=None,
+    preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
 ) -> dict[str, float | int | None]:
     if threshold_low is None or threshold_high is None:
         threshold_low, threshold_high = get_model_detection_thresholds(
@@ -1207,6 +1226,7 @@ def _evaluate_detection_proxy_map(
             split_cache_path=split_cache_path,
             splitter=splitter,
             split_candidate=split_candidate,
+            preloaded_records=preloaded_records,
         )
 
     return _evaluate_detection_proxy_map_from_cache(
@@ -1301,6 +1321,7 @@ def _calibrate_tinynext_proxy_thresholds(
     split_cache_path: str | None = None,
     splitter: UniversalModelSplitter | None = None,
     split_candidate=None,
+    preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
 ) -> tuple[dict[str, float | int | None], float, float]:
     current_low, current_high = get_model_detection_thresholds(model, model_name)
     _, default_high = get_detection_thresholds(model_name)
@@ -1317,12 +1338,14 @@ def _calibrate_tinynext_proxy_thresholds(
         gt_annotations=gt_annotations,
         device=device,
         threshold_low=float(current_low),
+        model_name=model_name,
         frame_cache=frame_cache,
         max_samples=max_samples,
         inference_batch_size=inference_batch_size,
         split_cache_path=split_cache_path,
         splitter=splitter,
         split_candidate=split_candidate,
+        preloaded_records=preloaded_records,
     )
     metrics_by_threshold: dict[float, dict[str, float | int | None]] = {}
 
@@ -1461,12 +1484,11 @@ class CloudContinualLearner:
             int(getattr(cl_cfg, "batch_size", 2))
             if cl_cfg else 2
         )
+        self.trace_batch_size = (
+            int(getattr(cl_cfg, "trace_batch_size", 2))
+            if cl_cfg else 2
+        )
         removed_cl_fields = {
-            "trace_batch_size": (
-                "server.continual_learning.trace_batch_size has been removed; "
-                "use server.continual_learning.batch_size for the shared "
-                "cloud continual-learning batch size."
-            ),
             "rebuild_batch_size": (
                 "server.continual_learning.rebuild_batch_size has been removed; "
                 "use server.continual_learning.batch_size for the shared "
@@ -1496,6 +1518,18 @@ class CloudContinualLearner:
         self.teacher_batch_size = (
             int(getattr(cl_cfg, "teacher_batch_size", self.batch_size))
             if cl_cfg else self.batch_size
+        )
+        self.proxy_eval_interval_rounds = (
+            int(getattr(cl_cfg, "proxy_eval_interval_rounds", 1))
+            if cl_cfg else 1
+        )
+        self.proxy_eval_patience = (
+            int(getattr(cl_cfg, "proxy_eval_patience", 0))
+            if cl_cfg else 0
+        )
+        self.proxy_eval_min_delta = (
+            float(getattr(cl_cfg, "proxy_eval_min_delta", 0.0))
+            if cl_cfg else 0.0
         )
         self.wrapper_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
@@ -2323,6 +2357,68 @@ class CloudContinualLearner:
             padded_inputs.append(padded_inputs[-1].clone())
         return torch.cat(padded_inputs[:target_batch_size], dim=0)
 
+    @staticmethod
+    def _pad_batched_runtime_tensor(
+        batch_input: torch.Tensor,
+        *,
+        target_batch_size: int,
+    ) -> torch.Tensor:
+        if batch_input.ndim < 1:
+            raise RuntimeError(
+                f"Expected batched runtime tensor, got shape {tuple(batch_input.shape)}."
+            )
+        current_batch_size = int(batch_input.shape[0])
+        if current_batch_size == int(target_batch_size):
+            return batch_input
+        if current_batch_size > int(target_batch_size):
+            return batch_input[: int(target_batch_size)]
+        if current_batch_size <= 0:
+            raise RuntimeError("Cannot pad an empty runtime tensor batch.")
+        repeats = [int(target_batch_size) - current_batch_size, *([1] * (batch_input.ndim - 1))]
+        padding = batch_input[-1:].repeat(*repeats)
+        return torch.cat([batch_input, padding], dim=0)
+
+    def _prepare_bundle_runtime_batch(
+        self,
+        model: torch.nn.Module,
+        frames: list[np.ndarray],
+        samples: list[Mapping[str, object]],
+        *,
+        target_batch_size: int,
+        context: str,
+    ) -> torch.Tensor:
+        if not frames:
+            raise ValueError("frames must contain at least one frame.")
+        if len(frames) != len(samples):
+            raise ValueError(f"{context} requires one sample metadata record per frame.")
+        model_family = model_zoo.get_model_family(str(getattr(model, "model_name", "")))
+        if model_family == "rfdetr" and hasattr(model, "_prepare_batch"):
+            tensors: list[torch.Tensor] = []
+            for frame in frames:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                tensor = torch.from_numpy(np.ascontiguousarray(rgb))
+                tensor = tensor.permute(2, 0, 1).float().div(255.0).to(self.device)
+                tensors.append(tensor)
+            batch_tensor, _ = model._prepare_batch(tensors)
+            return self._pad_batched_runtime_tensor(
+                batch_tensor.to(self.device),
+                target_batch_size=target_batch_size,
+            )
+
+        prepared_inputs = [
+            self._prepare_bundle_runtime_tensor(
+                model,
+                frame,
+                sample_metadata=sample,
+                context=context,
+            )
+            for frame, sample in zip(frames, samples)
+        ]
+        return self._pad_runtime_batch_inputs(
+            prepared_inputs,
+            target_batch_size=target_batch_size,
+        )
+
     def _bundle_batch_feature_provider(
         self,
         model: torch.nn.Module,
@@ -2354,32 +2450,33 @@ class CloudContinualLearner:
                 1,
                 int(self.batch_size if runtime_batch_size is None else runtime_batch_size),
             )
+            chunk_size = min(chunk_size, _FIXED_SPLIT_DYNAMIC_BATCH_MAX)
             for offset in range(0, len(raw_paths), chunk_size):
                 chunk_paths = raw_paths[offset:offset + chunk_size]
                 chunk_samples = samples[offset:offset + chunk_size]
-                prepared_inputs: list[torch.Tensor] = []
+                prepared_inputs: list[np.ndarray] = []
                 for raw_path, sample in zip(chunk_paths, chunk_samples):
                     frame = cv2.imread(raw_path)
                     if frame is None:
                         raise FileNotFoundError(raw_path)
-                    prepared_inputs.append(
-                        self._prepare_bundle_runtime_tensor(
-                            model,
-                            frame,
-                            sample_metadata=sample,
-                            context="Cloud fixed-split feature reconstruction",
-                        )
-                    )
+                    prepared_inputs.append(frame)
 
                 actual_chunk_size = len(chunk_paths)
-                inputs = self._pad_runtime_batch_inputs(
+                execution_batch_size = max(
+                    _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+                    actual_chunk_size,
+                )
+                inputs = self._prepare_bundle_runtime_batch(
+                    model,
                     prepared_inputs,
-                    target_batch_size=chunk_size,
+                    chunk_samples,
+                    target_batch_size=execution_batch_size,
+                    context="Cloud fixed-split feature reconstruction",
                 )
                 batch_payload = splitter.edge_forward(inputs, candidate=candidate)
                 chunk_payloads = self._split_batched_payload(
                     batch_payload,
-                    batch_size=chunk_size,
+                    batch_size=execution_batch_size,
                 )
                 payloads.extend(
                     chunk_payloads[:actual_chunk_size]
@@ -2402,7 +2499,7 @@ class CloudContinualLearner:
         model_family = model_zoo.get_model_family(str(model_name))
         split_spec = make_split_spec(
             boundary,
-            dynamic_batch=(2, 64),
+            dynamic_batch=_FIXED_SPLIT_DYNAMIC_BATCH,
             trainable=True,
             trace_batch_mode="batch_gt1",
             model_family=model_family,
@@ -2529,14 +2626,14 @@ class CloudContinualLearner:
                 model,
                 bundle_root,
                 manifest,
-                runtime_batch_size=2,
+                runtime_batch_size=max(1, int(self.trace_batch_size)),
             )
         boundary = _fixed_split_boundary_from_plan(split_plan_payload)
         model_name = self._resolve_fixed_split_model_name(manifest)
         model_family = model_zoo.get_model_family(model_name)
         split_spec = make_split_spec(
             boundary,
-            dynamic_batch=(2, 64),
+            dynamic_batch=_FIXED_SPLIT_DYNAMIC_BATCH,
             trainable=True,
             trace_batch_mode="batch_gt1",
             model_family=model_family,
@@ -2865,7 +2962,14 @@ class CloudContinualLearner:
         working_cache: str,
         force_rebuild: bool = False,
         runtime_batch_size: int | None = None,
-    ) -> tuple[dict[str, object], str, torch.Tensor | None, UniversalModelSplitter | None, object | None]:
+    ) -> tuple[
+        dict[str, object],
+        str,
+        torch.Tensor | None,
+        UniversalModelSplitter | None,
+        object | None,
+        dict[str, dict[str, object]],
+    ]:
         cache_identity = _build_fixed_split_cache_identity(manifest)
         cached_manifest = _read_json_file(_working_cache_manifest_path(working_cache))
         can_attempt_reuse = (
@@ -2885,7 +2989,7 @@ class CloudContinualLearner:
                 model,
                 bundle_cache_path,
                 manifest,
-                runtime_batch_size=runtime_batch_size,
+                runtime_batch_size=max(1, int(self.trace_batch_size)),
             )
 
         stage_started = time.perf_counter()
@@ -2898,7 +3002,10 @@ class CloudContinualLearner:
         )
         self._log_stage_duration("runtime template load / bind", stage_started)
 
+        preloaded_records: dict[str, dict[str, object]] = {}
+
         def _prepare_cache() -> dict[str, object]:
+            preloaded_records.clear()
             return prepare_split_training_cache(
                 bundle_cache_path,
                 working_cache,
@@ -2910,6 +3017,7 @@ class CloudContinualLearner:
                     candidate=prepared_candidate,
                     runtime_batch_size=runtime_batch_size,
                 ),
+                preloaded_records=preloaded_records,
             )
 
         stage_started = time.perf_counter()
@@ -2954,6 +3062,7 @@ class CloudContinualLearner:
             prepared_trace_sample_input,
             prepared_splitter,
             prepared_candidate,
+            dict(preloaded_records),
         )
 
     def _collect_teacher_annotations(
@@ -3022,6 +3131,7 @@ class CloudContinualLearner:
     def _load_cached_sample_metadata(
         cache_path: str,
         sample_ids,
+        preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
     ) -> dict[str, dict[str, object]]:
         metadata: dict[str, dict[str, object]] = {}
         metadata_index = _read_json_file(_working_cache_metadata_index_path(cache_path))
@@ -3036,6 +3146,10 @@ class CloudContinualLearner:
             )
             if isinstance(sample_metadata, Mapping):
                 metadata[sample_key] = dict(sample_metadata)
+                continue
+            record = _lookup_preloaded_record(preloaded_records, sample_key)
+            if record is not None:
+                metadata[sample_key] = dict(record)
                 continue
             pending_sample_ids.append(sample_key)
 
@@ -3062,6 +3176,7 @@ class CloudContinualLearner:
         split_cache_path: str | None = None,
         splitter: UniversalModelSplitter | None = None,
         split_candidate=None,
+        preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
     ) -> dict[str, float | int | None]:
         return _evaluate_detection_proxy_map(
             model,
@@ -3080,6 +3195,7 @@ class CloudContinualLearner:
             split_cache_path=split_cache_path,
             splitter=splitter,
             split_candidate=split_candidate,
+            preloaded_records=preloaded_records,
         )
 
     def _evaluate_tinynext_proxy_map(
@@ -3098,6 +3214,7 @@ class CloudContinualLearner:
         split_cache_path: str | None = None,
         splitter: UniversalModelSplitter | None = None,
         split_candidate=None,
+        preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
     ) -> dict[str, float | int | None]:
         full_proxy_sample_count = len(
             _normalize_proxy_sample_ids(
@@ -3131,6 +3248,7 @@ class CloudContinualLearner:
                 split_cache_path=split_cache_path,
                 splitter=splitter,
                 split_candidate=split_candidate,
+                preloaded_records=preloaded_records,
             )
             if abs(calibrated_high - initial_high) > 1e-6:
                 logger.info(
@@ -3153,6 +3271,7 @@ class CloudContinualLearner:
                 split_cache_path=split_cache_path,
                 splitter=splitter,
                 split_candidate=split_candidate,
+                preloaded_records=preloaded_records,
             )
 
         metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
@@ -3172,6 +3291,7 @@ class CloudContinualLearner:
             split_cache_path=split_cache_path,
             splitter=splitter,
             split_candidate=split_candidate,
+            preloaded_records=preloaded_records,
         )
         if abs(calibrated_high - initial_high) > 1e-6:
             logger.info(
@@ -3350,6 +3470,7 @@ class CloudContinualLearner:
         effective_batch_size: int,
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
         proxy_eval_frame_cache: dict[str, np.ndarray | None] | None = None,
+        preloaded_records: Mapping[str, Mapping[str, object]] | None = None,
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
         baseline_state = _snapshot_model_state(model)
         baseline_proxy_state_key = _model_state_fingerprint(model)
@@ -3415,6 +3536,7 @@ class CloudContinualLearner:
             "splitter": prepared_splitter,
             "chosen_candidate": prepared_candidate,
             "batch_size": bs,
+            "preloaded_records": preloaded_records,
         }
         split_retrain_kwargs.update(
             self._fixed_split_optimizer_overrides(current_model_name)
@@ -3465,6 +3587,7 @@ class CloudContinualLearner:
                         split_cache_path=working_cache,
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
+                        preloaded_records=preloaded_records,
                     )
                 max_samples = self.proxy_eval_max_samples
                 if selection_eval:
@@ -3483,6 +3606,7 @@ class CloudContinualLearner:
                     split_cache_path=working_cache,
                     splitter=prepared_splitter,
                     split_candidate=prepared_candidate,
+                    preloaded_records=preloaded_records,
                 )
             state_key = _model_state_fingerprint(model)
             cached_metrics = proxy_metrics_cache.get(state_key)
@@ -3500,6 +3624,7 @@ class CloudContinualLearner:
                 split_cache_path=working_cache,
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
+                preloaded_records=preloaded_records,
             )
             proxy_metrics_cache[state_key] = dict(metrics)
             return dict(metrics)
@@ -3514,15 +3639,20 @@ class CloudContinualLearner:
                 current_model_name,
                 int(effective_num_epoch),
             )
+            proxy_eval_interval_rounds = max(1, int(self.proxy_eval_interval_rounds))
+            proxy_eval_patience = max(0, int(self.proxy_eval_patience))
+            proxy_eval_min_delta = max(0.0, float(self.proxy_eval_min_delta))
             total_outer_rounds = math.ceil(
                 int(effective_num_epoch) / max(1, int(proxy_eval_inner_epochs))
             )
             completed_inner_epochs = 0
+            stale_proxy_eval_count = 0
             logger.info(
-                "[FixedSplitCL] {} fixed-split retrain will run {} outer rounds with up to {} inner epoch(s) per round and evaluate proxy mAP after each round.",
+                "[FixedSplitCL] {} fixed-split retrain will run {} outer rounds with up to {} inner epoch(s) per round and evaluate proxy mAP on round 1, every {} round(s), and the final round.",
                 training_label,
                 int(total_outer_rounds),
                 int(proxy_eval_inner_epochs),
+                int(proxy_eval_interval_rounds),
             )
             if tinynext_selection_uses_subset:
                 logger.info(
@@ -3549,15 +3679,36 @@ class CloudContinualLearner:
                 )
                 completed_inner_epochs += inner_epochs_this_round
                 split_retrain_elapsed += time.perf_counter() - stage_started
+                is_final_round = completed_inner_epochs >= int(effective_num_epoch)
+                should_evaluate_round = (
+                    epoch_index == 0
+                    or ((epoch_index + 1) % proxy_eval_interval_rounds == 0)
+                    or is_final_round
+                )
+                if not should_evaluate_round:
+                    continue
                 stage_started = time.perf_counter()
                 candidate_metrics = _evaluate_proxy_metrics_for_current_state(
                     selection_eval=tinynext_selection_uses_subset,
                 )
                 proxy_eval_elapsed += time.perf_counter() - stage_started
-                if _proxy_metrics_are_better(candidate_metrics, best_metrics):
+                candidate_is_better = _proxy_metrics_are_better(candidate_metrics, best_metrics)
+                if (
+                    candidate_is_better
+                    and proxy_eval_min_delta > 0.0
+                    and candidate_metrics.get("map") is not None
+                    and best_metrics.get("map") is not None
+                    and (
+                        float(candidate_metrics["map"])
+                        - float(best_metrics["map"])
+                    ) < proxy_eval_min_delta
+                ):
+                    candidate_is_better = False
+                if candidate_is_better:
                     best_state = _snapshot_model_state(model)
                     best_metrics = dict(candidate_metrics)
                     best_state_is_baseline = False
+                    stale_proxy_eval_count = 0
                     logger.info(
                         "[FixedSplitCL] Kept {} candidate from outer round {} (through inner epoch {}) with {}={:.4f}.",
                         training_label,
@@ -3566,6 +3717,16 @@ class CloudContinualLearner:
                         "selection_proxy_mAP@0.5" if tinynext_selection_uses_subset else "proxy_mAP@0.5",
                         float(candidate_metrics.get("map") or 0.0),
                     )
+                else:
+                    stale_proxy_eval_count += 1
+                    if proxy_eval_patience and stale_proxy_eval_count >= proxy_eval_patience:
+                        logger.info(
+                            "[FixedSplitCL] Early-stopping {} fixed-split retrain after {} proxy evaluation(s) without >= {} mAP improvement.",
+                            training_label,
+                            stale_proxy_eval_count,
+                            proxy_eval_min_delta,
+                        )
+                        break
             if tinynext_selection_uses_subset:
                 model.load_state_dict(best_state)
                 _set_detection_model_eval_mode(model)
@@ -3607,6 +3768,7 @@ class CloudContinualLearner:
                     split_cache_path=working_cache,
                     splitter=prepared_splitter,
                     split_candidate=prepared_candidate,
+                    preloaded_records=preloaded_records,
                 )
         else:
             if current_proxy_state_key != baseline_proxy_state_key:
@@ -3812,6 +3974,7 @@ class CloudContinualLearner:
                     prepared_trace_sample_input,
                     prepared_splitter,
                     prepared_candidate,
+                    preloaded_records,
                 ) = (
                     self._prepare_fixed_split_working_cache(
                         tmp_model,
@@ -3837,6 +4000,7 @@ class CloudContinualLearner:
                 sample_metadata_by_id = self._load_cached_sample_metadata(
                     working_cache,
                     bundle_info["all_sample_ids"],
+                    preloaded_records=preloaded_records,
                 )
                 proxy_eval_frame_cache = self._proxy_eval_frame_cache()
 
@@ -3856,6 +4020,7 @@ class CloudContinualLearner:
                         split_cache_path=working_cache,
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
+                        preloaded_records=preloaded_records,
                     )
                 else:
                     proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
@@ -3870,6 +4035,7 @@ class CloudContinualLearner:
                         split_cache_path=working_cache,
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
+                        preloaded_records=preloaded_records,
                     )
                 self._log_stage_duration("proxy evaluation before retrain", stage_started)
                 is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
@@ -3905,6 +4071,7 @@ class CloudContinualLearner:
                             prepared_trace_sample_input,
                             prepared_splitter,
                             prepared_candidate,
+                            preloaded_records,
                         ) = (
                             self._prepare_fixed_split_working_cache(
                                 tmp_model,
@@ -3919,6 +4086,7 @@ class CloudContinualLearner:
                         sample_metadata_by_id = self._load_cached_sample_metadata(
                             working_cache,
                             bundle_info["all_sample_ids"],
+                            preloaded_records=preloaded_records,
                         )
                         stage_started = time.perf_counter()
                         if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
@@ -3936,6 +4104,7 @@ class CloudContinualLearner:
                                 split_cache_path=working_cache,
                                 splitter=prepared_splitter,
                                 split_candidate=prepared_candidate,
+                                preloaded_records=preloaded_records,
                             )
                         else:
                             proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
@@ -3950,6 +4119,7 @@ class CloudContinualLearner:
                                 split_cache_path=working_cache,
                                 splitter=prepared_splitter,
                                 split_candidate=prepared_candidate,
+                                preloaded_records=preloaded_records,
                             )
                         self._log_stage_duration("proxy evaluation before retrain", stage_started)
 
@@ -3970,6 +4140,7 @@ class CloudContinualLearner:
                     effective_batch_size=effective_batch_size,
                     sample_metadata_by_id=sample_metadata_by_id,
                     proxy_eval_frame_cache=proxy_eval_frame_cache,
+                    preloaded_records=preloaded_records,
                 )
                 proxy_summary = _format_proxy_map_summary(
                     proxy_metrics_before,

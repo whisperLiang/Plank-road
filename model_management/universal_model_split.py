@@ -809,7 +809,7 @@ def save_split_feature_cache(
     frame_index: Any,
     intermediate: BoundaryPayload,
     **record_fields: Any,
-) -> None:
+) -> dict[str, Any]:
     os.makedirs(os.path.join(cache_path, "features"), exist_ok=True)
     extra_metadata = dict(record_fields.pop("extra_metadata", {}) or {})
     record = {
@@ -828,6 +828,7 @@ def save_split_feature_cache(
         **extra_metadata,
     }
     torch.save(record, _feature_path(cache_path, frame_index))
+    return record
 
 
 def load_split_feature_cache(cache_path: str, frame_index: Any) -> dict[str, Any]:
@@ -838,6 +839,20 @@ def load_split_feature_cache(cache_path: str, frame_index: Any) -> dict[str, Any
     if not isinstance(record, dict):
         raise TypeError(f"Unsupported split feature cache record: {type(record)!r}")
     return record
+
+
+def _get_preloaded_split_feature_record(
+    preloaded_records: Mapping[Any, Mapping[str, Any]] | None,
+    index: Any,
+) -> dict[str, Any] | None:
+    if preloaded_records is None:
+        return None
+    record = preloaded_records.get(index)
+    if record is None:
+        record = preloaded_records.get(str(index))
+    if isinstance(record, Mapping):
+        return dict(record)
+    return None
 
 
 def _combine_boundary_values(values: list[Any]) -> Any:
@@ -1004,6 +1019,7 @@ def universal_split_retrain(
     loss_fn=None,
     splitter: UniversalModelSplitter | None = None,
     batch_size: int = 2,
+    preloaded_records: Mapping[Any, Mapping[str, Any]] | None = None,
     **_: Any,
 ) -> list[float]:
     if loss_fn is None:
@@ -1020,7 +1036,11 @@ def universal_split_retrain(
             batch_indices = list(all_indices[start : start + int(batch_size)])
             if not batch_indices:
                 continue
-            records = [load_split_feature_cache(cache_path, index) for index in batch_indices]
+            records = [
+                _get_preloaded_split_feature_record(preloaded_records, index)
+                or load_split_feature_cache(cache_path, index)
+                for index in batch_indices
+            ]
             boundaries = [record.get("intermediate") for record in records]
             if not boundaries or not all(
                 isinstance(boundary, BoundaryPayload) for boundary in boundaries

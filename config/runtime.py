@@ -101,10 +101,14 @@ class SplitLearningConfig(ConfigSection):
 @dataclass
 class ContinualLearningConfig(ConfigSection):
     num_epoch: int = 5
+    trace_batch_size: int = 2
     batch_size: int = 2
     teacher_batch_size: int | None = None
     teacher_annotation_threshold: float = 0.5
     proxy_eval_max_samples: int = 0
+    proxy_eval_interval_rounds: int = 1
+    proxy_eval_patience: int = 0
+    proxy_eval_min_delta: float = 0.0
     proxy_eval_threshold_candidates: list[float] | None = None
     proxy_eval_frame_cache_enabled: bool = True
     split_learning_rate: float = 1e-3
@@ -279,11 +283,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "cloud training epochs are controlled by "
             "server.continual_learning.num_epoch."
         ),
-        "trace_batch_size": (
-            "server.continual_learning.trace_batch_size has been removed; "
-            "use server.continual_learning.batch_size for the shared "
-            "cloud continual-learning batch size."
-        ),
         "rebuild_batch_size": (
             "server.continual_learning.rebuild_batch_size has been removed; "
             "use server.continual_learning.batch_size for the shared "
@@ -332,6 +331,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         int(config.server.continual_learning.batch_size),
     )
     _validate_positive(
+        "server.continual_learning.trace_batch_size",
+        int(config.server.continual_learning.trace_batch_size),
+    )
+    _validate_positive(
         "server.continual_learning.tinynext_fixed_split_learning_rate",
         float(config.server.continual_learning.tinynext_fixed_split_learning_rate),
     )
@@ -356,6 +359,20 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         int(config.server.continual_learning.proxy_eval_max_samples),
         allow_zero=True,
     )
+    _validate_positive(
+        "server.continual_learning.proxy_eval_interval_rounds",
+        int(config.server.continual_learning.proxy_eval_interval_rounds),
+    )
+    _validate_positive(
+        "server.continual_learning.proxy_eval_patience",
+        int(config.server.continual_learning.proxy_eval_patience),
+        allow_zero=True,
+    )
+    if float(config.server.continual_learning.proxy_eval_min_delta) < 0.0:
+        raise ValueError(
+            "server.continual_learning.proxy_eval_min_delta must be >= 0, "
+            f"got {config.server.continual_learning.proxy_eval_min_delta!r}"
+        )
     _validate_threshold_candidates(
         "server.continual_learning.proxy_eval_threshold_candidates",
         config.server.continual_learning.proxy_eval_threshold_candidates,

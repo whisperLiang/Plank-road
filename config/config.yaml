@@ -174,7 +174,14 @@ server:
  # continual learning settings
  continual_learning:
   num_epoch: 50
+  # Cloud traces the fixed split runtime with a small batch to build a
+  # dynamic-batch Ariadne template; reconstruction/training use batch_size.
+  trace_batch_size: 2
   batch_size: 16
+  teacher_batch_size: 32
+  proxy_eval_interval_rounds: 5
+  proxy_eval_patience: 3
+  proxy_eval_min_delta: 0.0005
   # RF-DETR fixed-split jobs shrink the effective runtime batch size toward
   # this many optimizer steps per outer round so small bundles do not collapse
   # into a single heavily padded update.

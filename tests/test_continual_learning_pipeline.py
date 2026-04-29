@@ -687,6 +687,72 @@ def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
     assert splitter.seen_boundary is not None
 
 
+def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
+    tmp_path,
+    monkeypatch,
+):
+    cache_path = str(tmp_path / "cache")
+    preloaded_records = {}
+    sample_ids = [f"s{index}" for index in range(16)]
+    for index, sample_id in enumerate(sample_ids):
+        payload = boundary_payload_from_tensors(
+            {"node_1": torch.tensor([[float(index)]])},
+            split_id="after:node_1",
+            graph_signature="graph-sig",
+        )
+        preloaded_records[sample_id] = save_split_feature_cache(
+            cache_path,
+            sample_id,
+            payload,
+        )
+
+    def fail_load_split_feature_cache(*args, **kwargs):
+        raise AssertionError("training should use preloaded records before disk cache")
+
+    monkeypatch.setattr(
+        "model_management.universal_model_split.load_split_feature_cache",
+        fail_load_split_feature_cache,
+    )
+
+    class FullModelShouldNotRun(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("fixed-split continual learning should train only the suffix")
+
+    class DummySplitter:
+        def __init__(self):
+            self.seen_batch_sizes = []
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            self.seen_batch_sizes.append(boundary.batch_size)
+            assert boundary.batch_size == 16
+            assert boundary.tensors["node_1"].shape == (16, 1)
+            assert [target["label"] for target in targets] == list(range(16))
+            return torch.tensor(0.25), {}
+
+    splitter = DummySplitter()
+    losses = universal_split_retrain(
+        model=FullModelShouldNotRun(),
+        sample_input=torch.ones(1, 1),
+        cache_path=cache_path,
+        all_indices=sample_ids,
+        gt_annotations={
+            sample_id: {"label": index}
+            for index, sample_id in enumerate(sample_ids)
+        },
+        loss_fn=lambda outputs, targets: torch.tensor(0.25),
+        splitter=splitter,
+        batch_size=16,
+        preloaded_records=preloaded_records,
+    )
+
+    assert losses == [0.25]
+    assert splitter.seen_batch_sizes == [16]
+
+
 def test_split_retrain_attaches_cache_metadata_to_targets(tmp_path):
     cache_path = str(tmp_path / "cache")
     first = boundary_payload_from_tensors(
@@ -1694,6 +1760,99 @@ def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
     assert key.mode == "debug_interpreter"
 
 
+def test_cloud_fixed_split_working_cache_traces_with_configured_trace_batch(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=16, trace_batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    captured = {"trace_batch_sizes": []}
+
+    def fake_build_trace_input(model, bundle_root, manifest, *, runtime_batch_size=None):
+        captured["trace_batch_sizes"].append(runtime_batch_size)
+        return torch.zeros(int(runtime_batch_size), 3, 4, 4)
+
+    def fake_build_bundle_splitter(
+        model,
+        manifest,
+        *,
+        bundle_root,
+        trace_sample_input=None,
+        runtime_batch_size=None,
+    ):
+        captured["splitter_runtime_batch_size"] = runtime_batch_size
+        captured["trace_sample_shape"] = tuple(trace_sample_input.shape)
+        return object(), object()
+
+    def fake_prepare_split_training_cache(
+        bundle_root,
+        target_cache_path,
+        *,
+        batch_feature_provider,
+        preloaded_records,
+    ):
+        preloaded_records["s1"] = {"intermediate": _payload()}
+        return {"all_sample_ids": ["s1"], "drift_sample_ids": []}
+
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_batch_trace_sample_input",
+        fake_build_trace_input,
+    )
+    monkeypatch.setattr(learner, "_build_bundle_splitter", fake_build_bundle_splitter)
+    monkeypatch.setattr(
+        cloud_server,
+        "prepare_split_training_cache",
+        fake_prepare_split_training_cache,
+    )
+    monkeypatch.setattr(
+        learner,
+        "_validate_fixed_split_working_cache",
+        lambda **kwargs: (True, None),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_write_fixed_split_working_cache_manifest",
+        lambda *args, **kwargs: None,
+    )
+
+    (
+        bundle_info,
+        _frame_dir,
+        trace_sample_input,
+        _splitter,
+        _candidate,
+        preloaded_records,
+    ) = learner._prepare_fixed_split_working_cache(
+        torch.nn.Identity(),
+        {
+            "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+            "split_plan": {"split_label": "after:node_1"},
+            "samples": [{"sample_id": "s1"}],
+        },
+        bundle_cache_path=str(tmp_path / "bundle"),
+        working_cache=str(tmp_path / "working"),
+        runtime_batch_size=16,
+    )
+
+    assert captured["trace_batch_sizes"] == [2]
+    assert captured["trace_sample_shape"][0] == 2
+    assert captured["splitter_runtime_batch_size"] == 16
+    assert trace_sample_input.shape[0] == 2
+    assert bundle_info["all_sample_ids"] == ["s1"]
+    assert set(preloaded_records) == {"s1"}
+
+
 def test_cloud_reconstruction_splits_batched_boundary_payload(tmp_path):
     from cloud_server import CloudContinualLearner
 
@@ -1721,7 +1880,7 @@ def test_cloud_reconstruction_splits_batched_boundary_payload(tmp_path):
     assert split_payloads[1].passthrough_inputs["input"].shape == (1, 4)
 
 
-def test_cloud_batch_feature_provider_pads_short_final_chunk(
+def test_cloud_batch_feature_provider_uses_actual_short_final_chunk(
     tmp_path,
     sample_bgr_frame,
     monkeypatch,
@@ -1731,7 +1890,7 @@ def test_cloud_batch_feature_provider_pads_short_final_chunk(
     learner = CloudContinualLearner(
         config=SimpleNamespace(
             edge_model_name="rfdetr_nano",
-            continual_learning=SimpleNamespace(batch_size=4),
+            continual_learning=SimpleNamespace(batch_size=16),
             das=SimpleNamespace(enabled=False),
             workspace_root=str(tmp_path),
         ),
@@ -1772,15 +1931,71 @@ def test_cloud_batch_feature_provider_pads_short_final_chunk(
         bundle_root=str(tmp_path),
         splitter=fake_splitter,
         candidate=object(),
-        runtime_batch_size=4,
+        runtime_batch_size=16,
     )
 
     payloads = provider(raw_paths, samples, {})
 
-    assert fake_splitter.seen_shapes == [(4, 1)]
+    assert fake_splitter.seen_shapes == [(3, 1)]
     assert len(payloads) == 3
     assert [payload.batch_size for payload in payloads] == [1, 1, 1]
     assert payloads[2].tensors["node_1"].tolist() == [[2.0]]
+
+
+def test_cloud_batch_feature_provider_pads_single_sample_to_runtime_minimum(
+    tmp_path,
+    sample_bgr_frame,
+    monkeypatch,
+):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=16),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    raw_path = tmp_path / "single.jpg"
+    assert cv2.imwrite(str(raw_path), sample_bgr_frame)
+
+    def fake_prepare_bundle_runtime_tensor(model, frame, *, sample_metadata, context):
+        return torch.tensor([[float(sample_metadata["value"])]])
+
+    class FakeSplitter:
+        def __init__(self):
+            self.seen_shapes = []
+
+        def edge_forward(self, inputs, candidate=None):
+            self.seen_shapes.append(tuple(inputs.shape))
+            return boundary_payload_from_tensors(
+                {"node_1": inputs.clone()},
+                split_id="after:node_1",
+                graph_signature="graph-sig",
+            )
+
+    fake_splitter = FakeSplitter()
+    monkeypatch.setattr(
+        learner,
+        "_prepare_bundle_runtime_tensor",
+        fake_prepare_bundle_runtime_tensor,
+    )
+    provider = learner._bundle_batch_feature_provider(
+        object(),
+        {"samples": [{"sample_id": "s0", "value": 7}]},
+        bundle_root=str(tmp_path),
+        splitter=fake_splitter,
+        candidate=object(),
+        runtime_batch_size=16,
+    )
+
+    payloads = provider([str(raw_path)], [{"sample_id": "s0", "value": 7}], {})
+
+    assert fake_splitter.seen_shapes == [(2, 1)]
+    assert len(payloads) == 1
+    assert payloads[0].tensors["node_1"].tolist() == [[7.0]]
 
 
 def test_prepare_split_training_cache_preserves_unmodified_feature_mtime_on_reuse(

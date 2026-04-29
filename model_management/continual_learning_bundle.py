@@ -269,6 +269,13 @@ def _load_intermediate(feature_path: str) -> BoundaryPayload:
     raise TypeError(f"Unsupported bundled intermediate type: {type(intermediate)!r}")
 
 
+def _load_feature_record(feature_path: str) -> dict[str, Any]:
+    payload = torch.load(feature_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Unsupported split feature cache record: {type(payload)!r}")
+    return payload
+
+
 def _copy_raw_sample(
     bundle_root: str,
     raw_relpath: str | None,
@@ -359,6 +366,7 @@ def prepare_split_training_cache(
     target_cache_path: str,
     *,
     batch_feature_provider: Callable[[list[str], list[dict[str, Any]], dict[str, Any]], list[Any]] | None = None,
+    preloaded_records: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     manifest = load_training_bundle_manifest(bundle_root)
     os.makedirs(target_cache_path, exist_ok=True)
@@ -472,6 +480,8 @@ def prepare_split_training_cache(
                     source_feature_digest=source_feature_digest,
                     source_raw_digest=source_raw_digest,
                 )
+                if preloaded_records is not None:
+                    preloaded_records[sample_id] = _load_feature_record(feature_path)
                 all_sample_ids.append(sample_id)
                 if bool(sample.get("drift_flag", False)):
                     drift_sample_ids.append(sample_id)
@@ -523,6 +533,8 @@ def prepare_split_training_cache(
                     source_feature_digest=source_feature_digest,
                     source_raw_digest=source_raw_digest,
                 )
+                if preloaded_records is not None:
+                    preloaded_records[sample_id] = _load_feature_record(feature_path)
                 all_sample_ids.append(sample_id)
                 if bool(sample.get("drift_flag", False)):
                     drift_sample_ids.append(sample_id)
@@ -584,7 +596,7 @@ def prepare_split_training_cache(
         intermediate = item["intermediate"]
         input_image_size = item["input_image_size"]
         copied_raw = item["frame_path"]
-        save_split_feature_cache(
+        record = save_split_feature_cache(
             cache_path=target_cache_path,
             frame_index=sample_id,
             intermediate=intermediate,
@@ -607,6 +619,8 @@ def prepare_split_training_cache(
                 "has_raw_sample": copied_raw is not None,
             },
         )
+        if preloaded_records is not None:
+            preloaded_records[sample_id] = record
         metadata_samples[sample_id] = _build_metadata_entry(
             target_cache_path=target_cache_path,
             sample=sample,

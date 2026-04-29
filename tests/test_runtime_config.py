@@ -270,9 +270,13 @@ client:
 server:
   listen_address: "[::]:50051"
   continual_learning:
+    trace_batch_size: 2
     batch_size: 4
     teacher_batch_size: 3
     proxy_eval_max_samples: 24
+    proxy_eval_interval_rounds: 5
+    proxy_eval_patience: 3
+    proxy_eval_min_delta: 0.0005
     proxy_eval_threshold_candidates: [0.08, 0.148, 0.2]
     proxy_eval_frame_cache_enabled: true
 """.strip(),
@@ -282,8 +286,12 @@ server:
     config = load_runtime_config(config_path)
 
     assert config.server.continual_learning.batch_size == 4
+    assert config.server.continual_learning.trace_batch_size == 2
     assert config.server.continual_learning.teacher_batch_size == 3
     assert config.server.continual_learning.proxy_eval_max_samples == 24
+    assert config.server.continual_learning.proxy_eval_interval_rounds == 5
+    assert config.server.continual_learning.proxy_eval_patience == 3
+    assert config.server.continual_learning.proxy_eval_min_delta == pytest.approx(0.0005)
     assert config.server.continual_learning.proxy_eval_threshold_candidates == [
         0.08,
         0.148,
@@ -375,6 +383,7 @@ server:
     ("field_name", "field_value"),
     [
         ("batch_size", 0),
+        ("trace_batch_size", 0),
         ("tinynext_fixed_split_target_steps_per_round", 0),
         ("yolo_fixed_split_target_steps_per_round", 0),
         ("rfdetr_fixed_split_target_steps_per_round", 0),
@@ -429,6 +438,12 @@ server:
         ("teacher_batch_size: 0", "server.continual_learning.teacher_batch_size"),
         ("proxy_eval_max_samples: -1", "server.continual_learning.proxy_eval_max_samples"),
         (
+            "proxy_eval_interval_rounds: 0",
+            "server.continual_learning.proxy_eval_interval_rounds",
+        ),
+        ("proxy_eval_patience: -1", "server.continual_learning.proxy_eval_patience"),
+        ("proxy_eval_min_delta: -0.1", "server.continual_learning.proxy_eval_min_delta"),
+        (
             "proxy_eval_threshold_candidates: []",
             "server.continual_learning.proxy_eval_threshold_candidates",
         ),
@@ -466,7 +481,6 @@ server:
     [
         ("client.retrain", "batch_size", "client.retrain.batch_size has been removed"),
         ("client.retrain", "num_epoch", "client.retrain.num_epoch has been removed"),
-        ("server.continual_learning", "trace_batch_size", "trace_batch_size has been removed"),
         ("server.continual_learning", "rebuild_batch_size", "rebuild_batch_size has been removed"),
         (
             "server.continual_learning",
