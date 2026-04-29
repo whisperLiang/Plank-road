@@ -86,9 +86,8 @@ class TestFileOp:
         clear_folder(tmp_dir)
 
         remaining_root = [f for f in os.listdir(tmp_dir) if os.path.isfile(os.path.join(tmp_dir, f))]
-        remaining_frames = [f for f in os.listdir(frames_dir) if os.path.isfile(os.path.join(frames_dir, f))]
         assert remaining_root == []
-        assert remaining_frames == []
+        assert not os.path.exists(frames_dir)
 
     def test_clear_folder_nonexistent_no_error(self):
         clear_folder("/nonexistent_path_12345")
@@ -105,6 +104,26 @@ class TestFileOp:
 
         assert os.path.exists(keep_path)
         assert not os.path.exists(drop_path)
+
+    def test_clear_folder_removes_stale_cache_subdirs(self, tmp_dir):
+        keep_path = os.path.join(tmp_dir, "fixed_split_plan.json")
+        sample_store_dir = os.path.join(tmp_dir, "sample_store")
+        raw_dir = os.path.join(sample_store_dir, "raw")
+        server_bundle_dir = os.path.join(tmp_dir, "server_bundle")
+        os.makedirs(raw_dir, exist_ok=True)
+        os.makedirs(server_bundle_dir, exist_ok=True)
+        with open(keep_path, "w") as f:
+            f.write("plan")
+        with open(os.path.join(raw_dir, "1.jpg"), "w") as f:
+            f.write("stale")
+        with open(os.path.join(server_bundle_dir, "bundle.zip"), "w") as f:
+            f.write("stale")
+
+        clear_folder(tmp_dir, preserve={"fixed_split_plan.json"})
+
+        assert os.path.exists(keep_path)
+        assert not os.path.exists(sample_store_dir)
+        assert not os.path.exists(server_bundle_dir)
 
     def test_sample_files_keeps_selected(self, tmp_dir):
         # Create files named 1.jpg .. 5.jpg

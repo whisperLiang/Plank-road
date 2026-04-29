@@ -1,4 +1,5 @@
 import os
+import shutil
 from loguru import logger
 
 def creat_folder(folder_path):
@@ -18,22 +19,13 @@ def clear_folder(folder_path, preserve=None):
         if filename in preserve:
             continue
         file_path = os.path.join(folder_path, filename)
-        if os.path.isfile(file_path):
-            try:
+        try:
+            if os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+            elif os.path.isfile(file_path):
                 os.remove(file_path)
-            except Exception as e:
-                logger.debug(f"Failed to delete file: {file_path}. Reason: {e}")
-
-    frames_path = os.path.join(folder_path, 'frames')
-    if not os.path.exists(frames_path):
-        return
-    for filename in os.listdir(frames_path):
-        file_path = os.path.join(frames_path, filename)
-        if os.path.isfile(file_path):
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                logger.debug(f"Failed to delete file: {file_path}. Reason: {e}")
+        except Exception as e:
+            logger.debug(f"Failed to delete path: {file_path}. Reason: {e}")
 
 
 
