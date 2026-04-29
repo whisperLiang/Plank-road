@@ -256,10 +256,10 @@ if __name__ == '__main__':
         rotation="500 MB",
     )
 
-    preserve_cache_files = set()
+    preserve_cache_entries = {"pytest_tmp"}
     if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
-        preserve_cache_files.add("fixed_split_plan.json")
-    clear_folder(config.retrain.cache_path, preserve=preserve_cache_files)
+        preserve_cache_entries.add("fixed_split_plan.json")
+    clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
     edge = EdgeWorker(config)
 
     try:

@@ -125,6 +125,21 @@ class TestFileOp:
         assert not os.path.exists(sample_store_dir)
         assert not os.path.exists(server_bundle_dir)
 
+    def test_clear_folder_preserves_requested_root_dirs(self, tmp_dir):
+        keep_dir = os.path.join(tmp_dir, "pytest_tmp")
+        drop_dir = os.path.join(tmp_dir, "sample_store")
+        os.makedirs(keep_dir, exist_ok=True)
+        os.makedirs(drop_dir, exist_ok=True)
+        with open(os.path.join(keep_dir, "runtime_config"), "w") as f:
+            f.write("keep")
+        with open(os.path.join(drop_dir, "all.jsonl"), "w") as f:
+            f.write("drop")
+
+        clear_folder(tmp_dir, preserve={"pytest_tmp"})
+
+        assert os.path.exists(keep_dir)
+        assert not os.path.exists(drop_dir)
+
     def test_sample_files_keeps_selected(self, tmp_dir):
         # Create files named 1.jpg .. 5.jpg
         for i in range(1, 6):
