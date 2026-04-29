@@ -1058,6 +1058,7 @@ def _build_detection_proxy_prediction_cache(
                     batched_payload = _combine_boundary_payload_batch(
                         execution_payloads,
                         expected_batch_size=execution_batch_size,
+                        device=device,
                     )
                 if int(getattr(batched_payload, "batch_size", 0)) != execution_batch_size:
                     raise RuntimeError(

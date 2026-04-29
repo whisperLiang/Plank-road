@@ -894,6 +894,60 @@ def _combine_boundary_values(values: list[Any]) -> Any:
     return list(values)
 
 
+def _move_boundary_value_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {
+            key: _move_boundary_value_to_device(item, device)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_move_boundary_value_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_boundary_value_to_device(item, device) for item in value]
+    return value
+
+
+def _boundary_value_needs_device_move(value: Any, device: torch.device) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.device != device
+    if isinstance(value, dict):
+        return any(
+            _boundary_value_needs_device_move(item, device)
+            for item in value.values()
+        )
+    if isinstance(value, (tuple, list)):
+        return any(_boundary_value_needs_device_move(item, device) for item in value)
+    return False
+
+
+def _boundary_payload_to_device(
+    boundary: BoundaryPayload,
+    device: torch.device,
+) -> BoundaryPayload:
+    tensors = getattr(boundary, "tensors", {}) or {}
+    passthrough_inputs = getattr(boundary, "passthrough_inputs", {}) or {}
+    if all(
+        not isinstance(tensor, torch.Tensor) or tensor.device == device
+        for tensor in tensors.values()
+    ) and not _boundary_value_needs_device_move(passthrough_inputs, device):
+        return boundary
+    return BoundaryPayload(
+        split_id=boundary.split_id,
+        graph_signature=boundary.graph_signature,
+        batch_size=boundary.batch_size,
+        tensors={
+            label: tensor.to(device) if isinstance(tensor, torch.Tensor) else tensor
+            for label, tensor in tensors.items()
+        },
+        schema=boundary.schema,
+        requires_grad=boundary.requires_grad,
+        weight_version=boundary.weight_version,
+        passthrough_inputs=_move_boundary_value_to_device(passthrough_inputs, device),
+    )
+
+
 def _compatible_boundary_tensor(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     if str(lhs.dtype) != str(rhs.dtype):
         return False
@@ -938,7 +992,14 @@ def _combine_boundary_payload_batch(
     boundaries: list[BoundaryPayload],
     *,
     expected_batch_size: int,
+    device: str | torch.device | None = None,
 ) -> BoundaryPayload:
+    if device is not None:
+        target_device = torch.device(device)
+        boundaries = [
+            _boundary_payload_to_device(boundary, target_device)
+            for boundary in boundaries
+        ]
     first = boundaries[0]
     if int(first.batch_size) == int(expected_batch_size):
         return first
@@ -1169,6 +1230,7 @@ def universal_split_retrain(
             boundary = _combine_boundary_payload_batch(
                 execution_boundaries,
                 expected_batch_size=execution_batch_size,
+                device=device,
             )
             loss, _grads = runtime.train_suffix(
                 boundary,

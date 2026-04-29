@@ -757,6 +757,57 @@ def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
     assert splitter.seen_batch_sizes == [16]
 
 
+def test_split_retrain_moves_mixed_preloaded_boundary_devices_to_training_device(
+    tmp_path,
+):
+    cpu_payload = boundary_payload_from_tensors(
+        {"node_1": torch.ones(1, 2)},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.ones(1, 3)},
+    )
+    device_payload = boundary_payload_from_tensors(
+        {"node_1": torch.empty(1, 2, device="meta")},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.empty(1, 3, device="meta")},
+    )
+    preloaded_records = {
+        "cpu-sample": {"intermediate": cpu_payload},
+        "device-sample": {"intermediate": device_payload},
+    }
+
+    class DummySplitter:
+        def __init__(self):
+            self.seen_boundary = None
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            self.seen_boundary = boundary
+            assert boundary.batch_size == 2
+            assert boundary.tensors["node_1"].shape == (2, 2)
+            assert boundary.tensors["node_1"].device.type == "meta"
+            assert boundary.passthrough_inputs["input"].shape == (2, 3)
+            assert boundary.passthrough_inputs["input"].device.type == "meta"
+            return torch.tensor(0.5), {}
+
+    splitter = DummySplitter()
+    losses = universal_split_retrain(
+        model=torch.nn.Module(),
+        sample_input=torch.ones(1, 1),
+        cache_path=str(tmp_path / "cache"),
+        all_indices=["cpu-sample", "device-sample"],
+        gt_annotations={},
+        device=torch.device("meta"),
+        loss_fn=lambda outputs, targets: torch.tensor(0.5),
+        splitter=splitter,
+        batch_size=2,
+        preloaded_records=preloaded_records,
+    )
+
+    assert losses == [0.5]
+    assert splitter.seen_boundary is not None
+
+
 def test_split_retrain_uses_cached_pseudo_targets_and_pads_singleton_dynamic_batch(
     tmp_path,
 ):
