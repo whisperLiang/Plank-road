@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import time
 import zipfile
 from collections import OrderedDict
@@ -10,7 +11,10 @@ import pytest
 import torch
 
 from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
-from edge.transmit import pack_continual_learning_bundle
+from edge.transmit import (
+    pack_continual_learning_bundle,
+    pack_continual_learning_bundle_to_file,
+)
 import model_management.continual_learning_bundle as continual_learning_bundle
 from model_management.fixed_split import (
     compute_fixed_split_for_model,
@@ -929,6 +933,149 @@ def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_
     assert manifest["training_mode"]["low_confidence_mode"] == "raw-only"
 
 
+def test_bundle_uses_stored_zip_and_prepare_cache_reads_it(tmp_path):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    high = store.store_sample(
+        sample_id="high-1",
+        frame_index=1,
+        confidence=0.9,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=HIGH_CONFIDENCE,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_planned_payload(plan),
+    )
+
+    zip_path, manifest, stats = pack_continual_learning_bundle_to_file(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="0",
+        output_dir=str(tmp_path),
+    )
+
+    try:
+        bundle_root = tmp_path / "bundle"
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            assert {info.compress_type for info in zf.infolist()} == {zipfile.ZIP_STORED}
+            zf.extractall(bundle_root)
+
+        bundle_manifest = json.loads((bundle_root / "bundle_manifest.json").read_text())
+        assert bundle_manifest["selection_policy"]["zip_payload_bytes"] == stats["zip_payload_bytes"]
+        assert bundle_manifest["samples"][0]["sample_id"] == high.sample_id
+
+        info = prepare_split_training_cache(str(bundle_root), str(tmp_path / "prepared_cache"))
+        assert info["all_sample_ids"] == ["high-1"]
+        assert manifest["selection_policy"]["selected_sample_count"] == 1
+    finally:
+        os.remove(zip_path)
+
+
+def test_bundle_budget_keeps_drift_raw_and_omits_lowest_priority_raw(
+    tmp_path,
+    sample_bgr_frame,
+):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    high = store.store_sample(
+        sample_id="high-1",
+        frame_index=1,
+        confidence=0.9,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=HIGH_CONFIDENCE,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_planned_payload(plan),
+    )
+    drift = store.store_sample(
+        sample_id="drift-1",
+        frame_index=2,
+        confidence=0.2,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=LOW_CONFIDENCE,
+        quality_score=0.3,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_planned_payload(plan),
+        raw_frame=sample_bgr_frame,
+        drift_flag=True,
+    )
+    keep_low = store.store_sample(
+        sample_id="low-keep",
+        frame_index=3,
+        confidence=0.2,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=LOW_CONFIDENCE,
+        quality_score=0.1,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_planned_payload(plan),
+        raw_frame=sample_bgr_frame,
+    )
+    drop_low = store.store_sample(
+        sample_id="low-drop",
+        frame_index=4,
+        confidence=0.2,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=LOW_CONFIDENCE,
+        quality_score=0.8,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_planned_payload(plan),
+        raw_frame=sample_bgr_frame,
+    )
+
+    for record, size in ((drift, 1024), (keep_low, 768), (drop_low, 1_000_000)):
+        raw_path = tmp_path / "store" / record.raw_relpath
+        raw_path.write_bytes(bytes([len(record.sample_id) % 251]) * size)
+
+    def _selected_cost(record, *, include_feature: bool, include_raw: bool) -> int:
+        relpaths = [record.result_relpath, record.metadata_relpath]
+        if include_feature:
+            relpaths.append(record.feature_relpath)
+        if include_raw:
+            relpaths.append(record.raw_relpath)
+        return sum((tmp_path / "store" / relpath).stat().st_size for relpath in relpaths)
+
+    cap = (
+        _selected_cost(high, include_feature=True, include_raw=False)
+        + _selected_cost(drift, include_feature=False, include_raw=True)
+        + _selected_cost(keep_low, include_feature=False, include_raw=True)
+        + 20000
+    )
+
+    payload_zip, manifest = pack_continual_learning_bundle(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="0",
+        bundle_cap_bytes=cap,
+    )
+    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
+        bundle_manifest = json.loads(zf.read("bundle_manifest.json"))
+        names = set(zf.namelist())
+
+    sample_ids = [sample["sample_id"] for sample in bundle_manifest["samples"]]
+    assert sample_ids == ["high-1", "drift-1", "low-keep"]
+    assert "low-drop" not in sample_ids
+    assert drift.raw_relpath in names
+    assert keep_low.raw_relpath in names
+    assert drop_low.raw_relpath not in names
+    assert bundle_manifest["drift_sample_ids"] == ["drift-1"]
+    assert bundle_manifest["selection_policy"]["omitted_sample_count"] == 1
+    assert manifest["selection_policy"]["bundle_cap_bytes"] == cap
+
+
 def test_bundle_includes_low_conf_features_when_decision_requests_them(tmp_path, sample_bgr_frame):
     store = EdgeSampleStore(str(tmp_path))
     low = store.store_sample(
@@ -960,7 +1107,7 @@ def test_bundle_includes_low_conf_features_when_decision_requests_them(tmp_path,
     assert manifest["training_mode"]["low_confidence_mode"] == "raw+feature"
 
 
-def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path):
+def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path, sample_bgr_frame):
     store = EdgeSampleStore(str(tmp_path))
     keep = store.store_sample(
         sample_id="keep-1",
@@ -973,6 +1120,7 @@ def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path):
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_payload(),
         drift_flag=True,
+        raw_frame=sample_bgr_frame,
     )
     store.store_sample(
         sample_id="old-plan",
@@ -985,6 +1133,7 @@ def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path):
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_payload(),
         drift_flag=True,
+        raw_frame=sample_bgr_frame,
     )
     store.store_sample(
         sample_id="old-model",

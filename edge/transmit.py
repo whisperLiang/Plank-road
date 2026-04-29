@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import time
 import uuid
 
@@ -17,8 +18,9 @@ from model_management.continual_learning_bundle import (
     CONTINUAL_LEARNING_PROTOCOL_VERSION,
 )
 
-TRAINING_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+TRAINING_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
 TRAINING_UPLOAD_LOG_INTERVAL_BYTES = 32 * 1024 * 1024
+DEFAULT_CL_BUNDLE_MAX_BYTES = 32 * 1024 * 1024
 
 
 def _server_workspace_hint(edge_id: int, request_kind: str) -> str:
@@ -42,6 +44,244 @@ def _manifest_payload_summary(manifest: dict) -> dict[str, int]:
         "feature_bytes": sum(int(sample.get("feature_bytes", 0) or 0) for sample in samples),
         "raw_bytes": sum(int(sample.get("raw_bytes", 0) or 0) for sample in samples),
     }
+
+
+def _entry_for_relpath(
+    sample_store: EdgeSampleStore,
+    relpath: str | None,
+) -> dict[str, object] | None:
+    if relpath is None:
+        return None
+    normalized = str(relpath).replace("\\", "/")
+    path = os.path.join(sample_store.root_dir, normalized.replace("/", os.sep))
+    if not os.path.exists(path):
+        return None
+    return {
+        "relpath": normalized,
+        "path": path,
+        "bytes": os.path.getsize(path),
+    }
+
+
+def _quality_sort_key(record) -> tuple[float, str, str]:
+    quality = record.quality_score
+    return (
+        float("inf") if quality is None else float(quality),
+        str(record.timestamp),
+        str(record.sample_id),
+    )
+
+
+def _build_bundle_sample(
+    sample_store: EdgeSampleStore,
+    record,
+    *,
+    include_feature: bool,
+    include_raw: bool,
+) -> dict[str, object] | None:
+    result_entry = _entry_for_relpath(sample_store, record.result_relpath)
+    if result_entry is None:
+        return None
+    entries = [result_entry]
+
+    metadata_entry = _entry_for_relpath(sample_store, record.metadata_relpath)
+    if metadata_entry is not None:
+        entries.append(metadata_entry)
+
+    feature_entry = None
+    if include_feature:
+        feature_entry = _entry_for_relpath(sample_store, record.feature_relpath)
+        if feature_entry is None:
+            return None
+        entries.append(feature_entry)
+
+    raw_entry = None
+    if include_raw:
+        raw_entry = _entry_for_relpath(sample_store, record.raw_relpath)
+        if raw_entry is None:
+            return None
+        entries.append(raw_entry)
+
+    sample_entry = record.to_dict()
+    if feature_entry is None:
+        sample_entry["feature_relpath"] = None
+        sample_entry["feature_bytes"] = 0
+        sample_entry["has_feature"] = False
+    else:
+        sample_entry["feature_bytes"] = int(feature_entry["bytes"])
+
+    if raw_entry is None:
+        sample_entry["raw_relpath"] = None
+        sample_entry["raw_bytes"] = 0
+        sample_entry["has_raw_sample"] = False
+    else:
+        sample_entry["raw_bytes"] = int(raw_entry["bytes"])
+
+    return {
+        "record": record,
+        "sample": sample_entry,
+        "files": entries,
+    }
+
+
+def _select_bundle_records(
+    sample_store: EdgeSampleStore,
+    records: list,
+    *,
+    send_low_conf_features: bool,
+    bundle_cap_bytes: int,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    cap = max(1, int(bundle_cap_bytes))
+    selected_by_id: dict[str, dict[str, object]] = {}
+    selected_order: list[str] = []
+    included_files: dict[str, dict[str, object]] = {}
+    source_total_bytes = 0
+
+    def _add_or_update(
+        record,
+        *,
+        include_feature: bool,
+        include_raw: bool,
+        protected: bool,
+    ) -> bool:
+        nonlocal source_total_bytes
+        current = selected_by_id.get(record.sample_id)
+        if current is not None:
+            current_sample = dict(current["sample"])
+            include_feature = include_feature or current_sample.get("feature_relpath") is not None
+            include_raw = include_raw or current_sample.get("raw_relpath") is not None
+
+        candidate = _build_bundle_sample(
+            sample_store,
+            record,
+            include_feature=include_feature,
+            include_raw=include_raw,
+        )
+        if candidate is None:
+            return False
+
+        new_files = [
+            entry
+            for entry in candidate["files"]
+            if str(entry["relpath"]) not in included_files
+        ]
+        added_bytes = sum(int(entry["bytes"]) for entry in new_files)
+        if not protected and source_total_bytes + added_bytes > cap:
+            return False
+
+        if current is None:
+            selected_order.append(str(record.sample_id))
+        candidate["protected"] = bool(protected or (current or {}).get("protected", False))
+        selected_by_id[str(record.sample_id)] = candidate
+        for entry in new_files:
+            included_files[str(entry["relpath"])] = entry
+        source_total_bytes += added_bytes
+        return True
+
+    for record in records:
+        if record.confidence_bucket == HIGH_CONFIDENCE:
+            _add_or_update(
+                record,
+                include_feature=True,
+                include_raw=False,
+                protected=True,
+            )
+
+    for record in records:
+        if not bool(record.drift_flag):
+            continue
+        include_feature = (
+            record.confidence_bucket == HIGH_CONFIDENCE
+            or (
+                record.confidence_bucket == LOW_CONFIDENCE
+                and bool(send_low_conf_features)
+            )
+        )
+        _add_or_update(
+            record,
+            include_feature=include_feature,
+            include_raw=True,
+            protected=True,
+        )
+
+    low_non_drift = [
+        record
+        for record in records
+        if record.confidence_bucket == LOW_CONFIDENCE and not bool(record.drift_flag)
+    ]
+    for record in sorted(low_non_drift, key=_quality_sort_key):
+        _add_or_update(
+            record,
+            include_feature=bool(send_low_conf_features),
+            include_raw=True,
+            protected=False,
+        )
+
+    selected = [selected_by_id[sample_id] for sample_id in selected_order]
+    selected_ids = {str(entry["sample"]["sample_id"]) for entry in selected}
+    drift_omitted = [
+        record.sample_id
+        for record in records
+        if bool(record.drift_flag)
+        and (
+            str(record.sample_id) not in selected_ids
+            or selected_by_id[str(record.sample_id)]["sample"].get("raw_relpath") is None
+        )
+    ]
+    samples = [entry["sample"] for entry in selected]
+    policy = {
+        "policy": "latency_first_high_features_drift_raw_low_quality_raw",
+        "bundle_cap_bytes": cap,
+        "selected_sample_count": len(selected),
+        "omitted_sample_count": max(0, len(records) - len(selected)),
+        "drift_omitted_count": len(drift_omitted),
+        "drift_omitted_sample_ids": list(drift_omitted),
+        "source_total_bytes": int(source_total_bytes),
+        "source_feature_bytes": sum(
+            int(sample.get("feature_bytes", 0) or 0) for sample in samples
+        ),
+        "source_raw_bytes": sum(
+            int(sample.get("raw_bytes", 0) or 0) for sample in samples
+        ),
+        "zip_payload_bytes": 0,
+    }
+    return selected, policy
+
+
+def _estimate_stored_zip_bytes(
+    file_entries: list[dict[str, object]],
+    manifest_bytes: bytes,
+) -> int:
+    total = 22
+    for entry in file_entries:
+        name_bytes = str(entry["relpath"]).encode("utf-8")
+        total += int(entry["bytes"]) + 30 + len(name_bytes)
+        total += 46 + len(name_bytes)
+    manifest_name = b"bundle_manifest.json"
+    total += len(manifest_bytes) + 30 + len(manifest_name)
+    total += 46 + len(manifest_name)
+    return int(total)
+
+
+def _write_continual_learning_zip(
+    zip_path: str,
+    *,
+    file_entries: list[dict[str, object]],
+    manifest: dict,
+) -> None:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+        for entry in file_entries:
+            zf.write(
+                str(entry["path"]),
+                arcname=str(entry["relpath"]),
+                compress_type=zipfile.ZIP_STORED,
+            )
+        zf.writestr(
+            "bundle_manifest.json",
+            json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
+            compress_type=zipfile.ZIP_STORED,
+        )
+
 
 def pack_training_payload(cache_path, all_frame_indices, drift_frame_indices=None):
     buf = io.BytesIO()
@@ -76,7 +316,39 @@ def pack_continual_learning_bundle(
     split_plan: SplitPlan,
     model_id: str,
     model_version: str,
+    bundle_cap_bytes: int | None = None,
 ) -> tuple[bytes, dict]:
+    zip_path, manifest, _ = pack_continual_learning_bundle_to_file(
+        sample_store,
+        edge_id=edge_id,
+        send_low_conf_features=send_low_conf_features,
+        split_plan=split_plan,
+        model_id=model_id,
+        model_version=model_version,
+        bundle_cap_bytes=bundle_cap_bytes,
+    )
+    try:
+        with open(zip_path, "rb") as handle:
+            return handle.read(), manifest
+    finally:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+
+
+def pack_continual_learning_bundle_to_file(
+    sample_store: EdgeSampleStore,
+    *,
+    edge_id: int,
+    send_low_conf_features: bool,
+    split_plan: SplitPlan,
+    model_id: str,
+    model_version: str,
+    bundle_cap_bytes: int | None = None,
+    output_dir: str | None = None,
+) -> tuple[str, dict, dict]:
+    selection_started = time.perf_counter()
     records = [
         record
         for record in sample_store.list_records()
@@ -84,6 +356,18 @@ def pack_continual_learning_bundle(
         and record.model_id == str(model_id)
         and record.model_version == str(model_version)
     ]
+    selected, selection_policy = _select_bundle_records(
+        sample_store,
+        records,
+        send_low_conf_features=send_low_conf_features,
+        bundle_cap_bytes=(
+            DEFAULT_CL_BUNDLE_MAX_BYTES
+            if bundle_cap_bytes is None
+            else int(bundle_cap_bytes)
+        ),
+    )
+    selection_elapsed = time.perf_counter() - selection_started
+    cap = int(selection_policy["bundle_cap_bytes"])
     manifest = {
         "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
         "edge_id": int(edge_id),
@@ -96,34 +380,133 @@ def pack_continual_learning_bundle(
             "send_low_conf_features": bool(send_low_conf_features),
             "low_confidence_mode": "raw+feature" if send_low_conf_features else "raw-only",
         },
-        "drift_sample_ids": [record.sample_id for record in records if record.drift_flag],
+        "drift_sample_ids": [],
+        "selection_policy": selection_policy,
         "samples": [],
     }
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for record in records:
-            include_feature = (
-                record.confidence_bucket == HIGH_CONFIDENCE
-                or (record.confidence_bucket == LOW_CONFIDENCE and send_low_conf_features)
+    def _refresh_manifest() -> list[dict[str, object]]:
+        file_map: dict[str, dict[str, object]] = {}
+        for selected_entry in selected:
+            for file_entry in selected_entry["files"]:
+                file_map[str(file_entry["relpath"])] = file_entry
+        file_entries = list(file_map.values())
+        samples = [entry["sample"] for entry in selected]
+        selected_ids = {str(sample["sample_id"]) for sample in samples}
+        drift_omitted = [
+            record.sample_id
+            for record in records
+            if bool(record.drift_flag)
+            and (
+                str(record.sample_id) not in selected_ids
+                or next(
+                    (
+                        sample
+                        for sample in samples
+                        if str(sample["sample_id"]) == str(record.sample_id)
+                    ),
+                    {},
+                ).get("raw_relpath")
+                is None
             )
-            sample_entry = record.to_dict()
-            if not include_feature:
-                sample_entry["feature_relpath"] = None
-                sample_entry["feature_bytes"] = 0
-            manifest["samples"].append(sample_entry)
-
-            for path in sample_store.iter_existing_paths(record):
-                relpath = os.path.relpath(path, sample_store.root_dir).replace("\\", "/")
-                if not include_feature and relpath == record.feature_relpath:
-                    continue
-                zf.write(path, arcname=relpath)
-
-        zf.writestr(
-            "bundle_manifest.json",
-            json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
+        ]
+        manifest["samples"] = samples
+        manifest["drift_sample_ids"] = [
+            str(sample["sample_id"])
+            for sample in samples
+            if bool(sample.get("drift_flag", False)) and sample.get("raw_relpath") is not None
+        ]
+        policy = manifest["selection_policy"]
+        policy["selected_sample_count"] = len(samples)
+        policy["omitted_sample_count"] = max(0, len(records) - len(samples))
+        policy["drift_omitted_count"] = len(drift_omitted)
+        policy["drift_omitted_sample_ids"] = list(drift_omitted)
+        policy["source_total_bytes"] = sum(
+            int(entry["bytes"]) for entry in file_entries
         )
-    return buf.getvalue(), manifest
+        policy["source_feature_bytes"] = sum(
+            int(sample.get("feature_bytes", 0) or 0) for sample in samples
+        )
+        policy["source_raw_bytes"] = sum(
+            int(sample.get("raw_bytes", 0) or 0) for sample in samples
+        )
+        return file_entries
+
+    def _update_estimated_zip_bytes(file_entries: list[dict[str, object]]) -> int:
+        for _ in range(3):
+            manifest_bytes = json.dumps(
+                manifest,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            estimated_zip_bytes = _estimate_stored_zip_bytes(file_entries, manifest_bytes)
+            if int(manifest["selection_policy"]["zip_payload_bytes"]) == estimated_zip_bytes:
+                return estimated_zip_bytes
+            manifest["selection_policy"]["zip_payload_bytes"] = estimated_zip_bytes
+        return int(manifest["selection_policy"]["zip_payload_bytes"])
+
+    while True:
+        file_entries = _refresh_manifest()
+        estimated_zip_bytes = _update_estimated_zip_bytes(file_entries)
+        removable_index = next(
+            (
+                index
+                for index in range(len(selected) - 1, -1, -1)
+                if not bool(selected[index].get("protected", False))
+            ),
+            None,
+        )
+        if estimated_zip_bytes <= cap or removable_index is None:
+            break
+        selected.pop(removable_index)
+
+    file_entries = _refresh_manifest()
+    _update_estimated_zip_bytes(file_entries)
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f"cl_bundle_edge_{int(edge_id)}_",
+        suffix=".zip",
+        dir=output_dir,
+        delete=False,
+    )
+    zip_path = handle.name
+    handle.close()
+
+    zip_started = time.perf_counter()
+    try:
+        _write_continual_learning_zip(
+            zip_path,
+            file_entries=file_entries,
+            manifest=manifest,
+        )
+        zip_payload_bytes = os.path.getsize(zip_path)
+        if zip_payload_bytes != int(manifest["selection_policy"]["zip_payload_bytes"]):
+            manifest["selection_policy"]["zip_payload_bytes"] = int(zip_payload_bytes)
+            _write_continual_learning_zip(
+                zip_path,
+                file_entries=file_entries,
+                manifest=manifest,
+            )
+            zip_payload_bytes = os.path.getsize(zip_path)
+        manifest["selection_policy"]["zip_payload_bytes"] = int(zip_payload_bytes)
+        stats = dict(manifest["selection_policy"])
+        stats.update(
+            {
+                "selection_elapsed_sec": float(selection_elapsed),
+                "zip_write_elapsed_sec": float(time.perf_counter() - zip_started),
+                "zip_path": zip_path,
+                "zip_payload_bytes": int(zip_payload_bytes),
+            }
+        )
+        return zip_path, manifest, stats
+    except Exception:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        raise
 
 import socket
 
@@ -373,6 +756,61 @@ def _iter_training_job_chunks(
         )
 
 
+def _iter_training_job_file_chunks(
+    *,
+    protocol_version: str,
+    edge_id: int,
+    request_id: str,
+    job_type: int,
+    cache_path: str,
+    send_low_conf_features: bool,
+    frame_indices: list[int] | None,
+    all_frame_indices: list[int] | None,
+    drift_frame_indices: list[int] | None,
+    payload_zip_path: str,
+    chunk_size: int = TRAINING_UPLOAD_CHUNK_BYTES,
+):
+    total_size = os.path.getsize(payload_zip_path)
+    chunk_size = max(1, int(chunk_size))
+    next_log_at = TRAINING_UPLOAD_LOG_INTERVAL_BYTES
+    chunk_index = 0
+    sent = 0
+
+    with open(payload_zip_path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk and (chunk_index > 0 or total_size > 0):
+                break
+            sent += len(chunk)
+            if sent >= next_log_at or sent == total_size:
+                logger.info(
+                    "Streaming training upload request_id={} chunk={} bytes={} / {}",
+                    request_id,
+                    chunk_index,
+                    _format_bytes(sent),
+                    _format_bytes(total_size),
+                )
+                while next_log_at <= sent:
+                    next_log_at += TRAINING_UPLOAD_LOG_INTERVAL_BYTES
+            yield message_transmission_pb2.SubmitTrainingJobChunk(
+                protocol_version=str(protocol_version or ""),
+                edge_id=int(edge_id),
+                request_id=str(request_id or ""),
+                job_type=int(job_type),
+                cache_path=str(cache_path or ""),
+                send_low_conf_features=bool(send_low_conf_features),
+                frame_indices=[int(index) for index in (frame_indices or [])],
+                all_frame_indices=[int(index) for index in (all_frame_indices or [])],
+                drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
+                payload_chunk=chunk,
+                chunk_index=int(chunk_index),
+                total_payload_bytes=int(total_size),
+            )
+            chunk_index += 1
+            if not chunk:
+                break
+
+
 def submit_training_job_stream(
     server_ip: str,
     *,
@@ -431,6 +869,74 @@ def submit_training_job_stream(
     except Exception as exc:
         logger.exception(
             "submit_training_job_stream failed after {:.3f}s: {}",
+            time.perf_counter() - request_started,
+            exc,
+        )
+        return None
+    finally:
+        if owned_channel and channel is not None:
+            channel.close()
+
+
+def submit_training_job_stream_from_file(
+    server_ip: str,
+    *,
+    edge_id: int,
+    request_id: str,
+    job_type: int,
+    cache_path: str,
+    payload_zip_path: str,
+    protocol_version: str = "",
+    send_low_conf_features: bool = False,
+    frame_indices: list[int] | None = None,
+    all_frame_indices: list[int] | None = None,
+    drift_frame_indices: list[int] | None = None,
+    channel=None,
+):
+    owned_channel = channel is None
+    request_started = time.perf_counter()
+    payload_size = os.path.getsize(payload_zip_path)
+    try:
+        if channel is None:
+            channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        logger.info(
+            "Submitting file-backed streamed training job request_id={} edge_id={} "
+            "job_type={} payload_zip={} chunk_size={} server={}",
+            request_id,
+            edge_id,
+            job_type,
+            _format_bytes(payload_size),
+            _format_bytes(TRAINING_UPLOAD_CHUNK_BYTES),
+            server_ip,
+        )
+        reply = stub.submit_training_job_stream(
+            _iter_training_job_file_chunks(
+                protocol_version=protocol_version,
+                edge_id=edge_id,
+                request_id=request_id,
+                job_type=job_type,
+                cache_path=cache_path,
+                send_low_conf_features=send_low_conf_features,
+                frame_indices=frame_indices,
+                all_frame_indices=all_frame_indices,
+                drift_frame_indices=drift_frame_indices,
+                payload_zip_path=payload_zip_path,
+            )
+        )
+        logger.info(
+            "submit_training_job_stream_from_file reply request_id={} accepted={} "
+            "job_id={} status={} elapsed={:.3f}s",
+            request_id,
+            bool(reply.accepted),
+            reply.job_id,
+            reply.status,
+            time.perf_counter() - request_started,
+        )
+        return reply
+    except Exception as exc:
+        logger.exception(
+            "submit_training_job_stream_from_file failed after {:.3f}s: {}",
             time.perf_counter() - request_started,
             exc,
         )
@@ -500,9 +1006,12 @@ def submit_continual_learning_job(
     model_id: str,
     model_version: str,
     send_low_conf_features: bool,
+    bundle_cap_bytes: int | None = None,
+    bandwidth_mbps: float = 0.0,
     request_id: str | None = None,
     channel=None,
 ):
+    zip_path = None
     try:
         pack_started = time.perf_counter()
         stats = sample_store.stats()
@@ -519,28 +1028,47 @@ def submit_continual_learning_job(
             model_id,
             model_version,
         )
-        payload_zip, manifest = pack_continual_learning_bundle(
+        zip_path, manifest, pack_stats = pack_continual_learning_bundle_to_file(
             sample_store,
             edge_id=edge_id,
             send_low_conf_features=send_low_conf_features,
             split_plan=split_plan,
             model_id=model_id,
             model_version=model_version,
+            bundle_cap_bytes=bundle_cap_bytes,
         )
         payload_summary = _manifest_payload_summary(manifest)
+        zip_payload_bytes = int(pack_stats.get("zip_payload_bytes", 0))
+        estimated_upload_sec = None
+        if bandwidth_mbps > 0.0 and zip_payload_bytes > 0:
+            estimated_upload_sec = (
+                zip_payload_bytes * 8.0 / (float(bandwidth_mbps) * 1_000_000.0)
+            )
         logger.info(
-            "Packed continual learning bundle for edge {} in {:.3f}s "
+            "Packed continual learning bundle for edge {} "
+            "(selection_time={:.3f}s, zip_write_time={:.3f}s, total_pack_time={:.3f}s, "
             "(manifest_samples={}, drift={}, source_feature_bytes={}, "
-            "source_raw_bytes={}, zip_payload={}).",
+            "source_raw_bytes={}, source_total_bytes={}, cap={}, zip_payload={}, "
+            "estimated_upload_sec={}).",
             edge_id,
+            float(pack_stats.get("selection_elapsed_sec", 0.0)),
+            float(pack_stats.get("zip_write_elapsed_sec", 0.0)),
             time.perf_counter() - pack_started,
             payload_summary["samples"],
             payload_summary["drift"],
             _format_bytes(payload_summary["feature_bytes"]),
             _format_bytes(payload_summary["raw_bytes"]),
-            _format_bytes(len(payload_zip)),
+            _format_bytes(int(pack_stats.get("source_total_bytes", 0))),
+            _format_bytes(int(pack_stats.get("bundle_cap_bytes", 0))),
+            _format_bytes(zip_payload_bytes),
+            (
+                f"{estimated_upload_sec:.3f}s"
+                if estimated_upload_sec is not None
+                else "unknown"
+            ),
         )
-        reply = submit_training_job_stream(
+        upload_started = time.perf_counter()
+        reply = submit_training_job_stream_from_file(
             server_ip,
             edge_id=edge_id,
             request_id=str(request_id or uuid.uuid4().hex),
@@ -548,8 +1076,22 @@ def submit_continual_learning_job(
             cache_path=_server_workspace_hint(edge_id, "continual_learning"),
             protocol_version=manifest["protocol_version"],
             send_low_conf_features=bool(send_low_conf_features),
-            payload_zip=payload_zip,
+            payload_zip_path=zip_path,
             channel=channel,
+        )
+        upload_elapsed = time.perf_counter() - upload_started
+        upload_mbps = (
+            zip_payload_bytes * 8.0 / upload_elapsed / 1_000_000.0
+            if upload_elapsed > 0.0 and zip_payload_bytes > 0
+            else 0.0
+        )
+        logger.info(
+            "Continual learning upload completed for edge {} "
+            "(actual_upload_time={:.3f}s, upload_speed={:.3f} Mbps, zip_payload={}).",
+            edge_id,
+            upload_elapsed,
+            upload_mbps,
+            _format_bytes(zip_payload_bytes),
         )
         if reply is None:
             return False, "", "submit_training_job failed"
@@ -557,3 +1099,9 @@ def submit_continual_learning_job(
     except Exception as exc:
         logger.exception("submit_continual_learning_job failed: {}", exc)
         return False, "", str(exc)
+    finally:
+        if zip_path is not None:
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass

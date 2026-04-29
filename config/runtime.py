@@ -41,6 +41,7 @@ class RetrainConfig(ConfigSection):
     flag: bool = True
     cache_path: str = "./cache"
     collect_num: int = 20
+    raw_jpeg_quality: int = 82
 
 
 @dataclass
@@ -79,6 +80,9 @@ class ResourceAwareTriggerConfig(ConfigSection):
     min_training_samples: int = 10
     drift_bonus: float = 0.35
     upload_time_budget_sec: float = 5.0
+    bundle_max_bytes: int = 33554432
+    bundle_min_bytes: int = 8388608
+    bundle_target_upload_sec: float = 45.0
 
 
 @dataclass
@@ -314,6 +318,31 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive("client.frame_cache_maxsize", int(config.client.frame_cache_maxsize))
     _validate_positive("client.edge_num", int(config.client.edge_num))
     _validate_positive("client.retrain.collect_num", int(config.client.retrain.collect_num))
+    raw_jpeg_quality = int(config.client.retrain.raw_jpeg_quality)
+    if not 1 <= raw_jpeg_quality <= 100:
+        raise ValueError(
+            "client.retrain.raw_jpeg_quality must be within [1, 100], "
+            f"got {config.client.retrain.raw_jpeg_quality!r}"
+        )
+    bundle_min_bytes = int(config.client.resource_aware_trigger.bundle_min_bytes)
+    bundle_max_bytes = int(config.client.resource_aware_trigger.bundle_max_bytes)
+    _validate_positive(
+        "client.resource_aware_trigger.bundle_min_bytes",
+        bundle_min_bytes,
+    )
+    _validate_positive(
+        "client.resource_aware_trigger.bundle_max_bytes",
+        bundle_max_bytes,
+    )
+    _validate_positive(
+        "client.resource_aware_trigger.bundle_target_upload_sec",
+        float(config.client.resource_aware_trigger.bundle_target_upload_sec),
+    )
+    if bundle_min_bytes > bundle_max_bytes:
+        raise ValueError(
+            "client.resource_aware_trigger.bundle_min_bytes must be <= "
+            "client.resource_aware_trigger.bundle_max_bytes"
+        )
     if not 0.0 <= float(config.client.final_detection_threshold) <= 1.0:
         raise ValueError(
             "client.final_detection_threshold must be within [0, 1], "

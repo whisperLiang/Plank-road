@@ -51,6 +51,9 @@ client:
   status_not_found_grace_sec: 60
   cache_path: './cache'
   collect_num: 8
+  # JPEG quality for raw CL samples. Lowering quality reduces upload bytes
+  # without changing resolution.
+  raw_jpeg_quality: 82
  # drift detection
  drift_detection:
   # Fallback confidence threshold for edge-side sample bucketing when full quality signals are unavailable
@@ -138,6 +141,11 @@ client:
   min_training_samples: 80
   drift_bonus: 0.20
   upload_time_budget_sec: 5.0
+  # CL bundle byte budget. With a bandwidth estimate, the edge caps the
+  # bundle at min(max_bytes, max(min_bytes, mbps * target_sec / 8 * 1e6)).
+  bundle_max_bytes: 33554432
+  bundle_min_bytes: 8388608
+  bundle_target_upload_sec: 45.0
  # Split learning for continual learning 
  # When enabled, backbone features are extracted and cached on the edge.
  # Only drift-moment samples are annotated by the cloud's large model;

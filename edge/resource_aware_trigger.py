@@ -78,6 +78,8 @@ class TrainingDecision:
     urgency: float
     compute_pressure: float
     bandwidth_pressure: float
+    bandwidth_mbps: float = 0.0
+    bundle_cap_bytes: int | None = None
     action_scores: dict[str, float] = field(default_factory=dict)
     reason: str = ""
 
@@ -107,6 +109,9 @@ class ResourceAwareCLTrigger:
         min_training_samples: int = 1,
         drift_bonus: float = 0.35,
         upload_time_budget_sec: float = 5.0,
+        bundle_max_bytes: int = 33554432,
+        bundle_min_bytes: int = 8388608,
+        bundle_target_upload_sec: float = 45.0,
     ) -> None:
         self.V = float(V)
         self.K_p = float(K_p)
@@ -119,6 +124,9 @@ class ResourceAwareCLTrigger:
         self.min_training_samples = int(min_training_samples)
         self.drift_bonus = float(drift_bonus)
         self.upload_time_budget_sec = float(upload_time_budget_sec)
+        self.bundle_max_bytes = max(1, int(bundle_max_bytes))
+        self.bundle_min_bytes = max(1, min(int(bundle_min_bytes), self.bundle_max_bytes))
+        self.bundle_target_upload_sec = max(1e-6, float(bundle_target_upload_sec))
 
         self.Q_cloud = 0.0
         self.Q_bw = 0.0
@@ -197,6 +205,22 @@ class ResourceAwareCLTrigger:
             return 1.0
         transfer_sec = (payload_bytes * 8.0) / (bandwidth_mbps * 1_000_000.0)
         return max(0.0, min(1.0, transfer_sec / max(self.upload_time_budget_sec, 1e-6)))
+
+    def effective_bundle_cap_bytes(self, bandwidth_mbps: float) -> int:
+        if bandwidth_mbps <= 0:
+            return int(self.bundle_max_bytes)
+        bandwidth_cap = (
+            float(bandwidth_mbps)
+            * self.bundle_target_upload_sec
+            / 8.0
+            * 1_000_000.0
+        )
+        return int(
+            min(
+                self.bundle_max_bytes,
+                max(self.bundle_min_bytes, bandwidth_cap),
+            )
+        )
 
     def decide(
         self,
@@ -298,6 +322,8 @@ class ResourceAwareCLTrigger:
                 if send_low_conf_features
                 else raw_only_bw_pressure
             ),
+            bandwidth_mbps=float(bandwidth_mbps),
+            bundle_cap_bytes=self.effective_bundle_cap_bytes(float(bandwidth_mbps)),
             action_scores=action_scores,
             reason=reason,
         )
@@ -311,6 +337,7 @@ class ResourceAwareCLTrigger:
                 "urgency": float(urgency),
                 "compute_pressure": float(compute_pressure),
                 "bandwidth_mbps": float(bandwidth_mbps),
+                "bundle_cap_bytes": decision.bundle_cap_bytes,
                 "action_scores": action_scores,
             }
         )
@@ -381,4 +408,7 @@ def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
         min_training_samples=int(_get("min_training_samples", getattr(retrain, "collect_num", 1), ra)),
         drift_bonus=float(_get("drift_bonus", 0.35, ra)),
         upload_time_budget_sec=float(_get("upload_time_budget_sec", 5.0, ra)),
+        bundle_max_bytes=int(_get("bundle_max_bytes", 33554432, ra)),
+        bundle_min_bytes=int(_get("bundle_min_bytes", 8388608, ra)),
+        bundle_target_upload_sec=float(_get("bundle_target_upload_sec", 45.0, ra)),
     )

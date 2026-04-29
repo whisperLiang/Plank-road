@@ -29,10 +29,83 @@ server:
     assert config.client.source.video_path == "./demo.mp4"
     assert config.client.source.max_count == 12
     assert config.client.retrain.cache_path == "./cache"
+    assert config.client.retrain.raw_jpeg_quality == 82
+    assert config.client.resource_aware_trigger.bundle_max_bytes == 33554432
+    assert config.client.resource_aware_trigger.bundle_min_bytes == 8388608
+    assert config.client.resource_aware_trigger.bundle_target_upload_sec == pytest.approx(45.0)
     assert config.client.final_detection_threshold == 0.5
     assert config.server.golden == "yolo26x"
     assert config.server.workspace_root == "./cache/cloud-workspace"
     assert config.server.listen_address == "[::]:50051"
+
+
+def test_load_runtime_config_reads_edge_bundle_and_jpeg_knobs(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+  retrain:
+    raw_jpeg_quality: 75
+  resource_aware_trigger:
+    bundle_max_bytes: 16000000
+    bundle_min_bytes: 4000000
+    bundle_target_upload_sec: 30.0
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.client.retrain.raw_jpeg_quality == 75
+    assert config.client.resource_aware_trigger.bundle_max_bytes == 16000000
+    assert config.client.resource_aware_trigger.bundle_min_bytes == 4000000
+    assert config.client.resource_aware_trigger.bundle_target_upload_sec == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize(
+    ("field_block", "match_text"),
+    [
+        ("retrain:\n    raw_jpeg_quality: 0", "client.retrain.raw_jpeg_quality"),
+        (
+            "resource_aware_trigger:\n    bundle_max_bytes: 0",
+            "client.resource_aware_trigger.bundle_max_bytes",
+        ),
+        (
+            "resource_aware_trigger:\n    bundle_min_bytes: 0",
+            "client.resource_aware_trigger.bundle_min_bytes",
+        ),
+        (
+            "resource_aware_trigger:\n    bundle_target_upload_sec: 0",
+            "client.resource_aware_trigger.bundle_target_upload_sec",
+        ),
+        (
+            "resource_aware_trigger:\n    bundle_min_bytes: 10\n    bundle_max_bytes: 5",
+            "bundle_min_bytes must be <=",
+        ),
+    ],
+)
+def test_load_runtime_config_rejects_invalid_edge_bundle_and_jpeg_knobs(
+    tmp_path,
+    field_block,
+    match_text,
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+client:
+  server_ip: 10.0.0.1:50051
+  {field_block}
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=match_text):
+        load_runtime_config(config_path)
 
 
 def test_load_runtime_config_applies_environment_overrides(tmp_path, monkeypatch):

@@ -20,6 +20,7 @@ from grpc_server.rpc_server import (
     _reset_cache_dir,
 )
 from grpc_server.training_jobs import TrainingJobManager
+from edge.transmit import _iter_training_job_chunks, _iter_training_job_file_chunks
 
 
 def _zip_bytes(entries: dict[str, bytes]) -> bytes:
@@ -352,6 +353,86 @@ class TestMessageTransmissionServicer:
             _, workspace = mock_learner.get_ground_truth_and_fixed_split_retrain.call_args.args
             assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
             assert (Path(workspace) / "bundle_manifest.json").read_text(encoding="utf-8") == "{}"
+        finally:
+            manager.close()
+
+    def test_file_backed_stream_matches_bytes_stream_workspace(self, tmp_path):
+        mock_learner = MagicMock()
+        mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
+            True,
+            "model_data",
+            "ok",
+        )
+        manager = TrainingJobManager(
+            continual_learner=mock_learner,
+            max_concurrent_jobs=1,
+        )
+        try:
+            svc = self._make_servicer(
+                tmp_path,
+                continual_learner=mock_learner,
+                training_job_manager=manager,
+            )
+            payload_zip = _zip_bytes(
+                {
+                    "bundle_manifest.json": b'{"samples":[]}',
+                    "raw/sample.jpg": b"frame-bytes",
+                }
+            )
+            zip_path = tmp_path / "payload.zip"
+            zip_path.write_bytes(payload_zip)
+
+            byte_reply = svc.submit_training_job_stream(
+                _iter_training_job_chunks(
+                    protocol_version="edge-cl-bundle.v1",
+                    edge_id=1,
+                    request_id="bytes-stream",
+                    job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+                    cache_path="edge_1/continual_learning",
+                    send_low_conf_features=False,
+                    frame_indices=None,
+                    all_frame_indices=None,
+                    drift_frame_indices=None,
+                    payload_zip=payload_zip,
+                    chunk_size=11,
+                ),
+                MagicMock(),
+            )
+            assert byte_reply.accepted is True
+            assert self._wait_for_job(svc, edge_id=1, job_id=byte_reply.job_id).status == "SUCCEEDED"
+
+            file_reply = svc.submit_training_job_stream(
+                _iter_training_job_file_chunks(
+                    protocol_version="edge-cl-bundle.v1",
+                    edge_id=1,
+                    request_id="file-stream",
+                    job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+                    cache_path="edge_1/continual_learning",
+                    send_low_conf_features=False,
+                    frame_indices=None,
+                    all_frame_indices=None,
+                    drift_frame_indices=None,
+                    payload_zip_path=str(zip_path),
+                    chunk_size=11,
+                ),
+                MagicMock(),
+            )
+            assert file_reply.accepted is True
+            assert self._wait_for_job(svc, edge_id=1, job_id=file_reply.job_id).status == "SUCCEEDED"
+
+            workspaces = [
+                Path(call.args[1])
+                for call in mock_learner.get_ground_truth_and_fixed_split_retrain.call_args_list
+            ]
+            assert len(workspaces) == 2
+            assert [workspace.joinpath("bundle_manifest.json").read_bytes() for workspace in workspaces] == [
+                b'{"samples":[]}',
+                b'{"samples":[]}',
+            ]
+            assert [workspace.joinpath("raw", "sample.jpg").read_bytes() for workspace in workspaces] == [
+                b"frame-bytes",
+                b"frame-bytes",
+            ]
         finally:
             manager.close()
 

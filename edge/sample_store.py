@@ -224,6 +224,7 @@ class EdgeSampleStore:
         intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
         drift_flag: bool = False,
         raw_frame: Any | None = None,
+        raw_jpeg_quality: int = 82,
         timestamp: str | None = None,
         input_image_size: list[int] | tuple[int, int] | None = None,
         input_tensor_shape: list[int] | tuple[int, ...] | None = None,
@@ -246,7 +247,8 @@ class EdgeSampleStore:
         with open(result_path, "w", encoding="utf-8") as handle:
             json.dump(inference_result, handle, indent=2, sort_keys=True)
         if raw_frame is not None:
-            cv2.imwrite(raw_path, raw_frame)
+            quality = max(1, min(100, int(raw_jpeg_quality)))
+            cv2.imwrite(raw_path, raw_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
 
         record = StoredSampleRecord(
             sample_id=sample_key,

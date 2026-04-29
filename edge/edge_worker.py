@@ -390,6 +390,13 @@ class EdgeWorker:
             urgency=1.0 if should_train else 0.0,
             compute_pressure=0.0,
             bandwidth_pressure=0.0,
+            bundle_cap_bytes=int(
+                getattr(
+                    getattr(self.config, "resource_aware_trigger", None),
+                    "bundle_max_bytes",
+                    33554432,
+                )
+            ),
             reason="Fallback trigger without low-confidence feature upload.",
         )
 
@@ -413,6 +420,7 @@ class EdgeWorker:
         )
         save_raw = confidence_bucket == LOW_CONFIDENCE or drift_detected
         sample_id = self._next_sample_id(task)
+        retrain_cfg = getattr(getattr(self, "config", None), "retrain", None)
         self.sample_store.store_sample(
             sample_id=sample_id,
             frame_index=task.frame_index,
@@ -427,6 +435,7 @@ class EdgeWorker:
             intermediate=inference.intermediate,
             drift_flag=drift_detected,
             raw_frame=frame if save_raw else None,
+            raw_jpeg_quality=int(getattr(retrain_cfg, "raw_jpeg_quality", 82)),
             input_image_size=list(frame.shape[:2]),
             input_tensor_shape=inference.input_tensor_shape,
             input_resize_mode=inference.input_resize_mode,
@@ -486,6 +495,8 @@ class EdgeWorker:
                     model_id=self.model_id,
                     model_version=self.model_version,
                     send_low_conf_features=decision.send_low_conf_features,
+                    bundle_cap_bytes=decision.bundle_cap_bytes,
+                    bandwidth_mbps=decision.bandwidth_mbps,
                     channel=training_channel,
                 )
                 if not accepted or not job_id:
