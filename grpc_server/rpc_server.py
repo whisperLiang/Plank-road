@@ -1,9 +1,13 @@
 from loguru import logger
+from pathlib import Path
+import os
+import tempfile
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from grpc_server.workspace import (
     normalize_client_cache_path,
     prepare_request_workspace,
+    prepare_request_workspace_from_zip_file,
     reset_workspace_dir,
 )
 from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED
@@ -220,6 +224,83 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             protocol_version=request.protocol_version,
         )
 
+    def _async_not_configured_reply(self, method_name: str):
+        if self.continual_learner is None or self.training_job_manager is None:
+            logger.error("{}: async training is not configured", method_name)
+            return message_transmission_pb2.SubmitTrainingJobReply(
+                accepted=False,
+                job_id="",
+                status="",
+                queue_position=-1,
+                message="async training is not configured",
+            )
+        return None
+
+    def _submit_training_job_from_workspace(
+        self,
+        request,
+        *,
+        workspace,
+        request_kind: str,
+    ):
+        base_model_version = str(getattr(request, "base_model_version", "") or "0")
+        try:
+            from model_management.continual_learning_bundle import load_training_bundle_manifest
+            manifest = load_training_bundle_manifest(str(workspace))
+            if manifest is not None:
+                model_info = manifest.get("model", {})
+                base_model_version = str(model_info.get("model_version", base_model_version))
+                if self.edge_registry is not None:
+                    self.edge_registry.touch(
+                        int(request.edge_id),
+                        model_id=str(model_info.get("model_id", "")),
+                        model_version=base_model_version,
+                    )
+        except Exception:
+            pass
+
+        job, created = self.training_job_manager.submit(
+            edge_id=int(request.edge_id),
+            request_id=str(request.request_id or ""),
+            job_type=int(request.job_type),
+            workspace=str(workspace),
+            protocol_version=str(request.protocol_version or ""),
+            send_low_conf_features=bool(request.send_low_conf_features),
+            frame_indices=[int(index) for index in request.frame_indices],
+            all_frame_indices=[int(index) for index in request.all_frame_indices],
+            drift_frame_indices=[int(index) for index in request.drift_frame_indices],
+            base_model_version=base_model_version,
+        )
+
+        if self.edge_registry is not None and created:
+            self.edge_registry.record_job_submitted(
+                int(request.edge_id),
+                job.job_id,
+            )
+
+        queue_position = self.training_job_manager.queue_position(job.job_id)
+        message = (
+            "Training job accepted."
+            if created else "Training job already exists for this request_id."
+        )
+        logger.info(
+            "Accepted {} training request request_id={} job_id={} "
+            "created={} queue_position={} workspace={}",
+            request_kind,
+            request.request_id,
+            job.job_id,
+            created,
+            queue_position,
+            workspace,
+        )
+        return message_transmission_pb2.SubmitTrainingJobReply(
+            accepted=True,
+            job_id=job.job_id,
+            status=job.status,
+            queue_position=queue_position,
+            message=message,
+        )
+
     def submit_training_job(self, request, context):
         logger.info(
             "submit_training_job edge_id={} request_id={} job_type={}",
@@ -228,19 +309,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             request.job_type,
         )
 
-        # Track edge in registry
         if self.edge_registry is not None:
             self.edge_registry.touch(int(request.edge_id))
 
-        if self.continual_learner is None or self.training_job_manager is None:
-            logger.error("submit_training_job: async training is not configured")
-            return message_transmission_pb2.SubmitTrainingJobReply(
-                accepted=False,
-                job_id="",
-                status="",
-                queue_position=-1,
-                message="async training is not configured",
-            )
+        not_configured = self._async_not_configured_reply("submit_training_job")
+        if not_configured is not None:
+            return not_configured
 
         try:
             request_kind = self._request_kind_for_job_type(int(request.job_type))
@@ -260,55 +334,10 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 client_cache_path=request.cache_path,
             )
 
-            # Extract base_model_version from the bundle manifest if available
-            base_model_version = "0"
-            try:
-                from model_management.continual_learning_bundle import load_training_bundle_manifest
-                manifest = load_training_bundle_manifest(str(workspace))
-                if manifest is not None:
-                    model_info = manifest.get("model", {})
-                    base_model_version = str(model_info.get("model_version", "0"))
-                    # Also update edge registry with current model info
-                    if self.edge_registry is not None:
-                        self.edge_registry.touch(
-                            int(request.edge_id),
-                            model_id=str(model_info.get("model_id", "")),
-                            model_version=base_model_version,
-                        )
-            except Exception:
-                pass
-
-            job, created = self.training_job_manager.submit(
-                edge_id=int(request.edge_id),
-                request_id=str(request.request_id or ""),
-                job_type=int(request.job_type),
-                workspace=str(workspace),
-                protocol_version=str(request.protocol_version or ""),
-                send_low_conf_features=bool(request.send_low_conf_features),
-                frame_indices=[int(index) for index in request.frame_indices],
-                all_frame_indices=[int(index) for index in request.all_frame_indices],
-                drift_frame_indices=[int(index) for index in request.drift_frame_indices],
-                base_model_version=base_model_version,
-            )
-
-            # Notify edge registry of job submission
-            if self.edge_registry is not None and created:
-                self.edge_registry.record_job_submitted(
-                    int(request.edge_id),
-                    job.job_id,
-                )
-
-            queue_position = self.training_job_manager.queue_position(job.job_id)
-            message = (
-                "Training job accepted."
-                if created else "Training job already exists for this request_id."
-            )
-            return message_transmission_pb2.SubmitTrainingJobReply(
-                accepted=True,
-                job_id=job.job_id,
-                status=job.status,
-                queue_position=queue_position,
-                message=message,
+            return self._submit_training_job_from_workspace(
+                request,
+                workspace=workspace,
+                request_kind=request_kind,
             )
         except Exception as exc:
             logger.exception("submit_training_job error: {}", exc)
@@ -319,6 +348,108 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 queue_position=-1,
                 message=str(exc),
             )
+
+    def submit_training_job_stream(self, request_iterator, context):
+        not_configured = self._async_not_configured_reply("submit_training_job_stream")
+        if not_configured is not None:
+            return not_configured
+
+        upload_dir = Path(self.workspace_root or "./cache/server_workspace").resolve() / "_uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = None
+        first_chunk = None
+        total_received = 0
+        chunk_count = 0
+        next_log_at = 32 * 1024 * 1024
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=".zip.part",
+                prefix="training-upload-",
+                dir=upload_dir,
+                delete=False,
+            ) as handle:
+                temp_path = handle.name
+                for chunk in request_iterator:
+                    if first_chunk is None:
+                        first_chunk = chunk
+                        request_kind = self._request_kind_for_job_type(int(chunk.job_type))
+                        if self.edge_registry is not None:
+                            self.edge_registry.touch(int(chunk.edge_id))
+                        logger.info(
+                            "submit_training_job_stream started edge_id={} request_id={} "
+                            "job_type={} total_payload_bytes={}",
+                            chunk.edge_id,
+                            chunk.request_id,
+                            request_kind,
+                            int(chunk.total_payload_bytes),
+                        )
+
+                    if (
+                        int(chunk.edge_id) != int(first_chunk.edge_id)
+                        or str(chunk.request_id) != str(first_chunk.request_id)
+                        or int(chunk.job_type) != int(first_chunk.job_type)
+                    ):
+                        raise ValueError("streamed training upload metadata changed between chunks")
+
+                    payload_chunk = bytes(chunk.payload_chunk or b"")
+                    handle.write(payload_chunk)
+                    total_received += len(payload_chunk)
+                    chunk_count += 1
+                    if total_received >= next_log_at:
+                        logger.info(
+                            "submit_training_job_stream receiving request_id={} "
+                            "chunks={} received_bytes={} / {}",
+                            first_chunk.request_id,
+                            chunk_count,
+                            total_received,
+                            int(first_chunk.total_payload_bytes),
+                        )
+                        next_log_at += 32 * 1024 * 1024
+
+            if first_chunk is None:
+                raise ValueError("streamed training upload contained no chunks")
+            expected_total = int(first_chunk.total_payload_bytes)
+            if expected_total > 0 and total_received != expected_total:
+                raise ValueError(
+                    "streamed training upload size mismatch: "
+                    f"received={total_received}, expected={expected_total}"
+                )
+
+            request_kind = self._request_kind_for_job_type(int(first_chunk.job_type))
+            logger.info(
+                "submit_training_job_stream completed request_id={} chunks={} bytes={}; unpacking.",
+                first_chunk.request_id,
+                chunk_count,
+                total_received,
+            )
+            workspace = prepare_request_workspace_from_zip_file(
+                self.workspace_root,
+                edge_id=first_chunk.edge_id,
+                request_kind=request_kind,
+                payload_zip_path=temp_path,
+            )
+            return self._submit_training_job_from_workspace(
+                first_chunk,
+                workspace=workspace,
+                request_kind=request_kind,
+            )
+        except Exception as exc:
+            logger.exception("submit_training_job_stream error: {}", exc)
+            return message_transmission_pb2.SubmitTrainingJobReply(
+                accepted=False,
+                job_id="",
+                status="",
+                queue_position=-1,
+                message=str(exc),
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     def get_training_job_status(self, request, context):
         if self.training_job_manager is None:

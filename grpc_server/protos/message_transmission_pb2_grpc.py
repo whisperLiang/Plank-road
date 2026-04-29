@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from grpc_server.protos import message_transmission_pb2 as message__transmission__pb2
+from grpc_server.protos import message_transmission_pb2 as grpc__server_dot_protos_dot_message__transmission__pb2
 
 GRPC_GENERATED_VERSION = '1.78.1'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in message_transmission_pb2_grpc.py depends on'
+        + ' but the generated code in grpc_server/protos/message_transmission_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -36,48 +36,53 @@ class MessageTransmissionStub(object):
         """
         self.train_model_request = channel.unary_unary(
                 '/MessageTransmission/train_model_request',
-                request_serializer=message__transmission__pb2.TrainRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.TrainReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.FromString,
                 _registered_method=True)
         self.split_train_request = channel.unary_unary(
                 '/MessageTransmission/split_train_request',
-                request_serializer=message__transmission__pb2.SplitTrainRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.SplitTrainReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainReply.FromString,
                 _registered_method=True)
         self.continual_learning_request = channel.unary_unary(
                 '/MessageTransmission/continual_learning_request',
-                request_serializer=message__transmission__pb2.ContinualLearningRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.ContinualLearningReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningReply.FromString,
                 _registered_method=True)
         self.submit_training_job = channel.unary_unary(
                 '/MessageTransmission/submit_training_job',
-                request_serializer=message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.SubmitTrainingJobReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
+                _registered_method=True)
+        self.submit_training_job_stream = channel.stream_unary(
+                '/MessageTransmission/submit_training_job_stream',
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobChunk.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
                 _registered_method=True)
         self.get_training_job_status = channel.unary_unary(
                 '/MessageTransmission/get_training_job_status',
-                request_serializer=message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.TrainingJobStatusReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusReply.FromString,
                 _registered_method=True)
         self.download_trained_model = channel.unary_unary(
                 '/MessageTransmission/download_trained_model',
-                request_serializer=message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.DownloadTrainedModelReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelReply.FromString,
                 _registered_method=True)
         self.cancel_training_job = channel.unary_unary(
                 '/MessageTransmission/cancel_training_job',
-                request_serializer=message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.CancelTrainingJobReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobReply.FromString,
                 _registered_method=True)
         self.query_resource = channel.unary_unary(
                 '/MessageTransmission/query_resource',
-                request_serializer=message__transmission__pb2.ResourceRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.ResourceReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.FromString,
                 _registered_method=True)
         self.bandwidth_probe = channel.unary_unary(
                 '/MessageTransmission/bandwidth_probe',
-                request_serializer=message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.BandwidthProbeReply.FromString,
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.FromString,
                 _registered_method=True)
 
 
@@ -110,6 +115,13 @@ class MessageTransmissionServicer(object):
 
     def submit_training_job(self, request, context):
         """Async training job submission for edge-triggered continual learning.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def submit_training_job_stream(self, request_iterator, context):
+        """Streaming async training job submission for large edge bundles.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -155,48 +167,53 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'train_model_request': grpc.unary_unary_rpc_method_handler(
                     servicer.train_model_request,
-                    request_deserializer=message__transmission__pb2.TrainRequest.FromString,
-                    response_serializer=message__transmission__pb2.TrainReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.SerializeToString,
             ),
             'split_train_request': grpc.unary_unary_rpc_method_handler(
                     servicer.split_train_request,
-                    request_deserializer=message__transmission__pb2.SplitTrainRequest.FromString,
-                    response_serializer=message__transmission__pb2.SplitTrainReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainReply.SerializeToString,
             ),
             'continual_learning_request': grpc.unary_unary_rpc_method_handler(
                     servicer.continual_learning_request,
-                    request_deserializer=message__transmission__pb2.ContinualLearningRequest.FromString,
-                    response_serializer=message__transmission__pb2.ContinualLearningReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningReply.SerializeToString,
             ),
             'submit_training_job': grpc.unary_unary_rpc_method_handler(
                     servicer.submit_training_job,
-                    request_deserializer=message__transmission__pb2.SubmitTrainingJobRequest.FromString,
-                    response_serializer=message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
+            ),
+            'submit_training_job_stream': grpc.stream_unary_rpc_method_handler(
+                    servicer.submit_training_job_stream,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobChunk.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
             ),
             'get_training_job_status': grpc.unary_unary_rpc_method_handler(
                     servicer.get_training_job_status,
-                    request_deserializer=message__transmission__pb2.TrainingJobStatusRequest.FromString,
-                    response_serializer=message__transmission__pb2.TrainingJobStatusReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusReply.SerializeToString,
             ),
             'download_trained_model': grpc.unary_unary_rpc_method_handler(
                     servicer.download_trained_model,
-                    request_deserializer=message__transmission__pb2.DownloadTrainedModelRequest.FromString,
-                    response_serializer=message__transmission__pb2.DownloadTrainedModelReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelReply.SerializeToString,
             ),
             'cancel_training_job': grpc.unary_unary_rpc_method_handler(
                     servicer.cancel_training_job,
-                    request_deserializer=message__transmission__pb2.CancelTrainingJobRequest.FromString,
-                    response_serializer=message__transmission__pb2.CancelTrainingJobReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobReply.SerializeToString,
             ),
             'query_resource': grpc.unary_unary_rpc_method_handler(
                     servicer.query_resource,
-                    request_deserializer=message__transmission__pb2.ResourceRequest.FromString,
-                    response_serializer=message__transmission__pb2.ResourceReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.SerializeToString,
             ),
             'bandwidth_probe': grpc.unary_unary_rpc_method_handler(
                     servicer.bandwidth_probe,
-                    request_deserializer=message__transmission__pb2.BandwidthProbeRequest.FromString,
-                    response_serializer=message__transmission__pb2.BandwidthProbeReply.SerializeToString,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -224,8 +241,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/train_model_request',
-            message__transmission__pb2.TrainRequest.SerializeToString,
-            message__transmission__pb2.TrainReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -251,8 +268,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/split_train_request',
-            message__transmission__pb2.SplitTrainRequest.SerializeToString,
-            message__transmission__pb2.SplitTrainReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.SplitTrainReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -278,8 +295,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/continual_learning_request',
-            message__transmission__pb2.ContinualLearningRequest.SerializeToString,
-            message__transmission__pb2.ContinualLearningReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -305,8 +322,35 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/submit_training_job',
-            message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
-            message__transmission__pb2.SubmitTrainingJobReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def submit_training_job_stream(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/MessageTransmission/submit_training_job_stream',
+            grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobChunk.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -332,8 +376,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/get_training_job_status',
-            message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
-            message__transmission__pb2.TrainingJobStatusReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -359,8 +403,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/download_trained_model',
-            message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
-            message__transmission__pb2.DownloadTrainedModelReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -386,8 +430,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/cancel_training_job',
-            message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
-            message__transmission__pb2.CancelTrainingJobReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -413,8 +457,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/query_resource',
-            message__transmission__pb2.ResourceRequest.SerializeToString,
-            message__transmission__pb2.ResourceReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -440,8 +484,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/bandwidth_probe',
-            message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
-            message__transmission__pb2.BandwidthProbeReply.FromString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.FromString,
             options,
             channel_credentials,
             insecure,

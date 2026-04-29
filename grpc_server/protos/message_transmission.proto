@@ -12,6 +12,8 @@ service MessageTransmission {
   rpc continual_learning_request (ContinualLearningRequest) returns (ContinualLearningReply) {}
   // Async training job submission for edge-triggered continual learning.
   rpc submit_training_job (SubmitTrainingJobRequest) returns (SubmitTrainingJobReply) {}
+  // Streaming async training job submission for large edge bundles.
+  rpc submit_training_job_stream (stream SubmitTrainingJobChunk) returns (SubmitTrainingJobReply) {}
   // Poll async training job status by job_id.
   rpc get_training_job_status (TrainingJobStatusRequest) returns (TrainingJobStatusReply) {}
   // Download trained model for a completed async training job.
@@ -96,6 +98,23 @@ message SubmitTrainingJobRequest {
   bytes payload_zip = 11;
   // Model version at the time of submission (for stale detection)
   string base_model_version = 12;
+}
+
+message SubmitTrainingJobChunk {
+  string protocol_version = 1;
+  int64 edge_id = 2;
+  string request_id = 3;
+  TrainingJobType job_type = 4;
+  string cache_path = 5;
+  reserved 6;
+  bool send_low_conf_features = 7;
+  repeated int64 frame_indices = 8;
+  repeated int64 all_frame_indices = 9;
+  repeated int64 drift_frame_indices = 10;
+  bytes payload_chunk = 11;
+  string base_model_version = 12;
+  int64 chunk_index = 13;
+  int64 total_payload_bytes = 14;
 }
 
 message SubmitTrainingJobReply {

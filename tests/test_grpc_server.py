@@ -292,6 +292,69 @@ class TestMessageTransmissionServicer:
         finally:
             manager.close()
 
+    def test_submit_training_job_stream_for_continual_learning(self, tmp_path):
+        mock_learner = MagicMock()
+        mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (
+            True,
+            "model_data",
+            "ok",
+        )
+        manager = TrainingJobManager(
+            continual_learner=mock_learner,
+            max_concurrent_jobs=1,
+        )
+        try:
+            svc = self._make_servicer(
+                tmp_path,
+                continual_learner=mock_learner,
+                training_job_manager=manager,
+            )
+            payload_zip = _zip_bytes({"bundle_manifest.json": b"{}"})
+            chunks = [
+                message_transmission_pb2.SubmitTrainingJobChunk(
+                    edge_id=1,
+                    request_id="stream-req-1",
+                    job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+                    cache_path="edge_1/continual_learning",
+                    send_low_conf_features=True,
+                    protocol_version="edge-cl-bundle.v1",
+                    payload_chunk=payload_zip[:10],
+                    chunk_index=0,
+                    total_payload_bytes=len(payload_zip),
+                ),
+                message_transmission_pb2.SubmitTrainingJobChunk(
+                    edge_id=1,
+                    request_id="stream-req-1",
+                    job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+                    cache_path="edge_1/continual_learning",
+                    send_low_conf_features=True,
+                    protocol_version="edge-cl-bundle.v1",
+                    payload_chunk=payload_zip[10:],
+                    chunk_index=1,
+                    total_payload_bytes=len(payload_zip),
+                ),
+            ]
+
+            submit_reply = svc.submit_training_job_stream(iter(chunks), MagicMock())
+
+            assert submit_reply.accepted is True
+            assert submit_reply.job_id
+
+            status_reply = self._wait_for_job(
+                svc,
+                edge_id=1,
+                job_id=submit_reply.job_id,
+            )
+            assert status_reply is not None
+            assert status_reply.found is True
+            assert status_reply.status == "SUCCEEDED"
+            mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once()
+            _, workspace = mock_learner.get_ground_truth_and_fixed_split_retrain.call_args.args
+            assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
+            assert (Path(workspace) / "bundle_manifest.json").read_text(encoding="utf-8") == "{}"
+        finally:
+            manager.close()
+
     def test_submit_training_job_reuses_request_id(self, tmp_path):
         mock_learner = MagicMock()
         mock_learner.get_ground_truth_and_fixed_split_retrain.return_value = (

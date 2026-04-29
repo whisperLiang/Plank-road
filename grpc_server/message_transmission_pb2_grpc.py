@@ -54,6 +54,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.SubmitTrainingJobReply.FromString,
                 _registered_method=True)
+        self.submit_training_job_stream = channel.stream_unary(
+                '/MessageTransmission/submit_training_job_stream',
+                request_serializer=message__transmission__pb2.SubmitTrainingJobChunk.SerializeToString,
+                response_deserializer=message__transmission__pb2.SubmitTrainingJobReply.FromString,
+                _registered_method=True)
         self.get_training_job_status = channel.unary_unary(
                 '/MessageTransmission/get_training_job_status',
                 request_serializer=message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
@@ -115,6 +120,13 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def submit_training_job_stream(self, request_iterator, context):
+        """Streaming async training job submission for large edge bundles.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def get_training_job_status(self, request, context):
         """Poll async training job status by job_id.
         """
@@ -171,6 +183,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
             'submit_training_job': grpc.unary_unary_rpc_method_handler(
                     servicer.submit_training_job,
                     request_deserializer=message__transmission__pb2.SubmitTrainingJobRequest.FromString,
+                    response_serializer=message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
+            ),
+            'submit_training_job_stream': grpc.stream_unary_rpc_method_handler(
+                    servicer.submit_training_job_stream,
+                    request_deserializer=message__transmission__pb2.SubmitTrainingJobChunk.FromString,
                     response_serializer=message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
             ),
             'get_training_job_status': grpc.unary_unary_rpc_method_handler(
@@ -306,6 +323,33 @@ class MessageTransmission(object):
             target,
             '/MessageTransmission/submit_training_job',
             message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
+            message__transmission__pb2.SubmitTrainingJobReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def submit_training_job_stream(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/MessageTransmission/submit_training_job_stream',
+            message__transmission__pb2.SubmitTrainingJobChunk.SerializeToString,
             message__transmission__pb2.SubmitTrainingJobReply.FromString,
             options,
             channel_credentials,
