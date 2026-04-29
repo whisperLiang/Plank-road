@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import uuid
 
 import grpc
@@ -19,6 +20,25 @@ from model_management.continual_learning_bundle import (
 
 def _server_workspace_hint(edge_id: int, request_kind: str) -> str:
     return f"edge_{int(edge_id)}/{request_kind}"
+
+
+def _format_bytes(num_bytes: int | float) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024.0 or unit == "GiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{value:.1f} GiB"
+
+
+def _manifest_payload_summary(manifest: dict) -> dict[str, int]:
+    samples = list(manifest.get("samples") or [])
+    return {
+        "samples": len(samples),
+        "drift": len(list(manifest.get("drift_sample_ids") or [])),
+        "feature_bytes": sum(int(sample.get("feature_bytes", 0) or 0) for sample in samples),
+        "raw_bytes": sum(int(sample.get("raw_bytes", 0) or 0) for sample in samples),
+    }
 
 def pack_training_payload(cache_path, all_frame_indices, drift_frame_indices=None):
     buf = io.BytesIO()
@@ -253,10 +273,21 @@ def submit_training_job(
     channel=None,
 ):
     owned_channel = channel is None
+    request_started = time.perf_counter()
     try:
         if channel is None:
             channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        payload_size = len(payload_zip or b"")
+        logger.info(
+            "Submitting training job request_id={} edge_id={} job_type={} "
+            "payload_zip={} server={}",
+            request_id,
+            edge_id,
+            job_type,
+            _format_bytes(payload_size),
+            server_ip,
+        )
         req = message_transmission_pb2.SubmitTrainingJobRequest(
             protocol_version=str(protocol_version or ""),
             edge_id=int(edge_id),
@@ -269,9 +300,23 @@ def submit_training_job(
             drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
             payload_zip=payload_zip,
         )
-        return stub.submit_training_job(req)
+        reply = stub.submit_training_job(req)
+        logger.info(
+            "submit_training_job reply request_id={} accepted={} job_id={} "
+            "status={} elapsed={:.3f}s",
+            request_id,
+            bool(reply.accepted),
+            reply.job_id,
+            reply.status,
+            time.perf_counter() - request_started,
+        )
+        return reply
     except Exception as exc:
-        logger.exception("submit_training_job failed: {}", exc)
+        logger.exception(
+            "submit_training_job failed after {:.3f}s: {}",
+            time.perf_counter() - request_started,
+            exc,
+        )
         return None
     finally:
         if owned_channel and channel is not None:
@@ -342,6 +387,21 @@ def submit_continual_learning_job(
     channel=None,
 ):
     try:
+        pack_started = time.perf_counter()
+        stats = sample_store.stats()
+        logger.info(
+            "Packing continual learning bundle for edge {} "
+            "(samples={}, high_conf={}, low_conf={}, drift={}, "
+            "send_low_conf_features={}, model_id={}, model_version={})",
+            edge_id,
+            int(stats.get("total_samples", 0)),
+            int(stats.get("high_confidence_count", 0)),
+            int(stats.get("low_confidence_count", 0)),
+            int(stats.get("drift_count", 0)),
+            bool(send_low_conf_features),
+            model_id,
+            model_version,
+        )
         payload_zip, manifest = pack_continual_learning_bundle(
             sample_store,
             edge_id=edge_id,
@@ -349,6 +409,19 @@ def submit_continual_learning_job(
             split_plan=split_plan,
             model_id=model_id,
             model_version=model_version,
+        )
+        payload_summary = _manifest_payload_summary(manifest)
+        logger.info(
+            "Packed continual learning bundle for edge {} in {:.3f}s "
+            "(manifest_samples={}, drift={}, source_feature_bytes={}, "
+            "source_raw_bytes={}, zip_payload={}).",
+            edge_id,
+            time.perf_counter() - pack_started,
+            payload_summary["samples"],
+            payload_summary["drift"],
+            _format_bytes(payload_summary["feature_bytes"]),
+            _format_bytes(payload_summary["raw_bytes"]),
+            _format_bytes(len(payload_zip)),
         )
         reply = submit_training_job(
             server_ip,
