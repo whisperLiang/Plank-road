@@ -2038,7 +2038,7 @@ def test_cloud_batch_feature_provider_uses_actual_short_final_chunk(
 
     learner = CloudContinualLearner(
         config=SimpleNamespace(
-            edge_model_name="rfdetr_nano",
+            edge_model_name="yolov8n",
             continual_learning=SimpleNamespace(batch_size=16),
             das=SimpleNamespace(enabled=False),
             workspace_root=str(tmp_path),

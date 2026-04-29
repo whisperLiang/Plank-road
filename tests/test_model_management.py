@@ -52,6 +52,7 @@ from model_management.split_model_adapters import (
     _build_anchor_training_target,
     _build_rfdetr_training_labels,
     _build_ultralytics_training_batch,
+    RFDETRReplay,
     get_split_runtime_input_resize_mode,
 )
 
@@ -662,6 +663,34 @@ class TestModelZoo:
         assert output["labels"].tolist() == [13]
         assert len(output["boxes"]) == 1
         assert output["scores"][0].item() == pytest.approx(torch.sigmoid(torch.tensor(5.0)).item())
+
+    def test_rfdetr_replay_wraps_batched_tensor_without_unbinding_batch_dim(self):
+        captured: dict[str, object] = {}
+
+        class FakeCoreModel:
+            def __call__(self, samples):
+                captured["samples"] = samples
+                return {
+                    "pred_logits": torch.zeros((15, 2, 91), dtype=torch.float32),
+                    "pred_boxes": torch.zeros((15, 2, 4), dtype=torch.float32),
+                }
+
+        detector = SimpleNamespace(
+            rfdetr=SimpleNamespace(
+                model=SimpleNamespace(
+                    model=FakeCoreModel(),
+                )
+            )
+        )
+
+        replay = RFDETRReplay(detector)
+        outputs = replay(torch.randn(15, 3, 384, 384))
+
+        samples = captured["samples"]
+        assert tuple(samples.tensors.shape) == (15, 3, 384, 384)
+        assert tuple(samples.mask.shape) == (15, 384, 384)
+        assert bool(samples.mask.any()) is False
+        assert tuple(outputs["pred_logits"].shape) == (15, 2, 91)
 
     def test_build_tinynext_detector_unwraps_nested_full_detector_checkpoint(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module

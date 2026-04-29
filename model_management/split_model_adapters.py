@@ -33,8 +33,10 @@ from model_management.payload import BoundaryPayload
 
 try:
     from rfdetr.models.lwdetr import build_criterion_and_postprocessors
+    from rfdetr.utilities.tensors import NestedTensor
 except Exception:
     build_criterion_and_postprocessors = None
+    NestedTensor = None
 
 
 COCO_91_TO_80 = {label: idx for idx, label in enumerate(COCO_80_TO_91)}
@@ -117,8 +119,18 @@ class RFDETRReplay(torch.nn.Module):
         self.detector = detector
         self.model = detector.rfdetr.model.model
 
+    @staticmethod
+    def _normalize_images(images: torch.Tensor | Any) -> torch.Tensor | Any:
+        if NestedTensor is None or not isinstance(images, torch.Tensor):
+            return images
+        if images.ndim != 4:
+            return images
+        batch_size, _, height, width = images.shape
+        mask = torch.zeros((batch_size, height, width), dtype=torch.bool, device=images.device)
+        return NestedTensor(images, mask)
+
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        outputs = self.model(images)
+        outputs = self.model(self._normalize_images(images))
         if isinstance(outputs, tuple):
             return {
                 "pred_logits": outputs[1],

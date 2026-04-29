@@ -2436,7 +2436,6 @@ class CloudContinualLearner:
                 bundle_root=bundle_root,
                 runtime_batch_size=runtime_batch_size,
             )
-
         def _batch_provider(raw_paths: list[str], samples: list[dict[str, object]], manifest_payload: dict[str, object]):
             if not raw_paths:
                 return []
