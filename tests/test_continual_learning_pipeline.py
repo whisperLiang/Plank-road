@@ -757,6 +757,63 @@ def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
     assert splitter.seen_batch_sizes == [16]
 
 
+def test_split_retrain_uses_cached_pseudo_targets_and_pads_singleton_dynamic_batch(
+    tmp_path,
+):
+    cache_path = str(tmp_path / "cache")
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    save_split_feature_cache(
+        cache_path,
+        "s1",
+        payload,
+        pseudo_boxes=[[1.0, 2.0, 3.0, 4.0]],
+        pseudo_labels=[1],
+        extra_metadata={
+            "input_image_size": [10, 20],
+            "input_tensor_shape": [1, 3, 8, 16],
+        },
+    )
+
+    class DynamicBatchSplitter:
+        split_spec = SimpleNamespace(dynamic_batch=(2, 64))
+
+        def __init__(self):
+            self.seen_boundary = None
+            self.seen_targets = None
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            self.seen_boundary = boundary
+            self.seen_targets = targets
+            assert boundary.batch_size == 2
+            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0], [1.0, 2.0]]
+            assert len(targets) == 2
+            assert targets[0]["boxes"] == [[1.0, 2.0, 3.0, 4.0]]
+            assert targets[0]["labels"] == [1]
+            assert targets[0]["_split_meta"]["input_tensor_shape"] == [1, 3, 8, 16]
+            assert targets[1] == targets[0]
+            return torch.tensor(0.5), {}
+
+    splitter = DynamicBatchSplitter()
+    losses = universal_split_retrain(
+        model=torch.nn.Linear(1, 1),
+        sample_input=torch.ones(1, 1),
+        cache_path=cache_path,
+        all_indices=["s1"],
+        gt_annotations={},
+        loss_fn=lambda outputs, targets: torch.tensor(0.5),
+        splitter=splitter,
+        batch_size=16,
+    )
+
+    assert losses == [0.5]
+    assert splitter.seen_boundary is not None
+    assert splitter.seen_targets is not None
+
+
 def test_split_retrain_attaches_cache_metadata_to_targets(tmp_path):
     cache_path = str(tmp_path / "cache")
     first = boundary_payload_from_tensors(
@@ -882,6 +939,62 @@ def test_cached_split_proxy_eval_batches_schema_payloads(tmp_path):
 
     assert splitter.seen_boundary is not None
     assert len(prediction_cache["prediction_rows"]) == 2
+    assert prediction_cache["prediction_rows"][0][2]["scores"] == pytest.approx([0.9])
+
+
+def test_cached_split_proxy_eval_pads_singleton_dynamic_batch(tmp_path):
+    from cloud_server import _build_detection_proxy_prediction_cache
+
+    cache_path = str(tmp_path / "cache")
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.ones(1, 3)},
+    )
+    save_split_feature_cache(cache_path, "s1", payload)
+
+    class DummySplitter:
+        def __init__(self):
+            self.seen_boundary = None
+
+        def cloud_forward(self, boundary, *, candidate=None):
+            self.seen_boundary = boundary
+            assert candidate == "candidate-1"
+            assert boundary.batch_size == 2
+            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0], [1.0, 2.0]]
+            assert boundary.passthrough_inputs["input"].shape == (2, 3)
+            return [
+                {
+                    "boxes": torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+                    "labels": torch.tensor([1]),
+                    "scores": torch.tensor([0.9]),
+                },
+                {
+                    "boxes": torch.tensor([[2.0, 2.0, 3.0, 3.0]]),
+                    "labels": torch.tensor([2]),
+                    "scores": torch.tensor([0.8]),
+                },
+            ]
+
+    splitter = DummySplitter()
+    prediction_cache = _build_detection_proxy_prediction_cache(
+        torch.nn.Identity(),
+        frame_dir=str(tmp_path),
+        gt_annotations={
+            "s1": {"boxes": [[0.0, 0.0, 1.0, 1.0]], "labels": [1]},
+        },
+        device=torch.device("cpu"),
+        threshold_low=0.1,
+        model_name="rfdetr_nano",
+        inference_batch_size=16,
+        split_cache_path=cache_path,
+        splitter=splitter,
+        split_candidate="candidate-1",
+    )
+
+    assert splitter.seen_boundary is not None
+    assert len(prediction_cache["prediction_rows"]) == 1
     assert prediction_cache["prediction_rows"][0][2]["scores"] == pytest.approx([0.9])
 
 

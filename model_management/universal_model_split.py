@@ -1006,6 +1006,39 @@ def _target_with_split_metadata(target: Any, record: Mapping[str, Any]) -> Any:
     return updated_target
 
 
+def _pseudo_target_from_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    if "pseudo_boxes" not in record and "pseudo_labels" not in record:
+        return None
+    target = {
+        "boxes": list(record.get("pseudo_boxes") or []),
+        "labels": list(record.get("pseudo_labels") or []),
+    }
+    if "pseudo_scores" in record:
+        target["scores"] = list(record.get("pseudo_scores") or [])
+    return target
+
+
+def _target_for_split_training(
+    index: Any,
+    annotations: Mapping[Any, Any],
+    record: Mapping[str, Any],
+) -> Any:
+    target = annotations.get(index)
+    if target is None:
+        target = annotations.get(str(index))
+    if target is None:
+        target = _pseudo_target_from_record(record)
+    return _target_with_split_metadata(target, record)
+
+
+def _splitter_dynamic_batch_min(splitter: UniversalModelSplitter) -> int:
+    split_spec = getattr(splitter, "split_spec", None)
+    dynamic_batch = getattr(split_spec, "dynamic_batch", None)
+    if isinstance(dynamic_batch, (list, tuple)) and dynamic_batch:
+        return max(1, int(dynamic_batch[0]))
+    return 1
+
+
 def universal_split_retrain(
     *,
     model: torch.nn.Module,
@@ -1029,6 +1062,7 @@ def universal_split_retrain(
     optimizer = torch.optim.Adam(params, lr=float(learning_rate)) if params else None
     losses: list[float] = []
     annotations = dict(gt_annotations or {})
+    runtime_min_batch = _splitter_dynamic_batch_min(runtime)
 
     for _epoch in range(int(num_epoch)):
         epoch_losses: list[float] = []
@@ -1048,17 +1082,25 @@ def universal_split_retrain(
                 raise RuntimeError(
                     "Split-tail training requires cached BoundaryPayload records."
                 )
-            boundary = _combine_boundary_payload_batch(
-                boundaries,
-                expected_batch_size=len(batch_indices),
-            )
             targets = [
-                _target_with_split_metadata(annotations.get(index), record)
+                _target_for_split_training(index, annotations, record)
                 for index, record in zip(batch_indices, records)
             ]
+            execution_boundaries = list(boundaries)
+            execution_targets = list(targets)
+            execution_batch_size = len(batch_indices)
+            if execution_batch_size < runtime_min_batch:
+                pad_count = runtime_min_batch - execution_batch_size
+                execution_boundaries.extend([boundaries[-1]] * pad_count)
+                execution_targets.extend([targets[-1]] * pad_count)
+                execution_batch_size = runtime_min_batch
+            boundary = _combine_boundary_payload_batch(
+                execution_boundaries,
+                expected_batch_size=execution_batch_size,
+            )
             loss, _grads = runtime.train_suffix(
                 boundary,
-                targets,
+                execution_targets,
                 loss_fn=loss_fn,
                 optimizer=optimizer,
             )

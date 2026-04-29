@@ -1033,31 +1033,44 @@ def _build_detection_proxy_prediction_cache(
         prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
         _set_detection_model_eval_mode(model)
         with torch.no_grad():
-            batch_size = max(1, int(inference_batch_size))
+            batch_size = min(
+                max(1, int(inference_batch_size)),
+                _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
+            )
             for start in range(0, len(pending_samples), batch_size):
                 batch = pending_samples[start : start + batch_size]
                 batch_payloads = [payload for _, _, payload, _ in batch]
                 actual_batch_size = len(batch_payloads)
+                execution_batch_size = max(
+                    _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+                    actual_batch_size,
+                )
+                execution_payloads = list(batch_payloads)
+                if len(execution_payloads) < execution_batch_size:
+                    execution_payloads.extend(
+                        [execution_payloads[-1]]
+                        * (execution_batch_size - len(execution_payloads))
+                    )
                 batched_payload = batch_payloads[0]
                 if not isinstance(batched_payload, BoundaryPayload):
                     raise RuntimeError(
                         "Cached split proxy evaluation requires Ariadne BoundaryPayload records."
                     )
-                if int(getattr(batched_payload, "batch_size", 0)) != actual_batch_size:
+                if int(getattr(batched_payload, "batch_size", 0)) != execution_batch_size:
                     if not all(
                         isinstance(payload, BoundaryPayload)
                         and bool(getattr(payload, "schema", None))
-                        for payload in batch_payloads
+                        for payload in execution_payloads
                     ):
                         raise RuntimeError(
                             "Cached split proxy evaluation received per-sample payloads. "
                             "Plank-road no longer guesses batched cat/stack payloads without Ariadne schema."
                         )
                     batched_payload = _combine_boundary_payload_batch(
-                        batch_payloads,
-                        expected_batch_size=actual_batch_size,
+                        execution_payloads,
+                        expected_batch_size=execution_batch_size,
                     )
-                if int(getattr(batched_payload, "batch_size", 0)) != actual_batch_size:
+                if int(getattr(batched_payload, "batch_size", 0)) != execution_batch_size:
                     raise RuntimeError(
                         "Cached split proxy evaluation received per-sample payloads. "
                         "Plank-road no longer guesses batched cat/stack payloads without Ariadne schema."
@@ -1070,14 +1083,20 @@ def _build_detection_proxy_prediction_cache(
                     model,
                     raw_outputs,
                     model_name=model_name,
-                    batch_metadata=[metadata for _, _, _, metadata in batch],
+                    batch_metadata=[
+                        metadata
+                        for _, _, _, metadata in (
+                            batch
+                            + [batch[-1]] * (execution_batch_size - actual_batch_size)
+                        )
+                    ],
                     threshold_low=threshold_low,
                     device=device,
                 )
                 if low_threshold_predictions is None:
                     low_threshold_predictions = _batched_predictions_from_model_output(
                         raw_outputs,
-                        batch_size=len(batch),
+                        batch_size=execution_batch_size,
                         threshold_low=threshold_low,
                         threshold_high=threshold_low,
                     )
