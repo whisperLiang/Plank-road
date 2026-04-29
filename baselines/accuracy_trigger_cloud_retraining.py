@@ -1,4 +1,4 @@
-"""Accuracy-trigger cloud-retraining baseline.
+﻿"""Accuracy-trigger cloud-retraining baseline.
 
 This baseline is a simulation-oriented approximation of the method in
 "Edge-Assisted On-Device Model Update for Video Analytics in Adverse
@@ -40,7 +40,7 @@ class BufferedFrame:
     frame_index: int
     confidence: float
     proxy_map: float
-    drift_flag: bool
+    in_drift_window: bool
     latency_ms: float
     selection_score: float = 0.0
     selected_by: str = "none"
@@ -97,7 +97,7 @@ class AccuracyTriggerCloudRetraining(BaseMethod):
         self.drift_ratio_threshold = float(getattr(cfg, "drift_ratio_threshold", 0.20))
         self.configured_upload_mode = str(getattr(cfg, "upload_mode", "raw_only"))
         self.upload_mode = "raw_only"
-        self.low_confidence_threshold = float(getattr(cfg, "low_confidence_threshold", 0.50))
+        self.low_quality_threshold = float(getattr(cfg, "low_quality_threshold", 0.50))
         self.trigger_cooldown_windows = int(getattr(cfg, "trigger_cooldown_windows", 1))
         self.max_buffered_windows = int(getattr(cfg, "max_buffered_windows", 4))
         self.max_selected_frames_per_window = int(
@@ -167,7 +167,7 @@ class AccuracyTriggerCloudRetraining(BaseMethod):
                 frame_index=result.frame_index,
                 confidence=result.confidence,
                 proxy_map=result.proxy_map,
-                drift_flag=result.drift_flag,
+                in_drift_window=result.in_drift_window,
                 latency_ms=result.latency_ms,
             )
         )
@@ -199,24 +199,24 @@ class AccuracyTriggerCloudRetraining(BaseMethod):
         for frame in current_window:
             conf_delta = abs(frame.confidence - prev_conf)
             prev_conf = frame.confidence
-            low_conf_signal = max(0.0, self.low_confidence_threshold - frame.confidence)
-            low_conf_signal /= max(self.low_confidence_threshold, 1e-6)
+            low_conf_signal = max(0.0, self.low_quality_threshold - frame.confidence)
+            low_conf_signal /= max(self.low_quality_threshold, 1e-6)
             proxy_gap = max(0.0, frame.confidence - frame.proxy_map)
 
             if (
-                frame.confidence <= self.low_confidence_threshold
-                or frame.drift_flag
+                frame.confidence <= self.low_quality_threshold
+                or frame.in_drift_window
                 or proxy_gap > 0.08
             ):
                 score = low_conf_signal + 0.7 * conf_delta + 0.5 * proxy_gap
-                if frame.drift_flag:
+                if frame.in_drift_window:
                     score += 0.4
                 candidates.append(
                     BufferedFrame(
                         frame_index=frame.frame_index,
                         confidence=frame.confidence,
                         proxy_map=frame.proxy_map,
-                        drift_flag=frame.drift_flag,
+                        in_drift_window=frame.in_drift_window,
                         latency_ms=frame.latency_ms,
                         selection_score=score,
                         selected_by="low_conf+difference",
@@ -233,9 +233,9 @@ class AccuracyTriggerCloudRetraining(BaseMethod):
                     frame_index=frame.frame_index,
                     confidence=frame.confidence,
                     proxy_map=frame.proxy_map,
-                    drift_flag=frame.drift_flag,
+                    in_drift_window=frame.in_drift_window,
                     latency_ms=frame.latency_ms,
-                    selection_score=max(0.0, self.low_confidence_threshold - frame.confidence),
+                    selection_score=max(0.0, self.low_quality_threshold - frame.confidence),
                     selected_by="fallback_lowest_conf",
                 )
                 for frame in fallback
@@ -255,9 +255,9 @@ class AccuracyTriggerCloudRetraining(BaseMethod):
         ]
         mean_confidence = sum(confidences) / len(confidences)
         low_conf_ratio = sum(
-            1 for confidence in confidences if confidence < self.low_confidence_threshold
+            1 for confidence in confidences if confidence < self.low_quality_threshold
         ) / len(confidences)
-        drift_ratio = sum(1 for frame in current_window if frame.drift_flag) / len(current_window)
+        drift_ratio = sum(1 for frame in current_window if frame.in_drift_window) / len(current_window)
 
         baseline_len = max(1, len(confidences) // 4)
         baseline_confidence = sum(confidences[:baseline_len]) / baseline_len
@@ -648,3 +648,4 @@ class AccuracyTriggerCloudRetraining(BaseMethod):
         self._get_accuracy_history(plan.device_id).clear()
         if self._update_queue:
             self._update_queue.popleft()
+

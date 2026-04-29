@@ -1,4 +1,4 @@
-import io
+﻿import io
 import json
 import os
 import time
@@ -10,7 +10,7 @@ import cv2
 import pytest
 import torch
 
-from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
+from edge.sample_store import EdgeSampleStore, HIGH_QUALITY, LOW_QUALITY
 from edge.transmit import (
     pack_continual_learning_bundle,
     pack_continual_learning_bundle_to_file,
@@ -566,7 +566,7 @@ def test_apply_split_plan_uses_ariadne_candidate_id_only():
     assert runtime.calls == [{"candidate_id": "candidate-2"}]
 
 
-def test_high_confidence_sample_saves_feature_and_result_without_raw(tmp_path):
+def test_high_quality_sample_saves_feature_and_result_without_raw(tmp_path):
     store = EdgeSampleStore(str(tmp_path))
     record = store.store_sample(
         sample_id="high-1",
@@ -575,7 +575,7 @@ def test_high_confidence_sample_saves_feature_and_result_without_raw(tmp_path):
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.95]},
         intermediate=_payload(),
         raw_frame=None,
@@ -588,7 +588,7 @@ def test_high_confidence_sample_saves_feature_and_result_without_raw(tmp_path):
     assert not (tmp_path / "raw" / "high-1.jpg").exists()
 
 
-def test_low_confidence_sample_saves_feature_result_and_raw(tmp_path, sample_bgr_frame):
+def test_low_quality_sample_saves_feature_result_and_raw(tmp_path, sample_bgr_frame):
     store = EdgeSampleStore(str(tmp_path))
     payload = _payload()
     payload = payload.detach(requires_grad=True)
@@ -599,7 +599,7 @@ def test_low_confidence_sample_saves_feature_result_and_raw(tmp_path, sample_bgr
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=payload,
         raw_frame=sample_bgr_frame,
@@ -631,7 +631,7 @@ def test_sample_store_accepts_ariadne_boundary_payload(tmp_path):
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=payload,
     )
@@ -1007,7 +1007,7 @@ def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_payload(),
     )
@@ -1018,7 +1018,7 @@ def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_payload(),
         raw_frame=sample_bgr_frame,
@@ -1043,7 +1043,7 @@ def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_
     assert low.raw_relpath in names
     assert low.feature_relpath not in names
     assert sample_map["low-1"]["feature_relpath"] is None
-    assert manifest["training_mode"]["low_confidence_mode"] == "raw-only"
+    assert manifest["training_mode"]["low_quality_mode"] == "raw-only"
 
 
 def test_bundle_uses_stored_zip_and_prepare_cache_reads_it(tmp_path):
@@ -1056,7 +1056,7 @@ def test_bundle_uses_stored_zip_and_prepare_cache_reads_it(tmp_path):
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_planned_payload(plan),
     )
@@ -1101,7 +1101,7 @@ def test_bundle_budget_keeps_drift_raw_and_omits_lowest_priority_raw(
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_planned_payload(plan),
     )
@@ -1112,12 +1112,12 @@ def test_bundle_budget_keeps_drift_raw_and_omits_lowest_priority_raw(
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         quality_score=0.3,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_planned_payload(plan),
         raw_frame=sample_bgr_frame,
-        drift_flag=True,
+        in_drift_window=True,
     )
     keep_low = store.store_sample(
         sample_id="low-keep",
@@ -1126,7 +1126,7 @@ def test_bundle_budget_keeps_drift_raw_and_omits_lowest_priority_raw(
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         quality_score=0.1,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_planned_payload(plan),
@@ -1139,7 +1139,7 @@ def test_bundle_budget_keeps_drift_raw_and_omits_lowest_priority_raw(
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         quality_score=0.8,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_planned_payload(plan),
@@ -1184,12 +1184,12 @@ def test_bundle_budget_keeps_drift_raw_and_omits_lowest_priority_raw(
     assert drift.raw_relpath in names
     assert keep_low.raw_relpath in names
     assert drop_low.raw_relpath not in names
-    assert bundle_manifest["drift_sample_ids"] == ["drift-1"]
+    assert bundle_manifest["selection_policy"]["drift_window_selected_count"] == 1
     assert bundle_manifest["selection_policy"]["omitted_sample_count"] == 1
     assert manifest["selection_policy"]["bundle_cap_bytes"] == cap
 
 
-def test_bundle_budget_caps_non_drift_high_confidence_features(tmp_path):
+def test_bundle_budget_caps_non_drift_high_quality_features(tmp_path):
     store = EdgeSampleStore(str(tmp_path / "store"))
     plan = _dummy_plan()
     records = []
@@ -1201,7 +1201,7 @@ def test_bundle_budget_caps_non_drift_high_confidence_features(tmp_path):
             split_config_id="plan-1",
             model_id="model-a",
             model_version="0",
-            confidence_bucket=HIGH_CONFIDENCE,
+            quality_bucket=HIGH_QUALITY,
             inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
             intermediate=_planned_payload(plan),
         )
@@ -1249,7 +1249,7 @@ def test_bundle_includes_low_conf_features_when_decision_requests_them(tmp_path,
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_payload(),
         raw_frame=sample_bgr_frame,
@@ -1268,7 +1268,7 @@ def test_bundle_includes_low_conf_features_when_decision_requests_them(tmp_path,
 
     assert low.feature_relpath in names
     assert low.raw_relpath in names
-    assert manifest["training_mode"]["low_confidence_mode"] == "raw+feature"
+    assert manifest["training_mode"]["low_quality_mode"] == "raw+feature"
 
 
 def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path, sample_bgr_frame):
@@ -1280,10 +1280,10 @@ def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path, sample
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_payload(),
-        drift_flag=True,
+        in_drift_window=True,
         raw_frame=sample_bgr_frame,
     )
     store.store_sample(
@@ -1293,10 +1293,10 @@ def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path, sample
         split_config_id="plan-old",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_payload(),
-        drift_flag=True,
+        in_drift_window=True,
         raw_frame=sample_bgr_frame,
     )
     store.store_sample(
@@ -1306,7 +1306,7 @@ def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path, sample
         split_config_id="plan-1",
         model_id="model-b",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_payload(),
     )
@@ -1325,7 +1325,7 @@ def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path, sample
 
     sample_ids = [sample["sample_id"] for sample in bundle_manifest["samples"]]
     assert sample_ids == ["keep-1"]
-    assert bundle_manifest["drift_sample_ids"] == ["keep-1"]
+    assert bundle_manifest["selection_policy"]["drift_window_selected_count"] == 1
     assert keep.feature_relpath in names
     assert "features/old-plan.pt" not in names
     assert "features/old-model.pt" not in names
@@ -1341,7 +1341,7 @@ def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, s
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_planned_payload(plan),
         raw_frame=sample_bgr_frame,
@@ -1421,14 +1421,13 @@ def test_prepare_split_training_cache_reuses_bundled_feature_when_boundary_label
             "split_index": 3,
             "boundary_tensor_labels": ["new-boundary"],
         },
-        "drift_sample_ids": [],
         "samples": [
             {
                 "sample_id": "sample-1",
                 "frame_index": 1,
                 "confidence": 0.9,
-                "confidence_bucket": HIGH_CONFIDENCE,
-                "drift_flag": False,
+                "quality_bucket": HIGH_QUALITY,
+                "in_drift_window": False,
                 "feature_relpath": "features/sample-1.pt",
                 "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
                 "result_relpath": "results/sample-1.json",
@@ -1474,7 +1473,7 @@ def test_prepare_split_training_cache_backfills_input_image_size_from_raw_sample
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_payload(),
         raw_frame=sample_bgr_frame,
@@ -1523,14 +1522,13 @@ def test_prepare_split_training_cache_reuses_feature_only_sample_without_rebuild
         "edge_id": 1,
         "model": {"model_id": "model-a", "model_version": "0"},
         "split_plan": _dummy_plan().to_dict(),
-        "drift_sample_ids": [],
         "samples": [
             {
                 "sample_id": "sample-1",
                 "frame_index": 1,
                 "confidence": 0.9,
-                "confidence_bucket": HIGH_CONFIDENCE,
-                "drift_flag": False,
+                "quality_bucket": HIGH_QUALITY,
+                "in_drift_window": False,
                 "feature_relpath": "features/sample-1.pt",
                 "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
                 "result_relpath": "results/sample-1.json",
@@ -1586,7 +1584,7 @@ def test_prepare_split_training_cache_is_incremental_for_reconstructed_raw_only_
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_planned_payload(plan),
         raw_frame=sample_bgr_frame,
@@ -1688,14 +1686,13 @@ def test_prepare_split_training_cache_does_not_rewrite_reusable_feature_only_cac
         "edge_id": 1,
         "model": {"model_id": "model-a", "model_version": "0"},
         "split_plan": _dummy_plan().to_dict(),
-        "drift_sample_ids": [],
         "samples": [
             {
                 "sample_id": "sample-1",
                 "frame_index": 1,
                 "confidence": 0.9,
-                "confidence_bucket": HIGH_CONFIDENCE,
-                "drift_flag": False,
+                "quality_bucket": HIGH_QUALITY,
+                "in_drift_window": False,
                 "feature_relpath": "features/sample-1.pt",
                 "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
                 "result_relpath": "results/sample-1.json",
@@ -1794,14 +1791,13 @@ def test_prepare_split_training_cache_refreshes_feature_only_cache_when_source_d
         "edge_id": 1,
         "model": {"model_id": "model-a", "model_version": "0"},
         "split_plan": _dummy_plan().to_dict(),
-        "drift_sample_ids": [],
         "samples": [
             {
                 "sample_id": "sample-1",
                 "frame_index": 1,
                 "confidence": 0.9,
-                "confidence_bucket": HIGH_CONFIDENCE,
-                "drift_flag": False,
+                "quality_bucket": HIGH_QUALITY,
+                "in_drift_window": False,
                 "feature_relpath": "features/sample-1.pt",
                 "feature_bytes": initial_feature_size,
                 "result_relpath": "results/sample-1.json",
@@ -1873,14 +1869,13 @@ def test_prepare_split_training_cache_reuses_incompatible_feature_only_samples(t
         "edge_id": 1,
         "model": {"model_id": "model-a", "model_version": "0"},
         "split_plan": _dummy_plan().to_dict(),
-        "drift_sample_ids": [],
         "samples": [
             {
                 "sample_id": "old-1",
                 "frame_index": 1,
                 "confidence": 0.9,
-                "confidence_bucket": HIGH_CONFIDENCE,
-                "drift_flag": False,
+                "quality_bucket": HIGH_QUALITY,
+                "in_drift_window": False,
                 "feature_relpath": "features/old-1.pt",
                 "feature_bytes": (bundle_root / "features" / "old-1.pt").stat().st_size,
                 "result_relpath": "results/old-1.json",
@@ -1909,7 +1904,6 @@ def test_prepare_split_training_cache_reuses_incompatible_feature_only_samples(t
     )
 
     assert info["all_sample_ids"] == ["old-1"]
-    assert info["drift_sample_ids"] == []
     record = load_split_feature_cache(str(tmp_path / "prepared_cache"), "old-1")
     assert record["candidate_id"] == payload.candidate_id
     assert record["boundary_tensor_labels"] == list(payload.boundary_tensor_labels)
@@ -1928,14 +1922,13 @@ def test_prepare_split_training_cache_raises_when_sample_has_no_feature_or_raw(t
         "edge_id": 1,
         "model": {"model_id": "model-a", "model_version": "0"},
         "split_plan": _dummy_plan().to_dict(),
-        "drift_sample_ids": [],
         "samples": [
             {
                 "sample_id": "sample-1",
                 "frame_index": 1,
                 "confidence": 0.1,
-                "confidence_bucket": LOW_CONFIDENCE,
-                "drift_flag": False,
+                "quality_bucket": LOW_QUALITY,
+                "in_drift_window": False,
                 "feature_relpath": None,
                 "feature_bytes": 0,
                 "result_relpath": "results/sample-1.json",
@@ -1979,7 +1972,7 @@ def test_prepare_split_training_cache_raises_when_batch_rebuild_count_is_wrong(
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_planned_payload(plan),
         raw_frame=sample_bgr_frame,
@@ -2115,7 +2108,7 @@ def test_cloud_fixed_split_working_cache_traces_with_configured_trace_batch(
         preloaded_records,
     ):
         preloaded_records["s1"] = {"intermediate": _payload()}
-        return {"all_sample_ids": ["s1"], "drift_sample_ids": []}
+        return {"all_sample_ids": ["s1"]}
 
     monkeypatch.setattr(
         learner,
@@ -2323,7 +2316,7 @@ def test_prepare_split_training_cache_preserves_unmodified_feature_mtime_on_reus
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_planned_payload(plan),
         raw_frame=sample_bgr_frame,
@@ -2382,7 +2375,7 @@ def test_only_pending_raw_only_samples_trigger_rebuild(tmp_path, sample_bgr_fram
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=HIGH_CONFIDENCE,
+        quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
         intermediate=_planned_payload(plan),
     )
@@ -2393,7 +2386,7 @@ def test_only_pending_raw_only_samples_trigger_rebuild(tmp_path, sample_bgr_fram
         split_config_id="plan-1",
         model_id="model-a",
         model_version="0",
-        confidence_bucket=LOW_CONFIDENCE,
+        quality_bucket=LOW_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
         intermediate=_planned_payload(plan),
         raw_frame=sample_bgr_frame,
@@ -2424,3 +2417,6 @@ def test_only_pending_raw_only_samples_trigger_rebuild(tmp_path, sample_bgr_fram
     )
     assert set(info["all_sample_ids"]) == {"high-1", "low-1"}
     assert rebuilt_ids == ["low-1"]
+
+
+

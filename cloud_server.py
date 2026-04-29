@@ -324,19 +324,10 @@ def _select_fixed_split_gt_sample_ids(
 ) -> list[str]:
     """Choose bundle samples that should receive cloud-side GT annotations.
 
-    Drift samples are always annotated. Low-confidence samples that uploaded a
-    raw frame are also annotated regardless of whether the bundle used
-    ``raw-only`` or ``raw+feature`` mode, because their pseudo-labels are the
-    least reliable and can otherwise dominate split-tail retraining as
-    negatives.
+    Low-quality samples that uploaded a raw frame are annotated by the cloud
+    teacher. High-quality feature-only samples keep edge pseudo labels.
     """
     prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
-    drift_payload = manifest.get("drift_sample_ids", [])
-    drift_lookup = {
-        str(sample_id)
-        for sample_id in drift_payload
-        if str(sample_id) in prepared_lookup
-    }
 
     selected: list[str] = []
     for sample in manifest.get("samples", []):
@@ -345,10 +336,7 @@ def _select_fixed_split_gt_sample_ids(
         sample_id = str(sample.get("sample_id", "")).strip()
         if not sample_id or sample_id not in prepared_lookup:
             continue
-        if sample_id in drift_lookup:
-            selected.append(sample_id)
-            continue
-        if str(sample.get("confidence_bucket", "")).strip() != "low_confidence":
+        if str(sample.get("quality_bucket", "")).strip() != "low_quality":
             continue
         if sample.get("raw_relpath") is None:
             continue
@@ -2787,7 +2775,6 @@ class CloudContinualLearner:
         manifest_payload = {
             **dict(cache_identity),
             "all_sample_ids": list(bundle_info.get("all_sample_ids", [])),
-            "drift_sample_ids": list(bundle_info.get("drift_sample_ids", [])),
             "cache_reused": bool(cache_reused),
             "updated_at": (
                 datetime.now(timezone.utc)

@@ -47,28 +47,32 @@ class CloudResourceState:
 @dataclass
 class PendingTrainingStats:
     total_samples: int
-    high_confidence_count: int
-    low_confidence_count: int
-    drift_count: int
-    high_confidence_feature_bytes: int
-    low_confidence_feature_bytes: int
-    low_confidence_raw_bytes: int
+    high_quality_count: int
+    low_quality_count: int
+    low_quality_rate: float
+    uncovered_evidence_rate: float
+    drift_detected: bool
+    high_quality_feature_bytes: int
+    low_quality_feature_bytes: int
+    low_quality_raw_bytes: int
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "PendingTrainingStats":
         return cls(
             total_samples=int(payload.get("total_samples", 0)),
-            high_confidence_count=int(payload.get("high_confidence_count", 0)),
-            low_confidence_count=int(payload.get("low_confidence_count", 0)),
-            drift_count=int(payload.get("drift_count", 0)),
-            high_confidence_feature_bytes=int(payload.get("high_confidence_feature_bytes", 0)),
-            low_confidence_feature_bytes=int(payload.get("low_confidence_feature_bytes", 0)),
-            low_confidence_raw_bytes=int(payload.get("low_confidence_raw_bytes", 0)),
+            high_quality_count=int(payload.get("high_quality_count", 0)),
+            low_quality_count=int(payload.get("low_quality_count", 0)),
+            low_quality_rate=float(payload.get("low_quality_rate", 0.0)),
+            uncovered_evidence_rate=float(payload.get("uncovered_evidence_rate", 0.0)),
+            drift_detected=bool(payload.get("drift_detected", False)),
+            high_quality_feature_bytes=int(payload.get("high_quality_feature_bytes", 0)),
+            low_quality_feature_bytes=int(payload.get("low_quality_feature_bytes", 0)),
+            low_quality_raw_bytes=int(payload.get("low_quality_raw_bytes", 0)),
         )
 
     @property
     def always_sent_bytes(self) -> int:
-        return self.high_confidence_feature_bytes + self.low_confidence_raw_bytes
+        return self.high_quality_feature_bytes + self.low_quality_raw_bytes
 
 
 @dataclass
@@ -105,7 +109,6 @@ class ResourceAwareCLTrigger:
         lambda_bw: float = 0.5,
         w_cloud: float = 1.0,
         w_bw: float = 1.0,
-        confidence_threshold: float = 0.5,
         min_training_samples: int = 1,
         drift_bonus: float = 0.35,
         upload_time_budget_sec: float = 5.0,
@@ -120,7 +123,6 @@ class ResourceAwareCLTrigger:
         self.lambda_bw = float(lambda_bw)
         self.w_cloud = float(w_cloud)
         self.w_bw = float(w_bw)
-        self.confidence_threshold = float(confidence_threshold)
         self.min_training_samples = int(min_training_samples)
         self.drift_bonus = float(drift_bonus)
         self.upload_time_budget_sec = float(upload_time_budget_sec)
@@ -158,42 +160,32 @@ class ResourceAwareCLTrigger:
         self.trigger_count = 0
         self.history.clear()
 
-    def _loss_signal(self, avg_confidence: float, drift_detected: bool) -> float:
-        if avg_confidence is None:
-            avg_confidence = 0.0
-        base = max(0.0, self.confidence_threshold - float(avg_confidence))
-        normalised = base / max(self.confidence_threshold, 1e-6)
-        if drift_detected:
-            normalised += self.drift_bonus
-        return normalised
-
     def _urgency(
         self,
-        avg_confidence: float,
         drift_detected: bool,
         stats: PendingTrainingStats,
     ) -> float:
-        loss = self._loss_signal(avg_confidence, drift_detected)
+        threshold_progress = 0.0
+        if self.min_training_samples > 0:
+            threshold_progress = min(
+                1.0,
+                stats.low_quality_count / float(self.min_training_samples),
+            )
+        loss = max(
+            0.0,
+            (0.45 * float(stats.low_quality_rate))
+            + (0.35 * float(stats.uncovered_evidence_rate))
+            + (0.20 * threshold_progress),
+        )
+        if drift_detected or stats.drift_detected:
+            loss += self.drift_bonus
         self.loss_best = min(self.loss_best, loss)
         derivative = max(0.0, loss - self.loss_prev)
-        sample_factor = 1.0
-        if self.min_training_samples > 0:
-            sample_factor = min(
-                1.0,
-                max(0.1, stats.total_samples / float(self.min_training_samples)),
-            )
-        drift_gain = 0.0
-        if drift_detected and stats.drift_count > 0:
-            drift_gain = min(
-                1.0,
-                stats.drift_count / float(max(1, stats.total_samples)),
-            )
         urgency = max(
             0.0,
             (self.K_p * (loss - self.loss_best))
             + (self.K_d * derivative)
-            + (loss * sample_factor)
-            + drift_gain,
+            + loss,
         )
         self.loss_prev = loss
         return urgency
@@ -225,7 +217,6 @@ class ResourceAwareCLTrigger:
     def decide(
         self,
         *,
-        avg_confidence: float,
         drift_detected: bool,
         cloud_state: CloudResourceState,
         bandwidth_mbps: float,
@@ -236,12 +227,12 @@ class ResourceAwareCLTrigger:
             if isinstance(sample_stats, PendingTrainingStats)
             else PendingTrainingStats.from_mapping(sample_stats)
         )
-        urgency = self._urgency(avg_confidence, drift_detected, stats)
+        urgency = self._urgency(drift_detected, stats)
         compute_pressure = cloud_state.compute_pressure
 
         raw_only_payload_bytes = stats.always_sent_bytes
         raw_plus_feature_payload_bytes = (
-            stats.always_sent_bytes + stats.low_confidence_feature_bytes
+            stats.always_sent_bytes + stats.low_quality_feature_bytes
         )
         raw_only_bw_pressure = self._bandwidth_pressure(
             bandwidth_mbps, raw_only_payload_bytes
@@ -251,7 +242,7 @@ class ResourceAwareCLTrigger:
         )
         training_disabled = stats.total_samples < max(1, self.min_training_samples)
         low_conf_feature_ratio = (
-            stats.low_confidence_feature_bytes
+            stats.low_quality_feature_bytes
             / float(max(raw_plus_feature_payload_bytes, 1))
         )
 
@@ -332,8 +323,9 @@ class ResourceAwareCLTrigger:
                 "timestamp": time.time(),
                 "train_now": train_now,
                 "send_low_conf_features": send_low_conf_features,
-                "avg_confidence": float(avg_confidence),
                 "drift_detected": bool(drift_detected),
+                "low_quality_rate": float(stats.low_quality_rate),
+                "uncovered_evidence_rate": float(stats.uncovered_evidence_rate),
                 "urgency": float(urgency),
                 "compute_pressure": float(compute_pressure),
                 "bandwidth_mbps": float(bandwidth_mbps),
@@ -384,7 +376,6 @@ def estimate_bandwidth(
 
 def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
     ra = getattr(config, "resource_aware_trigger", None)
-    dd = getattr(config, "drift_detection", None)
     retrain = getattr(config, "retrain", None)
 
     def _get(key: str, default: Any, *sources: Any) -> Any:
@@ -397,14 +388,13 @@ def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
         return default
 
     return ResourceAwareCLTrigger(
-        V=float(_get("V", 10.0, ra, dd)),
-        K_p=float(_get("K_p", 1.0, ra, dd)),
-        K_d=float(_get("K_d", 0.5, ra, dd)),
+        V=float(_get("V", 10.0, ra)),
+        K_p=float(_get("K_p", 1.0, ra)),
+        K_d=float(_get("K_d", 0.5, ra)),
         lambda_cloud=float(_get("lambda_cloud", 0.5, ra)),
         lambda_bw=float(_get("lambda_bw", 0.5, ra)),
         w_cloud=float(_get("w_cloud", 1.0, ra)),
         w_bw=float(_get("w_bw", 1.0, ra)),
-        confidence_threshold=float(_get("confidence_threshold", 0.5, ra, dd)),
         min_training_samples=int(_get("min_training_samples", getattr(retrain, "collect_num", 1), ra)),
         drift_bonus=float(_get("drift_bonus", 0.35, ra)),
         upload_time_budget_sec=float(_get("upload_time_budget_sec", 5.0, ra)),

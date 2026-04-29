@@ -1,4 +1,4 @@
-"""Tests for the multi-device baseline experiment framework.
+﻿"""Tests for the multi-device baseline experiment framework.
 
 Covers:
 1. Method factory returns expected method types
@@ -41,7 +41,7 @@ from multi_edge.cloud_queue import CloudQueue
 from multi_edge.scenario_generator import ScenarioGenerator, DeviceProfile
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────
+# 鈹€鈹€ Fixtures 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 @pytest.fixture
@@ -75,7 +75,7 @@ def _feed_results(method: BaseMethod, device_ids: list[int], n_frames: int = 50)
                 confidence=max(0.0, min(1.0, conf)),
                 proxy_map=max(0.0, min(1.0, conf * 0.9)),
                 latency_ms=10.0 + abs(rng.gauss(0, 3)),
-                drift_flag=drift,
+                in_drift_window=drift,
             )
             method.on_inference_result(result)
             if method.should_trigger(dev_id):
@@ -83,7 +83,7 @@ def _feed_results(method: BaseMethod, device_ids: list[int], n_frames: int = 50)
                 method.execute_update(plan)
 
 
-# ── Test 1: Factory returns expected method ───────────────────────────
+# 鈹€鈹€ Test 1: Factory returns expected method 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestMethodFactory:
@@ -131,7 +131,7 @@ class TestMethodFactory:
             create_method(cfg)
 
 
-# ── Test 2: Multi-device registration ─────────────────────────────────
+# 鈹€鈹€ Test 2: Multi-device registration 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestMultiDeviceRegistration:
@@ -158,7 +158,7 @@ class TestMultiDeviceRegistration:
         assert v == 2
 
 
-# ── Test 3: Cloud queue tracks wait time ──────────────────────────────
+# 鈹€鈹€ Test 3: Cloud queue tracks wait time 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestCloudQueueWaitTime:
@@ -188,7 +188,7 @@ class TestCloudQueueWaitTime:
         assert queue.avg_wait_time() >= 0.0
 
 
-# ── Test 4: Plank-road routes models by device_id ─────────────────────
+# 鈹€鈹€ Test 4: Plank-road routes models by device_id 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestPlankRoadDeviceRouting:
@@ -200,13 +200,13 @@ class TestPlankRoadDeviceRouting:
         for i in range(25):
             method.on_inference_result(InferenceResult(
                 device_id=1, frame_index=i, confidence=0.6,
-                latency_ms=10.0, drift_flag=False,
+                latency_ms=10.0, in_drift_window=False,
             ))
         # Device 2: not enough
         for i in range(5):
             method.on_inference_result(InferenceResult(
                 device_id=2, frame_index=i, confidence=0.8,
-                latency_ms=10.0, drift_flag=False,
+                latency_ms=10.0, in_drift_window=False,
             ))
 
         assert method.should_trigger(1)
@@ -221,7 +221,7 @@ class TestPlankRoadDeviceRouting:
         for i in range(25):
             method.on_inference_result(InferenceResult(
                 device_id=1, frame_index=i, confidence=0.6,
-                latency_ms=10.0, drift_flag=False,
+                latency_ms=10.0, in_drift_window=False,
             ))
         if method.should_trigger(1):
             plan = method.build_update_plan(1)
@@ -231,7 +231,7 @@ class TestPlankRoadDeviceRouting:
         assert method._model_versions[2] == 0
 
 
-# ── Test 5: Ekya uses centralized retraining ──────────────────────────
+# 鈹€鈹€ Test 5: Ekya uses centralized retraining 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestEkyaCentralized:
@@ -256,14 +256,14 @@ class TestEkyaCentralized:
         for i in range(20):
             method.on_inference_result(InferenceResult(
                 device_id=1, frame_index=i, confidence=0.5,
-                latency_ms=10.0, drift_flag=True,
+                latency_ms=10.0, in_drift_window=True,
             ))
         if method.should_trigger(1):
             plan = method.build_update_plan(1)
             assert plan.is_central is True
 
 
-# ── Test 6: Accuracy trigger doesn't use resource-aware trigger ───────
+# 鈹€鈹€ Test 6: Accuracy trigger doesn't use resource-aware trigger 鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestAccuracyTriggerNoResourceAware:
@@ -272,20 +272,20 @@ class TestAccuracyTriggerNoResourceAware:
         method = create_method(cfg)
         assert isinstance(method, AccuracyTriggerCloudRetraining)
 
-        # Feed high-confidence frames — should NOT trigger
+        # Feed high-confidence frames 鈥?should NOT trigger
         for i in range(40):
             method.on_inference_result(InferenceResult(
                 device_id=1, frame_index=i, confidence=0.95,
-                latency_ms=10.0, drift_flag=False,
+                latency_ms=10.0, in_drift_window=False,
             ))
         assert not method.should_trigger(1)
 
-        # Feed low-confidence frames — should trigger
+        # Feed low-confidence frames 鈥?should trigger
         method2 = create_method(cfg)
         for i in range(40):
             method2.on_inference_result(InferenceResult(
                 device_id=1, frame_index=i, confidence=0.3,
-                latency_ms=10.0, drift_flag=False,
+                latency_ms=10.0, in_drift_window=False,
             ))
         assert method2.should_trigger(1)
 
@@ -311,7 +311,7 @@ class TestEkyaRestoredSemantics:
                 frame_index=i,
                 confidence=0.35,
                 latency_ms=10.0,
-                drift_flag=True,
+                in_drift_window=True,
             ))
         assert not method.should_trigger(1)
 
@@ -320,7 +320,7 @@ class TestEkyaRestoredSemantics:
             frame_index=7,
             confidence=0.35,
             latency_ms=10.0,
-            drift_flag=True,
+            in_drift_window=True,
         ))
         assert method.should_trigger(1)
 
@@ -337,7 +337,7 @@ class TestEkyaRestoredSemantics:
                 frame_index=i,
                 confidence=0.25,
                 latency_ms=10.0,
-                drift_flag=True,
+                in_drift_window=True,
             ))
         assert method.should_trigger(1)
         plan = method.build_update_plan(1)
@@ -348,7 +348,7 @@ class TestEkyaRestoredSemantics:
             frame_index=4,
             confidence=0.8,
             latency_ms=10.0,
-            drift_flag=False,
+            in_drift_window=False,
         ))
         dev = method.metrics.get_device(1)
         assert dev.inference_latencies_ms[-1] > 10.0
@@ -366,7 +366,7 @@ class TestEkyaRestoredSemantics:
                 frame_index=i,
                 confidence=0.3,
                 latency_ms=10.0,
-                drift_flag=True,
+                in_drift_window=True,
             ))
         plan = method.build_update_plan(1)
         assert plan.metadata["raw_retraining_only"] is True
@@ -423,7 +423,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=0.2,
                 proxy_map=0.18,
                 latency_ms=10.0,
-                drift_flag=True,
+                in_drift_window=True,
             ))
         assert method.should_trigger(1)
         plan = method.build_update_plan(1)
@@ -436,7 +436,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=0.2,
                 proxy_map=0.18,
                 latency_ms=10.0,
-                drift_flag=True,
+                in_drift_window=True,
             ))
         assert not method.should_trigger(1)
 
@@ -447,7 +447,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=0.2,
                 proxy_map=0.18,
                 latency_ms=10.0,
-                drift_flag=True,
+                in_drift_window=True,
             ))
         assert method.should_trigger(1)
 
@@ -464,7 +464,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=0.8,
                 proxy_map=0.75,
                 latency_ms=10.0,
-                drift_flag=False,
+                in_drift_window=False,
             ))
         assert not method.should_trigger(1)
 
@@ -475,7 +475,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=0.2,
                 proxy_map=0.18,
                 latency_ms=10.0,
-                drift_flag=True,
+                in_drift_window=True,
             ))
         assert method.should_trigger(1)
         plan = method.build_update_plan(1)
@@ -501,7 +501,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=0.85,
                 proxy_map=0.84,
                 latency_ms=10.0,
-                drift_flag=False,
+                in_drift_window=False,
             ))
         assert not method.should_trigger(1)
 
@@ -512,7 +512,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=0.72,
                 proxy_map=0.50,
                 latency_ms=10.0,
-                drift_flag=False,
+                in_drift_window=False,
             ))
         assert method.should_trigger(1)
 
@@ -529,7 +529,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=0.2,
                 proxy_map=0.15,
                 latency_ms=10.0,
-                drift_flag=True,
+                in_drift_window=True,
             ))
         assert method.should_trigger(1)
         plan = method.build_update_plan(1)
@@ -554,7 +554,7 @@ class TestAccuracyTriggerRestoredSemantics:
                 confidence=confidence,
                 proxy_map=max(0.0, confidence - 0.1),
                 latency_ms=10.0,
-                drift_flag=False,
+                in_drift_window=False,
             ))
         assert method.should_trigger(1)
 
@@ -580,7 +580,7 @@ class TestAccuracyTriggerRestoredSemantics:
                     frame_index=10,
                     confidence=0.2,
                     proxy_map=0.18,
-                    drift_flag=False,
+                    in_drift_window=False,
                     latency_ms=10.0,
                     selection_score=0.8,
                     selected_by="low_conf+difference",
@@ -628,7 +628,7 @@ class TestAccuracyTriggerRestoredSemantics:
         )
 
 
-# ── Test 7: Pure-edge never calls central retraining ──────────────────
+# 鈹€鈹€ Test 7: Pure-edge never calls central retraining 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestPureEdgeNoCentral:
@@ -653,7 +653,7 @@ class TestPureEdgeNoCentral:
         for i in range(20):
             method.on_inference_result(InferenceResult(
                 device_id=1, frame_index=i, confidence=0.3,
-                latency_ms=10.0, drift_flag=False,
+                latency_ms=10.0, in_drift_window=False,
             ))
         if method.should_trigger(1):
             plan = method.build_update_plan(1)
@@ -698,7 +698,7 @@ class TestPureEdgeRawRetrainingCosts:
         assert many > few
 
 
-# ── Test 8: Metrics schema consistent across all methods ──────────────
+# 鈹€鈹€ Test 8: Metrics schema consistent across all methods 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestMetricsSchemaConsistency:
@@ -749,7 +749,7 @@ class TestMetricsSchemaConsistency:
         assert set(export.keys()) == expected_keys
 
 
-# ── Test 9: Per-device and overall summary generation ─────────────────
+# 鈹€鈹€ Test 9: Per-device and overall summary generation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestOutputGeneration:
@@ -780,21 +780,21 @@ class TestOutputGeneration:
         assert len(rows) == 3, f"Expected 3 device rows, got {len(rows)}"
 
 
-# ── Additional tests ──────────────────────────────────────────────────
+# 鈹€鈹€ Additional tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestSlidingWindowStats:
     def test_confidence_tracking(self):
         window = SlidingWindowStats(window_size=10)
         for c in [0.8, 0.7, 0.6, 0.5, 0.4]:
-            window.update(c, drift_flag=False)
+            window.update(c, in_drift_window=False)
         assert abs(window.mean_confidence - 0.6) < 0.01
         assert window.low_conf_ratio == pytest.approx(0.2, abs=0.01)
 
     def test_drift_ratio(self):
         window = SlidingWindowStats(window_size=10)
         for i in range(10):
-            window.update(0.5, drift_flag=(i % 3 == 0))
+            window.update(0.5, in_drift_window=(i % 3 == 0))
         assert window.drift_ratio == pytest.approx(4 / 10, abs=0.01)
 
     def test_reset(self):
@@ -1045,3 +1045,4 @@ class TestRunnerRegressions:
 
         assert cfg.plank_road_multi_device.upload_mode_default == 'raw_only'
         assert cfg.plank_road_multi_device.allow_resource_aware_feature_upload is True
+

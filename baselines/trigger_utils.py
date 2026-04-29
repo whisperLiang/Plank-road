@@ -1,4 +1,4 @@
-"""Shared trigger utilities for baseline methods.
+﻿"""Shared trigger utilities for baseline methods.
 
 Provides a sliding-window statistics tracker used by the
 accuracy_trigger and pure_edge baselines.
@@ -17,24 +17,24 @@ class SlidingWindowStats:
     Attributes:
         window_size: Maximum number of recent observations.
         confidences: Recent confidence values.
-        drift_flags: Recent drift flags (bool).
+        in_drift_windows: Recent drift flags (bool).
     """
     window_size: int = 32
     confidences: deque = field(default_factory=lambda: deque(maxlen=32), repr=False)
-    drift_flags: deque = field(default_factory=lambda: deque(maxlen=32), repr=False)
+    in_drift_windows: deque = field(default_factory=lambda: deque(maxlen=32), repr=False)
     _baseline_confidence: float | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # Ensure deque maxlen matches window_size
         self.confidences = deque(maxlen=self.window_size)
-        self.drift_flags = deque(maxlen=self.window_size)
+        self.in_drift_windows = deque(maxlen=self.window_size)
 
-    def update(self, confidence: float, drift_flag: bool = False) -> None:
+    def update(self, confidence: float, in_drift_window: bool = False) -> None:
         """Add a new observation to the sliding window."""
         if self._baseline_confidence is None:
             self._baseline_confidence = confidence
         self.confidences.append(confidence)
-        self.drift_flags.append(drift_flag)
+        self.in_drift_windows.append(in_drift_window)
 
     @property
     def mean_confidence(self) -> float:
@@ -60,9 +60,9 @@ class SlidingWindowStats:
     @property
     def drift_ratio(self) -> float:
         """Fraction of window entries flagged as drift."""
-        if not self.drift_flags:
+        if not self.in_drift_windows:
             return 0.0
-        return sum(1 for d in self.drift_flags if d) / len(self.drift_flags)
+        return sum(1 for d in self.in_drift_windows if d) / len(self.in_drift_windows)
 
     @property
     def sample_count(self) -> int:
@@ -71,5 +71,6 @@ class SlidingWindowStats:
     def reset(self) -> None:
         """Clear the sliding window and reset baseline."""
         self.confidences.clear()
-        self.drift_flags.clear()
+        self.in_drift_windows.clear()
         self._baseline_confidence = None
+

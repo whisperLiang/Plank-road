@@ -51,10 +51,10 @@ class AccuracyTriggerConfig:
     """Configuration for the accuracy_trigger_cloud_retraining method."""
     trigger_window_size: int = 32
     confidence_drop_threshold: float = 0.15
-    low_conf_ratio_threshold: float = 0.30
+    low_quality_ratio_threshold: float = 0.30
     drift_ratio_threshold: float = 0.20
     upload_mode: str = "raw_only"
-    low_confidence_threshold: float = 0.50
+    quality_risk_threshold: float = 0.45
     trigger_cooldown_windows: int = 1
     max_buffered_windows: int = 4
     max_selected_frames_per_window: int = 12
@@ -67,7 +67,7 @@ class AccuracyTriggerConfig:
 class PureEdgeConfig:
     """Configuration for the pure_edge_local_updating method."""
     trigger_min_samples: int = 16
-    low_conf_ratio_threshold: float = 0.30
+    low_quality_ratio_threshold: float = 0.30
     local_num_epoch: int = 1
     retrain_target: str = "full_model"
     full_forward_epoch_ratio: float = 0.45

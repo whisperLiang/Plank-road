@@ -49,9 +49,12 @@ _FINAL_DUPLICATE_SUPPRESSION_THRESHOLDS = {
 @dataclass
 class InferenceArtifacts:
     intermediate: object | None
-    detection_boxes: list
-    detection_class: list
-    detection_score: list
+    final_detection_boxes: list
+    final_detection_labels: list
+    final_detection_scores: list
+    low_threshold_boxes: list
+    low_threshold_labels: list
+    low_threshold_scores: list
     confidence: float
     input_tensor_shape: list[int] | None = None
     input_resize_mode: str | None = None
@@ -64,9 +67,12 @@ class InferenceArtifacts:
 
     def to_inference_result(self) -> dict[str, list]:
         return {
-            "boxes": self.detection_boxes,
-            "labels": self.detection_class,
-            "scores": self.detection_score,
+            "boxes": self.final_detection_boxes,
+            "labels": self.final_detection_labels,
+            "scores": self.final_detection_scores,
+            "low_threshold_boxes": self.low_threshold_boxes,
+            "low_threshold_labels": self.low_threshold_labels,
+            "low_threshold_scores": self.low_threshold_scores,
         }
 
 def _collate_fn(batch):
@@ -293,9 +299,12 @@ class Object_Detection:
         if pred_boxes is None or pred_score is None:
             return InferenceArtifacts(
                 intermediate=split_payload,
-                detection_boxes=[],
-                detection_class=[],
-                detection_score=[],
+                final_detection_boxes=[],
+                final_detection_labels=[],
+                final_detection_scores=[],
+                low_threshold_boxes=[],
+                low_threshold_labels=[],
+                low_threshold_scores=[],
                 confidence=0.0,
                 input_tensor_shape=input_tensor_shape,
                 input_resize_mode=input_resize_mode,
@@ -308,6 +317,9 @@ class Object_Detection:
             )
 
         confidence = self._summarize_detection_confidence(pred_score)
+        low_threshold_boxes = list(pred_boxes)
+        low_threshold_labels = list(pred_class)
+        low_threshold_scores = list(pred_score)
         final_detection_threshold = self._resolve_final_detection_threshold()
         high_keep_indices = [
             index for index, score in enumerate(pred_score)
@@ -330,9 +342,12 @@ class Object_Detection:
 
         return InferenceArtifacts(
             intermediate=split_payload,
-            detection_boxes=detection_boxes,
-            detection_class=detection_class,
-            detection_score=detection_score,
+            final_detection_boxes=detection_boxes,
+            final_detection_labels=detection_class,
+            final_detection_scores=detection_score,
+            low_threshold_boxes=low_threshold_boxes,
+            low_threshold_labels=low_threshold_labels,
+            low_threshold_scores=low_threshold_scores,
             confidence=confidence,
             input_tensor_shape=input_tensor_shape,
             input_resize_mode=input_resize_mode,
@@ -349,16 +364,16 @@ class Object_Detection:
         if return_split_payload:
             return (
                 None,
-                artifacts.detection_boxes or None,
-                artifacts.detection_class or None,
-                artifacts.detection_score or None,
+                artifacts.final_detection_boxes or None,
+                artifacts.final_detection_labels or None,
+                artifacts.final_detection_scores or None,
                 artifacts.intermediate,
             )
         return (
             None,
-            artifacts.detection_boxes or None,
-            artifacts.detection_class or None,
-            artifacts.detection_score or None,
+            artifacts.final_detection_boxes or None,
+            artifacts.final_detection_labels or None,
+            artifacts.final_detection_scores or None,
         )
 
 

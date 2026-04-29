@@ -1,4 +1,4 @@
-import os
+﻿import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
@@ -39,7 +39,7 @@ Q_bw = 0.0
 
 # Representative payload statistics
 # raw_only_payload = always_sent_bytes
-# raw_plus_feature_payload = always_sent_bytes + low_confidence_feature_bytes
+# raw_plus_feature_payload = always_sent_bytes + low_quality_feature_bytes
 raw_only_payload = 20.0
 raw_plus_feature_payload = 26.0
 
@@ -248,3 +248,4 @@ if __name__ == "__main__":
     plot_3d_decision_space()
     plot_u_slices()
     plot_single_slice(U_value=0.25)
+

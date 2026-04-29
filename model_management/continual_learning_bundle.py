@@ -120,8 +120,22 @@ def _expected_record_fields(
     input_image_size: list[int] | None,
     has_raw_sample: bool,
 ) -> dict[str, Any]:
+    quality_fields = {
+        "quality_bucket": sample.get("quality_bucket"),
+        "quality_score": sample.get("quality_score"),
+        "risk_score": sample.get("risk_score"),
+        "risk_reasons": list(sample.get("risk_reasons") or []),
+        "evidence_count": sample.get("evidence_count"),
+        "covered_evidence_count": sample.get("covered_evidence_count"),
+        "uncovered_evidence_count": sample.get("uncovered_evidence_count"),
+        "uncovered_evidence_rate": sample.get("uncovered_evidence_rate"),
+        "candidate_uncovered_score": sample.get("candidate_uncovered_score"),
+        "motion_uncovered_score": sample.get("motion_uncovered_score"),
+        "track_uncovered_score": sample.get("track_uncovered_score"),
+        "window_id": sample.get("window_id"),
+        "in_drift_window": bool(sample.get("in_drift_window", False)),
+    }
     return {
-        "is_drift": bool(sample.get("drift_flag", False)),
         "pseudo_boxes": inference_result.get("boxes", []),
         "pseudo_labels": inference_result.get("labels", []),
         "pseudo_scores": inference_result.get("scores", []),
@@ -130,7 +144,7 @@ def _expected_record_fields(
         "split_plan_split_label": split_plan.get("split_label"),
         "split_plan_boundary_tensor_labels": list(split_plan.get("boundary_tensor_labels", [])),
         "sample_id": sample_id,
-        "confidence_bucket": sample.get("confidence_bucket"),
+        **quality_fields,
         "model_id": sample.get("model_id"),
         "model_version": sample.get("model_version"),
         "input_image_size": input_image_size,
@@ -227,8 +241,19 @@ def _build_metadata_entry(
         ),
         "frame_file_size": os.path.getsize(frame_path) if frame_path is not None and os.path.exists(frame_path) else None,
         "has_raw_sample": bool(frame_path is not None),
-        "drift_flag": bool(sample.get("drift_flag", False)),
-        "confidence_bucket": sample.get("confidence_bucket"),
+        "quality_bucket": sample.get("quality_bucket"),
+        "quality_score": sample.get("quality_score"),
+        "risk_score": sample.get("risk_score"),
+        "risk_reasons": list(sample.get("risk_reasons") or []),
+        "evidence_count": sample.get("evidence_count"),
+        "covered_evidence_count": sample.get("covered_evidence_count"),
+        "uncovered_evidence_count": sample.get("uncovered_evidence_count"),
+        "uncovered_evidence_rate": sample.get("uncovered_evidence_rate"),
+        "candidate_uncovered_score": sample.get("candidate_uncovered_score"),
+        "motion_uncovered_score": sample.get("motion_uncovered_score"),
+        "track_uncovered_score": sample.get("track_uncovered_score"),
+        "window_id": sample.get("window_id"),
+        "in_drift_window": bool(sample.get("in_drift_window", False)),
         "model_id": sample.get("model_id"),
         "model_version": sample.get("model_version"),
         "input_image_size": input_image_size,
@@ -373,7 +398,6 @@ def prepare_split_training_cache(
     previous_metadata_index, previous_metadata_samples = _load_metadata_index(target_cache_path)
 
     all_sample_ids: list[str] = []
-    drift_sample_ids: list[str] = []
     split_plan = dict(manifest.get("split_plan", {}))
     metadata_samples: dict[str, dict[str, Any]] = {}
 
@@ -483,8 +507,6 @@ def prepare_split_training_cache(
                 if preloaded_records is not None:
                     preloaded_records[sample_id] = _load_feature_record(feature_path)
                 all_sample_ids.append(sample_id)
-                if bool(sample.get("drift_flag", False)):
-                    drift_sample_ids.append(sample_id)
                 continue
 
             intermediate = _load_intermediate(
@@ -536,8 +558,6 @@ def prepare_split_training_cache(
                 if preloaded_records is not None:
                     preloaded_records[sample_id] = _load_feature_record(feature_path)
                 all_sample_ids.append(sample_id)
-                if bool(sample.get("drift_flag", False)):
-                    drift_sample_ids.append(sample_id)
                 continue
             pending_rebuilds.append({
                 "sample": sample,
@@ -553,8 +573,6 @@ def prepare_split_training_cache(
             })
 
         all_sample_ids.append(sample_id)
-        if bool(sample.get("drift_flag", False)):
-            drift_sample_ids.append(sample_id)
 
     if pending_rebuilds:
         if batch_feature_provider is None:
@@ -600,7 +618,6 @@ def prepare_split_training_cache(
             cache_path=target_cache_path,
             frame_index=sample_id,
             intermediate=intermediate,
-            is_drift=bool(sample.get("drift_flag", False)),
             pseudo_boxes=inference_result.get("boxes", []),
             pseudo_labels=inference_result.get("labels", []),
             pseudo_scores=inference_result.get("scores", []),
@@ -610,7 +627,19 @@ def prepare_split_training_cache(
                 "split_plan_split_label": split_plan.get("split_label"),
                 "split_plan_boundary_tensor_labels": list(split_plan.get("boundary_tensor_labels", [])),
                 "sample_id": sample_id,
-                "confidence_bucket": sample.get("confidence_bucket"),
+                "quality_bucket": sample.get("quality_bucket"),
+                "quality_score": sample.get("quality_score"),
+                "risk_score": sample.get("risk_score"),
+                "risk_reasons": list(sample.get("risk_reasons") or []),
+                "evidence_count": sample.get("evidence_count"),
+                "covered_evidence_count": sample.get("covered_evidence_count"),
+                "uncovered_evidence_count": sample.get("uncovered_evidence_count"),
+                "uncovered_evidence_rate": sample.get("uncovered_evidence_rate"),
+                "candidate_uncovered_score": sample.get("candidate_uncovered_score"),
+                "motion_uncovered_score": sample.get("motion_uncovered_score"),
+                "track_uncovered_score": sample.get("track_uncovered_score"),
+                "window_id": sample.get("window_id"),
+                "in_drift_window": bool(sample.get("in_drift_window", False)),
                 "model_id": sample.get("model_id"),
                 "model_version": sample.get("model_version"),
                 "input_image_size": input_image_size,
@@ -646,7 +675,6 @@ def prepare_split_training_cache(
             "boundary_tensor_labels": list(split_plan.get("boundary_tensor_labels", [])),
         },
         "all_sample_ids": all_sample_ids,
-        "drift_sample_ids": drift_sample_ids,
         "samples": metadata_samples,
     }
     if (
@@ -655,7 +683,6 @@ def prepare_split_training_cache(
         or previous_metadata_index.get("model") != metadata_index_payload["model"]
         or previous_metadata_index.get("split_plan") != metadata_index_payload["split_plan"]
         or previous_metadata_index.get("all_sample_ids") != metadata_index_payload["all_sample_ids"]
-        or previous_metadata_index.get("drift_sample_ids") != metadata_index_payload["drift_sample_ids"]
         or previous_metadata_index.get("samples") != metadata_index_payload["samples"]
     ):
         _write_json_file_if_changed(
@@ -666,5 +693,4 @@ def prepare_split_training_cache(
     return {
         "manifest": manifest,
         "all_sample_ids": all_sample_ids,
-        "drift_sample_ids": drift_sample_ids,
     }

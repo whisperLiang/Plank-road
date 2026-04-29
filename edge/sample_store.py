@@ -3,19 +3,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import cv2
 import torch
 
+from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY
 from model_management.payload import BoundaryPayload, SplitPayload
 
 
-HIGH_CONFIDENCE = "high_confidence"
-LOW_CONFIDENCE = "low_confidence"
-SAMPLE_STORE_VERSION = "edge-sample-store.v1"
+SAMPLE_STORE_VERSION = "edge-sample-store.v2"
 
 
 def _to_relpath(root_dir: str, path: str | None) -> str | None:
@@ -84,21 +83,30 @@ class StoredSampleRecord:
     split_config_id: str
     model_id: str
     model_version: str
-    confidence_bucket: str
-    quality_score: float | None
-    quality_bucket: str | None
-    has_raw_sample: bool
-    has_feature: bool
-    drift_flag: bool
-    input_image_size: list[int] | None
-    input_tensor_shape: list[int] | None
-    input_resize_mode: str | None
-    feature_relpath: str | None
-    result_relpath: str
-    metadata_relpath: str
-    raw_relpath: str | None
-    feature_bytes: int
-    raw_bytes: int
+    quality_bucket: str
+    quality_score: float
+    risk_score: float
+    risk_reasons: list[str] = field(default_factory=list)
+    evidence_count: int = 0
+    covered_evidence_count: int = 0
+    uncovered_evidence_count: int = 0
+    uncovered_evidence_rate: float = 0.0
+    candidate_uncovered_score: float = 0.0
+    motion_uncovered_score: float = 0.0
+    track_uncovered_score: float = 0.0
+    window_id: str | None = None
+    in_drift_window: bool = False
+    has_raw_sample: bool = False
+    has_feature: bool = True
+    input_image_size: list[int] | None = None
+    input_tensor_shape: list[int] | None = None
+    input_resize_mode: str | None = None
+    feature_relpath: str | None = None
+    result_relpath: str = ""
+    metadata_relpath: str = ""
+    raw_relpath: str | None = None
+    feature_bytes: int = 0
+    raw_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -109,12 +117,21 @@ class StoredSampleRecord:
             "split_config_id": self.split_config_id,
             "model_id": self.model_id,
             "model_version": self.model_version,
-            "confidence_bucket": self.confidence_bucket,
-            "quality_score": self.quality_score,
             "quality_bucket": self.quality_bucket,
+            "quality_score": self.quality_score,
+            "risk_score": self.risk_score,
+            "risk_reasons": list(self.risk_reasons),
+            "evidence_count": self.evidence_count,
+            "covered_evidence_count": self.covered_evidence_count,
+            "uncovered_evidence_count": self.uncovered_evidence_count,
+            "uncovered_evidence_rate": self.uncovered_evidence_rate,
+            "candidate_uncovered_score": self.candidate_uncovered_score,
+            "motion_uncovered_score": self.motion_uncovered_score,
+            "track_uncovered_score": self.track_uncovered_score,
+            "window_id": self.window_id,
+            "in_drift_window": self.in_drift_window,
             "has_raw_sample": self.has_raw_sample,
             "has_feature": self.has_feature,
-            "drift_flag": self.drift_flag,
             "input_image_size": self.input_image_size,
             "input_tensor_shape": self.input_tensor_shape,
             "input_resize_mode": self.input_resize_mode,
@@ -136,20 +153,21 @@ class StoredSampleRecord:
             split_config_id=str(payload.get("split_config_id", "")),
             model_id=str(payload.get("model_id", "")),
             model_version=str(payload.get("model_version", "")),
-            confidence_bucket=str(payload.get("confidence_bucket", LOW_CONFIDENCE)),
-            quality_score=(
-                None
-                if payload.get("quality_score") is None
-                else float(payload.get("quality_score"))
-            ),
-            quality_bucket=(
-                str(payload["quality_bucket"])
-                if payload.get("quality_bucket") is not None
-                else None
-            ),
+            quality_bucket=str(payload.get("quality_bucket", LOW_QUALITY)),
+            quality_score=float(payload.get("quality_score", 0.0)),
+            risk_score=float(payload.get("risk_score", 0.0)),
+            risk_reasons=list(payload.get("risk_reasons") or []),
+            evidence_count=int(payload.get("evidence_count", 0)),
+            covered_evidence_count=int(payload.get("covered_evidence_count", 0)),
+            uncovered_evidence_count=int(payload.get("uncovered_evidence_count", 0)),
+            uncovered_evidence_rate=float(payload.get("uncovered_evidence_rate", 0.0)),
+            candidate_uncovered_score=float(payload.get("candidate_uncovered_score", 0.0)),
+            motion_uncovered_score=float(payload.get("motion_uncovered_score", 0.0)),
+            track_uncovered_score=float(payload.get("track_uncovered_score", 0.0)),
+            window_id=(None if payload.get("window_id") is None else str(payload.get("window_id"))),
+            in_drift_window=bool(payload.get("in_drift_window", False)),
             has_raw_sample=bool(payload.get("has_raw_sample", False)),
             has_feature=bool(payload.get("has_feature", False)),
-            drift_flag=bool(payload.get("drift_flag", False)),
             input_image_size=list(payload["input_image_size"]) if payload.get("input_image_size") is not None else None,
             input_tensor_shape=list(payload["input_tensor_shape"]) if payload.get("input_tensor_shape") is not None else None,
             input_resize_mode=(
@@ -217,12 +235,21 @@ class EdgeSampleStore:
         split_config_id: str,
         model_id: str,
         model_version: str,
-        confidence_bucket: str,
+        quality_bucket: str,
         quality_score: float | None = None,
-        quality_bucket: str | None = None,
+        risk_score: float = 0.0,
+        risk_reasons: list[str] | None = None,
+        evidence_count: int = 0,
+        covered_evidence_count: int = 0,
+        uncovered_evidence_count: int = 0,
+        uncovered_evidence_rate: float = 0.0,
+        candidate_uncovered_score: float = 0.0,
+        motion_uncovered_score: float = 0.0,
+        track_uncovered_score: float = 0.0,
+        window_id: str | None = None,
+        in_drift_window: bool = False,
         inference_result: dict[str, Any],
         intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
-        drift_flag: bool = False,
         raw_frame: Any | None = None,
         raw_jpeg_quality: int = 82,
         timestamp: str | None = None,
@@ -231,8 +258,15 @@ class EdgeSampleStore:
         input_resize_mode: str | None = None,
     ) -> StoredSampleRecord:
         self._ensure_layout()
-        if confidence_bucket not in {HIGH_CONFIDENCE, LOW_CONFIDENCE}:
-            raise ValueError(f"Unsupported confidence bucket: {confidence_bucket!r}")
+        if quality_bucket not in {HIGH_QUALITY, LOW_QUALITY}:
+            raise ValueError(f"Unsupported quality bucket: {quality_bucket!r}")
+        if quality_bucket != LOW_QUALITY:
+            raw_frame = None
+        resolved_quality_score = (
+            (1.0 if quality_bucket == HIGH_QUALITY else 0.0)
+            if quality_score is None
+            else float(quality_score)
+        )
 
         sample_key = str(sample_id)
         ts = timestamp or datetime.now(timezone.utc).isoformat()
@@ -258,20 +292,21 @@ class EdgeSampleStore:
             split_config_id=str(split_config_id),
             model_id=str(model_id),
             model_version=str(model_version),
-            confidence_bucket=confidence_bucket,
-            quality_score=(
-                None
-                if quality_score is None
-                else float(quality_score)
-            ),
-            quality_bucket=(
-                None
-                if quality_bucket is None
-                else str(quality_bucket)
-            ),
+            quality_bucket=quality_bucket,
+            quality_score=resolved_quality_score,
+            risk_score=float(risk_score),
+            risk_reasons=list(risk_reasons or []),
+            evidence_count=int(evidence_count),
+            covered_evidence_count=int(covered_evidence_count),
+            uncovered_evidence_count=int(uncovered_evidence_count),
+            uncovered_evidence_rate=float(uncovered_evidence_rate),
+            candidate_uncovered_score=float(candidate_uncovered_score),
+            motion_uncovered_score=float(motion_uncovered_score),
+            track_uncovered_score=float(track_uncovered_score),
+            window_id=window_id,
+            in_drift_window=bool(in_drift_window),
             has_raw_sample=raw_path is not None,
             has_feature=True,
-            drift_flag=bool(drift_flag),
             input_image_size=list(input_image_size) if input_image_size is not None else None,
             input_tensor_shape=list(input_tensor_shape) if input_tensor_shape is not None else None,
             input_resize_mode=str(input_resize_mode) if input_resize_mode is not None else None,
@@ -287,9 +322,7 @@ class EdgeSampleStore:
             json.dump(record.to_dict(), handle, indent=2, sort_keys=True)
 
         self._append_index("all", record)
-        self._append_index(confidence_bucket, record)
-        if record.drift_flag:
-            self._append_index("drift", record)
+        self._append_index(quality_bucket, record)
         return record
 
     def load_record(self, sample_id: str) -> StoredSampleRecord:
@@ -300,8 +333,7 @@ class EdgeSampleStore:
     def list_records(
         self,
         *,
-        confidence_bucket: str | None = None,
-        drift_only: bool = False,
+        quality_bucket: str | None = None,
     ) -> list[StoredSampleRecord]:
         records: list[StoredSampleRecord] = []
         if not os.path.isdir(self.metadata_dir):
@@ -311,27 +343,49 @@ class EdgeSampleStore:
                 continue
             with open(os.path.join(self.metadata_dir, filename), "r", encoding="utf-8") as handle:
                 record = StoredSampleRecord.from_dict(json.load(handle))
-            if confidence_bucket is not None and record.confidence_bucket != confidence_bucket:
-                continue
-            if drift_only and not record.drift_flag:
+            if quality_bucket is not None and record.quality_bucket != quality_bucket:
                 continue
             records.append(record)
         records.sort(key=lambda item: (item.timestamp, item.sample_id))
         return records
 
+    def low_quality_count(self) -> int:
+        return len(self.list_records(quality_bucket=LOW_QUALITY))
+
     def stats(self) -> dict[str, Any]:
         records = self.list_records()
-        high = [record for record in records if record.confidence_bucket == HIGH_CONFIDENCE]
-        low = [record for record in records if record.confidence_bucket == LOW_CONFIDENCE]
-        drift = [record for record in records if record.drift_flag]
+        high = [record for record in records if record.quality_bucket == HIGH_QUALITY]
+        low = [record for record in records if record.quality_bucket == LOW_QUALITY]
+        total = len(records)
         return {
-            "total_samples": len(records),
-            "high_confidence_count": len(high),
-            "low_confidence_count": len(low),
-            "drift_count": len(drift),
-            "high_confidence_feature_bytes": sum(record.feature_bytes for record in high),
-            "low_confidence_feature_bytes": sum(record.feature_bytes for record in low),
-            "low_confidence_raw_bytes": sum(record.raw_bytes for record in low),
+            "total_samples": total,
+            "high_quality_count": len(high),
+            "low_quality_count": len(low),
+            "low_quality_rate": (len(low) / float(total)) if total else 0.0,
+            "uncovered_evidence_rate": (
+                sum(record.uncovered_evidence_rate for record in records) / float(total)
+                if total
+                else 0.0
+            ),
+            "candidate_uncovered_rate": (
+                sum(record.candidate_uncovered_score for record in records) / float(total)
+                if total
+                else 0.0
+            ),
+            "motion_uncovered_rate": (
+                sum(record.motion_uncovered_score for record in records) / float(total)
+                if total
+                else 0.0
+            ),
+            "track_uncovered_rate": (
+                sum(record.track_uncovered_score for record in records) / float(total)
+                if total
+                else 0.0
+            ),
+            "drift_window_sample_count": sum(1 for record in records if record.in_drift_window),
+            "high_quality_feature_bytes": sum(record.feature_bytes for record in high),
+            "low_quality_feature_bytes": sum(record.feature_bytes for record in low),
+            "low_quality_raw_bytes": sum(record.raw_bytes for record in low),
         }
 
     def load_inference_result(self, record: StoredSampleRecord) -> dict[str, Any]:

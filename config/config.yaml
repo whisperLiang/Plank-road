@@ -54,84 +54,50 @@ client:
   # JPEG quality for raw CL samples. Lowering quality reduces upload bytes
   # without changing resolution.
   raw_jpeg_quality: 82
- # drift detection
- drift_detection:
-  # Fallback confidence threshold for edge-side sample bucketing when full quality signals are unavailable
-  confidence_threshold: 0.8
-  # Token budget for adaptive drift triggering; lower is more conservative, higher allows more frequent triggers
-  pi_bar: 0.1
-
-  # -------------------------
-  # Frequently tuned parameters
-  # -------------------------
-  # Warmup frames before relative-drift detection becomes active; shorten for very short clips
-  adaptive_warmup_steps: 30
-  # Relative-drift anomaly threshold; lower is more sensitive, higher is more conservative
-  adaptive_anomaly_threshold: 0.35
-  # Number of consecutive anomalous frames required for relative-drift; larger values are more noise-tolerant
-  adaptive_persistence: 3
-  # Blind-spot score threshold; lower values make persistent misses easier to classify as blind spots
-  adaptive_blind_spot_score_threshold: 0.6
-  # Number of consecutive blind-spot frames required before drift is triggered
-  adaptive_blind_spot_persistence: 4
-  # Low-quality threshold for per-frame quality_score; higher values label more frames as low_quality
-  adaptive_quality_low_threshold: 0.50
-  # Sliding-window size used by low-quality accumulation drift
-  adaptive_low_quality_window: 20
-  # Number of low-quality samples inside the window required to declare drift
-  adaptive_low_quality_trigger_count: 8
-
-  # -------------------------
-  # Usually keep at defaults: internal scaling parameters
-  # -------------------------
-  # EMA smoothing factor controlling how quickly historical baselines adapt
-  adaptive_ema_alpha: 0.05
-  # Proposal-count lower bound for considering a frame "proposal rich" in blind-spot scoring
-  adaptive_blind_spot_min_proposals: 32
-  # Reference upper bound for retained/proposal ratio; lower ratios look more like persistent misses
-  adaptive_blind_spot_max_retained_ratio: 0.08
-  # Denominator for the low-confidence pressure term inside blind-spot scoring
-  adaptive_blind_spot_confidence_ceiling: 0.45
-  # Normalization scale for feature spectral-entropy shifts used in representation-shift anomaly scoring
-  adaptive_feature_entropy_scale: 0.2
-  # Normalization scale for logit-entropy increases; smaller values amplify uncertainty rises
-  adaptive_logit_entropy_scale: 0.2
-  # Normalization scale for logit-energy drops across frames
-  adaptive_logit_energy_scale: 2.0
-  # Minimum reference value for logit margin to avoid unstable ratio-drop amplification near zero
-  adaptive_quality_margin_floor: 0.10
-  # Tolerance band for logit entropy; small variations within this range are not treated as meaningful degradation
-  adaptive_quality_entropy_tolerance: 0.08
-  # Minimum number of quality samples required before percentile-based low-quality checks are enabled
-  adaptive_quality_min_history: 20
-  # Minimum drop below the sample-quality EMA before the current frame is considered meaningfully worse than baseline
-  adaptive_quality_relative_low_delta: 0.02
-  # Saturation ceiling for retained_count in over-detection scoring; penalties stop increasing beyond this value
-  adaptive_over_detection_retained_ceiling: 32
+  min_low_quality_samples: 80
+ # Evidence-coverage sample quality
+ sample_quality:
+  coverage_iou_threshold: 0.3
+  quality_risk_threshold: 0.45
+  candidate_weight: 0.5
+  motion_weight: 1.0
+  track_weight: 1.5
+  candidate_score_floor: 0.05
+  candidate_topk_per_class: 50
+  candidate_nms_iou: 0.5
+  candidate_cluster_iou: 0.5
+  min_motion_area: 64
+  motion_diff_threshold: 25
+ # Sliding-window drift state. Drift is not stored as a sample category.
+ window_drift:
+  window_size: 100
+  min_window_size: 30
+  low_quality_rate_threshold: 0.3
+  uncovered_evidence_rate_threshold: 0.35
+  persistence_windows: 3
 
  # Resource-aware CL trigger (two-queue Lyapunov scheduler)
  # Reference: RCCDA (NeurIPS 2025) — Lyapunov drift-plus-penalty
  # https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code
  #
- # When enabled, *replaces* the drift_detection trigger with a two-queue
+ # When enabled, gates the low-quality/window-drift trigger with a two-queue
  # Lyapunov policy that jointly decides (1) whether to trigger CL and
- # (2) whether low-confidence samples should also upload features, considering:
+ # (2) whether low-quality samples should also upload features, considering:
  #   - Cloud resource state (CPU / GPU / memory utilisation)
  #   - Network bandwidth to the cloud
- #   - Edge-side confidence-score degradation
+ #   - Edge-side low-quality and uncovered-evidence rates
  #
  # Virtual queues:
  #   Q_cloud  — bounds average cloud cost    ≤  lambda_cloud
  #   Q_bw     — bounds average bandwidth     ≤  lambda_bw
  resource_aware_trigger:
   enabled: True
-  # --- Shared with drift_detection (PD urgency controller) ---
+  # --- Evidence-quality urgency controller ---
   # Conservative profile: delay CL until enough evidence accumulates and let
   # the Q_cloud/Q_bw penalties suppress repeated training decisions.
   V: 10.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
   K_p: 0.6              # PD proportional gain
   K_d: 0.2              # PD derivative gain
-  # confidence_threshold: 0.8
   # --- Two-queue budget constraints ---
   lambda_cloud: 0.5     # avg cloud-cost budget per round [0,1]
   lambda_bw: 0.5        # avg bandwidth budget per round [0,1]

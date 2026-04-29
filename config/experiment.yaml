@@ -27,10 +27,10 @@ baselines:
   accuracy_trigger_cloud_retraining:
     trigger_window_size: 32
     confidence_drop_threshold: 0.15
-    low_conf_ratio_threshold: 0.30
+    low_quality_ratio_threshold: 0.30
     drift_ratio_threshold: 0.20
     upload_mode: raw_only  # fairness: baseline retrains from raw frames only
-    low_confidence_threshold: 0.50
+    quality_risk_threshold: 0.45
     trigger_cooldown_windows: 1
     max_buffered_windows: 4
     max_selected_frames_per_window: 12
@@ -40,7 +40,7 @@ baselines:
 
   pure_edge_local_updating:
     trigger_min_samples: 16
-    low_conf_ratio_threshold: 0.30
+    low_quality_ratio_threshold: 0.30
     local_num_epoch: 1
     retrain_target: full_model
     full_forward_epoch_ratio: 0.45

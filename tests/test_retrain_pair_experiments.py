@@ -14,7 +14,7 @@ def _base_config():
     return SimpleNamespace(
         client=SimpleNamespace(
             lightweight="tinynext_s",
-            drift_detection=SimpleNamespace(confidence_threshold=0.8),
+            sample_quality=SimpleNamespace(),
             split_learning=SimpleNamespace(
                 fixed_split=SimpleNamespace(),
             ),

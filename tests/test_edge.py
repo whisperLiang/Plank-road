@@ -1,8 +1,8 @@
-"""
+﻿"""
 Tests for edge/ module:
   - task.py         (Task data class)
   - info.py         (FRAME_TYPE, TASK_STATE enums)
-  - drift_detector.py (AdaptiveDriftDetector, CompositeDriftDetector)
+  - window_drift_detector.py (WindowDriftDetector)
   - resample.py     (history_sample, annotion_process)
   - resource_aware_trigger.py (helper functions, CloudResourceState, ResourceAwareCLTrigger)
 """
@@ -17,10 +17,7 @@ import torch
 
 from edge.task import Task
 from edge.info import FRAME_TYPE, TASK_STATE
-from edge.drift_detector import (
-    AdaptiveDriftDetector,
-    CompositeDriftDetector,
-)
+from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY, QualityAssessment
 from edge.resample import history_sample, annotion_process
 from edge.resource_aware_trigger import (
     CloudResourceState,
@@ -29,7 +26,8 @@ from edge.resource_aware_trigger import (
     TrainingDecision,
 )
 from edge.edge_worker import EdgeWorker
-from edge.sample_store import LOW_CONFIDENCE
+from edge.sample_store import LOW_QUALITY
+from edge.window_drift_detector import WindowDriftDetector
 from model_management.object_detection import InferenceArtifacts
 
 
@@ -297,21 +295,26 @@ class TestEdgeWorkerRouting:
 
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
-        worker.sample_confidence_threshold = 0.8
-        worker.drift_detector = SimpleNamespace(
-            assess_sample_quality=lambda observation: {
-                "quality_score": 0.2,
-                "quality_bucket": "low_quality",
-                "blind_spot_score": 0.0,
-                "over_detection_score": 0.0,
-                "uncertainty_score": 0.8,
-                "confidence_penalty": 0.0,
-                "margin_penalty": 0.0,
-                "entropy_penalty": 0.0,
-                "reasons": [],
-            },
-            update=lambda confidence: False,
+        quality = QualityAssessment(
+            quality_bucket=LOW_QUALITY,
+            quality_score=0.2,
+            risk_score=0.8,
+            risk_reasons=["candidate_evidence_uncovered"],
+            evidence_count=1,
+            covered_evidence_count=0,
+            uncovered_evidence_count=1,
+            uncovered_evidence_rate=1.0,
+            candidate_uncovered_score=1.0,
+            motion_uncovered_score=0.0,
+            track_uncovered_score=0.0,
         )
+        drift_state = SimpleNamespace(drift_detected=False)
+        worker.candidate_builder = SimpleNamespace(build=lambda **kwargs: [])
+        worker.motion_extractor = SimpleNamespace(extract=lambda *args: [])
+        worker.track_manager = SimpleNamespace(update_and_get_missing_evidence=lambda **kwargs: [])
+        worker.quality_assessor = SimpleNamespace(assess=lambda **kwargs: quality)
+        worker.window_drift_detector = SimpleNamespace(update=lambda *args, **kwargs: drift_state)
+        worker.previous_quality_frame = None
         worker.fixed_split_plan = SimpleNamespace(split_config_id="plan-1")
         worker.model_id = "yolo26n"
         worker.model_version = "0"
@@ -319,7 +322,16 @@ class TestEdgeWorkerRouting:
         worker.collect_flag = True
         worker.sample_store = SimpleNamespace(
             store_sample=lambda **kwargs: None,
-            stats=lambda: {"total_samples": 1},
+            stats=lambda: {
+                "total_samples": 1,
+                "high_quality_count": 0,
+                "low_quality_count": 1,
+                "low_quality_rate": 1.0,
+                "uncovered_evidence_rate": 1.0,
+                "high_quality_feature_bytes": 0,
+                "low_quality_feature_bytes": 1,
+                "low_quality_raw_bytes": 1,
+            },
         )
         worker.pending_training_decision = None
         worker._retrain_requested = threading.Event()
@@ -342,9 +354,12 @@ class TestEdgeWorkerRouting:
         )
         inference = InferenceArtifacts(
             intermediate=object(),
-            detection_boxes=[],
-            detection_class=[],
-            detection_score=[],
+            final_detection_boxes=[],
+            final_detection_labels=[],
+            final_detection_scores=[],
+            low_threshold_boxes=[[0, 0, 10, 10]],
+            low_threshold_labels=[1],
+            low_threshold_scores=[0.9],
             confidence=0.6,
             input_tensor_shape=[1, 3, 384, 640],
         )
@@ -448,58 +463,28 @@ class TestEdgeWorkerRouting:
         assert status_calls == ["job-1", "job-1", "job-1"]
         assert resets == [True]
 
-    def test_sample_confidence_threshold_falls_back_to_drift_detection(self):
-        config = SimpleNamespace(
-            drift_detection=SimpleNamespace(confidence_threshold=0.8),
-        )
-
-        threshold = EdgeWorker._resolve_sample_confidence_threshold(
-            config,
-            resource_trigger=None,
-        )
-
-        assert threshold == pytest.approx(0.8)
-
-    def test_sample_confidence_threshold_prefers_resource_trigger_override(self):
-        config = SimpleNamespace(
-            drift_detection=SimpleNamespace(confidence_threshold=0.8),
-        )
-        trigger = SimpleNamespace(confidence_threshold=0.65)
-
-        threshold = EdgeWorker._resolve_sample_confidence_threshold(
-            config,
-            resource_trigger=trigger,
-        )
-
-        assert threshold == pytest.approx(0.65)
-
-    def test_collect_data_uses_resolved_threshold_for_bucketing(self, sample_bgr_frame):
+    def test_collect_data_stores_low_quality_evidence_fields(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
-        worker.sample_confidence_threshold = 0.8
-        captured_drift = {}
-
-        def _assess(payload):
-            captured_drift["assess_payload"] = payload
-            return {
-                "quality_score": 0.2,
-                "quality_bucket": "low_quality",
-                "blind_spot_score": 0.0,
-                "over_detection_score": 0.0,
-                "uncertainty_score": 0.8,
-                "confidence_penalty": 0.0,
-                "margin_penalty": 0.0,
-                "entropy_penalty": 0.0,
-                "reasons": ["low_margin"],
-            }
-
-        def _update(payload):
-            captured_drift["update_payload"] = payload
-            return False
-
-        worker.drift_detector = SimpleNamespace(
-            assess_sample_quality=_assess,
-            update=_update,
+        quality = QualityAssessment(
+            quality_bucket=LOW_QUALITY,
+            quality_score=0.2,
+            risk_score=0.8,
+            risk_reasons=["motion_region_uncovered"],
+            evidence_count=2,
+            covered_evidence_count=0,
+            uncovered_evidence_count=2,
+            uncovered_evidence_rate=1.0,
+            candidate_uncovered_score=0.0,
+            motion_uncovered_score=1.0,
+            track_uncovered_score=0.0,
         )
+        drift_state = SimpleNamespace(drift_detected=True, window_id="window-1-1")
+        worker.candidate_builder = SimpleNamespace(build=lambda **kwargs: [])
+        worker.motion_extractor = SimpleNamespace(extract=lambda *args: [])
+        worker.track_manager = SimpleNamespace(update_and_get_missing_evidence=lambda **kwargs: [])
+        worker.quality_assessor = SimpleNamespace(assess=lambda **kwargs: quality)
+        worker.window_drift_detector = SimpleNamespace(update=lambda *args, **kwargs: drift_state)
+        worker.previous_quality_frame = None
         worker.fixed_split_plan = SimpleNamespace(split_config_id="plan-1")
         worker.model_id = "yolo26n"
         worker.model_version = "0"
@@ -521,9 +506,12 @@ class TestEdgeWorkerRouting:
         )
         inference = InferenceArtifacts(
             intermediate=object(),
-            detection_boxes=[],
-            detection_class=[],
-            detection_score=[],
+            final_detection_boxes=[],
+            final_detection_labels=[],
+            final_detection_scores=[],
+            low_threshold_boxes=[],
+            low_threshold_labels=[],
+            low_threshold_scores=[],
             confidence=0.6,
             input_tensor_shape=[1, 3, 384, 640],
             input_resize_mode=None,
@@ -531,22 +519,13 @@ class TestEdgeWorkerRouting:
 
         worker.collect_data(task, sample_bgr_frame, inference)
 
-        assert captured["confidence_bucket"] == LOW_CONFIDENCE
+        assert captured["quality_bucket"] == LOW_QUALITY
         assert captured["quality_score"] == pytest.approx(0.2)
-        assert captured["quality_bucket"] == "low_quality"
+        assert captured["risk_score"] == pytest.approx(0.8)
+        assert captured["risk_reasons"] == ["motion_region_uncovered"]
+        assert captured["uncovered_evidence_rate"] == pytest.approx(1.0)
         assert captured["raw_frame"] is sample_bgr_frame
         assert captured["input_resize_mode"] is None
-        expected_payload = {
-            "confidence": pytest.approx(0.6),
-            "proposal_count": 0,
-            "retained_count": 0,
-            "feature_spectral_entropy": None,
-            "logit_entropy": None,
-            "logit_margin": None,
-            "logit_energy": None,
-        }
-        assert captured_drift["assess_payload"] == expected_payload
-        assert captured_drift["update_payload"] == expected_payload
 
 
 # =====================================================================
@@ -565,339 +544,66 @@ class TestEnums:
 
 
 # =====================================================================
-# Drift Detection — helper
+# Window Drift Detection
 # =====================================================================
 
-# =====================================================================
-# CompositeDriftDetector
-# =====================================================================
-
-class TestCompositeDriftDetector:
+class TestWindowDriftDetector:
 
     @staticmethod
-    def _make_config():
-        return SimpleNamespace(
-            drift_detection=SimpleNamespace(
-                pi_bar=0.1,
-                confidence_threshold=0.5,
-                adaptive_warmup_steps=5,
-                adaptive_ema_alpha=0.1,
-                adaptive_anomaly_threshold=0.25,
-                adaptive_persistence=2,
-                adaptive_blind_spot_min_proposals=32,
-                adaptive_blind_spot_max_retained_ratio=0.08,
-                adaptive_blind_spot_confidence_ceiling=0.45,
-                adaptive_blind_spot_score_threshold=0.6,
-                adaptive_blind_spot_persistence=3,
-                adaptive_feature_entropy_scale=0.2,
-                adaptive_logit_entropy_scale=0.2,
-                adaptive_logit_energy_scale=2.0,
-            )
+    def _quality(bucket=HIGH_QUALITY, uncovered=0.0, candidate=0.0, motion=0.0, track=0.0):
+        return QualityAssessment(
+            quality_bucket=bucket,
+            quality_score=1.0 - uncovered,
+            risk_score=uncovered,
+            risk_reasons=[],
+            evidence_count=1,
+            covered_evidence_count=0 if uncovered else 1,
+            uncovered_evidence_count=1 if uncovered else 0,
+            uncovered_evidence_rate=uncovered,
+            candidate_uncovered_score=candidate,
+            motion_uncovered_score=motion,
+            track_uncovered_score=track,
         )
 
-    def test_stable_stream_no_drift(self):
-        cfg = self._make_config()
-        det = CompositeDriftDetector(cfg)
-        results = [det.update(0.8) for _ in range(50)]
-        assert not any(results)
+    def test_isolated_low_quality_does_not_trigger(self):
+        det = WindowDriftDetector(
+            window_size=4,
+            min_window_size=4,
+            low_quality_rate_threshold=0.5,
+            uncovered_evidence_rate_threshold=0.5,
+            persistence_windows=2,
+        )
+        states = [
+            det.update(self._quality(HIGH_QUALITY)),
+            det.update(self._quality(LOW_QUALITY, uncovered=1.0)),
+            det.update(self._quality(HIGH_QUALITY)),
+            det.update(self._quality(HIGH_QUALITY)),
+        ]
+        assert not any(state.drift_detected for state in states)
 
-    def test_reset(self):
-        cfg = self._make_config()
-        det = CompositeDriftDetector(cfg)
-        det.update({"confidence": 0.3, "proposal_count": 40, "retained_count": 1})
+    def test_sustained_low_quality_triggers_after_persistence(self):
+        det = WindowDriftDetector(
+            window_size=4,
+            min_window_size=4,
+            low_quality_rate_threshold=0.5,
+            uncovered_evidence_rate_threshold=0.5,
+            persistence_windows=2,
+        )
+        for _ in range(4):
+            state = det.update(self._quality(LOW_QUALITY, uncovered=0.8, motion=1.0))
+        assert state.drift_detected is False
+        state = det.update(self._quality(LOW_QUALITY, uncovered=0.8, motion=1.0))
+        assert state.drift_detected is True
+        assert state.low_quality_rate >= 0.5
+        assert "low_quality_rate" in state.drift_reasons
+
+    def test_reset_clears_window_state(self):
+        det = WindowDriftDetector(window_size=2, min_window_size=1, persistence_windows=1)
+        assert det.update(self._quality(LOW_QUALITY, uncovered=1.0)).drift_detected is True
         det.reset()
-        assert det.adaptive.step == 0
+        assert det.update(self._quality(HIGH_QUALITY)).drift_detected is False
 
-    def test_default_config(self):
-        cfg = SimpleNamespace()
-        det = CompositeDriftDetector(cfg)
-        assert isinstance(det.adaptive, AdaptiveDriftDetector)
-
-    def test_handles_low_baseline_then_relative_drop(self):
-        cfg = self._make_config()
-        det = CompositeDriftDetector(cfg)
-        stable = {
-            "confidence": 0.24,
-            "proposal_count": 20,
-            "retained_count": 3,
-        }
-        assert not any(det.update(stable) for _ in range(12))
-
-        degraded = {
-            "confidence": 0.10,
-            "proposal_count": 40,
-            "retained_count": 0,
-        }
-        assert any(det.update(degraded) for _ in range(8))
-
-
-class TestAdaptiveDriftDetector:
-
-
-    def test_stable_low_baseline_does_not_false_trigger(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=5,
-            ema_alpha=0.1,
-            anomaly_threshold=0.25,
-            persistence=2,
-        )
-        stable = {
-            "confidence": 0.24,
-            "proposal_count": 20,
-            "retained_count": 3,
-        }
-        assert not any(det.update(stable) for _ in range(20))
-
-    def test_relative_drop_triggers_after_warmup(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=5,
-            ema_alpha=0.1,
-            anomaly_threshold=0.25,
-            persistence=2,
-        )
-        stable = {
-            "confidence": 0.24,
-            "proposal_count": 200,
-            "retained_count": 3,
-        }
-        for _ in range(8):
-            det.update(stable)
-
-        degraded = {
-            "confidence": 0.10,
-            "proposal_count": 40,
-            "retained_count": 0,
-        }
-        assert any(det.update(degraded) for _ in range(6))
-
-    def test_blind_spot_pattern_triggers_without_waiting_for_relative_baseline(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=30,
-            ema_alpha=0.1,
-            anomaly_threshold=0.9,
-            persistence=10,
-            blind_spot_min_proposals=32,
-            blind_spot_max_retained_ratio=0.08,
-            blind_spot_confidence_ceiling=0.45,
-            blind_spot_score_threshold=0.6,
-            blind_spot_persistence=3,
-        )
-        blind_spot = {
-            "confidence": 0.20,
-            "proposal_count": 200,
-            "retained_count": 1,
-        }
-        assert any(det.update(blind_spot) for _ in range(4))
-
-    def test_small_empty_scene_does_not_false_trigger_blind_spot(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=30,
-            ema_alpha=0.1,
-            anomaly_threshold=0.9,
-            persistence=10,
-            blind_spot_min_proposals=32,
-            blind_spot_max_retained_ratio=0.08,
-            blind_spot_confidence_ceiling=0.45,
-            blind_spot_score_threshold=0.6,
-            blind_spot_persistence=3,
-        )
-        nearly_empty = {
-            "confidence": 0.0,
-            "proposal_count": 2,
-            "retained_count": 0,
-        }
-        assert not any(det.update(nearly_empty) for _ in range(8))
-
-    def test_representation_shift_triggers_from_feature_and_logit_signals(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=5,
-            ema_alpha=0.1,
-            anomaly_threshold=0.35,
-            persistence=2,
-        )
-        stable = {
-            "confidence": 0.60,
-            "proposal_count": 20,
-            "retained_count": 4,
-            "feature_spectral_entropy": 0.35,
-            "logit_entropy": 0.20,
-            "logit_margin": 0.82,
-            "logit_energy": 2.8,
-        }
-        assert not any(det.update(stable) for _ in range(8))
-
-        shifted = {
-            "confidence": 0.60,
-            "proposal_count": 20,
-            "retained_count": 4,
-            "feature_spectral_entropy": 0.75,
-            "logit_entropy": 0.62,
-            "logit_margin": 0.18,
-            "logit_energy": 0.6,
-        }
-        assert any(det.update(shifted) for _ in range(6))
-
-    def test_assess_sample_quality_separates_good_and_bad_frames(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=5,
-            ema_alpha=0.1,
-            anomaly_threshold=0.35,
-            persistence=2,
-        )
-        stable = {
-            "confidence": 0.72,
-            "proposal_count": 8,
-            "retained_count": 4,
-            "logit_entropy": 0.34,
-            "logit_margin": 0.14,
-        }
-        for _ in range(8):
-            det.update(stable)
-
-        good = det.assess_sample_quality(
-            {
-                "confidence": 0.72,
-                "proposal_count": 8,
-                "retained_count": 4,
-                "logit_entropy": 0.33,
-                "logit_margin": 0.14,
-            }
-        )
-        bad = det.assess_sample_quality(
-            {
-                "confidence": 0.81,
-                "proposal_count": 208,
-                "retained_count": 24,
-                "logit_entropy": 0.79,
-                "logit_margin": 0.13,
-            }
-        )
-
-        assert good["quality_bucket"] == "high_quality"
-        assert bad["quality_bucket"] == "low_quality"
-        assert float(good["quality_score"]) > float(bad["quality_score"])
-        assert "over_detection" in bad["reasons"]
-        assert float(good["over_detection_score"]) < float(bad["over_detection_score"])
-        assert float(good["uncertainty_score"]) < float(bad["uncertainty_score"])
-        assert float(good["quality_score"]) >= det.quality_low_threshold
-        assert float(bad["quality_score"]) < det.quality_low_threshold
-
-    def test_quality_drop_can_trigger_relative_drift(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=5,
-            ema_alpha=0.1,
-            anomaly_threshold=0.30,
-            persistence=2,
-        )
-        stable = {
-            "confidence": 0.72,
-            "proposal_count": 8,
-            "retained_count": 4,
-            "logit_entropy": 0.34,
-            "logit_margin": 0.14,
-        }
-        for _ in range(8):
-            det.update(stable)
-
-        degraded = {
-            "confidence": 0.81,
-            "proposal_count": 208,
-            "retained_count": 24,
-            "logit_entropy": 0.79,
-            "logit_margin": 0.13,
-        }
-        assert any(det.update(degraded) for _ in range(6))
-
-    def test_low_quality_accumulation_can_trigger_drift(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=100,
-            ema_alpha=0.1,
-            anomaly_threshold=0.99,
-            persistence=10,
-            blind_spot_score_threshold=1.1,
-            low_quality_window=6,
-            low_quality_trigger_count=3,
-        )
-        stable = {
-            "confidence": 0.72,
-            "proposal_count": 8,
-            "retained_count": 4,
-            "logit_entropy": 0.34,
-            "logit_margin": 0.14,
-        }
-        for _ in range(6):
-            det.update(stable)
-
-        low_quality = {
-            "confidence": 0.81,
-            "proposal_count": 208,
-            "retained_count": 24,
-            "logit_entropy": 0.79,
-            "logit_margin": 0.13,
-        }
-        assert any(det.update(low_quality) for _ in range(4))
-
-    def test_stable_over_detecting_stream_is_low_quality_without_relative_shift(self):
-        det = AdaptiveDriftDetector(
-            pi_bar=1.0,
-            warmup_steps=30,
-            ema_alpha=0.1,
-            anomaly_threshold=0.99,
-            persistence=10,
-            blind_spot_score_threshold=1.1,
-        )
-        over_detecting = {
-            "confidence": 0.81,
-            "proposal_count": 208,
-            "retained_count": 24,
-            "logit_entropy": 0.79,
-            "logit_margin": 0.13,
-        }
-        quality = det.assess_sample_quality(over_detecting)
-        assert quality["quality_bucket"] == "low_quality"
-        assert "over_detection" in quality["reasons"]
-
-
-# =====================================================================
-# resample
-# =====================================================================
-
-class TestResample:
-
-    def test_history_sample_basic(self):
-        indices = list(range(100))
-        scores = [{i: 0.5 + i * 0.001} for i in range(100)]
-        sampled_idx, sampled_scores = history_sample(indices, scores)
-        assert len(sampled_idx) == 25  # 1/4 of 100
-        # All sampled indices should be in original
-        assert all(i in indices for i in sampled_idx)
-
-    def test_history_sample_empty(self):
-        sampled_idx, sampled_scores = history_sample([], [])
-        assert sampled_idx == []
-        assert sampled_scores == []
-
-    def test_annotion_process_filters(self):
-        annotations = [[1, "a"], [2, "b"], [3, "c"], [4, "d"]]
-        result = annotion_process(annotations, [2, 4])
-        assert result == [[2, "b"], [4, "d"]]
-
-    def test_annotion_process_empty_index(self):
-        annotations = [[1, "a"], [2, "b"]]
-        result = annotion_process(annotations, [])
-        assert result == []
-
-
-# =====================================================================
-# Resource-Aware Trigger — helpers
+# =====================================================================`r`n# Resource-Aware Trigger 鈥?helpers
 # =====================================================================
 
 class TestResourceAwareHelpers(object): pass
@@ -911,12 +617,14 @@ class TestResourceAwareCLTrigger:
     def _stats(self):
         return PendingTrainingStats(
             total_samples=12,
-            high_confidence_count=6,
-            low_confidence_count=6,
-            drift_count=2,
-            high_confidence_feature_bytes=1200,
-            low_confidence_feature_bytes=600,
-            low_confidence_raw_bytes=300,
+            high_quality_count=6,
+            low_quality_count=6,
+            low_quality_rate=0.5,
+            uncovered_evidence_rate=0.5,
+            drift_detected=True,
+            high_quality_feature_bytes=1200,
+            low_quality_feature_bytes=600,
+            low_quality_raw_bytes=300,
         )
 
     def _cloud_state(self, pressure: float):
@@ -932,15 +640,16 @@ class TestResourceAwareCLTrigger:
         trigger = ResourceAwareCLTrigger(min_training_samples=1, V=10.0)
         stats = PendingTrainingStats(
             total_samples=12,
-            high_confidence_count=6,
-            low_confidence_count=6,
-            drift_count=2,
-            high_confidence_feature_bytes=4_000_000,
-            low_confidence_feature_bytes=8_000_000,
-            low_confidence_raw_bytes=2_000_000,
+            high_quality_count=6,
+            low_quality_count=6,
+            low_quality_rate=0.5,
+            uncovered_evidence_rate=0.5,
+            drift_detected=True,
+            high_quality_feature_bytes=4_000_000,
+            low_quality_feature_bytes=8_000_000,
+            low_quality_raw_bytes=2_000_000,
         )
         decision = trigger.decide(
-            avg_confidence=0.2,
             drift_detected=True,
             cloud_state=self._cloud_state(0.2),
             bandwidth_mbps=0.1,
@@ -952,7 +661,6 @@ class TestResourceAwareCLTrigger:
     def test_compute_tight_case_prefers_low_conf_feature_upload_when_training(self):
         trigger = ResourceAwareCLTrigger(min_training_samples=1, V=10.0)
         decision = trigger.decide(
-            avg_confidence=0.2,
             drift_detected=True,
             cloud_state=self._cloud_state(0.95),
             bandwidth_mbps=100.0,
@@ -970,7 +678,6 @@ class TestResourceAwareCLTrigger:
         )
 
         decision = trigger.decide(
-            avg_confidence=0.2,
             drift_detected=True,
             cloud_state=self._cloud_state(0.95),
             bandwidth_mbps=100.0,
@@ -984,22 +691,33 @@ class TestResourceAwareCLTrigger:
 
     def test_trigger_can_skip_training_when_urgency_is_low(self):
         trigger = ResourceAwareCLTrigger(min_training_samples=1, V=1.0)
+        stats = PendingTrainingStats(
+            total_samples=12,
+            high_quality_count=12,
+            low_quality_count=0,
+            low_quality_rate=0.0,
+            uncovered_evidence_rate=0.0,
+            drift_detected=False,
+            high_quality_feature_bytes=1200,
+            low_quality_feature_bytes=0,
+            low_quality_raw_bytes=0,
+        )
         decision = trigger.decide(
-            avg_confidence=0.95,
             drift_detected=False,
             cloud_state=self._cloud_state(0.9),
             bandwidth_mbps=0.5,
-            sample_stats=self._stats(),
+            sample_stats=stats,
         )
         assert decision.train_now is False
 
     def test_trigger_respects_minimum_sample_gate(self):
         trigger = ResourceAwareCLTrigger(min_training_samples=20, V=10.0)
         decision = trigger.decide(
-            avg_confidence=0.1,
             drift_detected=True,
             cloud_state=self._cloud_state(0.1),
             bandwidth_mbps=100.0,
             sample_stats=self._stats(),
         )
         assert decision.train_now is False
+
+

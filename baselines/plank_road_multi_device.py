@@ -1,4 +1,4 @@
-"""Plank-road multi-device method.
+﻿"""Plank-road multi-device method.
 
 Reuses the existing Plank-road main logic: per-device fixed-split
 inference, sample caching, resource-aware trigger, and central-server
@@ -70,9 +70,9 @@ class PlankRoadMultiDevice(BaseMethod):
             proxy_map=result.proxy_map,
         )
         window = self._get_window(result.device_id)
-        window.update(result.confidence, result.drift_flag)
+        window.update(result.confidence, result.in_drift_window)
         self._sample_counts[result.device_id] += 1
-        if result.drift_flag:
+        if result.in_drift_window:
             self._drift_counts[result.device_id] += 1
 
     def should_trigger(self, device_id: int) -> bool:
@@ -139,3 +139,4 @@ class PlankRoadMultiDevice(BaseMethod):
         self._get_window(plan.device_id).reset()
         if self._update_queue:
             self._update_queue.popleft()
+

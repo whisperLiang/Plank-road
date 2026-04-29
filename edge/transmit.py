@@ -12,7 +12,8 @@ from tools.grpc_options import grpc_message_options
 import zipfile
 import io
 
-from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
+from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY
+from edge.sample_store import EdgeSampleStore
 from model_management.fixed_split import SplitPlan
 from model_management.continual_learning_bundle import (
     CONTINUAL_LEARNING_PROTOCOL_VERSION,
@@ -38,7 +39,7 @@ def _manifest_payload_summary(manifest: dict) -> dict[str, int]:
     samples = list(manifest.get("samples") or [])
     return {
         "samples": len(samples),
-        "drift": len(list(manifest.get("drift_sample_ids") or [])),
+        "drift_window_samples": sum(1 for sample in samples if bool(sample.get("in_drift_window", False))),
         "feature_bytes": sum(int(sample.get("feature_bytes", 0) or 0) for sample in samples),
         "raw_bytes": sum(int(sample.get("raw_bytes", 0) or 0) for sample in samples),
     }
@@ -64,6 +65,7 @@ def _entry_for_relpath(
 def _quality_sort_key(record) -> tuple[float, str, str]:
     quality = record.quality_score
     return (
+        0.0 if bool(getattr(record, "in_drift_window", False)) else 1.0,
         float("inf") if quality is None else float(quality),
         str(record.timestamp),
         str(record.sample_id),
@@ -177,63 +179,37 @@ def _select_bundle_records(
         return True
 
     for record in records:
-        if record.confidence_bucket == HIGH_CONFIDENCE:
+        if record.quality_bucket == HIGH_QUALITY:
             _add_or_update(
                 record,
                 include_feature=True,
                 include_raw=False,
-                protected=bool(record.drift_flag),
+                protected=False,
             )
 
-    for record in records:
-        if not bool(record.drift_flag):
-            continue
-        include_feature = (
-            record.confidence_bucket == HIGH_CONFIDENCE
-            or (
-                record.confidence_bucket == LOW_CONFIDENCE
-                and bool(send_low_conf_features)
-            )
-        )
-        _add_or_update(
-            record,
-            include_feature=include_feature,
-            include_raw=True,
-            protected=True,
-        )
-
-    low_non_drift = [
+    low_quality_records = [
         record
         for record in records
-        if record.confidence_bucket == LOW_CONFIDENCE and not bool(record.drift_flag)
+        if record.quality_bucket == LOW_QUALITY
     ]
-    for record in sorted(low_non_drift, key=_quality_sort_key):
+    for record in sorted(low_quality_records, key=_quality_sort_key):
         _add_or_update(
             record,
             include_feature=bool(send_low_conf_features),
             include_raw=True,
-            protected=False,
+            protected=bool(getattr(record, "in_drift_window", False)),
         )
 
     selected = [selected_by_id[sample_id] for sample_id in selected_order]
-    selected_ids = {str(entry["sample"]["sample_id"]) for entry in selected}
-    drift_omitted = [
-        record.sample_id
-        for record in records
-        if bool(record.drift_flag)
-        and (
-            str(record.sample_id) not in selected_ids
-            or selected_by_id[str(record.sample_id)]["sample"].get("raw_relpath") is None
-        )
-    ]
     samples = [entry["sample"] for entry in selected]
     policy = {
-        "policy": "latency_first_capped_high_features_drift_raw_low_quality_raw",
+        "policy": "quality_capped_high_features_low_quality_raw",
         "bundle_cap_bytes": cap,
         "selected_sample_count": len(selected),
         "omitted_sample_count": max(0, len(records) - len(selected)),
-        "drift_omitted_count": len(drift_omitted),
-        "drift_omitted_sample_ids": list(drift_omitted),
+        "drift_window_selected_count": sum(
+            1 for sample in samples if bool(sample.get("in_drift_window", False))
+        ),
         "source_total_bytes": int(source_total_bytes),
         "source_feature_bytes": sum(
             int(sample.get("feature_bytes", 0) or 0) for sample in samples
@@ -376,9 +352,8 @@ def pack_continual_learning_bundle_to_file(
         "split_plan": split_plan.to_dict(),
         "training_mode": {
             "send_low_conf_features": bool(send_low_conf_features),
-            "low_confidence_mode": "raw+feature" if send_low_conf_features else "raw-only",
+            "low_quality_mode": "raw+feature" if send_low_conf_features else "raw-only",
         },
-        "drift_sample_ids": [],
         "selection_policy": selection_policy,
         "samples": [],
     }
@@ -390,35 +365,13 @@ def pack_continual_learning_bundle_to_file(
                 file_map[str(file_entry["relpath"])] = file_entry
         file_entries = list(file_map.values())
         samples = [entry["sample"] for entry in selected]
-        selected_ids = {str(sample["sample_id"]) for sample in samples}
-        drift_omitted = [
-            record.sample_id
-            for record in records
-            if bool(record.drift_flag)
-            and (
-                str(record.sample_id) not in selected_ids
-                or next(
-                    (
-                        sample
-                        for sample in samples
-                        if str(sample["sample_id"]) == str(record.sample_id)
-                    ),
-                    {},
-                ).get("raw_relpath")
-                is None
-            )
-        ]
         manifest["samples"] = samples
-        manifest["drift_sample_ids"] = [
-            str(sample["sample_id"])
-            for sample in samples
-            if bool(sample.get("drift_flag", False)) and sample.get("raw_relpath") is not None
-        ]
         policy = manifest["selection_policy"]
         policy["selected_sample_count"] = len(samples)
         policy["omitted_sample_count"] = max(0, len(records) - len(samples))
-        policy["drift_omitted_count"] = len(drift_omitted)
-        policy["drift_omitted_sample_ids"] = list(drift_omitted)
+        policy["drift_window_selected_count"] = sum(
+            1 for sample in samples if bool(sample.get("in_drift_window", False))
+        )
         policy["source_total_bytes"] = sum(
             int(entry["bytes"]) for entry in file_entries
         )
@@ -777,13 +730,12 @@ def submit_continual_learning_job(
         stats = sample_store.stats()
         logger.info(
             "Packing continual learning bundle for edge {} "
-            "(samples={}, high_conf={}, low_conf={}, drift={}, "
+            "(samples={}, high_quality={}, low_quality={}, "
             "send_low_conf_features={}, model_id={}, model_version={})",
             edge_id,
             int(stats.get("total_samples", 0)),
-            int(stats.get("high_confidence_count", 0)),
-            int(stats.get("low_confidence_count", 0)),
-            int(stats.get("drift_count", 0)),
+            int(stats.get("high_quality_count", 0)),
+            int(stats.get("low_quality_count", 0)),
             bool(send_low_conf_features),
             model_id,
             model_version,
@@ -808,13 +760,13 @@ def submit_continual_learning_job(
         logger.info(
             "Packed continual learning bundle for edge {} "
             "(total_pack_time={:.3f}s, "
-            "(manifest_samples={}, drift={}, source_feature_bytes={}, "
+            "(manifest_samples={}, drift_window_samples={}, source_feature_bytes={}, "
             "source_raw_bytes={}, source_total_bytes={}, cap={}, zip_payload={}, "
             "estimated_upload_sec={}).",
             edge_id,
             time.perf_counter() - pack_started,
             payload_summary["samples"],
-            payload_summary["drift"],
+            payload_summary["drift_window_samples"],
             _format_bytes(payload_summary["feature_bytes"]),
             _format_bytes(payload_summary["raw_bytes"]),
             _format_bytes(int(selection_policy.get("source_total_bytes", 0))),

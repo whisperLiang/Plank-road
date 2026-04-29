@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import copy
@@ -26,7 +26,9 @@ from cloud_server import (
     CloudContinualLearner,
     _evaluate_detection_proxy_map,
 )
-from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
+from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
+from edge.quality_assessor import LOW_QUALITY, QualityAssessor
+from edge.sample_store import EdgeSampleStore
 from edge.transmit import pack_continual_learning_bundle
 from model_management.fixed_split import SplitConstraints, SplitPlan, load_or_compute_fixed_split_plan
 from model_management.model_zoo import ensure_local_model_artifact, get_model_artifact_path
@@ -218,9 +220,29 @@ def _collect_edge_samples(
     frame_indices: list[int],
     frames: list[Any],
     sample_store: EdgeSampleStore,
-    confidence_threshold: float,
+    client_cfg: Any,
     model_name: str,
 ) -> dict[str, Any]:
+    quality_cfg = getattr(client_cfg, "sample_quality", None)
+    candidate_builder = CandidateEvidenceBuilder(
+        score_floor=float(getattr(quality_cfg, "candidate_score_floor", 0.05)),
+        topk_per_class=int(getattr(quality_cfg, "candidate_topk_per_class", 50)),
+        nms_iou=float(getattr(quality_cfg, "candidate_nms_iou", 0.5)),
+        cluster_iou=float(getattr(quality_cfg, "candidate_cluster_iou", 0.5)),
+    )
+    motion_extractor = MotionEvidenceExtractor(
+        min_area=int(getattr(quality_cfg, "min_motion_area", 64)),
+        diff_threshold=int(getattr(quality_cfg, "motion_diff_threshold", 25)),
+    )
+    track_manager = TrackEvidenceManager()
+    quality_assessor = QualityAssessor(
+        coverage_iou_threshold=float(getattr(quality_cfg, "coverage_iou_threshold", 0.3)),
+        quality_risk_threshold=float(getattr(quality_cfg, "quality_risk_threshold", 0.45)),
+        candidate_weight=float(getattr(quality_cfg, "candidate_weight", 0.5)),
+        motion_weight=float(getattr(quality_cfg, "motion_weight", 1.0)),
+        track_weight=float(getattr(quality_cfg, "track_weight", 1.5)),
+    )
+    previous_frame = None
     for frame_index, frame in zip(frame_indices, frames):
         inference = small_detector.infer_sample(frame, splitter=splitter)
         if inference.intermediate is None:
@@ -228,11 +250,29 @@ def _collect_edge_samples(
                 f"Split runtime did not produce an intermediate payload for frame {frame_index}."
             )
 
-        confidence_bucket = (
-            HIGH_CONFIDENCE
-            if float(inference.confidence) >= confidence_threshold
-            else LOW_CONFIDENCE
+        candidate_evidence = candidate_builder.build(
+            boxes=inference.low_threshold_boxes,
+            labels=inference.low_threshold_labels,
+            scores=inference.low_threshold_scores,
+            image_shape=frame.shape,
+            model_name=model_name,
         )
+        motion_evidence = motion_extractor.extract(previous_frame, frame)
+        track_evidence = track_manager.update_and_get_missing_evidence(
+            final_boxes=inference.final_detection_boxes,
+            final_labels=inference.final_detection_labels,
+            final_scores=inference.final_detection_scores,
+            image_shape=frame.shape,
+        )
+        quality = quality_assessor.assess(
+            final_boxes=inference.final_detection_boxes,
+            final_labels=inference.final_detection_labels,
+            final_scores=inference.final_detection_scores,
+            candidate_evidence=candidate_evidence,
+            motion_evidence=motion_evidence,
+            track_evidence=track_evidence,
+        )
+        previous_frame = frame.copy()
         sample_store.store_sample(
             sample_id=str(frame_index),
             frame_index=frame_index,
@@ -240,11 +280,21 @@ def _collect_edge_samples(
             split_config_id=plan.split_config_id,
             model_id=model_name,
             model_version="0",
-            confidence_bucket=confidence_bucket,
+            quality_bucket=quality.quality_bucket,
+            quality_score=quality.quality_score,
+            risk_score=quality.risk_score,
+            risk_reasons=quality.risk_reasons,
+            evidence_count=quality.evidence_count,
+            covered_evidence_count=quality.covered_evidence_count,
+            uncovered_evidence_count=quality.uncovered_evidence_count,
+            uncovered_evidence_rate=quality.uncovered_evidence_rate,
+            candidate_uncovered_score=quality.candidate_uncovered_score,
+            motion_uncovered_score=quality.motion_uncovered_score,
+            track_uncovered_score=quality.track_uncovered_score,
             inference_result=inference.to_inference_result(),
             intermediate=inference.intermediate,
-            drift_flag=False,
-            raw_frame=frame if confidence_bucket == LOW_CONFIDENCE else None,
+            in_drift_window=False,
+            raw_frame=frame if quality.quality_bucket == LOW_QUALITY else None,
             input_image_size=list(frame.shape[:2]),
             input_tensor_shape=inference.input_tensor_shape,
         )
@@ -341,7 +391,7 @@ def _run_pair_experiment(
             frame_indices=frame_indices,
             frames=frames,
             sample_store=sample_store,
-            confidence_threshold=float(client_cfg.drift_detection.confidence_threshold),
+            client_cfg=client_cfg,
             model_name=edge_model,
         )
 
@@ -491,7 +541,7 @@ def main() -> None:
                     "after_proxy_map": result.after_proxy_map,
                     "absolute_delta": result.absolute_delta,
                     "relative_delta_percent": result.relative_delta_percent,
-                    "low_confidence_count": result.sample_stats.get("low_confidence_count", 0),
+                    "low_quality_count": result.sample_stats.get("low_quality_count", 0),
                     "message": result.message,
                 },
                 ensure_ascii=False,
@@ -501,3 +551,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

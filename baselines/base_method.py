@@ -1,4 +1,4 @@
-"""Abstract base class for all baseline methods.
+﻿"""Abstract base class for all baseline methods.
 
 All four methods implement the same interface so the experiment runner
 can drive them uniformly through the main simulation loop.
@@ -25,7 +25,7 @@ class InferenceResult:
     confidence: float
     proxy_map: float = 0.0
     latency_ms: float = 0.0
-    drift_flag: bool = False
+    in_drift_window: bool = False
     num_detections: int = 0
 
 
@@ -37,7 +37,7 @@ class UpdatePlan:
     upload_mode: str = "raw_only"          # raw_only | raw+feature
     num_samples: int = 0
     estimated_upload_bytes: int = 0
-    is_central: bool = True                # False → pure-edge local
+    is_central: bool = True                # False 鈫?pure-edge local
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -46,11 +46,11 @@ class BaseMethod(abc.ABC):
 
     The experiment runner calls the methods in this order for each frame:
 
-    1. ``on_inference_result(result)`` — process a single inference
-    2. ``should_trigger(device_id)`` — check if training should start
-    3. ``build_update_plan(device_id)`` — describe the update plan
-    4. ``execute_update(plan)`` — simulate the training+update
-    5. ``collect_metrics()`` — return the metrics collector
+    1. ``on_inference_result(result)`` 鈥?process a single inference
+    2. ``should_trigger(device_id)`` 鈥?check if training should start
+    3. ``build_update_plan(device_id)`` 鈥?describe the update plan
+    4. ``execute_update(plan)`` 鈥?simulate the training+update
+    5. ``collect_metrics()`` 鈥?return the metrics collector
 
     Subclasses must implement all abstract methods.
     """
@@ -93,3 +93,4 @@ class BaseMethod(abc.ABC):
 
     def name(self) -> str:
         return self.method_name
+

@@ -41,33 +41,32 @@ class RetrainConfig(ConfigSection):
     flag: bool = True
     cache_path: str = "./cache"
     collect_num: int = 20
+    min_low_quality_samples: int = 80
     raw_jpeg_quality: int = 82
 
 
 @dataclass
-class DriftDetectionConfig(ConfigSection):
-    confidence_threshold: float = 0.8
-    pi_bar: float = 0.1
-    adaptive_warmup_steps: int = 30
-    adaptive_ema_alpha: float = 0.05
-    adaptive_anomaly_threshold: float = 0.35
-    adaptive_persistence: int = 3
-    adaptive_blind_spot_min_proposals: float = 32.0
-    adaptive_blind_spot_max_retained_ratio: float = 0.08
-    adaptive_blind_spot_confidence_ceiling: float = 0.45
-    adaptive_blind_spot_score_threshold: float = 0.6
-    adaptive_blind_spot_persistence: int = 4
-    adaptive_feature_entropy_scale: float = 0.2
-    adaptive_logit_entropy_scale: float = 0.2
-    adaptive_logit_energy_scale: float = 2.0
-    adaptive_quality_low_threshold: float = 0.50
-    adaptive_quality_margin_floor: float = 0.10
-    adaptive_quality_entropy_tolerance: float = 0.08
-    adaptive_quality_min_history: int = 20
-    adaptive_quality_relative_low_delta: float = 0.02
-    adaptive_over_detection_retained_ceiling: float = 32.0
-    adaptive_low_quality_window: int = 20
-    adaptive_low_quality_trigger_count: int = 8
+class SampleQualityConfig(ConfigSection):
+    coverage_iou_threshold: float = 0.3
+    quality_risk_threshold: float = 0.45
+    candidate_weight: float = 0.5
+    motion_weight: float = 1.0
+    track_weight: float = 1.5
+    candidate_score_floor: float = 0.05
+    candidate_topk_per_class: int = 50
+    candidate_nms_iou: float = 0.5
+    candidate_cluster_iou: float = 0.5
+    min_motion_area: int = 64
+    motion_diff_threshold: int = 25
+
+
+@dataclass
+class WindowDriftConfig(ConfigSection):
+    window_size: int = 100
+    min_window_size: int = 30
+    low_quality_rate_threshold: float = 0.3
+    uncovered_evidence_rate_threshold: float = 0.35
+    persistence_windows: int = 3
 
 
 @dataclass
@@ -154,7 +153,8 @@ class ClientConfig(ConfigSection):
     edge_id: int = 1
     edge_num: int = 1
     retrain: RetrainConfig = field(default_factory=RetrainConfig)
-    drift_detection: DriftDetectionConfig = field(default_factory=DriftDetectionConfig)
+    sample_quality: SampleQualityConfig = field(default_factory=SampleQualityConfig)
+    window_drift: WindowDriftConfig = field(default_factory=WindowDriftConfig)
     resource_aware_trigger: ResourceAwareTriggerConfig = field(
         default_factory=ResourceAwareTriggerConfig
     )
@@ -198,9 +198,13 @@ def _section(section_cls, value: Mapping[str, Any] | None):
     elif section_cls is ClientConfig:
         known["source"] = _section(SourceConfig, known.get("source"))
         known["retrain"] = _section(RetrainConfig, known.get("retrain"))
-        known["drift_detection"] = _section(
-            DriftDetectionConfig,
-            known.get("drift_detection"),
+        known["sample_quality"] = _section(
+            SampleQualityConfig,
+            known.get("sample_quality"),
+        )
+        known["window_drift"] = _section(
+            WindowDriftConfig,
+            known.get("window_drift"),
         )
         known["resource_aware_trigger"] = _section(
             ResourceAwareTriggerConfig,
@@ -318,6 +322,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive("client.frame_cache_maxsize", int(config.client.frame_cache_maxsize))
     _validate_positive("client.edge_num", int(config.client.edge_num))
     _validate_positive("client.retrain.collect_num", int(config.client.retrain.collect_num))
+    _validate_positive(
+        "client.retrain.min_low_quality_samples",
+        int(config.client.retrain.min_low_quality_samples),
+    )
     raw_jpeg_quality = int(config.client.retrain.raw_jpeg_quality)
     if not 1 <= raw_jpeg_quality <= 100:
         raise ValueError(
@@ -348,6 +356,36 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "client.final_detection_threshold must be within [0, 1], "
             f"got {config.client.final_detection_threshold!r}"
         )
+    for name in (
+        "coverage_iou_threshold",
+        "quality_risk_threshold",
+        "candidate_score_floor",
+        "candidate_nms_iou",
+        "candidate_cluster_iou",
+    ):
+        value = float(getattr(config.client.sample_quality, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"client.sample_quality.{name} must be within [0, 1], got {value!r}")
+    _validate_positive(
+        "client.sample_quality.candidate_topk_per_class",
+        int(config.client.sample_quality.candidate_topk_per_class),
+    )
+    _validate_positive(
+        "client.sample_quality.min_motion_area",
+        int(config.client.sample_quality.min_motion_area),
+    )
+    _validate_positive(
+        "client.window_drift.window_size",
+        int(config.client.window_drift.window_size),
+    )
+    _validate_positive(
+        "client.window_drift.min_window_size",
+        int(config.client.window_drift.min_window_size),
+    )
+    _validate_positive(
+        "client.window_drift.persistence_windows",
+        int(config.client.window_drift.persistence_windows),
+    )
     _validate_positive("server.local_queue_maxsize", int(config.server.local_queue_maxsize))
     _validate_positive("server.wait_thresh", int(config.server.wait_thresh))
     _validate_positive(

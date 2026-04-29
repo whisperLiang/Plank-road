@@ -10,8 +10,9 @@ import torch
 from loguru import logger
 
 from difference.diff import DiffProcessor
-from edge.drift_detector import CompositeDriftDetector
+from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
 from edge.info import TASK_STATE
+from edge.quality_assessor import LOW_QUALITY, QualityAssessor
 from edge.resource_aware_trigger import (
     CloudResourceState,
     PendingTrainingStats,
@@ -21,13 +22,14 @@ from edge.resource_aware_trigger import (
     estimate_bandwidth,
     query_cloud_resource,
 )
-from edge.sample_store import HIGH_CONFIDENCE, LOW_CONFIDENCE, EdgeSampleStore
+from edge.sample_store import EdgeSampleStore
 from edge.task import Task
 from edge.transmit import (
     download_trained_model,
     get_training_job_status,
     submit_continual_learning_job,
 )
+from edge.window_drift_detector import DriftWindowState, WindowDriftDetector
 from model_management.fixed_split import (
     SplitConstraints,
     SplitPlan,
@@ -42,19 +44,6 @@ _QUEUE_STOP = object()
 
 
 class EdgeWorker:
-    @staticmethod
-    def _resolve_sample_confidence_threshold(
-        config,
-        resource_trigger: ResourceAwareCLTrigger | None = None,
-    ) -> float:
-        if resource_trigger is not None:
-            return float(resource_trigger.confidence_threshold)
-
-        drift_cfg = getattr(config, "drift_detection", None)
-        if drift_cfg is None:
-            return 0.5
-        return float(getattr(drift_cfg, "confidence_threshold", 0.5))
-
     @staticmethod
     def _resolve_training_poll_interval(config) -> float:
         retrain_cfg = getattr(config, "retrain", None)
@@ -81,7 +70,34 @@ class EdgeWorker:
 
         self.edge_processor = DiffProcessor.str_to_class(config.feature)()
         self.small_object_detection = Object_Detection(config, type="small inference")
-        self.drift_detector = CompositeDriftDetector(config)
+        quality_cfg = getattr(config, "sample_quality", None)
+        self.candidate_builder = CandidateEvidenceBuilder(
+            score_floor=float(getattr(quality_cfg, "candidate_score_floor", 0.05)),
+            topk_per_class=int(getattr(quality_cfg, "candidate_topk_per_class", 50)),
+            nms_iou=float(getattr(quality_cfg, "candidate_nms_iou", 0.5)),
+            cluster_iou=float(getattr(quality_cfg, "candidate_cluster_iou", 0.5)),
+        )
+        self.motion_extractor = MotionEvidenceExtractor(
+            min_area=int(getattr(quality_cfg, "min_motion_area", 64)),
+            diff_threshold=int(getattr(quality_cfg, "motion_diff_threshold", 25)),
+        )
+        self.track_manager = TrackEvidenceManager()
+        self.quality_assessor = QualityAssessor(
+            coverage_iou_threshold=float(getattr(quality_cfg, "coverage_iou_threshold", 0.3)),
+            quality_risk_threshold=float(getattr(quality_cfg, "quality_risk_threshold", 0.45)),
+            candidate_weight=float(getattr(quality_cfg, "candidate_weight", 0.5)),
+            motion_weight=float(getattr(quality_cfg, "motion_weight", 1.0)),
+            track_weight=float(getattr(quality_cfg, "track_weight", 1.5)),
+        )
+        drift_cfg = getattr(config, "window_drift", None)
+        self.window_drift_detector = WindowDriftDetector(
+            window_size=int(getattr(drift_cfg, "window_size", 100)),
+            min_window_size=int(getattr(drift_cfg, "min_window_size", 30)),
+            low_quality_rate_threshold=float(getattr(drift_cfg, "low_quality_rate_threshold", 0.3)),
+            uncovered_evidence_rate_threshold=float(getattr(drift_cfg, "uncovered_evidence_rate_threshold", 0.35)),
+            persistence_windows=int(getattr(drift_cfg, "persistence_windows", 3)),
+        )
+        self.previous_quality_frame = None
 
         self.resource_trigger: ResourceAwareCLTrigger | None = None
         self._cloud_state: CloudResourceState | None = None
@@ -116,9 +132,12 @@ class EdgeWorker:
         self.model_id = getattr(self.small_object_detection, "model_name", "edge-model")
         self.model_version = "0"
         self.bundle_cache_path = os.path.join(self.config.retrain.cache_path, "server_bundle")
-        self.sample_confidence_threshold = self._resolve_sample_confidence_threshold(
-            config,
-            self.resource_trigger,
+        self.min_low_quality_samples = int(
+            getattr(
+                self.config.retrain,
+                "min_low_quality_samples",
+                getattr(self.config.retrain, "collect_num", 1),
+            )
         )
         self.training_poll_interval_sec = self._resolve_training_poll_interval(config)
         self.training_not_found_grace_sec = self._resolve_training_not_found_grace(config)
@@ -357,8 +376,7 @@ class EdgeWorker:
     def _make_training_decision(
         self,
         *,
-        confidence: float,
-        drift_detected: bool,
+        drift_state: DriftWindowState,
         stats: PendingTrainingStats,
     ) -> TrainingDecision:
         if self.resource_trigger_enabled and self.resource_trigger is not None:
@@ -371,8 +389,7 @@ class EdgeWorker:
                     )
                 bandwidth_mbps = estimate_bandwidth(self.config.server_ip)
                 return self.resource_trigger.decide(
-                    avg_confidence=confidence,
-                    drift_detected=drift_detected,
+                    drift_detected=drift_state.drift_detected,
                     cloud_state=self._cloud_state,
                     bandwidth_mbps=bandwidth_mbps,
                     sample_stats=stats,
@@ -381,8 +398,8 @@ class EdgeWorker:
                 logger.warning("Resource-aware trigger decision failed: {}", exc)
 
         should_train = (
-            stats.total_samples >= max(1, int(getattr(self.config.retrain, "collect_num", 1)))
-            or drift_detected
+            stats.low_quality_count >= max(1, int(getattr(self, "min_low_quality_samples", 1)))
+            or drift_state.drift_detected
         )
         return TrainingDecision(
             train_now=bool(should_train),
@@ -397,28 +414,53 @@ class EdgeWorker:
                     33554432,
                 )
             ),
-            reason="Fallback trigger without low-confidence feature upload.",
+            reason="Fallback trigger using low-quality sample count and window drift.",
         )
 
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> None:
         confidence = float(inference.confidence)
-        observation = {
-            "confidence": confidence,
-            "proposal_count": int(getattr(inference, "proposal_count", 0) or 0),
-            "retained_count": int(getattr(inference, "retained_count", 0) or 0),
+        candidate_builder = getattr(self, "candidate_builder", CandidateEvidenceBuilder())
+        motion_extractor = getattr(self, "motion_extractor", MotionEvidenceExtractor())
+        track_manager = getattr(self, "track_manager", TrackEvidenceManager())
+        quality_assessor = getattr(self, "quality_assessor", QualityAssessor())
+        window_detector = getattr(self, "window_drift_detector", WindowDriftDetector())
+
+        candidate_evidence = candidate_builder.build(
+            boxes=inference.low_threshold_boxes,
+            labels=inference.low_threshold_labels,
+            scores=inference.low_threshold_scores,
+            image_shape=frame.shape,
+            model_name=self.model_id,
+        )
+        motion_evidence = motion_extractor.extract(
+            getattr(self, "previous_quality_frame", None),
+            frame,
+        )
+        track_evidence = track_manager.update_and_get_missing_evidence(
+            final_boxes=inference.final_detection_boxes,
+            final_labels=inference.final_detection_labels,
+            final_scores=inference.final_detection_scores,
+            image_shape=frame.shape,
+        )
+        quality = quality_assessor.assess(
+            final_boxes=inference.final_detection_boxes,
+            final_labels=inference.final_detection_labels,
+            final_scores=inference.final_detection_scores,
+            candidate_evidence=candidate_evidence,
+            motion_evidence=motion_evidence,
+            track_evidence=track_evidence,
+        )
+        drift_state = window_detector.update(
+            quality,
+            feature_stats={
             "feature_spectral_entropy": getattr(inference, "feature_spectral_entropy", None),
             "logit_entropy": getattr(inference, "logit_entropy", None),
             "logit_margin": getattr(inference, "logit_margin", None),
             "logit_energy": getattr(inference, "logit_energy", None),
-        }
-        quality = self.drift_detector.assess_sample_quality(observation)
-        drift_detected = self.drift_detector.update(observation)
-        confidence_bucket = (
-            LOW_CONFIDENCE
-            if quality["quality_bucket"] == "low_quality"
-            else HIGH_CONFIDENCE
+            },
         )
-        save_raw = confidence_bucket == LOW_CONFIDENCE or drift_detected
+        self.previous_quality_frame = frame.copy()
+        save_raw = quality.quality_bucket == LOW_QUALITY
         sample_id = self._next_sample_id(task)
         retrain_cfg = getattr(getattr(self, "config", None), "retrain", None)
         self.sample_store.store_sample(
@@ -428,12 +470,21 @@ class EdgeWorker:
             split_config_id=self.fixed_split_plan.split_config_id,
             model_id=self.model_id,
             model_version=self.model_version,
-            confidence_bucket=confidence_bucket,
-            quality_score=float(quality["quality_score"]),
-            quality_bucket=str(quality["quality_bucket"]),
+            quality_bucket=quality.quality_bucket,
+            quality_score=quality.quality_score,
+            risk_score=quality.risk_score,
+            risk_reasons=quality.risk_reasons,
+            evidence_count=quality.evidence_count,
+            covered_evidence_count=quality.covered_evidence_count,
+            uncovered_evidence_count=quality.uncovered_evidence_count,
+            uncovered_evidence_rate=quality.uncovered_evidence_rate,
+            candidate_uncovered_score=quality.candidate_uncovered_score,
+            motion_uncovered_score=quality.motion_uncovered_score,
+            track_uncovered_score=quality.track_uncovered_score,
+            window_id=quality.window_id,
+            in_drift_window=quality.in_drift_window,
             inference_result=inference.to_inference_result(),
             intermediate=inference.intermediate,
-            drift_flag=drift_detected,
             raw_frame=frame if save_raw else None,
             raw_jpeg_quality=int(getattr(retrain_cfg, "raw_jpeg_quality", 82)),
             input_image_size=list(frame.shape[:2]),
@@ -445,9 +496,9 @@ class EdgeWorker:
             return
 
         stats = PendingTrainingStats.from_mapping(self.sample_store.stats())
+        stats.drift_detected = bool(drift_state.drift_detected)
         decision = self._make_training_decision(
-            confidence=confidence,
-            drift_detected=drift_detected,
+            drift_state=drift_state,
             stats=stats,
         )
         if decision.train_now and stats.total_samples > 0:
@@ -456,8 +507,9 @@ class EdgeWorker:
             self.collect_flag = False
             self._retrain_requested.set()
             logger.info(
-                "Continual learning triggered (samples={}, send_low_conf_features={}, reason={})",
+                "Continual learning triggered (samples={}, low_quality={}, send_low_conf_features={}, reason={})",
                 stats.total_samples,
+                stats.low_quality_count,
                 decision.send_low_conf_features,
                 decision.reason,
             )
@@ -629,7 +681,9 @@ class EdgeWorker:
                         self.small_object_detection.refresh_thresholds_from_model()
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
-                    self.drift_detector.reset()
+                    self.window_drift_detector.reset()
+                    self.track_manager.reset()
+                    self.previous_quality_frame = None
                     if terminal_message:
                         logger.success(
                             "Edge model updated from cloud successfully "
@@ -750,9 +804,9 @@ class EdgeWorker:
             )
 
             task.add_result(
-                inference.detection_boxes or None,
-                inference.detection_class or None,
-                inference.detection_score or None,
+                inference.final_detection_boxes or None,
+                inference.final_detection_labels or None,
+                inference.final_detection_scores or None,
             )
 
             if (

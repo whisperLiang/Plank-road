@@ -1,4 +1,4 @@
-"""Pure-edge local updating baseline.
+﻿"""Pure-edge local updating baseline.
 
 Each device performs both inference and retraining locally. No data is
 uploaded to the central server and no central retraining is invoked.
@@ -74,7 +74,7 @@ class PureEdgeLocalUpdating(BaseMethod):
             proxy_map=result.proxy_map,
         )
         window = self._get_window(result.device_id)
-        window.update(result.confidence, result.drift_flag)
+        window.update(result.confidence, result.in_drift_window)
         self._sample_counts[result.device_id] += 1
 
     def should_trigger(self, device_id: int) -> bool:
@@ -108,7 +108,7 @@ class PureEdgeLocalUpdating(BaseMethod):
         dev.record_trigger(plan.trigger_reason)
         self._triggered[plan.device_id] = True
 
-        # No queue or upload — purely local
+        # No queue or upload 鈥?purely local
         # 0 queue length for central server
         self.metrics.record_queue_length(0)
 
@@ -147,3 +147,4 @@ class PureEdgeLocalUpdating(BaseMethod):
         self._sample_counts[plan.device_id] = 0
         self._triggered[plan.device_id] = False
         self._get_window(plan.device_id).reset()
+

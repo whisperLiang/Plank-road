@@ -1,4 +1,4 @@
-"""Ekya-style centralized scheduling baseline.
+﻿"""Ekya-style centralized scheduling baseline.
 
 This baseline is a closer simulation of Ekya's core runtime semantics
 from the NSDI 2022 paper and the public ``edge-video-services/ekya``
@@ -232,7 +232,7 @@ class EkyaStyleCentralizedScheduling(BaseMethod):
         )
 
         window = self._get_window(result.device_id)
-        window.update(result.confidence, result.drift_flag)
+        window.update(result.confidence, result.in_drift_window)
         self._sample_counts[result.device_id] += 1
 
     def should_trigger(self, device_id: int) -> bool:
@@ -327,3 +327,4 @@ class EkyaStyleCentralizedScheduling(BaseMethod):
         self._retrain_rounds[plan.device_id] += 1
         if self._retrain_queue:
             self._retrain_queue.popleft()
+

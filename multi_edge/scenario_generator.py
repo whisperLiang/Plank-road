@@ -1,4 +1,4 @@
-"""Scenario generator for multi-device experiments.
+﻿"""Scenario generator for multi-device experiments.
 
 Generates per-device profiles and synthetic inference streams that
 simulate varying drift severity, bandwidth constraints, and local
@@ -14,7 +14,7 @@ from typing import Any
 from baselines.base_method import InferenceResult
 
 
-# ── Profile value tables ─────────────────────────────────────────────
+# 鈹€鈹€ Profile value tables 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 # Maps profile names to numeric parameters used by the simulation.
 # These are intentionally simple approximations, not realistic models.
@@ -198,9 +198,9 @@ class ScenarioGenerator:
                 eff_drop = drift_drop
 
             # Simulate confidence + drift
-            drift_flag = self.rng.random() < eff_drift_prob
+            in_drift_window = self.rng.random() < eff_drift_prob
             noise = self.rng.gauss(0.0, eff_noise)
-            confidence = max(0.0, min(1.0, eff_conf + noise - (eff_drop if drift_flag else 0.0)))
+            confidence = max(0.0, min(1.0, eff_conf + noise - (eff_drop if in_drift_window else 0.0)))
 
             # Proxy mAP correlates loosely with confidence
             proxy_map = max(0.0, min(1.0, confidence * 0.9 + self.rng.gauss(0.0, 0.05)))
@@ -214,8 +214,9 @@ class ScenarioGenerator:
                 confidence=confidence,
                 proxy_map=proxy_map,
                 latency_ms=latency_ms,
-                drift_flag=drift_flag,
+                in_drift_window=in_drift_window,
                 num_detections=max(0, int(5 + self.rng.gauss(0, 2))),
             ))
 
         return results
+
