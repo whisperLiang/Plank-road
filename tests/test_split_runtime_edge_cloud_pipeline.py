@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
+from ariadne.runtime.boundary import BoundaryTensorSpec
 
 from model_management.payload import deserialize_boundary_payload, serialize_boundary_payload
 from model_management.split_runtime import (
@@ -15,6 +16,7 @@ from model_management.split_runtime import (
     prepare_split_runtime,
     run_batch_suffix,
     train_batch_suffix,
+    validate_boundary_payload,
 )
 from model_management.split_runtime.template import (
     FixedSplitRuntimeTemplate,
@@ -132,6 +134,49 @@ def test_boundary_payload_roundtrip_preserves_schema():
     assert roundtripped.schema == boundary.schema
     assert roundtripped.requires_grad == boundary.requires_grad
     runtime.validate_boundary(roundtripped)
+
+
+def test_boundary_validation_remaps_equivalent_labels_before_check():
+    class Runtime:
+        split_id = "after:patch"
+        graph_signature = "cloud-graph"
+        candidate = type(
+            "Candidate",
+            (),
+            {
+                "boundary_schema": {
+                    "node_73": BoundaryTensorSpec(
+                        label="node_73",
+                        symbolic_shape=("B", 4),
+                        dtype="torch.float32",
+                        requires_grad=False,
+                        device_type="cpu",
+                    ),
+                }
+            },
+        )()
+        trace_plan = None
+
+        def validate_boundary(self, boundary):
+            self.boundary = boundary
+            assert boundary.graph_signature == "cloud-graph"
+            assert list(boundary.tensors) == ["node_73"]
+
+    runtime = Runtime()
+    boundary = BoundaryPayload(
+        split_id="after:patch",
+        graph_signature="edge-graph",
+        batch_size=1,
+        tensors={"node_13": torch.ones(1, 4)},
+        schema={},
+        requires_grad={"node_13": False},
+        weight_version=None,
+        passthrough_inputs={},
+    )
+
+    validate_boundary_payload(runtime, boundary)
+
+    assert runtime.boundary.tensors["node_73"].shape == (1, 4)
 
 
 def test_yolo_cross_batch_split_replay():

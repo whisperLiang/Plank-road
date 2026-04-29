@@ -326,9 +326,8 @@ def reconstruct_candidate_from_descriptor(
 class UniversalModelSplitter:
     """Thin Plank-road facade over Ariadne SplitRuntime.
 
-    This class intentionally does not own a graph replay engine. It keeps the
-    older orchestration entry points where the surrounding code still calls
-    them, but every runtime operation delegates to Ariadne.
+    This class intentionally does not own a graph replay engine; runtime
+    operations delegate to Ariadne.
     """
 
     def __init__(self, *, device: str | torch.device = "cpu") -> None:
@@ -454,15 +453,6 @@ class UniversalModelSplitter:
         self.candidates = [self.current_candidate]
         self._trace_sample_input = sample_input
         return self
-
-    def trace_graph(
-        self,
-        model: torch.nn.Module,
-        sample_input: Any,
-        sample_kwargs: Mapping[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> "UniversalModelSplitter":
-        return self.trace(model, sample_input, sample_kwargs=sample_kwargs, **kwargs)
 
     def bind_runtime(
         self,
@@ -846,6 +836,126 @@ def load_split_feature_cache(cache_path: str, frame_index: Any) -> dict[str, Any
     return record
 
 
+def _combine_boundary_values(values: list[Any]) -> Any:
+    first = values[0]
+    if all(isinstance(value, torch.Tensor) for value in values):
+        tensors = [value for value in values if isinstance(value, torch.Tensor)]
+        if all(tensor.ndim > 0 for tensor in tensors):
+            return torch.cat(tensors, dim=0)
+        return torch.stack(tensors, dim=0)
+    if all(isinstance(value, dict) for value in values):
+        keys = list(first.keys())
+        if not all(list(value.keys()) == keys for value in values if isinstance(value, dict)):
+            raise RuntimeError("Cannot batch BoundaryPayload dictionaries with different keys.")
+        return {
+            key: _combine_boundary_values([value[key] for value in values])
+            for key in keys
+        }
+    if all(isinstance(value, tuple) for value in values):
+        length = len(first)
+        if not all(len(value) == length for value in values if isinstance(value, tuple)):
+            raise RuntimeError("Cannot batch BoundaryPayload tuples with different lengths.")
+        return tuple(
+            _combine_boundary_values([value[index] for value in values])
+            for index in range(length)
+        )
+    if all(isinstance(value, list) for value in values):
+        length = len(first)
+        if not all(len(value) == length for value in values if isinstance(value, list)):
+            raise RuntimeError("Cannot batch BoundaryPayload lists with different lengths.")
+        return [
+            _combine_boundary_values([value[index] for value in values])
+            for index in range(length)
+        ]
+    try:
+        if all(value == first for value in values):
+            return first
+    except Exception:
+        pass
+    return list(values)
+
+
+def _compatible_boundary_tensor(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    if str(lhs.dtype) != str(rhs.dtype):
+        return False
+    if lhs.ndim != rhs.ndim:
+        return False
+    if lhs.ndim == 0:
+        return True
+    return tuple(lhs.shape[1:]) == tuple(rhs.shape[1:])
+
+
+def _map_boundary_tensors_to_labels(
+    boundary: BoundaryPayload,
+    target_tensors: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    source_tensors = dict(boundary.tensors)
+    used_labels: set[str] = set()
+    mapped: dict[str, torch.Tensor] = {}
+    for target_label, target_tensor in target_tensors.items():
+        source_label = target_label if target_label in source_tensors else None
+        if source_label is None:
+            for candidate_label, candidate_tensor in source_tensors.items():
+                if candidate_label in used_labels:
+                    continue
+                if _compatible_boundary_tensor(candidate_tensor, target_tensor):
+                    source_label = candidate_label
+                    break
+        if source_label is None:
+            raise RuntimeError(
+                "Cannot batch BoundaryPayload records with incompatible tensor labels."
+            )
+        source_tensor = source_tensors[source_label]
+        if not _compatible_boundary_tensor(source_tensor, target_tensor):
+            raise RuntimeError(
+                "Cannot batch BoundaryPayload records with incompatible tensor shapes."
+            )
+        used_labels.add(source_label)
+        mapped[target_label] = source_tensor
+    return mapped
+
+
+def _combine_boundary_payload_batch(
+    boundaries: list[BoundaryPayload],
+    *,
+    expected_batch_size: int,
+) -> BoundaryPayload:
+    first = boundaries[0]
+    if int(first.batch_size) == int(expected_batch_size):
+        return first
+    if not all(int(boundary.batch_size) == 1 for boundary in boundaries):
+        raise RuntimeError(
+            "Cached BoundaryPayload batch size does not match training batch "
+            f"(payload_batch={first.batch_size}, requested_batch={expected_batch_size})."
+        )
+    labels = list(first.tensors.keys())
+    for boundary in boundaries[1:]:
+        if boundary.split_id != first.split_id:
+            raise RuntimeError("Cannot batch BoundaryPayload records from different split ids.")
+        _map_boundary_tensors_to_labels(boundary, first.tensors)
+    mapped_boundaries = [
+        _map_boundary_tensors_to_labels(boundary, first.tensors)
+        for boundary in boundaries
+    ]
+    return BoundaryPayload(
+        split_id=first.split_id,
+        graph_signature=first.graph_signature,
+        batch_size=int(expected_batch_size),
+        tensors={
+            label: _combine_boundary_values(
+                [mapped_tensors[label] for mapped_tensors in mapped_boundaries]
+            )
+            for label in labels
+        },
+        schema=dict(first.schema),
+        requires_grad=dict(first.requires_grad),
+        weight_version=first.weight_version,
+        passthrough_inputs=_combine_boundary_values(
+            [dict(boundary.passthrough_inputs or {}) for boundary in boundaries]
+        ),
+    )
+
+
 def universal_split_retrain(
     *,
     model: torch.nn.Module,
@@ -881,15 +991,12 @@ def universal_split_retrain(
                 isinstance(boundary, BoundaryPayload) for boundary in boundaries
             ):
                 raise RuntimeError(
-                    "Split-tail training requires cached batch BoundaryPayload records; "
-                    "per-sample payload batching is intentionally unsupported."
+                    "Split-tail training requires cached BoundaryPayload records."
                 )
-            boundary = boundaries[0]
-            if int(boundary.batch_size) != len(batch_indices):
-                raise RuntimeError(
-                    "Cached BoundaryPayload batch size does not match training batch "
-                    f"(payload_batch={boundary.batch_size}, requested_batch={len(batch_indices)})."
-                )
+            boundary = _combine_boundary_payload_batch(
+                boundaries,
+                expected_batch_size=len(batch_indices),
+            )
             targets = [annotations.get(index) for index in batch_indices]
             loss, _grads = runtime.train_suffix(
                 boundary,

@@ -1,6 +1,6 @@
 # Plank-Road
 
-Plank-Road is a distributed edge-cloud video analytics system with drift-aware continual learning and graph-based split execution.
+Plank-Road is a distributed edge-cloud video analytics system with drift-aware continual learning and Ariadne-based split execution.
 
 The current implementation uses a fixed split plan that is computed once at startup, structured edge-local sample storage, and a versioned upload contract for continual learning.
 
@@ -32,8 +32,8 @@ The edge no longer uses normal cloud inference offloading as a branch after filt
 The split point combination is fixed for a given model and constraint pair.
 
 At startup, the edge:
-- traces the model graph with TorchLens
-- enumerates legal graph-cut candidates
+- prepares an Ariadne split runtime
+- enumerates Ariadne frontier candidates
 - validates replayability
 - selects the candidate that minimizes intermediate feature size
 - enforces:
@@ -46,8 +46,7 @@ Runtime inference does not adaptively switch split points.
 Core files:
 - [model_management/fixed_split.py](./model_management/fixed_split.py)
 - [model_management/universal_model_split.py](./model_management/universal_model_split.py)
-- [model_management/split_runtime.py](./model_management/split_runtime.py)
-- [model_management/candidate_generator.py](./model_management/candidate_generator.py)
+- [model_management/split_runtime/](./model_management/split_runtime/)
 - [model_management/candidate_profiler.py](./model_management/candidate_profiler.py)
 - [model_management/split_candidate.py](./model_management/split_candidate.py)
 
@@ -148,12 +147,11 @@ Plank-road/
 │   ├── activation_sparsity.py
 │   ├── continual_learning_bundle.py
 │   ├── fixed_split.py
-│   ├── graph_ir.py
+│   ├── fixed_split_runtime_template.py
 │   ├── split_candidate.py
 │   ├── payload.py
-│   ├── candidate_generator.py
 │   ├── candidate_profiler.py
-│   ├── split_runtime.py
+│   ├── split_runtime/
 │   ├── universal_model_split.py
 │   ├── object_detection.py
 │   └── model_zoo.py
@@ -164,7 +162,8 @@ Plank-road/
 
 ### Recommended Environment
 
-The graph-based split runtime has been validated with:
+The Ariadne split runtime has been validated with:
+- `ariadne-split==0.1.0`
 - `torchlens==1.0.1`
 - `numpy==1.26.4`
 - `opencv-python==4.11.0.86`

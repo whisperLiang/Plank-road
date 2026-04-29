@@ -10,7 +10,7 @@ from typing import Any, Iterable
 import cv2
 import torch
 
-from model_management.payload import SplitPayload
+from model_management.payload import BoundaryPayload, SplitPayload
 
 
 HIGH_CONFIDENCE = "high_confidence"
@@ -30,9 +30,42 @@ def _from_relpath(root_dir: str, relpath: str | None) -> str | None:
     return os.path.join(root_dir, relpath.replace("/", os.sep))
 
 
-def _normalise_payload(intermediate: SplitPayload | torch.Tensor | dict[str, torch.Tensor]) -> SplitPayload:
+def _detach_cpu_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _detach_cpu_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_detach_cpu_value(item) for item in value)
+    if isinstance(value, list):
+        return [_detach_cpu_value(item) for item in value]
+    return value
+
+
+def _normalise_boundary_payload(intermediate: BoundaryPayload) -> BoundaryPayload:
+    tensors = {
+        str(key): value.detach().cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in dict(getattr(intermediate, "tensors", {}) or {}).items()
+    }
+    return BoundaryPayload(
+        split_id=str(intermediate.split_id),
+        graph_signature=str(intermediate.graph_signature),
+        batch_size=int(intermediate.batch_size),
+        tensors=tensors,
+        schema=dict(intermediate.schema),
+        requires_grad=dict(intermediate.requires_grad),
+        weight_version=intermediate.weight_version,
+        passthrough_inputs=_detach_cpu_value(dict(intermediate.passthrough_inputs or {})),
+    )
+
+
+def _normalise_payload(
+    intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
+) -> BoundaryPayload:
     if isinstance(intermediate, SplitPayload):
         return intermediate.detach().cpu()
+    if isinstance(intermediate, BoundaryPayload):
+        return _normalise_boundary_payload(intermediate)
     if isinstance(intermediate, torch.Tensor):
         return SplitPayload.from_mapping({"payload": intermediate.detach().cpu()}, primary_label="payload")
     detached = {
@@ -188,7 +221,7 @@ class EdgeSampleStore:
         quality_score: float | None = None,
         quality_bucket: str | None = None,
         inference_result: dict[str, Any],
-        intermediate: SplitPayload | torch.Tensor | dict[str, torch.Tensor],
+        intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
         drift_flag: bool = False,
         raw_frame: Any | None = None,
         timestamp: str | None = None,
@@ -304,11 +337,11 @@ class EdgeSampleStore:
         with open(result_path, "r", encoding="utf-8") as handle:
             return json.load(handle)
 
-    def load_intermediate(self, record: StoredSampleRecord) -> SplitPayload:
+    def load_intermediate(self, record: StoredSampleRecord) -> BoundaryPayload:
         feature_path = _from_relpath(self.root_dir, record.feature_relpath)
         payload = torch.load(feature_path, map_location="cpu", weights_only=False)
         intermediate = payload.get("intermediate")
-        if isinstance(intermediate, SplitPayload):
+        if isinstance(intermediate, BoundaryPayload):
             return intermediate
         if isinstance(intermediate, dict):
             return SplitPayload.from_mapping(intermediate)

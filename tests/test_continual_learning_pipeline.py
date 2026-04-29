@@ -1,4 +1,3 @@
-import inspect
 import io
 import json
 import time
@@ -6,38 +5,29 @@ import zipfile
 from collections import OrderedDict
 from types import SimpleNamespace
 
+import cv2
 import pytest
 import torch
 
-import model_management.continual_learning_bundle as continual_learning_bundle
 from edge.sample_store import EdgeSampleStore, HIGH_CONFIDENCE, LOW_CONFIDENCE
 from edge.transmit import pack_continual_learning_bundle
-from model_management.candidate_generator import (
-    solve_best_candidate_exact,
-    solve_exact_candidates,
-)
-from model_management.fixed_split_artifacts import (
-    FIXED_SPLIT_EXACT_META_VERSION,
-    atomic_write_json,
-    atomic_write_torch,
-    build_graph_artifact_payload,
-    model_structure_fingerprint,
-    sample_input_signature,
-)
+import model_management.continual_learning_bundle as continual_learning_bundle
 from model_management.fixed_split import (
     compute_fixed_split_for_model,
     SplitConstraints,
     SplitPlan,
     apply_split_plan,
     load_or_compute_fixed_split_plan,
+    persist_split_plan,
 )
-from model_management.payload import SplitPayload
+from model_management.payload import BoundaryPayload, SplitPayload, boundary_payload_from_tensors
 from model_management.continual_learning_bundle import prepare_split_training_cache
-from model_management.graph_ir import GraphIR, GraphNode, ParameterTensorRef, TreeSpec
 from model_management.split_candidate import SplitCandidate
 from model_management.universal_model_split import (
     UniversalModelSplitter,
     load_split_feature_cache,
+    save_split_feature_cache,
+    universal_split_retrain,
 )
 
 
@@ -67,260 +57,6 @@ def _dummy_plan() -> SplitPlan:
             "max_payload_bytes": 32 * 1024 * 1024,
         },
         trace_signature="sig",
-    )
-
-
-def _graph_node(
-    label: str,
-    *,
-    parents: list[str],
-    children: list[str],
-    estimated_bytes: int,
-    parameter_refs: list[ParameterTensorRef],
-    trainable: bool,
-    index: int,
-    is_input: bool = False,
-    is_output: bool = False,
-) -> GraphNode:
-    return GraphNode(
-        label=label,
-        node_type="input" if is_input else ("output" if is_output else "operation"),
-        func_name="none",
-        func=None,
-        parent_labels=parents,
-        child_labels=children,
-        parent_arg_locations={"args": {}, "kwargs": {}},
-        arg_template=[],
-        kwarg_template={},
-        non_tensor_args={},
-        parameter_refs=parameter_refs,
-        buffer_refs=[],
-        input_output_address=None,
-        containing_module=None,
-        containing_modules=[],
-        is_input=is_input,
-        is_output=is_output,
-        is_inplace=False,
-        is_multi_output=False,
-        multi_output_index=None,
-        aggregation_kind=None,
-        indexing_metadata=None,
-        tensor_shape=(1,),
-        tensor_dtype=torch.float32,
-        numel=1,
-        estimated_bytes=estimated_bytes,
-        estimated_flops=1.0,
-        has_trainable_params=trainable,
-        topological_index=index,
-    )
-
-
-def _shared_optimum_graph() -> GraphIR:
-    signature = inspect.signature(lambda input_1: input_1)
-    dummy_spec = TreeSpec(kind="const", value=None)
-    nodes = OrderedDict(
-        [
-            (
-                "input_1",
-                _graph_node(
-                    "input_1",
-                    parents=[],
-                    children=["left", "right"],
-                    estimated_bytes=1,
-                    parameter_refs=[],
-                    trainable=False,
-                    index=0,
-                    is_input=True,
-                ),
-            ),
-            (
-                "left",
-                _graph_node(
-                    "left",
-                    parents=["input_1"],
-                    children=["merge"],
-                    estimated_bytes=5,
-                    parameter_refs=[ParameterTensorRef("", "p_left", "p_left")],
-                    trainable=True,
-                    index=1,
-                ),
-            ),
-            (
-                "right",
-                _graph_node(
-                    "right",
-                    parents=["input_1"],
-                    children=["merge"],
-                    estimated_bytes=5,
-                    parameter_refs=[ParameterTensorRef("", "p_right", "p_right")],
-                    trainable=True,
-                    index=2,
-                ),
-            ),
-            (
-                "merge",
-                _graph_node(
-                    "merge",
-                    parents=["left", "right"],
-                    children=["output_1"],
-                    estimated_bytes=1,
-                    parameter_refs=[],
-                    trainable=True,
-                    index=3,
-                ),
-            ),
-            (
-                "output_1",
-                _graph_node(
-                    "output_1",
-                    parents=["merge"],
-                    children=[],
-                    estimated_bytes=1,
-                    parameter_refs=[],
-                    trainable=False,
-                    index=4,
-                    is_output=True,
-                ),
-            ),
-        ]
-    )
-    return GraphIR(
-        nodes=nodes,
-        input_labels=["input_1"],
-        output_labels=["output_1"],
-        topological_order=list(nodes.keys()),
-        relevant_labels=list(nodes.keys()),
-        input_spec=dummy_spec,
-        output_spec=dummy_spec,
-        input_address_to_label={},
-        output_address_to_label={},
-        forward_signature=signature,
-        sample_args=(torch.tensor([0.0]),),
-        sample_kwargs={},
-        sample_input_spec=dummy_spec,
-        sample_output_spec=dummy_spec,
-        parameter_numels={"p_left": 1, "p_right": 1},
-        total_parameter_numel=2,
-    )
-
-
-def _non_prefix_optimum_graph() -> GraphIR:
-    signature = inspect.signature(lambda input_1: input_1)
-    dummy_spec = TreeSpec(kind="const", value=None)
-    parameter_numels = {
-        "p_left_1": 40,
-        "p_left_2": 40,
-        "p_right_1": 1,
-        "p_right_2": 1,
-        "p_merge": 1,
-    }
-    nodes = OrderedDict(
-        [
-            (
-                "input_1",
-                _graph_node(
-                    "input_1",
-                    parents=[],
-                    children=["left_1", "right_1"],
-                    estimated_bytes=1,
-                    parameter_refs=[],
-                    trainable=False,
-                    index=0,
-                    is_input=True,
-                ),
-            ),
-            (
-                "left_1",
-                _graph_node(
-                    "left_1",
-                    parents=["input_1"],
-                    children=["left_2"],
-                    estimated_bytes=1,
-                    parameter_refs=[ParameterTensorRef("", "p_left_1", "p_left_1")],
-                    trainable=True,
-                    index=1,
-                ),
-            ),
-            (
-                "right_1",
-                _graph_node(
-                    "right_1",
-                    parents=["input_1"],
-                    children=["right_2"],
-                    estimated_bytes=100,
-                    parameter_refs=[ParameterTensorRef("", "p_right_1", "p_right_1")],
-                    trainable=True,
-                    index=2,
-                ),
-            ),
-            (
-                "left_2",
-                _graph_node(
-                    "left_2",
-                    parents=["left_1"],
-                    children=["merge"],
-                    estimated_bytes=1,
-                    parameter_refs=[ParameterTensorRef("", "p_left_2", "p_left_2")],
-                    trainable=True,
-                    index=3,
-                ),
-            ),
-            (
-                "right_2",
-                _graph_node(
-                    "right_2",
-                    parents=["right_1"],
-                    children=["merge"],
-                    estimated_bytes=100,
-                    parameter_refs=[ParameterTensorRef("", "p_right_2", "p_right_2")],
-                    trainable=True,
-                    index=4,
-                ),
-            ),
-            (
-                "merge",
-                _graph_node(
-                    "merge",
-                    parents=["left_2", "right_2"],
-                    children=["output_1"],
-                    estimated_bytes=1,
-                    parameter_refs=[ParameterTensorRef("", "p_merge", "p_merge")],
-                    trainable=True,
-                    index=5,
-                ),
-            ),
-            (
-                "output_1",
-                _graph_node(
-                    "output_1",
-                    parents=["merge"],
-                    children=[],
-                    estimated_bytes=1,
-                    parameter_refs=[],
-                    trainable=False,
-                    index=6,
-                    is_output=True,
-                ),
-            ),
-        ]
-    )
-    return GraphIR(
-        nodes=nodes,
-        input_labels=["input_1"],
-        output_labels=["output_1"],
-        topological_order=list(nodes.keys()),
-        relevant_labels=list(nodes.keys()),
-        input_spec=dummy_spec,
-        output_spec=dummy_spec,
-        input_address_to_label={},
-        output_address_to_label={},
-        forward_signature=signature,
-        sample_args=(torch.tensor([0.0]),),
-        sample_kwargs={},
-        sample_input_spec=dummy_spec,
-        sample_output_spec=dummy_spec,
-        parameter_numels=parameter_numels,
-        total_parameter_numel=sum(parameter_numels.values()),
     )
 
 
@@ -419,176 +155,6 @@ def test_fixed_split_is_computed_once_and_reused(tmp_path, monkeypatch):
     assert validation_calls["count"] == 1
 
 
-def test_load_or_compute_fixed_split_plan_reuses_cached_graph_artifact(tmp_path, monkeypatch):
-    graph = _shared_optimum_graph()
-    model = torch.nn.Linear(1, 1)
-    sample_input = [torch.rand(1)]
-    cache_path = str(tmp_path / "fixed_split_plan.json")
-    persisted_plan = SplitPlan(
-        split_config_id="plan-graph-cache",
-        model_name="dummy-model",
-        candidate_id="candidate-left",
-        split_index=1,
-        split_label="left",
-        boundary_tensor_labels=["left"],
-        payload_bytes=5,
-        privacy_metric=1.0,
-        privacy_risk=1.0,
-        layer_freezing_ratio=0.5,
-        trace_signature="sig",
-        constraints={
-            "privacy_leakage_upper_bound": 0.0,
-            "privacy_leakage_epsilon": 1e-12,
-            "privacy_min_edge_parameter_count": 0,
-            "max_layer_freezing_ratio": 1.0,
-            "validate_candidates": True,
-            "max_candidates": 24,
-            "max_boundary_count": 8,
-            "max_payload_bytes": 32 * 1024 * 1024,
-        },
-    )
-    atomic_write_json(cache_path, persisted_plan.to_dict())
-    artifact_paths = tmp_path / "fixed_split_runtime_graph.pt"
-    atomic_write_torch(
-        str(artifact_paths),
-        build_graph_artifact_payload(
-            graph=graph,
-            trace_signature="sig",
-            model_fingerprint=model_structure_fingerprint(model),
-            sample_signature_value=sample_input_signature(sample_input, None),
-            trace_timings={"graph_build": 0.01},
-        ),
-    )
-
-    candidate = SplitCandidate(
-        candidate_id="candidate-left",
-        edge_nodes=["input_1", "left"],
-        cloud_nodes=["right", "merge", "output_1"],
-        boundary_edges=[("left", "merge"), ("input_1", "right")],
-        boundary_tensor_labels=["input_1", "left"],
-        edge_input_labels=["input_1"],
-        cloud_input_labels=[],
-        cloud_output_labels=["output_1"],
-        estimated_edge_flops=1.0,
-        estimated_cloud_flops=1.0,
-        estimated_payload_bytes=6,
-        estimated_privacy_risk=1.0,
-        estimated_latency=1.0,
-        is_trainable_tail=True,
-        legacy_layer_index=1,
-        boundary_count=2,
-    )
-
-    class DummySplitter:
-        def __init__(self):
-            self.graph = None
-            self.model = None
-            self.bind_calls = 0
-            self.trace_graph_calls = 0
-
-        def bind_graph(self, model, graph, **kwargs):
-            self.model = model
-            self.graph = graph
-            self.bind_calls += 1
-            self.trace_timings = dict(kwargs.get("trace_timings") or {})
-            return self
-
-        def trace_graph(self, model, sample_input, sample_kwargs=None):
-            self.trace_graph_calls += 1
-            raise AssertionError("trace_graph should not run when the graph artifact matches")
-
-        def split(self, **kwargs):
-            return candidate
-
-        def validate_candidate(self, chosen):
-            return {"success": True, "tail_trainability": True}
-
-    monkeypatch.setattr("model_management.fixed_split._trace_signature", lambda splitter: "sig")
-    monkeypatch.setattr(
-        "model_management.fixed_split.compute_fixed_split_for_model",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("compute_fixed_split_for_model should not run for a valid cached plan")
-        ),
-    )
-
-    splitter = DummySplitter()
-    plan = load_or_compute_fixed_split_plan(
-        model,
-        SplitConstraints(),
-        sample_input=sample_input,
-        splitter=splitter,
-        cache_path=cache_path,
-        model_name="dummy-model",
-    )
-
-    assert plan.split_config_id == "plan-graph-cache"
-    assert splitter.bind_calls == 1
-    assert splitter.trace_graph_calls == 0
-
-
-def test_compute_fixed_split_uses_previous_exact_metadata_as_warm_start(tmp_path, monkeypatch):
-    graph = _shared_optimum_graph()
-    model = torch.nn.Linear(1, 1)
-    sample_input = [torch.rand(1)]
-    cache_path = str(tmp_path / "fixed_split_plan.json")
-
-    class DummyRuntime:
-        def __init__(self):
-            self.graph = graph
-            self.model = model
-            self.trace_timings = {}
-
-        def _ensure_ready(self):
-            return self.model, self.graph
-
-    warm_summary = {
-        "candidate_id": "candidate-left",
-        "edge_nodes": ["input_1", "left"],
-        "boundary_tensor_labels": ["input_1", "left"],
-        "split_index": 1,
-    }
-    atomic_write_json(
-        str(tmp_path / "fixed_split_exact_meta.json"),
-        {
-            "artifact_version": FIXED_SPLIT_EXACT_META_VERSION,
-            "trace_signature": "sig",
-            "model_structure_fingerprint": model_structure_fingerprint(model),
-            "sample_input_signature": sample_input_signature(sample_input, None),
-            "best_candidate": warm_summary,
-        },
-    )
-
-    captured: dict[str, SplitCandidate | None] = {"warm_candidate": None}
-
-    def _fake_solve_best_candidate_exact(*args, previous_exact_candidate=None, return_session=False, **kwargs):
-        captured["warm_candidate"] = previous_exact_candidate
-        result = SimpleNamespace(
-            candidate=previous_exact_candidate,
-            diagnostics={"warm_start_source": "previous_exact_optimum"},
-        )
-        session = SimpleNamespace()
-        return (result, session) if return_session else result
-
-    monkeypatch.setattr("model_management.fixed_split._trace_signature", lambda splitter: "sig")
-    monkeypatch.setattr(
-        "model_management.fixed_split.solve_best_candidate_exact",
-        _fake_solve_best_candidate_exact,
-    )
-
-    plan = compute_fixed_split_for_model(
-        model,
-        SplitConstraints(validate_candidates=False),
-        sample_input=sample_input,
-        splitter=DummyRuntime(),
-        model_name="dummy-model",
-        cache_path=cache_path,
-    )
-
-    assert captured["warm_candidate"] is not None
-    assert captured["warm_candidate"].edge_nodes == ["input_1", "left"]
-    assert plan.validation["exact_solver"]["warm_start_source"] == "previous_exact_optimum"
-
-
 def test_fixed_split_validates_only_lowest_payload_group_until_success():
     constraints = SplitConstraints()
 
@@ -652,26 +218,8 @@ def test_fixed_split_validates_only_lowest_payload_group_until_success():
 
     class DummyRuntime:
         def __init__(self):
-            self.graph = SimpleNamespace(
-                relevant_labels=["n1", "n2", "n3"],
-                nodes={
-                    "n1": SimpleNamespace(
-                        has_trainable_params=True,
-                        tensor_shape=(1, 4, 4),
-                        containing_module="m.n1",
-                    ),
-                    "n2": SimpleNamespace(
-                        has_trainable_params=True,
-                        tensor_shape=(1, 4, 4),
-                        containing_module="m.n2",
-                    ),
-                    "n3": SimpleNamespace(
-                        has_trainable_params=True,
-                        tensor_shape=(1, 4, 4),
-                        containing_module="m.n3",
-                    ),
-                },
-            )
+            self.graph = "sig"
+            self.runtime = object()
             self.model = object()
             self.candidates = candidates
             self._candidate_enumeration_config = (
@@ -680,9 +228,6 @@ def test_fixed_split_validates_only_lowest_payload_group_until_success():
                 constraints.max_payload_bytes,
             )
             self.validation_calls: list[str] = []
-
-        def _ensure_ready(self):
-            return self.model, self.graph
 
         def validate_candidate(self, candidate):
             self.validation_calls.append(candidate.candidate_id)
@@ -736,26 +281,8 @@ def test_fixed_split_failure_reports_untrainable_replay_candidates():
 
     class DummyRuntime:
         def __init__(self):
-            self.graph = SimpleNamespace(
-                relevant_labels=["n1", "n2", "n3"],
-                nodes={
-                    "n1": SimpleNamespace(
-                        has_trainable_params=True,
-                        tensor_shape=(1, 4, 4),
-                        containing_module="m.n1",
-                    ),
-                    "n2": SimpleNamespace(
-                        has_trainable_params=True,
-                        tensor_shape=(1, 4, 4),
-                        containing_module="m.n2",
-                    ),
-                    "n3": SimpleNamespace(
-                        has_trainable_params=True,
-                        tensor_shape=(1, 4, 4),
-                        containing_module="m.n3",
-                    ),
-                },
-            )
+            self.graph = "sig"
+            self.runtime = object()
             self.model = object()
             self.candidates = candidates
             self._candidate_enumeration_config = (
@@ -763,9 +290,6 @@ def test_fixed_split_failure_reports_untrainable_replay_candidates():
                 constraints.max_boundary_count,
                 constraints.max_payload_bytes,
             )
-
-        def _ensure_ready(self):
-            return self.model, self.graph
 
         def validate_candidate(self, candidate):
             return {
@@ -813,8 +337,15 @@ def test_ariadne_fixed_split_rejects_failed_replay_validation():
         graph = "trace-sig"
         model = object()
         runtime = object()
+        candidates = [candidate]
+        _candidate_enumeration_config = None
 
-        def split(self):
+        def enumerate_candidates(self, **kwargs):
+            return [candidate]
+
+        def split(self, *, candidate=None, **kwargs):
+            assert candidate is not None
+            assert not kwargs
             return candidate
 
         def validate_candidate(self, chosen):
@@ -827,6 +358,30 @@ def test_ariadne_fixed_split_rejects_failed_replay_validation():
             SplitConstraints(validate_candidates=True),
             sample_input=torch.rand(1, 1),
             splitter=FailedAriadneRuntime(),
+            model_name="dummy-model",
+        )
+
+
+def test_fixed_split_refuses_auto_candidate_when_no_candidates_are_enumerated():
+    class AutoOnlyRuntime:
+        graph = "trace-sig"
+        model = object()
+        runtime = object()
+        candidates = []
+        _candidate_enumeration_config = None
+
+        def enumerate_candidates(self, **kwargs):
+            return []
+
+        def split(self, **kwargs):
+            raise AssertionError("Fixed split planning must not use the auto/current candidate.")
+
+    with pytest.raises(RuntimeError, match="refusing to use the runtime auto/current candidate"):
+        compute_fixed_split_for_model(
+            torch.nn.Linear(1, 1),
+            SplitConstraints(validate_candidates=True),
+            sample_input=torch.rand(1, 1),
+            splitter=AutoOnlyRuntime(),
             model_name="dummy-model",
         )
 
@@ -869,354 +424,6 @@ def test_ariadne_fixed_split_solves_candidate_from_constraints_instead_of_auto()
     assert plan.edge_parameter_count > 0
     assert plan.privacy_leakage <= constraints.privacy_leakage_upper_bound
     assert plan.validation["selection"] == "constraints"
-
-
-def test_fixed_split_exact_validation_falls_back_to_next_same_objective_candidate():
-    constraints = SplitConstraints(
-        privacy_leakage_upper_bound=1.0,
-        max_layer_freezing_ratio=1.0,
-        validate_candidates=True,
-        max_candidates=8,
-        max_boundary_count=8,
-        max_payload_bytes=1024,
-    )
-
-    class DummyRuntime:
-        def __init__(self):
-            self.graph = _shared_optimum_graph()
-            self.model = object()
-            self.validation_calls: list[tuple[str, ...]] = []
-
-        def _ensure_ready(self):
-            return self.model, self.graph
-
-        def validate_candidate(self, candidate):
-            edge_nodes = tuple(candidate.edge_nodes)
-            self.validation_calls.append(edge_nodes)
-            is_second_attempt = len(self.validation_calls) == 2
-            return {
-                "success": is_second_attempt,
-                "edge_latency": 0.1,
-                "cloud_latency": 0.2,
-                "end_to_end_latency": 0.3,
-                "tail_trainability": True,
-                "stability_score": 1.0,
-                "error": None if is_second_attempt else "mismatch",
-            }
-
-    runtime = DummyRuntime()
-    plan = compute_fixed_split_for_model(
-        torch.nn.Linear(1, 1),
-        constraints,
-        sample_input=[torch.rand(1)],
-        splitter=runtime,
-        model_name="dummy-model",
-    )
-
-    assert plan.payload_bytes == 6
-    assert len(runtime.validation_calls) == 2
-    assert plan.validation["exact_solver"]["validation_fallback_count"] == 1
-    assert plan.validation["exact_solver"]["validation_relaxed_objective_upper_bound"] is False
-
-
-def test_fixed_split_exact_validation_advances_after_exhausting_best_objective_face():
-    constraints = SplitConstraints(
-        privacy_leakage_upper_bound=1.0,
-        max_layer_freezing_ratio=1.0,
-        validate_candidates=True,
-        max_candidates=8,
-        max_boundary_count=8,
-        max_payload_bytes=1024,
-    )
-
-    class DummyRuntime:
-        def __init__(self):
-            self.graph = _shared_optimum_graph()
-            self.model = object()
-            self.validation_calls: list[tuple[str, ...]] = []
-
-        def _ensure_ready(self):
-            return self.model, self.graph
-
-        def validate_candidate(self, candidate):
-            edge_nodes = tuple(candidate.edge_nodes)
-            self.validation_calls.append(edge_nodes)
-            is_third_attempt = len(self.validation_calls) == 3
-            return {
-                "success": is_third_attempt,
-                "edge_latency": 0.1,
-                "cloud_latency": 0.2,
-                "end_to_end_latency": 0.3,
-                "tail_trainability": True,
-                "stability_score": 1.0,
-                "error": None if is_third_attempt else "mismatch",
-            }
-
-    runtime = DummyRuntime()
-    plan = compute_fixed_split_for_model(
-        torch.nn.Linear(1, 1),
-        constraints,
-        sample_input=[torch.rand(1)],
-        splitter=runtime,
-        model_name="dummy-model",
-    )
-
-    assert plan.payload_bytes == 10
-    assert len(runtime.validation_calls) == 3
-    assert plan.validation["exact_solver"]["validation_fallback_count"] == 2
-    assert plan.validation["exact_solver"]["validation_relaxed_objective_upper_bound"] is True
-
-
-def test_fixed_split_exact_solver_finds_non_prefix_optimum_under_parameter_constraints():
-    constraints = SplitConstraints(
-        privacy_leakage_upper_bound=1.0 / 80.0,
-        max_layer_freezing_ratio=1.0,
-        validate_candidates=False,
-        max_candidates=8,
-        max_boundary_count=8,
-        max_payload_bytes=32 * 1024 * 1024,
-    )
-
-    signature = inspect.signature(lambda input_1: input_1)
-    dummy_spec = TreeSpec(kind="const", value=None)
-    parameter_numels = {
-        "p_left_1": 40,
-        "p_left_2": 40,
-        "p_right_1": 1,
-        "p_right_2": 1,
-        "p_merge": 1,
-    }
-
-    def _node(
-        label: str,
-        *,
-        parents: list[str],
-        children: list[str],
-        estimated_bytes: int,
-        parameter_refs: list[ParameterTensorRef],
-        trainable: bool,
-        index: int,
-        is_input: bool = False,
-        is_output: bool = False,
-    ) -> GraphNode:
-        return GraphNode(
-            label=label,
-            node_type="input" if is_input else ("output" if is_output else "operation"),
-            func_name="none",
-            func=None,
-            parent_labels=parents,
-            child_labels=children,
-            parent_arg_locations={"args": {}, "kwargs": {}},
-            arg_template=[],
-            kwarg_template={},
-            non_tensor_args={},
-            parameter_refs=parameter_refs,
-            buffer_refs=[],
-            input_output_address=None,
-            containing_module=None,
-            containing_modules=[],
-            is_input=is_input,
-            is_output=is_output,
-            is_inplace=False,
-            is_multi_output=False,
-            multi_output_index=None,
-            aggregation_kind=None,
-            indexing_metadata=None,
-            tensor_shape=(1,),
-            tensor_dtype=torch.float32,
-            numel=1,
-            estimated_bytes=estimated_bytes,
-            estimated_flops=1.0,
-            has_trainable_params=trainable,
-            topological_index=index,
-        )
-
-    class DummyRuntime:
-        def __init__(self):
-            nodes = OrderedDict(
-                [
-                    (
-                        "input_1",
-                        _node(
-                            "input_1",
-                            parents=[],
-                            children=["left_1", "right_1"],
-                            estimated_bytes=1,
-                            parameter_refs=[],
-                            trainable=False,
-                            index=0,
-                            is_input=True,
-                        ),
-                    ),
-                    (
-                        "left_1",
-                        _node(
-                            "left_1",
-                            parents=["input_1"],
-                            children=["left_2"],
-                            estimated_bytes=1,
-                            parameter_refs=[ParameterTensorRef("", "p_left_1", "p_left_1")],
-                            trainable=True,
-                            index=1,
-                        ),
-                    ),
-                    (
-                        "right_1",
-                        _node(
-                            "right_1",
-                            parents=["input_1"],
-                            children=["right_2"],
-                            estimated_bytes=100,
-                            parameter_refs=[ParameterTensorRef("", "p_right_1", "p_right_1")],
-                            trainable=True,
-                            index=2,
-                        ),
-                    ),
-                    (
-                        "left_2",
-                        _node(
-                            "left_2",
-                            parents=["left_1"],
-                            children=["merge"],
-                            estimated_bytes=1,
-                            parameter_refs=[ParameterTensorRef("", "p_left_2", "p_left_2")],
-                            trainable=True,
-                            index=3,
-                        ),
-                    ),
-                    (
-                        "right_2",
-                        _node(
-                            "right_2",
-                            parents=["right_1"],
-                            children=["merge"],
-                            estimated_bytes=100,
-                            parameter_refs=[ParameterTensorRef("", "p_right_2", "p_right_2")],
-                            trainable=True,
-                            index=4,
-                        ),
-                    ),
-                    (
-                        "merge",
-                        _node(
-                            "merge",
-                            parents=["left_2", "right_2"],
-                            children=["output_1"],
-                            estimated_bytes=1,
-                            parameter_refs=[ParameterTensorRef("", "p_merge", "p_merge")],
-                            trainable=True,
-                            index=5,
-                        ),
-                    ),
-                    (
-                        "output_1",
-                        _node(
-                            "output_1",
-                            parents=["merge"],
-                            children=[],
-                            estimated_bytes=1,
-                            parameter_refs=[],
-                            trainable=False,
-                            index=6,
-                            is_output=True,
-                        ),
-                    ),
-                ]
-            )
-            self.graph = GraphIR(
-                nodes=nodes,
-                input_labels=["input_1"],
-                output_labels=["output_1"],
-                topological_order=list(nodes.keys()),
-                relevant_labels=list(nodes.keys()),
-                input_spec=dummy_spec,
-                output_spec=dummy_spec,
-                input_address_to_label={},
-                output_address_to_label={},
-                forward_signature=signature,
-                sample_args=(torch.tensor([0.0]),),
-                sample_kwargs={},
-                sample_input_spec=dummy_spec,
-                sample_output_spec=dummy_spec,
-                parameter_numels=parameter_numels,
-                total_parameter_numel=sum(parameter_numels.values()),
-            )
-            self.model = object()
-
-        def _ensure_ready(self):
-            return self.model, self.graph
-
-    runtime = DummyRuntime()
-    plan = compute_fixed_split_for_model(
-        torch.nn.Linear(1, 1),
-        constraints,
-        sample_input=[torch.rand(1)],
-        splitter=runtime,
-        model_name="dummy-model",
-    )
-
-    chosen = runtime.candidates[0]
-    assert plan.candidate_id == chosen.candidate_id
-    assert chosen.edge_nodes == ["input_1", "left_1", "left_2"]
-    assert set(chosen.boundary_tensor_labels) == {"input_1", "left_2"}
-    assert chosen.estimated_payload_bytes == 2
-    prefix = runtime.graph.relevant_labels[: chosen.legacy_layer_index + 1]
-    assert chosen.edge_nodes != prefix
-
-
-def test_solve_best_candidate_exact_matches_multi_candidate_first_solution():
-    graph = _non_prefix_optimum_graph()
-    result = solve_best_candidate_exact(
-        graph,
-        max_boundary_count=8,
-        max_payload_bytes=32 * 1024 * 1024,
-        privacy_leakage_upper_bound=1.0 / 80.0,
-        max_layer_freezing_ratio=1.0,
-        require_trainable_tail=True,
-    )
-    candidates = solve_exact_candidates(
-        graph,
-        max_candidates=4,
-        max_boundary_count=8,
-        max_payload_bytes=32 * 1024 * 1024,
-        privacy_leakage_upper_bound=1.0 / 80.0,
-        max_layer_freezing_ratio=1.0,
-        require_trainable_tail=True,
-    )
-
-    assert result.candidate is not None
-    assert candidates
-    assert result.candidate.edge_nodes == candidates[0].edge_nodes
-    assert result.objective_payload_bytes == candidates[0].estimated_payload_bytes
-    assert result.objective_boundary_count == candidates[0].boundary_count
-
-
-def test_solve_best_candidate_exact_reports_safe_pruning_diagnostics():
-    graph = _non_prefix_optimum_graph()
-    result, session = solve_best_candidate_exact(
-        graph,
-        max_boundary_count=8,
-        max_payload_bytes=32 * 1024 * 1024,
-        privacy_leakage_upper_bound=1.0 / 80.0,
-        max_layer_freezing_ratio=1.0,
-        require_trainable_tail=True,
-        return_session=True,
-    )
-
-    assert result.candidate is not None
-    assert session.diagnostics["solver_variable_count_after_pruning"] < session.diagnostics[
-        "solver_variable_count_before_pruning"
-    ]
-    assert session.diagnostics["frontier_count_after_pruning"] < session.diagnostics[
-        "frontier_count_before_pruning"
-    ]
-    assert (
-        session.diagnostics["pruned_invalid_frontiers"]
-        + session.diagnostics["pruned_untrainable_tail_frontiers"]
-        + session.diagnostics["pruned_parameter_upper_bound_frontiers"]
-        + session.diagnostics["pruned_dominated_frontiers"]
-    ) > 0
-    assert session.diagnostics["pruning_time_sec"] >= 0.0
 
 
 def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_available():
@@ -1273,15 +480,8 @@ def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_availabl
 
     class DummyRuntime:
         def __init__(self):
-            self.graph = SimpleNamespace(
-                relevant_labels=["n1", "n2", "n3", "n4"],
-                nodes={
-                    "n1": SimpleNamespace(has_trainable_params=True, tensor_shape=(1, 4, 4)),
-                    "n2": SimpleNamespace(has_trainable_params=True, tensor_shape=(1, 4, 4)),
-                    "n3": SimpleNamespace(has_trainable_params=True, tensor_shape=(1, 4, 4)),
-                    "n4": SimpleNamespace(has_trainable_params=True, tensor_shape=(1, 4, 4)),
-                },
-            )
+            self.graph = "sig"
+            self.runtime = object()
             self.model = object()
             self.candidates = candidates
             self._candidate_enumeration_config = (
@@ -1290,8 +490,9 @@ def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_availabl
                 constraints.max_payload_bytes,
             )
 
-        def _ensure_ready(self):
-            return self.model, self.graph
+        def split(self, *, candidate=None, **kwargs):
+            assert not kwargs
+            return candidate
 
     plan = compute_fixed_split_for_model(
         torch.nn.Linear(1, 1),
@@ -1309,7 +510,7 @@ def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_availabl
     assert plan.total_parameter_count == 100
 
 
-def test_apply_split_plan_prefers_canonical_split_selectors_before_candidate_id():
+def test_apply_split_plan_uses_ariadne_candidate_id_only():
     plan = SplitPlan(
         split_config_id="plan-1",
         model_name="dummy-model",
@@ -1324,401 +525,41 @@ def test_apply_split_plan_prefers_canonical_split_selectors_before_candidate_id(
         constraints={},
         trace_signature="sig",
     )
-
-    class SplitLabelRuntime:
-        def __init__(self):
-            self.calls = []
-
-        def enumerate_candidates(self, **kwargs):
-            raise AssertionError("Direct split recovery should not enumerate candidates.")
-
-        def split(
-            self,
-            *,
-            boundary_tensor_labels=None,
-            layer_label=None,
-            layer_index=None,
-            candidate_id=None,
-        ):
-            self.calls.append(
-                {
-                    "boundary_tensor_labels": boundary_tensor_labels,
-                    "layer_label": layer_label,
-                    "layer_index": layer_index,
-                    "candidate_id": candidate_id,
-                }
-            )
-            if boundary_tensor_labels is not None:
-                raise KeyError("missing boundary labels")
-            if layer_label is not None:
-                return "label-match"
-            raise AssertionError("split_label should be used before weaker fallbacks")
-
-    runtime = SplitLabelRuntime()
-    assert apply_split_plan(runtime, plan) == "label-match"
-    assert runtime.calls == [
-        {
-            "boundary_tensor_labels": ["missing-boundary"],
-            "layer_label": None,
-            "layer_index": None,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": "layer7",
-            "layer_index": None,
-            "candidate_id": None,
-        },
-    ]
-
-    class SplitIndexRuntime:
-        def __init__(self):
-            self.calls = []
-
-        def enumerate_candidates(self, **kwargs):
-            raise AssertionError("Direct split recovery should not enumerate candidates.")
-
-        def split(
-            self,
-            *,
-            boundary_tensor_labels=None,
-            layer_label=None,
-            layer_index=None,
-            candidate_id=None,
-        ):
-            self.calls.append(
-                {
-                    "boundary_tensor_labels": boundary_tensor_labels,
-                    "layer_label": layer_label,
-                    "layer_index": layer_index,
-                    "candidate_id": candidate_id,
-                }
-            )
-            if boundary_tensor_labels is not None or layer_label is not None:
-                raise KeyError("fallback")
-            if layer_index is not None:
-                return "layer-match"
-            raise AssertionError("candidate_id fallback should not be used here")
-
-    runtime = SplitIndexRuntime()
-    assert apply_split_plan(runtime, plan) == "layer-match"
-    assert runtime.calls == [
-        {
-            "boundary_tensor_labels": ["missing-boundary"],
-            "layer_label": None,
-            "layer_index": None,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": "layer7",
-            "layer_index": None,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": None,
-            "layer_index": 7,
-            "candidate_id": None,
-        },
-    ]
-
-    class CandidateRuntime:
-        def __init__(self):
-            self.calls = []
-
-        def enumerate_candidates(self, **kwargs):
-            raise AssertionError("Direct split recovery should not enumerate candidates.")
-
-        def split(
-            self,
-            *,
-            boundary_tensor_labels=None,
-            layer_label=None,
-            layer_index=None,
-            candidate_id=None,
-        ):
-            self.calls.append(
-                {
-                    "boundary_tensor_labels": boundary_tensor_labels,
-                    "layer_label": layer_label,
-                    "layer_index": layer_index,
-                    "candidate_id": candidate_id,
-                }
-            )
-            if (
-                boundary_tensor_labels is not None
-                or layer_label is not None
-                or layer_index is not None
-            ):
-                raise KeyError("fallback")
-            if candidate_id is not None:
-                return "candidate-match"
-            raise AssertionError("candidate_id should be the final fallback")
-
-    runtime = CandidateRuntime()
-    assert apply_split_plan(runtime, plan) == "candidate-match"
-    assert runtime.calls == [
-        {
-            "boundary_tensor_labels": ["missing-boundary"],
-            "layer_label": None,
-            "layer_index": None,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": "layer7",
-            "layer_index": None,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": None,
-            "layer_index": 7,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": None,
-            "layer_index": None,
-            "candidate_id": "candidate-2",
-        },
-    ]
-
-
-def test_apply_split_plan_uses_candidate_pool_only_after_direct_recovery_fails():
-    plan = SplitPlan(
-        split_config_id="plan-legacy",
-        model_name="dummy-model",
-        candidate_id="candidate-edge",
-        split_index=7,
-        split_label="edge-boundary",
-        boundary_tensor_labels=["missing-boundary"],
-        payload_bytes=128,
-        privacy_metric=0.4,
-        privacy_risk=0.6,
-        layer_freezing_ratio=0.5,
-        constraints={
-            "max_candidates": 8,
-            "max_boundary_count": 4,
-            "max_payload_bytes": 1024,
-        },
-        trace_signature="sig",
-    )
-
-    best_match = SplitCandidate(
-        candidate_id="candidate-batch-compatible",
-        edge_nodes=["edge-boundary"],
-        cloud_nodes=["cloud"],
-        boundary_edges=[("edge-boundary", "cloud")],
-        boundary_tensor_labels=["edge-boundary"],
-        edge_input_labels=["input"],
+    chosen = SplitCandidate(
+        candidate_id="candidate-2",
+        edge_nodes=["layer7"],
+        cloud_nodes=["tail"],
+        boundary_edges=[("layer7", "tail")],
+        boundary_tensor_labels=["layer7"],
+        edge_input_labels=[],
         cloud_input_labels=[],
-        cloud_output_labels=["cloud"],
+        cloud_output_labels=["tail"],
         estimated_edge_flops=1.0,
         estimated_cloud_flops=1.0,
         estimated_payload_bytes=128,
-        estimated_privacy_risk=0.2,
-        estimated_latency=1.0,
-        is_trainable_tail=True,
-        legacy_layer_index=7,
-        boundary_count=1,
-    )
-    weaker_match = SplitCandidate(
-        candidate_id="candidate-weaker",
-        edge_nodes=["aux", "edge-boundary"],
-        cloud_nodes=["cloud"],
-        boundary_edges=[("aux", "cloud"), ("edge-boundary", "cloud")],
-        boundary_tensor_labels=["aux", "edge-boundary"],
-        edge_input_labels=["input"],
-        cloud_input_labels=[],
-        cloud_output_labels=["cloud"],
-        estimated_edge_flops=1.0,
-        estimated_cloud_flops=1.0,
-        estimated_payload_bytes=512,
-        estimated_privacy_risk=0.2,
-        estimated_latency=1.0,
-        is_trainable_tail=True,
-        legacy_layer_index=7,
-        boundary_count=2,
-    )
-
-    class EnumeratedRuntime:
-        def __init__(self):
-            self.calls = []
-            self.split_calls = []
-            self.candidates = []
-            self._candidate_enumeration_config = None
-
-        def enumerate_candidates(self, *, max_candidates, max_boundary_count, max_payload_bytes):
-            self.calls.append(
-                (
-                    int(max_candidates),
-                    int(max_boundary_count),
-                    int(max_payload_bytes),
-                )
-            )
-            self.candidates = [weaker_match, best_match]
-            self._candidate_enumeration_config = (
-                int(max_candidates),
-                int(max_boundary_count),
-                int(max_payload_bytes),
-            )
-            return list(self.candidates)
-
-        def split(
-            self,
-            *,
-            boundary_tensor_labels=None,
-            layer_label=None,
-            layer_index=None,
-            candidate_id=None,
-        ):
-            self.split_calls.append(
-                {
-                    "boundary_tensor_labels": boundary_tensor_labels,
-                    "layer_label": layer_label,
-                    "layer_index": layer_index,
-                    "candidate_id": candidate_id,
-                }
-            )
-            if boundary_tensor_labels is not None or layer_label is not None:
-                raise KeyError("fallback")
-            if layer_index is not None:
-                raise KeyError("legacy-fallback")
-            if candidate_id is not None:
-                raise KeyError("candidate-fallback")
-            raise AssertionError("Unexpected split selector.")
-
-    runtime = EnumeratedRuntime()
-    assert apply_split_plan(runtime, plan) is best_match
-    assert runtime.calls == [(8, 4, 1024)]
-    assert runtime.split_calls == [
-        {
-            "boundary_tensor_labels": ["missing-boundary"],
-            "layer_label": None,
-            "layer_index": None,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": "edge-boundary",
-            "layer_index": None,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": None,
-            "layer_index": 7,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": None,
-            "layer_index": None,
-            "candidate_id": "candidate-edge",
-        },
-    ]
-
-
-def test_apply_split_plan_keeps_candidate_id_reachable_after_split_index_mismatch():
-    plan = SplitPlan(
-        split_config_id="plan-legacy-candidate-id",
-        model_name="dummy-model",
-        candidate_id="candidate-edge",
-        split_index=7,
-        split_label=None,
-        boundary_tensor_labels=[],
-        payload_bytes=128,
-        privacy_metric=0.4,
-        privacy_risk=0.6,
-        layer_freezing_ratio=0.5,
-        constraints={},
-        trace_signature="sig",
-    )
-
-    split_index_candidate = SplitCandidate(
-        candidate_id="legacy_7",
-        edge_nodes=["edge-a"],
-        cloud_nodes=["cloud"],
-        boundary_edges=[("edge-a", "cloud")],
-        boundary_tensor_labels=["edge-a"],
-        edge_input_labels=["input"],
-        cloud_input_labels=[],
-        cloud_output_labels=["cloud"],
-        estimated_edge_flops=1.0,
-        estimated_cloud_flops=1.0,
-        estimated_payload_bytes=64,
-        estimated_privacy_risk=0.2,
-        estimated_latency=1.0,
-        is_trainable_tail=True,
-        legacy_layer_index=7,
-        boundary_count=1,
-    )
-    candidate_id_match = SplitCandidate(
-        candidate_id="candidate-edge",
-        edge_nodes=["edge-b"],
-        cloud_nodes=["cloud"],
-        boundary_edges=[("edge-b", "cloud")],
-        boundary_tensor_labels=["edge-b"],
-        edge_input_labels=["input"],
-        cloud_input_labels=[],
-        cloud_output_labels=["cloud"],
-        estimated_edge_flops=1.0,
-        estimated_cloud_flops=1.0,
-        estimated_payload_bytes=64,
-        estimated_privacy_risk=0.2,
+        estimated_privacy_risk=0.4,
         estimated_latency=1.0,
         is_trainable_tail=True,
         legacy_layer_index=7,
         boundary_count=1,
     )
 
-    class CandidateIdReachableRuntime:
+    class AriadneRuntime:
         def __init__(self):
             self.calls = []
 
         def enumerate_candidates(self, **kwargs):
-            raise AssertionError("candidate_id should stay reachable before candidate enumeration.")
+            raise AssertionError("Ariadne plan replay should not enumerate candidates.")
 
-        def split(
-            self,
-            *,
-            boundary_tensor_labels=None,
-            layer_label=None,
-            layer_index=None,
-            candidate_id=None,
-        ):
-            self.calls.append(
-                {
-                    "boundary_tensor_labels": boundary_tensor_labels,
-                    "layer_label": layer_label,
-                    "layer_index": layer_index,
-                    "candidate_id": candidate_id,
-                }
-            )
-            if layer_index is not None:
-                return split_index_candidate
-            if candidate_id is not None:
-                return candidate_id_match
-            raise AssertionError("Unexpected split selector.")
+        def split(self, *, candidate_id=None, **kwargs):
+            self.calls.append({"candidate_id": candidate_id, **kwargs})
+            if candidate_id == "candidate-2":
+                return chosen
+            raise KeyError(candidate_id)
 
-    runtime = CandidateIdReachableRuntime()
-    assert apply_split_plan(runtime, plan) is candidate_id_match
-    assert runtime.calls == [
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": None,
-            "layer_index": 7,
-            "candidate_id": None,
-        },
-        {
-            "boundary_tensor_labels": None,
-            "layer_label": None,
-            "layer_index": None,
-            "candidate_id": "candidate-edge",
-        },
-    ]
+    runtime = AriadneRuntime()
+    assert apply_split_plan(runtime, plan) is chosen
+    assert runtime.calls == [{"candidate_id": "candidate-2"}]
 
 
 def test_high_confidence_sample_saves_feature_and_result_without_raw(tmp_path):
@@ -1768,6 +609,82 @@ def test_low_confidence_sample_saves_feature_result_and_raw(tmp_path, sample_bgr
     assert store.load_record("low-1").input_resize_mode is None
     stored = store.load_intermediate(record)
     assert all(not tensor.requires_grad for tensor in stored.tensors.values())
+
+
+def test_sample_store_accepts_ariadne_boundary_payload(tmp_path):
+    store = EdgeSampleStore(str(tmp_path))
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.ones(1, 2, requires_grad=True)},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.ones(1, 4, requires_grad=True)},
+    )
+
+    record = store.store_sample(
+        sample_id="boundary-1",
+        frame_index=3,
+        confidence=0.8,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        confidence_bucket=HIGH_CONFIDENCE,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=payload,
+    )
+
+    stored = store.load_intermediate(record)
+    assert isinstance(stored, BoundaryPayload)
+    assert stored.split_id == "after:node_1"
+    assert stored.graph_signature == "graph-sig"
+    assert stored.tensors["node_1"].device.type == "cpu"
+    assert stored.tensors["node_1"].requires_grad is False
+    assert stored.passthrough_inputs["input"].device.type == "cpu"
+    assert stored.passthrough_inputs["input"].requires_grad is False
+
+
+def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
+    cache_path = str(tmp_path / "cache")
+    first = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.ones(1, 3)},
+    )
+    second = boundary_payload_from_tensors(
+        {"node_99": torch.tensor([[3.0, 4.0]])},
+        split_id="after:node_1",
+        graph_signature="different-graph-sig",
+        passthrough_inputs={"input": torch.full((1, 3), 2.0)},
+    )
+    save_split_feature_cache(cache_path, "s1", first)
+    save_split_feature_cache(cache_path, "s2", second)
+
+    class DummySplitter:
+        def __init__(self):
+            self.seen_boundary = None
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            self.seen_boundary = boundary
+            assert targets == [{"label": 1}, {"label": 2}]
+            assert boundary.batch_size == 2
+            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+            assert boundary.passthrough_inputs["input"].shape == (2, 3)
+            return torch.tensor(1.0), {}
+
+    splitter = DummySplitter()
+    losses = universal_split_retrain(
+        model=torch.nn.Linear(1, 1),
+        sample_input=torch.ones(1, 1),
+        cache_path=cache_path,
+        all_indices=["s1", "s2"],
+        gt_annotations={"s1": {"label": 1}, "s2": {"label": 2}},
+        loss_fn=lambda outputs, targets: torch.tensor(1.0),
+        splitter=splitter,
+        batch_size=2,
+    )
+
+    assert losses == [1.0]
+    assert splitter.seen_boundary is not None
 
 
 def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_bgr_frame):
@@ -2581,7 +1498,11 @@ def test_prepare_split_training_cache_raises_when_batch_rebuild_count_is_wrong(
 
 
 def test_working_cache_manifest_fingerprint_matches_current_bundle():
-    from cloud_server import _build_fixed_split_cache_identity, CloudContinualLearner
+    from cloud_server import (
+        _build_fixed_split_cache_identity,
+        _fixed_split_boundary_from_plan,
+        CloudContinualLearner,
+    )
 
     manifest = {
         "model": {"model_id": "model-a", "model_version": "v1"},
@@ -2596,7 +1517,7 @@ def test_working_cache_manifest_fingerprint_matches_current_bundle():
     assert identity["model_version"] == "v1"
     assert identity["sample_ids"] == ["s1", "s2"]
     assert identity["fingerprint"]
-    assert identity["cache_version"] == 1
+    assert identity["cache_version"] == 2
 
     assert CloudContinualLearner._working_cache_manifest_matches(identity, identity) is True
 
@@ -2606,6 +1527,132 @@ def test_working_cache_manifest_fingerprint_matches_current_bundle():
     assert (
         CloudContinualLearner._working_cache_manifest_matches(changed_identity, identity) is False
     )
+    assert _fixed_split_boundary_from_plan(
+        {
+            "candidate_id": "after:model.backbone.stem",
+            "split_label": "after:node_5",
+            "boundary_tensor_labels": ["node_13", "node_5"],
+        }
+    ) == "after:model.backbone.stem"
+
+
+def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=16),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    manifest = {
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "split_plan": {
+            "split_label": "after:model.backbone.0.encoder.encoder.embeddings.patch_embeddings.projection",
+            "trace_signature": "edge-trace",
+        },
+        "samples": [{"sample_id": "s1"}],
+    }
+
+    key = learner._fixed_split_runtime_template_key(
+        model_name="rfdetr_nano",
+        manifest=manifest,
+        runtime_batch_size=16,
+    )
+
+    assert key.mode == "debug_interpreter"
+
+
+def test_cloud_reconstruction_splits_batched_boundary_payload(tmp_path):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=3),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.arange(6, dtype=torch.float32).reshape(3, 2)},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.ones(3, 4)},
+    )
+
+    split_payloads = learner._split_batched_payload(payload, batch_size=3)
+
+    assert [item.batch_size for item in split_payloads] == [1, 1, 1]
+    assert split_payloads[0].tensors["node_1"].shape == (1, 2)
+    assert split_payloads[2].tensors["node_1"].tolist() == [[4.0, 5.0]]
+    assert split_payloads[1].passthrough_inputs["input"].shape == (1, 4)
+
+
+def test_cloud_batch_feature_provider_pads_short_final_chunk(
+    tmp_path,
+    sample_bgr_frame,
+    monkeypatch,
+):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=4),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    raw_paths = []
+    samples = []
+    for index in range(3):
+        raw_path = tmp_path / f"{index}.jpg"
+        assert cv2.imwrite(str(raw_path), sample_bgr_frame)
+        raw_paths.append(str(raw_path))
+        samples.append({"sample_id": f"s{index}", "value": index})
+
+    def fake_prepare_bundle_runtime_tensor(model, frame, *, sample_metadata, context):
+        return torch.tensor([[float(sample_metadata["value"])]])
+
+    class FakeSplitter:
+        def __init__(self):
+            self.seen_shapes = []
+
+        def edge_forward(self, inputs, candidate=None):
+            self.seen_shapes.append(tuple(inputs.shape))
+            return boundary_payload_from_tensors(
+                {"node_1": inputs.clone()},
+                split_id="after:node_1",
+                graph_signature="graph-sig",
+            )
+
+    fake_splitter = FakeSplitter()
+    monkeypatch.setattr(
+        learner,
+        "_prepare_bundle_runtime_tensor",
+        fake_prepare_bundle_runtime_tensor,
+    )
+    provider = learner._bundle_batch_feature_provider(
+        object(),
+        {"samples": samples},
+        bundle_root=str(tmp_path),
+        splitter=fake_splitter,
+        candidate=object(),
+        runtime_batch_size=4,
+    )
+
+    payloads = provider(raw_paths, samples, {})
+
+    assert fake_splitter.seen_shapes == [(4, 1)]
+    assert len(payloads) == 3
+    assert [payload.batch_size for payload in payloads] == [1, 1, 1]
+    assert payloads[2].tensors["node_1"].tolist() == [[2.0]]
 
 
 def test_prepare_split_training_cache_preserves_unmodified_feature_mtime_on_reuse(

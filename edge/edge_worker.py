@@ -4,7 +4,6 @@ import os
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import Mapping
 
 import grpc
 import torch
@@ -33,13 +32,6 @@ from model_management.fixed_split import (
     SplitConstraints,
     SplitPlan,
     load_or_compute_fixed_split_plan,
-)
-from model_management.fixed_split_artifacts import (
-    artifact_paths_from_plan_cache,
-    graph_artifact_matches,
-    load_torch_artifact,
-    model_structure_fingerprint,
-    sample_input_signature,
 )
 from model_management.object_detection import InferenceArtifacts, Object_Detection
 from model_management.split_model_adapters import build_split_training_loss
@@ -138,6 +130,8 @@ class EdgeWorker:
         self.universal_splitter: UniversalModelSplitter | None = None
         self.fixed_split_plan: SplitPlan | None = None
         self._fixed_split_init_attempted = False
+        self._fixed_split_init_lock = threading.Lock()
+        self._fixed_split_init_thread: threading.Thread | None = None
         self.split_trace_image_size: tuple[int, int] | None = None
         if not self.split_learning_enabled:
             self.split_learning_disable_reason = "disabled_in_config"
@@ -189,60 +183,16 @@ class EdgeWorker:
                 )
             constraints = SplitConstraints.from_config(fixed_split_cfg)
             cache_path = os.path.join(self.config.retrain.cache_path, "fixed_split_plan.json")
-            graph_artifact_loaded = False
-            artifact_paths = artifact_paths_from_plan_cache(cache_path)
-            legacy_graph_runtime = hasattr(self.universal_splitter, "bind_graph") and not hasattr(
-                self.universal_splitter,
-                "runtime",
+            trace_started = time.perf_counter()
+            self.universal_splitter.trace(
+                split_model,
+                sample_input,
+                model_name=self.model_id,
             )
-            if artifact_paths is not None and legacy_graph_runtime:
-                graph_payload = load_torch_artifact(artifact_paths.graph_path)
-                if isinstance(graph_payload, Mapping):
-                    model_fingerprint = model_structure_fingerprint(split_model)
-                    sample_signature_value = sample_input_signature(sample_input, None)
-                    if graph_artifact_matches(
-                        graph_payload,
-                        model_fingerprint=model_fingerprint,
-                        sample_signature_value=sample_signature_value,
-                    ) and hasattr(self.universal_splitter, "bind_graph"):
-                        self.universal_splitter.bind_graph(
-                            split_model,
-                            graph_payload["graph"],
-                            trace_timings=graph_payload.get("trace_timings"),
-                        )
-                        graph_artifact_loaded = True
-                        logger.info(
-                            "Fixed split startup using cached graph artifact (trace_signature={})",
-                            graph_payload.get("trace_signature"),
-                        )
-
-            if not graph_artifact_loaded:
-                if hasattr(self.universal_splitter, "trace_graph"):
-                    self.universal_splitter.trace_graph(
-                        split_model,
-                        sample_input,
-                    )
-                else:
-                    self.universal_splitter.trace(
-                        split_model,
-                        sample_input,
-                    )
-                logger.info(
-                    "Fixed split startup using cold graph build "
-                    "(trace_time={:.3f}s, graph_build={:.3f}s)",
-                    float(
-                        getattr(self.universal_splitter, "trace_timings", {}).get(
-                            "torchlens_trace_forward",
-                            0.0,
-                        )
-                    ),
-                    float(
-                        getattr(self.universal_splitter, "trace_timings", {}).get(
-                            "graph_build",
-                            0.0,
-                        )
-                    ),
-                )
+            logger.info(
+                "Fixed split startup prepared Ariadne runtime (trace_time={:.3f}s)",
+                time.perf_counter() - trace_started,
+            )
             self.fixed_split_plan = load_or_compute_fixed_split_plan(
                 split_model,
                 constraints,
@@ -252,20 +202,14 @@ class EdgeWorker:
                 cache_path=cache_path,
                 splitter=self.universal_splitter,
             )
+            if self.fixed_split_plan.candidate_id is not None:
+                self.universal_splitter.split(candidate_id=self.fixed_split_plan.candidate_id)
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
-            plan_description = (
-                self.fixed_split_plan.describe()
-                if hasattr(self.fixed_split_plan, "describe")
-                else (
-                    f"split_index={getattr(self.fixed_split_plan, 'split_index', None)}, "
-                    f"payload_bytes={getattr(self.fixed_split_plan, 'payload_bytes', None)}"
-                )
-            )
             logger.info(
                 "Fixed split plan ready (split_config_id={}, {}, image_size={})",
                 self.fixed_split_plan.split_config_id,
-                plan_description,
+                self.fixed_split_plan.describe(),
                 self.split_trace_image_size,
             )
         except RuntimeError as exc:
@@ -278,6 +222,41 @@ class EdgeWorker:
             self.split_learning_disable_reason = str(exc)
             self.split_learning_enabled = False
             self._reset_split_runtime_state()
+
+    def _start_fixed_split_initialization(
+        self,
+        frame,
+        image_size: tuple[int, int],
+    ) -> None:
+        init_lock = getattr(self, "_fixed_split_init_lock", None)
+        if init_lock is None:
+            init_lock = threading.Lock()
+            self._fixed_split_init_lock = init_lock
+        with init_lock:
+            if getattr(self, "_fixed_split_init_attempted", False):
+                return
+            init_frame = frame.copy() if hasattr(frame, "copy") else frame
+            self._fixed_split_init_thread = threading.Thread(
+                target=self._run_fixed_split_initialization,
+                args=(init_frame, tuple(int(value) for value in image_size)),
+                daemon=True,
+                name=f"edge-{getattr(self, 'edge_id', 'unknown')}-fixed-split-init",
+            )
+            self._fixed_split_init_thread.start()
+            logger.info(
+                "Fixed split initialization started in background; "
+                "initial frames use unsplit local inference."
+            )
+
+    def _run_fixed_split_initialization(
+        self,
+        frame,
+        image_size: tuple[int, int],
+    ) -> None:
+        self._init_fixed_split_runtime(frame, image_size)
+        if self.collect_flag and not self.split_learning_enabled:
+            self.collect_flag = False
+            self._log_split_collection_disabled()
 
     def _next_sample_id(self, task: Task) -> str:
         return f"{task.frame_index}-{int(task.start_time * 1000)}"
@@ -366,11 +345,13 @@ class EdgeWorker:
         self._retrain_requested.clear()
 
     def _resolve_active_splitter(self, current_frame, frame_image_size: tuple[int, int]):
-        if self.split_learning_enabled and not self._fixed_split_init_attempted:
-            self._init_fixed_split_runtime(current_frame, frame_image_size)
-            if self.collect_flag and not self.split_learning_enabled:
-                self.collect_flag = False
-                self._log_split_collection_disabled()
+        if self.split_learning_enabled and not getattr(self, "_fixed_split_init_attempted", False):
+            self._start_fixed_split_initialization(current_frame, frame_image_size)
+            return None
+
+        init_thread = getattr(self, "_fixed_split_init_thread", None)
+        if init_thread is not None and init_thread.is_alive():
+            return None
 
         active_splitter = self.universal_splitter if self.universal_split_enabled else None
         effective_image_size = tuple(int(value) for value in frame_image_size)
@@ -715,6 +696,9 @@ class EdgeWorker:
         for thread in (self.diff_processor, self.local_processor, self.retrain_processor):
             if thread.is_alive():
                 thread.join(timeout=timeout)
+        init_thread = getattr(self, "_fixed_split_init_thread", None)
+        if init_thread is not None and init_thread.is_alive():
+            init_thread.join(timeout=timeout)
 
     def diff_worker(self):
         if not self.config.diff_flag:

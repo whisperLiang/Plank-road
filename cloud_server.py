@@ -69,7 +69,7 @@ from model_management.fixed_split_runtime_template import (
     fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
 )
-from model_management.split_runtime import make_split_spec, prepare_split_runtime
+from model_management.split_runtime import compare_outputs, make_split_spec, prepare_split_runtime
 from model_management.payload import BoundaryPayload
 from torchvision.models.detection.image_list import ImageList
 
@@ -80,7 +80,7 @@ def _collate_fn(batch):
     return tuple(zip(*batch))
 
 
-_FIXED_SPLIT_WORKING_CACHE_VERSION = 1
+_FIXED_SPLIT_WORKING_CACHE_VERSION = 2
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
 
 
@@ -150,6 +150,22 @@ def _build_fixed_split_cache_identity(
         "model_version": identity_payload["model_version"],
         "sample_ids": sample_ids,
     }
+
+
+def _fixed_split_boundary_from_plan(split_plan: Mapping[str, object]) -> str:
+    boundary = (
+        split_plan.get("candidate_id")
+        or split_plan.get("split_label")
+        or (
+            list(split_plan.get("boundary_tensor_labels") or [])[-1]
+            if split_plan.get("boundary_tensor_labels")
+            else "auto"
+        )
+    )
+    boundary = str(boundary)
+    if boundary != "auto" and not boundary.startswith("after:"):
+        boundary = f"after:{boundary}"
+    return boundary
 
 
 def _working_cache_manifest_path(working_cache: str) -> str:
@@ -2235,7 +2251,49 @@ class CloudContinualLearner:
                 "Cloud batch reconstruction produced a BoundaryPayload with the wrong batch size "
                 f"(payload_batch={getattr(batch_payload, 'batch_size', None)}, expected={batch_size})."
             )
-        return [batch_payload for _ in range(batch_size)]
+        return [
+            BoundaryPayload(
+                split_id=batch_payload.split_id,
+                graph_signature=batch_payload.graph_signature,
+                batch_size=1,
+                tensors={
+                    label: self._slice_batch_value(tensor, index, batch_size)
+                    for label, tensor in dict(batch_payload.tensors).items()
+                },
+                schema=dict(batch_payload.schema),
+                requires_grad=dict(batch_payload.requires_grad),
+                weight_version=batch_payload.weight_version,
+                passthrough_inputs=self._slice_batch_value(
+                    dict(batch_payload.passthrough_inputs or {}),
+                    index,
+                    batch_size,
+                ),
+            )
+            for index in range(batch_size)
+        ]
+
+    @staticmethod
+    def _slice_batch_value(value: object, index: int, batch_size: int) -> object:
+        if isinstance(value, torch.Tensor):
+            if value.ndim > 0 and int(value.shape[0]) == int(batch_size):
+                return value[index:index + 1]
+            return value
+        if isinstance(value, dict):
+            return {
+                key: CloudContinualLearner._slice_batch_value(item, index, batch_size)
+                for key, item in value.items()
+            }
+        if isinstance(value, tuple):
+            return tuple(
+                CloudContinualLearner._slice_batch_value(item, index, batch_size)
+                for item in value
+            )
+        if isinstance(value, list):
+            return [
+                CloudContinualLearner._slice_batch_value(item, index, batch_size)
+                for item in value
+            ]
+        return value
 
     @staticmethod
     def _pad_runtime_batch_inputs(
@@ -2298,14 +2356,18 @@ class CloudContinualLearner:
                         )
                     )
 
-                inputs = torch.cat(prepared_inputs, dim=0)
+                actual_chunk_size = len(chunk_paths)
+                inputs = self._pad_runtime_batch_inputs(
+                    prepared_inputs,
+                    target_batch_size=chunk_size,
+                )
                 batch_payload = splitter.edge_forward(inputs, candidate=candidate)
                 chunk_payloads = self._split_batched_payload(
                     batch_payload,
-                    batch_size=len(chunk_paths),
+                    batch_size=chunk_size,
                 )
                 payloads.extend(
-                    chunk_payloads[:len(chunk_paths)]
+                    chunk_payloads[:actual_chunk_size]
                 )
             return payloads
 
@@ -2321,15 +2383,7 @@ class CloudContinualLearner:
         split_plan = dict(manifest.get("split_plan", {}))
         trace_image_size = self._infer_bundle_trace_image_size(dict(manifest))
         image_size = trace_image_size or (640, 640)
-        boundary = (
-            split_plan.get("split_label")
-            or (list(split_plan.get("boundary_tensor_labels") or [])[-1]
-                if split_plan.get("boundary_tensor_labels")
-                else "auto")
-        )
-        boundary = str(boundary)
-        if boundary != "auto" and not boundary.startswith("after:"):
-            boundary = f"after:{boundary}"
+        boundary = _fixed_split_boundary_from_plan(split_plan)
         model_family = model_zoo.get_model_family(str(model_name))
         split_spec = make_split_spec(
             boundary,
@@ -2346,7 +2400,100 @@ class CloudContinualLearner:
             example_inputs=symbolic_example,
             graph_signature=str(split_plan.get("trace_signature") or "") or None,
             split_plan_hash=_json_fingerprint(split_plan),
-            mode="generated_eager",
+            mode=self._preferred_fixed_split_runtime_mode(model_family),
+        )
+
+    @staticmethod
+    def _runtime_example_args(sample_input):
+        if isinstance(sample_input, tuple):
+            return sample_input
+        if isinstance(sample_input, list):
+            return tuple(sample_input)
+        return (sample_input,)
+
+    @staticmethod
+    def _preferred_fixed_split_runtime_mode(model_family: str | None) -> str:
+        if str(model_family or "").lower() == "rfdetr":
+            return "debug_interpreter"
+        return "generated_eager"
+
+    def _validate_prepared_split_runtime(
+        self,
+        runtime,
+        model: torch.nn.Module,
+        sample_input,
+        *,
+        model_name: str,
+        mode: str,
+    ) -> tuple[bool, str | None]:
+        inputs = self._runtime_example_args(sample_input)
+        try:
+            with torch.no_grad():
+                boundary_payload = runtime.run_prefix(*inputs)
+                replayed = runtime.run_suffix(boundary_payload)
+                expected = model(*inputs)
+            ok, max_diff = compare_outputs(expected, replayed)
+        except Exception as exc:  # noqa: BLE001 - report and possibly fall back.
+            return False, str(exc)
+        if not ok:
+            return False, f"split replay output mismatch (max_diff={max_diff})"
+        logger.info(
+            "[FixedSplitCL] Ariadne {} runtime replay validation passed (split_id={}).",
+            mode,
+            getattr(runtime, "split_id", None),
+        )
+        return True, None
+
+    def _prepare_replayable_split_runtime(
+        self,
+        model: torch.nn.Module,
+        sample_input,
+        split_spec,
+        *,
+        model_name: str,
+        preferred_mode: str = "generated_eager",
+    ) -> tuple[object, str]:
+        modes = []
+        for mode in (preferred_mode, "generated_eager", "debug_interpreter"):
+            mode = str(mode)
+            if mode not in modes:
+                modes.append(mode)
+
+        errors: dict[str, str | None] = {}
+        for index, mode in enumerate(modes):
+            runtime = prepare_split_runtime(
+                model,
+                sample_input,
+                split_spec,
+                mode=mode,
+            )
+            ok, error = self._validate_prepared_split_runtime(
+                runtime,
+                model,
+                sample_input,
+                model_name=model_name,
+                mode=mode,
+            )
+            if ok:
+                return runtime, mode
+            errors[mode] = error
+            if index + 1 < len(modes):
+                logger.warning(
+                    "[FixedSplitCL] Ariadne {} runtime failed replay validation "
+                    "(model_name={}, split_id={}, error={}); retrying with {}.",
+                    mode,
+                    model_name,
+                    getattr(runtime, "split_id", None),
+                    error,
+                    modes[index + 1],
+                )
+
+        error_summary = ", ".join(
+            f"{mode}_error={error}" for mode, error in errors.items()
+        )
+        raise RuntimeError(
+            "Ariadne fixed split runtime is not replayable in any supported mode "
+            f"({error_summary})."
         )
 
     def _build_fixed_split_runtime_template(
@@ -2369,15 +2516,7 @@ class CloudContinualLearner:
                 manifest,
                 runtime_batch_size=2,
             )
-        boundary = (
-            split_plan_payload.get("split_label")
-            or (list(split_plan_payload.get("boundary_tensor_labels") or [])[-1]
-                if split_plan_payload.get("boundary_tensor_labels")
-                else "auto")
-        )
-        boundary = str(boundary)
-        if boundary != "auto" and not boundary.startswith("after:"):
-            boundary = f"after:{boundary}"
+        boundary = _fixed_split_boundary_from_plan(split_plan_payload)
         model_name = self._resolve_fixed_split_model_name(manifest)
         model_family = model_zoo.get_model_family(model_name)
         split_spec = make_split_spec(
@@ -2388,20 +2527,22 @@ class CloudContinualLearner:
             model_family=model_family,
         )
         trace_started = time.perf_counter()
-        runtime = prepare_split_runtime(
+        runtime, runtime_mode = self._prepare_replayable_split_runtime(
             split_model,
             sample_input,
             split_spec,
-            mode="generated_eager",
+            model_name=model_name,
+            preferred_mode=self._preferred_fixed_split_runtime_mode(model_family),
         )
         self._log_stage_elapsed("Ariadne prepare_split", time.perf_counter() - trace_started)
         trace_signature = str(getattr(runtime, "graph_signature", "") or "")
         logger.info(
-            "[FixedSplitCL] runtime template prepared Ariadne split (model_name={}, model_family={}, split_id={}, trace_signature={}, key={}).",
+            "[FixedSplitCL] runtime template prepared Ariadne split (model_name={}, model_family={}, split_id={}, trace_signature={}, mode={}, key={}).",
             model_name,
             model_family,
             getattr(runtime, "split_id", None),
             trace_signature,
+            runtime_mode,
             template_key.to_log_payload(),
         )
         return FixedSplitRuntimeTemplate(
@@ -2413,7 +2554,7 @@ class CloudContinualLearner:
             graph_signature=trace_signature,
             symbolic_input_schema_hash=template_key.symbolic_input_schema_hash,
             split_plan_hash=str(template_key.split_plan_hash),
-            mode="generated_eager",
+            mode=runtime_mode,
         )
 
     def _get_or_create_fixed_split_runtime_template(

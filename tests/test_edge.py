@@ -142,11 +142,10 @@ class TestEdgeWorkerRouting:
                 self.device = device
                 self.trainability_loss_fn = None
 
-            def trace_graph(self, model, runtime_input):
+            def trace(self, model, runtime_input, **kwargs):
                 trace_calls["trace_model"] = model
                 trace_calls["trace_input"] = runtime_input
-
-            trace = trace_graph
+                trace_calls["model_name"] = kwargs.get("model_name")
 
         worker.small_object_detection = DummyDetection()
 
@@ -158,6 +157,8 @@ class TestEdgeWorkerRouting:
                 split_config_id="plan-1",
                 split_index=7,
                 payload_bytes=1024,
+                candidate_id=None,
+                describe=lambda: "candidate_id=None",
             ),
         )
 
@@ -165,9 +166,12 @@ class TestEdgeWorkerRouting:
 
         assert trace_calls["frame"] is sample_bgr_frame
         assert trace_calls["trace_input"] is sample_input
+        assert trace_calls["model_name"] == "dummy-model"
         assert "synthetic_image_size" not in trace_calls
 
-    def test_init_fixed_split_runtime_reuses_cached_graph_artifact(self, monkeypatch, sample_bgr_frame, tmp_path):
+    def test_init_fixed_split_runtime_uses_ariadne_trace_without_graph_artifact_cache(
+        self, monkeypatch, sample_bgr_frame, tmp_path
+    ):
         worker = EdgeWorker.__new__(EdgeWorker)
         worker.config = SimpleNamespace(
             split_learning=SimpleNamespace(fixed_split=SimpleNamespace()),
@@ -184,9 +188,8 @@ class TestEdgeWorkerRouting:
 
         sample_input = object()
         split_model = torch.nn.Linear(1, 1)
-        fake_graph = object()
-        bind_calls = {"count": 0}
-        trace_calls = {"count": 0}
+        trace_calls = {}
+        plan_calls = {}
 
         class DummyDetection:
             model = object()
@@ -205,48 +208,42 @@ class TestEdgeWorkerRouting:
                 self.device = device
                 self.trainability_loss_fn = None
 
-            def bind_graph(self, model, graph, **kwargs):
-                bind_calls["count"] += 1
-                self.graph = graph
-                self.model = model
-                self.trace_timings = dict(kwargs.get("trace_timings") or {})
+            def trace(self, model, runtime_input, **kwargs):
+                trace_calls["model"] = model
+                trace_calls["input"] = runtime_input
+                trace_calls["model_name"] = kwargs.get("model_name")
                 return self
-
-            def trace_graph(self, model, runtime_input):
-                trace_calls["count"] += 1
-
-            trace = trace_graph
 
         worker.small_object_detection = DummyDetection()
 
         monkeypatch.setattr("edge.edge_worker.UniversalModelSplitter", DummySplitter)
         monkeypatch.setattr("edge.edge_worker.build_split_training_loss", lambda model: "loss-fn")
-        monkeypatch.setattr(
-            "edge.edge_worker.load_torch_artifact",
-            lambda path: {
-                "artifact_version": "fixed-split-graph.v1",
-                "graph": fake_graph,
-                "trace_signature": "sig",
-                "trace_timings": {"graph_build": 0.01},
-                "model_structure_fingerprint": "model-fp",
-                "sample_input_signature": "sample-sig",
-            },
-        )
-        monkeypatch.setattr("edge.edge_worker.model_structure_fingerprint", lambda model: "model-fp")
-        monkeypatch.setattr("edge.edge_worker.sample_input_signature", lambda sample_input, sample_kwargs=None: "sample-sig")
-        monkeypatch.setattr(
-            "edge.edge_worker.load_or_compute_fixed_split_plan",
-            lambda *args, **kwargs: SimpleNamespace(
+
+        def _fake_plan(*args, **kwargs):
+            plan_calls["splitter"] = kwargs.get("splitter")
+            plan_calls["sample_input"] = kwargs.get("sample_input")
+            return SimpleNamespace(
                 split_config_id="plan-1",
                 split_index=7,
                 payload_bytes=1024,
-            ),
+                candidate_id=None,
+                describe=lambda: "candidate_id=None",
+            )
+
+        monkeypatch.setattr(
+            "edge.edge_worker.load_or_compute_fixed_split_plan",
+            _fake_plan,
         )
 
         worker._init_fixed_split_runtime(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
 
-        assert bind_calls["count"] == 1
-        assert trace_calls["count"] == 0
+        assert trace_calls == {
+            "model": split_model,
+            "input": sample_input,
+            "model_name": "dummy-model",
+        }
+        assert plan_calls["splitter"] is worker.universal_splitter
+        assert plan_calls["sample_input"] is sample_input
 
     def test_resolve_active_splitter_disables_runtime_when_frame_size_changes(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
@@ -262,6 +259,34 @@ class TestEdgeWorkerRouting:
 
         assert active is None
         assert worker.split_learning_enabled is False
+
+    def test_resolve_active_splitter_starts_fixed_split_init_in_background(self, sample_bgr_frame):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.edge_id = 1
+        worker.split_learning_enabled = True
+        worker._fixed_split_init_attempted = False
+        worker.universal_split_enabled = False
+        worker.universal_splitter = None
+        started = threading.Event()
+        release = threading.Event()
+
+        def _fake_init(frame, image_size):
+            worker._fixed_split_init_attempted = True
+            started.set()
+            release.wait(1.0)
+
+        worker._run_fixed_split_initialization = _fake_init
+
+        start_time = time.perf_counter()
+        active = worker._resolve_active_splitter(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
+        elapsed = time.perf_counter() - start_time
+
+        assert active is None
+        assert elapsed < 0.2
+        assert started.wait(0.5) is True
+        assert worker._fixed_split_init_thread is not None
+        release.set()
+        worker._fixed_split_init_thread.join(timeout=1.0)
 
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
