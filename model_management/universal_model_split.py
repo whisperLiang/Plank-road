@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -9,6 +10,7 @@ import torch
 from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
 from ariadne.codegen.segment_builder import build_segments
 from ariadne.planner.frontier import enumerate_frontier_splits
+from loguru import logger
 
 from model_management.payload import deserialize_boundary_payload, serialize_boundary_payload
 from model_management.split_candidate import CandidateProfile, SplitCandidate
@@ -1176,6 +1178,8 @@ def universal_split_retrain(
     weight_decay: float = 0.0,
     grad_clip_norm: float | None = None,
     shuffle_samples: bool = False,
+    epoch_log_context: str | None = None,
+    log_every_n_batches: int = 1,
     **_: Any,
 ) -> list[float]:
     if loss_fn is None:
@@ -1193,21 +1197,41 @@ def universal_split_retrain(
     annotations = dict(gt_annotations or {})
     runtime_min_batch = _splitter_dynamic_batch_min(runtime)
 
-    for _epoch in range(int(num_epoch)):
+    total_epochs = int(num_epoch)
+    should_log_training = bool(epoch_log_context)
+    log_interval = max(1, int(log_every_n_batches))
+
+    for _epoch in range(total_epochs):
         epoch_losses: list[float] = []
         epoch_indices = list(all_indices)
         if shuffle_samples and len(epoch_indices) > 1:
             order = torch.randperm(len(epoch_indices)).tolist()
             epoch_indices = [epoch_indices[index] for index in order]
-        for start in range(0, len(epoch_indices), int(batch_size)):
+        epoch_batch_size = int(batch_size)
+        total_batches = (len(epoch_indices) + epoch_batch_size - 1) // epoch_batch_size
+        epoch_label = f"{epoch_log_context} epoch {_epoch + 1}/{total_epochs}"
+        if should_log_training:
+            logger.info(
+                "[FixedSplitCL] {} started (batches={}, samples={}, batch_size={}).",
+                epoch_label,
+                total_batches,
+                len(epoch_indices),
+                epoch_batch_size,
+            )
+        epoch_started = time.perf_counter()
+        data_load_time: list[float] = []
+        train_process_time: list[float] = []
+        for batch_number, start in enumerate(range(0, len(epoch_indices), epoch_batch_size), 1):
             batch_indices = list(epoch_indices[start : start + int(batch_size)])
             if not batch_indices:
                 continue
+            load_started = time.perf_counter()
             records = [
                 _get_preloaded_split_feature_record(preloaded_records, index)
                 or load_split_feature_cache(cache_path, index)
                 for index in batch_indices
             ]
+            data_load_time.append(time.perf_counter() - load_started)
             boundaries = [record.get("intermediate") for record in records]
             if not boundaries or not all(
                 isinstance(boundary, BoundaryPayload) for boundary in boundaries
@@ -1232,16 +1256,45 @@ def universal_split_retrain(
                 expected_batch_size=execution_batch_size,
                 device=device,
             )
+            train_started = time.perf_counter()
             loss, _grads = runtime.train_suffix(
                 boundary,
                 execution_targets,
                 loss_fn=loss_fn,
                 optimizer=optimizer,
             )
-            epoch_losses.append(float(loss.detach().cpu().item()))
+            train_process_time.append(time.perf_counter() - train_started)
+            loss_value = float(loss.detach().cpu().item())
+            epoch_losses.append(loss_value)
+            if should_log_training and (
+                batch_number == 1
+                or batch_number % log_interval == 0
+                or batch_number == total_batches
+            ):
+                logger.info(
+                    "[FixedSplitCL] {} batch {}/{} loss={:.6f} avg_loss={:.6f} data={:.3f}s/it train={:.3f}s/it.",
+                    epoch_label,
+                    batch_number,
+                    total_batches,
+                    loss_value,
+                    sum(epoch_losses) / len(epoch_losses),
+                    sum(data_load_time) / len(data_load_time),
+                    sum(train_process_time) / len(train_process_time),
+                )
         if not epoch_losses:
             raise RuntimeError("Split retraining did not produce any finite batch loss.")
-        losses.append(sum(epoch_losses) / len(epoch_losses))
+        epoch_loss = sum(epoch_losses) / len(epoch_losses)
+        losses.append(epoch_loss)
+        if should_log_training:
+            logger.info(
+                "[FixedSplitCL] {} finished avg_loss={:.6f} min_loss={:.6f} max_loss={:.6f} batches={} elapsed={:.3f}s.",
+                epoch_label,
+                epoch_loss,
+                min(epoch_losses),
+                max(epoch_losses),
+                len(epoch_losses),
+                time.perf_counter() - epoch_started,
+            )
     return losses
 
 

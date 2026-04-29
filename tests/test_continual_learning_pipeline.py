@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import cv2
 import pytest
 import torch
+from loguru import logger
 
 from edge.sample_store import EdgeSampleStore, HIGH_QUALITY, LOW_QUALITY
 from edge.transmit import (
@@ -755,6 +756,50 @@ def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
 
     assert losses == [0.25]
     assert splitter.seen_batch_sizes == [16]
+
+
+def test_split_retrain_logs_epoch_and_batch_losses_when_context_is_provided(tmp_path):
+    cache_path = str(tmp_path / "cache")
+    sample_ids = ["s1", "s2"]
+    for index, sample_id in enumerate(sample_ids, 1):
+        payload = boundary_payload_from_tensors(
+            {"node_1": torch.tensor([[float(index)]])},
+            split_id="after:node_1",
+            graph_signature="graph-sig",
+        )
+        save_split_feature_cache(cache_path, sample_id, payload)
+
+    class DummySplitter:
+        def __init__(self):
+            self.call_count = 0
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del boundary, targets, loss_fn, optimizer
+            self.call_count += 1
+            return torch.tensor(float(self.call_count)), {}
+
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+    try:
+        losses = universal_split_retrain(
+            model=torch.nn.Linear(1, 1),
+            sample_input=torch.ones(1, 1),
+            cache_path=cache_path,
+            all_indices=sample_ids,
+            gt_annotations={},
+            loss_fn=lambda outputs, targets: torch.tensor(1.0),
+            splitter=DummySplitter(),
+            batch_size=1,
+            num_epoch=2,
+            epoch_log_context="unit split",
+        )
+    finally:
+        logger.remove(sink_id)
+
+    assert losses == [1.5, 3.5]
+    joined_messages = "\n".join(messages)
+    assert "unit split epoch 1/2 batch 1/2 loss=1.000000 avg_loss=1.000000" in joined_messages
+    assert "unit split epoch 2/2 finished avg_loss=3.500000" in joined_messages
 
 
 def test_split_retrain_moves_mixed_preloaded_boundary_devices_to_training_device(

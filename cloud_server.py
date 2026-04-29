@@ -3760,6 +3760,7 @@ class CloudContinualLearner:
         universal_split_retrain(
             **split_retrain_kwargs,
             num_epoch=effective_num_epoch,
+            epoch_log_context=training_label,
         )
         self._log_stage_duration("split retraining", split_retrain_started)
         proxy_eval_started = time.perf_counter()
