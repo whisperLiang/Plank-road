@@ -76,11 +76,6 @@ def _safe_extract_zip_bytes(payload_zip: bytes, destination: Path) -> None:
         _safe_extract_zip_archive(archive, destination)
 
 
-def _safe_extract_zip_file(payload_zip_path: str | Path, destination: Path) -> None:
-    with zipfile.ZipFile(payload_zip_path, "r") as archive:
-        _safe_extract_zip_archive(archive, destination)
-
-
 def _uploaded_workspace_dir(
     workspace_root: Path,
     *,
@@ -122,27 +117,3 @@ def prepare_request_workspace(
         return workspace_dir
 
     return _resolve_requested_cache_path(root, client_cache_path)
-
-
-def prepare_request_workspace_from_zip_file(
-    workspace_root: str | Path | None,
-    *,
-    edge_id: int | str,
-    request_kind: str,
-    payload_zip_path: str | Path,
-) -> Path:
-    root = Path(workspace_root or "./cache/server_workspace").resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    workspace_dir = _uploaded_workspace_dir(
-        root,
-        edge_id=edge_id,
-        request_kind=request_kind,
-    )
-    reset_workspace_dir(workspace_dir)
-    _safe_extract_zip_file(payload_zip_path, workspace_dir)
-    logger.info(
-        "Saved and unpacked the streamed gRPC ZIP payload for edge_{} into workspace: {}",
-        edge_id,
-        workspace_dir,
-    )
-    return workspace_dir

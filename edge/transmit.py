@@ -18,8 +18,6 @@ from model_management.continual_learning_bundle import (
     CONTINUAL_LEARNING_PROTOCOL_VERSION,
 )
 
-TRAINING_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
-TRAINING_UPLOAD_LOG_INTERVAL_BYTES = 32 * 1024 * 1024
 DEFAULT_CL_BUNDLE_MAX_BYTES = 32 * 1024 * 1024
 
 
@@ -709,243 +707,6 @@ def submit_training_job(
             channel.close()
 
 
-def _iter_training_job_chunks(
-    *,
-    protocol_version: str,
-    edge_id: int,
-    request_id: str,
-    job_type: int,
-    cache_path: str,
-    send_low_conf_features: bool,
-    frame_indices: list[int] | None,
-    all_frame_indices: list[int] | None,
-    drift_frame_indices: list[int] | None,
-    payload_zip: bytes,
-    chunk_size: int = TRAINING_UPLOAD_CHUNK_BYTES,
-):
-    total_size = len(payload_zip or b"")
-    chunk_size = max(1, int(chunk_size))
-    next_log_at = TRAINING_UPLOAD_LOG_INTERVAL_BYTES
-    ranges = list(range(0, total_size, chunk_size)) or [0]
-    for chunk_index, start in enumerate(ranges):
-        end = min(start + chunk_size, total_size)
-        sent_after_chunk = end
-        if sent_after_chunk >= next_log_at or sent_after_chunk == total_size:
-            logger.info(
-                "Streaming training upload request_id={} chunk={} bytes={} / {}",
-                request_id,
-                chunk_index,
-                _format_bytes(sent_after_chunk),
-                _format_bytes(total_size),
-            )
-            while next_log_at <= sent_after_chunk:
-                next_log_at += TRAINING_UPLOAD_LOG_INTERVAL_BYTES
-        yield message_transmission_pb2.SubmitTrainingJobChunk(
-            protocol_version=str(protocol_version or ""),
-            edge_id=int(edge_id),
-            request_id=str(request_id or ""),
-            job_type=int(job_type),
-            cache_path=str(cache_path or ""),
-            send_low_conf_features=bool(send_low_conf_features),
-            frame_indices=[int(index) for index in (frame_indices or [])],
-            all_frame_indices=[int(index) for index in (all_frame_indices or [])],
-            drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
-            payload_chunk=payload_zip[start:end],
-            chunk_index=int(chunk_index),
-            total_payload_bytes=int(total_size),
-        )
-
-
-def _iter_training_job_file_chunks(
-    *,
-    protocol_version: str,
-    edge_id: int,
-    request_id: str,
-    job_type: int,
-    cache_path: str,
-    send_low_conf_features: bool,
-    frame_indices: list[int] | None,
-    all_frame_indices: list[int] | None,
-    drift_frame_indices: list[int] | None,
-    payload_zip_path: str,
-    chunk_size: int = TRAINING_UPLOAD_CHUNK_BYTES,
-):
-    total_size = os.path.getsize(payload_zip_path)
-    chunk_size = max(1, int(chunk_size))
-    next_log_at = TRAINING_UPLOAD_LOG_INTERVAL_BYTES
-    chunk_index = 0
-    sent = 0
-
-    with open(payload_zip_path, "rb") as handle:
-        while True:
-            chunk = handle.read(chunk_size)
-            if not chunk and (chunk_index > 0 or total_size > 0):
-                break
-            sent += len(chunk)
-            if sent >= next_log_at or sent == total_size:
-                logger.info(
-                    "Streaming training upload request_id={} chunk={} bytes={} / {}",
-                    request_id,
-                    chunk_index,
-                    _format_bytes(sent),
-                    _format_bytes(total_size),
-                )
-                while next_log_at <= sent:
-                    next_log_at += TRAINING_UPLOAD_LOG_INTERVAL_BYTES
-            yield message_transmission_pb2.SubmitTrainingJobChunk(
-                protocol_version=str(protocol_version or ""),
-                edge_id=int(edge_id),
-                request_id=str(request_id or ""),
-                job_type=int(job_type),
-                cache_path=str(cache_path or ""),
-                send_low_conf_features=bool(send_low_conf_features),
-                frame_indices=[int(index) for index in (frame_indices or [])],
-                all_frame_indices=[int(index) for index in (all_frame_indices or [])],
-                drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
-                payload_chunk=chunk,
-                chunk_index=int(chunk_index),
-                total_payload_bytes=int(total_size),
-            )
-            chunk_index += 1
-            if not chunk:
-                break
-
-
-def submit_training_job_stream(
-    server_ip: str,
-    *,
-    edge_id: int,
-    request_id: str,
-    job_type: int,
-    cache_path: str,
-    protocol_version: str = "",
-    send_low_conf_features: bool = False,
-    frame_indices: list[int] | None = None,
-    all_frame_indices: list[int] | None = None,
-    drift_frame_indices: list[int] | None = None,
-    payload_zip: bytes = b"",
-    channel=None,
-):
-    owned_channel = channel is None
-    request_started = time.perf_counter()
-    try:
-        if channel is None:
-            channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
-        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
-        logger.info(
-            "Submitting streamed training job request_id={} edge_id={} job_type={} "
-            "payload_zip={} chunk_size={} server={}",
-            request_id,
-            edge_id,
-            job_type,
-            _format_bytes(len(payload_zip or b"")),
-            _format_bytes(TRAINING_UPLOAD_CHUNK_BYTES),
-            server_ip,
-        )
-        reply = stub.submit_training_job_stream(
-            _iter_training_job_chunks(
-                protocol_version=protocol_version,
-                edge_id=edge_id,
-                request_id=request_id,
-                job_type=job_type,
-                cache_path=cache_path,
-                send_low_conf_features=send_low_conf_features,
-                frame_indices=frame_indices,
-                all_frame_indices=all_frame_indices,
-                drift_frame_indices=drift_frame_indices,
-                payload_zip=payload_zip or b"",
-            )
-        )
-        logger.info(
-            "submit_training_job_stream reply request_id={} accepted={} job_id={} "
-            "status={} elapsed={:.3f}s",
-            request_id,
-            bool(reply.accepted),
-            reply.job_id,
-            reply.status,
-            time.perf_counter() - request_started,
-        )
-        return reply
-    except Exception as exc:
-        logger.exception(
-            "submit_training_job_stream failed after {:.3f}s: {}",
-            time.perf_counter() - request_started,
-            exc,
-        )
-        return None
-    finally:
-        if owned_channel and channel is not None:
-            channel.close()
-
-
-def submit_training_job_stream_from_file(
-    server_ip: str,
-    *,
-    edge_id: int,
-    request_id: str,
-    job_type: int,
-    cache_path: str,
-    payload_zip_path: str,
-    protocol_version: str = "",
-    send_low_conf_features: bool = False,
-    frame_indices: list[int] | None = None,
-    all_frame_indices: list[int] | None = None,
-    drift_frame_indices: list[int] | None = None,
-    channel=None,
-):
-    owned_channel = channel is None
-    request_started = time.perf_counter()
-    payload_size = os.path.getsize(payload_zip_path)
-    try:
-        if channel is None:
-            channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
-        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
-        logger.info(
-            "Submitting file-backed streamed training job request_id={} edge_id={} "
-            "job_type={} payload_zip={} chunk_size={} server={}",
-            request_id,
-            edge_id,
-            job_type,
-            _format_bytes(payload_size),
-            _format_bytes(TRAINING_UPLOAD_CHUNK_BYTES),
-            server_ip,
-        )
-        reply = stub.submit_training_job_stream(
-            _iter_training_job_file_chunks(
-                protocol_version=protocol_version,
-                edge_id=edge_id,
-                request_id=request_id,
-                job_type=job_type,
-                cache_path=cache_path,
-                send_low_conf_features=send_low_conf_features,
-                frame_indices=frame_indices,
-                all_frame_indices=all_frame_indices,
-                drift_frame_indices=drift_frame_indices,
-                payload_zip_path=payload_zip_path,
-            )
-        )
-        logger.info(
-            "submit_training_job_stream_from_file reply request_id={} accepted={} "
-            "job_id={} status={} elapsed={:.3f}s",
-            request_id,
-            bool(reply.accepted),
-            reply.job_id,
-            reply.status,
-            time.perf_counter() - request_started,
-        )
-        return reply
-    except Exception as exc:
-        logger.exception(
-            "submit_training_job_stream_from_file failed after {:.3f}s: {}",
-            time.perf_counter() - request_started,
-            exc,
-        )
-        return None
-    finally:
-        if owned_channel and channel is not None:
-            channel.close()
-
-
 def get_training_job_status(
     server_ip: str,
     *,
@@ -1011,7 +772,6 @@ def submit_continual_learning_job(
     request_id: str | None = None,
     channel=None,
 ):
-    zip_path = None
     try:
         pack_started = time.perf_counter()
         stats = sample_store.stats()
@@ -1028,7 +788,7 @@ def submit_continual_learning_job(
             model_id,
             model_version,
         )
-        zip_path, manifest, pack_stats = pack_continual_learning_bundle_to_file(
+        payload_zip, manifest = pack_continual_learning_bundle(
             sample_store,
             edge_id=edge_id,
             send_low_conf_features=send_low_conf_features,
@@ -1038,7 +798,8 @@ def submit_continual_learning_job(
             bundle_cap_bytes=bundle_cap_bytes,
         )
         payload_summary = _manifest_payload_summary(manifest)
-        zip_payload_bytes = int(pack_stats.get("zip_payload_bytes", 0))
+        zip_payload_bytes = len(payload_zip)
+        selection_policy = dict(manifest.get("selection_policy", {}) or {})
         estimated_upload_sec = None
         if bandwidth_mbps > 0.0 and zip_payload_bytes > 0:
             estimated_upload_sec = (
@@ -1046,20 +807,18 @@ def submit_continual_learning_job(
             )
         logger.info(
             "Packed continual learning bundle for edge {} "
-            "(selection_time={:.3f}s, zip_write_time={:.3f}s, total_pack_time={:.3f}s, "
+            "(total_pack_time={:.3f}s, "
             "(manifest_samples={}, drift={}, source_feature_bytes={}, "
             "source_raw_bytes={}, source_total_bytes={}, cap={}, zip_payload={}, "
             "estimated_upload_sec={}).",
             edge_id,
-            float(pack_stats.get("selection_elapsed_sec", 0.0)),
-            float(pack_stats.get("zip_write_elapsed_sec", 0.0)),
             time.perf_counter() - pack_started,
             payload_summary["samples"],
             payload_summary["drift"],
             _format_bytes(payload_summary["feature_bytes"]),
             _format_bytes(payload_summary["raw_bytes"]),
-            _format_bytes(int(pack_stats.get("source_total_bytes", 0))),
-            _format_bytes(int(pack_stats.get("bundle_cap_bytes", 0))),
+            _format_bytes(int(selection_policy.get("source_total_bytes", 0))),
+            _format_bytes(int(selection_policy.get("bundle_cap_bytes", 0))),
             _format_bytes(zip_payload_bytes),
             (
                 f"{estimated_upload_sec:.3f}s"
@@ -1068,7 +827,7 @@ def submit_continual_learning_job(
             ),
         )
         upload_started = time.perf_counter()
-        reply = submit_training_job_stream_from_file(
+        reply = submit_training_job(
             server_ip,
             edge_id=edge_id,
             request_id=str(request_id or uuid.uuid4().hex),
@@ -1076,7 +835,7 @@ def submit_continual_learning_job(
             cache_path=_server_workspace_hint(edge_id, "continual_learning"),
             protocol_version=manifest["protocol_version"],
             send_low_conf_features=bool(send_low_conf_features),
-            payload_zip_path=zip_path,
+            payload_zip=payload_zip,
             channel=channel,
         )
         upload_elapsed = time.perf_counter() - upload_started
@@ -1099,9 +858,3 @@ def submit_continual_learning_job(
     except Exception as exc:
         logger.exception("submit_continual_learning_job failed: {}", exc)
         return False, "", str(exc)
-    finally:
-        if zip_path is not None:
-            try:
-                os.remove(zip_path)
-            except OSError:
-                pass
