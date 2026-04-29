@@ -687,6 +687,70 @@ def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
     assert splitter.seen_boundary is not None
 
 
+def test_split_retrain_attaches_cache_metadata_to_targets(tmp_path):
+    cache_path = str(tmp_path / "cache")
+    first = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    second = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[3.0, 4.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    save_split_feature_cache(
+        cache_path,
+        "s1",
+        first,
+        extra_metadata={
+            "input_image_size": [1080, 1920],
+            "input_tensor_shape": [1, 3, 384, 384],
+            "input_resize_mode": "direct_resize",
+        },
+    )
+    save_split_feature_cache(
+        cache_path,
+        "s2",
+        second,
+        extra_metadata={
+            "input_image_size": [720, 1280],
+            "input_tensor_shape": [1, 3, 384, 384],
+            "input_resize_mode": "direct_resize",
+        },
+    )
+
+    class DummySplitter:
+        def __init__(self):
+            self.seen_targets = None
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            self.seen_targets = targets
+            assert targets[0]["_split_meta"]["input_image_size"] == [1080, 1920]
+            assert targets[0]["_split_meta"]["input_tensor_shape"] == [1, 3, 384, 384]
+            assert targets[0]["_split_meta"]["input_resize_mode"] == "direct_resize"
+            assert targets[1]["_split_meta"]["input_image_size"] == [720, 1280]
+            return torch.tensor(1.0), {}
+
+    splitter = DummySplitter()
+    losses = universal_split_retrain(
+        model=torch.nn.Linear(1, 1),
+        sample_input=torch.ones(1, 1),
+        cache_path=cache_path,
+        all_indices=["s1", "s2"],
+        gt_annotations={
+            "s1": {"boxes": [[1.0, 2.0, 3.0, 4.0]], "labels": [1]},
+            "s2": {"boxes": [[2.0, 3.0, 4.0, 5.0]], "labels": [2]},
+        },
+        loss_fn=lambda outputs, targets: torch.tensor(1.0),
+        splitter=splitter,
+        batch_size=2,
+    )
+
+    assert losses == [1.0]
+    assert splitter.seen_targets is not None
+
+
 def test_cached_split_proxy_eval_batches_schema_payloads(tmp_path):
     from cloud_server import _build_detection_proxy_prediction_cache
 

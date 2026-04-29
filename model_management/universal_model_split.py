@@ -418,6 +418,7 @@ class UniversalModelSplitter:
         mode: str = "generated_eager",
         model_name: str | None = None,
         model_family: str | None = None,
+        enable_dynamic_batch: bool = True,
         **_: Any,
     ) -> "UniversalModelSplitter":
         if sample_kwargs:
@@ -427,7 +428,10 @@ class UniversalModelSplitter:
         self.model_family = model_family
         trace_batch_size = _first_tensor_batch_size(sample_input) or 1
         trace_batch_mode = "batch_gt1" if trace_batch_size > 1 else "batch_1"
-        dynamic_batch = (2, 64) if trace_batch_size > 1 else (1, 64)
+        if enable_dynamic_batch:
+            dynamic_batch = (2, 64) if trace_batch_size > 1 else (1, 64)
+        else:
+            dynamic_batch = None
         self.split_spec = split_spec or make_split_spec(
             boundary,
             dynamic_batch=dynamic_batch,
@@ -956,6 +960,37 @@ def _combine_boundary_payload_batch(
     )
 
 
+_SPLIT_TARGET_METADATA_FIELDS = (
+    "input_image_size",
+    "input_tensor_shape",
+    "input_resize_mode",
+)
+
+
+def _split_target_metadata_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        field_name: record[field_name]
+        for field_name in _SPLIT_TARGET_METADATA_FIELDS
+        if field_name in record and record[field_name] is not None
+    }
+
+
+def _target_with_split_metadata(target: Any, record: Mapping[str, Any]) -> Any:
+    if not isinstance(target, Mapping):
+        return target
+    metadata = _split_target_metadata_from_record(record)
+    if not metadata:
+        return target
+    updated_target = dict(target)
+    existing_meta = updated_target.get("_split_meta", {})
+    split_meta = dict(existing_meta) if isinstance(existing_meta, Mapping) else {}
+    for field_name, value in metadata.items():
+        if split_meta.get(field_name) is None:
+            split_meta[field_name] = value
+    updated_target["_split_meta"] = split_meta
+    return updated_target
+
+
 def universal_split_retrain(
     *,
     model: torch.nn.Module,
@@ -997,7 +1032,10 @@ def universal_split_retrain(
                 boundaries,
                 expected_batch_size=len(batch_indices),
             )
-            targets = [annotations.get(index) for index in batch_indices]
+            targets = [
+                _target_with_split_metadata(annotations.get(index), record)
+                for index, record in zip(batch_indices, records)
+            ]
             loss, _grads = runtime.train_suffix(
                 boundary,
                 targets,

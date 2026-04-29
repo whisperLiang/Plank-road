@@ -8,12 +8,15 @@ def creat_folder(folder_path):
         os.makedirs(frames_path)
 
 
-def clear_folder(folder_path):
+def clear_folder(folder_path, preserve=None):
     logger.debug("clear floder")
 
     if not os.path.exists(folder_path):
         return
+    preserve = set(preserve or ())
     for filename in os.listdir(folder_path):
+        if filename in preserve:
+            continue
         file_path = os.path.join(folder_path, filename)
         if os.path.isfile(file_path):
             try:

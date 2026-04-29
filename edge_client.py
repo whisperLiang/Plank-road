@@ -101,7 +101,7 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
     window_name = f"Edge {config.edge_id} Inference"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    window_created = False
 
     last_visual = {
         "boxes": [],
@@ -127,12 +127,28 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
             logger.info("Take the frame interval is {}", config.interval)
             display_delay_ms = max(1, int(1000 / video_fps))
             index = 0
+            split_runtime_prepared = False
 
             while True:
                 frame = next(video)
                 if frame is None:
                     logger.info("The video finished")
                     break
+
+                if not split_runtime_prepared:
+                    if getattr(edge, "split_learning_enabled", False):
+                        logger.info(
+                            "Preparing fixed split runtime before starting inference frames."
+                        )
+                        edge.ensure_fixed_split_runtime(
+                            frame,
+                            tuple(int(value) for value in frame.shape[:2]),
+                        )
+                    split_runtime_prepared = True
+
+                if not window_created:
+                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                    window_created = True
 
                 index += 1
                 sampled = index % config.interval == 0
@@ -240,7 +256,10 @@ if __name__ == '__main__':
         rotation="500 MB",
     )
 
-    clear_folder(config.retrain.cache_path)
+    preserve_cache_files = set()
+    if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
+        preserve_cache_files.add("fixed_split_plan.json")
+    clear_folder(config.retrain.cache_path, preserve=preserve_cache_files)
     edge = EdgeWorker(config)
 
     try:

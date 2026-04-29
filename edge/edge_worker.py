@@ -131,7 +131,6 @@ class EdgeWorker:
         self.fixed_split_plan: SplitPlan | None = None
         self._fixed_split_init_attempted = False
         self._fixed_split_init_lock = threading.Lock()
-        self._fixed_split_init_thread: threading.Thread | None = None
         self.split_trace_image_size: tuple[int, int] | None = None
         if not self.split_learning_enabled:
             self.split_learning_disable_reason = "disabled_in_config"
@@ -188,6 +187,7 @@ class EdgeWorker:
                 split_model,
                 sample_input,
                 model_name=self.model_id,
+                enable_dynamic_batch=False,
             )
             logger.info(
                 "Fixed split startup prepared Ariadne runtime (trace_time={:.3f}s)",
@@ -201,9 +201,8 @@ class EdgeWorker:
                 model_name=self.model_id,
                 cache_path=cache_path,
                 splitter=self.universal_splitter,
+                validate_cached_plan=False,
             )
-            if self.fixed_split_plan.candidate_id is not None:
-                self.universal_splitter.split(candidate_id=self.fixed_split_plan.candidate_id)
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
             logger.info(
@@ -223,7 +222,7 @@ class EdgeWorker:
             self.split_learning_enabled = False
             self._reset_split_runtime_state()
 
-    def _start_fixed_split_initialization(
+    def ensure_fixed_split_runtime(
         self,
         frame,
         image_size: tuple[int, int],
@@ -235,28 +234,13 @@ class EdgeWorker:
         with init_lock:
             if getattr(self, "_fixed_split_init_attempted", False):
                 return
-            init_frame = frame.copy() if hasattr(frame, "copy") else frame
-            self._fixed_split_init_thread = threading.Thread(
-                target=self._run_fixed_split_initialization,
-                args=(init_frame, tuple(int(value) for value in image_size)),
-                daemon=True,
-                name=f"edge-{getattr(self, 'edge_id', 'unknown')}-fixed-split-init",
+            self._init_fixed_split_runtime(
+                frame,
+                tuple(int(value) for value in image_size),
             )
-            self._fixed_split_init_thread.start()
-            logger.info(
-                "Fixed split initialization started in background; "
-                "initial frames use unsplit local inference."
-            )
-
-    def _run_fixed_split_initialization(
-        self,
-        frame,
-        image_size: tuple[int, int],
-    ) -> None:
-        self._init_fixed_split_runtime(frame, image_size)
-        if self.collect_flag and not self.split_learning_enabled:
-            self.collect_flag = False
-            self._log_split_collection_disabled()
+            if getattr(self, "collect_flag", False) and not self.split_learning_enabled:
+                self.collect_flag = False
+                self._log_split_collection_disabled()
 
     def _next_sample_id(self, task: Task) -> str:
         return f"{task.frame_index}-{int(task.start_time * 1000)}"
@@ -346,12 +330,7 @@ class EdgeWorker:
 
     def _resolve_active_splitter(self, current_frame, frame_image_size: tuple[int, int]):
         if self.split_learning_enabled and not getattr(self, "_fixed_split_init_attempted", False):
-            self._start_fixed_split_initialization(current_frame, frame_image_size)
-            return None
-
-        init_thread = getattr(self, "_fixed_split_init_thread", None)
-        if init_thread is not None and init_thread.is_alive():
-            return None
+            self.ensure_fixed_split_runtime(current_frame, frame_image_size)
 
         active_splitter = self.universal_splitter if self.universal_split_enabled else None
         effective_image_size = tuple(int(value) for value in frame_image_size)
@@ -696,9 +675,6 @@ class EdgeWorker:
         for thread in (self.diff_processor, self.local_processor, self.retrain_processor):
             if thread.is_alive():
                 thread.join(timeout=timeout)
-        init_thread = getattr(self, "_fixed_split_init_thread", None)
-        if init_thread is not None and init_thread.is_alive():
-            init_thread.join(timeout=timeout)
 
     def diff_worker(self):
         if not self.config.diff_flag:

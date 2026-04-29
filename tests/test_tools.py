@@ -93,6 +93,19 @@ class TestFileOp:
     def test_clear_folder_nonexistent_no_error(self):
         clear_folder("/nonexistent_path_12345")
 
+    def test_clear_folder_preserves_requested_root_files(self, tmp_dir):
+        keep_path = os.path.join(tmp_dir, "fixed_split_plan.json")
+        drop_path = os.path.join(tmp_dir, "latest.jsonl")
+        with open(keep_path, "w") as f:
+            f.write("plan")
+        with open(drop_path, "w") as f:
+            f.write("result")
+
+        clear_folder(tmp_dir, preserve={"fixed_split_plan.json"})
+
+        assert os.path.exists(keep_path)
+        assert not os.path.exists(drop_path)
+
     def test_sample_files_keeps_selected(self, tmp_dir):
         # Create files named 1.jpg .. 5.jpg
         for i in range(1, 6):

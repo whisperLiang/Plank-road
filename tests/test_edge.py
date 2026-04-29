@@ -146,6 +146,7 @@ class TestEdgeWorkerRouting:
                 trace_calls["trace_model"] = model
                 trace_calls["trace_input"] = runtime_input
                 trace_calls["model_name"] = kwargs.get("model_name")
+                trace_calls["enable_dynamic_batch"] = kwargs.get("enable_dynamic_batch")
 
         worker.small_object_detection = DummyDetection()
 
@@ -167,6 +168,7 @@ class TestEdgeWorkerRouting:
         assert trace_calls["frame"] is sample_bgr_frame
         assert trace_calls["trace_input"] is sample_input
         assert trace_calls["model_name"] == "dummy-model"
+        assert trace_calls["enable_dynamic_batch"] is False
         assert "synthetic_image_size" not in trace_calls
 
     def test_init_fixed_split_runtime_uses_ariadne_trace_without_graph_artifact_cache(
@@ -212,6 +214,7 @@ class TestEdgeWorkerRouting:
                 trace_calls["model"] = model
                 trace_calls["input"] = runtime_input
                 trace_calls["model_name"] = kwargs.get("model_name")
+                trace_calls["enable_dynamic_batch"] = kwargs.get("enable_dynamic_batch")
                 return self
 
         worker.small_object_detection = DummyDetection()
@@ -222,6 +225,7 @@ class TestEdgeWorkerRouting:
         def _fake_plan(*args, **kwargs):
             plan_calls["splitter"] = kwargs.get("splitter")
             plan_calls["sample_input"] = kwargs.get("sample_input")
+            plan_calls["validate_cached_plan"] = kwargs.get("validate_cached_plan")
             return SimpleNamespace(
                 split_config_id="plan-1",
                 split_index=7,
@@ -241,9 +245,11 @@ class TestEdgeWorkerRouting:
             "model": split_model,
             "input": sample_input,
             "model_name": "dummy-model",
+            "enable_dynamic_batch": False,
         }
         assert plan_calls["splitter"] is worker.universal_splitter
         assert plan_calls["sample_input"] is sample_input
+        assert plan_calls["validate_cached_plan"] is False
 
     def test_resolve_active_splitter_disables_runtime_when_frame_size_changes(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
@@ -260,33 +266,34 @@ class TestEdgeWorkerRouting:
         assert active is None
         assert worker.split_learning_enabled is False
 
-    def test_resolve_active_splitter_starts_fixed_split_init_in_background(self, sample_bgr_frame):
+    def test_resolve_active_splitter_initializes_fixed_split_synchronously(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
         worker.edge_id = 1
         worker.split_learning_enabled = True
         worker._fixed_split_init_attempted = False
         worker.universal_split_enabled = False
         worker.universal_splitter = None
-        started = threading.Event()
-        release = threading.Event()
+        worker.split_trace_image_size = None
+        worker._fixed_split_init_lock = threading.Lock()
+        splitter = object()
 
         def _fake_init(frame, image_size):
+            assert frame is sample_bgr_frame
+            assert image_size == tuple(sample_bgr_frame.shape[:2])
             worker._fixed_split_init_attempted = True
-            started.set()
-            release.wait(1.0)
+            worker.universal_split_enabled = True
+            worker.universal_splitter = splitter
+            worker.split_trace_image_size = image_size
+            time.sleep(0.03)
 
-        worker._run_fixed_split_initialization = _fake_init
+        worker._init_fixed_split_runtime = _fake_init
 
         start_time = time.perf_counter()
         active = worker._resolve_active_splitter(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
         elapsed = time.perf_counter() - start_time
 
-        assert active is None
-        assert elapsed < 0.2
-        assert started.wait(0.5) is True
-        assert worker._fixed_split_init_thread is not None
-        release.set()
-        worker._fixed_split_init_thread.join(timeout=1.0)
+        assert active is splitter
+        assert elapsed >= 0.03
 
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
