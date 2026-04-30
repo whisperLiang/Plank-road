@@ -1,13 +1,20 @@
 import os
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
 
-FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "figures")
+from lyapunov_plot_common import (
+    ACTION_LEGEND_LABELS,
+    ACTION_TICK_LABELS,
+    FIGURES_DIR,
+    build_trigger,
+    compute_action_scores,
+    low_conf_feature_ratio,
+    raw_plus_feature_pressure,
+    representative_payloads,
+)
 
 
-# =========================================================
-# Paper-style plotting
-# =========================================================
 plt.rcParams.update(
     {
         "font.size": 11,
@@ -24,146 +31,105 @@ plt.rcParams.update(
 )
 
 
-# =========================================================
-# Parameters aligned with current trigger implementation
-# =========================================================
-V = 5.0
-w_cloud = 1.0
-w_bw = 1.0
-lambda_cloud = 0.25
-lambda_bw = 0.25  # 修正：降低带宽预算，保证 Q_b 可累积
-
-# Representative payload statistics
-raw_only_payload = 20.0
-raw_plus_feature_payload = 26.0
-low_conf_feature_ratio = (raw_plus_feature_payload - raw_only_payload) / raw_plus_feature_payload
-payload_scale = raw_plus_feature_payload / raw_only_payload
+TRIGGER = build_trigger()
+PAYLOADS = representative_payloads()
+FEATURE_RATIO = low_conf_feature_ratio(PAYLOADS)
 
 
-# =========================================================
-# Decision score functions
-# =========================================================
-def compute_scores(U, C, W_raw, Q_c, Q_b):
-    W_raw_feat = min(1.0, payload_scale * W_raw)
-
-    # a0: skip training
-    J_skip = V * U
-
-    # a1: train with raw-only
-    J_raw = (
-        w_cloud * (Q_c + C) * (1.0 + C)
-        + w_bw * (Q_b + W_raw) * (1.0 + W_raw)
-        + C * low_conf_feature_ratio
+def select_action(urgency, compute_pressure, raw_only_bw_pressure, q_cloud, q_bw):
+    raw_plus_bw_pressure = raw_plus_feature_pressure(raw_only_bw_pressure, PAYLOADS)
+    scores = compute_action_scores(
+        trigger=TRIGGER,
+        urgency=urgency,
+        compute_pressure=compute_pressure,
+        raw_only_bw_pressure=raw_only_bw_pressure,
+        raw_plus_feature_bw_pressure=raw_plus_bw_pressure,
+        feature_ratio=FEATURE_RATIO,
+        q_cloud=q_cloud,
+        q_bw=q_bw,
     )
-
-    # a2: train with raw+feature
-    J_feat = (
-        w_cloud * (Q_c + C) * (1.0 + 0.5 * C)
-        + w_bw * (Q_b + W_raw_feat) * (1.0 + W_raw_feat)
-        + (1.0 + W_raw_feat) * low_conf_feature_ratio
-    )
-
-    return J_skip, J_raw, J_feat, W_raw_feat
+    score_values = [
+        scores["skip_training"],
+        scores["train_raw_only"],
+        scores["train_raw_plus_feature"],
+    ]
+    return int(np.argmin(score_values)), score_values, raw_plus_bw_pressure
 
 
-def select_action(U, C, W_raw, Q_c, Q_b):
-    J_skip, J_raw, J_feat, W_raw_feat = compute_scores(U, C, W_raw, Q_c, Q_b)
-    scores = [J_skip, J_raw, J_feat]
-    action = int(np.argmin(scores))  # 0,1,2
-    return action, scores, W_raw_feat
-
-
-# =========================================================
-# Simulate a time series to visualize queue evolution
-# =========================================================
 def simulate_trigger(T=120, seed=1):
     rng = np.random.default_rng(seed)
 
-    Q_c, Q_b = 0.0, 0.0
+    q_cloud, q_bw = 0.0, 0.0
 
     actions = []
-    U_list = []
-    C_list = []
-    W_list = []
-    Qc_list = [Q_c]
-    Qb_list = [Q_b]
+    urgency_list = []
+    compute_list = []
+    raw_bw_list = []
+    raw_plus_bw_list = []
+    q_cloud_list = [q_cloud]
+    q_bw_list = [q_bw]
 
     for t in range(T):
-        # ---------------------------
-        # 1) urgency U
-        # ---------------------------
-        U = 0.10 + 0.05 * np.sin(2 * np.pi * t / 25.0)
+        urgency = 0.10 + 0.05 * np.sin(2 * np.pi * t / 25.0)
         if 20 <= t <= 65:
-            U += 0.20
+            urgency += 0.20
         if 70 <= t <= 85:
-            U += 0.28
-        U += rng.normal(0.0, 0.015)
-        U = max(0.0, U)
+            urgency += 0.28
+        urgency += rng.normal(0.0, 0.015)
+        urgency = max(0.0, urgency)
 
-        # ---------------------------
-        # 2) cloud compute pressure C
-        # ---------------------------
-        C = 0.30 + 0.25 * np.sin(2 * np.pi * t / 30.0 + 0.8)
+        compute_pressure = 0.30 + 0.25 * np.sin(2 * np.pi * t / 30.0 + 0.8)
         if 20 <= t <= 60:
-            C += 0.30
-        C += rng.normal(0.0, 0.03)
-        C = float(np.clip(C, 0.0, 1.0))
+            compute_pressure += 0.30
+        compute_pressure += rng.normal(0.0, 0.03)
+        compute_pressure = float(np.clip(compute_pressure, 0.0, 1.0))
 
-        # ---------------------------
-        # 3) bandwidth pressure W_raw
-        # 修正：增加高带宽压力区间
-        # ---------------------------
-        W_raw = 0.3 + 0.25 * np.sin(2 * np.pi * t / 18.0 + 1.2)
-
-        # 强拥塞区间：确保 Q_b 明显上升
+        raw_only_bw_pressure = 0.30 + 0.25 * np.sin(2 * np.pi * t / 18.0 + 1.2)
         if 100 <= t <= 105:
-            W_raw += 0.35
+            raw_only_bw_pressure += 0.35
+        raw_only_bw_pressure += rng.normal(0.0, 0.03)
+        raw_only_bw_pressure = float(np.clip(raw_only_bw_pressure, 0.0, 1.0))
 
-        W_raw += rng.normal(0.0, 0.03)
-        W_raw = float(np.clip(W_raw, 0.0, 1.0))
+        action, _scores, raw_plus_bw_pressure = select_action(
+            urgency,
+            compute_pressure,
+            raw_only_bw_pressure,
+            q_cloud,
+            q_bw,
+        )
 
-        action, scores, W_raw_feat = select_action(U, C, W_raw, Q_c, Q_b)
-
-        # ---------------------------
-        # Selected costs
-        # ---------------------------
         if action == 0:
             selected_cloud_cost = 0.0
             selected_bw_cost = 0.0
         elif action == 1:
-            selected_cloud_cost = C
-            selected_bw_cost = W_raw
+            selected_cloud_cost = compute_pressure
+            selected_bw_cost = raw_only_bw_pressure
         else:
-            selected_cloud_cost = C
-            selected_bw_cost = W_raw_feat
+            selected_cloud_cost = compute_pressure
+            selected_bw_cost = raw_plus_bw_pressure
 
-        # ---------------------------
-        # Queue updates
-        # ---------------------------
-        Q_c = max(0.0, Q_c + selected_cloud_cost - lambda_cloud)
-        Q_b = max(0.0, Q_b + selected_bw_cost - lambda_bw)
+        q_cloud = max(0.0, q_cloud + selected_cloud_cost - TRIGGER.lambda_cloud)
+        q_bw = max(0.0, q_bw + selected_bw_cost - TRIGGER.lambda_bw)
 
-        # Record
         actions.append(action)
-        U_list.append(U)
-        C_list.append(C)
-        W_list.append(W_raw)
-        Qc_list.append(Q_c)
-        Qb_list.append(Q_b)
+        urgency_list.append(urgency)
+        compute_list.append(compute_pressure)
+        raw_bw_list.append(raw_only_bw_pressure)
+        raw_plus_bw_list.append(raw_plus_bw_pressure)
+        q_cloud_list.append(q_cloud)
+        q_bw_list.append(q_bw)
 
     return {
         "actions": np.array(actions),
-        "U": np.array(U_list),
-        "C": np.array(C_list),
-        "W_raw": np.array(W_list),
-        "Q_c": np.array(Qc_list),
-        "Q_b": np.array(Qb_list),
+        "urgency": np.array(urgency_list),
+        "compute_pressure": np.array(compute_list),
+        "raw_bw_pressure": np.array(raw_bw_list),
+        "raw_plus_bw_pressure": np.array(raw_plus_bw_list),
+        "Q_cloud": np.array(q_cloud_list),
+        "Q_bw": np.array(q_bw_list),
     }
 
 
-# =========================================================
-# Plot: action timeline + queue evolution
-# =========================================================
 def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
     T = len(data["actions"])
     t = np.arange(T)
@@ -181,37 +147,87 @@ def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
     c_cloud = "#1f77b4"
     c_bw = "#ff7f0e"
     c_urgency = "#2ca02c"
+    c_feature = "#9467bd"
 
-    # ---------------------------
-    # Top panel: environment inputs
-    # ---------------------------
     ax0 = axes[0]
-    ax0.plot(t, data["U"], linewidth=1.5, color=c_urgency, label=r"Urgency $U$")
-    ax0.plot(t, data["C"], linewidth=1.5, color=c_cloud, label=r"Cloud pressure $C$")
-    ax0.plot(t, data["W_raw"], linewidth=1.5, color=c_bw, label=r"Bandwidth pressure $W_{raw}$")
+    ax0.plot(t, data["urgency"], linewidth=1.5, color=c_urgency, label="Urgency")
+    ax0.plot(
+        t,
+        data["compute_pressure"],
+        linewidth=1.5,
+        color=c_cloud,
+        label="Cloud compute pressure",
+    )
+    ax0.plot(
+        t,
+        data["raw_bw_pressure"],
+        linewidth=1.5,
+        color=c_bw,
+        label="Raw-only bandwidth pressure",
+    )
+    ax0.plot(
+        t,
+        data["raw_plus_bw_pressure"],
+        linewidth=1.2,
+        linestyle="--",
+        color=c_feature,
+        label="Raw+feature bandwidth pressure",
+    )
     ax0.set_ylabel("Input value")
-    ax0.set_title("Lyapunov trigger actions and virtual queue evolution")
-    ax0.legend(loc="upper left", ncol=3, frameon=True)
+    ax0.set_title("Current Lyapunov trigger actions and virtual queue evolution")
+    ax0.legend(loc="upper left", ncol=2, frameon=True)
 
-    # ---------------------------
-    # Middle panel: action sequence
-    # ---------------------------
     ax1 = axes[1]
-    ax1.step(t, data["actions"], where="post", linewidth=1.8)
+    ax1.step(
+        t,
+        data["actions"],
+        where="post",
+        linewidth=1.8,
+        label="Selected action",
+    )
     ax1.set_yticks([0, 1, 2])
-    ax1.set_yticklabels([r"$a_0$", r"$a_1$", r"$a_2$"])
+    ax1.set_yticklabels(ACTION_TICK_LABELS)
     ax1.set_ylabel("Action")
-    ax1.legend(loc="upper left", frameon=True)
+    
+    # Create legend with action descriptions using patches
+    from matplotlib.patches import Patch
+    legend_labels = ["Selected action"] + [f"{ACTION_TICK_LABELS[i]}: {ACTION_LEGEND_LABELS[i]}" for i in range(len(ACTION_TICK_LABELS))]
+    legend_handles = [Patch(facecolor='#1f77b4', label=legend_labels[0])] + [Patch(facecolor='none', edgecolor='none', label=lbl) for lbl in legend_labels[1:]]
+    ax1.legend(
+        handles=legend_handles,
+        loc="upper left",
+        ncol=1,
+        frameon=True,
+    )
 
-    # ---------------------------
-    # Bottom panel: queue evolution
-    # ---------------------------
     ax2 = axes[2]
-    ax2.plot(tq, data["Q_c"], linewidth=2.0, color=c_cloud, label=r"$Q_c$ (cloud queue)")
-    ax2.plot(tq, data["Q_b"], linewidth=2.0, color=c_bw, label=r"$Q_b$ (bandwidth queue)")
-    ax2.set_xlabel("Time step $t$")
+    ax2.plot(
+        tq,
+        data["Q_cloud"],
+        linewidth=2.0,
+        color=c_cloud,
+        label=r"$Q_{cloud}$",
+    )
+    ax2.plot(tq, data["Q_bw"], linewidth=2.0, color=c_bw, label=r"$Q_{bw}$")
+    ax2.axhline(
+        TRIGGER.lambda_cloud,
+        color=c_cloud,
+        linewidth=0.9,
+        linestyle=":",
+        alpha=0.75,
+        label=r"$\lambda_{cloud}$",
+    )
+    ax2.axhline(
+        TRIGGER.lambda_bw,
+        color=c_bw,
+        linewidth=0.9,
+        linestyle=":",
+        alpha=0.75,
+        label=r"$\lambda_{bw}$",
+    )
+    ax2.set_xlabel("Time step")
     ax2.set_ylabel("Queue value")
-    ax2.legend(loc="upper left", frameon=True)
+    ax2.legend(loc="upper left", ncol=2, frameon=True)
 
     os.makedirs(FIGURES_DIR, exist_ok=True)
     png_path = os.path.join(FIGURES_DIR, f"{stem}.png")
@@ -220,11 +236,9 @@ def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
     fig.savefig(pdf_path, bbox_inches="tight")
     print(f"Saved: {png_path}")
     print(f"Saved: {pdf_path}")
+    plt.close(fig)
 
 
-# =========================================================
-# Main
-# =========================================================
 if __name__ == "__main__":
     data = simulate_trigger(T=120, seed=1)
     plot_action_and_queue_evolution(data)
