@@ -1080,6 +1080,47 @@ def test_split_retrain_logs_epoch_and_batch_losses_when_context_is_provided(tmp_
     assert "unit split epoch 2/2 finished avg_loss=3.500000" in joined_messages
 
 
+def test_split_retrain_can_suppress_batch_logs_when_context_is_provided(tmp_path):
+    cache_path = str(tmp_path / "cache")
+    sample_ids = ["s1", "s2"]
+    for index, sample_id in enumerate(sample_ids, 1):
+        payload = boundary_payload_from_tensors(
+            {"node_1": torch.tensor([[float(index)]])},
+            split_id="after:node_1",
+            graph_signature="graph-sig",
+        )
+        save_split_feature_cache(cache_path, sample_id, payload)
+
+    class DummySplitter:
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del boundary, targets, loss_fn, optimizer
+            return torch.tensor(1.0), {}
+
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+    try:
+        losses = universal_split_retrain(
+            model=torch.nn.Linear(1, 1),
+            sample_input=torch.ones(1, 1),
+            cache_path=cache_path,
+            all_indices=sample_ids,
+            gt_annotations={},
+            loss_fn=lambda outputs, targets: torch.tensor(1.0),
+            splitter=DummySplitter(),
+            batch_size=1,
+            num_epoch=1,
+            epoch_log_context="quiet split",
+            log_batches=False,
+        )
+    finally:
+        logger.remove(sink_id)
+
+    assert losses == [1.0]
+    joined_messages = "\n".join(messages)
+    assert "quiet split epoch 1/1 finished avg_loss=1.000000" in joined_messages
+    assert "quiet split epoch 1/1 batch" not in joined_messages
+
+
 def test_split_retrain_raises_when_no_trainable_parameters(tmp_path):
     model = torch.nn.Linear(1, 1)
     for parameter in model.parameters():

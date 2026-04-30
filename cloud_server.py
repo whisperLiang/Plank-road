@@ -3709,23 +3709,29 @@ class CloudContinualLearner:
                     int(proxy_eval_inner_epochs),
                     int(effective_num_epoch) - completed_inner_epochs,
                 )
+                projected_completed_inner_epochs = (
+                    completed_inner_epochs + inner_epochs_this_round
+                )
+                is_final_round = projected_completed_inner_epochs >= int(effective_num_epoch)
+                should_evaluate_round = (
+                    epoch_index == 0
+                    or ((epoch_index + 1) % proxy_eval_interval_rounds == 0)
+                    or is_final_round
+                )
                 outer_epoch_label = (
                     f"{training_label} outer round {epoch_index + 1}/{int(total_outer_rounds)}"
+                    if should_evaluate_round
+                    else None
                 )
                 stage_started = time.perf_counter()
                 universal_split_retrain(
                     **split_retrain_kwargs,
                     num_epoch=inner_epochs_this_round,
                     epoch_log_context=outer_epoch_label,
+                    log_batches=False,
                 )
-                completed_inner_epochs += inner_epochs_this_round
+                completed_inner_epochs = projected_completed_inner_epochs
                 split_retrain_elapsed += time.perf_counter() - stage_started
-                is_final_round = completed_inner_epochs >= int(effective_num_epoch)
-                should_evaluate_round = (
-                    epoch_index == 0
-                    or ((epoch_index + 1) % proxy_eval_interval_rounds == 0)
-                    or is_final_round
-                )
                 if not should_evaluate_round:
                     continue
                 stage_started = time.perf_counter()
@@ -3789,6 +3795,8 @@ class CloudContinualLearner:
             **split_retrain_kwargs,
             num_epoch=effective_num_epoch,
             epoch_log_context=training_label,
+            log_batches=False,
+            log_every_n_epochs=max(1, int(effective_num_epoch) // 10),
         )
         self._log_stage_duration("split retraining", split_retrain_started)
         log_split_retrain_profile(retrain_profile)

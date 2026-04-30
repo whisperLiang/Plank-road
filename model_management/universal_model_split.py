@@ -1527,6 +1527,8 @@ def universal_split_retrain(
     shuffle_samples: bool = False,
     epoch_log_context: str | None = None,
     log_every_n_batches: int = 1,
+    log_batches: bool = True,
+    log_every_n_epochs: int = 1,
     retrain_profile: SplitRetrainProfile | None = None,
     **_: Any,
 ) -> list[float]:
@@ -1557,6 +1559,7 @@ def universal_split_retrain(
     total_epochs = int(num_epoch)
     should_log_training = bool(epoch_log_context)
     log_interval = max(1, int(log_every_n_batches))
+    epoch_log_interval = max(1, int(log_every_n_epochs))
     epoch_batch_size = max(1, int(batch_size))
     prepared_batches = prepare_split_train_batches_once(
         splitter=runtime,
@@ -1576,13 +1579,19 @@ def universal_split_retrain(
 
     try:
         for _epoch in range(total_epochs):
+            epoch_number = _epoch + 1
+            should_log_epoch = should_log_training and (
+                epoch_number == 1
+                or epoch_number % epoch_log_interval == 0
+                or epoch_number == total_epochs
+            )
             epoch_losses: list[float] = []
             epoch_batches = list(prepared_batches)
             if shuffle_samples and len(epoch_batches) > 1:
                 order = torch.randperm(len(epoch_batches)).tolist()
                 epoch_batches = [epoch_batches[index] for index in order]
-            epoch_label = f"{epoch_log_context} epoch {_epoch + 1}/{total_epochs}"
-            if should_log_training:
+            epoch_label = f"{epoch_log_context} epoch {epoch_number}/{total_epochs}"
+            if should_log_epoch:
                 logger.info(
                     "[FixedSplitCL] {} started (batches={}, samples={}, batch_size={}).",
                     epoch_label,
@@ -1630,7 +1639,7 @@ def universal_split_retrain(
                 train_process_time.append(time.perf_counter() - train_started)
                 loss_value = float(loss.detach().cpu().item())
                 epoch_losses.append(loss_value)
-                if should_log_training and (
+                if log_batches and should_log_epoch and (
                     batch_number == 1
                     or batch_number % log_interval == 0
                     or batch_number == total_batches
@@ -1649,7 +1658,7 @@ def universal_split_retrain(
                 raise RuntimeError("Split retraining did not produce any finite batch loss.")
             epoch_loss = sum(epoch_losses) / len(epoch_losses)
             losses.append(epoch_loss)
-            if should_log_training:
+            if should_log_epoch:
                 logger.info(
                     "[FixedSplitCL] {} finished avg_loss={:.6f} min_loss={:.6f} max_loss={:.6f} batches={} elapsed={:.3f}s.",
                     epoch_label,
