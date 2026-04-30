@@ -1247,16 +1247,18 @@ def test_split_retrain_uses_cached_pseudo_targets_and_pads_singleton_dynamic_bat
     assert splitter.seen_targets is not None
 
 
+@pytest.mark.parametrize("model_name", ["rfdetr_nano", "yolov8n"])
 def test_proxy_selected_fixed_split_reuses_optimizer_across_outer_rounds(
     tmp_path,
     monkeypatch,
+    model_name,
 ):
     import cloud_server
     from cloud_server import CloudContinualLearner
 
     learner = CloudContinualLearner(
         config=SimpleNamespace(
-            edge_model_name="rfdetr_nano",
+            edge_model_name=model_name,
             continual_learning=SimpleNamespace(
                 batch_size=2,
                 proxy_eval_interval_rounds=1,
@@ -1280,7 +1282,7 @@ def test_proxy_selected_fixed_split_reuses_optimizer_across_outer_rounds(
 
     proxy_metrics_after, baseline_state = learner._run_fixed_split_retrain(
         model,
-        current_model_name="rfdetr_nano",
+        current_model_name=model_name,
         bundle_info={"all_sample_ids": ["s1", "s2"]},
         manifest={"samples": [{"sample_id": "s1"}, {"sample_id": "s2"}]},
         bundle_cache_path=str(tmp_path / "bundle"),

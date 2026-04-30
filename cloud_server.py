@@ -2883,7 +2883,7 @@ class CloudContinualLearner:
     def _uses_proxy_selected_fixed_split_epochs(
         model_name: str,
     ) -> bool:
-        return model_zoo.get_model_family(str(model_name)) in {"rfdetr", "tinynext"}
+        return model_zoo.get_model_family(str(model_name)) in {"yolo", "rfdetr", "tinynext"}
 
     @staticmethod
     def _resolve_fixed_split_proxy_eval_inner_epochs(
