@@ -178,29 +178,30 @@ def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
         constrained_layout=True,
     )
 
-    # ---------------------------
-    # Top panel: action sequence
-    # ---------------------------
-    ax0 = axes[0]
-    ax0.step(t, data["actions"], where="post", linewidth=1.8)
-    ax0.set_yticks([0, 1, 2])
-    ax0.set_yticklabels([r"$a_0$", r"$a_1$", r"$a_2$"])
-    ax0.set_ylabel("Action")
-    ax0.set_title("Lyapunov trigger actions and virtual queue evolution")
-
     c_cloud = "#1f77b4"
     c_bw = "#ff7f0e"
     c_urgency = "#2ca02c"
 
     # ---------------------------
-    # Middle panel: environment inputs
+    # Top panel: environment inputs
+    # ---------------------------
+    ax0 = axes[0]
+    ax0.plot(t, data["U"], linewidth=1.5, color=c_urgency, label=r"Urgency $U$")
+    ax0.plot(t, data["C"], linewidth=1.5, color=c_cloud, label=r"Cloud pressure $C$")
+    ax0.plot(t, data["W_raw"], linewidth=1.5, color=c_bw, label=r"Bandwidth pressure $W_{raw}$")
+    ax0.set_ylabel("Input value")
+    ax0.set_title("Lyapunov trigger actions and virtual queue evolution")
+    ax0.legend(loc="upper left", ncol=3, frameon=True)
+
+    # ---------------------------
+    # Middle panel: action sequence
     # ---------------------------
     ax1 = axes[1]
-    ax1.plot(t, data["U"], linewidth=1.5, color=c_urgency, label=r"Urgency $U$")
-    ax1.plot(t, data["C"], linewidth=1.5, color=c_cloud, label=r"Cloud pressure $C$")
-    ax1.plot(t, data["W_raw"], linewidth=1.5, color=c_bw, label=r"Bandwidth pressure $W_{raw}$")
-    ax1.set_ylabel("Input value")
-    ax1.legend(loc="upper left", ncol=3, frameon=True)
+    ax1.step(t, data["actions"], where="post", linewidth=1.8)
+    ax1.set_yticks([0, 1, 2])
+    ax1.set_yticklabels([r"$a_0$", r"$a_1$", r"$a_2$"])
+    ax1.set_ylabel("Action")
+    ax1.legend(loc="upper left", frameon=True)
 
     # ---------------------------
     # Bottom panel: queue evolution
