@@ -3689,12 +3689,15 @@ class CloudContinualLearner:
             completed_inner_epochs = 0
             stale_proxy_eval_count = 0
             if can_select_best_by_proxy:
+                proxy_eval_interval_epochs = (
+                    int(proxy_eval_interval_rounds) * int(proxy_eval_inner_epochs)
+                )
                 logger.info(
                     "[FixedSplitCL] {} fixed-split retrain will train {} epoch(s); proxy mAP is evaluated after epoch {}, every {} epoch(s), and the final epoch.",
                     training_label,
                     int(effective_num_epoch),
                     int(proxy_eval_inner_epochs),
-                    int(proxy_eval_interval_rounds) * int(proxy_eval_inner_epochs),
+                    int(proxy_eval_interval_epochs),
                 )
             else:
                 logger.info(
@@ -3704,7 +3707,7 @@ class CloudContinualLearner:
                 )
             if can_select_best_by_proxy and tinynext_selection_uses_subset:
                 logger.info(
-                    "[FixedSplitCL] TinyNeXt proxy selection will evaluate up to {} / {} GT proxy samples per outer round before one final full proxy evaluation.",
+                    "[FixedSplitCL] TinyNeXt proxy selection will evaluate up to {} / {} GT proxy samples at each proxy eval, then run one final full proxy evaluation.",
                     selection_proxy_eval_sample_count,
                     full_proxy_eval_sample_count,
                 )
@@ -3746,6 +3749,17 @@ class CloudContinualLearner:
                 if not should_evaluate_round:
                     continue
                 stage_started = time.perf_counter()
+                proxy_eval_metric_label = (
+                    "selection proxy_mAP@0.5"
+                    if tinynext_selection_uses_subset
+                    else "proxy_mAP@0.5"
+                )
+                logger.info(
+                    "[FixedSplitCL] Evaluating {} after epoch {}/{}.",
+                    proxy_eval_metric_label,
+                    int(completed_inner_epochs),
+                    int(effective_num_epoch),
+                )
                 candidate_metrics = _evaluate_proxy_metrics_for_current_state(
                     selection_eval=tinynext_selection_uses_subset,
                 )
@@ -3768,19 +3782,21 @@ class CloudContinualLearner:
                     best_state_is_baseline = False
                     stale_proxy_eval_count = 0
                     logger.info(
-                        "[FixedSplitCL] Kept {} candidate from outer round {} (through inner epoch {}) with {}={:.4f}.",
+                        "[FixedSplitCL] Kept {} candidate after epoch {}/{} with {}={:.4f}.",
                         training_label,
-                        epoch_index + 1,
-                        completed_inner_epochs,
-                        "selection_proxy_mAP@0.5" if tinynext_selection_uses_subset else "proxy_mAP@0.5",
+                        int(completed_inner_epochs),
+                        int(effective_num_epoch),
+                        proxy_eval_metric_label,
                         float(candidate_metrics.get("map") or 0.0),
                     )
                 else:
                     stale_proxy_eval_count += 1
                     if proxy_eval_patience and stale_proxy_eval_count >= proxy_eval_patience:
                         logger.info(
-                            "[FixedSplitCL] Early-stopping {} fixed-split retrain after {} proxy evaluation(s) without >= {} mAP improvement.",
+                            "[FixedSplitCL] Early-stopping {} fixed-split retrain after epoch {}/{}: {} consecutive proxy evaluation(s) without >= {} mAP improvement.",
                             training_label,
+                            int(completed_inner_epochs),
+                            int(effective_num_epoch),
                             stale_proxy_eval_count,
                             proxy_eval_min_delta,
                         )
