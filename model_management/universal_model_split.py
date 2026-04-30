@@ -1529,6 +1529,8 @@ def universal_split_retrain(
     log_every_n_batches: int = 1,
     log_batches: bool = True,
     log_every_n_epochs: int = 1,
+    epoch_log_start: int = 0,
+    epoch_log_total: int | None = None,
     retrain_profile: SplitRetrainProfile | None = None,
     **_: Any,
 ) -> list[float]:
@@ -1560,6 +1562,12 @@ def universal_split_retrain(
     should_log_training = bool(epoch_log_context)
     log_interval = max(1, int(log_every_n_batches))
     epoch_log_interval = max(1, int(log_every_n_epochs))
+    epoch_log_offset = max(0, int(epoch_log_start))
+    epoch_log_denominator = (
+        max(1, int(epoch_log_total))
+        if epoch_log_total is not None
+        else max(1, total_epochs)
+    )
     epoch_batch_size = max(1, int(batch_size))
     prepared_batches = prepare_split_train_batches_once(
         splitter=runtime,
@@ -1580,6 +1588,7 @@ def universal_split_retrain(
     try:
         for _epoch in range(total_epochs):
             epoch_number = _epoch + 1
+            display_epoch_number = epoch_log_offset + epoch_number
             should_log_epoch = should_log_training and (
                 epoch_number == 1
                 or epoch_number % epoch_log_interval == 0
@@ -1590,7 +1599,10 @@ def universal_split_retrain(
             if shuffle_samples and len(epoch_batches) > 1:
                 order = torch.randperm(len(epoch_batches)).tolist()
                 epoch_batches = [epoch_batches[index] for index in order]
-            epoch_label = f"{epoch_log_context} epoch {epoch_number}/{total_epochs}"
+            epoch_label = (
+                f"{epoch_log_context} epoch "
+                f"{display_epoch_number}/{epoch_log_denominator}"
+            )
             if should_log_epoch:
                 logger.info(
                     "[FixedSplitCL] {} started (batches={}, samples={}, batch_size={}).",

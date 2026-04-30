@@ -3507,7 +3507,7 @@ class CloudContinualLearner:
         baseline_proxy_state_key = _model_state_fingerprint(model)
         effective_num_epoch = num_epoch
         effective_learning_rate = self.default_split_learning_rate
-        if gt_annotations and (
+        if (
             model_zoo.is_wrapper_model(current_model_name)
             or model_zoo.get_model_family(current_model_name) == "tinynext"
         ):
@@ -3526,10 +3526,10 @@ class CloudContinualLearner:
         target_steps_per_round = self._resolve_fixed_split_target_steps_per_round(
             current_model_name,
         )
-        uses_proxy_selected_epochs = (
-            gt_annotations
-            and self._uses_proxy_selected_fixed_split_epochs(current_model_name)
+        uses_proxy_selected_epochs = self._uses_proxy_selected_fixed_split_epochs(
+            current_model_name
         )
+        can_select_best_by_proxy = bool(gt_annotations)
         logger.info(
             "[FixedSplitCL] Starting split retrain configuration: Epochs={}, Learning Rate={}, Runtime Batch Size={}, Total Samples={}",
             effective_num_epoch,
@@ -3688,14 +3688,21 @@ class CloudContinualLearner:
             )
             completed_inner_epochs = 0
             stale_proxy_eval_count = 0
-            logger.info(
-                "[FixedSplitCL] {} fixed-split retrain will run {} outer rounds with up to {} inner epoch(s) per round and evaluate proxy mAP on round 1, every {} round(s), and the final round.",
-                training_label,
-                int(total_outer_rounds),
-                int(proxy_eval_inner_epochs),
-                int(proxy_eval_interval_rounds),
-            )
-            if tinynext_selection_uses_subset:
+            if can_select_best_by_proxy:
+                logger.info(
+                    "[FixedSplitCL] {} fixed-split retrain will train {} epoch(s); proxy mAP is evaluated after epoch {}, every {} epoch(s), and the final epoch.",
+                    training_label,
+                    int(effective_num_epoch),
+                    int(proxy_eval_inner_epochs),
+                    int(proxy_eval_interval_rounds) * int(proxy_eval_inner_epochs),
+                )
+            else:
+                logger.info(
+                    "[FixedSplitCL] {} fixed-split retrain will train {} epoch(s); proxy mAP selection is skipped because no GT annotations are available.",
+                    training_label,
+                    int(effective_num_epoch),
+                )
+            if can_select_best_by_proxy and tinynext_selection_uses_subset:
                 logger.info(
                     "[FixedSplitCL] TinyNeXt proxy selection will evaluate up to {} / {} GT proxy samples per outer round before one final full proxy evaluation.",
                     selection_proxy_eval_sample_count,
@@ -3713,21 +3720,25 @@ class CloudContinualLearner:
                     completed_inner_epochs + inner_epochs_this_round
                 )
                 is_final_round = projected_completed_inner_epochs >= int(effective_num_epoch)
-                should_evaluate_round = (
+                should_evaluate_round = can_select_best_by_proxy and (
                     epoch_index == 0
                     or ((epoch_index + 1) % proxy_eval_interval_rounds == 0)
                     or is_final_round
                 )
-                outer_epoch_label = (
-                    f"{training_label} outer round {epoch_index + 1}/{int(total_outer_rounds)}"
-                    if should_evaluate_round
-                    else None
+                should_log_round = (
+                    should_evaluate_round
+                    or epoch_index == 0
+                    or ((epoch_index + 1) % proxy_eval_interval_rounds == 0)
+                    or is_final_round
                 )
+                epoch_log_context = training_label if should_log_round else None
                 stage_started = time.perf_counter()
                 universal_split_retrain(
                     **split_retrain_kwargs,
                     num_epoch=inner_epochs_this_round,
-                    epoch_log_context=outer_epoch_label,
+                    epoch_log_context=epoch_log_context,
+                    epoch_log_start=completed_inner_epochs,
+                    epoch_log_total=effective_num_epoch,
                     log_batches=False,
                 )
                 completed_inner_epochs = projected_completed_inner_epochs
@@ -3774,7 +3785,7 @@ class CloudContinualLearner:
                             proxy_eval_min_delta,
                         )
                         break
-            if tinynext_selection_uses_subset:
+            if can_select_best_by_proxy and tinynext_selection_uses_subset:
                 model.load_state_dict(best_state)
                 _set_detection_model_eval_mode(model)
                 if best_state_is_baseline:
@@ -3786,9 +3797,12 @@ class CloudContinualLearner:
             logger.info("[FixedSplitCL] split retraining took {:.3f}s.", split_retrain_elapsed)
             log_split_retrain_profile(retrain_profile)
             logger.info("[FixedSplitCL] proxy evaluation after retrain took {:.3f}s.", proxy_eval_elapsed)
-            model.load_state_dict(best_state)
+            if can_select_best_by_proxy:
+                model.load_state_dict(best_state)
+                _set_detection_model_eval_mode(model)
+                return dict(best_metrics), baseline_state
             _set_detection_model_eval_mode(model)
-            return dict(best_metrics), baseline_state
+            return dict(proxy_metrics_before), baseline_state
 
         split_retrain_started = time.perf_counter()
         universal_split_retrain(

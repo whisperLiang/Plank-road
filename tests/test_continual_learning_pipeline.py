@@ -1304,6 +1304,74 @@ def test_proxy_selected_fixed_split_reuses_optimizer_across_outer_rounds(
     assert set(baseline_state) == set(model.state_dict())
 
 
+def test_fixed_split_no_gt_uses_unified_outer_round_loop_without_reset(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="yolov8n",
+            continual_learning=SimpleNamespace(
+                batch_size=2,
+                proxy_eval_interval_rounds=1,
+                proxy_eval_patience=1,
+            ),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    model = torch.nn.Linear(1, 1)
+    baseline_weight = model.weight.detach().clone()
+    epoch_contexts: list[str | None] = []
+    epoch_log_starts: list[int] = []
+    epoch_log_totals: list[int] = []
+    learning_rates: list[float] = []
+
+    def fake_universal_split_retrain(**kwargs):
+        epoch_contexts.append(kwargs.get("epoch_log_context"))
+        epoch_log_starts.append(int(kwargs.get("epoch_log_start", 0)))
+        epoch_log_totals.append(int(kwargs.get("epoch_log_total", 0)))
+        learning_rates.append(float(kwargs["learning_rate"]))
+        with torch.no_grad():
+            kwargs["model"].weight.add_(1.0)
+        return [0.1]
+
+    monkeypatch.setattr(cloud_server, "universal_split_retrain", fake_universal_split_retrain)
+
+    proxy_metrics_after, baseline_state = learner._run_fixed_split_retrain(
+        model,
+        current_model_name="yolov8n",
+        bundle_info={"all_sample_ids": ["s1", "s2"]},
+        manifest={"samples": [{"sample_id": "s1"}, {"sample_id": "s2"}]},
+        bundle_cache_path=str(tmp_path / "bundle"),
+        working_cache=str(tmp_path / "working"),
+        frame_dir=str(tmp_path / "frames"),
+        gt_annotations={},
+        num_epoch=2,
+        proxy_metrics_before={"map": None, "evaluated_samples": 0},
+        prepared_trace_sample_input=None,
+        prepared_splitter=SimpleNamespace(split_spec=SimpleNamespace(dynamic_batch=(1, 64))),
+        prepared_candidate=object(),
+        effective_batch_size=2,
+        sample_metadata_by_id={},
+    )
+
+    assert epoch_contexts == [
+        "yolov8n",
+        "yolov8n",
+    ]
+    assert epoch_log_starts == [0, 1]
+    assert epoch_log_totals == [2, 2]
+    assert proxy_metrics_after["map"] is None
+    assert learning_rates == [learner._resolve_fixed_split_learning_rate("yolov8n")] * 2
+    assert torch.allclose(model.weight, baseline_weight + 2.0)
+    assert torch.allclose(baseline_state["weight"], baseline_weight)
+
+
 def test_split_retrain_honors_optimizer_overrides(tmp_path):
     cache_path = str(tmp_path / "cache")
     payload = boundary_payload_from_tensors(
