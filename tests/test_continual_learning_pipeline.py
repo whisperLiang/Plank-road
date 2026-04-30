@@ -1329,12 +1329,16 @@ def test_fixed_split_no_gt_uses_unified_outer_round_loop_without_reset(
     epoch_contexts: list[str | None] = []
     epoch_log_starts: list[int] = []
     epoch_log_totals: list[int] = []
+    log_every_n_epochs: list[int] = []
+    log_first_epoch: list[bool] = []
     learning_rates: list[float] = []
 
     def fake_universal_split_retrain(**kwargs):
         epoch_contexts.append(kwargs.get("epoch_log_context"))
         epoch_log_starts.append(int(kwargs.get("epoch_log_start", 0)))
         epoch_log_totals.append(int(kwargs.get("epoch_log_total", 0)))
+        log_every_n_epochs.append(int(kwargs.get("log_every_n_epochs", 1)))
+        log_first_epoch.append(bool(kwargs.get("log_first_epoch", True)))
         learning_rates.append(float(kwargs["learning_rate"]))
         with torch.no_grad():
             kwargs["model"].weight.add_(1.0)
@@ -1366,6 +1370,8 @@ def test_fixed_split_no_gt_uses_unified_outer_round_loop_without_reset(
     ]
     assert epoch_log_starts == [0, 1]
     assert epoch_log_totals == [2, 2]
+    assert log_every_n_epochs == [1, 1]
+    assert log_first_epoch == [False, False]
     assert proxy_metrics_after["map"] is None
     assert learning_rates == [learner._resolve_fixed_split_learning_rate("yolov8n")] * 2
     assert torch.allclose(model.weight, baseline_weight + 2.0)

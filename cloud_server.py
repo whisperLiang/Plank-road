@@ -3740,6 +3740,8 @@ class CloudContinualLearner:
                     **split_retrain_kwargs,
                     num_epoch=inner_epochs_this_round,
                     epoch_log_context=epoch_log_context,
+                    log_every_n_epochs=max(1, int(inner_epochs_this_round)),
+                    log_first_epoch=False,
                     epoch_log_start=completed_inner_epochs,
                     epoch_log_total=effective_num_epoch,
                     log_batches=False,

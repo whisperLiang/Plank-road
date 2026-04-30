@@ -1529,6 +1529,7 @@ def universal_split_retrain(
     log_every_n_batches: int = 1,
     log_batches: bool = True,
     log_every_n_epochs: int = 1,
+    log_first_epoch: bool = True,
     epoch_log_start: int = 0,
     epoch_log_total: int | None = None,
     retrain_profile: SplitRetrainProfile | None = None,
@@ -1590,7 +1591,7 @@ def universal_split_retrain(
             epoch_number = _epoch + 1
             display_epoch_number = epoch_log_offset + epoch_number
             should_log_epoch = should_log_training and (
-                epoch_number == 1
+                (bool(log_first_epoch) and epoch_number == 1)
                 or epoch_number % epoch_log_interval == 0
                 or epoch_number == total_epochs
             )
