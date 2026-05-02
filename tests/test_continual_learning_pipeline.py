@@ -649,6 +649,55 @@ def test_sample_store_accepts_ariadne_boundary_payload(tmp_path):
     assert stored.passthrough_inputs["input"].requires_grad is False
 
 
+def test_sample_store_stats_are_incremental_and_recovered(tmp_path, sample_bgr_frame):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    store.store_sample(
+        sample_id="high-1",
+        frame_index=1,
+        confidence=0.9,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        quality_bucket=HIGH_QUALITY,
+        uncovered_evidence_rate=0.25,
+        candidate_uncovered_score=0.5,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_payload(),
+    )
+    store.store_sample(
+        sample_id="low-1",
+        frame_index=2,
+        confidence=0.2,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        quality_bucket=LOW_QUALITY,
+        uncovered_evidence_rate=1.0,
+        candidate_uncovered_score=1.0,
+        in_drift_window=True,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=_payload(),
+        raw_frame=sample_bgr_frame,
+    )
+
+    stats = store.stats()
+    assert stats["total_samples"] == 2
+    assert stats["high_quality_count"] == 1
+    assert stats["low_quality_count"] == 1
+    assert stats["drift_window_sample_count"] == 1
+    assert stats["uncovered_evidence_rate"] == pytest.approx(0.625)
+    assert stats["candidate_uncovered_rate"] == pytest.approx(0.75)
+    assert stats["high_quality_feature_bytes"] > 0
+    assert stats["low_quality_feature_bytes"] > 0
+    assert stats["low_quality_raw_bytes"] > 0
+
+    store.list_records = lambda *args, **kwargs: pytest.fail("stats should be O(1)")
+    assert store.stats()["low_quality_count"] == 1
+
+    recovered = EdgeSampleStore(str(tmp_path / "store"))
+    assert recovered.stats() == stats
+
+
 def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
     cache_path = str(tmp_path / "cache")
     first = boundary_payload_from_tensors(
@@ -1688,6 +1737,57 @@ def test_bundle_uses_stored_zip_and_prepare_cache_reads_it(tmp_path):
         info = prepare_split_training_cache(str(bundle_root), str(tmp_path / "prepared_cache"))
         assert info["all_sample_ids"] == ["high-1"]
         assert manifest["selection_policy"]["selected_sample_count"] == 1
+    finally:
+        os.remove(zip_path)
+
+
+def test_prepare_split_training_cache_memory_preload_matches_disk_record(tmp_path):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    store.store_sample(
+        sample_id="high-1",
+        frame_index=1,
+        confidence=0.9,
+        split_config_id="plan-1",
+        model_id="model-a",
+        model_version="0",
+        quality_bucket=HIGH_QUALITY,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_planned_payload(plan),
+    )
+    zip_path, _manifest, _stats = pack_continual_learning_bundle_to_file(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="0",
+        output_dir=str(tmp_path),
+    )
+
+    try:
+        bundle_root = tmp_path / "bundle-memory"
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(bundle_root)
+        preloaded_records = {}
+        info = prepare_split_training_cache(
+            str(bundle_root),
+            str(tmp_path / "prepared_cache_memory"),
+            preloaded_records=preloaded_records,
+        )
+        disk_record = load_split_feature_cache(
+            str(tmp_path / "prepared_cache_memory"),
+            "high-1",
+        )
+        memory_record = preloaded_records["high-1"]
+
+        assert info["all_sample_ids"] == ["high-1"]
+        assert torch.equal(
+            disk_record["intermediate"].tensors["payload"],
+            memory_record["intermediate"].tensors["payload"],
+        )
+        assert disk_record["pseudo_boxes"] == memory_record["pseudo_boxes"]
+        assert disk_record["pseudo_labels"] == memory_record["pseudo_labels"]
     finally:
         os.remove(zip_path)
 

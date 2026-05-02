@@ -25,8 +25,8 @@ from edge.resource_aware_trigger import (
     ResourceAwareCLTrigger,
     TrainingDecision,
 )
-from edge.edge_worker import EdgeWorker
-from edge.sample_store import LOW_QUALITY
+from edge.edge_worker import AsyncSampleWriter, EdgeWorker, SampleStatsDelta, SampleWriteJob
+from edge.sample_store import EdgeSampleStore, LOW_QUALITY
 from edge.window_drift_detector import WindowDriftDetector
 from model_management.object_detection import InferenceArtifacts
 
@@ -274,6 +274,7 @@ class TestEdgeWorkerRouting:
         worker.split_trace_image_size = None
         worker._fixed_split_init_lock = threading.Lock()
         splitter = object()
+        init_finished = {"value": False}
 
         def _fake_init(frame, image_size):
             assert frame is sample_bgr_frame
@@ -283,15 +284,14 @@ class TestEdgeWorkerRouting:
             worker.universal_splitter = splitter
             worker.split_trace_image_size = image_size
             time.sleep(0.03)
+            init_finished["value"] = True
 
         worker._init_fixed_split_runtime = _fake_init
 
-        start_time = time.perf_counter()
         active = worker._resolve_active_splitter(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
-        elapsed = time.perf_counter() - start_time
 
         assert active is splitter
-        assert elapsed >= 0.03
+        assert init_finished["value"] is True
 
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
@@ -392,6 +392,39 @@ class TestEdgeWorkerRouting:
         assert worker.diff_processor.is_alive() is False
         assert worker.local_processor.is_alive() is False
         assert worker.retrain_processor.is_alive() is False
+
+    def test_async_sample_writer_flushes_and_drains_on_close(self, tmp_path, sample_bgr_frame):
+        store = EdgeSampleStore(str(tmp_path / "store"))
+        writer = AsyncSampleWriter(store)
+
+        def _job(sample_id):
+            return SampleWriteJob(
+                store_kwargs={
+                    "sample_id": sample_id,
+                    "frame_index": 1,
+                    "confidence": 0.2,
+                    "split_config_id": "plan-1",
+                    "model_id": "model-a",
+                    "model_version": "0",
+                    "quality_bucket": LOW_QUALITY,
+                    "inference_result": {"boxes": [], "labels": [], "scores": []},
+                    "intermediate": torch.ones(1, 2),
+                    "raw_frame": sample_bgr_frame,
+                },
+                stats_delta=SampleStatsDelta.from_values(
+                    quality_bucket=LOW_QUALITY,
+                    uncovered_evidence_rate=1.0,
+                    candidate_uncovered_score=1.0,
+                ),
+            )
+
+        writer.submit(_job("async-1"))
+        assert writer.flush(timeout=2.0) is True
+        assert store.load_record("async-1").has_raw_sample is True
+
+        writer.submit(_job("async-2"))
+        assert writer.close(timeout=2.0) is True
+        assert store.load_record("async-2").has_raw_sample is True
 
     def test_retrain_worker_retries_transient_not_found_status(self, monkeypatch):
         worker = EdgeWorker.__new__(EdgeWorker)

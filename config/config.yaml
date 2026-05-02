@@ -152,6 +152,7 @@ server:
   # dynamic-batch Ariadne template; reconstruction/training use batch_size.
   trace_batch_size: 2
   batch_size: 16
+  feature_cache_mode: auto
   teacher_batch_size: 32
   proxy_eval_interval_rounds: 5
   proxy_eval_patience: 3

@@ -89,6 +89,7 @@ _FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
 _FIXED_SPLIT_DYNAMIC_BATCH_MIN = _FIXED_SPLIT_DYNAMIC_BATCH[0]
 _FIXED_SPLIT_DYNAMIC_BATCH_MAX = _FIXED_SPLIT_DYNAMIC_BATCH[1]
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
+_AUTO_MEMORY_FEATURE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
 
 class _TeacherAnnotationQueueState:
@@ -1499,6 +1500,16 @@ class CloudContinualLearner:
             int(getattr(cl_cfg, "trace_batch_size", 2))
             if cl_cfg else 2
         )
+        self.feature_cache_mode = (
+            str(getattr(cl_cfg, "feature_cache_mode", "auto"))
+            if cl_cfg
+            else "auto"
+        ).strip().lower()
+        if self.feature_cache_mode not in {"auto", "memory", "disk"}:
+            raise ValueError(
+                "server.continual_learning.feature_cache_mode must be one of: "
+                "auto, memory, disk."
+            )
         removed_cl_fields = {
             "rebuild_batch_size": (
                 "server.continual_learning.rebuild_batch_size has been removed; "
@@ -2525,6 +2536,7 @@ class CloudContinualLearner:
             example_inputs=symbolic_example,
             graph_signature=str(split_plan.get("trace_signature") or "") or None,
             split_plan_hash=_json_fingerprint(split_plan),
+            trace_batch_size=max(1, int(self.trace_batch_size)),
             mode=self._preferred_fixed_split_runtime_mode(model_family),
         )
 
@@ -2965,6 +2977,39 @@ class CloudContinualLearner:
         )
         return int(effective_batch_size)
 
+    def _should_preload_fixed_split_feature_records(
+        self,
+        manifest: Mapping[str, object],
+    ) -> bool:
+        mode = str(getattr(self, "feature_cache_mode", "auto")).strip().lower()
+        if mode == "memory":
+            return True
+        if mode == "disk":
+            return False
+        samples = [
+            sample
+            for sample in list(manifest.get("samples", []) or [])
+            if isinstance(sample, Mapping)
+        ]
+        feature_bytes = sum(int(sample.get("feature_bytes", 0) or 0) for sample in samples)
+        raw_bytes = sum(int(sample.get("raw_bytes", 0) or 0) for sample in samples)
+        estimated_bytes = max(feature_bytes, feature_bytes + raw_bytes // 4)
+        return estimated_bytes <= _AUTO_MEMORY_FEATURE_CACHE_MAX_BYTES
+
+    def _cloud_dataloader_kwargs(self, dataset_size: int) -> dict[str, object]:
+        if os.name == "nt" or int(dataset_size) <= 1:
+            num_workers = 0
+        else:
+            cpu_count = os.cpu_count() or 1
+            num_workers = max(0, min(4, cpu_count - 1, int(dataset_size)))
+        kwargs: dict[str, object] = {
+            "num_workers": num_workers,
+            "pin_memory": bool(torch.cuda.is_available()),
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = True
+        return kwargs
+
     def _prepare_fixed_split_working_cache(
         self,
         model: torch.nn.Module,
@@ -3014,10 +3059,14 @@ class CloudContinualLearner:
         )
         self._log_stage_duration("runtime template load / bind", stage_started)
 
-        preloaded_records: dict[str, dict[str, object]] = {}
+        preload_records = self._should_preload_fixed_split_feature_records(manifest)
+        preloaded_records: dict[str, dict[str, object]] | None = (
+            {} if preload_records else None
+        )
 
         def _prepare_cache() -> dict[str, object]:
-            preloaded_records.clear()
+            if preloaded_records is not None:
+                preloaded_records.clear()
             return prepare_split_training_cache(
                 bundle_cache_path,
                 working_cache,
@@ -3074,7 +3123,7 @@ class CloudContinualLearner:
             prepared_trace_sample_input,
             prepared_splitter,
             prepared_candidate,
-            dict(preloaded_records),
+            dict(preloaded_records or {}),
         )
 
     def _collect_teacher_annotations(
@@ -3392,6 +3441,7 @@ class CloudContinualLearner:
             dataset=dataset,
             batch_size=batch_size,
             collate_fn=_collate_fn,
+            **self._cloud_dataloader_kwargs(len(dataset)),
         )
         tr_metric = RetrainMetric()
 

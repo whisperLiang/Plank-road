@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -15,6 +16,47 @@ from model_management.payload import BoundaryPayload, SplitPayload
 
 
 SAMPLE_STORE_VERSION = "edge-sample-store.v2"
+
+
+def _atomic_json_dump(path: str, payload: dict[str, Any]) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp-{threading.get_ident()}"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def _atomic_torch_save(payload: Any, path: str) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp-{threading.get_ident()}"
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_cv2_imwrite(path: str, image: Any, params: list[int]) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp-{threading.get_ident()}.jpg"
+    try:
+        ok = cv2.imwrite(tmp_path, image, params)
+        if not ok:
+            raise OSError(f"cv2.imwrite failed for {path}")
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _to_relpath(root_dir: str, path: str | None) -> str | None:
@@ -184,6 +226,78 @@ class StoredSampleRecord:
         )
 
 
+@dataclass
+class _SampleStoreCounters:
+    total_samples: int = 0
+    high_quality_count: int = 0
+    low_quality_count: int = 0
+    drift_window_sample_count: int = 0
+    high_quality_feature_bytes: int = 0
+    low_quality_feature_bytes: int = 0
+    low_quality_raw_bytes: int = 0
+    uncovered_evidence_sum: float = 0.0
+    candidate_uncovered_sum: float = 0.0
+    motion_uncovered_sum: float = 0.0
+    track_uncovered_sum: float = 0.0
+
+    def add(self, record: StoredSampleRecord, *, sign: int = 1) -> None:
+        factor = 1 if sign >= 0 else -1
+        self.total_samples += factor
+        if record.quality_bucket == HIGH_QUALITY:
+            self.high_quality_count += factor
+            self.high_quality_feature_bytes += factor * int(record.feature_bytes)
+        elif record.quality_bucket == LOW_QUALITY:
+            self.low_quality_count += factor
+            self.low_quality_feature_bytes += factor * int(record.feature_bytes)
+            self.low_quality_raw_bytes += factor * int(record.raw_bytes)
+        if record.in_drift_window:
+            self.drift_window_sample_count += factor
+        self.uncovered_evidence_sum += factor * float(record.uncovered_evidence_rate)
+        self.candidate_uncovered_sum += factor * float(record.candidate_uncovered_score)
+        self.motion_uncovered_sum += factor * float(record.motion_uncovered_score)
+        self.track_uncovered_sum += factor * float(record.track_uncovered_score)
+
+    def clamp(self) -> None:
+        self.total_samples = max(0, int(self.total_samples))
+        self.high_quality_count = max(0, int(self.high_quality_count))
+        self.low_quality_count = max(0, int(self.low_quality_count))
+        self.drift_window_sample_count = max(0, int(self.drift_window_sample_count))
+        self.high_quality_feature_bytes = max(0, int(self.high_quality_feature_bytes))
+        self.low_quality_feature_bytes = max(0, int(self.low_quality_feature_bytes))
+        self.low_quality_raw_bytes = max(0, int(self.low_quality_raw_bytes))
+        if self.total_samples == 0:
+            self.uncovered_evidence_sum = 0.0
+            self.candidate_uncovered_sum = 0.0
+            self.motion_uncovered_sum = 0.0
+            self.track_uncovered_sum = 0.0
+
+    def to_stats(self) -> dict[str, Any]:
+        total = max(0, int(self.total_samples))
+        low = max(0, int(self.low_quality_count))
+        return {
+            "total_samples": total,
+            "high_quality_count": max(0, int(self.high_quality_count)),
+            "low_quality_count": low,
+            "low_quality_rate": (low / float(total)) if total else 0.0,
+            "uncovered_evidence_rate": (
+                float(self.uncovered_evidence_sum) / float(total) if total else 0.0
+            ),
+            "candidate_uncovered_rate": (
+                float(self.candidate_uncovered_sum) / float(total) if total else 0.0
+            ),
+            "motion_uncovered_rate": (
+                float(self.motion_uncovered_sum) / float(total) if total else 0.0
+            ),
+            "track_uncovered_rate": (
+                float(self.track_uncovered_sum) / float(total) if total else 0.0
+            ),
+            "drift_window_sample_count": max(0, int(self.drift_window_sample_count)),
+            "high_quality_feature_bytes": max(0, int(self.high_quality_feature_bytes)),
+            "low_quality_feature_bytes": max(0, int(self.low_quality_feature_bytes)),
+            "low_quality_raw_bytes": max(0, int(self.low_quality_raw_bytes)),
+        }
+
+
 class EdgeSampleStore:
     def __init__(self, root_dir: str) -> None:
         self.root_dir = os.path.abspath(root_dir)
@@ -193,7 +307,10 @@ class EdgeSampleStore:
         self.raw_dir = os.path.join(self.root_dir, "raw")
         self.index_dir = os.path.join(self.root_dir, "indexes")
         self.manifest_path = os.path.join(self.root_dir, "manifest.json")
+        self._lock = threading.RLock()
+        self._counters = _SampleStoreCounters()
         self._ensure_layout()
+        self._recover_counters()
 
     def _ensure_layout(self) -> None:
         os.makedirs(self.features_dir, exist_ok=True)
@@ -202,21 +319,36 @@ class EdgeSampleStore:
         os.makedirs(self.raw_dir, exist_ok=True)
         os.makedirs(self.index_dir, exist_ok=True)
         if not os.path.exists(self.manifest_path):
-            with open(self.manifest_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "schema_version": SAMPLE_STORE_VERSION,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    handle,
-                    indent=2,
-                    sort_keys=True,
-                )
+            _atomic_json_dump(
+                self.manifest_path,
+                {
+                    "schema_version": SAMPLE_STORE_VERSION,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+    def _recover_counters(self) -> None:
+        counters = _SampleStoreCounters()
+        if os.path.isdir(self.metadata_dir):
+            for filename in sorted(os.listdir(self.metadata_dir)):
+                if not filename.endswith(".json"):
+                    continue
+                path = os.path.join(self.metadata_dir, filename)
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        counters.add(StoredSampleRecord.from_dict(json.load(handle)))
+                except Exception:
+                    continue
+        counters.clamp()
+        with self._lock:
+            self._counters = counters
 
     def clear(self) -> None:
-        if os.path.isdir(self.root_dir):
-            shutil.rmtree(self.root_dir, ignore_errors=True)
-        self._ensure_layout()
+        with self._lock:
+            if os.path.isdir(self.root_dir):
+                shutil.rmtree(self.root_dir, ignore_errors=True)
+            self._ensure_layout()
+            self._counters = _SampleStoreCounters()
 
     def _index_path(self, bucket: str) -> str:
         return os.path.join(self.index_dir, f"{bucket}.jsonl")
@@ -225,6 +357,16 @@ class EdgeSampleStore:
         with open(self._index_path(bucket), "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record.to_dict(), sort_keys=True))
             handle.write("\n")
+
+    def _existing_record_unlocked(self, sample_id: str) -> StoredSampleRecord | None:
+        metadata_path = os.path.join(self.metadata_dir, f"{sample_id}.json")
+        if not os.path.exists(metadata_path):
+            return None
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                return StoredSampleRecord.from_dict(json.load(handle))
+        except Exception:
+            return None
 
     def store_sample(
         self,
@@ -257,7 +399,11 @@ class EdgeSampleStore:
         input_tensor_shape: list[int] | tuple[int, ...] | None = None,
         input_resize_mode: str | None = None,
     ) -> StoredSampleRecord:
-        self._ensure_layout()
+        sample_key = str(sample_id)
+        with self._lock:
+            self._ensure_layout()
+            previous_record = self._existing_record_unlocked(sample_key)
+
         if quality_bucket not in {HIGH_QUALITY, LOW_QUALITY}:
             raise ValueError(f"Unsupported quality bucket: {quality_bucket!r}")
         if quality_bucket != LOW_QUALITY:
@@ -268,21 +414,23 @@ class EdgeSampleStore:
             else float(quality_score)
         )
 
-        sample_key = str(sample_id)
         ts = timestamp or datetime.now(timezone.utc).isoformat()
         payload = _normalise_payload(intermediate)
 
         feature_path = os.path.join(self.features_dir, f"{sample_key}.pt")
         result_path = os.path.join(self.results_dir, f"{sample_key}.json")
         metadata_path = os.path.join(self.metadata_dir, f"{sample_key}.json")
-        raw_path = os.path.join(self.raw_dir, f"{sample_key}.jpg") if raw_frame is not None else None
+        raw_path = (
+            os.path.join(self.raw_dir, f"{sample_key}.jpg")
+            if raw_frame is not None
+            else None
+        )
 
-        torch.save({"intermediate": payload}, feature_path)
-        with open(result_path, "w", encoding="utf-8") as handle:
-            json.dump(inference_result, handle, indent=2, sort_keys=True)
+        _atomic_torch_save({"intermediate": payload}, feature_path)
+        _atomic_json_dump(result_path, inference_result)
         if raw_frame is not None:
             quality = max(1, min(100, int(raw_jpeg_quality)))
-            cv2.imwrite(raw_path, raw_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            _atomic_cv2_imwrite(raw_path, raw_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
 
         record = StoredSampleRecord(
             sample_id=sample_key,
@@ -318,90 +466,67 @@ class EdgeSampleStore:
             raw_bytes=os.path.getsize(raw_path) if raw_path is not None else 0,
         )
 
-        with open(metadata_path, "w", encoding="utf-8") as handle:
-            json.dump(record.to_dict(), handle, indent=2, sort_keys=True)
+        _atomic_json_dump(metadata_path, record.to_dict())
 
-        self._append_index("all", record)
-        self._append_index(quality_bucket, record)
+        with self._lock:
+            self._append_index("all", record)
+            self._append_index(quality_bucket, record)
+            if previous_record is not None:
+                self._counters.add(previous_record, sign=-1)
+            self._counters.add(record)
+            self._counters.clamp()
         return record
 
     def load_record(self, sample_id: str) -> StoredSampleRecord:
-        metadata_path = os.path.join(self.metadata_dir, f"{sample_id}.json")
-        with open(metadata_path, "r", encoding="utf-8") as handle:
-            return StoredSampleRecord.from_dict(json.load(handle))
+        with self._lock:
+            metadata_path = os.path.join(self.metadata_dir, f"{sample_id}.json")
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                return StoredSampleRecord.from_dict(json.load(handle))
 
     def list_records(
         self,
         *,
         quality_bucket: str | None = None,
     ) -> list[StoredSampleRecord]:
-        records: list[StoredSampleRecord] = []
-        if not os.path.isdir(self.metadata_dir):
+        with self._lock:
+            records: list[StoredSampleRecord] = []
+            if not os.path.isdir(self.metadata_dir):
+                return records
+            for filename in sorted(os.listdir(self.metadata_dir)):
+                if not filename.endswith(".json"):
+                    continue
+                with open(os.path.join(self.metadata_dir, filename), "r", encoding="utf-8") as handle:
+                    record = StoredSampleRecord.from_dict(json.load(handle))
+                if quality_bucket is not None and record.quality_bucket != quality_bucket:
+                    continue
+                records.append(record)
+            records.sort(key=lambda item: (item.timestamp, item.sample_id))
             return records
-        for filename in sorted(os.listdir(self.metadata_dir)):
-            if not filename.endswith(".json"):
-                continue
-            with open(os.path.join(self.metadata_dir, filename), "r", encoding="utf-8") as handle:
-                record = StoredSampleRecord.from_dict(json.load(handle))
-            if quality_bucket is not None and record.quality_bucket != quality_bucket:
-                continue
-            records.append(record)
-        records.sort(key=lambda item: (item.timestamp, item.sample_id))
-        return records
 
     def low_quality_count(self) -> int:
-        return len(self.list_records(quality_bucket=LOW_QUALITY))
+        with self._lock:
+            return int(self._counters.low_quality_count)
 
     def stats(self) -> dict[str, Any]:
-        records = self.list_records()
-        high = [record for record in records if record.quality_bucket == HIGH_QUALITY]
-        low = [record for record in records if record.quality_bucket == LOW_QUALITY]
-        total = len(records)
-        return {
-            "total_samples": total,
-            "high_quality_count": len(high),
-            "low_quality_count": len(low),
-            "low_quality_rate": (len(low) / float(total)) if total else 0.0,
-            "uncovered_evidence_rate": (
-                sum(record.uncovered_evidence_rate for record in records) / float(total)
-                if total
-                else 0.0
-            ),
-            "candidate_uncovered_rate": (
-                sum(record.candidate_uncovered_score for record in records) / float(total)
-                if total
-                else 0.0
-            ),
-            "motion_uncovered_rate": (
-                sum(record.motion_uncovered_score for record in records) / float(total)
-                if total
-                else 0.0
-            ),
-            "track_uncovered_rate": (
-                sum(record.track_uncovered_score for record in records) / float(total)
-                if total
-                else 0.0
-            ),
-            "drift_window_sample_count": sum(1 for record in records if record.in_drift_window),
-            "high_quality_feature_bytes": sum(record.feature_bytes for record in high),
-            "low_quality_feature_bytes": sum(record.feature_bytes for record in low),
-            "low_quality_raw_bytes": sum(record.raw_bytes for record in low),
-        }
+        with self._lock:
+            return self._counters.to_stats()
 
     def load_inference_result(self, record: StoredSampleRecord) -> dict[str, Any]:
-        result_path = _from_relpath(self.root_dir, record.result_relpath)
-        with open(result_path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+        with self._lock:
+            result_path = _from_relpath(self.root_dir, record.result_relpath)
+            with open(result_path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
 
     def load_intermediate(self, record: StoredSampleRecord) -> BoundaryPayload:
-        feature_path = _from_relpath(self.root_dir, record.feature_relpath)
-        payload = torch.load(feature_path, map_location="cpu", weights_only=False)
-        intermediate = payload.get("intermediate")
-        if isinstance(intermediate, BoundaryPayload):
-            return intermediate
-        if isinstance(intermediate, dict):
-            return SplitPayload.from_mapping(intermediate)
-        raise TypeError(f"Unsupported cached intermediate type: {type(intermediate)!r}")
+        with self._lock:
+            feature_path = _from_relpath(self.root_dir, record.feature_relpath)
+            payload = torch.load(feature_path, map_location="cpu", weights_only=False)
+            intermediate = payload.get("intermediate")
+            if isinstance(intermediate, BoundaryPayload):
+                return intermediate
+            if isinstance(intermediate, dict):
+                return SplitPayload.from_mapping(intermediate)
+            raise TypeError(f"Unsupported cached intermediate type: {type(intermediate)!r}")
 
     def iter_existing_paths(self, record: StoredSampleRecord) -> Iterable[str]:
         for relpath in (

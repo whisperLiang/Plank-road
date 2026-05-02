@@ -3,7 +3,9 @@ import io
 import os
 import threading
 import time
+from dataclasses import dataclass
 from queue import Empty, Full, Queue
+from typing import Any, Callable
 
 import grpc
 import torch
@@ -41,6 +43,118 @@ from model_management.universal_model_split import UniversalModelSplitter
 from tools.grpc_options import grpc_message_options
 
 _QUEUE_STOP = object()
+
+
+@dataclass(frozen=True)
+class SampleStatsDelta:
+    total_samples: int = 1
+    high_quality_count: int = 0
+    low_quality_count: int = 0
+    drift_window_sample_count: int = 0
+    uncovered_evidence_sum: float = 0.0
+    candidate_uncovered_sum: float = 0.0
+    motion_uncovered_sum: float = 0.0
+    track_uncovered_sum: float = 0.0
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        quality_bucket: str,
+        uncovered_evidence_rate: float = 0.0,
+        candidate_uncovered_score: float = 0.0,
+        motion_uncovered_score: float = 0.0,
+        track_uncovered_score: float = 0.0,
+        in_drift_window: bool = False,
+    ) -> "SampleStatsDelta":
+        return cls(
+            high_quality_count=1 if quality_bucket != LOW_QUALITY else 0,
+            low_quality_count=1 if quality_bucket == LOW_QUALITY else 0,
+            drift_window_sample_count=1 if in_drift_window else 0,
+            uncovered_evidence_sum=float(uncovered_evidence_rate),
+            candidate_uncovered_sum=float(candidate_uncovered_score),
+            motion_uncovered_sum=float(motion_uncovered_score),
+            track_uncovered_sum=float(track_uncovered_score),
+        )
+
+
+@dataclass(frozen=True)
+class SampleWriteJob:
+    store_kwargs: dict[str, Any]
+    stats_delta: SampleStatsDelta
+
+
+class AsyncSampleWriter:
+    def __init__(
+        self,
+        sample_store: EdgeSampleStore,
+        *,
+        maxsize: int = 0,
+        on_done: Callable[[SampleWriteJob, object | None, BaseException | None], None] | None = None,
+    ) -> None:
+        self.sample_store = sample_store
+        self._queue: Queue = Queue(maxsize=max(0, int(maxsize)))
+        self._on_done = on_done
+        self._closed = False
+        self._errors: list[BaseException] = []
+        self._thread = threading.Thread(
+            target=self._run,
+            name="edge-sample-writer",
+            daemon=False,
+        )
+        self._thread.start()
+
+    @property
+    def errors(self) -> list[BaseException]:
+        return list(self._errors)
+
+    def submit(self, job: SampleWriteJob) -> None:
+        if self._closed:
+            raise RuntimeError("sample writer is closed")
+        self._queue.put(job, block=True)
+
+    def flush(self, *, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                if deadline is None:
+                    self._queue.all_tasks_done.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._queue.all_tasks_done.wait(timeout=remaining)
+        return True
+
+    def close(self, *, timeout: float | None = None) -> bool:
+        if self._closed:
+            return not self._thread.is_alive()
+        flushed = self.flush(timeout=timeout)
+        self._closed = True
+        self._queue.put(_QUEUE_STOP, block=True)
+        self._thread.join(timeout=timeout)
+        return flushed and not self._thread.is_alive()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get(block=True)
+            try:
+                if item is _QUEUE_STOP:
+                    return
+                job = item
+                record = None
+                error = None
+                try:
+                    record = self.sample_store.store_sample(**job.store_kwargs)
+                except BaseException as exc:  # noqa: BLE001 - preserve worker thread.
+                    error = exc
+                    self._errors.append(exc)
+                    logger.exception("Async sample write failed: {}", exc)
+                finally:
+                    if self._on_done is not None:
+                        self._on_done(job, record, error)
+            finally:
+                self._queue.task_done()
 
 
 class EdgeWorker:
@@ -128,6 +242,12 @@ class EdgeWorker:
         self.pending_training_decision: TrainingDecision | None = None
         self.sample_store = EdgeSampleStore(
             os.path.join(self.config.retrain.cache_path, "sample_store")
+        )
+        self._pending_sample_stats_lock = threading.Lock()
+        self._pending_sample_stats = SampleStatsDelta(total_samples=0)
+        self.sample_writer = AsyncSampleWriter(
+            self.sample_store,
+            on_done=self._on_sample_write_done,
         )
         self.model_id = getattr(self.small_object_detection, "model_name", "edge-model")
         self.model_version = "0"
@@ -263,6 +383,141 @@ class EdgeWorker:
 
     def _next_sample_id(self, task: Task) -> str:
         return f"{task.frame_index}-{int(task.start_time * 1000)}"
+
+    def _apply_pending_sample_stats(self, delta: SampleStatsDelta, *, sign: int) -> None:
+        factor = 1 if sign >= 0 else -1
+        lock = getattr(self, "_pending_sample_stats_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._pending_sample_stats_lock = lock
+        with lock:
+            current = getattr(self, "_pending_sample_stats", SampleStatsDelta(total_samples=0))
+            self._pending_sample_stats = SampleStatsDelta(
+                total_samples=max(0, current.total_samples + factor * delta.total_samples),
+                high_quality_count=max(
+                    0,
+                    current.high_quality_count + factor * delta.high_quality_count,
+                ),
+                low_quality_count=max(
+                    0,
+                    current.low_quality_count + factor * delta.low_quality_count,
+                ),
+                drift_window_sample_count=max(
+                    0,
+                    current.drift_window_sample_count
+                    + factor * delta.drift_window_sample_count,
+                ),
+                uncovered_evidence_sum=max(
+                    0.0,
+                    current.uncovered_evidence_sum
+                    + factor * delta.uncovered_evidence_sum,
+                ),
+                candidate_uncovered_sum=max(
+                    0.0,
+                    current.candidate_uncovered_sum
+                    + factor * delta.candidate_uncovered_sum,
+                ),
+                motion_uncovered_sum=max(
+                    0.0,
+                    current.motion_uncovered_sum
+                    + factor * delta.motion_uncovered_sum,
+                ),
+                track_uncovered_sum=max(
+                    0.0,
+                    current.track_uncovered_sum + factor * delta.track_uncovered_sum,
+                ),
+            )
+
+    def _on_sample_write_done(
+        self,
+        job: SampleWriteJob,
+        _record: object | None,
+        error: BaseException | None,
+    ) -> None:
+        self._apply_pending_sample_stats(job.stats_delta, sign=-1)
+        if error is not None:
+            logger.error(
+                "Dropped queued sample {} after async write failure: {}",
+                job.store_kwargs.get("sample_id"),
+                error,
+            )
+
+    def _stats_for_training_trigger(self) -> dict[str, Any]:
+        stats = dict(self.sample_store.stats())
+        lock = getattr(self, "_pending_sample_stats_lock", None)
+        if lock is None:
+            return stats
+        with lock:
+            pending = getattr(self, "_pending_sample_stats", SampleStatsDelta(total_samples=0))
+        if pending.total_samples <= 0:
+            return stats
+
+        base_total = int(stats.get("total_samples", 0) or 0)
+        total = base_total + int(pending.total_samples)
+        low = int(stats.get("low_quality_count", 0) or 0) + int(pending.low_quality_count)
+        high = int(stats.get("high_quality_count", 0) or 0) + int(pending.high_quality_count)
+
+        def _merged_average(key: str, pending_sum: float) -> float:
+            if total <= 0:
+                return 0.0
+            base_sum = float(stats.get(key, 0.0) or 0.0) * float(base_total)
+            return (base_sum + float(pending_sum)) / float(total)
+
+        stats.update(
+            {
+                "total_samples": total,
+                "high_quality_count": high,
+                "low_quality_count": low,
+                "low_quality_rate": (low / float(total)) if total else 0.0,
+                "uncovered_evidence_rate": _merged_average(
+                    "uncovered_evidence_rate",
+                    pending.uncovered_evidence_sum,
+                ),
+                "candidate_uncovered_rate": _merged_average(
+                    "candidate_uncovered_rate",
+                    pending.candidate_uncovered_sum,
+                ),
+                "motion_uncovered_rate": _merged_average(
+                    "motion_uncovered_rate",
+                    pending.motion_uncovered_sum,
+                ),
+                "track_uncovered_rate": _merged_average(
+                    "track_uncovered_rate",
+                    pending.track_uncovered_sum,
+                ),
+                "drift_window_sample_count": int(
+                    stats.get("drift_window_sample_count", 0) or 0
+                )
+                + int(pending.drift_window_sample_count),
+            }
+        )
+        return stats
+
+    def _submit_sample_write(self, job: SampleWriteJob) -> None:
+        writer = getattr(self, "sample_writer", None)
+        if writer is None:
+            self.sample_store.store_sample(**job.store_kwargs)
+            return
+        self._apply_pending_sample_stats(job.stats_delta, sign=1)
+        try:
+            writer.submit(job)
+        except Exception:
+            self._apply_pending_sample_stats(job.stats_delta, sign=-1)
+            logger.exception(
+                "Async sample writer unavailable; storing sample {} synchronously.",
+                job.store_kwargs.get("sample_id"),
+            )
+            self.sample_store.store_sample(**job.store_kwargs)
+
+    def _flush_sample_writer(self, *, timeout: float = 10.0) -> bool:
+        writer = getattr(self, "sample_writer", None)
+        if writer is None:
+            return True
+        try:
+            return bool(writer.flush(timeout=timeout))
+        except Exception as exc:
+            logger.error("Failed to flush async sample writer: {}", exc)
+            return False
 
     def submit_task(self, task: Task) -> Task:
         self.frame_cache.put(task, block=True)
@@ -463,39 +718,52 @@ class EdgeWorker:
         save_raw = quality.quality_bucket == LOW_QUALITY
         sample_id = self._next_sample_id(task)
         retrain_cfg = getattr(getattr(self, "config", None), "retrain", None)
-        self.sample_store.store_sample(
-            sample_id=sample_id,
-            frame_index=task.frame_index,
-            confidence=confidence,
-            split_config_id=self.fixed_split_plan.split_config_id,
-            model_id=self.model_id,
-            model_version=self.model_version,
-            quality_bucket=quality.quality_bucket,
-            quality_score=quality.quality_score,
-            risk_score=quality.risk_score,
-            risk_reasons=quality.risk_reasons,
-            evidence_count=quality.evidence_count,
-            covered_evidence_count=quality.covered_evidence_count,
-            uncovered_evidence_count=quality.uncovered_evidence_count,
-            uncovered_evidence_rate=quality.uncovered_evidence_rate,
-            candidate_uncovered_score=quality.candidate_uncovered_score,
-            motion_uncovered_score=quality.motion_uncovered_score,
-            track_uncovered_score=quality.track_uncovered_score,
-            window_id=quality.window_id,
-            in_drift_window=quality.in_drift_window,
-            inference_result=inference.to_inference_result(),
-            intermediate=inference.intermediate,
-            raw_frame=frame if save_raw else None,
-            raw_jpeg_quality=int(getattr(retrain_cfg, "raw_jpeg_quality", 82)),
-            input_image_size=list(frame.shape[:2]),
-            input_tensor_shape=inference.input_tensor_shape,
-            input_resize_mode=inference.input_resize_mode,
+        store_kwargs = {
+            "sample_id": sample_id,
+            "frame_index": task.frame_index,
+            "confidence": confidence,
+            "split_config_id": self.fixed_split_plan.split_config_id,
+            "model_id": self.model_id,
+            "model_version": self.model_version,
+            "quality_bucket": quality.quality_bucket,
+            "quality_score": quality.quality_score,
+            "risk_score": quality.risk_score,
+            "risk_reasons": quality.risk_reasons,
+            "evidence_count": quality.evidence_count,
+            "covered_evidence_count": quality.covered_evidence_count,
+            "uncovered_evidence_count": quality.uncovered_evidence_count,
+            "uncovered_evidence_rate": quality.uncovered_evidence_rate,
+            "candidate_uncovered_score": quality.candidate_uncovered_score,
+            "motion_uncovered_score": quality.motion_uncovered_score,
+            "track_uncovered_score": quality.track_uncovered_score,
+            "window_id": quality.window_id,
+            "in_drift_window": quality.in_drift_window,
+            "inference_result": inference.to_inference_result(),
+            "intermediate": inference.intermediate,
+            "raw_frame": frame if save_raw else None,
+            "raw_jpeg_quality": int(getattr(retrain_cfg, "raw_jpeg_quality", 82)),
+            "input_image_size": list(frame.shape[:2]),
+            "input_tensor_shape": inference.input_tensor_shape,
+            "input_resize_mode": inference.input_resize_mode,
+        }
+        self._submit_sample_write(
+            SampleWriteJob(
+                store_kwargs=store_kwargs,
+                stats_delta=SampleStatsDelta.from_values(
+                    quality_bucket=quality.quality_bucket,
+                    uncovered_evidence_rate=quality.uncovered_evidence_rate,
+                    candidate_uncovered_score=quality.candidate_uncovered_score,
+                    motion_uncovered_score=quality.motion_uncovered_score,
+                    track_uncovered_score=quality.track_uncovered_score,
+                    in_drift_window=quality.in_drift_window,
+                ),
+            )
         )
 
         if self.retrain_flag:
             return
 
-        stats = PendingTrainingStats.from_mapping(self.sample_store.stats())
+        stats = PendingTrainingStats.from_mapping(self._stats_for_training_trigger())
         stats.drift_detected = bool(drift_state.drift_detected)
         decision = self._make_training_decision(
             drift_state=drift_state,
@@ -539,6 +807,10 @@ class EdgeWorker:
                 options=grpc_message_options(),
             )
             try:
+                if not self._flush_sample_writer(timeout=30.0):
+                    logger.warning(
+                        "Timed out while flushing pending sample writes before continual learning upload."
+                    )
                 accepted, job_id, msg = submit_continual_learning_job(
                     self.config.server_ip,
                     edge_id=self.edge_id,
@@ -740,6 +1012,10 @@ class EdgeWorker:
         for thread in (self.diff_processor, self.local_processor, self.retrain_processor):
             if thread.is_alive():
                 thread.join(timeout=timeout)
+        writer = getattr(self, "sample_writer", None)
+        if writer is not None:
+            if not writer.close(timeout=timeout):
+                logger.warning("Timed out while closing async sample writer.")
 
     def diff_worker(self):
         if not self.config.diff_flag:

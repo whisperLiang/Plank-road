@@ -1262,17 +1262,25 @@ def prepare_split_train_batches_once(
     epoch_batch_size = max(1, int(batch_size))
     ariadne_runtime = _ariadne_runtime_from_splitter(splitter)
     model_name, model_family = _splitter_model_context(splitter)
+    disk_record_cache: dict[Any, dict[str, Any]] = {}
+
+    def _record_for_index(index: Any) -> dict[str, Any]:
+        preloaded = _get_preloaded_split_feature_record(preloaded_records, index)
+        if preloaded is not None:
+            return preloaded
+        cache_key = str(index)
+        cached = disk_record_cache.get(cache_key)
+        if cached is None:
+            cached = load_split_feature_cache(cache_path, index)
+            disk_record_cache[cache_key] = cached
+        return dict(cached)
 
     try:
         for start in range(0, len(all_indices), epoch_batch_size):
             batch_indices = list(all_indices[start : start + epoch_batch_size])
             if not batch_indices:
                 continue
-            records = [
-                _get_preloaded_split_feature_record(preloaded_records, index)
-                or load_split_feature_cache(cache_path, index)
-                for index in batch_indices
-            ]
+            records = [_record_for_index(index) for index in batch_indices]
             boundaries = [record.get("intermediate") for record in records]
             if not boundaries or not all(
                 isinstance(boundary, BoundaryPayload) for boundary in boundaries

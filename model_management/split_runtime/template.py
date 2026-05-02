@@ -18,10 +18,13 @@ FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 2
 @dataclass(frozen=True)
 class FixedSplitRuntimeTemplateKey(RuntimeCacheKey):
     version: int = FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION
+    trace_batch_size: int | None = None
 
     def as_dict(self) -> dict[str, object]:
         payload = super().as_dict()
         payload["version"] = int(self.version)
+        if self.trace_batch_size is not None:
+            payload["trace_batch_size"] = int(self.trace_batch_size)
         return payload
 
 
@@ -33,6 +36,7 @@ def fixed_split_runtime_template_key(
     example_inputs: Any,
     graph_signature: str | None = None,
     split_plan_hash: str | None = None,
+    trace_batch_size: int | None = None,
     mode: str = "generated_eager",
 ) -> FixedSplitRuntimeTemplateKey:
     key = make_runtime_cache_key(
@@ -44,7 +48,10 @@ def fixed_split_runtime_template_key(
         split_plan_hash_value=split_plan_hash,
         mode=mode,
     )
-    return FixedSplitRuntimeTemplateKey(**key.__dict__)
+    return FixedSplitRuntimeTemplateKey(
+        **key.__dict__,
+        trace_batch_size=None if trace_batch_size is None else int(trace_batch_size),
+    )
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import torch
 
 from model_management.split_runtime import (
@@ -60,6 +63,54 @@ def test_runtime_template_cache_reuses_same_instance():
 
     assert first is second
     assert calls["count"] == 1
+
+
+def test_fixed_split_template_key_can_include_trace_batch_size():
+    spec = make_split_spec("auto", model_family="yolo")
+    key_b2 = fixed_split_runtime_template_key(
+        model_name="toy",
+        model_family="yolo",
+        split_spec=spec,
+        example_inputs=torch.randn(2, 3, 8, 8),
+        trace_batch_size=2,
+    )
+    key_b4 = fixed_split_runtime_template_key(
+        model_name="toy",
+        model_family="yolo",
+        split_spec=spec,
+        example_inputs=torch.randn(2, 3, 8, 8),
+        trace_batch_size=4,
+    )
+
+    assert key_b2 != key_b4
+    assert key_b2.as_dict()["trace_batch_size"] == 2
+    assert key_b4.as_dict()["trace_batch_size"] == 4
+
+
+def test_runtime_template_cache_shares_inflight_builds():
+    cache = FixedSplitRuntimeTemplateCache()
+    key = ("toy", "inflight")
+    calls = {"count": 0}
+    results = []
+
+    def builder():
+        calls["count"] += 1
+        time.sleep(0.05)
+        return object()
+
+    def lookup():
+        results.append(cache.get_or_create_lookup(key, builder))
+
+    threads = [threading.Thread(target=lookup) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert calls["count"] == 1
+    assert len(results) == 4
+    assert len({id(result.template) for result in results}) == 1
+    assert {result.cache_status for result in results} <= {"miss", "wait", "hit"}
 
 
 def test_runtime_template_bind_uses_request_model_for_suffix_training():

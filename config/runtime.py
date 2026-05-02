@@ -106,6 +106,7 @@ class ContinualLearningConfig(ConfigSection):
     num_epoch: int = 5
     trace_batch_size: int = 2
     batch_size: int = 2
+    feature_cache_mode: str = "auto"
     teacher_batch_size: int | None = None
     teacher_annotation_threshold: float = 0.5
     proxy_eval_max_samples: int = 0
@@ -126,6 +127,7 @@ class ContinualLearningConfig(ConfigSection):
     def __post_init__(self) -> None:
         if self.teacher_batch_size is None:
             self.teacher_batch_size = int(self.batch_size)
+        self.feature_cache_mode = str(self.feature_cache_mode).strip().lower()
 
 
 @dataclass
@@ -401,6 +403,16 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.continual_learning.trace_batch_size",
         int(config.server.continual_learning.trace_batch_size),
     )
+    if str(config.server.continual_learning.feature_cache_mode).strip().lower() not in {
+        "auto",
+        "memory",
+        "disk",
+    }:
+        raise ValueError(
+            "server.continual_learning.feature_cache_mode must be one of "
+            "{'auto', 'memory', 'disk'}, "
+            f"got {config.server.continual_learning.feature_cache_mode!r}"
+        )
     _validate_positive(
         "server.continual_learning.tinynext_fixed_split_learning_rate",
         float(config.server.continual_learning.tinynext_fixed_split_learning_rate),

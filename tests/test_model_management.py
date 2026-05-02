@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 from PIL import Image
+from torchvision import transforms as tv_transforms
 
 from model_management.model_info import model_lib, COCO_INSTANCE_CATEGORY_NAMES, classes
 from model_management.utils import (
@@ -48,6 +49,7 @@ from model_management.model_zoo import (
     set_detection_trainable_params,
     set_model_detection_thresholds,
 )
+from model_management.object_detection import bgr_image_to_tensor
 from model_management.split_model_adapters import (
     _build_anchor_training_target,
     _build_rfdetr_training_labels,
@@ -55,6 +57,22 @@ from model_management.split_model_adapters import (
     RFDETRReplay,
     get_split_runtime_input_resize_mode,
 )
+
+
+def test_bgr_image_to_tensor_matches_pil_to_tensor_path():
+    bgr = np.array(
+        [
+            [[0, 10, 255], [32, 64, 96]],
+            [[255, 128, 0], [7, 8, 9]],
+        ],
+        dtype=np.uint8,
+    )
+    expected = tv_transforms.ToTensor()(Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
+    actual = bgr_image_to_tensor(bgr, target_device=torch.device("cpu"))
+
+    assert actual.dtype == torch.float32
+    assert actual.shape == (3, 2, 2)
+    assert torch.equal(actual, expected)
 
 
 # =====================================================================

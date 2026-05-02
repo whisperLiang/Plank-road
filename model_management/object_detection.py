@@ -29,8 +29,6 @@ from model_management.split_model_adapters import (
     prepare_split_runtime_input,
     summarize_split_runtime_observables,
 )
-from PIL import Image
-from torchvision import transforms
 from torchvision.ops import box_iou
 from mapcalc import calculate_map
 
@@ -80,6 +78,13 @@ def _collate_fn(batch):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.debug(device)
+
+
+def bgr_image_to_tensor(img, *, target_device=None):
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    tensor = torch.from_numpy(np.ascontiguousarray(rgb))
+    tensor = tensor.permute(2, 0, 1).float().div_(255.0)
+    return tensor.to(target_device or device)
 
 class Object_Detection:
     def __init__(self, config, type):
@@ -425,10 +430,7 @@ class Object_Detection:
         return self._parse_prediction_output(res, threshold)
 
     def _prepare_image_tensor(self, img):
-        img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        transform = transforms.Compose([transforms.ToTensor()])
-        img = transform(img)
-        return img.to(device)
+        return bgr_image_to_tensor(img, target_device=device)
 
     def _prepare_runtime_frame(
         self,
