@@ -17,6 +17,7 @@ from model_management.universal_model_split import save_split_feature_cache
 
 CONTINUAL_LEARNING_PROTOCOL_VERSION = "edge-cl-bundle.v1"
 TRAINING_CACHE_METADATA_VERSION = 1
+PARALLEL_FEATURE_CACHE_WRITE_MIN_ITEMS = 32
 
 
 def _metadata_index_path(target_cache_path: str) -> str:
@@ -672,7 +673,7 @@ def prepare_split_training_cache(
         )
         return item, record
 
-    if len(processed_items) > 1:
+    if len(processed_items) >= PARALLEL_FEATURE_CACHE_WRITE_MIN_ITEMS:
         max_workers = min(4, len(processed_items))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             saved_items = list(executor.map(_save_processed_item, processed_items))
