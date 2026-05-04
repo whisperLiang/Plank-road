@@ -11,22 +11,26 @@ import pytest
 import torch
 from loguru import logger
 
+import model_management.continual_learning_bundle as continual_learning_bundle
 from edge.sample_store import EdgeSampleStore, HIGH_QUALITY, LOW_QUALITY
 from edge.transmit import (
     pack_continual_learning_bundle,
     pack_continual_learning_bundle_to_file,
 )
-import model_management.continual_learning_bundle as continual_learning_bundle
+from model_management.continual_learning_bundle import prepare_split_training_cache
 from model_management.fixed_split import (
-    compute_fixed_split_for_model,
     SplitConstraints,
     SplitPlan,
     apply_split_plan,
+    compute_fixed_split_for_model,
     load_or_compute_fixed_split_plan,
     persist_split_plan,
 )
+from model_management.model_delta_payload import (
+    MODEL_DELTA_PAYLOAD_FORMAT,
+    require_state_dict_delta_payload,
+)
 from model_management.payload import BoundaryPayload, SplitPayload, boundary_payload_from_tensors
-from model_management.continual_learning_bundle import prepare_split_training_cache
 from model_management.split_candidate import SplitCandidate
 from model_management.universal_model_split import (
     UniversalModelSplitter,
@@ -1353,6 +1357,95 @@ def test_proxy_selected_fixed_split_reuses_optimizer_across_outer_rounds(
     assert set(baseline_state) == set(model.state_dict())
 
 
+def test_cloud_serializes_only_delta_payload(tmp_path):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="toy",
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1))
+    for parameter in model[0].parameters():
+        parameter.requires_grad_(False)
+    weights_metadata = {
+        "edge_id": 1,
+        "model_name": "toy",
+        "checkpoint_model_version": "2",
+        "source_base_model_version": "1",
+    }
+
+    payload_bytes = learner._serialise_model_bytes(
+        model,
+        model_name="toy",
+        edge_id=1,
+        weights_metadata=weights_metadata,
+    )
+    payload = require_state_dict_delta_payload(
+        torch.load(io.BytesIO(payload_bytes), map_location="cpu", weights_only=False)
+    )
+
+    assert payload["format"] == MODEL_DELTA_PAYLOAD_FORMAT
+    assert payload["base_model_version"] == "1"
+    assert payload["result_model_version"] == "2"
+    assert set(payload["state_dict"]) == {"1.weight", "1.bias"}
+
+
+def test_delta_payload_applies_to_matching_model(tmp_path):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="toy",
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    cloud_model = torch.nn.Linear(2, 1)
+    edge_model = torch.nn.Linear(2, 1)
+    edge_model.load_state_dict(cloud_model.state_dict())
+    with torch.no_grad():
+        cloud_model.weight.add_(3.0)
+        cloud_model.bias.add_(1.0)
+
+    payload = require_state_dict_delta_payload(
+        torch.load(
+            io.BytesIO(
+                learner._serialise_model_bytes(
+                    cloud_model,
+                    model_name="toy",
+                    edge_id=1,
+                    weights_metadata={
+                        "edge_id": 1,
+                        "model_name": "toy",
+                        "checkpoint_model_version": "1",
+                        "source_base_model_version": "0",
+                    },
+                )
+            ),
+            map_location="cpu",
+            weights_only=False,
+        )
+    )
+    edge_model.load_state_dict(dict(payload["state_dict"]), strict=False)
+
+    for key, value in cloud_model.state_dict().items():
+        assert torch.equal(edge_model.state_dict()[key], value)
+
+
+def test_old_full_state_dict_payload_is_rejected():
+    full_state = torch.nn.Linear(1, 1).state_dict()
+
+    with pytest.raises(RuntimeError, match="Unsupported cloud model update format"):
+        require_state_dict_delta_payload(full_state)
+
+
 def test_fixed_split_no_gt_uses_unified_outer_round_loop_without_reset(
     tmp_path,
     monkeypatch,
@@ -1691,8 +1784,10 @@ def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_
 
     sample_map = {sample["sample_id"]: sample for sample in bundle_manifest["samples"]}
     assert high.feature_relpath in names
-    assert high.result_relpath in names
-    assert low.result_relpath in names
+    assert high.result_relpath not in names
+    assert low.result_relpath not in names
+    assert sample_map["high-1"]["inference_result"]["labels"] == [1]
+    assert sample_map["low-1"]["inference_result"]["labels"] == []
     assert low.raw_relpath in names
     assert low.feature_relpath not in names
     assert sample_map["low-1"]["feature_relpath"] is None
@@ -2861,6 +2956,94 @@ def test_cloud_fixed_split_working_cache_traces_with_configured_trace_batch(
     assert trace_sample_input.shape[0] == 2
     assert bundle_info["all_sample_ids"] == ["s1"]
     assert set(preloaded_records) == {"s1"}
+
+
+def test_cloud_fixed_split_working_cache_hit_skips_prepare_cache(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner, _build_fixed_split_cache_identity
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=16, feature_cache_mode="disk"),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    manifest = {
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "split_plan": {
+            "candidate_id": "after:node_1",
+            "split_label": "after:node_1",
+            "boundary_tensor_labels": ["payload"],
+        },
+        "samples": [{"sample_id": "s1"}],
+    }
+    working_cache = tmp_path / "working"
+    record = save_split_feature_cache(
+        cache_path=str(working_cache),
+        frame_index="s1",
+        intermediate=_payload(),
+        pseudo_boxes=[],
+        pseudo_labels=[],
+        pseudo_scores=[],
+    )
+    (working_cache / "metadata_index.json").write_text(
+        json.dumps(
+            {
+                "samples": {
+                    "s1": {
+                        "sample_id": "s1",
+                        "has_raw_sample": False,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cache_identity = _build_fixed_split_cache_identity(manifest)
+    (working_cache / "cache_manifest.json").write_text(
+        json.dumps(
+            {
+                **cache_identity,
+                "all_sample_ids": ["s1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_splitter",
+        lambda *args, **kwargs: (SimpleNamespace(), object()),
+    )
+    monkeypatch.setattr(
+        cloud_server,
+        "prepare_split_training_cache",
+        lambda *args, **kwargs: pytest.fail("cache hit should skip prepare cache"),
+    )
+
+    bundle_info, frame_dir, trace_input, splitter, candidate, preloaded = (
+        learner._prepare_fixed_split_working_cache(
+            torch.nn.Identity(),
+            manifest,
+            bundle_cache_path=str(tmp_path / "bundle"),
+            working_cache=str(working_cache),
+            runtime_batch_size=16,
+        )
+    )
+
+    assert record["intermediate"] is not None
+    assert bundle_info["all_sample_ids"] == ["s1"]
+    assert frame_dir.endswith("frames")
+    assert trace_input is None
+    assert splitter is not None
+    assert candidate is not None
+    assert preloaded == {}
 
 
 def test_cloud_reconstruction_splits_batched_boundary_payload(tmp_path):

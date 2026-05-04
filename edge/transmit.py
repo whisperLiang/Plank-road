@@ -79,14 +79,16 @@ def _build_bundle_sample(
     include_feature: bool,
     include_raw: bool,
 ) -> dict[str, object] | None:
-    result_entry = _entry_for_relpath(sample_store, record.result_relpath)
-    if result_entry is None:
-        return None
-    entries = [result_entry]
-
-    metadata_entry = _entry_for_relpath(sample_store, record.metadata_relpath)
-    if metadata_entry is not None:
-        entries.append(metadata_entry)
+    entries = []
+    sample_entry = record.to_dict()
+    try:
+        sample_entry["inference_result"] = sample_store.load_inference_result(record)
+        sample_entry["result_relpath"] = None
+    except Exception:
+        result_entry = _entry_for_relpath(sample_store, record.result_relpath)
+        if result_entry is None:
+            return None
+        entries.append(result_entry)
 
     feature_entry = None
     if include_feature:
@@ -102,7 +104,6 @@ def _build_bundle_sample(
             return None
         entries.append(raw_entry)
 
-    sample_entry = record.to_dict()
     if feature_entry is None:
         sample_entry["feature_relpath"] = None
         sample_entry["feature_bytes"] = 0

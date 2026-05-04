@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from grpc_server import message_transmission_pb2
+from grpc_server.workspace import prepare_request_workspace
 
 if TYPE_CHECKING:
     from cloud.edge_registry import EdgeRegistry
@@ -42,6 +43,9 @@ class TrainingJob:
     job_type: int
     workspace: str
     protocol_version: str
+    workspace_root: str = "./cache/server_workspace"
+    request_kind: str = ""
+    payload_zip: bytes = b""
     send_low_conf_features: bool = False
     frame_indices: tuple[int, ...] = ()
     all_frame_indices: tuple[int, ...] = ()
@@ -77,6 +81,7 @@ class TrainingJobManager:
         self._pending_by_edge: dict[int, deque[str]] = {}
         self._edge_round_robin: deque[int] = deque()
         self._running_jobs: set[str] = set()
+        self._worker_threads: list[threading.Thread] = []
         self._active_edges: set[int] = set()
         self._edge_model_versions: dict[int, str] = {}
         self._closed = False
@@ -94,6 +99,13 @@ class TrainingJobManager:
             self._cv.notify_all()
         if self._dispatcher.is_alive():
             self._dispatcher.join(timeout=timeout)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        for worker in list(self._worker_threads):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            if worker.is_alive():
+                worker.join(timeout=remaining)
 
     def submit(
         self,
@@ -103,6 +115,9 @@ class TrainingJobManager:
         job_type: int,
         workspace: str,
         protocol_version: str,
+        workspace_root: str = "./cache/server_workspace",
+        request_kind: str = "",
+        payload_zip: bytes = b"",
         send_low_conf_features: bool = False,
         frame_indices: list[int] | tuple[int, ...] | None = None,
         all_frame_indices: list[int] | tuple[int, ...] | None = None,
@@ -125,6 +140,9 @@ class TrainingJobManager:
                 job_type=int(job_type),
                 workspace=str(workspace),
                 protocol_version=str(protocol_version or ""),
+                workspace_root=str(workspace_root or "./cache/server_workspace"),
+                request_kind=str(request_kind or ""),
+                payload_zip=bytes(payload_zip or b""),
                 send_low_conf_features=bool(send_low_conf_features),
                 frame_indices=tuple(int(value) for value in (frame_indices or [])),
                 all_frame_indices=tuple(int(value) for value in (all_frame_indices or [])),
@@ -227,6 +245,8 @@ class TrainingJobManager:
                 name=f"training-job-{job.job_id}",
                 daemon=True,
             )
+            with self._lock:
+                self._worker_threads.append(worker)
             worker.start()
 
     def _next_dispatchable_job_locked(self) -> TrainingJob | None:
@@ -271,6 +291,9 @@ class TrainingJobManager:
             edge_id = job.edge_id
             job_type = job.job_type
             workspace = job.workspace
+            workspace_root = job.workspace_root
+            request_kind = job.request_kind
+            payload_zip = job.payload_zip
             frame_indices = list(job.frame_indices)
             all_frame_indices = list(job.all_frame_indices)
             drift_frame_indices = list(job.drift_frame_indices)
@@ -284,6 +307,19 @@ class TrainingJobManager:
         )
 
         try:
+            if payload_zip:
+                workspace = str(
+                    prepare_request_workspace(
+                        workspace_root,
+                        edge_id=edge_id,
+                        request_kind=(
+                            request_kind
+                            or self._request_kind_for_job_type(job_type)
+                        ),
+                        payload_zip=payload_zip,
+                        client_cache_path=workspace,
+                    )
+                )
             success, model_data, message = self._execute_job(
                 edge_id=edge_id,
                 job_type=job_type,
@@ -387,6 +423,16 @@ class TrainingJobManager:
                 edge_id,
                 workspace,
             )
+        raise ValueError(f"Unsupported training job type: {job_type!r}")
+
+    @staticmethod
+    def _request_kind_for_job_type(job_type: int) -> str:
+        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
+            return "train_model"
+        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_SPLIT:
+            return "split_train"
+        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
+            return "continual_learning"
         raise ValueError(f"Unsupported training job type: {job_type!r}")
 
     def _queue_position_locked(self, job_id: str) -> int:

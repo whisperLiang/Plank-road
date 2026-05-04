@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Mapping
 
 import torch
@@ -416,12 +417,16 @@ def prepare_split_training_cache(
                 manifest.get("model", {}).get("model_version"),
             )
             continue
-        result_path = os.path.join(
-            bundle_root,
-            str(sample["result_relpath"]).replace("/", os.sep),
-        )
-        with open(result_path, "r", encoding="utf-8") as handle:
-            inference_result = json.load(handle)
+        inline_result = sample.get("inference_result")
+        if isinstance(inline_result, Mapping):
+            inference_result = dict(inline_result)
+        else:
+            result_path = os.path.join(
+                bundle_root,
+                str(sample["result_relpath"]).replace("/", os.sep),
+            )
+            with open(result_path, "r", encoding="utf-8") as handle:
+                inference_result = json.load(handle)
 
         bundled_feature = sample.get("feature_relpath")
         raw_relpath = sample.get("raw_relpath")
@@ -432,10 +437,27 @@ def prepare_split_training_cache(
         )
         feature_path = _feature_record_path(target_cache_path, sample_id)
         existing_entry = previous_metadata_samples.get(sample_id)
-        source_feature_digest = _hash_file(
-            os.path.join(bundle_root, bundled_feature.replace("/", os.sep))
-        ) if bundled_feature else None
-        source_raw_digest = _hash_file(raw_path) if raw_path is not None and os.path.exists(raw_path) else None
+        can_reuse_existing = isinstance(existing_entry, Mapping)
+        existing_feature_digest = (
+            str(existing_entry.get("source_feature_sha256", "") or "").strip()
+            if can_reuse_existing
+            else ""
+        )
+        existing_raw_digest = (
+            str(existing_entry.get("source_raw_sha256", "") or "").strip()
+            if can_reuse_existing
+            else ""
+        )
+        source_feature_digest = (
+            _hash_file(os.path.join(bundle_root, bundled_feature.replace("/", os.sep)))
+            if bundled_feature and (not can_reuse_existing or existing_feature_digest)
+            else None
+        )
+        source_raw_digest = (
+            _hash_file(raw_path)
+            if raw_path is not None and os.path.exists(raw_path) and existing_raw_digest
+            else None
+        )
         raw_key = _raw_cache_key(
             sample,
             sample_id,
@@ -607,7 +629,7 @@ def prepare_split_training_cache(
                 "source_raw_digest": pending["source_raw_digest"],
             })
 
-    for item in processed_items:
+    def _save_processed_item(item: Mapping[str, Any]) -> tuple[Mapping[str, Any], dict[str, Any]]:
         sample = item["sample"]
         sample_id = item["sample_id"]
         inference_result = item["inference_result"]
@@ -648,6 +670,20 @@ def prepare_split_training_cache(
                 "has_raw_sample": copied_raw is not None,
             },
         )
+        return item, record
+
+    if len(processed_items) > 1:
+        max_workers = min(4, len(processed_items))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            saved_items = list(executor.map(_save_processed_item, processed_items))
+    else:
+        saved_items = [_save_processed_item(item) for item in processed_items]
+
+    for item, record in saved_items:
+        sample = item["sample"]
+        sample_id = item["sample_id"]
+        input_image_size = item["input_image_size"]
+        copied_raw = item["frame_path"]
         if preloaded_records is not None:
             preloaded_records[sample_id] = record
         metadata_samples[sample_id] = _build_metadata_entry(

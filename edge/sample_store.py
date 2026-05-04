@@ -309,6 +309,8 @@ class EdgeSampleStore:
         self.manifest_path = os.path.join(self.root_dir, "manifest.json")
         self._lock = threading.RLock()
         self._counters = _SampleStoreCounters()
+        self._records: dict[str, StoredSampleRecord] = {}
+        self._results: dict[str, dict[str, Any]] = {}
         self._ensure_layout()
         self._recover_counters()
 
@@ -329,6 +331,7 @@ class EdgeSampleStore:
 
     def _recover_counters(self) -> None:
         counters = _SampleStoreCounters()
+        records: dict[str, StoredSampleRecord] = {}
         if os.path.isdir(self.metadata_dir):
             for filename in sorted(os.listdir(self.metadata_dir)):
                 if not filename.endswith(".json"):
@@ -336,12 +339,15 @@ class EdgeSampleStore:
                 path = os.path.join(self.metadata_dir, filename)
                 try:
                     with open(path, "r", encoding="utf-8") as handle:
-                        counters.add(StoredSampleRecord.from_dict(json.load(handle)))
+                        record = StoredSampleRecord.from_dict(json.load(handle))
                 except Exception:
                     continue
+                records[record.sample_id] = record
+                counters.add(record)
         counters.clamp()
         with self._lock:
             self._counters = counters
+            self._records = records
 
     def clear(self) -> None:
         with self._lock:
@@ -349,6 +355,8 @@ class EdgeSampleStore:
                 shutil.rmtree(self.root_dir, ignore_errors=True)
             self._ensure_layout()
             self._counters = _SampleStoreCounters()
+            self._records = {}
+            self._results = {}
 
     def _index_path(self, bucket: str) -> str:
         return os.path.join(self.index_dir, f"{bucket}.jsonl")
@@ -359,14 +367,7 @@ class EdgeSampleStore:
             handle.write("\n")
 
     def _existing_record_unlocked(self, sample_id: str) -> StoredSampleRecord | None:
-        metadata_path = os.path.join(self.metadata_dir, f"{sample_id}.json")
-        if not os.path.exists(metadata_path):
-            return None
-        try:
-            with open(metadata_path, "r", encoding="utf-8") as handle:
-                return StoredSampleRecord.from_dict(json.load(handle))
-        except Exception:
-            return None
+        return self._records.get(str(sample_id))
 
     def store_sample(
         self,
@@ -401,7 +402,6 @@ class EdgeSampleStore:
     ) -> StoredSampleRecord:
         sample_key = str(sample_id)
         with self._lock:
-            self._ensure_layout()
             previous_record = self._existing_record_unlocked(sample_key)
 
         if quality_bucket not in {HIGH_QUALITY, LOW_QUALITY}:
@@ -468,17 +468,22 @@ class EdgeSampleStore:
 
         _atomic_json_dump(metadata_path, record.to_dict())
 
+        self._append_index("all", record)
+        self._append_index(quality_bucket, record)
         with self._lock:
-            self._append_index("all", record)
-            self._append_index(quality_bucket, record)
             if previous_record is not None:
                 self._counters.add(previous_record, sign=-1)
             self._counters.add(record)
             self._counters.clamp()
+            self._records[sample_key] = record
+            self._results[sample_key] = dict(inference_result)
         return record
 
     def load_record(self, sample_id: str) -> StoredSampleRecord:
         with self._lock:
+            cached = self._records.get(str(sample_id))
+            if cached is not None:
+                return cached
             metadata_path = os.path.join(self.metadata_dir, f"{sample_id}.json")
             with open(metadata_path, "r", encoding="utf-8") as handle:
                 return StoredSampleRecord.from_dict(json.load(handle))
@@ -489,17 +494,38 @@ class EdgeSampleStore:
         quality_bucket: str | None = None,
     ) -> list[StoredSampleRecord]:
         with self._lock:
-            records: list[StoredSampleRecord] = []
-            if not os.path.isdir(self.metadata_dir):
-                return records
-            for filename in sorted(os.listdir(self.metadata_dir)):
-                if not filename.endswith(".json"):
-                    continue
-                with open(os.path.join(self.metadata_dir, filename), "r", encoding="utf-8") as handle:
-                    record = StoredSampleRecord.from_dict(json.load(handle))
-                if quality_bucket is not None and record.quality_bucket != quality_bucket:
-                    continue
-                records.append(record)
+            records_by_id: dict[str, StoredSampleRecord] = dict(self._records)
+
+            if not records_by_id:
+                index_path = self._index_path("all")
+                if os.path.exists(index_path):
+                    with open(index_path, "r", encoding="utf-8") as handle:
+                        for line in handle:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                record = StoredSampleRecord.from_dict(json.loads(line))
+                            except Exception:
+                                records_by_id.clear()
+                                break
+                            records_by_id[record.sample_id] = record
+
+            if not records_by_id:
+                if not os.path.isdir(self.metadata_dir):
+                    return []
+                for filename in sorted(os.listdir(self.metadata_dir)):
+                    if not filename.endswith(".json"):
+                        continue
+                    with open(os.path.join(self.metadata_dir, filename), "r", encoding="utf-8") as handle:
+                        record = StoredSampleRecord.from_dict(json.load(handle))
+                    records_by_id[record.sample_id] = record
+
+            records = [
+                record
+                for record in records_by_id.values()
+                if quality_bucket is None or record.quality_bucket == quality_bucket
+            ]
             records.sort(key=lambda item: (item.timestamp, item.sample_id))
             return records
 
@@ -513,6 +539,9 @@ class EdgeSampleStore:
 
     def load_inference_result(self, record: StoredSampleRecord) -> dict[str, Any]:
         with self._lock:
+            cached = self._results.get(str(record.sample_id))
+            if cached is not None:
+                return dict(cached)
             result_path = _from_relpath(self.root_dir, record.result_relpath)
             with open(result_path, "r", encoding="utf-8") as handle:
                 return json.load(handle)

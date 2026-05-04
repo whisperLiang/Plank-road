@@ -15,3 +15,4 @@ record_*.txt
 model_management/models/
 results/
 figures/
+benchmark_results/

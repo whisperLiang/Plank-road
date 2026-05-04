@@ -1,3 +1,7 @@
+import io
+import json
+import zipfile
+
 from loguru import logger
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
@@ -238,11 +242,18 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         *,
         workspace,
         request_kind: str,
+        payload_zip: bytes = b"",
     ):
         base_model_version = str(getattr(request, "base_model_version", "") or "0")
         try:
-            from model_management.continual_learning_bundle import load_training_bundle_manifest
-            manifest = load_training_bundle_manifest(str(workspace))
+            manifest = None
+            if payload_zip:
+                with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as archive:
+                    with archive.open("bundle_manifest.json", "r") as handle:
+                        manifest = json.loads(handle.read().decode("utf-8"))
+            else:
+                from model_management.continual_learning_bundle import load_training_bundle_manifest
+                manifest = load_training_bundle_manifest(str(workspace))
             if manifest is not None:
                 model_info = manifest.get("model", {})
                 base_model_version = str(model_info.get("model_version", base_model_version))
@@ -261,6 +272,9 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             job_type=int(request.job_type),
             workspace=str(workspace),
             protocol_version=str(request.protocol_version or ""),
+            workspace_root=str(self.workspace_root),
+            request_kind=str(request_kind),
+            payload_zip=payload_zip,
             send_low_conf_features=bool(request.send_low_conf_features),
             frame_indices=[int(index) for index in request.frame_indices],
             all_frame_indices=[int(index) for index in request.all_frame_indices],
@@ -322,18 +336,11 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 len(getattr(request, "payload_zip", b"")),
             )
             
-            workspace = prepare_request_workspace(
-                self.workspace_root,
-                edge_id=request.edge_id,
-                request_kind=request_kind,
-                payload_zip=getattr(request, "payload_zip", b""),
-                client_cache_path=request.cache_path,
-            )
-
             return self._submit_training_job_from_workspace(
                 request,
-                workspace=workspace,
+                workspace=request.cache_path,
                 request_kind=request_kind,
+                payload_zip=getattr(request, "payload_zip", b""),
             )
         except Exception as exc:
             logger.exception("submit_training_job error: {}", exc)

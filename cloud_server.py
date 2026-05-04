@@ -37,6 +37,7 @@ from model_management.detection_annotations import load_annotation_targets
 from model_management.detection_dataset import DetectionDataset
 from model_management.detection_metric import RetrainMetric
 from model_management.model_info import model_lib
+from model_management.model_delta_payload import build_state_dict_delta_payload
 from model_management.model_zoo import (
     get_detection_thresholds,
     get_model_detection_thresholds,
@@ -2047,12 +2048,9 @@ class CloudContinualLearner:
             resolved_model_name,
             edge_id=edge_id,
         )
-        state_dict = model.state_dict()
-        buf = io.BytesIO()
-        torch.save(state_dict, buf)
-        serialized = buf.getvalue()
+        full_state_dict = model.state_dict()
         with open(edge_weights, "wb") as handle:
-            handle.write(serialized)
+            torch.save(full_state_dict, handle)
         if weights_metadata is not None:
             if edge_id is None:
                 raise ValueError("weights metadata requires an edge_id")
@@ -2063,9 +2061,22 @@ class CloudContinualLearner:
                 ),
                 weights_metadata,
             )
+        base_model_version = "0"
+        result_model_version = "1"
+        if weights_metadata is not None:
+            base_model_version = str(weights_metadata.get("source_base_model_version", "0"))
+            result_model_version = str(weights_metadata.get("checkpoint_model_version", "1"))
+        payload = build_state_dict_delta_payload(
+            model,
+            model_name=str(resolved_model_name),
+            base_model_version=base_model_version,
+            result_model_version=result_model_version,
+        )
+        buf = io.BytesIO()
+        torch.save(payload, buf)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return serialized
+        return buf.getvalue()
 
     @staticmethod
     def _log_stage_duration(stage: str, started_at: float) -> float:
@@ -3063,6 +3074,46 @@ class CloudContinualLearner:
         preloaded_records: dict[str, dict[str, object]] | None = (
             {} if preload_records else None
         )
+
+        if can_attempt_reuse:
+            cached_bundle_info = {
+                "manifest": manifest,
+                "all_sample_ids": list(cached_manifest.get("all_sample_ids") or cache_identity["sample_ids"]),
+            }
+            cache_valid, cache_error = self._validate_fixed_split_working_cache(
+                working_cache=working_cache,
+                bundle_info=cached_bundle_info,
+                cache_identity=cache_identity,
+                verify_feature_records=True,
+            )
+            if cache_valid:
+                if preloaded_records is not None:
+                    for sample_id in cached_bundle_info["all_sample_ids"]:
+                        preloaded_records[str(sample_id)] = load_split_feature_cache(
+                            working_cache,
+                            str(sample_id),
+                        )
+                logger.info(
+                    "[FixedSplitCL] Fixed-split working cache hit; skipped cache prepare/rebuild."
+                )
+                self._write_fixed_split_working_cache_manifest(
+                    working_cache,
+                    cache_identity=cache_identity,
+                    bundle_info=cached_bundle_info,
+                    cache_reused=True,
+                )
+                return (
+                    cached_bundle_info,
+                    os.path.join(working_cache, "frames"),
+                    prepared_trace_sample_input,
+                    prepared_splitter,
+                    prepared_candidate,
+                    dict(preloaded_records or {}),
+                )
+            logger.warning(
+                "[FixedSplitCL] Fixed-split working cache reuse skipped ({}); preparing cache.",
+                cache_error,
+            )
 
         def _prepare_cache() -> dict[str, object]:
             if preloaded_records is not None:

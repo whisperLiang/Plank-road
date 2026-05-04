@@ -98,6 +98,7 @@ class FixedSplitConfig(ConfigSection):
 @dataclass
 class SplitLearningConfig(ConfigSection):
     enabled: bool = True
+    warmup_iterations: int = 1
     fixed_split: FixedSplitConfig = field(default_factory=FixedSplitConfig)
 
 
@@ -323,6 +324,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive("client.wait_thresh", int(config.client.wait_thresh))
     _validate_positive("client.frame_cache_maxsize", int(config.client.frame_cache_maxsize))
     _validate_positive("client.edge_num", int(config.client.edge_num))
+    _validate_positive(
+        "client.split_learning.warmup_iterations",
+        int(config.client.split_learning.warmup_iterations),
+        allow_zero=True,
+    )
     _validate_positive("client.retrain.collect_num", int(config.client.retrain.collect_num))
     _validate_positive(
         "client.retrain.min_low_quality_samples",

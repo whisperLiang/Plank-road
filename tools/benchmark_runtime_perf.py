@@ -426,6 +426,7 @@ def _write_comparison(output_dir: Path) -> None:
         ("Edge", "inference-thread blocking time", "edge_inference_thread_blocking_ms", "ms"),
         ("Edge", "sample_store.stats()", "edge_sample_store_stats_ms", "ms"),
         ("Edge", "sample storage time", "edge_sample_storage_ms", "ms"),
+        ("Edge", "bundle packing time", "edge_bundle_packing_ms", "ms"),
         ("Cloud", "runtime graph/template preparation", "cloud_runtime_graph_template_preparation_s", "s"),
         ("Cloud", "feature cache build/load", "cloud_feature_cache_build_load_s", "s"),
         ("Cloud", "teacher annotation", "cloud_teacher_annotation_s", "s"),

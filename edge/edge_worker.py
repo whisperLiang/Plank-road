@@ -37,6 +37,7 @@ from model_management.fixed_split import (
     SplitPlan,
     load_or_compute_fixed_split_plan,
 )
+from model_management.model_delta_payload import require_state_dict_delta_payload
 from model_management.object_detection import InferenceArtifacts, Object_Detection
 from model_management.split_model_adapters import build_split_training_loss
 from model_management.universal_model_split import UniversalModelSplitter
@@ -90,6 +91,7 @@ class AsyncSampleWriter:
         sample_store: EdgeSampleStore,
         *,
         maxsize: int = 0,
+        worker_count: int = 1,
         on_done: Callable[[SampleWriteJob, object | None, BaseException | None], None] | None = None,
     ) -> None:
         self.sample_store = sample_store
@@ -97,12 +99,17 @@ class AsyncSampleWriter:
         self._on_done = on_done
         self._closed = False
         self._errors: list[BaseException] = []
-        self._thread = threading.Thread(
-            target=self._run,
-            name="edge-sample-writer",
-            daemon=False,
-        )
-        self._thread.start()
+        workers = max(1, int(worker_count))
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"edge-sample-writer-{index + 1}",
+                daemon=False,
+            )
+            for index in range(workers)
+        ]
+        for thread in self._threads:
+            thread.start()
 
     @property
     def errors(self) -> list[BaseException]:
@@ -128,12 +135,14 @@ class AsyncSampleWriter:
 
     def close(self, *, timeout: float | None = None) -> bool:
         if self._closed:
-            return not self._thread.is_alive()
+            return not any(thread.is_alive() for thread in self._threads)
         flushed = self.flush(timeout=timeout)
         self._closed = True
-        self._queue.put(_QUEUE_STOP, block=True)
-        self._thread.join(timeout=timeout)
-        return flushed and not self._thread.is_alive()
+        for _thread in self._threads:
+            self._queue.put(_QUEUE_STOP, block=True)
+        for thread in self._threads:
+            thread.join(timeout=timeout)
+        return flushed and not any(thread.is_alive() for thread in self._threads)
 
     def _run(self) -> None:
         while True:
@@ -344,6 +353,7 @@ class EdgeWorker:
             )
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
+            self._warmup_fixed_split_runtime(sample_input)
             logger.info(
                 "Fixed split plan ready (split_config_id={}, {}, image_size={})",
                 self.fixed_split_plan.split_config_id,
@@ -360,6 +370,28 @@ class EdgeWorker:
             self.split_learning_disable_reason = str(exc)
             self.split_learning_enabled = False
             self._reset_split_runtime_state()
+
+    def _warmup_fixed_split_runtime(self, sample_input) -> None:
+        sl_cfg = getattr(self.config, "split_learning", None)
+        warmup_iterations = int(getattr(sl_cfg, "warmup_iterations", 1) or 0)
+        if warmup_iterations <= 0 or self.universal_splitter is None:
+            return
+        warmup_started = time.perf_counter()
+        try:
+            with torch.inference_mode():
+                for _ in range(warmup_iterations):
+                    self.universal_splitter.replay_inference(
+                        sample_input,
+                        return_split_output=True,
+                    )
+        except Exception as exc:
+            logger.warning("Fixed split warmup failed; continuing without warm cache: {}", exc)
+            return
+        logger.info(
+            "Fixed split warmup completed (iterations={}, elapsed={:.3f}s).",
+            warmup_iterations,
+            time.perf_counter() - warmup_started,
+        )
 
     def ensure_fixed_split_runtime(
         self,
@@ -945,7 +977,10 @@ class EdgeWorker:
 
                 try:
                     buf = io.BytesIO(base64.b64decode(model_b64))
-                    state_dict = torch.load(buf, map_location="cpu", weights_only=False)
+                    update_payload = require_state_dict_delta_payload(
+                        torch.load(buf, map_location="cpu", weights_only=False)
+                    )
+                    state_dict = dict(update_payload["state_dict"])
                     with self.small_object_detection.model_lock:
                         self.small_object_detection.model.load_state_dict(state_dict, strict=False)
                         self.small_object_detection.model.eval()

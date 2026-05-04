@@ -266,40 +266,41 @@ class Object_Detection:
         input_resize_mode = None
         observables: dict[str, float | None] = {}
         with self.model_lock:
-            if splitter is not None:
-                splitter_input = prepare_split_runtime_input(self.model, img, device=device)
-                input_resize_mode = get_split_runtime_input_resize_mode(self.model)
-                if isinstance(splitter_input, torch.Tensor):
-                    input_tensor_shape = [int(dim) for dim in splitter_input.shape]
-                elif (
-                    isinstance(splitter_input, (list, tuple))
-                    and splitter_input
-                    and isinstance(splitter_input[0], torch.Tensor)
-                ):
-                    input_tensor_shape = [int(dim) for dim in splitter_input[0].shape]
-                replayed, split_payload = splitter.replay_inference(
-                    splitter_input, return_split_output=True,
-                )
-                observables = summarize_split_runtime_observables(
-                    self.model,
-                    replayed,
-                    split_payload,
-                )
-                replayed = postprocess_split_runtime_output(
-                    self.model,
-                    replayed,
-                    threshold=self.threshold_low,
-                    model_input=splitter_input,
-                    orig_image=img,
-                )
-                pred_boxes, pred_class, pred_score = self._parse_prediction_output(
-                    replayed, self.threshold_low,
-                )
-            else:
-                pred_boxes, pred_class, pred_score = self.get_model_prediction(
-                    img,
-                    self.threshold_low,
-                )
+            with torch.inference_mode():
+                if splitter is not None:
+                    splitter_input = prepare_split_runtime_input(self.model, img, device=device)
+                    input_resize_mode = get_split_runtime_input_resize_mode(self.model)
+                    if isinstance(splitter_input, torch.Tensor):
+                        input_tensor_shape = [int(dim) for dim in splitter_input.shape]
+                    elif (
+                        isinstance(splitter_input, (list, tuple))
+                        and splitter_input
+                        and isinstance(splitter_input[0], torch.Tensor)
+                    ):
+                        input_tensor_shape = [int(dim) for dim in splitter_input[0].shape]
+                    replayed, split_payload = splitter.replay_inference(
+                        splitter_input, return_split_output=True,
+                    )
+                    observables = summarize_split_runtime_observables(
+                        self.model,
+                        replayed,
+                        split_payload,
+                    )
+                    replayed = postprocess_split_runtime_output(
+                        self.model,
+                        replayed,
+                        threshold=self.threshold_low,
+                        model_input=splitter_input,
+                        orig_image=img,
+                    )
+                    pred_boxes, pred_class, pred_score = self._parse_prediction_output(
+                        replayed, self.threshold_low,
+                    )
+                else:
+                    pred_boxes, pred_class, pred_score = self.get_model_prediction(
+                        img,
+                        self.threshold_low,
+                    )
 
         if pred_boxes is None or pred_score is None:
             return InferenceArtifacts(
