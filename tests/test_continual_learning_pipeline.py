@@ -2865,11 +2865,10 @@ def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
     assert key.mode == "debug_interpreter"
 
 
-def test_cloud_fixed_split_working_cache_traces_with_configured_trace_batch(
+def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batch(
     tmp_path,
     monkeypatch,
 ):
-    import cloud_server
     from cloud_server import CloudContinualLearner
 
     learner = CloudContinualLearner(
@@ -2882,43 +2881,131 @@ def test_cloud_fixed_split_working_cache_traces_with_configured_trace_batch(
         large_object_detection=SimpleNamespace(),
     )
     captured = {"trace_batch_sizes": []}
+    manifest = {
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "split_plan": {"split_label": "after:node_1"},
+        "samples": [{"sample_id": "s1"}],
+    }
 
     def fake_build_trace_input(model, bundle_root, manifest, *, runtime_batch_size=None):
         captured["trace_batch_sizes"].append(runtime_batch_size)
         return torch.zeros(int(runtime_batch_size), 3, 4, 4)
 
-    def fake_build_bundle_splitter(
+    def fake_prepare_replayable_split_runtime(
         model,
-        manifest,
+        sample_input,
+        split_spec,
         *,
-        bundle_root,
-        trace_sample_input=None,
-        runtime_batch_size=None,
+        model_name,
+        preferred_mode,
     ):
-        captured["splitter_runtime_batch_size"] = runtime_batch_size
-        captured["trace_sample_shape"] = tuple(trace_sample_input.shape)
-        return object(), object()
-
-    def fake_prepare_split_training_cache(
-        bundle_root,
-        target_cache_path,
-        *,
-        batch_feature_provider,
-        preloaded_records,
-    ):
-        preloaded_records["s1"] = {"intermediate": _payload()}
-        return {"all_sample_ids": ["s1"]}
+        captured["trace_sample_shape"] = tuple(sample_input.shape)
+        captured["split_boundary"] = split_spec.boundary
+        captured["model_name"] = model_name
+        captured["preferred_mode"] = preferred_mode
+        return SimpleNamespace(graph_signature="runtime-sig", split_id=split_spec.boundary), preferred_mode
 
     monkeypatch.setattr(
         learner,
         "_build_bundle_batch_trace_sample_input",
         fake_build_trace_input,
     )
-    monkeypatch.setattr(learner, "_build_bundle_splitter", fake_build_bundle_splitter)
+    monkeypatch.setattr(
+        learner,
+        "_prepare_replayable_split_runtime",
+        fake_prepare_replayable_split_runtime,
+    )
+
+    template_key = learner._fixed_split_runtime_template_key(
+        model_name="rfdetr_nano",
+        manifest=manifest,
+        runtime_batch_size=16,
+    )
+    template = learner._build_fixed_split_runtime_template(
+        torch.nn.Identity(),
+        manifest,
+        bundle_root=str(tmp_path / "bundle"),
+        template_key=template_key,
+        runtime_batch_size=16,
+    )
+
+    assert captured["trace_batch_sizes"] == [2]
+    assert captured["trace_sample_shape"][0] == 2
+    assert captured["split_boundary"] == "after:node_1"
+    assert captured["model_name"] == "rfdetr_nano"
+    assert captured["preferred_mode"] == "debug_interpreter"
+    assert template.mode == "debug_interpreter"
+
+
+def test_cloud_fixed_split_working_cache_rebuild_with_template_hit_skips_trace_input(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+    from model_management.fixed_split_runtime_template import (
+        FixedSplitRuntimeTemplate,
+        FixedSplitRuntimeTemplateCache,
+    )
+    from model_management.split_runtime import make_split_spec
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=16, trace_batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    learner._fixed_split_runtime_template_cache = FixedSplitRuntimeTemplateCache()
+    manifest = {
+        "model": {"model_id": "rfdetr_nano", "model_version": "1"},
+        "split_plan": {"split_label": "after:node_1"},
+        "samples": [{"sample_id": "s1"}],
+    }
+    template_key = learner._fixed_split_runtime_template_key(
+        model_name="rfdetr_nano",
+        manifest=manifest,
+        runtime_batch_size=16,
+    )
+    split_spec = make_split_spec(
+        "after:node_1",
+        dynamic_batch=(2, 64),
+        trainable=True,
+        trace_batch_mode="batch_gt1",
+        model_family="rfdetr",
+    )
+    template = FixedSplitRuntimeTemplate(
+        cache_key=template_key,
+        runtime=object(),
+        split_spec=split_spec,
+        model_name="rfdetr_nano",
+        model_family="rfdetr",
+        graph_signature="runtime-sig",
+        symbolic_input_schema_hash=template_key.symbolic_input_schema_hash,
+        split_plan_hash=template_key.split_plan_hash,
+        mode="debug_interpreter",
+    )
+    learner._fixed_split_runtime_template_cache.get_or_create(template_key, lambda: template)
+
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_batch_trace_sample_input",
+        lambda *args, **kwargs: pytest.fail("template hit should skip trace input build"),
+    )
+    monkeypatch.setattr(
+        cloud_server,
+        "bind_request_splitter_from_template",
+        lambda *args, **kwargs: (
+            SimpleNamespace(runtime=SimpleNamespace(split_id="after:node_1")),
+            object(),
+        ),
+    )
     monkeypatch.setattr(
         cloud_server,
         "prepare_split_training_cache",
-        fake_prepare_split_training_cache,
+        lambda *args, **kwargs: {"all_sample_ids": ["s1"]},
     )
     monkeypatch.setattr(
         learner,
@@ -2935,27 +3022,21 @@ def test_cloud_fixed_split_working_cache_traces_with_configured_trace_batch(
         bundle_info,
         _frame_dir,
         trace_sample_input,
-        _splitter,
-        _candidate,
-        preloaded_records,
+        splitter,
+        candidate,
+        _preloaded_records,
     ) = learner._prepare_fixed_split_working_cache(
         torch.nn.Identity(),
-        {
-            "model": {"model_id": "rfdetr_nano", "model_version": "0"},
-            "split_plan": {"split_label": "after:node_1"},
-            "samples": [{"sample_id": "s1"}],
-        },
+        manifest,
         bundle_cache_path=str(tmp_path / "bundle"),
         working_cache=str(tmp_path / "working"),
         runtime_batch_size=16,
     )
 
-    assert captured["trace_batch_sizes"] == [2]
-    assert captured["trace_sample_shape"][0] == 2
-    assert captured["splitter_runtime_batch_size"] == 16
-    assert trace_sample_input.shape[0] == 2
+    assert trace_sample_input is None
+    assert splitter is not None
+    assert candidate is not None
     assert bundle_info["all_sample_ids"] == ["s1"]
-    assert set(preloaded_records) == {"s1"}
 
 
 def test_cloud_fixed_split_working_cache_hit_skips_prepare_cache(
