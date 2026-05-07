@@ -628,6 +628,27 @@ class EdgeWorker:
         self.fixed_split_plan = None
         self.split_trace_image_size = None
 
+    def _reset_split_runtime_after_model_update(self) -> None:
+        sl_cfg = getattr(self.config, "split_learning", None)
+        split_config_enabled = bool(getattr(sl_cfg, "enabled", False)) if sl_cfg else False
+        had_split_runtime = bool(
+            self.universal_split_enabled
+            or self.universal_splitter is not None
+            or self.fixed_split_plan is not None
+        )
+        if not split_config_enabled and not had_split_runtime:
+            return
+
+        self._reset_split_runtime_state()
+        self._fixed_split_init_attempted = False
+        if split_config_enabled:
+            self.split_learning_enabled = True
+            self.split_learning_disable_reason = None
+        logger.info(
+            "Fixed split runtime invalidated after edge model update; "
+            "it will be rebuilt on the next inference frame."
+        )
+
     def _reset_pending_training_cycle(self) -> None:
         self.pending_training_decision = None
         self.retrain_flag = False
@@ -981,16 +1002,40 @@ class EdgeWorker:
                         torch.load(buf, map_location="cpu", weights_only=False)
                     )
                     state_dict = dict(update_payload["state_dict"])
+                    weight_keys = [
+                        name
+                        for name in state_dict
+                        if name not in {"plank_threshold_low", "plank_threshold_high"}
+                    ]
+                    if not weight_keys:
+                        logger.warning(
+                            "Cloud model update for job {} contains only threshold metadata; "
+                            "model weights will not change.",
+                            job_id,
+                        )
                     with self.small_object_detection.model_lock:
-                        self.small_object_detection.model.load_state_dict(state_dict, strict=False)
+                        load_result = self.small_object_detection.model.load_state_dict(
+                            state_dict,
+                            strict=False,
+                        )
                         self.small_object_detection.model.eval()
                         self.small_object_detection.get_split_runtime_model().eval()
                         self.small_object_detection.refresh_thresholds_from_model()
+                        self._reset_split_runtime_after_model_update()
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
                     self.window_drift_detector.reset()
                     self.track_manager.reset()
                     self.previous_quality_frame = None
+                    logger.info(
+                        "Applied cloud model update for job {} "
+                        "(state_keys={}, weight_keys={}, missing_keys={}, unexpected_keys={}).",
+                        job_id,
+                        len(state_dict),
+                        len(weight_keys),
+                        len(list(getattr(load_result, "missing_keys", ()) or ())),
+                        len(list(getattr(load_result, "unexpected_keys", ()) or ())),
+                    )
                     if terminal_message:
                         logger.success(
                             "Edge model updated from cloud successfully "

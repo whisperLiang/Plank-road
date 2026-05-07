@@ -293,6 +293,27 @@ class TestEdgeWorkerRouting:
         assert active is splitter
         assert init_finished["value"] is True
 
+    def test_model_update_invalidates_fixed_split_runtime(self):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.config = SimpleNamespace(split_learning=SimpleNamespace(enabled=True))
+        worker.split_learning_enabled = False
+        worker.split_learning_disable_reason = "old runtime failed"
+        worker.universal_split_enabled = True
+        worker.universal_splitter = object()
+        worker.fixed_split_plan = object()
+        worker.split_trace_image_size = (480, 640)
+        worker._fixed_split_init_attempted = True
+
+        worker._reset_split_runtime_after_model_update()
+
+        assert worker.universal_split_enabled is False
+        assert worker.universal_splitter is None
+        assert worker.fixed_split_plan is None
+        assert worker.split_trace_image_size is None
+        assert worker._fixed_split_init_attempted is False
+        assert worker.split_learning_enabled is True
+        assert worker.split_learning_disable_reason is None
+
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
         quality = QualityAssessment(

@@ -7,6 +7,98 @@ import torch
 
 
 MODEL_DELTA_PAYLOAD_FORMAT = "state_dict_delta.v1"
+_THRESHOLD_STATE_NAMES = frozenset(
+    {
+        "plank_threshold_low",
+        "plank_threshold_high",
+    }
+)
+_WRAPPER_INNER_MODULE_PATHS = (
+    ("yolo", "model"),
+    ("rtdetr", "model"),
+    ("detr",),
+    ("rfdetr", "model", "model"),
+)
+
+
+def _resolve_attr_path(root: object, path: tuple[str, ...]) -> object | None:
+    current = root
+    for attr in path:
+        current = getattr(current, attr, None)
+        if current is None:
+            return None
+    return current
+
+
+def _iter_named_parameters(module: object):
+    named_parameters = getattr(module, "named_parameters", None)
+    if not callable(named_parameters):
+        return
+    try:
+        yield from named_parameters()
+    except TypeError:
+        yield from named_parameters(recurse=True)
+
+
+def _state_key_for_parameter_name(
+    parameter_name: str,
+    state_keys: set[str],
+) -> str | None:
+    if parameter_name in state_keys:
+        return parameter_name
+
+    if "." in parameter_name:
+        stripped = parameter_name.split(".", 1)[1]
+        if stripped in state_keys:
+            return stripped
+
+    suffix_matches = [
+        key for key in state_keys
+        if key.endswith(f".{parameter_name}")
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
+def _trainable_state_dict_names(
+    model: torch.nn.Module,
+    state: Mapping[str, object],
+) -> set[str]:
+    """Return trainable parameter names as they appear in ``model.state_dict()``.
+
+    Several detector wrappers expose ``state_dict()`` from an inner model while
+    ``named_parameters()`` either carries a wrapper prefix or is empty because
+    the wrapped detector is not an ``nn.Module`` child.  The edge update payload
+    must use state-dict keys, otherwise the cloud sends a delta that contains no
+    real weights.
+    """
+    state_keys = {str(key) for key in state.keys()}
+    selected: set[str] = set()
+    saw_trainable_parameter = False
+
+    modules: list[object] = [model]
+    for path in _WRAPPER_INNER_MODULE_PATHS:
+        inner = _resolve_attr_path(model, path)
+        if isinstance(inner, torch.nn.Module):
+            modules.append(inner)
+
+    for module in modules:
+        for name, parameter in _iter_named_parameters(module) or ():
+            if not bool(getattr(parameter, "requires_grad", False)):
+                continue
+            saw_trainable_parameter = True
+            state_key = _state_key_for_parameter_name(str(name), state_keys)
+            if state_key is not None:
+                selected.add(state_key)
+
+    if saw_trainable_parameter and not selected:
+        selected.update(
+            str(name)
+            for name, value in state.items()
+            if torch.is_tensor(value) and value.is_floating_point()
+        )
+    return selected
 
 
 def build_state_dict_delta_payload(
@@ -17,16 +109,8 @@ def build_state_dict_delta_payload(
     result_model_version: str,
 ) -> dict[str, Any]:
     state = model.state_dict()
-    trainable_names = {
-        name
-        for name, parameter in model.named_parameters()
-        if bool(getattr(parameter, "requires_grad", False))
-    }
-    threshold_names = {
-        "plank_threshold_low",
-        "plank_threshold_high",
-    }
-    selected_names = trainable_names | {name for name in state if name in threshold_names}
+    trainable_names = _trainable_state_dict_names(model, state)
+    selected_names = trainable_names | {name for name in state if name in _THRESHOLD_STATE_NAMES}
     return {
         "format": MODEL_DELTA_PAYLOAD_FORMAT,
         "model_name": str(model_name),
