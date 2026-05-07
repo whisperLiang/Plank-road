@@ -628,27 +628,6 @@ class EdgeWorker:
         self.fixed_split_plan = None
         self.split_trace_image_size = None
 
-    def _reset_split_runtime_after_model_update(self) -> None:
-        sl_cfg = getattr(self.config, "split_learning", None)
-        split_config_enabled = bool(getattr(sl_cfg, "enabled", False)) if sl_cfg else False
-        had_split_runtime = bool(
-            self.universal_split_enabled
-            or self.universal_splitter is not None
-            or self.fixed_split_plan is not None
-        )
-        if not split_config_enabled and not had_split_runtime:
-            return
-
-        self._reset_split_runtime_state()
-        self._fixed_split_init_attempted = False
-        if split_config_enabled:
-            self.split_learning_enabled = True
-            self.split_learning_disable_reason = None
-        logger.info(
-            "Fixed split runtime invalidated after edge model update; "
-            "it will be rebuilt on the next inference frame."
-        )
-
     def _reset_pending_training_cycle(self) -> None:
         self.pending_training_decision = None
         self.retrain_flag = False
@@ -1021,7 +1000,12 @@ class EdgeWorker:
                         self.small_object_detection.model.eval()
                         self.small_object_detection.get_split_runtime_model().eval()
                         self.small_object_detection.refresh_thresholds_from_model()
-                        self._reset_split_runtime_after_model_update()
+                        if self.fixed_split_plan is not None:
+                            logger.info(
+                                "Reusing fixed split plan after edge model update "
+                                "(split_config_id={}).",
+                                self.fixed_split_plan.split_config_id,
+                            )
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
                     self.window_drift_detector.reset()

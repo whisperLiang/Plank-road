@@ -6,6 +6,8 @@ Tests for edge/ module:
   - resample.py     (history_sample, annotion_process)
   - resource_aware_trigger.py (helper functions, CloudResourceState, ResourceAwareCLTrigger)
 """
+import base64
+import io
 import threading
 import time
 from queue import Queue
@@ -293,26 +295,128 @@ class TestEdgeWorkerRouting:
         assert active is splitter
         assert init_finished["value"] is True
 
-    def test_model_update_invalidates_fixed_split_runtime(self):
+    def test_retrain_worker_reuses_fixed_split_after_model_update(self, monkeypatch):
         worker = EdgeWorker.__new__(EdgeWorker)
-        worker.config = SimpleNamespace(split_learning=SimpleNamespace(enabled=True))
-        worker.split_learning_enabled = False
-        worker.split_learning_disable_reason = "old runtime failed"
+        worker._stop_event = threading.Event()
+        worker._retrain_requested = threading.Event()
+        worker.retrain_flag = True
+        worker.collect_flag = False
+        worker.pending_training_decision = TrainingDecision(
+            train_now=True,
+            send_low_conf_features=False,
+            urgency=1.0,
+            compute_pressure=0.0,
+            bandwidth_pressure=0.0,
+            reason="test",
+        )
+        worker.config = SimpleNamespace(
+            server_ip="cloud:50051",
+            retrain=SimpleNamespace(),
+        )
+        worker.edge_id = 1
+        worker.model_id = "edge-model"
+        worker.model_version = "0"
+        worker.training_poll_interval_sec = 0.01
+        worker.training_not_found_grace_sec = 1.0
+        worker.split_learning_enabled = True
+        worker.split_learning_disable_reason = None
         worker.universal_split_enabled = True
-        worker.universal_splitter = object()
-        worker.fixed_split_plan = object()
+        split_runtime = object()
+        split_plan = SimpleNamespace(split_config_id="plan-1")
+        worker.universal_splitter = split_runtime
+        worker.fixed_split_plan = split_plan
         worker.split_trace_image_size = (480, 640)
         worker._fixed_split_init_attempted = True
 
-        worker._reset_split_runtime_after_model_update()
+        class DummyChannel:
+            def close(self):
+                pass
 
-        assert worker.universal_split_enabled is False
-        assert worker.universal_splitter is None
-        assert worker.fixed_split_plan is None
-        assert worker.split_trace_image_size is None
-        assert worker._fixed_split_init_attempted is False
+        model = torch.nn.Linear(1, 1)
+        updated_state = {
+            "weight": torch.full_like(model.weight, 2.0),
+            "bias": torch.full_like(model.bias, 0.5),
+        }
+        payload = {
+            "format": "state_dict_delta.v1",
+            "model_name": "edge-model",
+            "base_model_version": "0",
+            "result_model_version": "1",
+            "state_dict": updated_state,
+        }
+        buffer = io.BytesIO()
+        torch.save(payload, buffer)
+        model_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+        cleared = []
+        drift_resets = []
+        track_resets = []
+        threshold_refreshes = []
+
+        class DummyDetection:
+            model_lock = threading.Lock()
+
+            def __init__(self):
+                self.model = model
+
+            def get_split_runtime_model(self):
+                return self.model
+
+            def refresh_thresholds_from_model(self):
+                threshold_refreshes.append(True)
+
+        def _reset_pending_training_cycle():
+            worker.pending_training_decision = None
+            worker.retrain_flag = False
+            worker.collect_flag = True
+            worker._retrain_requested.clear()
+            worker._stop_event.set()
+
+        monkeypatch.setattr(
+            "edge.edge_worker.grpc.insecure_channel",
+            lambda *args, **kwargs: DummyChannel(),
+        )
+        monkeypatch.setattr(
+            "edge.edge_worker.submit_continual_learning_job",
+            lambda *args, **kwargs: (True, "job-1", "accepted"),
+        )
+        monkeypatch.setattr(
+            "edge.edge_worker.get_training_job_status",
+            lambda *args, **kwargs: SimpleNamespace(
+                found=True,
+                status="SUCCEEDED",
+                queue_position=-1,
+                message="done",
+            ),
+        )
+        monkeypatch.setattr(
+            "edge.edge_worker.download_trained_model",
+            lambda *args, **kwargs: (True, model_b64, "done"),
+        )
+        worker.small_object_detection = DummyDetection()
+        worker.sample_store = SimpleNamespace(clear=lambda: cleared.append(True))
+        worker.window_drift_detector = SimpleNamespace(reset=lambda: drift_resets.append(True))
+        worker.track_manager = SimpleNamespace(reset=lambda: track_resets.append(True))
+        worker.previous_quality_frame = object()
+        worker._reset_pending_training_cycle = _reset_pending_training_cycle
+
+        worker._retrain_requested.set()
+        thread = threading.Thread(target=worker.retrain_worker)
+        thread.start()
+        thread.join(timeout=2.0)
+
+        assert thread.is_alive() is False
+        assert worker.fixed_split_plan is split_plan
+        assert worker.universal_splitter is split_runtime
+        assert worker.universal_split_enabled is True
+        assert worker.split_trace_image_size == (480, 640)
+        assert worker._fixed_split_init_attempted is True
         assert worker.split_learning_enabled is True
         assert worker.split_learning_disable_reason is None
+        assert worker.model_version == "1"
+        assert cleared == [True]
+        assert drift_resets == [True]
+        assert track_resets == [True]
+        assert threshold_refreshes == [True]
 
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
