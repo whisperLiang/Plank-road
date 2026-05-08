@@ -91,6 +91,16 @@ _FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
 _FIXED_SPLIT_DYNAMIC_BATCH_MIN = _FIXED_SPLIT_DYNAMIC_BATCH[0]
 _FIXED_SPLIT_DYNAMIC_BATCH_MAX = _FIXED_SPLIT_DYNAMIC_BATCH[1]
 LOW_QUALITY_TRIGGER_PROTOCOL_VERSION = "low-quality-trigger-shard.v1"
+POOL_LABEL_COORDINATE_SPACE = "model_input_xyxy"
+POOL_LABEL_RUNTIME_VERSION = "fixed-split-pool-labels.v1"
+POOL_LABEL_METADATA_FIELDS = (
+    "label_coordinate_space",
+    "label_input_size",
+    "label_resize_mode",
+    "label_split_id",
+    "label_graph_signature",
+    "label_runtime_version",
+)
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
 _AUTO_MEMORY_FEATURE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
@@ -305,6 +315,14 @@ def _model_state_fingerprint(model: torch.nn.Module) -> str:
     return hasher.hexdigest()
 
 
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    oom_error_type = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_error_type is not None and isinstance(exc, oom_error_type):
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message and ("cuda" in message or "gpu" in message)
+
+
 def _looks_like_fused_ultralytics_state_dict(state: object) -> bool:
     """Detect BN-folded Ultralytics checkpoints saved as raw state-dicts.
 
@@ -513,6 +531,72 @@ def _labels_fit_model_input(
         ):
             return False
     return True
+
+
+def _size_pair_from_value(value: object) -> tuple[int, int] | None:
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        height = int(value[0])
+        width = int(value[1])
+        if height > 0 and width > 0:
+            return height, width
+    return None
+
+
+def _pool_label_metadata_from_record(
+    record: Mapping[str, object],
+    *,
+    model_input_size: tuple[int, int] | None,
+    resize_mode: str,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "label_coordinate_space": POOL_LABEL_COORDINATE_SPACE,
+        "label_resize_mode": str(resize_mode or "direct_resize"),
+        "label_runtime_version": POOL_LABEL_RUNTIME_VERSION,
+    }
+    if model_input_size is not None:
+        metadata["label_input_size"] = [
+            int(model_input_size[0]),
+            int(model_input_size[1]),
+        ]
+    intermediate = dict(record).get("intermediate")
+    if isinstance(intermediate, BoundaryPayload):
+        metadata["label_split_id"] = str(intermediate.split_id)
+        metadata["label_graph_signature"] = str(intermediate.graph_signature)
+    return metadata
+
+
+def _pool_label_metadata_is_compatible(
+    labels: Mapping[str, object],
+    *,
+    model_input_size: tuple[int, int] | None,
+    input_resize_mode: str | None,
+    expected_split_id: str | None,
+) -> tuple[bool, str | None]:
+    coordinate_space = str(labels.get("label_coordinate_space") or "").strip()
+    if coordinate_space and coordinate_space != POOL_LABEL_COORDINATE_SPACE:
+        return False, "coordinate_space"
+
+    label_input_size = _size_pair_from_value(labels.get("label_input_size"))
+    if (
+        label_input_size is not None
+        and model_input_size is not None
+        and label_input_size != model_input_size
+    ):
+        return False, "input_size"
+
+    label_resize_mode = str(labels.get("label_resize_mode") or "").strip()
+    if (
+        label_resize_mode
+        and input_resize_mode
+        and label_resize_mode != str(input_resize_mode).strip()
+    ):
+        return False, "resize_mode"
+
+    label_split_id = str(labels.get("label_split_id") or "").strip()
+    if expected_split_id and label_split_id and label_split_id != str(expected_split_id):
+        return False, "split_id"
+
+    return True, None
 
 
 def _build_synthetic_runtime_input(
@@ -1872,13 +1956,16 @@ class CloudContinualLearner:
     @staticmethod
     def _pool_annotations_from_labels(
         labels: Mapping[str, object],
-    ) -> dict[str, list[object]]:
+    ) -> dict[str, object]:
         annotations = {
             "boxes": list(labels.get("boxes") or []),
             "labels": list(labels.get("labels") or []),
         }
         if "scores" in labels:
             annotations["scores"] = list(labels.get("scores") or [])
+        for field_name in POOL_LABEL_METADATA_FIELDS:
+            if labels.get(field_name) is not None:
+                annotations[field_name] = labels[field_name]
         return annotations
 
     @staticmethod
@@ -1945,6 +2032,13 @@ class CloudContinualLearner:
                 original_size=original_size,
                 model_input_size=resolved_model_input_size,
                 resize_mode=resize_mode,
+            )
+            trainable_labels.update(
+                _pool_label_metadata_from_record(
+                    record,
+                    model_input_size=resolved_model_input_size,
+                    resize_mode=resize_mode,
+                )
             )
             processed_samples.append(
                 {
@@ -2057,7 +2151,13 @@ class CloudContinualLearner:
         preloaded_records: dict[str, dict[str, object]] = {}
         annotations: dict[str, dict[str, object]] = {}
         sample_metadata_by_id: dict[str, dict[str, object]] = {}
+        scanned_count = 0
+        unreadable_count = 0
+        deactivated_by_split: list[str] = []
+        deactivated_by_label_bounds: list[str] = []
+        deactivated_by_label_metadata: list[str] = []
         for entry in active_entries:
+            scanned_count += 1
             sample_id = str(entry.get("sample_id", "") or "")
             if not sample_id:
                 continue
@@ -2070,6 +2170,7 @@ class CloudContinualLearner:
                     sample_id,
                     exc,
                 )
+                unreadable_count += 1
                 continue
             intermediate = dict(training_record).get("intermediate")
             if (
@@ -2078,13 +2179,7 @@ class CloudContinualLearner:
                 and str(intermediate.split_id) != str(expected_split_id)
             ):
                 sample_pool.deactivate_sample(sample_id)
-                logger.warning(
-                    "[FixedSplitCL] Deactivated pool sample {} because its split_id={} "
-                    "does not match current runtime split_id={}.",
-                    sample_id,
-                    intermediate.split_id,
-                    expected_split_id,
-                )
+                deactivated_by_split.append(sample_id)
                 continue
             training_record = dict(training_record)
             if runtime_input_tensor_shape is not None:
@@ -2103,20 +2198,53 @@ class CloudContinualLearner:
                 and len(runtime_input_tensor_shape) >= 3
                 else None
             )
+            metadata_compatible, _metadata_reason = _pool_label_metadata_is_compatible(
+                labels,
+                model_input_size=model_input_size,
+                input_resize_mode=input_resize_mode,
+                expected_split_id=expected_split_id,
+            )
+            if not metadata_compatible:
+                sample_pool.deactivate_sample(sample_id)
+                deactivated_by_label_metadata.append(sample_id)
+                continue
             if not _labels_fit_model_input(labels, model_input_size=model_input_size):
                 sample_pool.deactivate_sample(sample_id)
-                logger.warning(
-                    "[FixedSplitCL] Deactivated pool sample {} because its labels "
-                    "exceed current model input size {}; stale pre-projection pool "
-                    "entries are not used for training.",
-                    sample_id,
-                    model_input_size,
-                )
+                deactivated_by_label_bounds.append(sample_id)
                 continue
             sample_ids.append(sample_id)
             preloaded_records[sample_id] = training_record
             annotations[sample_id] = labels
             sample_metadata_by_id[sample_id] = dict(training_record)
+        deactivated_count = (
+            len(deactivated_by_split)
+            + len(deactivated_by_label_bounds)
+            + len(deactivated_by_label_metadata)
+        )
+        compacted = False
+        if deactivated_count:
+            compacted = sample_pool.maybe_compact(force=True)
+        logger.info(
+            "[FixedSplitCL] Cloud sample-pool training input scan: scanned={} "
+            "accepted={} unreadable={} deactivated_by_split={} "
+            "deactivated_by_label_bounds={} deactivated_by_label_metadata={} "
+            "compacted={}.",
+            scanned_count,
+            len(sample_ids),
+            unreadable_count,
+            len(deactivated_by_split),
+            len(deactivated_by_label_bounds),
+            len(deactivated_by_label_metadata),
+            bool(compacted),
+        )
+        if deactivated_count:
+            logger.debug(
+                "[FixedSplitCL] Cloud sample-pool deactivated sample ids: "
+                "split={} label_bounds={} label_metadata={}.",
+                deactivated_by_split,
+                deactivated_by_label_bounds,
+                deactivated_by_label_metadata,
+            )
         bundle_info = {
             "manifest": {},
             "all_sample_ids": sample_ids,
@@ -3647,6 +3775,19 @@ class CloudContinualLearner:
         return 24
 
     @staticmethod
+    def _resolve_rfdetr_proxy_selection_max_samples(
+        *,
+        available_samples: int,
+        full_eval_max_samples: int | None,
+    ) -> int | None:
+        full_eval_budget = max(0, int(available_samples))
+        if full_eval_max_samples is not None:
+            full_eval_budget = min(full_eval_budget, max(0, int(full_eval_max_samples)))
+        if full_eval_budget <= 32:
+            return None
+        return 32
+
+    @staticmethod
     def _resolve_fixed_split_training_label(
         model_name: str,
     ) -> str:
@@ -3993,32 +4134,39 @@ class CloudContinualLearner:
                 working_cache=working_cache,
                 bundle_info=cached_bundle_info,
                 cache_identity=cache_identity,
-                verify_feature_records=True,
+                verify_feature_records=preloaded_records is None,
             )
             if cache_valid:
                 if preloaded_records is not None:
-                    for sample_id in cached_bundle_info["all_sample_ids"]:
-                        preloaded_records[str(sample_id)] = load_split_feature_cache(
-                            working_cache,
-                            str(sample_id),
-                        )
-                logger.info(
-                    "[FixedSplitCL] Fixed-split working cache hit; skipped cache prepare/rebuild."
-                )
-                self._write_fixed_split_working_cache_manifest(
-                    working_cache,
-                    cache_identity=cache_identity,
-                    bundle_info=cached_bundle_info,
-                    cache_reused=True,
-                )
-                return (
-                    cached_bundle_info,
-                    os.path.join(working_cache, "frames"),
-                    None,
-                    prepared_splitter,
-                    prepared_candidate,
-                    dict(preloaded_records or {}),
-                )
+                    try:
+                        for sample_id in cached_bundle_info["all_sample_ids"]:
+                            preloaded_records[str(sample_id)] = load_split_feature_cache(
+                                working_cache,
+                                str(sample_id),
+                            )
+                    except Exception as exc:
+                        cache_valid = False
+                        cache_error = f"cached feature record preload failed: {exc}"
+                if cache_valid:
+                    logger.info(
+                        "[FixedSplitCL] Fixed-split working cache hit; skipped cache prepare/rebuild."
+                    )
+                    self._write_fixed_split_working_cache_manifest(
+                        working_cache,
+                        cache_identity=cache_identity,
+                        bundle_info=cached_bundle_info,
+                        cache_reused=True,
+                    )
+                    return (
+                        cached_bundle_info,
+                        os.path.join(working_cache, "frames"),
+                        None,
+                        prepared_splitter,
+                        prepared_candidate,
+                        dict(preloaded_records or {}),
+                    )
+                if preloaded_records is not None:
+                    preloaded_records.clear()
             logger.warning(
                 "[FixedSplitCL] Fixed-split working cache reuse skipped ({}); preparing cache.",
                 cache_error,
@@ -4515,7 +4663,6 @@ class CloudContinualLearner:
             trainable_param_count,
         )
         baseline_state = _snapshot_model_state(model)
-        baseline_proxy_state_key = _model_state_fingerprint(model)
         effective_num_epoch = num_epoch
         effective_learning_rate = self.default_split_learning_rate
         if (
@@ -4585,30 +4732,33 @@ class CloudContinualLearner:
         split_retrain_kwargs.update(
             self._fixed_split_optimizer_overrides(current_model_name)
         )
-        proxy_metrics_cache: dict[str, dict[str, float | int | None]] = {}
-        if proxy_metrics_before:
-            proxy_metrics_cache[baseline_proxy_state_key] = dict(proxy_metrics_before)
-
         full_proxy_eval_sample_count = len(
             _normalize_proxy_sample_ids(
                 gt_annotations,
                 max_samples=self.proxy_eval_max_samples,
             )
         )
-        tinynext_proxy_selection_max_samples = None
-        tinynext_selection_uses_subset = False
-        if model_family == "tinynext" and gt_annotations:
-            tinynext_proxy_selection_max_samples = self._resolve_tinynext_proxy_selection_max_samples(
-                available_samples=len(gt_annotations),
-                full_eval_max_samples=self.proxy_eval_max_samples,
-            )
+        selection_proxy_max_samples = None
+        selection_proxy_eval_sample_count = full_proxy_eval_sample_count
+        selection_uses_subset = False
+        if model_family in {"tinynext", "rfdetr"} and gt_annotations:
+            if model_family == "tinynext":
+                selection_proxy_max_samples = self._resolve_tinynext_proxy_selection_max_samples(
+                    available_samples=len(gt_annotations),
+                    full_eval_max_samples=self.proxy_eval_max_samples,
+                )
+            else:
+                selection_proxy_max_samples = self._resolve_rfdetr_proxy_selection_max_samples(
+                    available_samples=len(gt_annotations),
+                    full_eval_max_samples=self.proxy_eval_max_samples,
+                )
             selection_proxy_eval_sample_count = len(
                 _normalize_proxy_sample_ids(
                     gt_annotations,
-                    max_samples=tinynext_proxy_selection_max_samples,
+                    max_samples=selection_proxy_max_samples,
                 )
             )
-            tinynext_selection_uses_subset = (
+            selection_uses_subset = (
                 selection_proxy_eval_sample_count > 0
                 and selection_proxy_eval_sample_count < full_proxy_eval_sample_count
             )
@@ -4617,8 +4767,13 @@ class CloudContinualLearner:
             *,
             selection_eval: bool = False,
         ) -> dict[str, float | int | None]:
+            max_samples = (
+                selection_proxy_max_samples
+                if selection_eval and selection_uses_subset
+                else self.proxy_eval_max_samples
+            )
             if model_family == "tinynext":
-                if selection_eval and tinynext_selection_uses_subset:
+                if selection_eval and selection_uses_subset:
                     return self._evaluate_fixed_split_proxy_map(
                         model,
                         frame_dir=frame_dir,
@@ -4626,16 +4781,13 @@ class CloudContinualLearner:
                         model_name=current_model_name,
                         sample_metadata_by_id=sample_metadata_by_id,
                         frame_cache=proxy_eval_frame_cache,
-                        max_samples=tinynext_proxy_selection_max_samples,
+                        max_samples=max_samples,
                         inference_batch_size=bs,
                         split_cache_path=working_cache,
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
                     )
-                max_samples = self.proxy_eval_max_samples
-                if selection_eval:
-                    max_samples = tinynext_proxy_selection_max_samples
                 return self._evaluate_tinynext_proxy_map(
                     model,
                     frame_dir=frame_dir,
@@ -4652,26 +4804,20 @@ class CloudContinualLearner:
                     split_candidate=prepared_candidate,
                     preloaded_records=preloaded_records,
                 )
-            state_key = _model_state_fingerprint(model)
-            cached_metrics = proxy_metrics_cache.get(state_key)
-            if cached_metrics is not None:
-                return dict(cached_metrics)
-            metrics = self._evaluate_fixed_split_proxy_map(
+            return self._evaluate_fixed_split_proxy_map(
                 model,
                 frame_dir=frame_dir,
                 gt_annotations=gt_annotations,
                 model_name=current_model_name,
                 sample_metadata_by_id=sample_metadata_by_id,
                 frame_cache=proxy_eval_frame_cache,
-                max_samples=self.proxy_eval_max_samples,
+                max_samples=max_samples,
                 inference_batch_size=bs,
                 split_cache_path=working_cache,
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
             )
-            proxy_metrics_cache[state_key] = dict(metrics)
-            return dict(metrics)
 
         if uses_proxy_selected_epochs:
             split_retrain_kwargs["optimizer"] = build_split_retrain_optimizer(
@@ -4685,8 +4831,72 @@ class CloudContinualLearner:
             best_state = baseline_state
             best_metrics = dict(proxy_metrics_before)
             best_state_is_baseline = True
+            best_full_state = baseline_state
+            best_full_metrics = dict(proxy_metrics_before)
+            best_full_state_is_baseline = True
             split_retrain_elapsed = 0.0
             proxy_eval_elapsed = 0.0
+            rfdetr_adaptive_high_map = 0.995
+
+            def _metric_map(metrics: Mapping[str, object]) -> float | None:
+                value = metrics.get("map")
+                if value is None:
+                    return None
+                return float(value)
+
+            def _metrics_improve_by_min_delta(
+                candidate: Mapping[str, object],
+                incumbent: Mapping[str, object],
+            ) -> bool:
+                if not _proxy_metrics_are_better(candidate, incumbent):
+                    return False
+                if (
+                    proxy_eval_min_delta > 0.0
+                    and candidate.get("map") is not None
+                    and incumbent.get("map") is not None
+                    and (float(candidate["map"]) - float(incumbent["map"]))
+                    < proxy_eval_min_delta
+                ):
+                    return False
+                return True
+
+            def _rebuild_proxy_selected_optimizer() -> torch.optim.Optimizer | None:
+                return build_split_retrain_optimizer(
+                    get_split_runtime_model(model),
+                    runtime=prepared_splitter,
+                    learning_rate=effective_learning_rate,
+                    optimizer_name=str(split_retrain_kwargs.get("optimizer_name", "adam")),
+                    weight_decay=float(split_retrain_kwargs.get("weight_decay", 0.0)),
+                    grad_clip_norm=split_retrain_kwargs.get("grad_clip_norm"),
+                )
+
+            def _universal_split_retrain_with_batch_retry(**kwargs: object) -> object:
+                nonlocal bs
+                try:
+                    return universal_split_retrain(**kwargs)
+                except Exception as exc:
+                    fallback_batch_size = 16
+                    if bs <= fallback_batch_size or not _is_cuda_oom_error(exc):
+                        raise
+                    logger.warning(
+                        "[FixedSplitCL] {} split retrain hit CUDA OOM at batch_size={}; "
+                        "restoring the best checkpoint and retrying with batch_size={}.",
+                        training_label,
+                        bs,
+                        fallback_batch_size,
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    model.load_state_dict(best_state, strict=False)
+                    _set_detection_model_eval_mode(model)
+                    bs = fallback_batch_size
+                    split_retrain_kwargs["batch_size"] = bs
+                    split_retrain_kwargs["optimizer"] = _rebuild_proxy_selected_optimizer()
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["batch_size"] = bs
+                    retry_kwargs["optimizer"] = split_retrain_kwargs["optimizer"]
+                    return universal_split_retrain(**retry_kwargs)
+
             proxy_eval_inner_epochs = self._resolve_fixed_split_proxy_eval_inner_epochs(
                 current_model_name,
                 int(effective_num_epoch),
@@ -4716,9 +4926,10 @@ class CloudContinualLearner:
                     training_label,
                     int(effective_num_epoch),
                 )
-            if can_select_best_by_proxy and tinynext_selection_uses_subset:
+            if can_select_best_by_proxy and selection_uses_subset:
                 logger.info(
-                    "[FixedSplitCL] TinyNeXt proxy selection will evaluate up to {} / {} GT proxy samples at each proxy eval, then run one final full proxy evaluation.",
+                    "[FixedSplitCL] {} proxy selection will evaluate up to {} / {} GT proxy samples at each proxy eval, then run one final full proxy evaluation.",
+                    training_label,
                     selection_proxy_eval_sample_count,
                     full_proxy_eval_sample_count,
                 )
@@ -4747,7 +4958,7 @@ class CloudContinualLearner:
                 )
                 epoch_log_context = training_label if should_log_round else None
                 stage_started = time.perf_counter()
-                universal_split_retrain(
+                _universal_split_retrain_with_batch_retry(
                     **split_retrain_kwargs,
                     num_epoch=inner_epochs_this_round,
                     epoch_log_context=epoch_log_context,
@@ -4764,7 +4975,7 @@ class CloudContinualLearner:
                 stage_started = time.perf_counter()
                 proxy_eval_metric_label = (
                     "selection proxy_mAP@0.5"
-                    if tinynext_selection_uses_subset
+                    if selection_uses_subset
                     else "proxy_mAP@0.5"
                 )
                 logger.info(
@@ -4774,23 +4985,17 @@ class CloudContinualLearner:
                     int(effective_num_epoch),
                 )
                 candidate_metrics = _evaluate_proxy_metrics_for_current_state(
-                    selection_eval=tinynext_selection_uses_subset,
+                    selection_eval=selection_uses_subset,
                 )
                 proxy_eval_elapsed += time.perf_counter() - stage_started
-                candidate_is_better = _proxy_metrics_are_better(candidate_metrics, best_metrics)
-                if (
-                    candidate_is_better
-                    and proxy_eval_min_delta > 0.0
-                    and candidate_metrics.get("map") is not None
-                    and best_metrics.get("map") is not None
-                    and (
-                        float(candidate_metrics["map"])
-                        - float(best_metrics["map"])
-                    ) < proxy_eval_min_delta
-                ):
-                    candidate_is_better = False
+                candidate_is_better = _metrics_improve_by_min_delta(
+                    candidate_metrics,
+                    best_metrics,
+                )
+                candidate_state: dict[str, torch.Tensor] | None = None
                 if candidate_is_better:
-                    best_state = _snapshot_model_state(model)
+                    candidate_state = _snapshot_model_state(model)
+                    best_state = candidate_state
                     best_metrics = dict(candidate_metrics)
                     best_state_is_baseline = False
                     stale_proxy_eval_count = 0
@@ -4802,9 +5007,81 @@ class CloudContinualLearner:
                         proxy_eval_metric_label,
                         float(candidate_metrics.get("map") or 0.0),
                     )
+                    if not selection_uses_subset:
+                        best_full_state = best_state
+                        best_full_metrics = dict(candidate_metrics)
+                        best_full_state_is_baseline = False
                 else:
                     stale_proxy_eval_count += 1
+
+                candidate_map = _metric_map(candidate_metrics)
+                best_full_map = _metric_map(best_full_metrics)
+                should_confirm_full_proxy = (
+                    selection_uses_subset
+                    and model_family == "rfdetr"
+                    and candidate_map is not None
+                    and candidate_map >= rfdetr_adaptive_high_map
+                    and (
+                        candidate_is_better
+                        or best_full_map is None
+                        or best_full_map < rfdetr_adaptive_high_map
+                        or is_final_round
+                    )
+                )
+                if should_confirm_full_proxy:
+                    if candidate_state is None:
+                        candidate_state = _snapshot_model_state(model)
+                    stage_started = time.perf_counter()
+                    full_candidate_metrics = _evaluate_proxy_metrics_for_current_state(
+                        selection_eval=False,
+                    )
+                    proxy_eval_elapsed += time.perf_counter() - stage_started
+                    logger.info(
+                        "[FixedSplitCL] Confirmed RF-DETR candidate after epoch {}/{} with full proxy_mAP@0.5={:.4f}.",
+                        int(completed_inner_epochs),
+                        int(effective_num_epoch),
+                        float(full_candidate_metrics.get("map") or 0.0),
+                    )
+                    if _metrics_improve_by_min_delta(
+                        full_candidate_metrics,
+                        best_full_metrics,
+                    ):
+                        best_full_state = candidate_state
+                        best_full_metrics = dict(full_candidate_metrics)
+                        best_full_state_is_baseline = False
+
+                if not candidate_is_better:
+                    best_map = (
+                        _metric_map(best_full_metrics)
+                        if selection_uses_subset and model_family == "rfdetr"
+                        else _metric_map(best_metrics)
+                    )
+                    if (
+                        model_family == "rfdetr"
+                        and int(completed_inner_epochs) >= 20
+                        and best_map is not None
+                        and best_map >= rfdetr_adaptive_high_map
+                    ):
+                        logger.info(
+                            "[FixedSplitCL] Early-stopping {} fixed-split retrain after epoch {}/{}: proxy_mAP@0.5 is already {:.4f} and the latest proxy evaluation did not improve by >= {}.",
+                            training_label,
+                            int(completed_inner_epochs),
+                            int(effective_num_epoch),
+                            float(best_map),
+                            proxy_eval_min_delta,
+                        )
+                        break
                     if proxy_eval_patience and stale_proxy_eval_count >= proxy_eval_patience:
+                        if (
+                            selection_uses_subset
+                            and model_family == "rfdetr"
+                            and (
+                                best_map is None
+                                or best_map < rfdetr_adaptive_high_map
+                            )
+                            and not is_final_round
+                        ):
+                            continue
                         logger.info(
                             "[FixedSplitCL] Early-stopping {} fixed-split retrain after epoch {}/{}: {} consecutive proxy evaluation(s) without >= {} mAP improvement.",
                             training_label,
@@ -4814,15 +5091,20 @@ class CloudContinualLearner:
                             proxy_eval_min_delta,
                         )
                         break
-            if can_select_best_by_proxy and tinynext_selection_uses_subset:
-                model.load_state_dict(best_state)
-                _set_detection_model_eval_mode(model)
-                if best_state_is_baseline:
-                    best_metrics = dict(proxy_metrics_before)
+            if can_select_best_by_proxy and selection_uses_subset:
+                if model_family == "rfdetr" and not best_full_state_is_baseline:
+                    best_state = best_full_state
+                    best_metrics = dict(best_full_metrics)
+                    best_state_is_baseline = False
                 else:
-                    stage_started = time.perf_counter()
-                    best_metrics = _evaluate_proxy_metrics_for_current_state(selection_eval=False)
-                    proxy_eval_elapsed += time.perf_counter() - stage_started
+                    model.load_state_dict(best_state)
+                    _set_detection_model_eval_mode(model)
+                    if best_state_is_baseline:
+                        best_metrics = dict(proxy_metrics_before)
+                    else:
+                        stage_started = time.perf_counter()
+                        best_metrics = _evaluate_proxy_metrics_for_current_state(selection_eval=False)
+                        proxy_eval_elapsed += time.perf_counter() - stage_started
             logger.info("[FixedSplitCL] split retraining took {:.3f}s.", split_retrain_elapsed)
             log_split_retrain_profile(retrain_profile)
             logger.info("[FixedSplitCL] proxy evaluation after retrain took {:.3f}s.", proxy_eval_elapsed)
@@ -4844,30 +5126,27 @@ class CloudContinualLearner:
         self._log_stage_duration("split retraining", split_retrain_started)
         log_split_retrain_profile(retrain_profile)
         proxy_eval_started = time.perf_counter()
-        current_proxy_state_key = _model_state_fingerprint(model)
-        if current_proxy_state_key == baseline_proxy_state_key:
+        if not gt_annotations:
             proxy_metrics_after = dict(proxy_metrics_before)
         if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
-            if current_proxy_state_key != baseline_proxy_state_key:
-                proxy_metrics_after = self._evaluate_tinynext_proxy_map(
-                    model,
-                    frame_dir=frame_dir,
-                    gt_annotations=gt_annotations,
-                    model_name=current_model_name,
-                    sample_metadata_by_id=sample_metadata_by_id,
-                    frame_cache=proxy_eval_frame_cache,
-                    max_samples=self.proxy_eval_max_samples,
-                    candidate_thresholds=self.proxy_eval_threshold_candidates,
-                    inference_batch_size=bs,
-                    stage_label="proxy evaluation after retrain",
-                    split_cache_path=working_cache,
-                    splitter=prepared_splitter,
-                    split_candidate=prepared_candidate,
-                    preloaded_records=preloaded_records,
-                )
-        else:
-            if current_proxy_state_key != baseline_proxy_state_key:
-                proxy_metrics_after = _evaluate_proxy_metrics_for_current_state()
+            proxy_metrics_after = self._evaluate_tinynext_proxy_map(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                model_name=current_model_name,
+                sample_metadata_by_id=sample_metadata_by_id,
+                frame_cache=proxy_eval_frame_cache,
+                max_samples=self.proxy_eval_max_samples,
+                candidate_thresholds=self.proxy_eval_threshold_candidates,
+                inference_batch_size=bs,
+                stage_label="proxy evaluation after retrain",
+                split_cache_path=working_cache,
+                splitter=prepared_splitter,
+                split_candidate=prepared_candidate,
+                preloaded_records=preloaded_records,
+            )
+        elif gt_annotations:
+            proxy_metrics_after = _evaluate_proxy_metrics_for_current_state()
         self._log_stage_duration("proxy evaluation after retrain", proxy_eval_started)
         return proxy_metrics_after, baseline_state
 
@@ -5210,6 +5489,7 @@ class CloudContinualLearner:
                 )
                 low_quality_added = sample_pool.ingest_low_quality_processed_samples(
                     low_quality_pool_samples,
+                    skip_unchanged_existing=True,
                 )
                 sample_pool.maybe_compact()
                 self._log_stage_duration("low-quality sample-pool commit", stage_started)

@@ -62,6 +62,21 @@ _LABEL_FIELDS = {
     "pseudo_boxes",
     "pseudo_labels",
     "pseudo_scores",
+    "label_coordinate_space",
+    "label_input_size",
+    "label_resize_mode",
+    "label_split_id",
+    "label_graph_signature",
+    "label_runtime_version",
+}
+
+_LABEL_METADATA_FIELDS = {
+    "label_coordinate_space",
+    "label_input_size",
+    "label_resize_mode",
+    "label_split_id",
+    "label_graph_signature",
+    "label_runtime_version",
 }
 
 
@@ -201,7 +216,7 @@ def _boundary_payload_from_feature_sample(
     )
 
 
-def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, list[Any]]:
+def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
     result = dict(result or {})
     labels = {
         "boxes": list(result.get("boxes") or []),
@@ -209,6 +224,9 @@ def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, list[Any]
     }
     if "scores" in result:
         labels["scores"] = list(result.get("scores") or [])
+    for field_name in _LABEL_METADATA_FIELDS:
+        if result.get(field_name) is not None:
+            labels[field_name] = result[field_name]
     return labels
 
 
@@ -344,7 +362,7 @@ def _record_from_feature_payload(
 class FeatureLabelRecord:
     sample_id: str
     feature_record: dict[str, Any]
-    labels: dict[str, list[Any]]
+    labels: dict[str, Any]
 
 
 class FeatureLabelShardReader:
@@ -415,7 +433,7 @@ class FeatureLabelShardReader:
             )
         return dict(value)
 
-    def load_label(self, shard: str, key: str) -> dict[str, list[Any]]:
+    def load_label(self, shard: str, key: str) -> dict[str, Any]:
         records = self._load_shard(self._label_cache, shard, "labels")
         value = records[str(key)]
         if not isinstance(value, Mapping):
@@ -445,6 +463,9 @@ class FeatureLabelShardReader:
         training_record["pseudo_labels"] = list(record.labels.get("labels") or [])
         if "scores" in record.labels:
             training_record["pseudo_scores"] = list(record.labels.get("scores") or [])
+        for field_name in _LABEL_METADATA_FIELDS:
+            if record.labels.get(field_name) is not None:
+                training_record[field_name] = record.labels[field_name]
         return training_record
 
 
@@ -706,27 +727,48 @@ class CloudSamplePool:
                 ).fetchone()[0]
             )
 
-    def _active_sample_exists(self, sample_id: str) -> bool:
+    def _active_sample_entries_by_id(
+        self,
+        sample_ids: list[str] | tuple[str, ...] | set[str],
+    ) -> dict[str, dict[str, Any]]:
+        unique_ids = sorted({str(sample_id) for sample_id in sample_ids if str(sample_id)})
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unique_ids)
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM samples WHERE sample_id = ? AND active = 1",
-                (str(sample_id),),
-            ).fetchone()
-        return row is not None
+            rows = connection.execute(
+                f"""
+                SELECT sample_id, feature_shard, feature_key, label_shard, label_key,
+                       object_count, class_counts_json, dominant_class, created_at, active
+                FROM samples
+                WHERE active = 1 AND sample_id IN ({placeholders})
+                """,
+                unique_ids,
+            ).fetchall()
+        return {str(row["sample_id"]): dict(row) for row in rows}
 
     def _enforce_capacity_for_pending(self, samples: list[Mapping[str, Any]]) -> int:
         if self.max_active_samples is None:
             return 0
+        existing_ids = set(
+            self._active_sample_entries_by_id(
+                [
+                    str(sample.get("sample_id", "") or "")
+                    for sample in samples
+                ]
+            )
+        )
+        active_count = self._active_sample_count()
         reserved_new_ids: set[str] = set()
         replacement_count = 0
         for sample in samples:
             sample_id = str(sample.get("sample_id", "") or "")
             if not sample_id:
                 continue
-            if sample_id in reserved_new_ids or self._active_sample_exists(sample_id):
+            if sample_id in reserved_new_ids or sample_id in existing_ids:
                 continue
             while (
-                self._active_sample_count() + len(reserved_new_ids) + 1
+                active_count + len(reserved_new_ids) + 1
                 > int(self.max_active_samples)
             ):
                 victim = self.select_victim_for_new_sample(sample, force=True)
@@ -734,9 +776,42 @@ class CloudSamplePool:
                     break
                 if not self.deactivate_sample(victim):
                     break
+                active_count = max(0, active_count - 1)
                 replacement_count += 1
             reserved_new_ids.add(sample_id)
         return replacement_count
+
+    def _unchanged_active_sample_ids(
+        self,
+        samples: list[Mapping[str, Any]],
+    ) -> set[str]:
+        entries_by_id = self._active_sample_entries_by_id(
+            [
+                str(sample.get("sample_id", "") or "")
+                for sample in samples
+            ]
+        )
+        if not entries_by_id:
+            return set()
+        unchanged: set[str] = set()
+        for sample in samples:
+            sample_id = str(sample.get("sample_id", "") or "")
+            entry = entries_by_id.get(sample_id)
+            if entry is None:
+                continue
+            labels = sample.get("labels") or sample.get("label") or sample.get("target")
+            if not isinstance(labels, Mapping):
+                continue
+            try:
+                existing_labels = self.reader.load_label(
+                    str(entry["label_shard"]),
+                    str(entry["label_key"]),
+                )
+            except Exception:
+                continue
+            if _stable_json(existing_labels) == _stable_json(_labels_from_result(labels)):
+                unchanged.add(sample_id)
+        return unchanged
 
     def _trim_to_capacity(self) -> int:
         if self.max_active_samples is None:
@@ -827,6 +902,11 @@ class CloudSamplePool:
                     "sample_id": sample["sample_id"],
                     "boxes": list(sample["labels"].get("boxes") or []),
                     "labels": list(sample["labels"].get("labels") or []),
+                    **{
+                        field_name: sample["labels"][field_name]
+                        for field_name in sorted(_LABEL_METADATA_FIELDS)
+                        if sample["labels"].get(field_name) is not None
+                    },
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -869,13 +949,29 @@ class CloudSamplePool:
         self._trim_to_capacity()
         return sample_id
 
-    def ingest_low_quality_processed_samples(self, samples: list[Mapping[str, Any]]) -> int:
+    def ingest_low_quality_processed_samples(
+        self,
+        samples: list[Mapping[str, Any]],
+        *,
+        skip_unchanged_existing: bool = False,
+    ) -> int:
         pending: list[Mapping[str, Any]] = []
         for sample in samples:
             sample_id = str(sample.get("sample_id", "") or "")
             if not sample_id:
                 continue
             pending.append(sample)
+        unchanged_existing = (
+            self._unchanged_active_sample_ids(pending)
+            if skip_unchanged_existing
+            else set()
+        )
+        if unchanged_existing:
+            pending = [
+                sample
+                for sample in pending
+                if str(sample.get("sample_id", "") or "") not in unchanged_existing
+            ]
         self._enforce_capacity_for_pending(pending)
         added = 0
         for offset in range(0, len(pending), self.shard_size):
@@ -883,7 +979,7 @@ class CloudSamplePool:
                 list(pending[offset:offset + self.shard_size])
             )
         self._trim_to_capacity()
-        return added
+        return added + len(unchanged_existing)
 
     def ingest_high_quality_feature_label_bundle(self, bundle_root: str) -> int:
         manifest_path = os.path.join(bundle_root, "bundle_manifest.json")

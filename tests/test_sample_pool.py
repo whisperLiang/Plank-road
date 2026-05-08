@@ -352,6 +352,104 @@ def test_cloud_sample_pool_preserves_boundary_payload_metadata(tmp_path):
     assert restored.batch_size == boundary.batch_size
 
 
+def test_cloud_sample_pool_preserves_label_space_metadata(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = _construct_pool(pool_cls, tmp_path, max_samples=4)
+    boundary = boundary_payload_from_tensors(
+        {"node_1": torch.ones(1, 4)},
+        split_id="after:model.backbone",
+        graph_signature="runtime-signature",
+    )
+
+    pool.ingest_low_quality_processed_samples(
+        [
+            {
+                "sample_id": "label-meta",
+                "feature_record": {
+                    "sample_id": "label-meta",
+                    "intermediate": boundary,
+                },
+                "labels": {
+                    "boxes": [[1.0, 2.0, 3.0, 4.0]],
+                    "labels": [1],
+                    "label_coordinate_space": "model_input_xyxy",
+                    "label_input_size": [384, 384],
+                    "label_resize_mode": "direct_resize",
+                    "label_split_id": boundary.split_id,
+                    "label_graph_signature": boundary.graph_signature,
+                    "label_runtime_version": "fixed-split-pool-labels.v1",
+                },
+                "created_at": 1.0,
+            }
+        ]
+    )
+
+    entry = _samples_by_id(_list_samples(pool, edge_id=1))["label-meta"]
+    labels = pool.reader.read(entry).labels
+    training_record = pool.reader.training_record(entry)
+
+    assert labels["label_coordinate_space"] == "model_input_xyxy"
+    assert labels["label_input_size"] == [384, 384]
+    assert training_record["label_split_id"] == boundary.split_id
+
+
+def test_cloud_sample_pool_skips_unchanged_active_low_quality_samples(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = _construct_pool(pool_cls, tmp_path, max_samples=4)
+    first_boundary = boundary_payload_from_tensors(
+        {"node_1": torch.ones(1, 4)},
+        split_id="after:model.backbone",
+        graph_signature="runtime-signature",
+    )
+    sample = {
+        "sample_id": "unchanged-active",
+        "feature_record": {
+            "sample_id": "unchanged-active",
+            "intermediate": first_boundary,
+        },
+        "labels": {
+            "boxes": [[1.0, 2.0, 3.0, 4.0]],
+            "labels": [1],
+            "label_coordinate_space": "model_input_xyxy",
+            "label_input_size": [384, 384],
+            "label_resize_mode": "direct_resize",
+            "label_split_id": first_boundary.split_id,
+            "label_graph_signature": first_boundary.graph_signature,
+            "label_runtime_version": "fixed-split-pool-labels.v1",
+        },
+        "created_at": 1.0,
+    }
+
+    assert pool.ingest_low_quality_processed_samples([sample]) == 1
+    feature_shards = sorted((tmp_path / "pool" / "features").glob("*.pt"))
+    assert len(feature_shards) == 1
+
+    assert (
+        pool.ingest_low_quality_processed_samples(
+            [sample],
+            skip_unchanged_existing=True,
+        )
+        == 1
+    )
+    assert sorted((tmp_path / "pool" / "features").glob("*.pt")) == feature_shards
+
+    changed_sample = dict(sample)
+    changed_labels = dict(sample["labels"])
+    changed_labels["boxes"] = [[10.0, 20.0, 30.0, 40.0]]
+    changed_sample["labels"] = changed_labels
+    assert (
+        pool.ingest_low_quality_processed_samples(
+            [changed_sample],
+            skip_unchanged_existing=True,
+        )
+        == 1
+    )
+    assert len(sorted((tmp_path / "pool" / "features").glob("*.pt"))) == 2
+
+    entry = _samples_by_id(_list_samples(pool, edge_id=1))["unchanged-active"]
+    assert pool.reader.read(entry).labels["boxes"] == [[10.0, 20.0, 30.0, 40.0]]
+
+
 @pytest.mark.parametrize("mode", ["raw-only", "raw+feature"])
 def test_benchmark_shard_sample_pool_cli_outputs_trigger_and_cloud_speedups(tmp_path, mode):
     benchmark = importlib.import_module("benchmarks.benchmark_shard_sample_pool")
