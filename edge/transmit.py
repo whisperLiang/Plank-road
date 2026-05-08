@@ -21,6 +21,7 @@ import io
 from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
 from model_management.fixed_split import SplitPlan
+from model_management.payload import BoundaryPayload
 from model_management.continual_learning_bundle import (
     CONTINUAL_LEARNING_PROTOCOL_VERSION,
 )
@@ -295,6 +296,28 @@ def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
     return tensors
 
 
+def _boundary_payload_metadata(intermediate: Any) -> dict[str, Any] | None:
+    if not isinstance(intermediate, BoundaryPayload):
+        return None
+    return {
+        "split_id": str(intermediate.split_id),
+        "graph_signature": str(intermediate.graph_signature),
+        "batch_size": int(intermediate.batch_size),
+        "schema": dict(intermediate.schema or {}),
+        "requires_grad": dict(intermediate.requires_grad or {}),
+        "weight_version": intermediate.weight_version,
+        "passthrough_inputs": dict(intermediate.passthrough_inputs or {}),
+    }
+
+
+def _feature_sample_payload(intermediate: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"tensors": _tensor_only_features(intermediate)}
+    metadata = _boundary_payload_metadata(intermediate)
+    if metadata is not None:
+        payload["boundary"] = metadata
+    return payload
+
+
 def _record_abs_path(sample_store: EdgeSampleStore, relpath: str | None) -> str | None:
     if relpath is None:
         return None
@@ -407,9 +430,9 @@ def _write_low_quality_feature_shard(
         if feature_path is None or not os.path.exists(feature_path):
             continue
         try:
-            feature_payload["samples"][sample_id] = {
-                "tensors": _tensor_only_features(sample_store.load_intermediate(record)),
-            }
+            feature_payload["samples"][sample_id] = _feature_sample_payload(
+                sample_store.load_intermediate(record)
+            )
         except Exception as exc:
             logger.warning(
                 "Skipping optional low-quality feature for sample {}: {}",

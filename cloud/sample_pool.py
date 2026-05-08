@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 
-from model_management.payload import BoundaryPayload, SplitPayload
+from model_management.payload import BoundaryPayload, SplitPayload, boundary_payload_from_tensors
 
 
 POOL_MANIFEST_FIELDS = (
@@ -159,6 +159,48 @@ def _coerce_boundary_payload(payload: Any) -> BoundaryPayload:
     raise TypeError(f"Unsupported split feature payload: {type(payload)!r}")
 
 
+def _boundary_payload_metadata(boundary: BoundaryPayload) -> dict[str, Any]:
+    return {
+        "split_id": str(boundary.split_id),
+        "graph_signature": str(boundary.graph_signature),
+        "batch_size": int(boundary.batch_size),
+        "schema": dict(boundary.schema or {}),
+        "requires_grad": dict(boundary.requires_grad or {}),
+        "weight_version": boundary.weight_version,
+        "passthrough_inputs": dict(boundary.passthrough_inputs or {}),
+    }
+
+
+def _boundary_payload_from_feature_sample(
+    sample_id: str,
+    tensors: Mapping[str, torch.Tensor],
+    boundary_metadata: Mapping[str, Any] | None,
+) -> BoundaryPayload:
+    clean_tensors = {
+        str(label): tensor.detach().cpu()
+        for label, tensor in dict(tensors or {}).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    metadata = dict(boundary_metadata or {})
+    split_id = str(metadata.get("split_id") or "").strip()
+    graph_signature = str(metadata.get("graph_signature") or "").strip()
+    if split_id and graph_signature:
+        return boundary_payload_from_tensors(
+            clean_tensors,
+            split_id=split_id,
+            graph_signature=graph_signature,
+            batch_size=metadata.get("batch_size"),
+            schema=metadata.get("schema"),
+            requires_grad=metadata.get("requires_grad"),
+            weight_version=metadata.get("weight_version"),
+            passthrough_inputs=dict(metadata.get("passthrough_inputs") or {}),
+        )
+    return SplitPayload.from_mapping(
+        clean_tensors,
+        primary_label=next(reversed(clean_tensors), None) if clean_tensors else None,
+    )
+
+
 def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, list[Any]]:
     result = dict(result or {})
     labels = {
@@ -228,20 +270,17 @@ def _sanitize_feature_record(record: Mapping[str, Any]) -> dict[str, Any]:
 def _feature_record_from_tensors(
     sample_id: str,
     tensors: Mapping[str, torch.Tensor],
+    boundary_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    clean_tensors = {
-        str(label): tensor.detach().cpu()
-        for label, tensor in dict(tensors or {}).items()
-        if isinstance(tensor, torch.Tensor)
-    }
+    boundary = _boundary_payload_from_feature_sample(sample_id, tensors, boundary_metadata)
+    boundary_labels = list(
+        getattr(boundary, "boundary_tensor_labels", list(boundary.tensors.keys())) or []
+    )
     return {
         "sample_id": str(sample_id),
-        "intermediate": SplitPayload.from_mapping(
-            clean_tensors,
-            primary_label=next(reversed(clean_tensors), None) if clean_tensors else None,
-        ),
-        "boundary_tensor_labels": list(clean_tensors.keys()),
-        "split_label": next(reversed(clean_tensors), None) if clean_tensors else None,
+        "intermediate": boundary,
+        "boundary_tensor_labels": boundary_labels,
+        "split_label": getattr(boundary, "split_label", None),
     }
 
 
@@ -253,7 +292,8 @@ def _feature_sample_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
             str(label): tensor.detach().cpu()
             for label, tensor in dict(boundary.tensors).items()
             if isinstance(tensor, torch.Tensor)
-        }
+        },
+        "boundary": _boundary_payload_metadata(boundary),
     }
 
 
@@ -364,7 +404,15 @@ class FeatureLabelShardReader:
         if not isinstance(value, Mapping):
             raise TypeError(f"Unsupported feature record for {key!r}: {type(value)!r}")
         if "tensors" in value:
-            return _feature_record_from_tensors(str(key), dict(value.get("tensors") or {}))
+            return _feature_record_from_tensors(
+                str(key),
+                dict(value.get("tensors") or {}),
+                boundary_metadata=(
+                    value.get("boundary")
+                    if isinstance(value.get("boundary"), Mapping)
+                    else value
+                ),
+            )
         return dict(value)
 
     def load_label(self, shard: str, key: str) -> dict[str, list[Any]]:
@@ -883,8 +931,16 @@ class CloudSamplePool:
                     trainable_samples.append(
                         {
                             "sample_id": sample_key,
-                            "feature_record": _feature_record_from_tensors(sample_key, tensors),
-                    "labels": _labels_from_result(labels_by_id[sample_key]),
+                            "feature_record": _feature_record_from_tensors(
+                                sample_key,
+                                tensors,
+                                boundary_metadata=(
+                                    feature_value.get("boundary")
+                                    if isinstance(feature_value.get("boundary"), Mapping)
+                                    else feature_value
+                                ),
+                            ),
+                            "labels": _labels_from_result(labels_by_id[sample_key]),
                             "created_at": _created_at_text(),
                         }
                     )

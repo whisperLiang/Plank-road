@@ -75,6 +75,28 @@ def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
     return tensors
 
 
+def _boundary_payload_metadata(intermediate: Any) -> dict[str, Any] | None:
+    if not isinstance(intermediate, BoundaryPayload):
+        return None
+    return {
+        "split_id": str(intermediate.split_id),
+        "graph_signature": str(intermediate.graph_signature),
+        "batch_size": int(intermediate.batch_size),
+        "schema": dict(intermediate.schema or {}),
+        "requires_grad": dict(intermediate.requires_grad or {}),
+        "weight_version": intermediate.weight_version,
+        "passthrough_inputs": dict(intermediate.passthrough_inputs or {}),
+    }
+
+
+def _feature_sample_payload(intermediate: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"tensors": _tensor_only_features(intermediate)}
+    metadata = _boundary_payload_metadata(intermediate)
+    if metadata is not None:
+        payload["boundary"] = metadata
+    return payload
+
+
 def _training_labels(result: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "boxes": list(result.get("boxes") or []),
@@ -179,9 +201,7 @@ def pack_high_quality_sync_bundle_to_file(
                     sample_id = str(record.sample_id)
                     intermediate = sample_store.load_intermediate(record)
                     result = sample_store.load_inference_result(record)
-                    feature_payload["samples"][sample_id] = {
-                        "tensors": _tensor_only_features(intermediate),
-                    }
+                    feature_payload["samples"][sample_id] = _feature_sample_payload(intermediate)
                     labels = _training_labels(result)
                     label_lines.append(
                         json.dumps(

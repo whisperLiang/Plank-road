@@ -3688,7 +3688,7 @@ def test_low_quality_raw_feature_trigger_matches_raw_shard_grouping(
                 weights_only=False,
             )
             assert list(feature_payload["samples"].keys()) == raw_ids
-            assert all(set(sample_payload) == {"tensors"} for sample_payload in feature_payload["samples"].values())
+            assert all("tensors" in sample_payload for sample_payload in feature_payload["samples"].values())
     finally:
         os.remove(zip_path)
 

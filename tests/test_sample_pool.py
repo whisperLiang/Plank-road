@@ -6,6 +6,7 @@ import json
 
 import pytest
 import torch
+from model_management.payload import boundary_payload_from_tensors
 
 
 def _load_cloud_sample_pool():
@@ -316,6 +317,39 @@ def test_cloud_sample_pool_enforces_capacity_for_batch_ingest(tmp_path):
 
     by_id = _samples_by_id(_list_samples(pool, edge_id=3))
     assert len(by_id) == 2
+
+
+def test_cloud_sample_pool_preserves_boundary_payload_metadata(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = _construct_pool(pool_cls, tmp_path, max_samples=4)
+    boundary = boundary_payload_from_tensors(
+        {"node_1": torch.ones(16, 384, 24, 24), "node_0": torch.ones(16, 384, 384)},
+        split_id="after:model.backbone.0.encoder.encoder.embeddings.patch_embeddings.projection",
+        graph_signature="runtime-signature",
+        batch_size=16,
+        passthrough_inputs={"split_label": "projection"},
+    )
+
+    pool.ingest_low_quality_processed_samples(
+        [
+            {
+                "sample_id": "boundary-sample",
+                "feature_record": {
+                    "sample_id": "boundary-sample",
+                    "intermediate": boundary,
+                },
+                "labels": {"boxes": [[0.0, 1.0, 2.0, 3.0]], "labels": [1]},
+                "created_at": 1.0,
+            }
+        ]
+    )
+
+    entry = _samples_by_id(_list_samples(pool, edge_id=1))["boundary-sample"]
+    training_record = pool.reader.training_record(entry)
+    restored = training_record["intermediate"]
+    assert restored.split_id == boundary.split_id
+    assert restored.graph_signature == boundary.graph_signature
+    assert restored.batch_size == boundary.batch_size
 
 
 @pytest.mark.parametrize("mode", ["raw-only", "raw+feature"])

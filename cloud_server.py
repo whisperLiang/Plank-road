@@ -79,7 +79,7 @@ from model_management.fixed_split_runtime_template import (
     get_fixed_split_runtime_template_cache,
 )
 from model_management.split_runtime import compare_outputs, make_split_spec, prepare_split_runtime
-from model_management.payload import BoundaryPayload, SplitPayload
+from model_management.payload import BoundaryPayload, SplitPayload, boundary_payload_from_tensors
 from torchvision.models.detection.image_list import ImageList
 
 from grpc_server import message_transmission_pb2_grpc
@@ -1915,6 +1915,8 @@ class CloudContinualLearner:
     def _build_pool_training_inputs(
         self,
         sample_pool: CloudSamplePool,
+        *,
+        expected_split_id: str | None = None,
     ) -> tuple[
         dict[str, object],
         dict[str, dict[str, object]],
@@ -1938,6 +1940,21 @@ class CloudContinualLearner:
                     "[FixedSplitCL] Skipping active pool sample {} because its shard record could not be loaded: {}",
                     sample_id,
                     exc,
+                )
+                continue
+            intermediate = dict(training_record).get("intermediate")
+            if (
+                expected_split_id
+                and isinstance(intermediate, BoundaryPayload)
+                and str(intermediate.split_id) != str(expected_split_id)
+            ):
+                sample_pool.deactivate_sample(sample_id)
+                logger.warning(
+                    "[FixedSplitCL] Deactivated pool sample {} because its split_id={} "
+                    "does not match current runtime split_id={}.",
+                    sample_id,
+                    intermediate.split_id,
+                    expected_split_id,
                 )
                 continue
             sample_ids.append(sample_id)
@@ -1968,7 +1985,7 @@ class CloudContinualLearner:
         os.makedirs(raw_root, exist_ok=True)
         os.makedirs(feature_root, exist_ok=True)
 
-        feature_tensors_by_id: dict[str, Mapping[str, torch.Tensor]] = {}
+        feature_payload_by_id: dict[str, dict[str, object]] = {}
         for shard in list(trigger_manifest.get("feature_shards", []) or []):
             if not isinstance(shard, Mapping):
                 continue
@@ -1991,7 +2008,14 @@ class CloudContinualLearner:
                     if isinstance(tensor, torch.Tensor)
                 }
                 if tensors:
-                    feature_tensors_by_id[str(sample_id)] = tensors
+                    feature_payload_by_id[str(sample_id)] = {
+                        "tensors": tensors,
+                        "boundary": (
+                            dict(feature_value.get("boundary"))
+                            if isinstance(feature_value.get("boundary"), Mapping)
+                            else {}
+                        ),
+                    }
 
         samples: list[dict[str, object]] = []
         for shard in list(trigger_manifest.get("raw_shards", []) or []):
@@ -2035,20 +2059,39 @@ class CloudContinualLearner:
                         shutil.copyfileobj(source, handle)
 
                     feature_relpath = None
-                    if sample_id in feature_tensors_by_id:
-                        tensors = dict(feature_tensors_by_id[sample_id])
+                    if sample_id in feature_payload_by_id:
+                        feature_payload = feature_payload_by_id[sample_id]
+                        tensors = dict(feature_payload.get("tensors") or {})
+                        boundary_meta = dict(feature_payload.get("boundary") or {})
                         feature_relpath = f"low_quality_staging/features/{safe_sample_id}.pt"
                         feature_path = os.path.join(
                             bundle_cache_path,
                             feature_relpath.replace("/", os.sep),
                         )
+                        split_id = str(boundary_meta.get("split_id") or "").strip()
+                        graph_signature = str(
+                            boundary_meta.get("graph_signature") or ""
+                        ).strip()
+                        if split_id and graph_signature:
+                            intermediate = boundary_payload_from_tensors(
+                                tensors,
+                                split_id=split_id,
+                                graph_signature=graph_signature,
+                                batch_size=boundary_meta.get("batch_size"),
+                                schema=boundary_meta.get("schema"),
+                                requires_grad=boundary_meta.get("requires_grad"),
+                                weight_version=boundary_meta.get("weight_version"),
+                                passthrough_inputs=dict(
+                                    boundary_meta.get("passthrough_inputs") or {}
+                                ),
+                            )
+                        else:
+                            intermediate = SplitPayload.from_mapping(
+                                tensors,
+                                primary_label=next(reversed(tensors), None),
+                            )
                         torch.save(
-                            {
-                                "intermediate": SplitPayload.from_mapping(
-                                    tensors,
-                                    primary_label=next(reversed(tensors), None),
-                                )
-                            },
+                            {"intermediate": intermediate},
                             feature_path,
                         )
                     samples.append(
@@ -4756,7 +4799,14 @@ class CloudContinualLearner:
                     preloaded_records,
                     gt_annotations,
                     sample_metadata_by_id,
-                ) = self._build_pool_training_inputs(sample_pool)
+                ) = self._build_pool_training_inputs(
+                    sample_pool,
+                    expected_split_id=str(
+                        getattr(getattr(prepared_splitter, "runtime", None), "split_id", "")
+                        or ""
+                    )
+                    or None,
+                )
                 if not bundle_info["all_sample_ids"]:
                     raise RuntimeError(
                         "No active cloud sample-pool samples were available for fixed-split retraining."
