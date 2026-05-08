@@ -101,6 +101,9 @@ client:
  #   Q_bw     — bounds average bandwidth     ≤  lambda_bw
  resource_aware_trigger:
   enabled: True
+  probe_interval_sec: 5.0
+  probe_timeout_sec: 3.0
+  bandwidth_probe_size_bytes: 65536
   # --- Evidence-quality urgency controller ---
   # Conservative profile: delay CL until enough evidence accumulates and let
   # the Q_cloud/Q_bw penalties suppress repeated training decisions.

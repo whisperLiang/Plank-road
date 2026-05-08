@@ -72,6 +72,9 @@ class WindowDriftConfig(ConfigSection):
 @dataclass
 class ResourceAwareTriggerConfig(ConfigSection):
     enabled: bool = True
+    probe_interval_sec: float = 5.0
+    probe_timeout_sec: float = 3.0
+    bandwidth_probe_size_bytes: int = 65536
     lambda_cloud: float = 0.5
     lambda_bw: float = 0.5
     w_cloud: float = 1.0
@@ -406,6 +409,18 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive(
         "client.resource_aware_trigger.bundle_target_upload_sec",
         float(config.client.resource_aware_trigger.bundle_target_upload_sec),
+    )
+    _validate_positive(
+        "client.resource_aware_trigger.probe_interval_sec",
+        float(config.client.resource_aware_trigger.probe_interval_sec),
+    )
+    _validate_positive(
+        "client.resource_aware_trigger.probe_timeout_sec",
+        float(config.client.resource_aware_trigger.probe_timeout_sec),
+    )
+    _validate_positive(
+        "client.resource_aware_trigger.bandwidth_probe_size_bytes",
+        int(config.client.resource_aware_trigger.bandwidth_probe_size_bytes),
     )
     if bundle_min_bytes > bundle_max_bytes:
         raise ValueError(

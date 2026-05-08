@@ -562,6 +562,93 @@ class TestEdgeWorkerRouting:
         assert worker.pending_training_decision is None
         assert worker._retrain_requested.is_set() is False
 
+    def test_training_decision_reads_cached_resource_probe_without_network(
+        self,
+        monkeypatch,
+    ):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.resource_trigger_enabled = True
+        worker.resource_trigger = ResourceAwareCLTrigger(
+            min_training_samples=1,
+            V=10.0,
+        )
+        worker._resource_probe_lock = threading.Lock()
+        worker._cloud_state = CloudResourceState(
+            cpu_utilization=0.1,
+            gpu_utilization=0.1,
+            memory_utilization=0.1,
+            train_queue_size=0,
+            max_queue_size=10,
+        )
+        worker._bandwidth_mbps = 123.0
+        worker.resource_probe_interval_sec = 5.0
+
+        monkeypatch.setattr(
+            "edge.edge_worker.query_cloud_resource",
+            lambda *args, **kwargs: pytest.fail("decision path must not query cloud"),
+        )
+        monkeypatch.setattr(
+            "edge.edge_worker.estimate_bandwidth",
+            lambda *args, **kwargs: pytest.fail("decision path must not probe bandwidth"),
+        )
+
+        decision = worker._make_training_decision(
+            drift_state=SimpleNamespace(drift_detected=True),
+            stats=PendingTrainingStats(
+                total_samples=12,
+                high_quality_count=6,
+                low_quality_count=6,
+                low_quality_rate=0.5,
+                uncovered_evidence_rate=0.5,
+                drift_detected=True,
+                high_quality_feature_bytes=1200,
+                low_quality_feature_bytes=600,
+                low_quality_raw_bytes=300,
+            ),
+        )
+
+        assert decision.bandwidth_mbps == pytest.approx(123.0)
+
+    def test_refresh_resource_probe_cache_updates_cloud_state_and_bandwidth(
+        self,
+        monkeypatch,
+    ):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.config = SimpleNamespace(server_ip="cloud:50051")
+        worker.edge_id = 7
+        worker._resource_probe_lock = threading.Lock()
+        worker._cloud_state = None
+        worker._bandwidth_mbps = 0.0
+        worker.resource_probe_timeout_sec = 1.25
+        worker.bandwidth_probe_size_bytes = 2048
+        cloud_state = CloudResourceState(
+            cpu_utilization=0.2,
+            gpu_utilization=0.3,
+            memory_utilization=0.4,
+            train_queue_size=1,
+            max_queue_size=10,
+        )
+
+        def _query(server_ip, *, edge_id, timeout_sec):
+            assert server_ip == "cloud:50051"
+            assert edge_id == 7
+            assert timeout_sec == pytest.approx(1.25)
+            return cloud_state
+
+        def _estimate(server_ip, *, probe_size_bytes, timeout_sec):
+            assert server_ip == "cloud:50051"
+            assert probe_size_bytes == 2048
+            assert timeout_sec == pytest.approx(1.25)
+            return 45.0
+
+        monkeypatch.setattr("edge.edge_worker.query_cloud_resource", _query)
+        monkeypatch.setattr("edge.edge_worker.estimate_bandwidth", _estimate)
+
+        worker._refresh_resource_probe_cache()
+
+        assert worker._cloud_state is cloud_state
+        assert worker._bandwidth_mbps == pytest.approx(45.0)
+
     def test_close_sets_shutdown_events_and_joins_threads(self):
         worker = EdgeWorker.__new__(EdgeWorker)
         worker._closed = False

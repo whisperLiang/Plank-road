@@ -188,6 +188,40 @@ class EdgeWorker:
         except Exception:
             return 60.0
 
+    @staticmethod
+    def _resolve_resource_probe_interval(config) -> float:
+        ra_cfg = getattr(config, "resource_aware_trigger", None)
+        try:
+            return max(0.5, float(getattr(ra_cfg, "probe_interval_sec", 5.0)))
+        except Exception:
+            return 5.0
+
+    @staticmethod
+    def _resolve_resource_probe_timeout(config) -> float:
+        ra_cfg = getattr(config, "resource_aware_trigger", None)
+        try:
+            return max(0.1, float(getattr(ra_cfg, "probe_timeout_sec", 3.0)))
+        except Exception:
+            return 3.0
+
+    @staticmethod
+    def _resolve_bandwidth_probe_size(config) -> int:
+        ra_cfg = getattr(config, "resource_aware_trigger", None)
+        try:
+            return max(1, int(getattr(ra_cfg, "bandwidth_probe_size_bytes", 64 * 1024)))
+        except Exception:
+            return 64 * 1024
+
+    @staticmethod
+    def _conservative_cloud_state() -> CloudResourceState:
+        return CloudResourceState(
+            cpu_utilization=1.0,
+            gpu_utilization=1.0,
+            memory_utilization=1.0,
+            train_queue_size=1,
+            max_queue_size=1,
+        )
+
     def __init__(self, config):
         self.config = config
         self.edge_id = config.edge_id
@@ -225,6 +259,8 @@ class EdgeWorker:
 
         self.resource_trigger: ResourceAwareCLTrigger | None = None
         self._cloud_state: CloudResourceState | None = None
+        self._bandwidth_mbps = 0.0
+        self._resource_probe_lock = threading.Lock()
         ra_cfg = getattr(config, "resource_aware_trigger", None)
         self.resource_trigger_enabled = bool(getattr(ra_cfg, "enabled", False)) if ra_cfg else False
         if self.resource_trigger_enabled:
@@ -278,6 +314,9 @@ class EdgeWorker:
         )
         self.training_poll_interval_sec = self._resolve_training_poll_interval(config)
         self.training_not_found_grace_sec = self._resolve_training_not_found_grace(config)
+        self.resource_probe_interval_sec = self._resolve_resource_probe_interval(config)
+        self.resource_probe_timeout_sec = self._resolve_resource_probe_timeout(config)
+        self.bandwidth_probe_size_bytes = self._resolve_bandwidth_probe_size(config)
 
         sl_cfg = getattr(config, "split_learning", None)
         self.split_learning_enabled = bool(getattr(sl_cfg, "enabled", False)) if sl_cfg else False
@@ -299,6 +338,13 @@ class EdgeWorker:
         self._stop_event = threading.Event()
         self._retrain_requested = threading.Event()
         self._closed = False
+        self.resource_probe_processor: threading.Thread | None = None
+        if self.resource_trigger_enabled:
+            self.resource_probe_processor = threading.Thread(
+                target=self.resource_probe_worker,
+                daemon=True,
+            )
+            self.resource_probe_processor.start()
         self.sample_syncer.start()
 
         self.diff_processor = threading.Thread(target=self.diff_worker, daemon=False)
@@ -716,6 +762,76 @@ class EdgeWorker:
         )
         return None
 
+    def _update_resource_probe_cache(
+        self,
+        *,
+        cloud_state: CloudResourceState | None = None,
+        bandwidth_mbps: float | None = None,
+    ) -> None:
+        lock = getattr(self, "_resource_probe_lock", None)
+        if lock is None:
+            if cloud_state is not None:
+                self._cloud_state = cloud_state
+            if bandwidth_mbps is not None:
+                self._bandwidth_mbps = float(bandwidth_mbps)
+            return
+        with lock:
+            if cloud_state is not None:
+                self._cloud_state = cloud_state
+            if bandwidth_mbps is not None:
+                self._bandwidth_mbps = float(bandwidth_mbps)
+
+    def _resource_probe_snapshot(self) -> tuple[CloudResourceState, float]:
+        lock = getattr(self, "_resource_probe_lock", None)
+        if lock is None:
+            cloud_state = getattr(self, "_cloud_state", None)
+            bandwidth_mbps = getattr(self, "_bandwidth_mbps", 0.0)
+        else:
+            with lock:
+                cloud_state = getattr(self, "_cloud_state", None)
+                bandwidth_mbps = getattr(self, "_bandwidth_mbps", 0.0)
+
+        max_age_sec = max(
+            30.0,
+            float(getattr(self, "resource_probe_interval_sec", 5.0)) * 2.0,
+        )
+        if cloud_state is None or cloud_state.is_stale(max_age_sec):
+            cloud_state = self._conservative_cloud_state()
+        return cloud_state, max(0.0, float(bandwidth_mbps or 0.0))
+
+    def _refresh_resource_probe_cache(self) -> None:
+        timeout_sec = float(getattr(self, "resource_probe_timeout_sec", 3.0))
+        try:
+            cloud_state = query_cloud_resource(
+                self.config.server_ip,
+                edge_id=self.edge_id,
+                timeout_sec=timeout_sec,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Resource probe cloud-state refresh failed; using conservative cache: {}",
+                exc,
+            )
+            cloud_state = self._conservative_cloud_state()
+
+        bandwidth_mbps = estimate_bandwidth(
+            self.config.server_ip,
+            probe_size_bytes=int(getattr(self, "bandwidth_probe_size_bytes", 64 * 1024)),
+            timeout_sec=timeout_sec,
+        )
+        self._update_resource_probe_cache(
+            cloud_state=cloud_state,
+            bandwidth_mbps=bandwidth_mbps,
+        )
+
+    def resource_probe_worker(self) -> None:
+        while not self._stop_event.is_set():
+            self._refresh_resource_probe_cache()
+            if self._stop_event.wait(
+                float(getattr(self, "resource_probe_interval_sec", 5.0))
+            ):
+                return
+
     def _make_training_decision(
         self,
         *,
@@ -724,16 +840,10 @@ class EdgeWorker:
     ) -> TrainingDecision:
         if self.resource_trigger_enabled and self.resource_trigger is not None:
             try:
-                if self._cloud_state is None or self._cloud_state.is_stale(30.0):
-                    self._cloud_state = query_cloud_resource(
-                        self.config.server_ip,
-                        edge_id=self.edge_id,
-                        timeout_sec=3.0,
-                    )
-                bandwidth_mbps = estimate_bandwidth(self.config.server_ip)
+                cloud_state, bandwidth_mbps = self._resource_probe_snapshot()
                 return self.resource_trigger.decide(
                     drift_detected=drift_state.drift_detected,
-                    cloud_state=self._cloud_state,
+                    cloud_state=cloud_state,
                     bandwidth_mbps=bandwidth_mbps,
                     sample_stats=stats,
                 )
@@ -1138,8 +1248,13 @@ class EdgeWorker:
                         inserted = True
                 except Exception:
                     inserted = True
-        for thread in (self.diff_processor, self.local_processor, self.retrain_processor):
-            if thread.is_alive():
+        for thread in (
+            getattr(self, "diff_processor", None),
+            getattr(self, "local_processor", None),
+            getattr(self, "retrain_processor", None),
+            getattr(self, "resource_probe_processor", None),
+        ):
+            if thread is not None and thread.is_alive():
                 thread.join(timeout=timeout)
         writer = getattr(self, "sample_writer", None)
         if writer is not None:

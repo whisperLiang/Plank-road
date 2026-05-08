@@ -33,6 +33,9 @@ server:
     assert config.client.resource_aware_trigger.bundle_max_bytes == 33554432
     assert config.client.resource_aware_trigger.bundle_min_bytes == 8388608
     assert config.client.resource_aware_trigger.bundle_target_upload_sec == pytest.approx(45.0)
+    assert config.client.resource_aware_trigger.probe_interval_sec == pytest.approx(5.0)
+    assert config.client.resource_aware_trigger.probe_timeout_sec == pytest.approx(3.0)
+    assert config.client.resource_aware_trigger.bandwidth_probe_size_bytes == 65536
     assert config.client.final_detection_threshold == 0.5
     assert config.server.golden == "yolo26x"
     assert config.server.workspace_root == "./cache/cloud-workspace"
@@ -51,6 +54,9 @@ client:
     bundle_max_bytes: 16000000
     bundle_min_bytes: 4000000
     bundle_target_upload_sec: 30.0
+    probe_interval_sec: 7.5
+    probe_timeout_sec: 1.5
+    bandwidth_probe_size_bytes: 32768
 server:
   listen_address: "[::]:50051"
 """.strip(),
@@ -63,6 +69,9 @@ server:
     assert config.client.resource_aware_trigger.bundle_max_bytes == 16000000
     assert config.client.resource_aware_trigger.bundle_min_bytes == 4000000
     assert config.client.resource_aware_trigger.bundle_target_upload_sec == pytest.approx(30.0)
+    assert config.client.resource_aware_trigger.probe_interval_sec == pytest.approx(7.5)
+    assert config.client.resource_aware_trigger.probe_timeout_sec == pytest.approx(1.5)
+    assert config.client.resource_aware_trigger.bandwidth_probe_size_bytes == 32768
 
 
 @pytest.mark.parametrize(
@@ -80,6 +89,18 @@ server:
         (
             "resource_aware_trigger:\n    bundle_target_upload_sec: 0",
             "client.resource_aware_trigger.bundle_target_upload_sec",
+        ),
+        (
+            "resource_aware_trigger:\n    probe_interval_sec: 0",
+            "client.resource_aware_trigger.probe_interval_sec",
+        ),
+        (
+            "resource_aware_trigger:\n    probe_timeout_sec: 0",
+            "client.resource_aware_trigger.probe_timeout_sec",
+        ),
+        (
+            "resource_aware_trigger:\n    bandwidth_probe_size_bytes: 0",
+            "client.resource_aware_trigger.bandwidth_probe_size_bytes",
         ),
         (
             "resource_aware_trigger:\n    bundle_min_bytes: 10\n    bundle_max_bytes: 5",
