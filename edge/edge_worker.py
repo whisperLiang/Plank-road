@@ -851,6 +851,9 @@ class EdgeWorker:
         if self.retrain_flag:
             return
 
+        if not bool(drift_state.drift_detected):
+            return
+
         stats = PendingTrainingStats.from_mapping(self._stats_for_training_trigger())
         stats.drift_detected = bool(drift_state.drift_detected)
         decision = self._make_training_decision(

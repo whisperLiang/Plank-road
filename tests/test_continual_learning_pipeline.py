@@ -2957,6 +2957,7 @@ def test_cloud_materialized_low_quality_trigger_keeps_edge_metadata_out_of_stagi
             "input_resize_mode",
         }
         assert not any(field in record for field in forbidden_cache_fields)
+        assert record["input_image_size"] == [16, 16]
         assert "pseudo_boxes" not in record
         assert "pseudo_labels" not in record
     finally:

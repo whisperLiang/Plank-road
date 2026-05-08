@@ -433,7 +433,7 @@ class TestEdgeWorkerRouting:
             motion_uncovered_score=0.0,
             track_uncovered_score=0.0,
         )
-        drift_state = SimpleNamespace(drift_detected=False)
+        drift_state = SimpleNamespace(drift_detected=True)
         worker.candidate_builder = SimpleNamespace(build=lambda **kwargs: [])
         worker.motion_extractor = SimpleNamespace(extract=lambda *args: [])
         worker.track_manager = SimpleNamespace(update_and_get_missing_evidence=lambda **kwargs: [])
@@ -495,6 +495,72 @@ class TestEdgeWorkerRouting:
         assert worker.collect_flag is False
         assert worker.pending_training_decision is not None
         assert worker._retrain_requested.is_set() is True
+
+    def test_collect_data_skips_training_decision_without_drift(self, sample_bgr_frame):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        quality = QualityAssessment(
+            quality_bucket=LOW_QUALITY,
+            quality_score=0.2,
+            risk_score=0.8,
+            risk_reasons=["candidate_evidence_uncovered"],
+            evidence_count=1,
+            covered_evidence_count=0,
+            uncovered_evidence_count=1,
+            uncovered_evidence_rate=1.0,
+            candidate_uncovered_score=1.0,
+            motion_uncovered_score=0.0,
+            track_uncovered_score=0.0,
+        )
+        drift_state = SimpleNamespace(drift_detected=False)
+        worker.candidate_builder = SimpleNamespace(build=lambda **kwargs: [])
+        worker.motion_extractor = SimpleNamespace(extract=lambda *args: [])
+        worker.track_manager = SimpleNamespace(update_and_get_missing_evidence=lambda **kwargs: [])
+        worker.quality_assessor = SimpleNamespace(assess=lambda **kwargs: quality)
+        worker.window_drift_detector = SimpleNamespace(update=lambda *args, **kwargs: drift_state)
+        worker.previous_quality_frame = None
+        worker.fixed_split_plan = SimpleNamespace(split_config_id="plan-1")
+        worker.model_id = "yolo26n"
+        worker.model_version = "0"
+        worker.retrain_flag = False
+        worker.collect_flag = True
+        worker.pending_training_decision = None
+        worker._retrain_requested = threading.Event()
+        worker._next_sample_id = lambda task: "sample-1"
+        worker._make_training_decision = lambda **kwargs: pytest.fail(
+            "training decision should wait for drift"
+        )
+        stored = []
+        worker.sample_store = SimpleNamespace(
+            store_sample=lambda **kwargs: stored.append(kwargs)
+            or SimpleNamespace(sample_id="sample-1")
+        )
+
+        task = Task(
+            edge_id=1,
+            frame_index=7,
+            frame=sample_bgr_frame,
+            start_time=time.time(),
+            raw_shape=sample_bgr_frame.shape,
+        )
+        inference = InferenceArtifacts(
+            intermediate=object(),
+            final_detection_boxes=[],
+            final_detection_labels=[],
+            final_detection_scores=[],
+            low_threshold_boxes=[[0, 0, 10, 10]],
+            low_threshold_labels=[1],
+            low_threshold_scores=[0.9],
+            confidence=0.6,
+            input_tensor_shape=[1, 3, 384, 640],
+        )
+
+        worker.collect_data(task, sample_bgr_frame, inference)
+
+        assert len(stored) == 1
+        assert worker.retrain_flag is False
+        assert worker.collect_flag is True
+        assert worker.pending_training_decision is None
+        assert worker._retrain_requested.is_set() is False
 
     def test_close_sets_shutdown_events_and_joins_threads(self):
         worker = EdgeWorker.__new__(EdgeWorker)
