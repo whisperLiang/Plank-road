@@ -90,6 +90,34 @@ class ContinualLearningReply(_message.Message):
     protocol_version: str
     def __init__(self, success: bool = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ..., protocol_version: _Optional[str] = ...) -> None: ...
 
+class SampleSyncRequest(_message.Message):
+    __slots__ = ("protocol_version", "edge_id", "model_id", "model_version", "split_config_id", "sync_type", "payload_zip")
+    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    SPLIT_CONFIG_ID_FIELD_NUMBER: _ClassVar[int]
+    SYNC_TYPE_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_ZIP_FIELD_NUMBER: _ClassVar[int]
+    protocol_version: str
+    edge_id: int
+    model_id: str
+    model_version: str
+    split_config_id: str
+    sync_type: str
+    payload_zip: bytes
+    def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., model_id: _Optional[str] = ..., model_version: _Optional[str] = ..., split_config_id: _Optional[str] = ..., sync_type: _Optional[str] = ..., payload_zip: _Optional[bytes] = ...) -> None: ...
+
+class SampleSyncReply(_message.Message):
+    __slots__ = ("success", "message", "committed_samples")
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_SAMPLES_FIELD_NUMBER: _ClassVar[int]
+    success: bool
+    message: str
+    committed_samples: int
+    def __init__(self, success: bool = ..., message: _Optional[str] = ..., committed_samples: _Optional[int] = ...) -> None: ...
+
 class SubmitTrainingJobRequest(_message.Message):
     __slots__ = ("protocol_version", "edge_id", "request_id", "job_type", "cache_path", "send_low_conf_features", "frame_indices", "all_frame_indices", "drift_frame_indices", "payload_zip", "base_model_version")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]

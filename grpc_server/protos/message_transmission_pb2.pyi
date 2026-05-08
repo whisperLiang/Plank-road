@@ -90,6 +90,34 @@ class ContinualLearningReply(_message.Message):
     protocol_version: str
     def __init__(self, success: bool = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ..., protocol_version: _Optional[str] = ...) -> None: ...
 
+class SampleSyncRequest(_message.Message):
+    __slots__ = ("protocol_version", "edge_id", "model_id", "model_version", "split_config_id", "sync_type", "payload_zip")
+    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    SPLIT_CONFIG_ID_FIELD_NUMBER: _ClassVar[int]
+    SYNC_TYPE_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_ZIP_FIELD_NUMBER: _ClassVar[int]
+    protocol_version: str
+    edge_id: int
+    model_id: str
+    model_version: str
+    split_config_id: str
+    sync_type: str
+    payload_zip: bytes
+    def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., model_id: _Optional[str] = ..., model_version: _Optional[str] = ..., split_config_id: _Optional[str] = ..., sync_type: _Optional[str] = ..., payload_zip: _Optional[bytes] = ...) -> None: ...
+
+class SampleSyncReply(_message.Message):
+    __slots__ = ("success", "message", "committed_samples")
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_SAMPLES_FIELD_NUMBER: _ClassVar[int]
+    success: bool
+    message: str
+    committed_samples: int
+    def __init__(self, success: bool = ..., message: _Optional[str] = ..., committed_samples: _Optional[int] = ...) -> None: ...
+
 class SubmitTrainingJobRequest(_message.Message):
     __slots__ = ("protocol_version", "edge_id", "request_id", "job_type", "cache_path", "send_low_conf_features", "frame_indices", "all_frame_indices", "drift_frame_indices", "payload_zip", "base_model_version")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
@@ -115,36 +143,6 @@ class SubmitTrainingJobRequest(_message.Message):
     payload_zip: bytes
     base_model_version: str
     def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., cache_path: _Optional[str] = ..., send_low_conf_features: bool = ..., frame_indices: _Optional[_Iterable[int]] = ..., all_frame_indices: _Optional[_Iterable[int]] = ..., drift_frame_indices: _Optional[_Iterable[int]] = ..., payload_zip: _Optional[bytes] = ..., base_model_version: _Optional[str] = ...) -> None: ...
-
-class SubmitTrainingJobChunk(_message.Message):
-    __slots__ = ("protocol_version", "edge_id", "request_id", "job_type", "cache_path", "send_low_conf_features", "frame_indices", "all_frame_indices", "drift_frame_indices", "payload_chunk", "base_model_version", "chunk_index", "total_payload_bytes")
-    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
-    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
-    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
-    JOB_TYPE_FIELD_NUMBER: _ClassVar[int]
-    CACHE_PATH_FIELD_NUMBER: _ClassVar[int]
-    SEND_LOW_CONF_FEATURES_FIELD_NUMBER: _ClassVar[int]
-    FRAME_INDICES_FIELD_NUMBER: _ClassVar[int]
-    ALL_FRAME_INDICES_FIELD_NUMBER: _ClassVar[int]
-    DRIFT_FRAME_INDICES_FIELD_NUMBER: _ClassVar[int]
-    PAYLOAD_CHUNK_FIELD_NUMBER: _ClassVar[int]
-    BASE_MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
-    CHUNK_INDEX_FIELD_NUMBER: _ClassVar[int]
-    TOTAL_PAYLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
-    protocol_version: str
-    edge_id: int
-    request_id: str
-    job_type: TrainingJobType
-    cache_path: str
-    send_low_conf_features: bool
-    frame_indices: _containers.RepeatedScalarFieldContainer[int]
-    all_frame_indices: _containers.RepeatedScalarFieldContainer[int]
-    drift_frame_indices: _containers.RepeatedScalarFieldContainer[int]
-    payload_chunk: bytes
-    base_model_version: str
-    chunk_index: int
-    total_payload_bytes: int
-    def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., cache_path: _Optional[str] = ..., send_low_conf_features: bool = ..., frame_indices: _Optional[_Iterable[int]] = ..., all_frame_indices: _Optional[_Iterable[int]] = ..., drift_frame_indices: _Optional[_Iterable[int]] = ..., payload_chunk: _Optional[bytes] = ..., base_model_version: _Optional[str] = ..., chunk_index: _Optional[int] = ..., total_payload_bytes: _Optional[int] = ...) -> None: ...
 
 class SubmitTrainingJobReply(_message.Message):
     __slots__ = ("accepted", "job_id", "status", "queue_position", "message")

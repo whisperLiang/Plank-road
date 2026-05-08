@@ -49,6 +49,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.ContinualLearningRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.ContinualLearningReply.FromString,
                 _registered_method=True)
+        self.sync_samples = channel.unary_unary(
+                '/MessageTransmission/sync_samples',
+                request_serializer=message__transmission__pb2.SampleSyncRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.SampleSyncReply.FromString,
+                _registered_method=True)
         self.submit_training_job = channel.unary_unary(
                 '/MessageTransmission/submit_training_job',
                 request_serializer=message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
@@ -103,6 +108,13 @@ class MessageTransmissionServicer(object):
 
     def continual_learning_request(self, request, context):
         """Versioned continual-learning bundle upload for the fixed-split pipeline.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def sync_samples(self, request, context):
+        """Sharded sample pool exchange without creating a training job.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -167,6 +179,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.continual_learning_request,
                     request_deserializer=message__transmission__pb2.ContinualLearningRequest.FromString,
                     response_serializer=message__transmission__pb2.ContinualLearningReply.SerializeToString,
+            ),
+            'sync_samples': grpc.unary_unary_rpc_method_handler(
+                    servicer.sync_samples,
+                    request_deserializer=message__transmission__pb2.SampleSyncRequest.FromString,
+                    response_serializer=message__transmission__pb2.SampleSyncReply.SerializeToString,
             ),
             'submit_training_job': grpc.unary_unary_rpc_method_handler(
                     servicer.submit_training_job,
@@ -280,6 +297,33 @@ class MessageTransmission(object):
             '/MessageTransmission/continual_learning_request',
             message__transmission__pb2.ContinualLearningRequest.SerializeToString,
             message__transmission__pb2.ContinualLearningReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def sync_samples(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/sync_samples',
+            message__transmission__pb2.SampleSyncRequest.SerializeToString,
+            message__transmission__pb2.SampleSyncReply.FromString,
             options,
             channel_credentials,
             insecure,

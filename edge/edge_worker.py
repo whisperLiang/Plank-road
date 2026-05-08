@@ -24,6 +24,7 @@ from edge.resource_aware_trigger import (
     estimate_bandwidth,
     query_cloud_resource,
 )
+from edge.sample_sync import HighQualitySampleSyncer
 from edge.sample_store import EdgeSampleStore
 from edge.task import Task
 from edge.transmit import (
@@ -260,6 +261,13 @@ class EdgeWorker:
         )
         self.model_id = getattr(self.small_object_detection, "model_name", "edge-model")
         self.model_version = "0"
+        self.sample_syncer = HighQualitySampleSyncer(
+            self.sample_store,
+            server_ip=self.config.server_ip,
+            edge_id=self.edge_id,
+            sample_pool_config=getattr(self.config, "sample_pool", None),
+            context_provider=self._sample_sync_context,
+        )
         self.bundle_cache_path = os.path.join(self.config.retrain.cache_path, "server_bundle")
         self.min_low_quality_samples = int(
             getattr(
@@ -291,6 +299,7 @@ class EdgeWorker:
         self._stop_event = threading.Event()
         self._retrain_requested = threading.Event()
         self._closed = False
+        self.sample_syncer.start()
 
         self.diff_processor = threading.Thread(target=self.diff_worker, daemon=False)
         self.local_processor = threading.Thread(target=self.local_worker, daemon=False)
@@ -463,7 +472,7 @@ class EdgeWorker:
     def _on_sample_write_done(
         self,
         job: SampleWriteJob,
-        _record: object | None,
+        record: object | None,
         error: BaseException | None,
     ) -> None:
         self._apply_pending_sample_stats(job.stats_delta, sign=-1)
@@ -473,6 +482,32 @@ class EdgeWorker:
                 job.store_kwargs.get("sample_id"),
                 error,
             )
+            return
+        if record is not None:
+            self._notify_sample_syncer(record)
+
+    def _notify_sample_syncer(self, record: object) -> None:
+        syncer = getattr(self, "sample_syncer", None)
+        if syncer is None:
+            return
+        try:
+            syncer.notify_sample(record)
+        except Exception as exc:
+            logger.warning(
+                "Failed to queue high-quality sample {} for background sync: {}",
+                getattr(record, "sample_id", None),
+                exc,
+            )
+
+    def _sample_sync_context(self) -> dict[str, object]:
+        split_plan = getattr(self, "fixed_split_plan", None)
+        return {
+            "model_id": str(getattr(self, "model_id", "") or ""),
+            "model_version": str(getattr(self, "model_version", "") or ""),
+            "split_config_id": str(getattr(split_plan, "split_config_id", "") or ""),
+            "split_label": getattr(split_plan, "split_label", None),
+            "boundary_tensor_labels": list(getattr(split_plan, "boundary_tensor_labels", []) or []),
+        }
 
     def _stats_for_training_trigger(self) -> dict[str, Any]:
         stats = dict(self.sample_store.stats())
@@ -528,7 +563,8 @@ class EdgeWorker:
     def _submit_sample_write(self, job: SampleWriteJob) -> None:
         writer = getattr(self, "sample_writer", None)
         if writer is None:
-            self.sample_store.store_sample(**job.store_kwargs)
+            record = self.sample_store.store_sample(**job.store_kwargs)
+            self._notify_sample_syncer(record)
             return
         self._apply_pending_sample_stats(job.stats_delta, sign=1)
         try:
@@ -539,7 +575,8 @@ class EdgeWorker:
                 "Async sample writer unavailable; storing sample {} synchronously.",
                 job.store_kwargs.get("sample_id"),
             )
-            self.sample_store.store_sample(**job.store_kwargs)
+            record = self.sample_store.store_sample(**job.store_kwargs)
+            self._notify_sample_syncer(record)
 
     def _flush_sample_writer(self, *, timeout: float = 10.0) -> bool:
         writer = getattr(self, "sample_writer", None)
@@ -550,6 +587,25 @@ class EdgeWorker:
         except Exception as exc:
             logger.error("Failed to flush async sample writer: {}", exc)
             return False
+
+    def _flush_sample_syncer(self, *, timeout: float = 10.0) -> bool:
+        syncer = getattr(self, "sample_syncer", None)
+        if syncer is None:
+            return True
+        try:
+            return bool(syncer.flush(timeout=timeout, include_partial=True))
+        except Exception as exc:
+            logger.error("Failed to flush high-quality sample syncer: {}", exc)
+            return False
+
+    def _sample_pool_shard_size(self) -> int | None:
+        sample_pool_cfg = getattr(self.config, "sample_pool", None)
+        if sample_pool_cfg is None:
+            return None
+        try:
+            return max(1, int(getattr(sample_pool_cfg, "shard_size")))
+        except Exception:
+            return None
 
     def submit_task(self, task: Task) -> Task:
         self.frame_cache.put(task, block=True)
@@ -843,6 +899,11 @@ class EdgeWorker:
                     logger.warning(
                         "Timed out while flushing pending sample writes before continual learning upload."
                     )
+                if not self._flush_sample_syncer(timeout=30.0):
+                    logger.warning(
+                        "Timed out while syncing high-quality samples before "
+                        "continual learning upload."
+                    )
                 accepted, job_id, msg = submit_continual_learning_job(
                     self.config.server_ip,
                     edge_id=self.edge_id,
@@ -852,6 +913,7 @@ class EdgeWorker:
                     model_version=self.model_version,
                     send_low_conf_features=decision.send_low_conf_features,
                     bundle_cap_bytes=decision.bundle_cap_bytes,
+                    trigger_shard_size=self._sample_pool_shard_size(),
                     bandwidth_mbps=decision.bandwidth_mbps,
                     channel=training_channel,
                 )
@@ -1080,6 +1142,10 @@ class EdgeWorker:
         if writer is not None:
             if not writer.close(timeout=timeout):
                 logger.warning("Timed out while closing async sample writer.")
+        syncer = getattr(self, "sample_syncer", None)
+        if syncer is not None:
+            if not syncer.close(timeout=timeout):
+                logger.warning("Timed out while closing high-quality sample syncer.")
 
     def diff_worker(self):
         if not self.config.diff_flag:

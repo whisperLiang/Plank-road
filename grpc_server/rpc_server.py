@@ -1,6 +1,7 @@
 import io
 import json
 import zipfile
+from pathlib import Path
 
 from loguru import logger
 
@@ -224,6 +225,70 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             protocol_version=request.protocol_version,
         )
 
+    def sync_samples(self, request, context):
+        logger.info(
+            "sync_samples edge_id={} sync_type={} payload_zip={} model_id={} model_version={} split_config_id={}",
+            request.edge_id,
+            request.sync_type,
+            len(getattr(request, "payload_zip", b"") or b""),
+            request.model_id,
+            request.model_version,
+            request.split_config_id,
+        )
+        if self.edge_registry is not None:
+            self.edge_registry.touch(int(request.edge_id))
+
+        if self.continual_learner is None:
+            logger.error("sync_samples: continual_learner not configured")
+            return message_transmission_pb2.SampleSyncReply(
+                success=False,
+                message="continual_learner not configured",
+            )
+
+        sync_method = getattr(self.continual_learner, "sync_samples", None)
+        if sync_method is None:
+            logger.error("sync_samples: continual_learner has no sample sync method")
+            return message_transmission_pb2.SampleSyncReply(
+                success=False,
+                message="continual_learner has no sample sync method",
+            )
+
+        try:
+            result = sync_method(
+                edge_id=int(request.edge_id),
+                protocol_version=str(request.protocol_version or ""),
+                sync_type=str(request.sync_type or ""),
+                payload_zip=bytes(request.payload_zip or b""),
+                model_id=str(request.model_id or ""),
+                model_version=str(request.model_version or ""),
+                split_config_id=str(request.split_config_id or ""),
+            )
+            if isinstance(result, message_transmission_pb2.SampleSyncReply):
+                return result
+            if isinstance(result, tuple):
+                values = list(result)
+                return message_transmission_pb2.SampleSyncReply(
+                    success=bool(values[0]) if values else True,
+                    message=str(values[1]) if len(values) > 1 else "sample sync completed",
+                    committed_samples=int(values[2] or 0) if len(values) > 2 else 0,
+                )
+            if isinstance(result, dict):
+                return message_transmission_pb2.SampleSyncReply(
+                    success=bool(result.get("success", True)),
+                    message=str(result.get("message", "sample sync completed")),
+                    committed_samples=int(result.get("committed_samples", 0) or 0),
+                )
+            return message_transmission_pb2.SampleSyncReply(
+                success=bool(result),
+                message="sample sync completed",
+            )
+        except Exception as exc:
+            logger.exception("sync_samples error: {}", exc)
+            return message_transmission_pb2.SampleSyncReply(
+                success=False,
+                message=str(exc),
+            )
+
     def _async_not_configured_reply(self, method_name: str):
         if self.continual_learner is None or self.training_job_manager is None:
             logger.error("{}: async training is not configured", method_name)
@@ -249,13 +314,27 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             manifest = None
             if payload_zip:
                 with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as archive:
-                    with archive.open("bundle_manifest.json", "r") as handle:
+                    manifest_name = (
+                        "bundle_manifest.json"
+                        if "bundle_manifest.json" in archive.namelist()
+                        else "trigger_manifest.json"
+                    )
+                    with archive.open(manifest_name, "r") as handle:
                         manifest = json.loads(handle.read().decode("utf-8"))
             else:
-                from model_management.continual_learning_bundle import load_training_bundle_manifest
-                manifest = load_training_bundle_manifest(str(workspace))
+                trigger_manifest_path = Path(workspace) / "trigger_manifest.json"
+                if trigger_manifest_path.exists():
+                    manifest = json.loads(trigger_manifest_path.read_text(encoding="utf-8"))
+                else:
+                    from model_management.continual_learning_bundle import load_training_bundle_manifest
+                    manifest = load_training_bundle_manifest(str(workspace))
             if manifest is not None:
                 model_info = manifest.get("model", {})
+                if not model_info:
+                    model_info = {
+                        "model_id": manifest.get("model_id", ""),
+                        "model_version": manifest.get("model_version", ""),
+                    }
                 base_model_version = str(model_info.get("model_version", base_model_version))
                 if self.edge_registry is not None:
                     self.edge_registry.touch(

@@ -132,6 +132,17 @@ class ContinualLearningConfig(ConfigSection):
 
 
 @dataclass
+class SamplePoolConfig(ConfigSection):
+    enabled: bool = True
+    shard_size: int = 64
+    sync_interval_sec: float = 30.0
+    max_samples: int = 5000
+    root_dir: str = "./cache/cloud_sample_pool"
+    compact_threshold: float = 0.3
+    enable_timing_logs: bool = False
+
+
+@dataclass
 class DASConfig(ConfigSection):
     enabled: bool = False
     bn_only: bool = False
@@ -162,6 +173,7 @@ class ClientConfig(ConfigSection):
         default_factory=ResourceAwareTriggerConfig
     )
     split_learning: SplitLearningConfig = field(default_factory=SplitLearningConfig)
+    sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
 
 
 @dataclass
@@ -175,15 +187,23 @@ class ServerConfig(ConfigSection):
     continual_learning: ContinualLearningConfig = field(default_factory=ContinualLearningConfig)
     das: DASConfig = field(default_factory=DASConfig)
     workspace_root: str = "./cache/server_workspace"
+    sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
 
 
 @dataclass
 class RuntimeConfig(ConfigSection):
     client: ClientConfig = field(default_factory=ClientConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
+
+    def __post_init__(self) -> None:
+        self.client.sample_pool = self.sample_pool
+        self.server.sample_pool = self.sample_pool
 
 
 def _section(section_cls, value: Mapping[str, Any] | None):
+    if isinstance(value, section_cls):
+        return value
     data = dict(value or {})
     field_names = set(section_cls.__dataclass_fields__.keys()) - {"_extras"}
     known: dict[str, Any] = {}
@@ -199,6 +219,7 @@ def _section(section_cls, value: Mapping[str, Any] | None):
     elif section_cls is SplitLearningConfig:
         known["fixed_split"] = _section(FixedSplitConfig, known.get("fixed_split"))
     elif section_cls is ClientConfig:
+        known["sample_pool"] = _section(SamplePoolConfig, known.get("sample_pool"))
         known["source"] = _section(SourceConfig, known.get("source"))
         known["retrain"] = _section(RetrainConfig, known.get("retrain"))
         known["sample_quality"] = _section(
@@ -218,14 +239,21 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             known.get("split_learning"),
         )
     elif section_cls is ServerConfig:
+        known["sample_pool"] = _section(SamplePoolConfig, known.get("sample_pool"))
         known["continual_learning"] = _section(
             ContinualLearningConfig,
             known.get("continual_learning"),
         )
         known["das"] = _section(DASConfig, known.get("das"))
     elif section_cls is RuntimeConfig:
-        known["client"] = _section(ClientConfig, known.get("client"))
-        known["server"] = _section(ServerConfig, known.get("server"))
+        sample_pool = _section(SamplePoolConfig, known.get("sample_pool"))
+        client_data = dict(known.get("client") or {})
+        client_data["sample_pool"] = sample_pool
+        server_data = dict(known.get("server") or {})
+        server_data["sample_pool"] = sample_pool
+        known["sample_pool"] = sample_pool
+        known["client"] = _section(ClientConfig, client_data)
+        known["server"] = _section(ServerConfig, server_data)
 
     return section_cls(**known, _extras=extras)
 
@@ -283,6 +311,30 @@ def _validate_threshold_candidates(name: str, value: object) -> None:
             )
 
 
+def _validate_sample_pool_config(name: str, value: SamplePoolConfig) -> None:
+    if not isinstance(value.enabled, bool):
+        raise ValueError(
+            f"{name}.enabled must be a boolean, "
+            f"got {value.enabled!r}"
+        )
+    _validate_positive(f"{name}.shard_size", int(value.shard_size))
+    _validate_positive(f"{name}.sync_interval_sec", float(value.sync_interval_sec))
+    _validate_positive(f"{name}.max_samples", int(value.max_samples))
+    compact_threshold = float(value.compact_threshold)
+    if not 0.0 < compact_threshold <= 1.0:
+        raise ValueError(
+            f"{name}.compact_threshold must be within (0, 1], "
+            f"got {value.compact_threshold!r}"
+        )
+    if not isinstance(value.root_dir, str) or not value.root_dir.strip():
+        raise ValueError(f"{name}.root_dir must be non-empty")
+    if not isinstance(value.enable_timing_logs, bool):
+        raise ValueError(
+            f"{name}.enable_timing_logs must be a boolean, "
+            f"got {value.enable_timing_logs!r}"
+        )
+
+
 def _validate_runtime_config(config: RuntimeConfig) -> None:
     removed_fields = {
         "client.retrain.batch_size": (
@@ -319,6 +371,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         if getattr(config.server.continual_learning, field_name, None) is not None:
             raise ValueError(message)
 
+    _validate_sample_pool_config("sample_pool", config.sample_pool)
     _validate_positive("client.interval", int(config.client.interval))
     _validate_positive("client.local_queue_maxsize", int(config.client.local_queue_maxsize))
     _validate_positive("client.wait_thresh", int(config.client.wait_thresh))

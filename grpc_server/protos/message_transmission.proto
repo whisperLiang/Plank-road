@@ -10,6 +10,8 @@ service MessageTransmission {
   rpc split_train_request (SplitTrainRequest) returns (SplitTrainReply) {}
   // Versioned continual-learning bundle upload for the fixed-split pipeline.
   rpc continual_learning_request (ContinualLearningRequest) returns (ContinualLearningReply) {}
+  // Sharded sample pool exchange without creating a training job.
+  rpc sync_samples (SampleSyncRequest) returns (SampleSyncReply) {}
   // Async training job submission for edge-triggered continual learning.
   rpc submit_training_job (SubmitTrainingJobRequest) returns (SubmitTrainingJobReply) {}
   // Poll async training job status by job_id.
@@ -80,6 +82,22 @@ message ContinualLearningReply {
   string model_data = 2;
   string message = 3;
   string protocol_version = 4;
+}
+
+message SampleSyncRequest {
+  string protocol_version = 1;
+  int64 edge_id = 2;
+  string model_id = 3;
+  string model_version = 4;
+  string split_config_id = 5;
+  string sync_type = 6;
+  bytes payload_zip = 7;
+}
+
+message SampleSyncReply {
+  bool success = 1;
+  string message = 2;
+  int64 committed_samples = 3;
 }
 
 message SubmitTrainingJobRequest {

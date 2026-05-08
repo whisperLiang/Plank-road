@@ -10,6 +10,8 @@ import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from grpc_server import message_transmission_pb2
 from grpc_server.rpc_server import (
     MessageTransmissionServicer,
@@ -28,6 +30,63 @@ def _zip_bytes(entries: dict[str, bytes]) -> bytes:
         for relative_path, payload in entries.items():
             archive.writestr(relative_path, payload)
     return buffer.getvalue()
+
+
+def _require_sync_samples_rpc():
+    request_cls = getattr(message_transmission_pb2, "SyncSamplesRequest", None)
+    if request_cls is None:
+        request_cls = getattr(message_transmission_pb2, "SampleSyncRequest", None)
+    if request_cls is None or not hasattr(MessageTransmissionServicer, "sync_samples"):
+        pytest.skip("sync_samples RPC is not available yet")
+    return request_cls
+
+
+def _make_sync_samples_request(**overrides):
+    request_cls = _require_sync_samples_rpc()
+    fields = request_cls.DESCRIPTOR.fields_by_name
+    defaults = {
+        "protocol_version": "edge-sample-pool.v1",
+        "edge_id": 9,
+        "sync_type": "raw_plus_feature",
+        "request_id": "sync-req-1",
+        "cache_path": "edge_9/sync_samples",
+        "payload_zip": _zip_bytes(
+            {
+                "sample_manifest.json": b'{"samples": [{"sample_id": "sample-1"}]}',
+                "raw/sample-1.jpg": b"raw-bytes",
+                "features/sample-1.pt": b"feature-bytes",
+            }
+        ),
+        "model_id": "model-a",
+        "model_version": "model-v1",
+        "split_config_id": "split-a",
+        "split_id": "split-1",
+        "split_index": 3,
+        "split_label": "layer-3",
+        "trace_signature": "trace-a",
+        "graph_signature": "graph-a",
+        "base_model_version": "model-v1",
+    }
+    values = {
+        name: value
+        for name, value in {**defaults, **overrides}.items()
+        if name in fields
+    }
+    return request_cls(**values)
+
+
+def _sync_reply_success(reply):
+    for field_name in ("success", "accepted", "ok"):
+        if hasattr(reply, field_name):
+            return bool(getattr(reply, field_name))
+    pytest.fail("SyncSamplesReply needs a success/accepted/ok field")
+
+
+def _sync_reply_message(reply):
+    for field_name in ("message", "status_message", "error"):
+        if hasattr(reply, field_name):
+            return str(getattr(reply, field_name))
+    return ""
 
 
 class TestResourceHelpers:
@@ -328,3 +387,46 @@ class TestMessageTransmissionServicer:
             assert "already exists" in second.message
         finally:
             manager.close()
+
+    def test_sync_samples_returns_not_configured_without_learner(self, tmp_path):
+        _require_sync_samples_rpc()
+        svc = self._make_servicer(tmp_path, continual_learner=None)
+        request = _make_sync_samples_request(edge_id=11)
+
+        reply = svc.sync_samples(request, MagicMock())
+
+        assert _sync_reply_success(reply) is False
+        assert "not configured" in _sync_reply_message(reply).lower()
+
+    def test_sync_samples_forwards_payload_and_model_metadata_to_mock_learner(self, tmp_path):
+        _require_sync_samples_rpc()
+        mock_learner = MagicMock()
+        mock_learner.sync_samples.return_value = {
+            "success": True,
+            "message": "stored samples",
+            "committed_samples": 2,
+        }
+        svc = self._make_servicer(tmp_path, continual_learner=mock_learner)
+        payload_zip = _zip_bytes(
+            {
+                "sample_manifest.json": b'{"samples": [{"sample_id": "sample-1"}]}',
+                "raw/sample-1.jpg": b"raw-bytes",
+                "features/sample-1.pt": b"feature-bytes",
+            }
+        )
+        request = _make_sync_samples_request(edge_id=12, payload_zip=payload_zip)
+
+        reply = svc.sync_samples(request, MagicMock())
+
+        assert _sync_reply_success(reply) is True
+        assert reply.committed_samples == 2
+        mock_learner.sync_samples.assert_called_once()
+        args, kwargs = mock_learner.sync_samples.call_args
+        assert args == ()
+        assert kwargs["edge_id"] == 12
+        assert kwargs["protocol_version"] == "edge-sample-pool.v1"
+        assert kwargs["sync_type"] == "raw_plus_feature"
+        assert kwargs["payload_zip"] == payload_zip
+        assert kwargs["model_id"] == "model-a"
+        assert kwargs["model_version"] == "model-v1"
+        assert kwargs["split_config_id"] == "split-a"

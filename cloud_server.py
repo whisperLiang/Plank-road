@@ -9,8 +9,10 @@ import math
 import os
 import re
 import shutil
+import tarfile
 import threading
 import time
+import zipfile
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -28,8 +30,10 @@ from config import load_runtime_config
 from loguru import logger
 from grpc_server.rpc_server import MessageTransmissionServicer
 from grpc_server.training_jobs import TrainingJobManager
+from grpc_server.workspace import prepare_request_workspace
 from tools.grpc_options import grpc_message_options
 from cloud.edge_registry import EdgeRegistry
+from cloud.sample_pool import CloudSamplePool
 
 import model_management.model_zoo as model_zoo
 from model_management.object_detection import Object_Detection
@@ -75,7 +79,7 @@ from model_management.fixed_split_runtime_template import (
     get_fixed_split_runtime_template_cache,
 )
 from model_management.split_runtime import compare_outputs, make_split_spec, prepare_split_runtime
-from model_management.payload import BoundaryPayload
+from model_management.payload import BoundaryPayload, SplitPayload
 from torchvision.models.detection.image_list import ImageList
 
 from grpc_server import message_transmission_pb2_grpc
@@ -1607,6 +1611,49 @@ class CloudContinualLearner:
             "fixed_split_working_cache",
         )
         os.makedirs(self.fixed_split_cache_root, exist_ok=True)
+        sample_pool_cfg = getattr(config, "sample_pool", None)
+        self.sample_pool_enabled = (
+            bool(getattr(sample_pool_cfg, "enabled", True))
+            if sample_pool_cfg is not None
+            else True
+        )
+        self.sample_pool_root = os.path.abspath(
+            str(
+                getattr(
+                    sample_pool_cfg,
+                    "root_dir",
+                    os.path.join(self.workspace_root, "cloud_sample_pool"),
+                )
+            )
+        )
+        os.makedirs(self.sample_pool_root, exist_ok=True)
+        raw_sample_pool_max = (
+            getattr(sample_pool_cfg, "max_samples", None)
+            if sample_pool_cfg is not None
+            else getattr(cl_cfg, "sample_pool_max_active_samples", None)
+            if cl_cfg
+            else None
+        )
+        self.sample_pool_max_active_samples = (
+            None
+            if raw_sample_pool_max in (None, "", 0)
+            else int(raw_sample_pool_max)
+        )
+        self.sample_pool_reader_cache_size = (
+            int(getattr(cl_cfg, "sample_pool_reader_cache_size", 4))
+            if cl_cfg
+            else 4
+        )
+        self.sample_pool_shard_size = (
+            max(1, int(getattr(sample_pool_cfg, "shard_size", 64)))
+            if sample_pool_cfg is not None
+            else 64
+        )
+        self.sample_pool_enable_timing_logs = (
+            bool(getattr(sample_pool_cfg, "enable_timing_logs", False))
+            if sample_pool_cfg is not None
+            else False
+        )
         self._fixed_split_runtime_template_cache = (
             get_fixed_split_runtime_template_cache()
         )
@@ -1649,6 +1696,421 @@ class CloudContinualLearner:
             _sanitize_cache_segment(model_name),
             "working_cache",
         )
+
+    @staticmethod
+    def _sample_pool_manifest_context(
+        manifest: Mapping[str, object],
+    ) -> dict[str, object]:
+        model_meta = dict(manifest.get("model", {}) or {})
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        return {
+            "model_id": str(manifest.get("model_id") or model_meta.get("model_id", "") or ""),
+            "model_version": str(
+                manifest.get("model_version") or model_meta.get("model_version", "") or ""
+            ),
+            "split_config_id": str(
+                manifest.get("split_config_id") or split_plan.get("split_config_id", "") or ""
+            ),
+            "split_label": manifest.get("split_label")
+            if "split_label" in manifest
+            else split_plan.get("split_label"),
+            "boundary_tensor_labels": list(
+                manifest.get("boundary_tensor_labels")
+                or split_plan.get("boundary_tensor_labels", [])
+                or []
+            ),
+        }
+
+    def _cloud_sample_pool_path(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+    ) -> str:
+        context = self._sample_pool_manifest_context(manifest)
+        split_key = str(context.get("split_config_id", "") or "").strip()
+        if not split_key:
+            split_key = _json_fingerprint(
+                {
+                    "split_label": context.get("split_label"),
+                    "boundary_tensor_labels": list(
+                        context.get("boundary_tensor_labels", []) or []
+                    ),
+                }
+            )[:16]
+        return os.path.join(
+            self.sample_pool_root,
+            f"edge_{_sanitize_cache_segment(edge_id)}",
+            _sanitize_cache_segment(context.get("model_id") or "unknown_model"),
+            f"version_{_sanitize_cache_segment(context.get('model_version') or '0')}",
+            _sanitize_cache_segment(split_key),
+        )
+
+    def _cloud_sample_pool_for_manifest(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+    ) -> CloudSamplePool:
+        context = self._sample_pool_manifest_context(manifest)
+        return CloudSamplePool(
+            self._cloud_sample_pool_path(edge_id=edge_id, manifest=manifest),
+            model_id=str(context.get("model_id", "") or ""),
+            model_version=str(context.get("model_version", "") or ""),
+            split_config_id=str(context.get("split_config_id", "") or ""),
+            split_label=(
+                None
+                if context.get("split_label") is None
+                else str(context.get("split_label"))
+            ),
+            boundary_tensor_labels=list(
+                context.get("boundary_tensor_labels", []) or []
+            ),
+            max_active_samples=self.sample_pool_max_active_samples,
+            shard_size=self.sample_pool_shard_size,
+            reader_cache_size=self.sample_pool_reader_cache_size,
+        )
+
+    @staticmethod
+    def _pool_annotations_from_labels(
+        labels: Mapping[str, object],
+    ) -> dict[str, list[object]]:
+        annotations = {
+            "boxes": list(labels.get("boxes") or []),
+            "labels": list(labels.get("labels") or []),
+        }
+        if "scores" in labels:
+            annotations["scores"] = list(labels.get("scores") or [])
+        return annotations
+
+    def _build_low_quality_pool_samples(
+        self,
+        *,
+        manifest: Mapping[str, object],
+        prepared_sample_ids,
+        working_cache: str,
+        gt_annotations: Mapping[str, Mapping[str, object]],
+        preloaded_records: Mapping[object, Mapping[str, object]] | None,
+    ) -> list[dict[str, object]]:
+        prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
+        processed_samples: list[dict[str, object]] = []
+        for sample in manifest.get("samples", []):
+            if not isinstance(sample, Mapping):
+                continue
+            if str(sample.get("quality_bucket", "")).strip() != "low_quality":
+                continue
+            sample_id = str(sample.get("sample_id", "")).strip()
+            if not sample_id or sample_id not in prepared_lookup:
+                continue
+            labels = gt_annotations.get(sample_id)
+            if labels is None:
+                continue
+            record = _lookup_preloaded_record(preloaded_records, sample_id)
+            if record is None:
+                try:
+                    record = load_split_feature_cache(working_cache, sample_id)
+                except FileNotFoundError:
+                    logger.warning(
+                        "[FixedSplitCL] Low-quality sample {} was teacher-labeled but has no cached split feature record; skipping pool commit.",
+                        sample_id,
+                    )
+                    continue
+            processed_samples.append(
+                {
+                    "sample_id": sample_id,
+                    "feature_record": dict(record),
+                    "labels": self._pool_annotations_from_labels(labels),
+                    "created_at": time.time(),
+                }
+            )
+        return processed_samples
+
+    @staticmethod
+    def _low_quality_feature_matches_split_plan(
+        feature_path: str,
+        split_plan: Mapping[str, object],
+    ) -> bool:
+        try:
+            payload = torch.load(feature_path, map_location="cpu", weights_only=False)
+        except Exception:
+            return False
+        if isinstance(payload, Mapping) and "intermediate" in payload:
+            intermediate = payload.get("intermediate")
+        else:
+            intermediate = payload
+        if not isinstance(intermediate, BoundaryPayload):
+            return True
+
+        expected_boundary = [
+            str(label)
+            for label in list(split_plan.get("boundary_tensor_labels", []) or [])
+        ]
+        actual_boundary = [
+            str(label)
+            for label in list(
+                getattr(
+                    intermediate,
+                    "boundary_tensor_labels",
+                    list(getattr(intermediate, "tensors", {}).keys()),
+                )
+                or []
+            )
+        ]
+        if expected_boundary and actual_boundary and actual_boundary != expected_boundary:
+            return False
+
+        expected_split_label = split_plan.get("split_label")
+        actual_split_label = getattr(intermediate, "split_label", None)
+        if actual_split_label is None:
+            actual_split_label = getattr(intermediate, "split_id", None)
+        if (
+            expected_split_label is not None
+            and actual_split_label is not None
+            and str(actual_split_label) != str(expected_split_label)
+        ):
+            return False
+        return True
+
+    def _disable_incompatible_low_quality_features(
+        self,
+        *,
+        bundle_cache_path: str,
+        manifest: dict[str, object],
+    ) -> int:
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        samples = list(manifest.get("samples", []) or [])
+        disabled_count = 0
+        for sample in samples:
+            if not isinstance(sample, dict):
+                continue
+            if str(sample.get("quality_bucket", "")).strip() != "low_quality":
+                continue
+            feature_relpath = sample.get("feature_relpath")
+            raw_relpath = sample.get("raw_relpath")
+            if not feature_relpath or raw_relpath is None:
+                continue
+            feature_path = os.path.join(
+                bundle_cache_path,
+                str(feature_relpath).replace("/", os.sep),
+            )
+            if self._low_quality_feature_matches_split_plan(feature_path, split_plan):
+                continue
+            sample["feature_relpath"] = None
+            sample["feature_bytes"] = 0
+            sample["has_feature"] = False
+            disabled_count += 1
+
+        if disabled_count:
+            manifest["samples"] = samples
+            _write_json_file(
+                os.path.join(bundle_cache_path, "bundle_manifest.json"),
+                manifest,
+            )
+            logger.info(
+                "[FixedSplitCL] Disabled {} incompatible low-quality bundled feature(s); raw samples will be rebuilt on the cloud.",
+                disabled_count,
+            )
+        return disabled_count
+
+    def _build_pool_training_inputs(
+        self,
+        sample_pool: CloudSamplePool,
+    ) -> tuple[
+        dict[str, object],
+        dict[str, dict[str, object]],
+        dict[str, dict[str, object]],
+        dict[str, dict[str, object]],
+    ]:
+        active_entries = sample_pool.list_active_samples()
+        sample_ids: list[str] = []
+        preloaded_records: dict[str, dict[str, object]] = {}
+        annotations: dict[str, dict[str, object]] = {}
+        sample_metadata_by_id: dict[str, dict[str, object]] = {}
+        for entry in active_entries:
+            sample_id = str(entry.get("sample_id", "") or "")
+            if not sample_id:
+                continue
+            try:
+                feature_label = sample_pool.reader.read(entry)
+                training_record = sample_pool.reader.training_record(entry)
+            except Exception as exc:
+                logger.warning(
+                    "[FixedSplitCL] Skipping active pool sample {} because its shard record could not be loaded: {}",
+                    sample_id,
+                    exc,
+                )
+                continue
+            sample_ids.append(sample_id)
+            preloaded_records[sample_id] = dict(training_record)
+            annotations[sample_id] = self._pool_annotations_from_labels(
+                feature_label.labels
+            )
+            sample_metadata_by_id[sample_id] = dict(feature_label.feature_record)
+        bundle_info = {
+            "manifest": {},
+            "all_sample_ids": sample_ids,
+            "from_sample_pool": True,
+        }
+        return bundle_info, preloaded_records, annotations, sample_metadata_by_id
+
+    def _materialize_low_quality_trigger_bundle(
+        self,
+        bundle_cache_path: str,
+    ) -> dict[str, object] | None:
+        trigger_manifest_path = os.path.join(bundle_cache_path, "trigger_manifest.json")
+        if not os.path.exists(trigger_manifest_path):
+            return None
+        trigger_manifest = _read_json_file(trigger_manifest_path)
+        staging_root = os.path.join(bundle_cache_path, "low_quality_staging")
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raw_root = os.path.join(staging_root, "raw")
+        feature_root = os.path.join(staging_root, "features")
+        os.makedirs(raw_root, exist_ok=True)
+        os.makedirs(feature_root, exist_ok=True)
+
+        feature_tensors_by_id: dict[str, Mapping[str, torch.Tensor]] = {}
+        for shard in list(trigger_manifest.get("feature_shards", []) or []):
+            if not isinstance(shard, Mapping):
+                continue
+            relpath = shard.get("file") or shard.get("path")
+            if not relpath:
+                continue
+            shard_path = os.path.join(bundle_cache_path, str(relpath).replace("/", os.sep))
+            if not os.path.exists(shard_path):
+                continue
+            payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+            feature_samples = payload.get("samples") if isinstance(payload, Mapping) else None
+            if not isinstance(feature_samples, Mapping):
+                continue
+            for sample_id, feature_value in feature_samples.items():
+                if not isinstance(feature_value, Mapping):
+                    continue
+                tensors = {
+                    str(label): tensor.detach().cpu()
+                    for label, tensor in dict(feature_value.get("tensors") or {}).items()
+                    if isinstance(tensor, torch.Tensor)
+                }
+                if tensors:
+                    feature_tensors_by_id[str(sample_id)] = tensors
+
+        samples: list[dict[str, object]] = []
+        for shard in list(trigger_manifest.get("raw_shards", []) or []):
+            if not isinstance(shard, Mapping):
+                continue
+            relpath = shard.get("file") or shard.get("path")
+            if not relpath:
+                continue
+            tar_path = os.path.join(bundle_cache_path, str(relpath).replace("/", os.sep))
+            if not os.path.exists(tar_path):
+                continue
+            with tarfile.open(tar_path, "r") as archive:
+                manifest_member = archive.extractfile("manifest.jsonl")
+                if manifest_member is None:
+                    continue
+                raw_entries = [
+                    json.loads(line.decode("utf-8"))
+                    for line in manifest_member.readlines()
+                    if line.strip()
+                ]
+                for raw_entry in raw_entries:
+                    if not isinstance(raw_entry, Mapping):
+                        continue
+                    sample_id = str(raw_entry.get("sample_id", "") or "")
+                    raw_file = raw_entry.get("raw_file") or raw_entry.get("raw_path")
+                    if not sample_id or not raw_file:
+                        continue
+                    member_name = str(raw_file).replace("\\", "/")
+                    if member_name.startswith("/") or ".." in member_name.split("/"):
+                        raise RuntimeError(f"Unsafe raw shard member path: {member_name!r}")
+                    member = archive.getmember(member_name)
+                    source = archive.extractfile(member)
+                    if source is None:
+                        continue
+                    suffix = os.path.splitext(member_name)[1] or ".jpg"
+                    safe_sample_id = _sanitize_cache_segment(sample_id)
+                    raw_relpath = f"low_quality_staging/raw/{safe_sample_id}{suffix}"
+                    raw_path = os.path.join(bundle_cache_path, raw_relpath.replace("/", os.sep))
+                    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+                    with open(raw_path, "wb") as handle:
+                        shutil.copyfileobj(source, handle)
+
+                    feature_relpath = None
+                    if sample_id in feature_tensors_by_id:
+                        tensors = dict(feature_tensors_by_id[sample_id])
+                        feature_relpath = f"low_quality_staging/features/{safe_sample_id}.pt"
+                        feature_path = os.path.join(
+                            bundle_cache_path,
+                            feature_relpath.replace("/", os.sep),
+                        )
+                        torch.save(
+                            {
+                                "intermediate": SplitPayload.from_mapping(
+                                    tensors,
+                                    primary_label=next(reversed(tensors), None),
+                                )
+                            },
+                            feature_path,
+                        )
+                    samples.append(
+                        {
+                            "sample_id": sample_id,
+                            "quality_bucket": "low_quality",
+                            "raw_relpath": raw_relpath,
+                            "raw_bytes": os.path.getsize(raw_path),
+                            "has_raw_sample": True,
+                            "feature_relpath": feature_relpath,
+                            "feature_bytes": (
+                                os.path.getsize(
+                                    os.path.join(
+                                        bundle_cache_path,
+                                        feature_relpath.replace("/", os.sep),
+                                    )
+                                )
+                                if feature_relpath
+                                else 0
+                            ),
+                            "inference_result": {"boxes": [], "labels": []},
+                            "model_id": trigger_manifest.get("model_id", ""),
+                            "model_version": trigger_manifest.get("model_version", ""),
+                        }
+                    )
+
+        legacy_manifest = {
+            "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
+            "edge_id": trigger_manifest.get("edge_id"),
+            "model": {
+                "model_id": str(trigger_manifest.get("model_id", "") or ""),
+                "model_version": str(trigger_manifest.get("model_version", "") or "0"),
+            },
+            "split_plan": dict(trigger_manifest.get("split_plan", {}) or {}),
+            "training_mode": {
+                "send_low_conf_features": bool(trigger_manifest.get("feature_shards")),
+                "low_quality_mode": str(trigger_manifest.get("upload_mode", "raw-only")),
+            },
+            "selection_policy": {
+                "policy": "low_quality_trigger_shards",
+                "selected_sample_count": len(samples),
+                "zip_payload_bytes": 0,
+            },
+            "samples": samples,
+            "trigger_manifest": {
+                "protocol_version": trigger_manifest.get("protocol_version"),
+                "shard_size": trigger_manifest.get("shard_size"),
+                "raw_shard_count": len(trigger_manifest.get("raw_shards", []) or []),
+                "feature_shard_count": len(trigger_manifest.get("feature_shards", []) or []),
+            },
+        }
+        with open(os.path.join(bundle_cache_path, "bundle_manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump(legacy_manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        logger.info(
+            "[ShardCL][CloudUnpack] materialized low-quality trigger shards samples={} "
+            "raw_shards={} feature_shards={}",
+            len(samples),
+            len(trigger_manifest.get("raw_shards", []) or []),
+            len(trigger_manifest.get("feature_shards", []) or []),
+        )
+        return legacy_manifest
 
     @contextmanager
     def _training_job_scope(self, edge_id: int | str):
@@ -3174,6 +3636,7 @@ class CloudContinualLearner:
         *,
         missing_raw_message: str | None = None,
         key_transform=None,
+        include_empty: bool = False,
     ) -> dict:
         transform = key_transform or (lambda sample_id: sample_id)
         annotations = {}
@@ -3229,6 +3692,11 @@ class CloudContinualLearner:
                         pred_score,
                     )
                     if teacher_targets is None:
+                        if include_empty:
+                            annotations[transform(sample_id)] = {
+                                "boxes": [],
+                                "labels": [],
+                            }
                         continue
                     annotations[transform(sample_id)] = teacher_targets
         return annotations
@@ -3955,6 +4423,76 @@ class CloudContinualLearner:
     # Public API
     # ------------------------------------------------------------------
 
+    def sync_samples(
+        self,
+        edge_id: int,
+        protocol_version: str,
+        sync_type: str,
+        payload_zip: bytes,
+        model_id: str = "",
+        model_version: str = "",
+        split_config_id: str = "",
+    ) -> tuple[bool, str, int]:
+        """Ingest high-quality feature-label samples into the cloud pool."""
+        try:
+            if str(sync_type or "") != "HIGH_QUALITY_FEATURE_LABEL_SHARD":
+                raise RuntimeError(
+                    f"Unsupported sample sync type: {sync_type!r}"
+                )
+            workspace = prepare_request_workspace(
+                self.workspace_root,
+                edge_id=edge_id,
+                request_kind="sample_sync",
+                payload_zip=bytes(payload_zip or b""),
+                client_cache_path="",
+            )
+            bundle_cache_path = str(workspace)
+            manifest = _read_json_file(os.path.join(bundle_cache_path, "bundle_manifest.json"))
+            if manifest.get("protocol_version") != "high-quality-feature-label-shard.v1":
+                raise RuntimeError(
+                    f"Unexpected sync protocol version: {manifest.get('protocol_version')!r}"
+                )
+            if protocol_version and manifest.get("protocol_version") != protocol_version:
+                raise RuntimeError(
+                    f"Request protocol_version={protocol_version!r} does not match bundle "
+                    f"protocol_version={manifest.get('protocol_version')!r}."
+                )
+            if model_id and not manifest.get("model_id"):
+                manifest["model_id"] = str(model_id)
+            if model_version and not manifest.get("model_version"):
+                manifest["model_version"] = str(model_version)
+            if split_config_id and not manifest.get("split_config_id"):
+                manifest["split_config_id"] = str(split_config_id)
+            with open(
+                os.path.join(bundle_cache_path, "bundle_manifest.json"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                json.dump(manifest, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            sample_pool = self._cloud_sample_pool_for_manifest(
+                edge_id=edge_id,
+                manifest=manifest,
+            )
+            added = sample_pool.ingest_high_quality_feature_label_bundle(
+                bundle_cache_path,
+            )
+            active_count = len(sample_pool.list_active_samples())
+            message = (
+                f"Synced {added} high-quality sample(s); "
+                f"{active_count} active cloud sample-pool sample(s)."
+            )
+            logger.info(
+                "[ShardCL][SamplePoolCommit] {} edge_id={} pool={}",
+                message,
+                edge_id,
+                sample_pool.root_dir,
+            )
+            return True, message, int(added)
+        except Exception as exc:
+            logger.exception("[FixedSplitCL] Sample sync failed for edge {}: {}", edge_id, exc)
+            return False, str(exc), 0
+
     def get_ground_truth_and_retrain(
         self,
         edge_id: int,
@@ -4079,7 +4617,10 @@ class CloudContinualLearner:
             total_round_started = time.perf_counter()
             try:
                 stage_started = time.perf_counter()
-                manifest = load_training_bundle_manifest(bundle_cache_path)
+                materialized_manifest = self._materialize_low_quality_trigger_bundle(
+                    bundle_cache_path
+                )
+                manifest = materialized_manifest or load_training_bundle_manifest(bundle_cache_path)
                 self._log_stage_duration("loading bundle manifest", stage_started)
                 if manifest.get("protocol_version") != CONTINUAL_LEARNING_PROTOCOL_VERSION:
                     raise RuntimeError(
@@ -4094,6 +4635,24 @@ class CloudContinualLearner:
                 bundle_model_version = _normalize_model_version(
                     manifest.get("model", {}).get("model_version", "0"),
                     field_name="bundle model version",
+                )
+                sample_pool = self._cloud_sample_pool_for_manifest(
+                    edge_id=edge_id,
+                    manifest=manifest,
+                )
+                stage_started = time.perf_counter()
+                high_quality_added = sample_pool.ingest_high_quality_feature_label_bundle(
+                    bundle_cache_path,
+                )
+                self._log_stage_duration("high-quality sample-pool ingest", stage_started)
+                logger.info(
+                    "[FixedSplitCL] Cloud sample pool {} ingested {} high-quality sample(s).",
+                    sample_pool.root_dir,
+                    high_quality_added,
+                )
+                self._disable_incompatible_low_quality_features(
+                    bundle_cache_path=bundle_cache_path,
+                    manifest=manifest,
                 )
                 next_checkpoint_model_version = _increment_model_version(
                     bundle_model_version,
@@ -4170,12 +4729,49 @@ class CloudContinualLearner:
                     gt_sample_ids,
                     missing_raw_message="[FixedSplitCL] GT sample {} missing raw frame.",
                     key_transform=str,
+                    include_empty=True,
                 )
                 self._log_stage_duration("teacher annotation", stage_started)
-                sample_metadata_by_id = self._load_cached_sample_metadata(
-                    working_cache,
-                    bundle_info["all_sample_ids"],
+                stage_started = time.perf_counter()
+                low_quality_pool_samples = self._build_low_quality_pool_samples(
+                    manifest=manifest,
+                    prepared_sample_ids=bundle_info["all_sample_ids"],
+                    working_cache=working_cache,
+                    gt_annotations=gt_annotations,
                     preloaded_records=preloaded_records,
+                )
+                low_quality_added = sample_pool.ingest_low_quality_processed_samples(
+                    low_quality_pool_samples,
+                )
+                sample_pool.maybe_compact()
+                self._log_stage_duration("low-quality sample-pool commit", stage_started)
+                logger.info(
+                    "[FixedSplitCL] Cloud sample pool committed {} / {} teacher-labeled low-quality sample(s).",
+                    low_quality_added,
+                    len(low_quality_pool_samples),
+                )
+
+                (
+                    bundle_info,
+                    preloaded_records,
+                    gt_annotations,
+                    sample_metadata_by_id,
+                ) = self._build_pool_training_inputs(sample_pool)
+                if not bundle_info["all_sample_ids"]:
+                    raise RuntimeError(
+                        "No active cloud sample-pool samples were available for fixed-split retraining."
+                    )
+                effective_batch_size = self._resolve_fixed_split_runtime_batch_size(
+                    current_model_name,
+                    num_train_samples=len(bundle_info["all_sample_ids"]),
+                )
+                working_cache = sample_pool.root_dir
+                frame_dir = os.path.join(sample_pool.root_dir, "frames")
+                os.makedirs(frame_dir, exist_ok=True)
+                logger.info(
+                    "[FixedSplitCL] Training from {} active cloud sample-pool sample(s) ({} label entry/entries).",
+                    len(bundle_info["all_sample_ids"]),
+                    len(gt_annotations),
                 )
                 proxy_eval_frame_cache = self._proxy_eval_frame_cache()
 
@@ -4219,6 +4815,20 @@ class CloudContinualLearner:
                     gt_annotations
                     and is_wrapper_fixed_split
                     and _proxy_metrics_indicate_dead_detector(proxy_metrics_before)
+                    and bool(bundle_info.get("from_sample_pool", False))
+                ):
+                    logger.warning(
+                        "[FixedSplitCL] Cached {} weights produced no detections on {} pool label sample(s), "
+                        "but keeping the cached model because resetting would invalidate active cloud sample-pool features.",
+                        current_model_name,
+                        len(gt_annotations),
+                    )
+
+                if (
+                    gt_annotations
+                    and is_wrapper_fixed_split
+                    and _proxy_metrics_indicate_dead_detector(proxy_metrics_before)
+                    and not bool(bundle_info.get("from_sample_pool", False))
                 ):
                     if str(current_model_name).lower().startswith("rfdetr_"):
                         logger.warning(

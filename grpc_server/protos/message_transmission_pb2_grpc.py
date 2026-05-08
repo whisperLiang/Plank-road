@@ -49,14 +49,14 @@ class MessageTransmissionStub(object):
                 request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningRequest.SerializeToString,
                 response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningReply.FromString,
                 _registered_method=True)
+        self.sync_samples = channel.unary_unary(
+                '/MessageTransmission/sync_samples',
+                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncRequest.SerializeToString,
+                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncReply.FromString,
+                _registered_method=True)
         self.submit_training_job = channel.unary_unary(
                 '/MessageTransmission/submit_training_job',
                 request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
-                _registered_method=True)
-        self.submit_training_job_stream = channel.stream_unary(
-                '/MessageTransmission/submit_training_job_stream',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobChunk.SerializeToString,
                 response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
                 _registered_method=True)
         self.get_training_job_status = channel.unary_unary(
@@ -113,15 +113,15 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def submit_training_job(self, request, context):
-        """Async training job submission for edge-triggered continual learning.
+    def sync_samples(self, request, context):
+        """Sharded sample pool exchange without creating a training job.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def submit_training_job_stream(self, request_iterator, context):
-        """Streaming async training job submission for large edge bundles.
+    def submit_training_job(self, request, context):
+        """Async training job submission for edge-triggered continual learning.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -180,14 +180,14 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningRequest.FromString,
                     response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningReply.SerializeToString,
             ),
+            'sync_samples': grpc.unary_unary_rpc_method_handler(
+                    servicer.sync_samples,
+                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncRequest.FromString,
+                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncReply.SerializeToString,
+            ),
             'submit_training_job': grpc.unary_unary_rpc_method_handler(
                     servicer.submit_training_job,
                     request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
-            ),
-            'submit_training_job_stream': grpc.stream_unary_rpc_method_handler(
-                    servicer.submit_training_job_stream,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobChunk.FromString,
                     response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
             ),
             'get_training_job_status': grpc.unary_unary_rpc_method_handler(
@@ -308,6 +308,33 @@ class MessageTransmission(object):
             _registered_method=True)
 
     @staticmethod
+    def sync_samples(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/sync_samples',
+            grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncRequest.SerializeToString,
+            grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def submit_training_job(request,
             target,
             options=(),
@@ -323,33 +350,6 @@ class MessageTransmission(object):
             target,
             '/MessageTransmission/submit_training_job',
             grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def submit_training_job_stream(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
-            target,
-            '/MessageTransmission/submit_training_job_stream',
-            grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobChunk.SerializeToString,
             grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
             options,
             channel_credentials,

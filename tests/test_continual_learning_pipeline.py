@@ -1,6 +1,7 @@
 ﻿import io
 import json
 import os
+import tarfile
 import time
 import zipfile
 from collections import OrderedDict
@@ -13,9 +14,11 @@ from loguru import logger
 
 import model_management.continual_learning_bundle as continual_learning_bundle
 from edge.sample_store import EdgeSampleStore, HIGH_QUALITY, LOW_QUALITY
+from edge.sample_sync import HighQualitySampleSyncer, pack_high_quality_sync_bundle_to_file
 from edge.transmit import (
     pack_continual_learning_bundle,
     pack_continual_learning_bundle_to_file,
+    pack_low_quality_trigger_bundle_to_file,
 )
 from model_management.continual_learning_bundle import prepare_split_training_cache
 from model_management.fixed_split import (
@@ -3385,6 +3388,309 @@ def test_only_pending_raw_only_samples_trigger_rebuild(tmp_path, sample_bgr_fram
     )
     assert set(info["all_sample_ids"]) == {"high-1", "low-1"}
     assert rebuilt_ids == ["low-1"]
+
+
+_FORBIDDEN_SHARD_METADATA = {
+    "quality_score",
+    "risk_score",
+    "risk_reasons",
+    "evidence_count",
+    "covered_evidence_count",
+    "uncovered_evidence_count",
+    "uncovered_evidence_rate",
+    "candidate_uncovered_score",
+    "motion_uncovered_score",
+    "track_uncovered_score",
+    "window_id",
+    "input_image_size",
+    "input_tensor_shape",
+    "input_resize_mode",
+    "scores",
+}
+
+
+def _store_high_quality_for_shard(store, *, sample_id, frame_index, plan):
+    return store.store_sample(
+        sample_id=sample_id,
+        frame_index=frame_index,
+        confidence=0.95,
+        split_config_id=plan.split_config_id,
+        model_id="model-a",
+        model_version="1",
+        quality_bucket=HIGH_QUALITY,
+        quality_score=0.99,
+        risk_score=0.01,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [frame_index % 3], "scores": [0.9]},
+        intermediate=_planned_payload(plan),
+    )
+
+
+def _store_low_quality_for_shard(store, *, sample_id, frame_index, plan, frame):
+    return store.store_sample(
+        sample_id=sample_id,
+        frame_index=frame_index,
+        confidence=0.2,
+        split_config_id=plan.split_config_id,
+        model_id="model-a",
+        model_version="1",
+        quality_bucket=LOW_QUALITY,
+        quality_score=0.2,
+        risk_score=0.8,
+        risk_reasons=["candidate_evidence_uncovered"],
+        evidence_count=3,
+        uncovered_evidence_count=2,
+        uncovered_evidence_rate=0.66,
+        candidate_uncovered_score=0.5,
+        motion_uncovered_score=0.1,
+        track_uncovered_score=0.2,
+        window_id="window-1",
+        inference_result={"boxes": [[9, 8, 7, 6]], "labels": [9], "scores": [0.1]},
+        intermediate=_planned_payload(plan),
+        raw_frame=frame,
+    )
+
+
+def test_high_quality_sync_bundle_uses_feature_label_shards_without_metadata(tmp_path):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    records = [
+        _store_high_quality_for_shard(store, sample_id=f"high-{index}", frame_index=index, plan=plan)
+        for index in range(5)
+    ]
+
+    zip_path, manifest, stats = pack_high_quality_sync_bundle_to_file(
+        store,
+        records,
+        edge_id=1,
+        shard_size=64,
+        split_context={
+            "model_id": "model-a",
+            "model_version": "1",
+            "split_config_id": plan.split_config_id,
+            "split_label": plan.split_label,
+            "boundary_tensor_labels": plan.boundary_tensor_labels,
+        },
+        output_dir=str(tmp_path),
+    )
+    try:
+        assert manifest["protocol_version"] == "high-quality-feature-label-shard.v1"
+        assert manifest["shard_size"] == 64
+        assert manifest["shards"][0]["sample_count"] == 5
+        assert stats["shard_count"] == 1
+        manifest_text = json.dumps(manifest, sort_keys=True)
+        assert not any(field in manifest_text for field in _FORBIDDEN_SHARD_METADATA)
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            names = archive.namelist()
+            assert "bundle_manifest.json" in names
+            assert not any(name.startswith("raw/") or name.startswith("raw_shards/") for name in names)
+            shard = manifest["shards"][0]
+            feature_payload = torch.load(
+                io.BytesIO(archive.read(shard["feature_file"])),
+                map_location="cpu",
+                weights_only=False,
+            )
+            assert feature_payload["schema_version"] == 1
+            assert set(feature_payload["samples"]) == {f"high-{index}" for index in range(5)}
+            assert "tensors" in feature_payload["samples"]["high-0"]
+            label_lines = archive.read(shard["label_file"]).decode("utf-8").splitlines()
+            assert len(label_lines) == 5
+            label_entry = json.loads(label_lines[0])
+            assert set(label_entry) == {"sample_id", "boxes", "labels"}
+    finally:
+        os.remove(zip_path)
+
+
+def test_high_quality_syncer_groups_retryable_samples_by_record_context(tmp_path):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    first = _store_high_quality_for_shard(
+        store,
+        sample_id="high-version-1",
+        frame_index=1,
+        plan=plan,
+    )
+    second = store.store_sample(
+        sample_id="high-version-2",
+        frame_index=2,
+        confidence=0.96,
+        split_config_id="other-split",
+        model_id="model-a",
+        model_version="2",
+        quality_bucket=HIGH_QUALITY,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_planned_payload(plan),
+    )
+    syncer = HighQualitySampleSyncer(
+        store,
+        server_ip="127.0.0.1:50051",
+        edge_id=1,
+        shard_size=64,
+        enabled=True,
+        context_provider=lambda: {
+            "model_id": "",
+            "model_version": "0",
+            "split_config_id": "",
+        },
+    )
+    syncer._mark_samples([first.sample_id, second.sample_id], "pending")
+
+    groups = syncer._select_retryable_record_groups(include_partial=True)
+    contexts = [
+        syncer._split_context_for_records(group)
+        for group in groups
+    ]
+
+    assert len(groups) == 2
+    assert {
+        (context["model_version"], context["split_config_id"])
+        for context in contexts
+    } == {("1", plan.split_config_id), ("2", "other-split")}
+
+
+def test_low_quality_raw_only_trigger_uses_partial_raw_shards_without_edge_labels(
+    tmp_path,
+    sample_bgr_frame,
+):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    frame = sample_bgr_frame[:16, :16].copy()
+    for index in range(130):
+        _store_low_quality_for_shard(
+            store,
+            sample_id=f"low-{index}",
+            frame_index=index,
+            plan=plan,
+            frame=frame,
+        )
+
+    zip_path, manifest, _stats = pack_low_quality_trigger_bundle_to_file(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="1",
+        shard_size=64,
+        output_dir=str(tmp_path),
+    )
+    try:
+        assert manifest["protocol_version"] == "low-quality-trigger-shard.v1"
+        assert manifest["upload_mode"] == "raw-only"
+        assert manifest["shard_size"] == 64
+        assert [entry["sample_count"] for entry in manifest["raw_shards"]] == [64, 64, 2]
+        assert manifest["feature_shards"] == []
+        manifest_text = json.dumps(manifest, sort_keys=True)
+        assert not any(field in manifest_text for field in _FORBIDDEN_SHARD_METADATA)
+        assert "boxes" not in manifest_text
+        assert '"labels":' not in manifest_text
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            first_raw_shard = manifest["raw_shards"][0]
+            with tarfile.open(fileobj=io.BytesIO(archive.read(first_raw_shard["file"])), mode="r") as tar:
+                raw_manifest = tar.extractfile("manifest.jsonl").read().decode("utf-8").splitlines()
+                first_entry = json.loads(raw_manifest[0])
+                assert set(first_entry) == {"sample_id", "raw_file"}
+                assert "raw_path" not in first_entry
+    finally:
+        os.remove(zip_path)
+
+
+def test_low_quality_raw_feature_trigger_skips_missing_optional_features(
+    tmp_path,
+    sample_bgr_frame,
+):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    frame = sample_bgr_frame[:16, :16].copy()
+    records = [
+        _store_low_quality_for_shard(
+            store,
+            sample_id=f"low-missing-feature-{index}",
+            frame_index=index,
+            plan=plan,
+            frame=frame,
+        )
+        for index in range(7)
+    ]
+    missing_feature_path = os.path.join(
+        store.root_dir,
+        records[0].feature_relpath.replace("/", os.sep),
+    )
+    os.remove(missing_feature_path)
+
+    zip_path, manifest, _stats = pack_low_quality_trigger_bundle_to_file(
+        store,
+        edge_id=1,
+        send_low_conf_features=True,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="1",
+        shard_size=64,
+        output_dir=str(tmp_path),
+    )
+    try:
+        assert [entry["sample_count"] for entry in manifest["raw_shards"]] == [7]
+        assert [entry["sample_count"] for entry in manifest["feature_shards"]] == [6]
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            feature_shard = manifest["feature_shards"][0]
+            feature_payload = torch.load(
+                io.BytesIO(archive.read(feature_shard["file"])),
+                map_location="cpu",
+                weights_only=False,
+            )
+            assert "low-missing-feature-0" not in feature_payload["samples"]
+    finally:
+        os.remove(zip_path)
+
+
+def test_low_quality_raw_feature_trigger_matches_raw_shard_grouping(
+    tmp_path,
+    sample_bgr_frame,
+):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    frame = sample_bgr_frame[:16, :16].copy()
+    for index in range(7):
+        _store_low_quality_for_shard(
+            store,
+            sample_id=f"low-feature-{index}",
+            frame_index=index,
+            plan=plan,
+            frame=frame,
+        )
+
+    zip_path, manifest, _stats = pack_low_quality_trigger_bundle_to_file(
+        store,
+        edge_id=1,
+        send_low_conf_features=True,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="1",
+        shard_size=64,
+        output_dir=str(tmp_path),
+    )
+    try:
+        assert manifest["upload_mode"] == "raw+feature"
+        assert [entry["sample_count"] for entry in manifest["raw_shards"]] == [7]
+        assert [entry["sample_count"] for entry in manifest["feature_shards"]] == [7]
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            raw_shard = manifest["raw_shards"][0]
+            feature_shard = manifest["feature_shards"][0]
+            with tarfile.open(fileobj=io.BytesIO(archive.read(raw_shard["file"])), mode="r") as tar:
+                raw_ids = [
+                    json.loads(line)["sample_id"]
+                    for line in tar.extractfile("manifest.jsonl").read().decode("utf-8").splitlines()
+                ]
+            feature_payload = torch.load(
+                io.BytesIO(archive.read(feature_shard["file"])),
+                map_location="cpu",
+                weights_only=False,
+            )
+            assert list(feature_payload["samples"].keys()) == raw_ids
+            assert all(set(sample_payload) == {"tensors"} for sample_payload in feature_payload["samples"].values())
+    finally:
+        os.remove(zip_path)
 
 
 

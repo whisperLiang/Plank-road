@@ -684,3 +684,85 @@ server:
 
     with pytest.raises(ValueError, match="must be within \\[0, 1\\]"):
         load_runtime_config(config_path)
+
+
+def test_load_runtime_config_sample_pool_defaults_match_shard_pool_spec(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+    assert config.sample_pool.enabled is True
+    assert config.sample_pool.shard_size == 64
+    assert config.sample_pool.sync_interval_sec == pytest.approx(30)
+    assert config.sample_pool.max_samples == 5000
+    assert config.sample_pool.root_dir == "./cache/cloud_sample_pool"
+    assert config.sample_pool.compact_threshold == pytest.approx(0.3)
+    assert config.sample_pool.enable_timing_logs is False
+    assert config.client.sample_pool is config.sample_pool
+    assert config.server.sample_pool is config.sample_pool
+
+
+def test_load_runtime_config_reads_single_shared_sample_pool_shard_size(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+sample_pool:
+  shard_size: 17
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.sample_pool.shard_size == 17
+    assert config.client.sample_pool.shard_size == 17
+    assert config.server.sample_pool.shard_size == 17
+    assert "high_quality_shard_size" not in getattr(config.sample_pool, "_extras", {})
+    assert "low_quality_shard_size" not in getattr(config.sample_pool, "_extras", {})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    [
+        ("enabled", '"yes"'),
+        ("max_samples", "0"),
+        ("shard_size", "0"),
+        ("sync_interval_sec", "0"),
+        ("compact_threshold", "-0.1"),
+        ("compact_threshold", "1.1"),
+        ("root_dir", '""'),
+        ("enable_timing_logs", "1"),
+    ],
+)
+def test_load_runtime_config_rejects_invalid_sample_pool_settings(
+    tmp_path,
+    field_name,
+    bad_value,
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+sample_pool:
+  {field_name}: {bad_value}
+client:
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=f"sample_pool.*{field_name}"):
+        load_runtime_config(config_path)
