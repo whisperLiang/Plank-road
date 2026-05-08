@@ -289,7 +289,7 @@ workspace_root/
 
 ### 6.2 边缘行为调整
 
-边缘不再在 `request_continual_learning()` 内阻塞到训练完成，而是：
+边缘不再在旧的同步 continual-learning 请求内阻塞到训练完成，而是：
 
 1. 触发训练时打包并提交任务。
 2. 保存返回的 `job_id`。

@@ -944,41 +944,6 @@ class CloudSamplePool:
                             "created_at": _created_at_text(),
                         }
                     )
-        else:
-            for sample in list(manifest.get("samples", []) or []):
-                if not isinstance(sample, Mapping):
-                    continue
-                if str(sample.get("quality_bucket", "") or "") != "high_quality":
-                    continue
-                sample_id = str(sample.get("sample_id", "") or "")
-                feature_relpath = sample.get("feature_relpath")
-                if not sample_id or not feature_relpath:
-                    continue
-                feature_path = _resolve_relpath(bundle_root, str(feature_relpath))
-                if not os.path.exists(feature_path):
-                    continue
-                payload = torch.load(feature_path, map_location="cpu", weights_only=False)
-                if not isinstance(payload, Mapping):
-                    continue
-                result_payload = sample.get("inference_result")
-                if not isinstance(result_payload, Mapping):
-                    result_relpath = sample.get("result_relpath")
-                    if result_relpath:
-                        result_payload = _read_json(_resolve_relpath(bundle_root, str(result_relpath)))
-                    else:
-                        result_payload = {}
-                trainable_samples.append(
-                    {
-                        "sample_id": sample_id,
-                        "feature_record": _record_from_feature_payload(
-                            payload,
-                            sample=sample,
-                            split_plan=split_plan,
-                        ),
-                        "labels": _labels_from_result(result_payload),
-                        "created_at": _created_at_text(),
-                    }
-                )
         return self.ingest_low_quality_processed_samples(trainable_samples)
 
     def maybe_compact(self, *, force: bool = False) -> bool:

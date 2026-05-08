@@ -52,6 +52,7 @@ from model_management.model_zoo import (
 from model_management.split_model_adapters import (
     build_split_runtime_sample_input,
     build_split_training_loss,
+    get_split_runtime_input_resize_mode,
     get_split_runtime_model,
     postprocess_split_runtime_output,
     prepare_split_runtime_input,
@@ -64,11 +65,7 @@ from model_management.universal_model_split import (
     log_split_retrain_profile,
     universal_split_retrain,
     load_split_feature_cache,
-)
-from model_management.continual_learning_bundle import (
-    CONTINUAL_LEARNING_PROTOCOL_VERSION,
-    load_training_bundle_manifest,
-    prepare_split_training_cache,
+    save_split_feature_cache,
 )
 from model_management.fixed_split_runtime_template import (
     FixedSplitRuntimeTemplate,
@@ -93,6 +90,7 @@ _FIXED_SPLIT_WORKING_CACHE_VERSION = 2
 _FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
 _FIXED_SPLIT_DYNAMIC_BATCH_MIN = _FIXED_SPLIT_DYNAMIC_BATCH[0]
 _FIXED_SPLIT_DYNAMIC_BATCH_MAX = _FIXED_SPLIT_DYNAMIC_BATCH[1]
+LOW_QUALITY_TRIGGER_PROTOCOL_VERSION = "low-quality-trigger-shard.v1"
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
 _AUTO_MEMORY_FEATURE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
@@ -345,12 +343,26 @@ def _select_fixed_split_gt_sample_ids(
         sample_id = str(sample.get("sample_id", "")).strip()
         if not sample_id or sample_id not in prepared_lookup:
             continue
-        if str(sample.get("quality_bucket", "")).strip() != "low_quality":
+        if not _is_low_quality_trigger_sample(manifest, sample):
             continue
         if sample.get("raw_relpath") is None:
             continue
         selected.append(sample_id)
     return selected
+
+
+def _is_low_quality_trigger_sample(
+    manifest: Mapping[str, object],
+    sample: Mapping[str, object],
+) -> bool:
+    if str(sample.get("quality_bucket", "")).strip() == "low_quality":
+        return True
+    if str(manifest.get("protocol_version", "")).strip() == LOW_QUALITY_TRIGGER_PROTOCOL_VERSION:
+        return sample.get("raw_relpath") is not None
+    trigger_context = manifest.get("trigger_manifest")
+    if isinstance(trigger_context, Mapping):
+        return sample.get("raw_relpath") is not None
+    return False
 
 
 def _set_detection_model_eval_mode(model: torch.nn.Module) -> None:
@@ -415,6 +427,92 @@ def _runtime_input_tensor_shape_from_metadata(
     if runtime_image_size is None:
         return None
     return (1, 3, runtime_image_size[0], runtime_image_size[1])
+
+
+def _project_box_to_model_input(
+    box: object,
+    *,
+    original_size: tuple[int, int],
+    model_input_size: tuple[int, int],
+    resize_mode: str,
+) -> list[float]:
+    values = [float(value) for value in list(box or [])[:4]]
+    if len(values) < 4:
+        return values
+    orig_h, orig_w = original_size
+    model_h, model_w = model_input_size
+    if str(resize_mode).strip().lower() == "letterbox":
+        scale = min(float(model_w) / float(orig_w), float(model_h) / float(orig_h))
+        resized_w = float(orig_w) * scale
+        resized_h = float(orig_h) * scale
+        pad_x = (float(model_w) - resized_w) * 0.5
+        pad_y = (float(model_h) - resized_h) * 0.5
+        values[0] = values[0] * scale + pad_x
+        values[2] = values[2] * scale + pad_x
+        values[1] = values[1] * scale + pad_y
+        values[3] = values[3] * scale + pad_y
+    else:
+        values[0] = values[0] * (float(model_w) / float(orig_w))
+        values[2] = values[2] * (float(model_w) / float(orig_w))
+        values[1] = values[1] * (float(model_h) / float(orig_h))
+        values[3] = values[3] * (float(model_h) / float(orig_h))
+    values[0] = max(0.0, min(float(model_w), values[0]))
+    values[2] = max(0.0, min(float(model_w), values[2]))
+    values[1] = max(0.0, min(float(model_h), values[1]))
+    values[3] = max(0.0, min(float(model_h), values[3]))
+    return values
+
+
+def _project_label_boxes_to_model_input(
+    labels: Mapping[str, object],
+    *,
+    original_size: tuple[int, int] | None,
+    model_input_size: tuple[int, int] | None,
+    resize_mode: str,
+) -> dict[str, object]:
+    projected = {
+        "boxes": list(labels.get("boxes") or []),
+        "labels": list(labels.get("labels") or []),
+    }
+    if original_size is None or model_input_size is None or original_size == model_input_size:
+        return projected
+    projected["boxes"] = [
+        _project_box_to_model_input(
+            box,
+            original_size=original_size,
+            model_input_size=model_input_size,
+            resize_mode=resize_mode,
+        )
+        for box in list(projected.get("boxes") or [])
+    ]
+    return projected
+
+
+def _labels_fit_model_input(
+    labels: Mapping[str, object],
+    *,
+    model_input_size: tuple[int, int] | None,
+) -> bool:
+    if model_input_size is None:
+        return True
+    model_h, model_w = model_input_size
+    epsilon = 1e-3
+    for box in list(labels.get("boxes") or []):
+        values = [float(value) for value in list(box or [])[:4]]
+        if len(values) < 4:
+            continue
+        if (
+            values[0] < -epsilon
+            or values[2] < -epsilon
+            or values[1] < -epsilon
+            or values[3] < -epsilon
+            or values[0] > float(model_w) + epsilon
+            or values[2] > float(model_w) + epsilon
+            or values[1] > float(model_h) + epsilon
+            or values[3] > float(model_h) + epsilon
+        ):
+            return False
+    return True
 
 
 def _build_synthetic_runtime_input(
@@ -1783,6 +1881,27 @@ class CloudContinualLearner:
             annotations["scores"] = list(labels.get("scores") or [])
         return annotations
 
+    @staticmethod
+    def _model_input_size_from_record(
+        record: Mapping[str, object],
+    ) -> tuple[int, int] | None:
+        tensor_shape = _runtime_input_tensor_shape_from_metadata(record)
+        if tensor_shape is not None:
+            return int(tensor_shape[-2]), int(tensor_shape[-1])
+        intermediate = record.get("intermediate")
+        if isinstance(intermediate, BoundaryPayload):
+            candidate_sizes: list[tuple[int, int]] = []
+            for tensor in dict(intermediate.tensors or {}).values():
+                if not isinstance(tensor, torch.Tensor) or tensor.ndim < 3:
+                    continue
+                height = int(tensor.shape[-2])
+                width = int(tensor.shape[-1])
+                if height > 0 and width > 0:
+                    candidate_sizes.append((height, width))
+            if candidate_sizes:
+                return max(candidate_sizes, key=lambda item: item[0] * item[1])
+        return None
+
     def _build_low_quality_pool_samples(
         self,
         *,
@@ -1791,13 +1910,15 @@ class CloudContinualLearner:
         working_cache: str,
         gt_annotations: Mapping[str, Mapping[str, object]],
         preloaded_records: Mapping[object, Mapping[str, object]] | None,
+        model_input_size: tuple[int, int] | None = None,
+        resize_mode: str = "direct_resize",
     ) -> list[dict[str, object]]:
         prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
         processed_samples: list[dict[str, object]] = []
         for sample in manifest.get("samples", []):
             if not isinstance(sample, Mapping):
                 continue
-            if str(sample.get("quality_bucket", "")).strip() != "low_quality":
+            if not _is_low_quality_trigger_sample(manifest, sample):
                 continue
             sample_id = str(sample.get("sample_id", "")).strip()
             if not sample_id or sample_id not in prepared_lookup:
@@ -1815,11 +1936,21 @@ class CloudContinualLearner:
                         sample_id,
                     )
                     continue
+            original_size = _original_image_size_from_metadata(record)
+            resolved_model_input_size = (
+                model_input_size or self._model_input_size_from_record(record)
+            )
+            trainable_labels = _project_label_boxes_to_model_input(
+                labels,
+                original_size=original_size,
+                model_input_size=resolved_model_input_size,
+                resize_mode=resize_mode,
+            )
             processed_samples.append(
                 {
                     "sample_id": sample_id,
                     "feature_record": dict(record),
-                    "labels": self._pool_annotations_from_labels(labels),
+                    "labels": self._pool_annotations_from_labels(trainable_labels),
                     "created_at": time.time(),
                 }
             )
@@ -1883,7 +2014,7 @@ class CloudContinualLearner:
         for sample in samples:
             if not isinstance(sample, dict):
                 continue
-            if str(sample.get("quality_bucket", "")).strip() != "low_quality":
+            if not _is_low_quality_trigger_sample(manifest, sample):
                 continue
             feature_relpath = sample.get("feature_relpath")
             raw_relpath = sample.get("raw_relpath")
@@ -1902,10 +2033,6 @@ class CloudContinualLearner:
 
         if disabled_count:
             manifest["samples"] = samples
-            _write_json_file(
-                os.path.join(bundle_cache_path, "bundle_manifest.json"),
-                manifest,
-            )
             logger.info(
                 "[FixedSplitCL] Disabled {} incompatible low-quality bundled feature(s); raw samples will be rebuilt on the cloud.",
                 disabled_count,
@@ -1917,6 +2044,8 @@ class CloudContinualLearner:
         sample_pool: CloudSamplePool,
         *,
         expected_split_id: str | None = None,
+        runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
+        input_resize_mode: str | None = None,
     ) -> tuple[
         dict[str, object],
         dict[str, dict[str, object]],
@@ -1957,12 +2086,37 @@ class CloudContinualLearner:
                     expected_split_id,
                 )
                 continue
-            sample_ids.append(sample_id)
-            preloaded_records[sample_id] = dict(training_record)
-            annotations[sample_id] = self._pool_annotations_from_labels(
-                feature_label.labels
+            training_record = dict(training_record)
+            if runtime_input_tensor_shape is not None:
+                training_record["input_tensor_shape"] = [
+                    int(dim) for dim in runtime_input_tensor_shape
+                ]
+            if input_resize_mode:
+                training_record["input_resize_mode"] = str(input_resize_mode)
+            labels = self._pool_annotations_from_labels(feature_label.labels)
+            model_input_size = (
+                (
+                    int(runtime_input_tensor_shape[-2]),
+                    int(runtime_input_tensor_shape[-1]),
+                )
+                if runtime_input_tensor_shape is not None
+                and len(runtime_input_tensor_shape) >= 3
+                else None
             )
-            sample_metadata_by_id[sample_id] = dict(feature_label.feature_record)
+            if not _labels_fit_model_input(labels, model_input_size=model_input_size):
+                sample_pool.deactivate_sample(sample_id)
+                logger.warning(
+                    "[FixedSplitCL] Deactivated pool sample {} because its labels "
+                    "exceed current model input size {}; stale pre-projection pool "
+                    "entries are not used for training.",
+                    sample_id,
+                    model_input_size,
+                )
+                continue
+            sample_ids.append(sample_id)
+            preloaded_records[sample_id] = training_record
+            annotations[sample_id] = labels
+            sample_metadata_by_id[sample_id] = dict(training_record)
         bundle_info = {
             "manifest": {},
             "all_sample_ids": sample_ids,
@@ -2097,7 +2251,6 @@ class CloudContinualLearner:
                     samples.append(
                         {
                             "sample_id": sample_id,
-                            "quality_bucket": "low_quality",
                             "raw_relpath": raw_relpath,
                             "raw_bytes": os.path.getsize(raw_path),
                             "has_raw_sample": True,
@@ -2112,40 +2265,39 @@ class CloudContinualLearner:
                                 if feature_relpath
                                 else 0
                             ),
-                            "inference_result": {"boxes": [], "labels": []},
                             "model_id": trigger_manifest.get("model_id", ""),
                             "model_version": trigger_manifest.get("model_version", ""),
                         }
                     )
 
-        legacy_manifest = {
-            "protocol_version": CONTINUAL_LEARNING_PROTOCOL_VERSION,
-            "edge_id": trigger_manifest.get("edge_id"),
-            "model": {
-                "model_id": str(trigger_manifest.get("model_id", "") or ""),
-                "model_version": str(trigger_manifest.get("model_version", "") or "0"),
-            },
-            "split_plan": dict(trigger_manifest.get("split_plan", {}) or {}),
-            "training_mode": {
-                "send_low_conf_features": bool(trigger_manifest.get("feature_shards")),
-                "low_quality_mode": str(trigger_manifest.get("upload_mode", "raw-only")),
-            },
-            "selection_policy": {
-                "policy": "low_quality_trigger_shards",
-                "selected_sample_count": len(samples),
-                "zip_payload_bytes": 0,
-            },
-            "samples": samples,
-            "trigger_manifest": {
-                "protocol_version": trigger_manifest.get("protocol_version"),
-                "shard_size": trigger_manifest.get("shard_size"),
-                "raw_shard_count": len(trigger_manifest.get("raw_shards", []) or []),
-                "feature_shard_count": len(trigger_manifest.get("feature_shards", []) or []),
-            },
-        }
-        with open(os.path.join(bundle_cache_path, "bundle_manifest.json"), "w", encoding="utf-8") as handle:
-            json.dump(legacy_manifest, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        normalized_manifest = dict(trigger_manifest)
+        normalized_manifest.update(
+            {
+                "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
+                "edge_id": trigger_manifest.get("edge_id"),
+                "model": {
+                    "model_id": str(trigger_manifest.get("model_id", "") or ""),
+                    "model_version": str(trigger_manifest.get("model_version", "") or "0"),
+                },
+                "split_plan": dict(trigger_manifest.get("split_plan", {}) or {}),
+                "training_mode": {
+                    "send_low_conf_features": bool(trigger_manifest.get("feature_shards")),
+                    "low_quality_mode": str(trigger_manifest.get("upload_mode", "raw-only")),
+                },
+                "selection_policy": {
+                    "policy": "low_quality_trigger_shards",
+                    "selected_sample_count": len(samples),
+                    "zip_payload_bytes": 0,
+                },
+                "samples": samples,
+                "trigger_manifest": {
+                    "protocol_version": trigger_manifest.get("protocol_version"),
+                    "shard_size": trigger_manifest.get("shard_size"),
+                    "raw_shard_count": len(trigger_manifest.get("raw_shards", []) or []),
+                    "feature_shard_count": len(trigger_manifest.get("feature_shards", []) or []),
+                },
+            }
+        )
         logger.info(
             "[ShardCL][CloudUnpack] materialized low-quality trigger shards samples={} "
             "raw_shards={} feature_shards={}",
@@ -2153,7 +2305,7 @@ class CloudContinualLearner:
             len(trigger_manifest.get("raw_shards", []) or []),
             len(trigger_manifest.get("feature_shards", []) or []),
         )
-        return legacy_manifest
+        return normalized_manifest
 
     @contextmanager
     def _training_job_scope(self, edge_id: int | str):
@@ -3065,6 +3217,60 @@ class CloudContinualLearner:
         return (sample_input,)
 
     @staticmethod
+    def _tensor_shape_from_runtime_input(sample_input) -> tuple[int, ...] | None:
+        if isinstance(sample_input, torch.Tensor):
+            return tuple(int(dim) for dim in sample_input.shape)
+        if isinstance(sample_input, (list, tuple)):
+            for value in sample_input:
+                if isinstance(value, torch.Tensor):
+                    return tuple(int(dim) for dim in value.shape)
+        return None
+
+    def _infer_pool_runtime_input_tensor_shape(
+        self,
+        model: torch.nn.Module,
+        *,
+        bundle_root: str,
+        manifest: dict[str, object],
+        prepared_trace_sample_input,
+    ) -> tuple[int, ...] | None:
+        shape = self._tensor_shape_from_runtime_input(prepared_trace_sample_input)
+        if shape is not None:
+            return shape
+        for sample in manifest.get("samples", []):
+            if not isinstance(sample, Mapping):
+                continue
+            raw_relpath = sample.get("raw_relpath")
+            if raw_relpath is None:
+                continue
+            raw_path = os.path.join(bundle_root, str(raw_relpath).replace("/", os.sep))
+            if not os.path.exists(raw_path):
+                continue
+            frame = cv2.imread(raw_path)
+            if frame is None:
+                continue
+            runtime_input = self._prepare_split_runtime_input(
+                model,
+                frame,
+                sample_metadata=sample,
+            )
+            runtime_tensor = self._normalize_bundle_runtime_tensor(
+                runtime_input,
+                context="Cloud sample-pool runtime shape inference",
+            )
+            return tuple(int(dim) for dim in runtime_tensor.shape)
+        trace_image_size = self._infer_bundle_trace_image_size(manifest)
+        runtime_tensor = self._normalize_bundle_runtime_tensor(
+            build_split_runtime_sample_input(
+                model,
+                image_size=trace_image_size,
+                device=self.device,
+            ),
+            context="Cloud sample-pool runtime shape inference",
+        )
+        return tuple(int(dim) for dim in runtime_tensor.shape)
+
+    @staticmethod
     def _preferred_fixed_split_runtime_mode(model_family: str | None) -> str:
         if str(model_family or "").lower() == "rfdetr":
             return "debug_interpreter"
@@ -3526,6 +3732,214 @@ class CloudContinualLearner:
             kwargs["persistent_workers"] = True
         return kwargs
 
+    @staticmethod
+    def _load_low_quality_trigger_intermediate(feature_path: str) -> object:
+        payload = torch.load(feature_path, map_location="cpu", weights_only=False)
+        if isinstance(payload, Mapping) and "intermediate" in payload:
+            return payload["intermediate"]
+        if isinstance(payload, (BoundaryPayload, SplitPayload)):
+            return payload
+        if isinstance(payload, Mapping):
+            tensors = payload.get("tensors")
+            if isinstance(tensors, Mapping):
+                return SplitPayload.from_mapping(dict(tensors))
+            return SplitPayload.from_mapping(dict(payload))
+        raise TypeError(f"Unsupported low-quality trigger feature payload: {type(payload)!r}")
+
+    def _prepare_low_quality_trigger_training_cache(
+        self,
+        model: torch.nn.Module,
+        manifest: dict[str, object],
+        *,
+        bundle_cache_path: str,
+        working_cache: str,
+        splitter: UniversalModelSplitter | None,
+        candidate: object | None,
+        runtime_batch_size: int | None = None,
+        preloaded_records: dict[str, dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        os.makedirs(os.path.join(working_cache, "features"), exist_ok=True)
+        os.makedirs(os.path.join(working_cache, "frames"), exist_ok=True)
+        if preloaded_records is not None:
+            preloaded_records.clear()
+
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        all_sample_ids: list[str] = []
+        processed_items: list[dict[str, object]] = []
+        pending_rebuilds: list[dict[str, object]] = []
+
+        for sample in list(manifest.get("samples", []) or []):
+            if not isinstance(sample, Mapping):
+                continue
+            if not _is_low_quality_trigger_sample(manifest, sample):
+                continue
+            sample_id = str(sample.get("sample_id", "") or "").strip()
+            raw_relpath = sample.get("raw_relpath")
+            if not sample_id or raw_relpath is None:
+                continue
+            raw_path = os.path.join(bundle_cache_path, str(raw_relpath).replace("/", os.sep))
+            if not os.path.exists(raw_path):
+                raise FileNotFoundError(raw_path)
+
+            frame_path = os.path.join(working_cache, "frames", f"{sample_id}.jpg")
+            if (
+                not os.path.exists(frame_path)
+                or os.path.getsize(frame_path) != int(sample.get("raw_bytes") or os.path.getsize(raw_path))
+            ):
+                shutil.copyfile(raw_path, frame_path)
+            frame = cv2.imread(frame_path)
+            input_image_size = (
+                [int(frame.shape[0]), int(frame.shape[1])]
+                if frame is not None and frame.ndim >= 2
+                else None
+            )
+
+            intermediate = None
+            feature_relpath = sample.get("feature_relpath")
+            if feature_relpath:
+                feature_path = os.path.join(
+                    bundle_cache_path,
+                    str(feature_relpath).replace("/", os.sep),
+                )
+                if os.path.exists(feature_path) and self._low_quality_feature_matches_split_plan(
+                    feature_path,
+                    split_plan,
+                ):
+                    try:
+                        intermediate = self._load_low_quality_trigger_intermediate(feature_path)
+                    except Exception as exc:
+                        logger.warning(
+                            "[ShardCL][FeatureRebuild] Ignoring unreadable optional low-quality feature for sample {}: {}",
+                            sample_id,
+                            exc,
+                        )
+
+            item = {
+                "sample": dict(sample),
+                "sample_id": sample_id,
+                "input_image_size": input_image_size,
+                "frame_path": frame_path,
+            }
+            if intermediate is None:
+                pending_rebuilds.append({**item, "raw_path": raw_path})
+            else:
+                processed_items.append({**item, "intermediate": intermediate})
+            all_sample_ids.append(sample_id)
+
+        if pending_rebuilds:
+            provider = self._bundle_batch_feature_provider(
+                model,
+                manifest,
+                bundle_root=bundle_cache_path,
+                splitter=splitter,
+                candidate=candidate,
+                runtime_batch_size=runtime_batch_size,
+            )
+            started = time.perf_counter()
+            logger.info(
+                "[ShardCL][FeatureRebuild] Reconstructing {} low-quality trigger sample(s) on the cloud.",
+                len(pending_rebuilds),
+            )
+            rebuilt_payloads = provider(
+                [str(item["raw_path"]) for item in pending_rebuilds],
+                [dict(item["sample"]) for item in pending_rebuilds],
+                manifest,
+            )
+            if len(rebuilt_payloads) != len(pending_rebuilds):
+                raise RuntimeError(
+                    "Cloud feature reconstruction returned the wrong number of payloads: "
+                    f"expected {len(pending_rebuilds)}, got {len(rebuilt_payloads)}."
+                )
+            for item, intermediate in zip(pending_rebuilds, rebuilt_payloads):
+                processed_items.append({**item, "intermediate": intermediate})
+            logger.info(
+                "[ShardCL][FeatureRebuild] reconstructed_samples={} elapsed={:.3f}s",
+                len(pending_rebuilds),
+                time.perf_counter() - started,
+            )
+
+        metadata_samples: dict[str, dict[str, object]] = {}
+        model_meta = dict(manifest.get("model", {}) or {})
+        for item in processed_items:
+            sample = dict(item["sample"])
+            sample_id = str(item["sample_id"])
+            frame_path = str(item["frame_path"])
+            input_image_size = item.get("input_image_size")
+            record = save_split_feature_cache(
+                cache_path=working_cache,
+                frame_index=sample_id,
+                intermediate=item["intermediate"],
+                extra_metadata={
+                    "split_plan_candidate_id": split_plan.get("candidate_id"),
+                    "split_plan_split_index": split_plan.get("split_index"),
+                    "split_plan_split_label": split_plan.get("split_label"),
+                    "split_plan_boundary_tensor_labels": list(
+                        split_plan.get("boundary_tensor_labels", []) or []
+                    ),
+                    "sample_id": sample_id,
+                    "model_id": str(model_meta.get("model_id", "") or ""),
+                    "model_version": str(model_meta.get("model_version", "") or ""),
+                    **(
+                        {"input_image_size": input_image_size}
+                        if input_image_size is not None
+                        else {}
+                    ),
+                    "has_raw_sample": True,
+                },
+            )
+            if preloaded_records is not None:
+                preloaded_records[sample_id] = record
+            feature_path = os.path.join(working_cache, "features", f"{sample_id}.pt")
+            metadata_samples[sample_id] = {
+                "sample_id": sample_id,
+                "feature_relpath": os.path.relpath(feature_path, working_cache).replace("\\", "/"),
+                "feature_file_size": os.path.getsize(feature_path),
+                "frame_relpath": os.path.relpath(frame_path, working_cache).replace("\\", "/"),
+                "frame_file_size": os.path.getsize(frame_path),
+                "has_raw_sample": True,
+                "split_plan_candidate_id": split_plan.get("candidate_id"),
+                "split_plan_split_index": split_plan.get("split_index"),
+                "split_plan_split_label": split_plan.get("split_label"),
+                "split_plan_boundary_tensor_labels": list(
+                    split_plan.get("boundary_tensor_labels", []) or []
+                ),
+                "source_feature_relpath": sample.get("feature_relpath"),
+                "source_feature_bytes": int(sample.get("feature_bytes") or 0),
+                "source_raw_relpath": sample.get("raw_relpath"),
+                "source_raw_bytes": int(sample.get("raw_bytes") or 0),
+                "model_id": str(model_meta.get("model_id", "") or ""),
+                "model_version": str(model_meta.get("model_version", "") or ""),
+                **(
+                    {"input_image_size": input_image_size}
+                    if input_image_size is not None
+                    else {}
+                ),
+            }
+
+        _write_json_file(
+            _working_cache_metadata_index_path(working_cache),
+            {
+                "version": 1,
+                "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
+                "model": model_meta,
+                "split_plan": {
+                    "candidate_id": split_plan.get("candidate_id"),
+                    "split_index": split_plan.get("split_index"),
+                    "split_label": split_plan.get("split_label"),
+                    "boundary_tensor_labels": list(
+                        split_plan.get("boundary_tensor_labels", []) or []
+                    ),
+                },
+                "all_sample_ids": all_sample_ids,
+                "samples": metadata_samples,
+            },
+        )
+        return {
+            "manifest": manifest,
+            "all_sample_ids": all_sample_ids,
+            "from_trigger_shards": True,
+        }
+
     def _prepare_fixed_split_working_cache(
         self,
         model: torch.nn.Module,
@@ -3611,19 +4025,14 @@ class CloudContinualLearner:
             )
 
         def _prepare_cache() -> dict[str, object]:
-            if preloaded_records is not None:
-                preloaded_records.clear()
-            return prepare_split_training_cache(
-                bundle_cache_path,
-                working_cache,
-                batch_feature_provider=self._bundle_batch_feature_provider(
-                    model,
-                    manifest,
-                    bundle_root=bundle_cache_path,
-                    splitter=prepared_splitter,
-                    candidate=prepared_candidate,
-                    runtime_batch_size=runtime_batch_size,
-                ),
+            return self._prepare_low_quality_trigger_training_cache(
+                model,
+                manifest,
+                bundle_cache_path=bundle_cache_path,
+                working_cache=working_cache,
+                splitter=prepared_splitter,
+                candidate=prepared_candidate,
+                runtime_batch_size=runtime_batch_size,
                 preloaded_records=preloaded_records,
             )
 
@@ -4663,9 +5072,14 @@ class CloudContinualLearner:
                 materialized_manifest = self._materialize_low_quality_trigger_bundle(
                     bundle_cache_path
                 )
-                manifest = materialized_manifest or load_training_bundle_manifest(bundle_cache_path)
+                if materialized_manifest is None:
+                    raise RuntimeError(
+                        "Shard-based continual-learning trigger payload must contain "
+                        "trigger_manifest.json; legacy bundle_manifest.json uploads are no longer supported."
+                    )
+                manifest = materialized_manifest
                 self._log_stage_duration("loading bundle manifest", stage_started)
-                if manifest.get("protocol_version") != CONTINUAL_LEARNING_PROTOCOL_VERSION:
+                if manifest.get("protocol_version") != LOW_QUALITY_TRIGGER_PROTOCOL_VERSION:
                     raise RuntimeError(
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
                     )
@@ -4682,16 +5096,6 @@ class CloudContinualLearner:
                 sample_pool = self._cloud_sample_pool_for_manifest(
                     edge_id=edge_id,
                     manifest=manifest,
-                )
-                stage_started = time.perf_counter()
-                high_quality_added = sample_pool.ingest_high_quality_feature_label_bundle(
-                    bundle_cache_path,
-                )
-                self._log_stage_duration("high-quality sample-pool ingest", stage_started)
-                logger.info(
-                    "[FixedSplitCL] Cloud sample pool {} ingested {} high-quality sample(s).",
-                    sample_pool.root_dir,
-                    high_quality_added,
                 )
                 self._disable_incompatible_low_quality_features(
                     bundle_cache_path=bundle_cache_path,
@@ -4762,6 +5166,25 @@ class CloudContinualLearner:
                     )
                 )
                 self._log_stage_duration("preparing/reusing working cache", stage_started)
+                pool_runtime_input_tensor_shape = self._infer_pool_runtime_input_tensor_shape(
+                    tmp_model,
+                    bundle_root=bundle_cache_path,
+                    manifest=manifest,
+                    prepared_trace_sample_input=prepared_trace_sample_input,
+                )
+                pool_model_input_size = (
+                    (
+                        int(pool_runtime_input_tensor_shape[-2]),
+                        int(pool_runtime_input_tensor_shape[-1]),
+                    )
+                    if pool_runtime_input_tensor_shape is not None
+                    and len(pool_runtime_input_tensor_shape) >= 3
+                    else None
+                )
+                pool_input_resize_mode = (
+                    get_split_runtime_input_resize_mode(get_split_runtime_model(tmp_model))
+                    or "direct_resize"
+                )
                 gt_sample_ids = _select_fixed_split_gt_sample_ids(
                     manifest,
                     prepared_sample_ids=bundle_info["all_sample_ids"],
@@ -4782,6 +5205,8 @@ class CloudContinualLearner:
                     working_cache=working_cache,
                     gt_annotations=gt_annotations,
                     preloaded_records=preloaded_records,
+                    model_input_size=pool_model_input_size,
+                    resize_mode=pool_input_resize_mode,
                 )
                 low_quality_added = sample_pool.ingest_low_quality_processed_samples(
                     low_quality_pool_samples,
@@ -4806,6 +5231,8 @@ class CloudContinualLearner:
                         or ""
                     )
                     or None,
+                    runtime_input_tensor_shape=pool_runtime_input_tensor_shape,
+                    input_resize_mode=pool_input_resize_mode,
                 )
                 if not bundle_info["all_sample_ids"]:
                     raise RuntimeError(

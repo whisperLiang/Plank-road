@@ -1,4 +1,4 @@
-﻿import io
+import io
 import json
 import os
 import tarfile
@@ -12,15 +12,11 @@ import pytest
 import torch
 from loguru import logger
 
-import model_management.continual_learning_bundle as continual_learning_bundle
 from edge.sample_store import EdgeSampleStore, HIGH_QUALITY, LOW_QUALITY
 from edge.sample_sync import HighQualitySampleSyncer, pack_high_quality_sync_bundle_to_file
 from edge.transmit import (
-    pack_continual_learning_bundle,
-    pack_continual_learning_bundle_to_file,
     pack_low_quality_trigger_bundle_to_file,
 )
-from model_management.continual_learning_bundle import prepare_split_training_cache
 from model_management.fixed_split import (
     SplitConstraints,
     SplitPlan,
@@ -1747,1058 +1743,6 @@ def test_cached_split_proxy_eval_pads_singleton_dynamic_batch(tmp_path):
     assert prediction_cache["prediction_rows"][0][2]["scores"] == pytest.approx([0.9])
 
 
-def test_bundle_always_includes_high_conf_features_and_results(tmp_path, sample_bgr_frame):
-    store = EdgeSampleStore(str(tmp_path))
-    high = store.store_sample(
-        sample_id="high-1",
-        frame_index=1,
-        confidence=0.9,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=HIGH_QUALITY,
-        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-        intermediate=_payload(),
-    )
-    low = store.store_sample(
-        sample_id="low-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_payload(),
-        raw_frame=sample_bgr_frame,
-    )
-
-    payload_zip, manifest = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=_dummy_plan(),
-        model_id="model-a",
-        model_version="0",
-    )
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        names = set(zf.namelist())
-        bundle_manifest = json.loads(zf.read("bundle_manifest.json"))
-
-    sample_map = {sample["sample_id"]: sample for sample in bundle_manifest["samples"]}
-    assert high.feature_relpath in names
-    assert high.result_relpath not in names
-    assert low.result_relpath not in names
-    assert sample_map["high-1"]["inference_result"]["labels"] == [1]
-    assert sample_map["low-1"]["inference_result"]["labels"] == []
-    assert low.raw_relpath in names
-    assert low.feature_relpath not in names
-    assert sample_map["low-1"]["feature_relpath"] is None
-    assert manifest["training_mode"]["low_quality_mode"] == "raw-only"
-
-
-def test_bundle_uses_stored_zip_and_prepare_cache_reads_it(tmp_path):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    high = store.store_sample(
-        sample_id="high-1",
-        frame_index=1,
-        confidence=0.9,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=HIGH_QUALITY,
-        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-        intermediate=_planned_payload(plan),
-    )
-
-    zip_path, manifest, stats = pack_continual_learning_bundle_to_file(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-        output_dir=str(tmp_path),
-    )
-
-    try:
-        bundle_root = tmp_path / "bundle"
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            assert {info.compress_type for info in zf.infolist()} == {zipfile.ZIP_STORED}
-            zf.extractall(bundle_root)
-
-        bundle_manifest = json.loads((bundle_root / "bundle_manifest.json").read_text())
-        assert bundle_manifest["selection_policy"]["zip_payload_bytes"] == stats["zip_payload_bytes"]
-        assert bundle_manifest["samples"][0]["sample_id"] == high.sample_id
-
-        info = prepare_split_training_cache(str(bundle_root), str(tmp_path / "prepared_cache"))
-        assert info["all_sample_ids"] == ["high-1"]
-        assert manifest["selection_policy"]["selected_sample_count"] == 1
-    finally:
-        os.remove(zip_path)
-
-
-def test_prepare_split_training_cache_memory_preload_matches_disk_record(tmp_path):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    store.store_sample(
-        sample_id="high-1",
-        frame_index=1,
-        confidence=0.9,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=HIGH_QUALITY,
-        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-        intermediate=_planned_payload(plan),
-    )
-    zip_path, _manifest, _stats = pack_continual_learning_bundle_to_file(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-        output_dir=str(tmp_path),
-    )
-
-    try:
-        bundle_root = tmp_path / "bundle-memory"
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(bundle_root)
-        preloaded_records = {}
-        info = prepare_split_training_cache(
-            str(bundle_root),
-            str(tmp_path / "prepared_cache_memory"),
-            preloaded_records=preloaded_records,
-        )
-        disk_record = load_split_feature_cache(
-            str(tmp_path / "prepared_cache_memory"),
-            "high-1",
-        )
-        memory_record = preloaded_records["high-1"]
-
-        assert info["all_sample_ids"] == ["high-1"]
-        assert torch.equal(
-            disk_record["intermediate"].tensors["payload"],
-            memory_record["intermediate"].tensors["payload"],
-        )
-        assert disk_record["pseudo_boxes"] == memory_record["pseudo_boxes"]
-        assert disk_record["pseudo_labels"] == memory_record["pseudo_labels"]
-    finally:
-        os.remove(zip_path)
-
-
-def test_bundle_budget_keeps_drift_raw_and_omits_lowest_priority_raw(
-    tmp_path,
-    sample_bgr_frame,
-):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    high = store.store_sample(
-        sample_id="high-1",
-        frame_index=1,
-        confidence=0.9,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=HIGH_QUALITY,
-        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-        intermediate=_planned_payload(plan),
-    )
-    drift = store.store_sample(
-        sample_id="drift-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        quality_score=0.3,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_planned_payload(plan),
-        raw_frame=sample_bgr_frame,
-        in_drift_window=True,
-    )
-    keep_low = store.store_sample(
-        sample_id="low-keep",
-        frame_index=3,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        quality_score=0.1,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_planned_payload(plan),
-        raw_frame=sample_bgr_frame,
-    )
-    drop_low = store.store_sample(
-        sample_id="low-drop",
-        frame_index=4,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        quality_score=0.8,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_planned_payload(plan),
-        raw_frame=sample_bgr_frame,
-    )
-
-    for record, size in ((drift, 1024), (keep_low, 768), (drop_low, 1_000_000)):
-        raw_path = tmp_path / "store" / record.raw_relpath
-        raw_path.write_bytes(bytes([len(record.sample_id) % 251]) * size)
-
-    def _selected_cost(record, *, include_feature: bool, include_raw: bool) -> int:
-        relpaths = [record.result_relpath, record.metadata_relpath]
-        if include_feature:
-            relpaths.append(record.feature_relpath)
-        if include_raw:
-            relpaths.append(record.raw_relpath)
-        return sum((tmp_path / "store" / relpath).stat().st_size for relpath in relpaths)
-
-    cap = (
-        _selected_cost(high, include_feature=True, include_raw=False)
-        + _selected_cost(drift, include_feature=False, include_raw=True)
-        + _selected_cost(keep_low, include_feature=False, include_raw=True)
-        + 20000
-    )
-
-    payload_zip, manifest = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-        bundle_cap_bytes=cap,
-    )
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        bundle_manifest = json.loads(zf.read("bundle_manifest.json"))
-        names = set(zf.namelist())
-
-    sample_ids = [sample["sample_id"] for sample in bundle_manifest["samples"]]
-    assert sample_ids == ["high-1", "drift-1", "low-keep"]
-    assert "low-drop" not in sample_ids
-    assert drift.raw_relpath in names
-    assert keep_low.raw_relpath in names
-    assert drop_low.raw_relpath not in names
-    assert bundle_manifest["selection_policy"]["drift_window_selected_count"] == 1
-    assert bundle_manifest["selection_policy"]["omitted_sample_count"] == 1
-    assert manifest["selection_policy"]["bundle_cap_bytes"] == cap
-
-
-def test_bundle_budget_caps_non_drift_high_quality_features(tmp_path):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    records = []
-    for index in range(3):
-        record = store.store_sample(
-            sample_id=f"high-{index}",
-            frame_index=index,
-            confidence=0.9,
-            split_config_id="plan-1",
-            model_id="model-a",
-            model_version="0",
-            quality_bucket=HIGH_QUALITY,
-            inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-            intermediate=_planned_payload(plan),
-        )
-        feature_path = tmp_path / "store" / record.feature_relpath
-        feature_path.write_bytes(bytes([index + 1]) * 256_000)
-        records.append(record)
-
-    first_cost = sum(
-        (tmp_path / "store" / relpath).stat().st_size
-        for relpath in (
-            records[0].result_relpath,
-            records[0].metadata_relpath,
-            records[0].feature_relpath,
-        )
-    )
-    cap = first_cost + 30_000
-
-    payload_zip, manifest = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-        bundle_cap_bytes=cap,
-    )
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        bundle_manifest = json.loads(zf.read("bundle_manifest.json"))
-        names = set(zf.namelist())
-
-    sample_ids = [sample["sample_id"] for sample in bundle_manifest["samples"]]
-    assert sample_ids == ["high-0"]
-    assert records[0].feature_relpath in names
-    assert records[1].feature_relpath not in names
-    assert bundle_manifest["selection_policy"]["omitted_sample_count"] == 2
-    assert manifest["selection_policy"]["zip_payload_bytes"] <= cap
-
-
-def test_bundle_includes_low_conf_features_when_decision_requests_them(tmp_path, sample_bgr_frame):
-    store = EdgeSampleStore(str(tmp_path))
-    low = store.store_sample(
-        sample_id="low-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_payload(),
-        raw_frame=sample_bgr_frame,
-    )
-
-    payload_zip, manifest = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=True,
-        split_plan=_dummy_plan(),
-        model_id="model-a",
-        model_version="0",
-    )
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        names = set(zf.namelist())
-
-    assert low.feature_relpath in names
-    assert low.raw_relpath in names
-    assert manifest["training_mode"]["low_quality_mode"] == "raw+feature"
-
-
-def test_bundle_filters_records_to_current_split_plan_and_model(tmp_path, sample_bgr_frame):
-    store = EdgeSampleStore(str(tmp_path))
-    keep = store.store_sample(
-        sample_id="keep-1",
-        frame_index=1,
-        confidence=0.9,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=HIGH_QUALITY,
-        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-        intermediate=_payload(),
-        in_drift_window=True,
-        raw_frame=sample_bgr_frame,
-    )
-    store.store_sample(
-        sample_id="old-plan",
-        frame_index=2,
-        confidence=0.9,
-        split_config_id="plan-old",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=HIGH_QUALITY,
-        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-        intermediate=_payload(),
-        in_drift_window=True,
-        raw_frame=sample_bgr_frame,
-    )
-    store.store_sample(
-        sample_id="old-model",
-        frame_index=3,
-        confidence=0.9,
-        split_config_id="plan-1",
-        model_id="model-b",
-        model_version="0",
-        quality_bucket=HIGH_QUALITY,
-        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-        intermediate=_payload(),
-    )
-
-    payload_zip, manifest = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=_dummy_plan(),
-        model_id="model-a",
-        model_version="0",
-    )
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        names = set(zf.namelist())
-        bundle_manifest = json.loads(zf.read("bundle_manifest.json"))
-
-    sample_ids = [sample["sample_id"] for sample in bundle_manifest["samples"]]
-    assert sample_ids == ["keep-1"]
-    assert bundle_manifest["selection_policy"]["drift_window_selected_count"] == 1
-    assert keep.feature_relpath in names
-    assert "features/old-plan.pt" not in names
-    assert "features/old-model.pt" not in names
-
-
-def test_server_reconstructs_low_conf_features_only_in_raw_only_mode(tmp_path, sample_bgr_frame):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    store.store_sample(
-        sample_id="low-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_planned_payload(plan),
-        raw_frame=sample_bgr_frame,
-    )
-
-    provider_calls = {"count": 0}
-
-    def _batch_provider(raw_paths, samples, manifest):
-        provider_calls["count"] += 1
-        assert len(raw_paths) == len(samples)
-        return [_payload() for _ in raw_paths]
-
-    raw_only_zip, _ = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-    )
-    raw_only_root = tmp_path / "raw_only_bundle"
-    with zipfile.ZipFile(io.BytesIO(raw_only_zip), "r") as zf:
-        zf.extractall(raw_only_root)
-    prepare_split_training_cache(
-        str(raw_only_root),
-        str(tmp_path / "raw_only_cache"),
-        batch_feature_provider=_batch_provider,
-    )
-    assert provider_calls["count"] == 1
-
-    provider_calls["count"] = 0
-    raw_plus_zip, _ = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=True,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-    )
-    raw_plus_root = tmp_path / "raw_plus_bundle"
-    with zipfile.ZipFile(io.BytesIO(raw_plus_zip), "r") as zf:
-        zf.extractall(raw_plus_root)
-    prepare_split_training_cache(
-        str(raw_plus_root),
-        str(tmp_path / "raw_plus_cache"),
-        batch_feature_provider=_batch_provider,
-    )
-    assert provider_calls["count"] == 0
-
-
-def test_prepare_split_training_cache_reuses_bundled_feature_when_boundary_labels_drift(tmp_path):
-    bundle_root = tmp_path / "bundle"
-    (bundle_root / "features").mkdir(parents=True)
-    (bundle_root / "results").mkdir()
-
-    payload = SplitPayload(
-        tensors=OrderedDict([("payload", torch.ones(1, 2, 2))]),
-        candidate_id="candidate-old",
-        boundary_tensor_labels=["old-boundary"],
-        primary_label="payload",
-        split_index=3,
-        split_label="payload",
-    )
-    torch.save({"intermediate": payload}, bundle_root / "features" / "sample-1.pt")
-    (bundle_root / "results" / "sample-1.json").write_text(
-        json.dumps({"boxes": [], "labels": [], "scores": []}),
-        encoding="utf-8",
-    )
-
-    manifest = {
-        "protocol_version": "edge-cl-bundle.v1",
-        "edge_id": 1,
-        "model": {"model_id": "model-a", "model_version": "0"},
-        "split_plan": {
-            **_dummy_plan().to_dict(),
-            "candidate_id": "candidate-new",
-            "split_index": 3,
-            "boundary_tensor_labels": ["new-boundary"],
-        },
-        "samples": [
-            {
-                "sample_id": "sample-1",
-                "frame_index": 1,
-                "confidence": 0.9,
-                "quality_bucket": HIGH_QUALITY,
-                "in_drift_window": False,
-                "feature_relpath": "features/sample-1.pt",
-                "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
-                "result_relpath": "results/sample-1.json",
-                "metadata_relpath": "metadata/sample-1.json",
-                "raw_relpath": None,
-                "raw_bytes": 0,
-                "has_feature": True,
-                "has_raw_sample": False,
-                "split_config_id": "plan-1",
-                "model_id": "model-a",
-                "model_version": "0",
-                "input_image_size": None,
-                "input_tensor_shape": None,
-                "timestamp": "2026-01-01T00:00:00+00:00",
-            }
-        ],
-    }
-    (bundle_root / "bundle_manifest.json").write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
-    )
-
-    info = prepare_split_training_cache(
-        str(bundle_root),
-        str(tmp_path / "prepared_cache"),
-    )
-
-    assert info["all_sample_ids"] == ["sample-1"]
-    record = load_split_feature_cache(str(tmp_path / "prepared_cache"), "sample-1")
-    assert record["candidate_id"] == payload.candidate_id
-    assert record["boundary_tensor_labels"] == list(payload.boundary_tensor_labels)
-    assert record["split_plan_boundary_tensor_labels"] == ["new-boundary"]
-
-
-def test_prepare_split_training_cache_backfills_input_image_size_from_raw_sample(
-    tmp_path, sample_bgr_frame
-):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    store.store_sample(
-        sample_id="low-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_payload(),
-        raw_frame=sample_bgr_frame,
-    )
-
-    payload_zip, _ = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=_dummy_plan(),
-        model_id="model-a",
-        model_version="0",
-    )
-    bundle_root = tmp_path / "bundle"
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        zf.extractall(bundle_root)
-
-    manifest = json.loads((bundle_root / "bundle_manifest.json").read_text())
-    assert manifest["samples"][0]["input_image_size"] is None
-
-    cache_root = tmp_path / "prepared_cache"
-    prepare_split_training_cache(
-        str(bundle_root),
-        str(cache_root),
-        batch_feature_provider=lambda raw_paths, samples, manifest: [_payload() for _ in raw_paths],
-    )
-
-    record = load_split_feature_cache(str(cache_root), "low-1")
-    assert record["input_image_size"] == list(sample_bgr_frame.shape[:2])
-
-
-def test_prepare_split_training_cache_reuses_feature_only_sample_without_rebuild(tmp_path):
-    bundle_root = tmp_path / "bundle"
-    (bundle_root / "features").mkdir(parents=True)
-    (bundle_root / "results").mkdir()
-
-    payload = _planned_payload()
-    torch.save({"intermediate": payload}, bundle_root / "features" / "sample-1.pt")
-    (bundle_root / "results" / "sample-1.json").write_text(
-        json.dumps({"boxes": [], "labels": [], "scores": []}),
-        encoding="utf-8",
-    )
-
-    manifest = {
-        "protocol_version": "edge-cl-bundle.v1",
-        "edge_id": 1,
-        "model": {"model_id": "model-a", "model_version": "0"},
-        "split_plan": _dummy_plan().to_dict(),
-        "samples": [
-            {
-                "sample_id": "sample-1",
-                "frame_index": 1,
-                "confidence": 0.9,
-                "quality_bucket": HIGH_QUALITY,
-                "in_drift_window": False,
-                "feature_relpath": "features/sample-1.pt",
-                "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
-                "result_relpath": "results/sample-1.json",
-                "metadata_relpath": "metadata/sample-1.json",
-                "raw_relpath": None,
-                "raw_bytes": 0,
-                "has_feature": True,
-                "has_raw_sample": False,
-                "split_config_id": "plan-1",
-                "model_id": "model-a",
-                "model_version": "0",
-                "input_image_size": [8, 8],
-                "input_tensor_shape": [1, 3, 8, 8],
-                "timestamp": "2026-01-01T00:00:00+00:00",
-            }
-        ],
-    }
-    (bundle_root / "bundle_manifest.json").write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
-    )
-
-    def _batch_provider(*_args, **_kwargs):
-        raise AssertionError(
-            "batch_feature_provider should not be called for feature-only samples without raw input"
-        )
-
-    cache_root = tmp_path / "prepared_cache"
-    info = prepare_split_training_cache(
-        str(bundle_root),
-        str(cache_root),
-        batch_feature_provider=_batch_provider,
-    )
-
-    assert info["all_sample_ids"] == ["sample-1"]
-    record = load_split_feature_cache(str(cache_root), "sample-1")
-    assert record["candidate_id"] == payload.candidate_id
-    assert record["boundary_tensor_labels"] == list(payload.boundary_tensor_labels)
-    assert record["split_plan_boundary_tensor_labels"] == list(_dummy_plan().boundary_tensor_labels)
-
-
-def test_prepare_split_training_cache_is_incremental_for_reconstructed_raw_only_samples(
-    tmp_path,
-    sample_bgr_frame,
-    monkeypatch,
-):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    store.store_sample(
-        sample_id="low-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_planned_payload(plan),
-        raw_frame=sample_bgr_frame,
-    )
-
-    payload_zip, _ = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-    )
-    bundle_root = tmp_path / "bundle"
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        zf.extractall(bundle_root)
-
-    cache_root = tmp_path / "prepared_cache"
-    provider_calls = {"count": 0}
-
-    def _batch_provider(raw_paths, samples, manifest):
-        provider_calls["count"] += 1
-        assert len(raw_paths) == len(samples) == 1
-        return [_payload()]
-
-    prepare_split_training_cache(
-        str(bundle_root),
-        str(cache_root),
-        batch_feature_provider=_batch_provider,
-    )
-    assert provider_calls["count"] == 1
-
-    feature_path = cache_root / "features" / "low-1.pt"
-    frame_path = cache_root / "frames" / "low-1.jpg"
-    metadata_path = cache_root / "metadata_index.json"
-    assert feature_path.exists()
-    assert frame_path.exists()
-    assert metadata_path.exists()
-
-    feature_mtime = feature_path.stat().st_mtime_ns
-    frame_mtime = frame_path.stat().st_mtime_ns
-    metadata_mtime = metadata_path.stat().st_mtime_ns
-
-    save_calls = {"count": 0}
-    copy_calls = {"count": 0}
-    provider_calls["count"] = 0
-    original_save = continual_learning_bundle.save_split_feature_cache
-    original_copy = continual_learning_bundle.shutil.copyfile
-
-    def _counting_save(*args, **kwargs):
-        save_calls["count"] += 1
-        return original_save(*args, **kwargs)
-
-    def _counting_copy(src, dst):
-        copy_calls["count"] += 1
-        return original_copy(src, dst)
-
-    monkeypatch.setattr(continual_learning_bundle, "save_split_feature_cache", _counting_save)
-    monkeypatch.setattr(continual_learning_bundle.shutil, "copyfile", _counting_copy)
-
-    time.sleep(0.02)
-    prepare_split_training_cache(
-        str(bundle_root),
-        str(cache_root),
-        batch_feature_provider=_batch_provider,
-    )
-
-    assert provider_calls["count"] == 0
-    assert save_calls["count"] == 0
-    assert copy_calls["count"] == 0
-    assert feature_path.stat().st_mtime_ns == feature_mtime
-    assert frame_path.stat().st_mtime_ns == frame_mtime
-    assert metadata_path.stat().st_mtime_ns == metadata_mtime
-
-    metadata_index = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert metadata_index["all_sample_ids"] == ["low-1"]
-    assert metadata_index["samples"]["low-1"]["feature_relpath"] == "features/low-1.pt"
-    assert metadata_index["samples"]["low-1"]["frame_relpath"] == "frames/low-1.jpg"
-    assert metadata_index["samples"]["low-1"]["has_raw_sample"] is True
-
-
-def test_prepare_split_training_cache_does_not_rewrite_reusable_feature_only_cache(
-    tmp_path,
-    monkeypatch,
-):
-    bundle_root = tmp_path / "bundle"
-    (bundle_root / "features").mkdir(parents=True)
-    (bundle_root / "results").mkdir()
-
-    payload = _planned_payload()
-    torch.save({"intermediate": payload}, bundle_root / "features" / "sample-1.pt")
-    (bundle_root / "results" / "sample-1.json").write_text(
-        json.dumps({"boxes": [], "labels": [], "scores": []}),
-        encoding="utf-8",
-    )
-
-    manifest = {
-        "protocol_version": "edge-cl-bundle.v1",
-        "edge_id": 1,
-        "model": {"model_id": "model-a", "model_version": "0"},
-        "split_plan": _dummy_plan().to_dict(),
-        "samples": [
-            {
-                "sample_id": "sample-1",
-                "frame_index": 1,
-                "confidence": 0.9,
-                "quality_bucket": HIGH_QUALITY,
-                "in_drift_window": False,
-                "feature_relpath": "features/sample-1.pt",
-                "feature_bytes": (bundle_root / "features" / "sample-1.pt").stat().st_size,
-                "result_relpath": "results/sample-1.json",
-                "metadata_relpath": "metadata/sample-1.json",
-                "raw_relpath": None,
-                "raw_bytes": 0,
-                "has_feature": True,
-                "has_raw_sample": False,
-                "split_config_id": "plan-1",
-                "model_id": "model-a",
-                "model_version": "0",
-                "input_image_size": [8, 8],
-                "input_tensor_shape": [1, 3, 8, 8],
-                "timestamp": "2026-01-01T00:00:00+00:00",
-            }
-        ],
-    }
-    (bundle_root / "bundle_manifest.json").write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
-    )
-
-    cache_root = tmp_path / "prepared_cache"
-    prepare_split_training_cache(str(bundle_root), str(cache_root))
-
-    feature_path = cache_root / "features" / "sample-1.pt"
-    metadata_path = cache_root / "metadata_index.json"
-    feature_mtime = feature_path.stat().st_mtime_ns
-    metadata_mtime = metadata_path.stat().st_mtime_ns
-
-    save_calls = {"count": 0}
-    original_save = continual_learning_bundle.save_split_feature_cache
-
-    def _counting_save(*args, **kwargs):
-        save_calls["count"] += 1
-        return original_save(*args, **kwargs)
-
-    monkeypatch.setattr(
-        continual_learning_bundle,
-        "_load_intermediate",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("bundled feature should not be reloaded")
-        ),
-    )
-    monkeypatch.setattr(
-        continual_learning_bundle,
-        "save_split_feature_cache",
-        _counting_save,
-    )
-
-    time.sleep(0.02)
-    prepare_split_training_cache(str(bundle_root), str(cache_root))
-
-    assert save_calls["count"] == 0
-    assert feature_path.stat().st_mtime_ns == feature_mtime
-    assert metadata_path.stat().st_mtime_ns == metadata_mtime
-
-    metadata_index = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert metadata_index["samples"]["sample-1"]["feature_relpath"] == "features/sample-1.pt"
-    assert metadata_index["samples"]["sample-1"]["has_raw_sample"] is False
-
-
-def test_prepare_split_training_cache_refreshes_feature_only_cache_when_source_digest_changes(
-    tmp_path,
-):
-    bundle_root = tmp_path / "bundle"
-    (bundle_root / "features").mkdir(parents=True)
-    (bundle_root / "results").mkdir()
-
-    initial_payload = SplitPayload(
-        tensors=OrderedDict([("payload", torch.ones(1, 2, 2))]),
-        candidate_id="candidate-1",
-        boundary_tensor_labels=["layer3"],
-        primary_label="payload",
-        split_index=3,
-        split_label="layer3",
-    )
-    updated_payload = SplitPayload(
-        tensors=OrderedDict([("payload", torch.zeros(1, 2, 2))]),
-        candidate_id="candidate-1",
-        boundary_tensor_labels=["layer3"],
-        primary_label="payload",
-        split_index=3,
-        split_label="layer3",
-    )
-    source_feature_path = bundle_root / "features" / "sample-1.pt"
-    torch.save({"intermediate": initial_payload}, source_feature_path)
-    initial_feature_size = source_feature_path.stat().st_size
-    (bundle_root / "results" / "sample-1.json").write_text(
-        json.dumps({"boxes": [], "labels": [], "scores": []}),
-        encoding="utf-8",
-    )
-
-    manifest = {
-        "protocol_version": "edge-cl-bundle.v1",
-        "edge_id": 1,
-        "model": {"model_id": "model-a", "model_version": "0"},
-        "split_plan": _dummy_plan().to_dict(),
-        "samples": [
-            {
-                "sample_id": "sample-1",
-                "frame_index": 1,
-                "confidence": 0.9,
-                "quality_bucket": HIGH_QUALITY,
-                "in_drift_window": False,
-                "feature_relpath": "features/sample-1.pt",
-                "feature_bytes": initial_feature_size,
-                "result_relpath": "results/sample-1.json",
-                "metadata_relpath": "metadata/sample-1.json",
-                "raw_relpath": None,
-                "raw_bytes": 0,
-                "has_feature": True,
-                "has_raw_sample": False,
-                "split_config_id": "plan-1",
-                "model_id": "model-a",
-                "model_version": "0",
-                "input_image_size": [8, 8],
-                "input_tensor_shape": [1, 3, 8, 8],
-                "timestamp": "2026-01-01T00:00:00+00:00",
-            }
-        ],
-    }
-    (bundle_root / "bundle_manifest.json").write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
-    )
-
-    cache_root = tmp_path / "prepared_cache"
-    prepare_split_training_cache(str(bundle_root), str(cache_root))
-    cached_record = load_split_feature_cache(str(cache_root), "sample-1")
-    assert torch.equal(
-        cached_record["intermediate"].tensors["payload"],
-        torch.ones(1, 2, 2),
-    )
-
-    time.sleep(0.02)
-    torch.save({"intermediate": updated_payload}, source_feature_path)
-    assert source_feature_path.stat().st_size == initial_feature_size
-
-    prepare_split_training_cache(str(bundle_root), str(cache_root))
-
-    cached_record = load_split_feature_cache(str(cache_root), "sample-1")
-    assert torch.equal(
-        cached_record["intermediate"].tensors["payload"],
-        torch.zeros(1, 2, 2),
-    )
-    metadata_index = json.loads(
-        (cache_root / "metadata_index.json").read_text(encoding="utf-8")
-    )
-    assert metadata_index["samples"]["sample-1"]["source_feature_sha256"]
-
-
-def test_prepare_split_training_cache_reuses_incompatible_feature_only_samples(tmp_path):
-    bundle_root = tmp_path / "bundle"
-    (bundle_root / "features").mkdir(parents=True)
-    (bundle_root / "results").mkdir()
-
-    payload = SplitPayload(
-        tensors=OrderedDict([("payload", torch.ones(1, 2, 2))]),
-        candidate_id="candidate-old",
-        boundary_tensor_labels=["old-boundary"],
-        primary_label="payload",
-        split_index=99,
-        split_label="payload",
-    )
-    torch.save({"intermediate": payload}, bundle_root / "features" / "old-1.pt")
-    (bundle_root / "results" / "old-1.json").write_text(
-        json.dumps({"boxes": [], "labels": [], "scores": []}),
-        encoding="utf-8",
-    )
-
-    manifest = {
-        "protocol_version": "edge-cl-bundle.v1",
-        "edge_id": 1,
-        "model": {"model_id": "model-a", "model_version": "0"},
-        "split_plan": _dummy_plan().to_dict(),
-        "samples": [
-            {
-                "sample_id": "old-1",
-                "frame_index": 1,
-                "confidence": 0.9,
-                "quality_bucket": HIGH_QUALITY,
-                "in_drift_window": False,
-                "feature_relpath": "features/old-1.pt",
-                "feature_bytes": (bundle_root / "features" / "old-1.pt").stat().st_size,
-                "result_relpath": "results/old-1.json",
-                "metadata_relpath": "metadata/old-1.json",
-                "raw_relpath": None,
-                "raw_bytes": 0,
-                "has_feature": True,
-                "has_raw_sample": False,
-                "split_config_id": "plan-old",
-                "model_id": "model-a",
-                "model_version": "0",
-                "input_image_size": None,
-                "input_tensor_shape": None,
-                "timestamp": "2026-01-01T00:00:00+00:00",
-            }
-        ],
-    }
-    (bundle_root / "bundle_manifest.json").write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
-    )
-
-    info = prepare_split_training_cache(
-        str(bundle_root),
-        str(tmp_path / "prepared_cache"),
-    )
-
-    assert info["all_sample_ids"] == ["old-1"]
-    record = load_split_feature_cache(str(tmp_path / "prepared_cache"), "old-1")
-    assert record["candidate_id"] == payload.candidate_id
-    assert record["boundary_tensor_labels"] == list(payload.boundary_tensor_labels)
-    assert record["split_plan_boundary_tensor_labels"] == list(_dummy_plan().boundary_tensor_labels)
-
-
-def test_prepare_split_training_cache_raises_when_sample_has_no_feature_or_raw(tmp_path):
-    bundle_root = tmp_path / "bundle"
-    (bundle_root / "results").mkdir(parents=True)
-    (bundle_root / "results" / "sample-1.json").write_text(
-        json.dumps({"boxes": [], "labels": [], "scores": []}),
-        encoding="utf-8",
-    )
-    manifest = {
-        "protocol_version": "edge-cl-bundle.v1",
-        "edge_id": 1,
-        "model": {"model_id": "model-a", "model_version": "0"},
-        "split_plan": _dummy_plan().to_dict(),
-        "samples": [
-            {
-                "sample_id": "sample-1",
-                "frame_index": 1,
-                "confidence": 0.1,
-                "quality_bucket": LOW_QUALITY,
-                "in_drift_window": False,
-                "feature_relpath": None,
-                "feature_bytes": 0,
-                "result_relpath": "results/sample-1.json",
-                "metadata_relpath": "metadata/sample-1.json",
-                "raw_relpath": None,
-                "raw_bytes": 0,
-                "has_feature": False,
-                "has_raw_sample": False,
-                "split_config_id": "plan-1",
-                "model_id": "model-a",
-                "model_version": "0",
-                "input_image_size": None,
-                "input_tensor_shape": None,
-                "timestamp": "2026-01-01T00:00:00+00:00",
-            }
-        ],
-    }
-    (bundle_root / "bundle_manifest.json").write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(
-        RuntimeError, match="missing both bundled intermediate features and a raw sample"
-    ):
-        prepare_split_training_cache(
-            str(bundle_root),
-            str(tmp_path / "prepared_cache"),
-        )
-
-
-def test_prepare_split_training_cache_raises_when_batch_rebuild_count_is_wrong(
-    tmp_path, sample_bgr_frame
-):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    store.store_sample(
-        sample_id="low-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_planned_payload(plan),
-        raw_frame=sample_bgr_frame,
-    )
-    raw_only_zip, _ = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-    )
-    bundle_root = tmp_path / "bundle"
-    with zipfile.ZipFile(io.BytesIO(raw_only_zip), "r") as zf:
-        zf.extractall(bundle_root)
-
-    with pytest.raises(RuntimeError, match="wrong number of payloads"):
-        prepare_split_training_cache(
-            str(bundle_root),
-            str(tmp_path / "prepared_cache"),
-            batch_feature_provider=lambda raw_paths, samples, manifest: [],
-        )
-
-
 def test_working_cache_manifest_fingerprint_matches_current_bundle():
     from cloud_server import (
         _build_fixed_split_cache_identity,
@@ -3006,9 +1950,13 @@ def test_cloud_fixed_split_working_cache_rebuild_with_template_hit_skips_trace_i
         ),
     )
     monkeypatch.setattr(
-        cloud_server,
-        "prepare_split_training_cache",
-        lambda *args, **kwargs: {"all_sample_ids": ["s1"]},
+        learner,
+        "_prepare_low_quality_trigger_training_cache",
+        lambda *args, **kwargs: {
+            "manifest": manifest,
+            "all_sample_ids": ["s1"],
+            "from_trigger_shards": True,
+        },
     )
     monkeypatch.setattr(
         learner,
@@ -3106,8 +2054,8 @@ def test_cloud_fixed_split_working_cache_hit_skips_prepare_cache(
         lambda *args, **kwargs: (SimpleNamespace(), object()),
     )
     monkeypatch.setattr(
-        cloud_server,
-        "prepare_split_training_cache",
+        learner,
+        "_prepare_low_quality_trigger_training_cache",
         lambda *args, **kwargs: pytest.fail("cache hit should skip prepare cache"),
     )
 
@@ -3275,121 +2223,6 @@ def test_cloud_batch_feature_provider_pads_single_sample_to_runtime_minimum(
     assert payloads[0].tensors["node_1"].tolist() == [[7.0]]
 
 
-def test_prepare_split_training_cache_preserves_unmodified_feature_mtime_on_reuse(
-    tmp_path, sample_bgr_frame, monkeypatch
-):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    store.store_sample(
-        sample_id="low-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_planned_payload(plan),
-        raw_frame=sample_bgr_frame,
-    )
-
-    payload_zip, _ = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-    )
-    bundle_root = tmp_path / "bundle"
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        zf.extractall(bundle_root)
-
-    cache_root = tmp_path / "prepared_cache"
-    provider_calls = {"count": 0}
-
-    def _batch_provider(raw_paths, samples, manifest):
-        provider_calls["count"] += 1
-        return [_payload() for _ in raw_paths]
-
-    prepare_split_training_cache(
-        str(bundle_root), str(cache_root), batch_feature_provider=_batch_provider
-    )
-    assert provider_calls["count"] == 1
-
-    feature_path = cache_root / "features" / "low-1.pt"
-    metadata_path = cache_root / "metadata_index.json"
-    assert feature_path.exists()
-    assert metadata_path.exists()
-
-    feature_mtime_before = feature_path.stat().st_mtime_ns
-    metadata_mtime_before = metadata_path.stat().st_mtime_ns
-
-    provider_calls["count"] = 0
-    time.sleep(0.02)
-    prepare_split_training_cache(
-        str(bundle_root), str(cache_root), batch_feature_provider=_batch_provider
-    )
-
-    assert provider_calls["count"] == 0
-    assert feature_path.stat().st_mtime_ns == feature_mtime_before
-    assert metadata_path.stat().st_mtime_ns == metadata_mtime_before
-
-
-def test_only_pending_raw_only_samples_trigger_rebuild(tmp_path, sample_bgr_frame):
-    store = EdgeSampleStore(str(tmp_path / "store"))
-    plan = _dummy_plan()
-    store.store_sample(
-        sample_id="high-1",
-        frame_index=1,
-        confidence=0.9,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=HIGH_QUALITY,
-        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
-        intermediate=_planned_payload(plan),
-    )
-    store.store_sample(
-        sample_id="low-1",
-        frame_index=2,
-        confidence=0.2,
-        split_config_id="plan-1",
-        model_id="model-a",
-        model_version="0",
-        quality_bucket=LOW_QUALITY,
-        inference_result={"boxes": [], "labels": [], "scores": []},
-        intermediate=_planned_payload(plan),
-        raw_frame=sample_bgr_frame,
-    )
-
-    payload_zip, _ = pack_continual_learning_bundle(
-        store,
-        edge_id=1,
-        send_low_conf_features=False,
-        split_plan=plan,
-        model_id="model-a",
-        model_version="0",
-    )
-    bundle_root = tmp_path / "bundle"
-    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as zf:
-        zf.extractall(bundle_root)
-
-    rebuilt_ids = []
-
-    def _tracking_provider(raw_paths, samples, manifest):
-        rebuilt_ids.extend(s.get("sample_id") for s in samples)
-        return [_payload() for _ in raw_paths]
-
-    info = prepare_split_training_cache(
-        str(bundle_root),
-        str(tmp_path / "cache"),
-        batch_feature_provider=_tracking_provider,
-    )
-    assert set(info["all_sample_ids"]) == {"high-1", "low-1"}
-    assert rebuilt_ids == ["low-1"]
-
-
 _FORBIDDEN_SHARD_METADATA = {
     "quality_score",
     "risk_score",
@@ -3499,6 +2332,99 @@ def test_high_quality_sync_bundle_uses_feature_label_shards_without_metadata(tmp
             assert set(label_entry) == {"sample_id", "boxes", "labels"}
     finally:
         os.remove(zip_path)
+
+
+def test_high_quality_sync_bundle_projects_boxes_to_model_input_without_size_metadata(tmp_path):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    record = store.store_sample(
+        sample_id="high-projected",
+        frame_index=1,
+        confidence=0.95,
+        split_config_id=plan.split_config_id,
+        model_id="model-a",
+        model_version="1",
+        quality_bucket=HIGH_QUALITY,
+        inference_result={"boxes": [[100, 200, 300, 400]], "labels": [1], "scores": [0.9]},
+        intermediate=_planned_payload(plan),
+        input_image_size=[1000, 1000],
+        input_tensor_shape=[1, 3, 100, 100],
+        input_resize_mode="direct_resize",
+    )
+
+    zip_path, manifest, _stats = pack_high_quality_sync_bundle_to_file(
+        store,
+        [record],
+        edge_id=1,
+        shard_size=64,
+        split_context={
+            "model_id": "model-a",
+            "model_version": "1",
+            "split_config_id": plan.split_config_id,
+        },
+        output_dir=str(tmp_path),
+    )
+    try:
+        manifest_text = json.dumps(manifest, sort_keys=True)
+        assert "input_image_size" not in manifest_text
+        assert "input_tensor_shape" not in manifest_text
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            label_file = manifest["shards"][0]["label_file"]
+            label_entry = json.loads(archive.read(label_file).decode("utf-8").splitlines()[0])
+        assert label_entry["boxes"] == [[10.0, 20.0, 30.0, 40.0]]
+        assert set(label_entry) == {"sample_id", "boxes", "labels"}
+    finally:
+        os.remove(zip_path)
+
+
+def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path):
+    from cloud.sample_pool import CloudSamplePool
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=16),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    pool = CloudSamplePool(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    payload = boundary_payload_from_tensors(
+        {"node_0": torch.ones(1, 4), "node_1": torch.ones(1, 4, 2, 2)},
+        split_id="after:model.backbone",
+        graph_signature="graph-sig",
+    )
+    pool.add_trainable_sample(
+        {
+            "sample_id": "pool-1",
+            "feature_record": {"sample_id": "pool-1", "intermediate": payload},
+            "labels": {"boxes": [[1, 2, 3, 4]], "labels": [2]},
+        }
+    )
+    pool.add_trainable_sample(
+        {
+            "sample_id": "stale-raw-coords",
+            "feature_record": {"sample_id": "stale-raw-coords", "intermediate": payload},
+            "labels": {"boxes": [[1, 2, 600, 700]], "labels": [2]},
+        }
+    )
+
+    bundle_info, preloaded_records, annotations, metadata = learner._build_pool_training_inputs(
+        pool,
+        expected_split_id="after:model.backbone",
+        runtime_input_tensor_shape=(1, 3, 384, 384),
+        input_resize_mode="direct_resize",
+    )
+
+    assert bundle_info["all_sample_ids"] == ["pool-1"]
+    assert "stale-raw-coords" not in preloaded_records
+    assert annotations["pool-1"] == {"boxes": [[1, 2, 3, 4]], "labels": [2]}
+    assert preloaded_records["pool-1"]["input_tensor_shape"] == [1, 3, 384, 384]
+    assert preloaded_records["pool-1"]["input_resize_mode"] == "direct_resize"
+    assert metadata["pool-1"]["input_tensor_shape"] == [1, 3, 384, 384]
+    assert "input_image_size" not in pool.reader.read(pool.list_active_samples()[0]).feature_record
 
 
 def test_high_quality_syncer_groups_retryable_samples_by_record_context(tmp_path):
@@ -3693,4 +2619,79 @@ def test_low_quality_raw_feature_trigger_matches_raw_shard_grouping(
         os.remove(zip_path)
 
 
+def test_cloud_materialized_low_quality_trigger_keeps_edge_metadata_out_of_staging(
+    tmp_path,
+    sample_bgr_frame,
+    monkeypatch,
+):
+    from cloud_server import CloudContinualLearner, _select_fixed_split_gt_sample_ids
 
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    _store_low_quality_for_shard(
+        store,
+        sample_id="low-staged",
+        frame_index=1,
+        plan=plan,
+        frame=sample_bgr_frame[:16, :16].copy(),
+    )
+    zip_path, _manifest, _stats = pack_low_quality_trigger_bundle_to_file(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="1",
+        shard_size=64,
+        output_dir=str(tmp_path),
+    )
+    bundle_root = tmp_path / "trigger"
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(bundle_root)
+        learner = CloudContinualLearner(
+            config=SimpleNamespace(
+                edge_model_name="rfdetr_nano",
+                continual_learning=SimpleNamespace(batch_size=16),
+                das=SimpleNamespace(enabled=False),
+                workspace_root=str(tmp_path),
+            ),
+            large_object_detection=SimpleNamespace(),
+        )
+        materialized = learner._materialize_low_quality_trigger_bundle(str(bundle_root))
+        materialized_text = json.dumps(materialized, sort_keys=True)
+        assert not any(field in materialized_text for field in _FORBIDDEN_SHARD_METADATA)
+        assert "quality_bucket" not in materialized["samples"][0]
+        assert "inference_result" not in materialized["samples"][0]
+        assert _select_fixed_split_gt_sample_ids(
+            materialized,
+            prepared_sample_ids=["low-staged"],
+        ) == ["low-staged"]
+
+        cache_root = tmp_path / "prepared"
+        monkeypatch.setattr(
+            learner,
+            "_bundle_batch_feature_provider",
+            lambda *args, **kwargs: (
+                lambda raw_paths, samples, manifest: [_payload() for _ in raw_paths]
+            ),
+        )
+        learner._prepare_low_quality_trigger_training_cache(
+            torch.nn.Identity(),
+            materialized,
+            bundle_cache_path=str(bundle_root),
+            working_cache=str(cache_root),
+            splitter=None,
+            candidate=None,
+        )
+        record = load_split_feature_cache(str(cache_root), "low-staged")
+        forbidden_cache_fields = _FORBIDDEN_SHARD_METADATA - {
+            "input_image_size",
+            "input_tensor_shape",
+            "input_resize_mode",
+        }
+        assert not any(field in record for field in forbidden_cache_fields)
+        assert "pseudo_boxes" not in record
+        assert "pseudo_labels" not in record
+    finally:
+        os.remove(zip_path)

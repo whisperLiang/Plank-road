@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import sys
+import tarfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -35,13 +36,47 @@ from model_management.split_model_adapters import (
 from model_management.universal_model_split import UniversalModelSplitter
 
 
-def _load_bundle_manifest(bundle_root: Path) -> dict[str, Any]:
-    with (bundle_root / "bundle_manifest.json").open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+def _load_trigger_eval_manifest(bundle_root: Path) -> dict[str, Any]:
+    with (bundle_root / "trigger_manifest.json").open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    samples: list[dict[str, str]] = []
+    staging_root = bundle_root / ".observables_trigger_raw"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    for shard in manifest.get("raw_shards", []) or []:
+        shard_file = shard.get("file") if isinstance(shard, dict) else None
+        if not shard_file:
+            continue
+        with tarfile.open(bundle_root / str(shard_file).replace("/", "\\"), "r") as archive:
+            manifest_member = archive.extractfile("manifest.jsonl")
+            if manifest_member is None:
+                continue
+            for line in manifest_member:
+                if not line.strip():
+                    continue
+                entry = json.loads(line.decode("utf-8"))
+                sample_id = str(entry.get("sample_id", "") or "")
+                raw_file = str(entry.get("raw_file", "") or "")
+                if not sample_id or not raw_file:
+                    continue
+                suffix = Path(raw_file).suffix or ".jpg"
+                target = staging_root / f"{sample_id}{suffix}"
+                source = archive.extractfile(raw_file)
+                if source is None:
+                    continue
+                if not target.exists():
+                    target.write_bytes(source.read())
+                samples.append(
+                    {
+                        "sample_id": sample_id,
+                        "raw_relpath": target.relative_to(bundle_root).as_posix(),
+                    }
+                )
+    manifest["samples"] = samples
+    return manifest
 
 
 def _collect_eval_items(bundle_root: Path, holdout_dir: Path) -> list[dict[str, str]]:
-    manifest = _load_bundle_manifest(bundle_root)
+    manifest = _load_trigger_eval_manifest(bundle_root)
     items: list[dict[str, str]] = []
     seen_paths: set[str] = set()
     for sample in manifest.get("samples", []):
@@ -422,7 +457,7 @@ def run_experiment(
         teacher_targets[item["sample_id"]] = targets
     items = [item for item in items if item["sample_id"] in teacher_targets]
 
-    manifest = _load_bundle_manifest(bundle_root)
+    manifest = _load_trigger_eval_manifest(bundle_root)
     all_records: list[dict[str, Any]] = []
     state_reports: dict[str, Any] = {}
     for state_name in ("random_init", "pretrained", "cloud_trained"):

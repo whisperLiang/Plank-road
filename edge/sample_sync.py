@@ -97,10 +97,95 @@ def _feature_sample_payload(intermediate: Any) -> dict[str, Any]:
     return payload
 
 
-def _training_labels(result: Mapping[str, Any]) -> dict[str, Any]:
+def _image_size_from_value(value: object) -> tuple[int, int] | None:
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        height = int(value[0])
+        width = int(value[1])
+        if height > 0 and width > 0:
+            return height, width
+    return None
+
+
+def _model_input_size_from_shape(value: object) -> tuple[int, int] | None:
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        height = int(value[-2])
+        width = int(value[-1])
+        if height > 0 and width > 0:
+            return height, width
+    return None
+
+
+def _project_box_to_model_input(
+    box: object,
+    *,
+    original_size: tuple[int, int],
+    model_input_size: tuple[int, int],
+    resize_mode: str,
+) -> list[float]:
+    values = [float(value) for value in list(box or [])[:4]]
+    if len(values) < 4:
+        return values
+    orig_h, orig_w = original_size
+    model_h, model_w = model_input_size
+    if str(resize_mode).strip().lower() == "letterbox":
+        scale = min(float(model_w) / float(orig_w), float(model_h) / float(orig_h))
+        resized_w = float(orig_w) * scale
+        resized_h = float(orig_h) * scale
+        pad_x = (float(model_w) - resized_w) * 0.5
+        pad_y = (float(model_h) - resized_h) * 0.5
+        values[0] = values[0] * scale + pad_x
+        values[2] = values[2] * scale + pad_x
+        values[1] = values[1] * scale + pad_y
+        values[3] = values[3] * scale + pad_y
+    else:
+        values[0] = values[0] * (float(model_w) / float(orig_w))
+        values[2] = values[2] * (float(model_w) / float(orig_w))
+        values[1] = values[1] * (float(model_h) / float(orig_h))
+        values[3] = values[3] * (float(model_h) / float(orig_h))
+    values[0] = max(0.0, min(float(model_w), values[0]))
+    values[2] = max(0.0, min(float(model_w), values[2]))
+    values[1] = max(0.0, min(float(model_h), values[1]))
+    values[3] = max(0.0, min(float(model_h), values[3]))
+    return values
+
+
+def _project_labels_to_model_input(
+    labels: Mapping[str, Any],
+    *,
+    record: StoredSampleRecord,
+) -> dict[str, Any]:
+    original_size = _image_size_from_value(getattr(record, "input_image_size", None))
+    model_input_size = _model_input_size_from_shape(
+        getattr(record, "input_tensor_shape", None)
+    )
+    if original_size is None or model_input_size is None:
+        return dict(labels)
+    if original_size == model_input_size:
+        return dict(labels)
+    projected = dict(labels)
+    projected["boxes"] = [
+        _project_box_to_model_input(
+            box,
+            original_size=original_size,
+            model_input_size=model_input_size,
+            resize_mode=str(getattr(record, "input_resize_mode", "") or "direct_resize"),
+        )
+        for box in list(labels.get("boxes") or [])
+    ]
+    return projected
+
+
+def _training_labels(result: Mapping[str, Any], record: StoredSampleRecord) -> dict[str, Any]:
+    labels = _project_labels_to_model_input(
+        {
+            "boxes": list(result.get("boxes") or []),
+            "labels": list(result.get("labels") or []),
+        },
+        record=record,
+    )
     return {
-        "boxes": list(result.get("boxes") or []),
-        "labels": list(result.get("labels") or []),
+        "boxes": list(labels.get("boxes") or []),
+        "labels": list(labels.get("labels") or []),
     }
 
 
@@ -202,7 +287,7 @@ def pack_high_quality_sync_bundle_to_file(
                     intermediate = sample_store.load_intermediate(record)
                     result = sample_store.load_inference_result(record)
                     feature_payload["samples"][sample_id] = _feature_sample_payload(intermediate)
-                    labels = _training_labels(result)
+                    labels = _training_labels(result, record)
                     label_lines.append(
                         json.dumps(
                             {

@@ -102,19 +102,20 @@ Core file:
 
 When continual learning is triggered, the edge uploads a versioned bundle containing:
 - high-confidence features + results
-- low-confidence raw samples + results
-- optional low-confidence features
-- drift flags and split-plan metadata
+- background high-quality feature-label shard sync
+- low-confidence raw trigger shards
+- optional low-confidence feature shards
 
 The server supports two low-confidence modes:
 - `raw-only`
 - `raw+feature`
 
-In `raw-only` mode, the server reconstructs missing low-confidence features from uploaded raw samples before split-tail retraining. In both `raw-only` and `raw+feature` modes, the server annotates low-confidence raw samples with the large model because their pseudo-labels are often empty or unreliable.
+In `raw-only` mode, the server reconstructs missing low-confidence features from uploaded raw samples before split-tail retraining. In both `raw-only` and `raw+feature` modes, the server annotates low-confidence raw samples with the large model before committing feature-label samples into the cloud sample pool.
 
 Core files:
 - [edge/transmit.py](./edge/transmit.py)
-- [model_management/continual_learning_bundle.py](./model_management/continual_learning_bundle.py)
+- [edge/sample_sync.py](./edge/sample_sync.py)
+- [cloud/sample_pool.py](./cloud/sample_pool.py)
 - [grpc_server/protos/message_transmission.proto](./grpc_server/protos/message_transmission.proto)
 - [grpc_server/rpc_server.py](./grpc_server/rpc_server.py)
 - [cloud_server.py](./cloud_server.py)
@@ -145,7 +146,6 @@ Plank-road/
 ├── tools/
 ├── model_management/
 │   ├── activation_sparsity.py
-│   ├── continual_learning_bundle.py
 │   ├── fixed_split.py
 │   ├── fixed_split_runtime_template.py
 │   ├── split_candidate.py

@@ -29,7 +29,7 @@ from cloud_server import (
 from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
 from edge.quality_assessor import LOW_QUALITY, QualityAssessor
 from edge.sample_store import EdgeSampleStore
-from edge.transmit import pack_continual_learning_bundle
+from edge.transmit import pack_low_quality_trigger_bundle
 from model_management.fixed_split import SplitConstraints, SplitPlan, load_or_compute_fixed_split_plan
 from model_management.model_zoo import ensure_local_model_artifact, get_model_artifact_path
 from model_management.object_detection import Object_Detection
@@ -395,7 +395,7 @@ def _run_pair_experiment(
             model_name=edge_model,
         )
 
-        payload_zip, _ = pack_continual_learning_bundle(
+        payload_zip, _ = pack_low_quality_trigger_bundle(
             sample_store,
             edge_id=1,
             send_low_conf_features=send_low_conf_features,

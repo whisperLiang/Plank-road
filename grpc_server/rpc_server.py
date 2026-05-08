@@ -314,20 +314,13 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             manifest = None
             if payload_zip:
                 with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as archive:
-                    manifest_name = (
-                        "bundle_manifest.json"
-                        if "bundle_manifest.json" in archive.namelist()
-                        else "trigger_manifest.json"
-                    )
-                    with archive.open(manifest_name, "r") as handle:
-                        manifest = json.loads(handle.read().decode("utf-8"))
+                    if "trigger_manifest.json" in archive.namelist():
+                        with archive.open("trigger_manifest.json", "r") as handle:
+                            manifest = json.loads(handle.read().decode("utf-8"))
             else:
                 trigger_manifest_path = Path(workspace) / "trigger_manifest.json"
                 if trigger_manifest_path.exists():
                     manifest = json.loads(trigger_manifest_path.read_text(encoding="utf-8"))
-                else:
-                    from model_management.continual_learning_bundle import load_training_bundle_manifest
-                    manifest = load_training_bundle_manifest(str(workspace))
             if manifest is not None:
                 model_info = manifest.get("model", {})
                 if not model_info:

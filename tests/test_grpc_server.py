@@ -32,6 +32,19 @@ def _zip_bytes(entries: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+def _trigger_payload(model_version: str = "0") -> bytes:
+    return _zip_bytes(
+        {
+            "trigger_manifest.json": (
+                b'{"protocol_version":"low-quality-trigger-shard.v1",'
+                b'"model_id":"model-a","model_version":"'
+                + str(model_version).encode("utf-8")
+                + b'","raw_shards":[],"feature_shards":[]}'
+            )
+        }
+    )
+
+
 def _require_sync_samples_rpc():
     request_cls = getattr(message_transmission_pb2, "SyncSamplesRequest", None)
     if request_cls is None:
@@ -277,12 +290,12 @@ class TestMessageTransmissionServicer:
             "ok",
         )
         svc = self._make_servicer(tmp_path, continual_learner=mock_learner)
-        payload_zip = _zip_bytes({"bundle_manifest.json": b"{}"})
+        payload_zip = _trigger_payload()
         request = message_transmission_pb2.ContinualLearningRequest(
             edge_id=1,
             cache_path="edge_1/continual_learning",
             send_low_conf_features=True,
-            protocol_version="edge-cl-bundle.v1",
+            protocol_version="low-quality-trigger-shard.v1",
             payload_zip=payload_zip,
         )
 
@@ -292,7 +305,7 @@ class TestMessageTransmissionServicer:
         mock_learner.get_ground_truth_and_fixed_split_retrain.assert_called_once()
         _, workspace = mock_learner.get_ground_truth_and_fixed_split_retrain.call_args.args
         assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
-        assert (Path(workspace) / "bundle_manifest.json").read_text(encoding="utf-8") == "{}"
+        assert (Path(workspace) / "trigger_manifest.json").exists()
 
     def test_submit_training_job_for_continual_learning_and_download_model(self, tmp_path):
         mock_learner = MagicMock()
@@ -311,7 +324,7 @@ class TestMessageTransmissionServicer:
                 continual_learner=mock_learner,
                 training_job_manager=manager,
             )
-            payload_zip = _zip_bytes({"bundle_manifest.json": b"{}"})
+            payload_zip = _trigger_payload()
             submit_reply = svc.submit_training_job(
                 message_transmission_pb2.SubmitTrainingJobRequest(
                     edge_id=1,
@@ -319,7 +332,7 @@ class TestMessageTransmissionServicer:
                     job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
                     cache_path="edge_1/continual_learning",
                     send_low_conf_features=True,
-                    protocol_version="edge-cl-bundle.v1",
+                    protocol_version="low-quality-trigger-shard.v1",
                     payload_zip=payload_zip,
                 ),
                 MagicMock(),
@@ -347,7 +360,7 @@ class TestMessageTransmissionServicer:
             )
             assert download_reply.success is True
             assert download_reply.model_data == "model_data"
-            assert download_reply.protocol_version == "edge-cl-bundle.v1"
+            assert download_reply.protocol_version == "low-quality-trigger-shard.v1"
         finally:
             manager.close()
 
@@ -368,13 +381,13 @@ class TestMessageTransmissionServicer:
                 continual_learner=mock_learner,
                 training_job_manager=manager,
             )
-            payload_zip = _zip_bytes({"bundle_manifest.json": b"{}"})
+            payload_zip = _trigger_payload()
             request = message_transmission_pb2.SubmitTrainingJobRequest(
                 edge_id=4,
                 request_id="same-request",
                 job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
                 cache_path="edge_4/continual_learning",
-                protocol_version="edge-cl-bundle.v1",
+                protocol_version="low-quality-trigger-shard.v1",
                 payload_zip=payload_zip,
             )
 
