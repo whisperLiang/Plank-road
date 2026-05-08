@@ -445,6 +445,7 @@ class TestEdgeWorkerRouting:
         worker.model_version = "0"
         worker.retrain_flag = False
         worker.collect_flag = True
+        worker.resource_trigger_enabled = False
         worker.sample_store = SimpleNamespace(
             store_sample=lambda **kwargs: None,
             stats=lambda: {
@@ -495,6 +496,85 @@ class TestEdgeWorkerRouting:
         assert worker.collect_flag is False
         assert worker.pending_training_decision is not None
         assert worker._retrain_requested.is_set() is True
+
+    def test_collect_data_requests_probe_and_defers_decision_on_drift(self, sample_bgr_frame):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        quality = QualityAssessment(
+            quality_bucket=LOW_QUALITY,
+            quality_score=0.2,
+            risk_score=0.8,
+            risk_reasons=["candidate_evidence_uncovered"],
+            evidence_count=1,
+            covered_evidence_count=0,
+            uncovered_evidence_count=1,
+            uncovered_evidence_rate=1.0,
+            candidate_uncovered_score=1.0,
+            motion_uncovered_score=0.0,
+            track_uncovered_score=0.0,
+        )
+        drift_state = SimpleNamespace(drift_detected=True)
+        worker.candidate_builder = SimpleNamespace(build=lambda **kwargs: [])
+        worker.motion_extractor = SimpleNamespace(extract=lambda *args: [])
+        worker.track_manager = SimpleNamespace(update_and_get_missing_evidence=lambda **kwargs: [])
+        worker.quality_assessor = SimpleNamespace(assess=lambda **kwargs: quality)
+        worker.window_drift_detector = SimpleNamespace(update=lambda *args, **kwargs: drift_state)
+        worker.previous_quality_frame = None
+        worker.fixed_split_plan = SimpleNamespace(split_config_id="plan-1")
+        worker.model_id = "yolo26n"
+        worker.model_version = "0"
+        worker.retrain_flag = False
+        worker.collect_flag = True
+        worker.resource_trigger_enabled = True
+        worker.resource_trigger = ResourceAwareCLTrigger(min_training_samples=1)
+        worker._resource_probe_lock = threading.Lock()
+        worker._resource_probe_requested = threading.Event()
+        worker._resource_probe_inflight = False
+        worker._resource_probe_next_allowed_at = 0.0
+        worker._resource_probe_completed_at = 0.0
+        worker._resource_probe_required_after = 0.0
+        worker._resource_probe_failure_count = 0
+        worker._drift_probe_active = False
+        worker._cloud_state = None
+        worker._bandwidth_mbps = 0.0
+        worker.resource_probe_interval_sec = 5.0
+        worker.pending_training_decision = None
+        worker._retrain_requested = threading.Event()
+        worker._next_sample_id = lambda task: "sample-1"
+        worker._make_training_decision = lambda **kwargs: pytest.fail(
+            "training decision should wait for the drift probe result"
+        )
+        stored = []
+        worker.sample_store = SimpleNamespace(
+            store_sample=lambda **kwargs: stored.append(kwargs)
+            or SimpleNamespace(sample_id="sample-1")
+        )
+
+        task = Task(
+            edge_id=1,
+            frame_index=7,
+            frame=sample_bgr_frame,
+            start_time=time.time(),
+            raw_shape=sample_bgr_frame.shape,
+        )
+        inference = InferenceArtifacts(
+            intermediate=object(),
+            final_detection_boxes=[],
+            final_detection_labels=[],
+            final_detection_scores=[],
+            low_threshold_boxes=[[0, 0, 10, 10]],
+            low_threshold_labels=[1],
+            low_threshold_scores=[0.9],
+            confidence=0.6,
+            input_tensor_shape=[1, 3, 384, 640],
+        )
+
+        worker.collect_data(task, sample_bgr_frame, inference)
+
+        assert len(stored) == 1
+        assert worker._resource_probe_requested.is_set() is True
+        assert worker._resource_probe_inflight is True
+        assert worker.retrain_flag is False
+        assert worker.pending_training_decision is None
 
     def test_collect_data_skips_training_decision_without_drift(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
@@ -644,10 +724,77 @@ class TestEdgeWorkerRouting:
         monkeypatch.setattr("edge.edge_worker.query_cloud_resource", _query)
         monkeypatch.setattr("edge.edge_worker.estimate_bandwidth", _estimate)
 
-        worker._refresh_resource_probe_cache()
+        assert worker._refresh_resource_probe_cache() is True
 
         assert worker._cloud_state is cloud_state
         assert worker._bandwidth_mbps == pytest.approx(45.0)
+
+    def test_failed_resource_probe_skips_bandwidth_probe_and_uses_backoff(
+        self,
+        monkeypatch,
+    ):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.config = SimpleNamespace(server_ip="cloud:50051")
+        worker.edge_id = 7
+        worker._resource_probe_lock = threading.Lock()
+        worker._cloud_state = None
+        worker._bandwidth_mbps = 123.0
+        worker.resource_probe_timeout_sec = 1.25
+        worker.bandwidth_probe_size_bytes = 2048
+        worker.resource_probe_interval_sec = 5.0
+        worker._resource_probe_failure_count = 0
+        worker._resource_probe_next_allowed_at = 0.0
+        worker._resource_probe_inflight = True
+        monkeypatch.setattr(
+            "edge.edge_worker.query_cloud_resource",
+            lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("slow")),
+        )
+        monkeypatch.setattr(
+            "edge.edge_worker.estimate_bandwidth",
+            lambda *args, **kwargs: pytest.fail("bandwidth probe should be skipped"),
+        )
+
+        assert worker._refresh_resource_probe_cache() is False
+        assert worker._cloud_state.compute_pressure == pytest.approx(1.0)
+        assert worker._bandwidth_mbps == pytest.approx(0.0)
+
+        started = time.time()
+        worker._finish_resource_probe(False)
+
+        assert worker._resource_probe_failure_count == 1
+        assert worker._resource_probe_inflight is False
+        assert worker._resource_probe_next_allowed_at >= started + 9.0
+
+    def test_resource_probe_worker_waits_for_drift_request(self, monkeypatch):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker._stop_event = threading.Event()
+        worker._resource_probe_requested = threading.Event()
+        worker._resource_probe_lock = threading.Lock()
+        worker._resource_probe_inflight = True
+        worker._resource_probe_failure_count = 0
+        worker._resource_probe_next_allowed_at = 0.0
+        worker.resource_probe_interval_sec = 5.0
+        calls = []
+
+        def _refresh():
+            calls.append(True)
+            worker._stop_event.set()
+            return True
+
+        monkeypatch.setattr(worker, "_refresh_resource_probe_cache", _refresh)
+        thread = threading.Thread(target=worker.resource_probe_worker)
+        thread.start()
+        time.sleep(0.05)
+
+        assert calls == []
+
+        worker._resource_probe_requested.set()
+        thread.join(timeout=1.0)
+
+        assert thread.is_alive() is False
+        assert calls == [True]
+        assert worker._resource_probe_inflight is False
+        assert worker._resource_probe_failure_count == 0
 
     def test_close_sets_shutdown_events_and_joins_threads(self):
         worker = EdgeWorker.__new__(EdgeWorker)

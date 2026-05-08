@@ -260,7 +260,14 @@ class EdgeWorker:
         self.resource_trigger: ResourceAwareCLTrigger | None = None
         self._cloud_state: CloudResourceState | None = None
         self._bandwidth_mbps = 0.0
+        self._resource_probe_failure_count = 0
         self._resource_probe_lock = threading.Lock()
+        self._resource_probe_requested = threading.Event()
+        self._resource_probe_inflight = False
+        self._resource_probe_next_allowed_at = 0.0
+        self._resource_probe_completed_at = 0.0
+        self._resource_probe_required_after = 0.0
+        self._drift_probe_active = False
         ra_cfg = getattr(config, "resource_aware_trigger", None)
         self.resource_trigger_enabled = bool(getattr(ra_cfg, "enabled", False)) if ra_cfg else False
         if self.resource_trigger_enabled:
@@ -734,6 +741,7 @@ class EdgeWorker:
         self.pending_training_decision = None
         self.retrain_flag = False
         self.collect_flag = True
+        self._drift_probe_active = False
         self._retrain_requested.clear()
 
     def _resolve_active_splitter(self, current_frame, frame_image_size: tuple[int, int]):
@@ -768,18 +776,21 @@ class EdgeWorker:
         cloud_state: CloudResourceState | None = None,
         bandwidth_mbps: float | None = None,
     ) -> None:
+        completed_at = time.time()
         lock = getattr(self, "_resource_probe_lock", None)
         if lock is None:
             if cloud_state is not None:
                 self._cloud_state = cloud_state
             if bandwidth_mbps is not None:
                 self._bandwidth_mbps = float(bandwidth_mbps)
+            self._resource_probe_completed_at = completed_at
             return
         with lock:
             if cloud_state is not None:
                 self._cloud_state = cloud_state
             if bandwidth_mbps is not None:
                 self._bandwidth_mbps = float(bandwidth_mbps)
+            self._resource_probe_completed_at = completed_at
 
     def _resource_probe_snapshot(self) -> tuple[CloudResourceState, float]:
         lock = getattr(self, "_resource_probe_lock", None)
@@ -799,7 +810,80 @@ class EdgeWorker:
             cloud_state = self._conservative_cloud_state()
         return cloud_state, max(0.0, float(bandwidth_mbps or 0.0))
 
-    def _refresh_resource_probe_cache(self) -> None:
+    def _resource_probe_ready_for_decision(self) -> bool:
+        lock = getattr(self, "_resource_probe_lock", None)
+        if lock is None:
+            cloud_state = getattr(self, "_cloud_state", None)
+            completed_at = float(getattr(self, "_resource_probe_completed_at", 0.0))
+            required_after = float(getattr(self, "_resource_probe_required_after", 0.0))
+        else:
+            with lock:
+                cloud_state = getattr(self, "_cloud_state", None)
+                completed_at = float(getattr(self, "_resource_probe_completed_at", 0.0))
+                required_after = float(getattr(self, "_resource_probe_required_after", 0.0))
+
+        if cloud_state is None or completed_at < required_after:
+            return False
+        max_age_sec = max(
+            30.0,
+            float(getattr(self, "resource_probe_interval_sec", 5.0)) * 2.0,
+        )
+        return not cloud_state.is_stale(max_age_sec)
+
+    def _request_resource_probe(self) -> bool:
+        requested = getattr(self, "_resource_probe_requested", None)
+        if requested is None:
+            return False
+        now = time.time()
+        lock = getattr(self, "_resource_probe_lock", None)
+        if lock is None:
+            if getattr(self, "_resource_probe_inflight", False):
+                return True
+            if now < float(getattr(self, "_resource_probe_next_allowed_at", 0.0)):
+                return False
+            self._resource_probe_inflight = True
+            requested.set()
+            return True
+        with lock:
+            if getattr(self, "_resource_probe_inflight", False):
+                return True
+            if now < float(getattr(self, "_resource_probe_next_allowed_at", 0.0)):
+                return False
+            self._resource_probe_inflight = True
+            requested.set()
+            return True
+
+    def _finish_resource_probe(self, success: bool) -> None:
+        base_interval = float(getattr(self, "resource_probe_interval_sec", 5.0))
+        next_allowed_at = 0.0
+        lock = getattr(self, "_resource_probe_lock", None)
+        if lock is None:
+            if success:
+                self._resource_probe_failure_count = 0
+            else:
+                self._resource_probe_failure_count += 1
+                backoff_sec = min(
+                    max(30.0, base_interval),
+                    base_interval * (2 ** self._resource_probe_failure_count),
+                )
+                next_allowed_at = time.time() + backoff_sec
+            self._resource_probe_next_allowed_at = next_allowed_at
+            self._resource_probe_inflight = False
+            return
+        with lock:
+            if success:
+                self._resource_probe_failure_count = 0
+            else:
+                self._resource_probe_failure_count += 1
+                backoff_sec = min(
+                    max(30.0, base_interval),
+                    base_interval * (2 ** self._resource_probe_failure_count),
+                )
+                next_allowed_at = time.time() + backoff_sec
+            self._resource_probe_next_allowed_at = next_allowed_at
+            self._resource_probe_inflight = False
+
+    def _refresh_resource_probe_cache(self) -> bool:
         timeout_sec = float(getattr(self, "resource_probe_timeout_sec", 3.0))
         try:
             cloud_state = query_cloud_resource(
@@ -812,7 +896,11 @@ class EdgeWorker:
                 "Resource probe cloud-state refresh failed; using conservative cache: {}",
                 exc,
             )
-            cloud_state = self._conservative_cloud_state()
+            self._update_resource_probe_cache(
+                cloud_state=self._conservative_cloud_state(),
+                bandwidth_mbps=0.0,
+            )
+            return False
 
         bandwidth_mbps = estimate_bandwidth(
             self.config.server_ip,
@@ -823,14 +911,22 @@ class EdgeWorker:
             cloud_state=cloud_state,
             bandwidth_mbps=bandwidth_mbps,
         )
+        return True
 
     def resource_probe_worker(self) -> None:
         while not self._stop_event.is_set():
-            self._refresh_resource_probe_cache()
-            if self._stop_event.wait(
-                float(getattr(self, "resource_probe_interval_sec", 5.0))
-            ):
+            requested = getattr(self, "_resource_probe_requested", None)
+            if requested is None:
                 return
+            requested.wait()
+            if self._stop_event.is_set():
+                return
+            requested.clear()
+            success = False
+            try:
+                success = self._refresh_resource_probe_cache()
+            finally:
+                self._finish_resource_probe(success)
 
     def _make_training_decision(
         self,
@@ -962,7 +1058,16 @@ class EdgeWorker:
             return
 
         if not bool(drift_state.drift_detected):
+            self._drift_probe_active = False
             return
+
+        if self.resource_trigger_enabled and self.resource_trigger is not None:
+            if not getattr(self, "_drift_probe_active", False):
+                self._drift_probe_active = True
+                self._resource_probe_required_after = time.time()
+            if not self._resource_probe_ready_for_decision():
+                self._request_resource_probe()
+                return
 
         stats = PendingTrainingStats.from_mapping(self._stats_for_training_trigger())
         stats.drift_detected = bool(drift_state.drift_detected)
@@ -1235,6 +1340,9 @@ class EdgeWorker:
         self._closed = True
         self._stop_event.set()
         self._retrain_requested.set()
+        probe_requested = getattr(self, "_resource_probe_requested", None)
+        if probe_requested is not None:
+            probe_requested.set()
         for queue_obj in (self.frame_cache, self.local_queue):
             inserted = False
             while not inserted:
