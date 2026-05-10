@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from ariadne.runtime.boundary import BoundaryPayload
 
 from tools import run_tail_training_motivation_experiments as experiments
 
@@ -166,9 +167,13 @@ class _FakeRuntime:
 
     def __init__(self):
         self.trained_boundaries = []
+        self.fail_lse_once = False
 
     def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
         del targets, loss_fn, optimizer
+        if self.fail_lse_once:
+            self.fail_lse_once = False
+            raise RuntimeError("LSE is not correctly aligned (strideH)")
         self.trained_boundaries.append(boundary)
         return torch.tensor(0.25), None
 
@@ -241,3 +246,60 @@ def test_split_cached_training_rejects_mismatched_cached_boundary_split_id():
     assert "percent='percent:75'" in message
     assert "sample index=0" in message
     assert "same SplitPlan" in message
+
+
+def test_contiguous_boundary_payload_preserves_split_identity():
+    tensor = torch.arange(24).reshape(2, 3, 4).transpose(1, 2)
+    passthrough = torch.arange(12).reshape(3, 4).t()
+    assert not tensor.is_contiguous()
+    assert not passthrough.is_contiguous()
+    boundary = BoundaryPayload(
+        split_id="after:exact",
+        graph_signature="graph",
+        batch_size=2,
+        tensors={"x": tensor},
+        schema={},
+        requires_grad={"x": False},
+        passthrough_inputs={"input": passthrough},
+    )
+
+    contiguous = experiments._contiguous_boundary_payload(boundary)
+
+    assert contiguous.split_id == boundary.split_id
+    assert contiguous.graph_signature == boundary.graph_signature
+    assert contiguous.tensors["x"].is_contiguous()
+    assert contiguous.passthrough_inputs["input"].is_contiguous()
+
+
+def test_split_cached_training_retries_cuda_lse_alignment_with_same_batch():
+    runtime = _FakeRuntime()
+    runtime.fail_lse_once = True
+    boundary = SimpleNamespace(split_id=runtime.split_id)
+    cached_split = experiments.CachedSplitRuntime(
+        percent="percent:25",
+        split_id=runtime.split_id,
+        runtime=runtime,
+        cached_batches=[
+            experiments.CachedSplitBatch(
+                sample_ids=(1, 2),
+                boundary=boundary,
+                boundary_split_id=boundary.split_id,
+                targets=({"boxes": [], "labels": []}, {"boxes": [], "labels": []}),
+            )
+        ],
+        cache_build_time=1.0,
+        runtime_build_time=2.0,
+    )
+
+    metrics = experiments._train_split_cached_loop(
+        cached_split=cached_split,
+        epochs=1,
+        loss_fn=lambda _outputs, _targets: torch.tensor(0.25),
+        optimizer=None,
+        seed=3,
+        shuffle_samples=False,
+        device=torch.device("cuda"),
+    )
+
+    assert runtime.trained_boundaries == [boundary]
+    assert metrics["final_loss"] == pytest.approx(0.25)

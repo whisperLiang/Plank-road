@@ -8,7 +8,8 @@ import json
 import random
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -654,6 +655,51 @@ def _require_boundary_split_id(boundary: Any) -> str:
     return str(split_id)
 
 
+def _contiguous_tensor_tree(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value if value.is_contiguous() else value.contiguous()
+    if isinstance(value, Mapping):
+        return {key: _contiguous_tensor_tree(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_contiguous_tensor_tree(item) for item in value)
+    if isinstance(value, list):
+        return [_contiguous_tensor_tree(item) for item in value]
+    return value
+
+
+def _contiguous_boundary_payload(boundary: Any) -> Any:
+    tensors = getattr(boundary, "tensors", None)
+    if not isinstance(tensors, Mapping):
+        return boundary
+    contiguous_tensors = {
+        key: _contiguous_tensor_tree(value)
+        for key, value in tensors.items()
+    }
+    passthrough_inputs = getattr(boundary, "passthrough_inputs", None)
+    contiguous_passthrough = (
+        _contiguous_tensor_tree(passthrough_inputs)
+        if isinstance(passthrough_inputs, Mapping)
+        else passthrough_inputs
+    )
+    if contiguous_tensors is tensors and contiguous_passthrough is passthrough_inputs:
+        return boundary
+    return replace(
+        boundary,
+        tensors=contiguous_tensors,
+        passthrough_inputs=contiguous_passthrough,
+    )
+
+
+def _math_sdp_context(device: torch.device):
+    if device.type != "cuda":
+        return nullcontext()
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except Exception:  # noqa: BLE001
+        return nullcontext()
+    return sdpa_kernel(SDPBackend.MATH)
+
+
 def _raise_cached_split_id_mismatch(
     *,
     cached_sample_split_id: str,
@@ -862,6 +908,7 @@ def _build_cached_batches(
                 percent=percent,
                 sample_index=len(batches),
             )
+        boundary = _contiguous_boundary_payload(boundary)
         batches.append(
             CachedSplitBatch(
                 sample_ids=tuple(int(item) for item in batch_ids),
@@ -906,15 +953,35 @@ def _train_split_cached_loop(
             rng = np.random.default_rng(int(seed) + int(epoch))
             order = rng.permutation(np.arange(len(epoch_batches))).tolist()
             epoch_batches = [epoch_batches[index] for index in order]
-        for cached_batch in epoch_batches:
+        for sample_index, cached_batch in enumerate(epoch_batches):
             _synchronize(device)
             batch_started = time.perf_counter()
-            loss, _boundary_grads = runtime.train_suffix(
-                cached_batch.boundary,
-                list(copy.deepcopy(cached_batch.targets)),
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-            )
+            boundary = _contiguous_boundary_payload(cached_batch.boundary)
+            targets = list(copy.deepcopy(cached_batch.targets))
+            try:
+                loss, _boundary_grads = runtime.train_suffix(
+                    boundary,
+                    targets,
+                    loss_fn=loss_fn,
+                    optimizer=optimizer,
+                )
+            except RuntimeError as exc:
+                if device.type != "cuda" or "LSE is not correctly aligned" not in str(exc):
+                    raise
+                logger.warning(
+                    "Cached split suffix hit CUDA SDPA LSE alignment issue "
+                    "(percent={}, split_id={}, sample_index={}); retrying with math SDP.",
+                    cached_split.percent,
+                    cached_split.split_id,
+                    sample_index,
+                )
+                with _math_sdp_context(device):
+                    loss, _boundary_grads = runtime.train_suffix(
+                        boundary,
+                        targets,
+                        loss_fn=loss_fn,
+                        optimizer=optimizer,
+                    )
             _synchronize(device)
             batch_times.append(time.perf_counter() - batch_started)
             losses.append(float(loss.detach().cpu().item()))
