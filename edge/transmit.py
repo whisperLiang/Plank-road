@@ -21,7 +21,6 @@ import io
 from edge.quality_assessor import LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
 from model_management.fixed_split import SplitPlan
-from model_management.payload import BoundaryPayload
 
 LOW_QUALITY_TRIGGER_PROTOCOL_VERSION = "low-quality-trigger-shard.v1"
 
@@ -67,7 +66,7 @@ def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
     elif isinstance(intermediate, torch.Tensor):
         source = {"payload": intermediate}
     elif isinstance(intermediate, Mapping):
-        source = dict(intermediate)
+        source = dict(intermediate.get("tensors") or intermediate)
     else:
         raise TypeError(f"Unsupported intermediate feature type: {type(intermediate)!r}")
     tensors: dict[str, torch.Tensor] = {}
@@ -79,26 +78,8 @@ def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _boundary_payload_metadata(intermediate: Any) -> dict[str, Any] | None:
-    if not isinstance(intermediate, BoundaryPayload):
-        return None
-    return {
-        "split_id": str(intermediate.split_id),
-        "graph_signature": str(intermediate.graph_signature),
-        "batch_size": int(intermediate.batch_size),
-        "schema": dict(intermediate.schema or {}),
-        "requires_grad": dict(intermediate.requires_grad or {}),
-        "weight_version": intermediate.weight_version,
-        "passthrough_inputs": dict(intermediate.passthrough_inputs or {}),
-    }
-
-
 def _feature_sample_payload(intermediate: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {"tensors": _tensor_only_features(intermediate)}
-    metadata = _boundary_payload_metadata(intermediate)
-    if metadata is not None:
-        payload["boundary"] = metadata
-    return payload
+    return {"tensors": _tensor_only_features(intermediate)}
 
 
 def _record_abs_path(sample_store: EdgeSampleStore, relpath: str | None) -> str | None:
@@ -281,7 +262,8 @@ def pack_low_quality_trigger_bundle_to_file(
         for record in sample_store.list_records()
         if record.split_config_id == split_plan.split_config_id
         and record.model_id == str(model_id)
-        and record.model_version == str(model_version)
+        and str(getattr(record, "front_version", "0") or "0")
+        == str(getattr(split_plan, "front_version", "0") or "0")
         and record.quality_bucket == LOW_QUALITY
     ]
     selected, selection_policy = _select_low_quality_trigger_records(
@@ -296,7 +278,14 @@ def pack_low_quality_trigger_bundle_to_file(
         "edge_id": int(edge_id),
         "model_id": str(model_id),
         "model_version": str(model_version),
+        "front_version": str(getattr(split_plan, "front_version", "0") or "0"),
         "split_config_id": str(split_plan.split_config_id),
+        "canonical_split_key": str(getattr(split_plan, "canonical_split_key", "") or ""),
+        "edge_split_id": str(getattr(split_plan, "edge_split_id", "") or ""),
+        "input_tensor_shape": [
+            int(dim) for dim in list(getattr(split_plan, "input_tensor_shape", []) or [])
+        ],
+        "input_resize_mode": str(getattr(split_plan, "input_resize_mode", "") or "direct_resize"),
         "split_label": None if split_plan.split_label is None else str(split_plan.split_label),
         "boundary_tensor_labels": [str(label) for label in split_plan.boundary_tensor_labels],
         "upload_mode": "raw+feature" if send_low_conf_features else "raw-only",

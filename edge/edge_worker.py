@@ -40,7 +40,10 @@ from model_management.fixed_split import (
 )
 from model_management.model_delta_payload import require_state_dict_delta_payload
 from model_management.object_detection import InferenceArtifacts, Object_Detection
-from model_management.split_model_adapters import build_split_training_loss
+from model_management.split_model_adapters import (
+    build_split_training_loss,
+    get_split_runtime_input_resize_mode,
+)
 from model_management.universal_model_split import UniversalModelSplitter
 from tools.grpc_options import grpc_message_options
 
@@ -304,6 +307,7 @@ class EdgeWorker:
         )
         self.model_id = getattr(self.small_object_detection, "model_name", "edge-model")
         self.model_version = "0"
+        self.front_version = "0"
         self.sample_syncer = HighQualitySampleSyncer(
             self.sample_store,
             server_ip=self.config.server_ip,
@@ -412,6 +416,11 @@ class EdgeWorker:
                 cache_path=cache_path,
                 splitter=self.universal_splitter,
                 validate_cached_plan=False,
+                input_resize_mode=(
+                    get_split_runtime_input_resize_mode(split_model)
+                    or "direct_resize"
+                ),
+                front_version=self.front_version,
             )
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
@@ -554,12 +563,20 @@ class EdgeWorker:
 
     def _sample_sync_context(self) -> dict[str, object]:
         split_plan = getattr(self, "fixed_split_plan", None)
+        boundary_tensor_labels = list(
+            getattr(split_plan, "boundary_tensor_labels", []) or []
+        )
         return {
             "model_id": str(getattr(self, "model_id", "") or ""),
             "model_version": str(getattr(self, "model_version", "") or ""),
+            "front_version": str(getattr(self, "front_version", "0") or "0"),
             "split_config_id": str(getattr(split_plan, "split_config_id", "") or ""),
+            "canonical_split_key": getattr(split_plan, "canonical_split_key", None),
+            "edge_split_id": getattr(split_plan, "edge_split_id", None),
+            "input_tensor_shape": list(getattr(split_plan, "input_tensor_shape", []) or []),
+            "input_resize_mode": getattr(split_plan, "input_resize_mode", None),
             "split_label": getattr(split_plan, "split_label", None),
-            "boundary_tensor_labels": list(getattr(split_plan, "boundary_tensor_labels", []) or []),
+            "boundary_tensor_labels": boundary_tensor_labels,
         }
 
     def _stats_for_training_trigger(self) -> dict[str, Any]:
@@ -1019,6 +1036,7 @@ class EdgeWorker:
             "split_config_id": self.fixed_split_plan.split_config_id,
             "model_id": self.model_id,
             "model_version": self.model_version,
+            "front_version": self.front_version,
             "quality_bucket": quality.quality_bucket,
             "quality_score": quality.quality_score,
             "risk_score": quality.risk_score,

@@ -12,7 +12,7 @@ import cv2
 import torch
 
 from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY
-from model_management.payload import BoundaryPayload, SplitPayload
+from model_management.payload import BoundaryPayload
 
 
 SAMPLE_STORE_VERSION = "edge-sample-store.v2"
@@ -71,49 +71,25 @@ def _from_relpath(root_dir: str, relpath: str | None) -> str | None:
     return os.path.join(root_dir, relpath.replace("/", os.sep))
 
 
-def _detach_cpu_value(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, dict):
-        return {key: _detach_cpu_value(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_detach_cpu_value(item) for item in value)
-    if isinstance(value, list):
-        return [_detach_cpu_value(item) for item in value]
-    return value
-
-
-def _normalise_boundary_payload(intermediate: BoundaryPayload) -> BoundaryPayload:
-    tensors = {
-        str(key): value.detach().cpu() if isinstance(value, torch.Tensor) else value
-        for key, value in dict(getattr(intermediate, "tensors", {}) or {}).items()
-    }
-    return BoundaryPayload(
-        split_id=str(intermediate.split_id),
-        graph_signature=str(intermediate.graph_signature),
-        batch_size=int(intermediate.batch_size),
-        tensors=tensors,
-        schema=dict(intermediate.schema),
-        requires_grad=dict(intermediate.requires_grad),
-        weight_version=intermediate.weight_version,
-        passthrough_inputs=_detach_cpu_value(dict(intermediate.passthrough_inputs or {})),
-    )
-
-
 def _normalise_payload(
     intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
-) -> BoundaryPayload:
-    if isinstance(intermediate, SplitPayload):
-        return intermediate.detach().cpu()
+) -> dict[str, torch.Tensor]:
     if isinstance(intermediate, BoundaryPayload):
-        return _normalise_boundary_payload(intermediate)
+        source = dict(getattr(intermediate, "tensors", {}) or {})
     if isinstance(intermediate, torch.Tensor):
-        return SplitPayload.from_mapping({"payload": intermediate.detach().cpu()}, primary_label="payload")
-    detached = {
-        key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
-        for key, value in intermediate.items()
+        source = {"payload": intermediate}
+    elif isinstance(intermediate, dict):
+        source = dict(intermediate.get("tensors") or intermediate)
+    elif not isinstance(intermediate, BoundaryPayload):
+        raise TypeError(f"Unsupported split feature type: {type(intermediate)!r}")
+    tensors = {
+        str(key): value.detach().cpu()
+        for key, value in source.items()
+        if isinstance(value, torch.Tensor)
     }
-    return SplitPayload.from_mapping(detached, primary_label=next(iter(detached.keys()), None)).cpu()
+    if not tensors:
+        raise ValueError("Cached split feature did not contain tensor values.")
+    return tensors
 
 
 @dataclass
@@ -125,6 +101,7 @@ class StoredSampleRecord:
     split_config_id: str
     model_id: str
     model_version: str
+    front_version: str
     quality_bucket: str
     quality_score: float
     risk_score: float
@@ -159,6 +136,7 @@ class StoredSampleRecord:
             "split_config_id": self.split_config_id,
             "model_id": self.model_id,
             "model_version": self.model_version,
+            "front_version": self.front_version,
             "quality_bucket": self.quality_bucket,
             "quality_score": self.quality_score,
             "risk_score": self.risk_score,
@@ -195,6 +173,7 @@ class StoredSampleRecord:
             split_config_id=str(payload.get("split_config_id", "")),
             model_id=str(payload.get("model_id", "")),
             model_version=str(payload.get("model_version", "")),
+            front_version=str(payload.get("front_version", "0") or "0"),
             quality_bucket=str(payload.get("quality_bucket", LOW_QUALITY)),
             quality_score=float(payload.get("quality_score", 0.0)),
             risk_score=float(payload.get("risk_score", 0.0)),
@@ -378,6 +357,7 @@ class EdgeSampleStore:
         split_config_id: str,
         model_id: str,
         model_version: str,
+        front_version: str = "0",
         quality_bucket: str,
         quality_score: float | None = None,
         risk_score: float = 0.0,
@@ -426,7 +406,7 @@ class EdgeSampleStore:
             else None
         )
 
-        _atomic_torch_save({"intermediate": payload}, feature_path)
+        _atomic_torch_save({"feature": payload}, feature_path)
         _atomic_json_dump(result_path, inference_result)
         if raw_frame is not None:
             quality = max(1, min(100, int(raw_jpeg_quality)))
@@ -440,6 +420,7 @@ class EdgeSampleStore:
             split_config_id=str(split_config_id),
             model_id=str(model_id),
             model_version=str(model_version),
+            front_version=str(front_version or "0"),
             quality_bucket=quality_bucket,
             quality_score=resolved_quality_score,
             risk_score=float(risk_score),
@@ -546,16 +527,18 @@ class EdgeSampleStore:
             with open(result_path, "r", encoding="utf-8") as handle:
                 return json.load(handle)
 
-    def load_intermediate(self, record: StoredSampleRecord) -> BoundaryPayload:
+    def load_intermediate(self, record: StoredSampleRecord) -> dict[str, torch.Tensor]:
         with self._lock:
             feature_path = _from_relpath(self.root_dir, record.feature_relpath)
             payload = torch.load(feature_path, map_location="cpu", weights_only=False)
-            intermediate = payload.get("intermediate")
-            if isinstance(intermediate, BoundaryPayload):
-                return intermediate
-            if isinstance(intermediate, dict):
-                return SplitPayload.from_mapping(intermediate)
-            raise TypeError(f"Unsupported cached intermediate type: {type(intermediate)!r}")
+            feature = payload.get("feature") if isinstance(payload, dict) else payload
+            if isinstance(feature, BoundaryPayload):
+                return _normalise_payload(feature)
+            if isinstance(feature, dict):
+                return _normalise_payload(feature)
+            if isinstance(feature, torch.Tensor):
+                return _normalise_payload(feature)
+            raise TypeError(f"Unsupported cached feature type: {type(feature)!r}")
 
     def iter_existing_paths(self, record: StoredSampleRecord) -> Iterable[str]:
         for relpath in (

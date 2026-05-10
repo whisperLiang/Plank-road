@@ -17,7 +17,7 @@ from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.universal_model_split import UniversalModelSplitter
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v3"
+FIXED_SPLIT_PLAN_VERSION = "fixed-split.v4"
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
 
@@ -200,7 +200,22 @@ class SplitPlan:
     validation: dict[str, Any] = field(default_factory=dict)
     constraints: dict[str, Any] = field(default_factory=dict)
     trace_signature: str | None = None
+    canonical_split_key: str = ""
+    edge_split_id: str = ""
+    input_tensor_shape: list[int] = field(default_factory=list)
+    input_resize_mode: str = "direct_resize"
+    front_version: str = "0"
     plan_version: str = FIXED_SPLIT_PLAN_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.canonical_split_key:
+            raw = self.edge_split_id or self.candidate_id or self.split_label or "auto"
+            self.canonical_split_key = _normalise_after_key(raw)
+        if not self.edge_split_id:
+            self.edge_split_id = str(self.candidate_id or self.canonical_split_key)
+        self.input_tensor_shape = [int(dim) for dim in list(self.input_tensor_shape or [])]
+        self.input_resize_mode = str(self.input_resize_mode or "direct_resize")
+        self.front_version = str(self.front_version or "0")
 
     @property
     def boundary_count(self) -> int:
@@ -212,6 +227,7 @@ class SplitPlan:
             max_items=max_boundary_labels,
         )
         return (
+            f"canonical_split_key={self.canonical_split_key}, "
             f"candidate_id={self.candidate_id}, "
             f"boundary_count={self.boundary_count}, "
             f"boundary_tensor_labels={boundary_labels}, "
@@ -226,13 +242,32 @@ class SplitPlan:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "SplitPlan":
+        canonical_split_key = str(
+            payload.get("canonical_split_key")
+            or payload.get("edge_split_id")
+            or payload.get("candidate_id")
+            or payload.get("split_label")
+            or ""
+        )
+        edge_split_id = str(
+            payload.get("edge_split_id")
+            or payload.get("candidate_id")
+            or canonical_split_key
+        )
         return cls(
             split_config_id=str(payload["split_config_id"]),
+            canonical_split_key=canonical_split_key,
+            edge_split_id=edge_split_id,
             model_name=str(payload["model_name"]),
             candidate_id=payload.get("candidate_id"),
             split_index=payload.get("split_index"),
             split_label=payload.get("split_label"),
             boundary_tensor_labels=list(payload.get("boundary_tensor_labels", [])),
+            input_tensor_shape=[
+                int(dim) for dim in list(payload.get("input_tensor_shape", []) or [])
+            ],
+            input_resize_mode=str(payload.get("input_resize_mode") or "direct_resize"),
+            front_version=str(payload.get("front_version") or "0"),
             payload_bytes=int(payload.get("payload_bytes", 0)),
             privacy_metric=float(payload.get("privacy_metric", 0.0)),
             privacy_risk=float(payload.get("privacy_risk", 0.0)),
@@ -257,12 +292,16 @@ class SplitPlan:
         model_name: str,
         constraints: SplitConstraints,
         trace_signature: str | None,
+        input_resize_mode: str = "direct_resize",
+        front_version: str = "0",
     ) -> bool:
         return (
             self.plan_version == FIXED_SPLIT_PLAN_VERSION
             and self.model_name == model_name
             and self.constraints == _constraints_payload(constraints)
             and self.trace_signature == trace_signature
+            and self.input_resize_mode == str(input_resize_mode or "direct_resize")
+            and self.front_version == str(front_version or "0")
         )
 
 
@@ -341,6 +380,42 @@ def _make_plan_id(
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()
+
+
+def _normalise_after_key(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise RuntimeError(
+            "Fixed split candidates must expose a stable module-boundary split key."
+        )
+    return text if text.startswith("after:") else f"after:{text}"
+
+
+def canonical_split_key_for_candidate(candidate: SplitCandidate) -> str:
+    metadata = dict(getattr(candidate, "metadata", {}) or {})
+    raw_key = (
+        metadata.get("canonical_split_key")
+        or metadata.get("ariadne_boundary_after")
+        or getattr(candidate, "candidate_id", None)
+    )
+    key = _normalise_after_key(raw_key)
+    unstable_prefixes = ("after:node_", "after:__node_", "after:fx_")
+    if any(key.startswith(prefix) for prefix in unstable_prefixes):
+        raise RuntimeError(
+            "This split point is not stable across batch sizes. "
+            "Please choose a module-boundary split."
+        )
+    return key
+
+
+def _input_tensor_shape_from_sample(sample_input: Any) -> list[int]:
+    if isinstance(sample_input, torch.Tensor):
+        return [int(dim) for dim in sample_input.shape]
+    if isinstance(sample_input, (list, tuple)):
+        for value in sample_input:
+            if isinstance(value, torch.Tensor):
+                return [int(dim) for dim in value.shape]
+    return []
 
 
 def _fallback_candidate_pool(
@@ -606,6 +681,8 @@ def compute_fixed_split_for_model(
     model_name: str | None = None,
     splitter: UniversalModelSplitter | None = None,
     cache_path: str | None = None,
+    input_resize_mode: str = "direct_resize",
+    front_version: str = "0",
 ) -> SplitPlan:
     del cache_path
     runtime = splitter or UniversalModelSplitter(device=device)
@@ -654,12 +731,15 @@ def compute_fixed_split_for_model(
             "refusing to use the runtime auto/current candidate as a fixed plan."
         )
 
+    canonical_split_key = canonical_split_key_for_candidate(chosen)
     return SplitPlan(
         split_config_id=_make_plan_id(
             model_name=model_name or model.__class__.__name__,
             candidate=chosen,
             constraints=constraints,
         ),
+        canonical_split_key=canonical_split_key,
+        edge_split_id=str(chosen.candidate_id),
         model_name=model_name or model.__class__.__name__,
         candidate_id=chosen.candidate_id,
         split_index=chosen.legacy_layer_index,
@@ -667,6 +747,9 @@ def compute_fixed_split_for_model(
         if chosen.boundary_tensor_labels
         else None,
         boundary_tensor_labels=list(chosen.boundary_tensor_labels),
+        input_tensor_shape=_input_tensor_shape_from_sample(sample_input),
+        input_resize_mode=str(input_resize_mode or "direct_resize"),
+        front_version=str(front_version or "0"),
         payload_bytes=int(chosen.estimated_payload_bytes),
         privacy_metric=float(privacy_leakage),
         privacy_risk=float(privacy_leakage),
@@ -702,6 +785,8 @@ def load_or_compute_fixed_split_plan(
     cache_path: str | None = None,
     splitter: UniversalModelSplitter | None = None,
     validate_cached_plan: bool = True,
+    input_resize_mode: str = "direct_resize",
+    front_version: str = "0",
 ) -> SplitPlan:
     runtime = splitter or UniversalModelSplitter(device=device)
     if runtime.graph is None or runtime.model is None:
@@ -720,6 +805,8 @@ def load_or_compute_fixed_split_plan(
             model_name=model_key,
             constraints=constraints,
             trace_signature=trace_signature,
+            input_resize_mode=input_resize_mode,
+            front_version=front_version,
         ):
             try:
                 cached_candidate = apply_split_plan(runtime, cached)
@@ -751,6 +838,8 @@ def load_or_compute_fixed_split_plan(
         model_name=model_key,
         splitter=runtime,
         cache_path=cache_path,
+        input_resize_mode=input_resize_mode,
+        front_version=front_version,
     )
     if cache_path:
         persist_split_plan(cache_path, plan)

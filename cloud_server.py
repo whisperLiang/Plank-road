@@ -16,6 +16,7 @@ import zipfile
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 
 import cv2
 import numpy as np
@@ -75,7 +76,13 @@ from model_management.fixed_split_runtime_template import (
     get_fixed_split_runtime_template_cache,
 )
 from model_management.split_runtime import compare_outputs, make_split_spec, prepare_split_runtime
-from model_management.payload import BoundaryPayload, SplitPayload, boundary_payload_from_tensors
+from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
+from model_management.fixed_split import canonical_split_key_for_candidate
+from model_management.split_contract import (
+    SplitRuntimeContract,
+    feature_layout_from_tensors,
+    normalise_feature_tensors,
+)
 from torchvision.models.detection.image_list import ImageList
 
 from grpc_server import message_transmission_pb2_grpc
@@ -96,8 +103,6 @@ POOL_LABEL_METADATA_FIELDS = (
     "label_coordinate_space",
     "label_input_size",
     "label_resize_mode",
-    "label_split_id",
-    "label_graph_signature",
     "label_runtime_version",
 )
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
@@ -174,7 +179,9 @@ def _build_fixed_split_cache_identity(
 
 def _fixed_split_boundary_from_plan(split_plan: Mapping[str, object]) -> str:
     boundary = (
-        split_plan.get("candidate_id")
+        split_plan.get("canonical_split_key")
+        or split_plan.get("edge_split_id")
+        or split_plan.get("candidate_id")
         or split_plan.get("split_label")
         or (
             list(split_plan.get("boundary_tensor_labels") or [])[-1]
@@ -557,10 +564,6 @@ def _pool_label_metadata_from_record(
             int(model_input_size[0]),
             int(model_input_size[1]),
         ]
-    intermediate = dict(record).get("intermediate")
-    if isinstance(intermediate, BoundaryPayload):
-        metadata["label_split_id"] = str(intermediate.split_id)
-        metadata["label_graph_signature"] = str(intermediate.graph_signature)
     return metadata
 
 
@@ -569,7 +572,6 @@ def _pool_label_metadata_is_compatible(
     *,
     model_input_size: tuple[int, int] | None,
     input_resize_mode: str | None,
-    expected_split_id: str | None,
 ) -> tuple[bool, str | None]:
     coordinate_space = str(labels.get("label_coordinate_space") or "").strip()
     if coordinate_space and coordinate_space != POOL_LABEL_COORDINATE_SPACE:
@@ -590,10 +592,6 @@ def _pool_label_metadata_is_compatible(
         and label_resize_mode != str(input_resize_mode).strip()
     ):
         return False, "resize_mode"
-
-    label_split_id = str(labels.get("label_split_id") or "").strip()
-    if expected_split_id and label_split_id and label_split_id != str(expected_split_id):
-        return False, "split_id"
 
     return True, None
 
@@ -1141,6 +1139,44 @@ def _filter_prediction_by_high_threshold(
     }
 
 
+def _proxy_feature_tensors_from_record(record: Mapping[str, object]) -> dict[str, torch.Tensor]:
+    if "feature" in record:
+        return normalise_feature_tensors(record["feature"])
+    intermediate = record.get("intermediate")
+    if isinstance(intermediate, BoundaryPayload):
+        return normalise_feature_tensors(dict(intermediate.tensors))
+    if intermediate is not None:
+        return normalise_feature_tensors(intermediate)
+    return normalise_feature_tensors(record)
+
+
+def _proxy_boundary_batch(
+    records: list[Mapping[str, object]],
+    *,
+    splitter: UniversalModelSplitter,
+) -> BoundaryPayload:
+    tensor_groups = [_proxy_feature_tensors_from_record(record) for record in records]
+    labels = list(tensor_groups[0].keys())
+    batched_tensors: dict[str, torch.Tensor] = {}
+    for label in labels:
+        pieces = []
+        for tensors in tensor_groups:
+            tensor = tensors[label]
+            if tensor.ndim == 0 or int(tensor.shape[0]) != 1:
+                raise RuntimeError(
+                    "Cached split proxy evaluation expects single-sample feature tensors."
+                )
+            pieces.append(tensor)
+        batched_tensors[label] = torch.cat(pieces, dim=0)
+    runtime = getattr(splitter, "runtime", splitter)
+    return boundary_payload_from_tensors(
+        batched_tensors,
+        split_id=str(getattr(runtime, "split_id", "") or "split-tail"),
+        graph_signature=str(getattr(runtime, "graph_signature", "") or "split-runtime"),
+        batch_size=len(records),
+    )
+
+
 def _build_detection_proxy_prediction_cache(
     model: torch.nn.Module,
     *,
@@ -1176,7 +1212,7 @@ def _build_detection_proxy_prediction_cache(
             tuple[
                 list[object],
                 list[object],
-                BoundaryPayload | torch.Tensor,
+                Mapping[str, object],
                 Mapping[str, object] | None,
             ]
         ] = []
@@ -1195,8 +1231,9 @@ def _build_detection_proxy_prediction_cache(
                 except FileNotFoundError:
                     skipped_missing_frame += 1
                     continue
-            payload = record.get("intermediate")
-            if not isinstance(payload, (BoundaryPayload, torch.Tensor)):
+            try:
+                _proxy_feature_tensors_from_record(record)
+            except Exception:
                 skipped_missing_frame += 1
                 continue
             sample_metadata = (
@@ -1206,29 +1243,23 @@ def _build_detection_proxy_prediction_cache(
             )
             if not isinstance(sample_metadata, Mapping):
                 sample_metadata = record if isinstance(record, Mapping) else None
-            pending_samples.append((gt_boxes, gt_labels, payload, sample_metadata))
+            pending_samples.append((gt_boxes, gt_labels, dict(record), sample_metadata))
 
         prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
         _set_detection_model_eval_mode(model)
         with torch.no_grad():
             start = 0
             while start < len(pending_samples):
-                batched_payload = pending_samples[start][2]
-                if not isinstance(batched_payload, BoundaryPayload):
-                    raise RuntimeError(
-                        "Cached split proxy evaluation requires Ariadne BoundaryPayload records."
-                    )
-                execution_batch_size = int(getattr(batched_payload, "batch_size", 0) or 0)
                 actual_batch_size = min(
                     len(pending_samples) - start,
-                    max(1, execution_batch_size),
+                    max(1, int(inference_batch_size)),
                 )
                 batch = pending_samples[start : start + actual_batch_size]
-                if execution_batch_size < max(_FIXED_SPLIT_DYNAMIC_BATCH_MIN, actual_batch_size):
-                    raise RuntimeError(
-                        "Cached split proxy evaluation received per-sample payloads. "
-                        "Regenerate the cache with batched Ariadne prefix execution."
-                    )
+                batched_payload = _proxy_boundary_batch(
+                    [record for _, _, record, _ in batch],
+                    splitter=splitter,
+                )
+                execution_batch_size = int(batched_payload.batch_size)
                 raw_outputs = splitter.cloud_forward(
                     batched_payload,
                     candidate=split_candidate,
@@ -1239,10 +1270,7 @@ def _build_detection_proxy_prediction_cache(
                     model_name=model_name,
                     batch_metadata=[
                         metadata
-                        for _, _, _, metadata in (
-                            batch
-                            + [batch[-1]] * (execution_batch_size - actual_batch_size)
-                        )
+                        for _, _, _, metadata in batch
                     ],
                     threshold_low=threshold_low,
                     device=device,
@@ -1784,6 +1812,19 @@ class CloudContinualLearner:
             )
         )
         os.makedirs(self.sample_pool_root, exist_ok=True)
+        self.split_contract_root = os.path.abspath(
+            str(
+                getattr(
+                    sample_pool_cfg,
+                    "split_contract_root",
+                    os.path.join(
+                        os.path.dirname(self.workspace_root),
+                        "split_contracts",
+                    ),
+                )
+            )
+        )
+        os.makedirs(self.split_contract_root, exist_ok=True)
         raw_sample_pool_max = (
             getattr(sample_pool_cfg, "max_samples", None)
             if sample_pool_cfg is not None
@@ -1862,19 +1903,39 @@ class CloudContinualLearner:
         split_plan = dict(manifest.get("split_plan", {}) or {})
         return {
             "model_id": str(manifest.get("model_id") or model_meta.get("model_id", "") or ""),
-            "model_version": str(
-                manifest.get("model_version") or model_meta.get("model_version", "") or ""
+            "front_version": str(
+                manifest.get("front_version")
+                or split_plan.get("front_version")
+                or "0"
             ),
             "split_config_id": str(
                 manifest.get("split_config_id") or split_plan.get("split_config_id", "") or ""
             ),
-            "split_label": manifest.get("split_label")
-            if "split_label" in manifest
-            else split_plan.get("split_label"),
             "boundary_tensor_labels": list(
                 manifest.get("boundary_tensor_labels")
                 or split_plan.get("boundary_tensor_labels", [])
                 or []
+            ),
+            "canonical_split_key": str(
+                manifest.get("canonical_split_key")
+                or split_plan.get("canonical_split_key")
+                or ""
+            ),
+            "edge_split_id": str(
+                manifest.get("edge_split_id")
+                or split_plan.get("edge_split_id")
+                or split_plan.get("candidate_id")
+                or ""
+            ),
+            "input_tensor_shape": list(
+                manifest.get("input_tensor_shape")
+                or split_plan.get("input_tensor_shape", [])
+                or []
+            ),
+            "input_resize_mode": str(
+                manifest.get("input_resize_mode")
+                or split_plan.get("input_resize_mode")
+                or "direct_resize"
             ),
         }
 
@@ -1889,7 +1950,7 @@ class CloudContinualLearner:
         if not split_key:
             split_key = _json_fingerprint(
                 {
-                    "split_label": context.get("split_label"),
+                    "canonical_split_key": context.get("canonical_split_key"),
                     "boundary_tensor_labels": list(
                         context.get("boundary_tensor_labels", []) or []
                     ),
@@ -1899,7 +1960,7 @@ class CloudContinualLearner:
             self.sample_pool_root,
             f"edge_{_sanitize_cache_segment(edge_id)}",
             _sanitize_cache_segment(context.get("model_id") or "unknown_model"),
-            f"version_{_sanitize_cache_segment(context.get('model_version') or '0')}",
+            f"front_version_{_sanitize_cache_segment(context.get('front_version') or '0')}",
             _sanitize_cache_segment(split_key),
         )
 
@@ -1913,13 +1974,8 @@ class CloudContinualLearner:
         return CloudSamplePool(
             self._cloud_sample_pool_path(edge_id=edge_id, manifest=manifest),
             model_id=str(context.get("model_id", "") or ""),
-            model_version=str(context.get("model_version", "") or ""),
+            front_version=str(context.get("front_version", "") or "0"),
             split_config_id=str(context.get("split_config_id", "") or ""),
-            split_label=(
-                None
-                if context.get("split_label") is None
-                else str(context.get("split_label"))
-            ),
             boundary_tensor_labels=list(
                 context.get("boundary_tensor_labels", []) or []
             ),
@@ -1927,6 +1983,291 @@ class CloudContinualLearner:
             shard_size=self.sample_pool_shard_size,
             reader_cache_size=self.sample_pool_reader_cache_size,
         )
+
+    @staticmethod
+    def _preview_ids(sample_ids: list[str], *, limit: int = 10) -> list[str]:
+        return [str(sample_id) for sample_id in sample_ids[: max(0, int(limit))]]
+
+    @staticmethod
+    def _feature_tensors_from_record(record: Mapping[str, object]) -> dict[str, torch.Tensor]:
+        if "feature" in record:
+            return normalise_feature_tensors(record["feature"])
+        if "tensors" in record:
+            return normalise_feature_tensors(record["tensors"])
+        intermediate = record.get("intermediate")
+        if isinstance(intermediate, BoundaryPayload):
+            return normalise_feature_tensors(dict(intermediate.tensors))
+        if intermediate is not None:
+            return normalise_feature_tensors(intermediate)
+        return normalise_feature_tensors(record)
+
+    @staticmethod
+    def _first_sample_feature_tensors(
+        samples: list[Mapping[str, object]],
+    ) -> dict[str, torch.Tensor] | None:
+        for sample in samples:
+            feature_record = sample.get("feature_record")
+            if not isinstance(feature_record, Mapping):
+                continue
+            try:
+                return CloudContinualLearner._feature_tensors_from_record(feature_record)
+            except Exception:
+                continue
+        return None
+
+    def _contract_layout_tensors_from_runtime(
+        self,
+        *,
+        splitter: UniversalModelSplitter,
+        candidate: object | None,
+        input_tensor_shape: list[int],
+    ) -> dict[str, torch.Tensor] | None:
+        if len(input_tensor_shape) < 4:
+            return None
+        batch_shape = [2, *[int(dim) for dim in input_tensor_shape[1:]]]
+        example = torch.zeros(batch_shape, dtype=torch.float32, device=self.device)
+        try:
+            with torch.no_grad():
+                payload = splitter.edge_forward(example, candidate=candidate)
+        except Exception as exc:
+            logger.warning(
+                "[FixedSplitCL] Could not sample cloud batch feature layout from runtime; using uploaded feature layout for contract creation: {}",
+                exc,
+            )
+            return None
+        if not isinstance(payload, BoundaryPayload):
+            return None
+        tensors = {}
+        for label, tensor in dict(payload.tensors or {}).items():
+            if isinstance(tensor, torch.Tensor):
+                tensors[str(label)] = tensor[:1].detach().cpu()
+        return tensors or None
+
+    def _get_or_create_split_runtime_contract(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+        feature_tensors: Mapping[str, torch.Tensor] | None = None,
+        model: torch.nn.Module | None = None,
+        splitter: UniversalModelSplitter | None = None,
+        candidate: object | None = None,
+        bundle_root: str | None = None,
+    ) -> SplitRuntimeContract:
+        context = self._sample_pool_manifest_context(manifest)
+        model_id = str(context.get("model_id") or self.edge_model_name)
+        split_config_id = str(context.get("split_config_id") or "").strip()
+        if not split_config_id:
+            raise RuntimeError("SplitRuntimeContract requires split_config_id.")
+        existing = SplitRuntimeContract.load(
+            self.split_contract_root,
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+        )
+        if existing is not None:
+            canonical_from_context = str(context.get("canonical_split_key") or "").strip()
+            if canonical_from_context and canonical_from_context != existing.canonical_split_key:
+                raise RuntimeError(
+                    "SplitRuntimeContract mismatch for canonical_split_key: "
+                    f"existing={existing.canonical_split_key!r}, incoming={canonical_from_context!r}."
+                )
+            front_from_context = str(context.get("front_version") or "0")
+            if front_from_context != existing.front_version:
+                raise RuntimeError(
+                    "SplitRuntimeContract mismatch for front_version: "
+                    f"existing={existing.front_version!r}, incoming={front_from_context!r}."
+                )
+            return existing
+
+        canonical_split_key = str(context.get("canonical_split_key") or "").strip()
+        if not canonical_split_key:
+            raise RuntimeError(
+                "This split point is not stable across batch sizes. "
+                "Please choose a module-boundary split."
+            )
+        if feature_tensors is None:
+            raise RuntimeError(
+                "SplitRuntimeContract creation requires a representative feature tensor."
+            )
+        if splitter is None:
+            if model is None:
+                model = self._load_edge_training_model(
+                    model_name=model_id,
+                    edge_id=edge_id,
+                    cache_policy="auto",
+                )
+            manifest_for_runtime = dict(manifest)
+            if not isinstance(manifest_for_runtime.get("split_plan"), Mapping):
+                manifest_for_runtime["split_plan"] = {
+                    "split_config_id": split_config_id,
+                    "canonical_split_key": canonical_split_key,
+                    "edge_split_id": context.get("edge_split_id") or canonical_split_key,
+                    "input_tensor_shape": list(context.get("input_tensor_shape", []) or []),
+                    "input_resize_mode": str(
+                        context.get("input_resize_mode") or "direct_resize"
+                    ),
+                    "front_version": str(context.get("front_version") or "0"),
+                    "boundary_tensor_labels": list(
+                        context.get("boundary_tensor_labels", []) or []
+                    ),
+                }
+            splitter, candidate = self._build_bundle_splitter(
+                model,
+                manifest_for_runtime,
+                bundle_root=bundle_root or self.workspace_root,
+                runtime_batch_size=_FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+            )
+
+        candidates_by_key: dict[str, object] = {}
+        for batch_candidate in splitter.enumerate_candidates():
+            try:
+                key = canonical_split_key_for_candidate(batch_candidate)
+            except RuntimeError:
+                continue
+            candidates_by_key[key] = batch_candidate
+        batch_candidate = candidates_by_key.get(canonical_split_key)
+        if batch_candidate is None:
+            raise RuntimeError(
+                "This split point is not stable across batch sizes. "
+                "Please choose a module-boundary split."
+            )
+        cloud_batch_split_id = str(
+            getattr(batch_candidate, "candidate_id", None)
+            or getattr(getattr(splitter, "runtime", None), "split_id", "")
+            or canonical_split_key
+        )
+        layout_tensors = self._contract_layout_tensors_from_runtime(
+            splitter=splitter,
+            candidate=candidate,
+            input_tensor_shape=[int(dim) for dim in list(context.get("input_tensor_shape", []) or [])],
+        )
+        edge_split_id = str(context.get("edge_split_id") or canonical_split_key)
+        boundary_tensor_labels = list(
+            getattr(batch_candidate, "boundary_tensor_labels", None)
+            or context.get("boundary_tensor_labels", [])
+            or []
+        )
+        contract = SplitRuntimeContract.create(
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+            canonical_split_key=canonical_split_key,
+            edge_split_id=edge_split_id,
+            cloud_batch_split_id=cloud_batch_split_id,
+            input_tensor_shape=list(context.get("input_tensor_shape", []) or []),
+            input_resize_mode=str(context.get("input_resize_mode") or "direct_resize"),
+            boundary_tensor_labels=boundary_tensor_labels,
+            front_version=str(context.get("front_version") or "0"),
+            feature_tensors=layout_tensors or feature_tensors,
+            tail_version=str(dict(manifest.get("model", {}) or {}).get("model_version", "") or "")
+            or None,
+        )
+        path = contract.save(self.split_contract_root)
+        logger.info(
+            "[FixedSplitCL] SplitRuntimeContract created edge_id={} model_id={} split_config_id={} canonical_split_key={} cloud_batch_split_id={} feature_layout_id={} path={}",
+            edge_id,
+            model_id,
+            split_config_id,
+            canonical_split_key,
+            cloud_batch_split_id,
+            contract.feature_layout_id,
+            path,
+        )
+        return contract
+
+    @staticmethod
+    def _labels_are_structurally_valid(labels: Mapping[str, object]) -> bool:
+        boxes = list(labels.get("boxes") or [])
+        label_values = list(labels.get("labels") or [])
+        if bool(boxes) != bool(label_values):
+            return False
+        if boxes and len(boxes) != len(label_values):
+            return False
+        for box in boxes:
+            try:
+                values = [float(value) for value in list(box)[:4]]
+            except (TypeError, ValueError):
+                return False
+            if len(values) != 4:
+                return False
+        return True
+
+    def _filter_pool_samples_for_contract(
+        self,
+        samples: list[Mapping[str, object]],
+        *,
+        contract: SplitRuntimeContract,
+        source_label: str,
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        accepted: list[dict[str, object]] = []
+        skipped: dict[str, list[str]] = {
+            "skipped_contract_mismatch": [],
+            "skipped_front_version_mismatch": [],
+            "skipped_feature_layout_mismatch": [],
+            "skipped_label_invalid": [],
+            "skipped_label_metadata": [],
+            "skipped_label_bounds": [],
+            "skipped_unreadable": [],
+        }
+        model_input_size = (
+            (int(contract.input_tensor_shape[-2]), int(contract.input_tensor_shape[-1]))
+            if len(contract.input_tensor_shape) >= 3
+            else None
+        )
+        for sample in samples:
+            sample_id = str(sample.get("sample_id", "") or "")
+            feature_record = sample.get("feature_record")
+            labels = sample.get("labels")
+            if not sample_id or not isinstance(feature_record, Mapping) or not isinstance(labels, Mapping):
+                skipped["skipped_unreadable"].append(sample_id)
+                continue
+            record = dict(feature_record)
+            split_config_id = str(record.get("split_config_id") or sample.get("split_config_id") or "")
+            front_version = str(record.get("front_version") or sample.get("front_version") or "0")
+            if split_config_id != contract.split_config_id:
+                skipped["skipped_contract_mismatch"].append(sample_id)
+                continue
+            if front_version != contract.front_version:
+                skipped["skipped_front_version_mismatch"].append(sample_id)
+                continue
+            try:
+                tensors = self._feature_tensors_from_record(record)
+            except Exception:
+                skipped["skipped_unreadable"].append(sample_id)
+                continue
+            try:
+                if feature_layout_from_tensors(tensors) != contract.feature_layout:
+                    skipped["skipped_feature_layout_mismatch"].append(sample_id)
+                    continue
+            except Exception:
+                skipped["skipped_feature_layout_mismatch"].append(sample_id)
+                continue
+            labels_payload = dict(labels)
+            metadata_ok, _metadata_reason = _pool_label_metadata_is_compatible(
+                labels_payload,
+                model_input_size=model_input_size,
+                input_resize_mode=contract.input_resize_mode,
+            )
+            if not metadata_ok:
+                skipped["skipped_label_metadata"].append(sample_id)
+                continue
+            if not self._labels_are_structurally_valid(labels_payload):
+                skipped["skipped_label_invalid"].append(sample_id)
+                continue
+            if not _labels_fit_model_input(labels_payload, model_input_size=model_input_size):
+                skipped["skipped_label_bounds"].append(sample_id)
+                continue
+            accepted.append(dict(sample))
+
+        stats: dict[str, object] = {
+            "source": source_label,
+            "accepted": len(accepted),
+        }
+        for key, sample_ids in skipped.items():
+            stats[key] = len(sample_ids)
+            stats[f"{key}_preview"] = self._preview_ids(sample_ids)
+        return accepted, stats
 
     @staticmethod
     def _pool_annotations_from_labels(
@@ -2015,103 +2356,56 @@ class CloudContinualLearner:
                     resize_mode=resize_mode,
                 )
             )
+            model_meta = dict(manifest.get("model", {}) or {})
+            split_plan = dict(manifest.get("split_plan", {}) or {})
+            input_tensor_shape = (
+                record.get("input_tensor_shape")
+                or manifest.get("input_tensor_shape")
+                or split_plan.get("input_tensor_shape", [])
+                or []
+            )
+            feature_record = {
+                "sample_id": sample_id,
+                "feature": self._feature_tensors_from_record(dict(record)),
+                "sample_source": "low_quality",
+                "label_source": "teacher",
+                "model_id": str(model_meta.get("model_id", "") or manifest.get("model_id", "") or ""),
+                "split_config_id": str(
+                    manifest.get("split_config_id")
+                    or split_plan.get("split_config_id")
+                    or ""
+                ),
+                "front_version": str(
+                    manifest.get("front_version")
+                    or split_plan.get("front_version")
+                    or "0"
+                ),
+                "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape)],
+                "input_resize_mode": str(
+                    record.get("input_resize_mode")
+                    or manifest.get("input_resize_mode")
+                    or split_plan.get("input_resize_mode")
+                    or resize_mode
+                    or "direct_resize"
+                ),
+            }
             processed_samples.append(
                 {
                     "sample_id": sample_id,
-                    "feature_record": dict(record),
+                    "feature_record": feature_record,
+                    "split_config_id": feature_record["split_config_id"],
+                    "front_version": feature_record["front_version"],
                     "labels": self._pool_annotations_from_labels(trainable_labels),
                     "created_at": time.time(),
                 }
             )
         return processed_samples
 
-    @staticmethod
-    def _low_quality_feature_matches_split_plan(
-        feature_path: str,
-        split_plan: Mapping[str, object],
-    ) -> bool:
-        try:
-            payload = torch.load(feature_path, map_location="cpu", weights_only=False)
-        except Exception:
-            return False
-        if isinstance(payload, Mapping) and "intermediate" in payload:
-            intermediate = payload.get("intermediate")
-        else:
-            intermediate = payload
-        if not isinstance(intermediate, BoundaryPayload):
-            return True
-
-        expected_boundary = [
-            str(label)
-            for label in list(split_plan.get("boundary_tensor_labels", []) or [])
-        ]
-        actual_boundary = [
-            str(label)
-            for label in list(
-                getattr(
-                    intermediate,
-                    "boundary_tensor_labels",
-                    list(getattr(intermediate, "tensors", {}).keys()),
-                )
-                or []
-            )
-        ]
-        if expected_boundary and actual_boundary and actual_boundary != expected_boundary:
-            return False
-
-        expected_split_label = split_plan.get("split_label")
-        actual_split_label = getattr(intermediate, "split_label", None)
-        if actual_split_label is None:
-            actual_split_label = getattr(intermediate, "split_id", None)
-        if (
-            expected_split_label is not None
-            and actual_split_label is not None
-            and str(actual_split_label) != str(expected_split_label)
-        ):
-            return False
-        return True
-
-    def _disable_incompatible_low_quality_features(
-        self,
-        *,
-        bundle_cache_path: str,
-        manifest: dict[str, object],
-    ) -> int:
-        split_plan = dict(manifest.get("split_plan", {}) or {})
-        samples = list(manifest.get("samples", []) or [])
-        disabled_count = 0
-        for sample in samples:
-            if not isinstance(sample, dict):
-                continue
-            if not _is_low_quality_trigger_sample(manifest, sample):
-                continue
-            feature_relpath = sample.get("feature_relpath")
-            raw_relpath = sample.get("raw_relpath")
-            if not feature_relpath or raw_relpath is None:
-                continue
-            feature_path = os.path.join(
-                bundle_cache_path,
-                str(feature_relpath).replace("/", os.sep),
-            )
-            if self._low_quality_feature_matches_split_plan(feature_path, split_plan):
-                continue
-            sample["feature_relpath"] = None
-            sample["feature_bytes"] = 0
-            sample["has_feature"] = False
-            disabled_count += 1
-
-        if disabled_count:
-            manifest["samples"] = samples
-            logger.info(
-                "[FixedSplitCL] Disabled {} incompatible low-quality bundled feature(s); raw samples will be rebuilt on the cloud.",
-                disabled_count,
-            )
-        return disabled_count
-
     def _build_pool_training_inputs(
         self,
         sample_pool: CloudSamplePool,
         *,
+        contract: SplitRuntimeContract,
         expected_split_id: str | None = None,
         runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
         input_resize_mode: str | None = None,
@@ -2127,10 +2421,19 @@ class CloudContinualLearner:
         annotations: dict[str, dict[str, object]] = {}
         sample_metadata_by_id: dict[str, dict[str, object]] = {}
         scanned_count = 0
-        unreadable_count = 0
-        deactivated_by_split: list[str] = []
-        deactivated_by_label_bounds: list[str] = []
-        deactivated_by_label_metadata: list[str] = []
+        accepted_high_quality = 0
+        accepted_low_quality = 0
+        skipped_contract_mismatch: list[str] = []
+        skipped_front_version_mismatch: list[str] = []
+        skipped_feature_layout_mismatch: list[str] = []
+        skipped_label_bounds: list[str] = []
+        skipped_label_metadata: list[str] = []
+        skipped_unreadable: list[str] = []
+        model_input_size = (
+            (int(contract.input_tensor_shape[-2]), int(contract.input_tensor_shape[-1]))
+            if len(contract.input_tensor_shape) >= 3
+            else None
+        )
         for entry in active_entries:
             scanned_count += 1
             sample_id = str(entry.get("sample_id", "") or "")
@@ -2145,89 +2448,85 @@ class CloudContinualLearner:
                     sample_id,
                     exc,
                 )
-                unreadable_count += 1
-                continue
-            intermediate = dict(training_record).get("intermediate")
-            if (
-                expected_split_id
-                and isinstance(intermediate, BoundaryPayload)
-                and str(intermediate.split_id) != str(expected_split_id)
-            ):
-                sample_pool.deactivate_sample(sample_id)
-                deactivated_by_split.append(sample_id)
-                continue
-            if (
-                expected_split_id
-                and isinstance(intermediate, BoundaryPayload)
-                and int(getattr(intermediate, "batch_size", 0) or 0)
-                < _FIXED_SPLIT_DYNAMIC_BATCH_MIN
-            ):
-                sample_pool.deactivate_sample(sample_id)
-                deactivated_by_split.append(sample_id)
+                skipped_unreadable.append(sample_id)
                 continue
             training_record = dict(training_record)
-            if runtime_input_tensor_shape is not None:
-                training_record["input_tensor_shape"] = [
-                    int(dim) for dim in runtime_input_tensor_shape
-                ]
-            if input_resize_mode:
-                training_record["input_resize_mode"] = str(input_resize_mode)
-            labels = self._pool_annotations_from_labels(feature_label.labels)
-            model_input_size = (
-                (
-                    int(runtime_input_tensor_shape[-2]),
-                    int(runtime_input_tensor_shape[-1]),
+            split_config_id = str(training_record.get("split_config_id") or "")
+            front_version = str(training_record.get("front_version") or "0")
+            if split_config_id != contract.split_config_id:
+                skipped_contract_mismatch.append(sample_id)
+                continue
+            if front_version != contract.front_version:
+                skipped_front_version_mismatch.append(sample_id)
+                continue
+            try:
+                tensors = self._feature_tensors_from_record(training_record)
+                if feature_layout_from_tensors(tensors) != contract.feature_layout:
+                    skipped_feature_layout_mismatch.append(sample_id)
+                    continue
+            except Exception:
+                skipped_feature_layout_mismatch.append(sample_id)
+                continue
+            training_record["feature"] = tensors
+            training_record["cloud_batch_split_id"] = contract.cloud_batch_split_id
+            training_record["input_tensor_shape"] = [
+                int(dim) for dim in (
+                    runtime_input_tensor_shape or contract.input_tensor_shape
                 )
-                if runtime_input_tensor_shape is not None
-                and len(runtime_input_tensor_shape) >= 3
-                else None
+            ]
+            training_record["input_resize_mode"] = str(
+                input_resize_mode or contract.input_resize_mode
             )
+            labels = self._pool_annotations_from_labels(feature_label.labels)
             metadata_compatible, _metadata_reason = _pool_label_metadata_is_compatible(
                 labels,
                 model_input_size=model_input_size,
-                input_resize_mode=input_resize_mode,
-                expected_split_id=expected_split_id,
+                input_resize_mode=input_resize_mode or contract.input_resize_mode,
             )
             if not metadata_compatible:
-                sample_pool.deactivate_sample(sample_id)
-                deactivated_by_label_metadata.append(sample_id)
+                skipped_label_metadata.append(sample_id)
                 continue
             if not _labels_fit_model_input(labels, model_input_size=model_input_size):
-                sample_pool.deactivate_sample(sample_id)
-                deactivated_by_label_bounds.append(sample_id)
+                skipped_label_bounds.append(sample_id)
                 continue
+            source = str(training_record.get("sample_source") or "")
+            if source == "high_quality":
+                accepted_high_quality += 1
+            elif source == "low_quality":
+                accepted_low_quality += 1
             sample_ids.append(sample_id)
             preloaded_records[sample_id] = training_record
             annotations[sample_id] = labels
             sample_metadata_by_id[sample_id] = dict(training_record)
-        deactivated_count = (
-            len(deactivated_by_split)
-            + len(deactivated_by_label_bounds)
-            + len(deactivated_by_label_metadata)
-        )
-        compacted = False
-        if deactivated_count:
-            compacted = sample_pool.maybe_compact(force=True)
         logger.info(
             "[FixedSplitCL] Cloud sample-pool training input scan: scanned={} "
-            "accepted={} unreadable={} deactivated_by_split={} "
-            "deactivated_by_label_bounds={} deactivated_by_label_metadata={} "
-            "compacted={}.",
+            "accepted={} accepted_high_quality={} accepted_low_quality={} "
+            "skipped_contract_mismatch={} skipped_front_version_mismatch={} "
+            "skipped_feature_layout_mismatch={} skipped_label_bounds={} "
+            "skipped_label_metadata={} skipped_unreadable={}.",
             scanned_count,
             len(sample_ids),
-            unreadable_count,
-            len(deactivated_by_split),
-            len(deactivated_by_label_bounds),
-            len(deactivated_by_label_metadata),
-            bool(compacted),
+            accepted_high_quality,
+            accepted_low_quality,
+            len(skipped_contract_mismatch),
+            len(skipped_front_version_mismatch),
+            len(skipped_feature_layout_mismatch),
+            len(skipped_label_bounds),
+            len(skipped_label_metadata),
+            len(skipped_unreadable),
         )
-        if deactivated_count:
-            logger.debug(
-                "[FixedSplitCL] Cloud sample-pool deactivated sample ids: "
-                "split={} label_bounds={} label_metadata={}.",
-                deactivated_by_split,
-                deactivated_by_label_bounds,
-                deactivated_by_label_metadata,
+        skipped_preview = {
+            "contract_mismatch": self._preview_ids(skipped_contract_mismatch),
+            "front_version_mismatch": self._preview_ids(skipped_front_version_mismatch),
+            "feature_layout_mismatch": self._preview_ids(skipped_feature_layout_mismatch),
+            "label_bounds": self._preview_ids(skipped_label_bounds),
+            "label_metadata": self._preview_ids(skipped_label_metadata),
+            "unreadable": self._preview_ids(skipped_unreadable),
+        }
+        if any(skipped_preview.values()):
+            logger.info(
+                "[FixedSplitCL] Cloud sample-pool skipped preview ids (max 10 each): {}",
+                skipped_preview,
             )
         bundle_info = {
             "manifest": {},
@@ -2250,38 +2549,6 @@ class CloudContinualLearner:
         feature_root = os.path.join(staging_root, "features")
         os.makedirs(raw_root, exist_ok=True)
         os.makedirs(feature_root, exist_ok=True)
-
-        feature_payload_by_id: dict[str, dict[str, object]] = {}
-        for shard in list(trigger_manifest.get("feature_shards", []) or []):
-            if not isinstance(shard, Mapping):
-                continue
-            relpath = shard.get("file") or shard.get("path")
-            if not relpath:
-                continue
-            shard_path = os.path.join(bundle_cache_path, str(relpath).replace("/", os.sep))
-            if not os.path.exists(shard_path):
-                continue
-            payload = torch.load(shard_path, map_location="cpu", weights_only=False)
-            feature_samples = payload.get("samples") if isinstance(payload, Mapping) else None
-            if not isinstance(feature_samples, Mapping):
-                continue
-            for sample_id, feature_value in feature_samples.items():
-                if not isinstance(feature_value, Mapping):
-                    continue
-                tensors = {
-                    str(label): tensor.detach().cpu()
-                    for label, tensor in dict(feature_value.get("tensors") or {}).items()
-                    if isinstance(tensor, torch.Tensor)
-                }
-                if tensors:
-                    feature_payload_by_id[str(sample_id)] = {
-                        "tensors": tensors,
-                        "boundary": (
-                            dict(feature_value.get("boundary"))
-                            if isinstance(feature_value.get("boundary"), Mapping)
-                            else {}
-                        ),
-                    }
 
         samples: list[dict[str, object]] = []
         for shard in list(trigger_manifest.get("raw_shards", []) or []):
@@ -2324,61 +2591,24 @@ class CloudContinualLearner:
                     with open(raw_path, "wb") as handle:
                         shutil.copyfileobj(source, handle)
 
-                    feature_relpath = None
-                    if sample_id in feature_payload_by_id:
-                        feature_payload = feature_payload_by_id[sample_id]
-                        tensors = dict(feature_payload.get("tensors") or {})
-                        boundary_meta = dict(feature_payload.get("boundary") or {})
-                        feature_relpath = f"low_quality_staging/features/{safe_sample_id}.pt"
-                        feature_path = os.path.join(
-                            bundle_cache_path,
-                            feature_relpath.replace("/", os.sep),
-                        )
-                        split_id = str(boundary_meta.get("split_id") or "").strip()
-                        graph_signature = str(
-                            boundary_meta.get("graph_signature") or ""
-                        ).strip()
-                        if split_id and graph_signature:
-                            intermediate = boundary_payload_from_tensors(
-                                tensors,
-                                split_id=split_id,
-                                graph_signature=graph_signature,
-                                batch_size=boundary_meta.get("batch_size"),
-                                schema=boundary_meta.get("schema"),
-                                requires_grad=boundary_meta.get("requires_grad"),
-                                weight_version=boundary_meta.get("weight_version"),
-                                passthrough_inputs=dict(
-                                    boundary_meta.get("passthrough_inputs") or {}
-                                ),
-                            )
-                        else:
-                            intermediate = SplitPayload.from_mapping(
-                                tensors,
-                                primary_label=next(reversed(tensors), None),
-                            )
-                        torch.save(
-                            {"intermediate": intermediate},
-                            feature_path,
-                        )
                     samples.append(
                         {
                             "sample_id": sample_id,
                             "raw_relpath": raw_relpath,
                             "raw_bytes": os.path.getsize(raw_path),
                             "has_raw_sample": True,
-                            "feature_relpath": feature_relpath,
-                            "feature_bytes": (
-                                os.path.getsize(
-                                    os.path.join(
-                                        bundle_cache_path,
-                                        feature_relpath.replace("/", os.sep),
-                                    )
-                                )
-                                if feature_relpath
-                                else 0
-                            ),
+                            "feature_relpath": None,
+                            "feature_bytes": 0,
                             "model_id": trigger_manifest.get("model_id", ""),
                             "model_version": trigger_manifest.get("model_version", ""),
+                            "front_version": str(trigger_manifest.get("front_version", "0") or "0"),
+                            "input_tensor_shape": list(
+                                trigger_manifest.get("input_tensor_shape", []) or []
+                            ),
+                            "input_resize_mode": str(
+                                trigger_manifest.get("input_resize_mode", "")
+                                or "direct_resize"
+                            ),
                         }
                     )
 
@@ -2387,6 +2617,19 @@ class CloudContinualLearner:
             {
                 "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
                 "edge_id": trigger_manifest.get("edge_id"),
+                "model_id": str(trigger_manifest.get("model_id", "") or ""),
+                "front_version": str(trigger_manifest.get("front_version", "0") or "0"),
+                "split_config_id": str(trigger_manifest.get("split_config_id", "") or ""),
+                "canonical_split_key": str(
+                    trigger_manifest.get("canonical_split_key", "") or ""
+                ),
+                "edge_split_id": str(trigger_manifest.get("edge_split_id", "") or ""),
+                "input_tensor_shape": list(
+                    trigger_manifest.get("input_tensor_shape", []) or []
+                ),
+                "input_resize_mode": str(
+                    trigger_manifest.get("input_resize_mode", "") or "direct_resize"
+                ),
                 "model": {
                     "model_id": str(trigger_manifest.get("model_id", "") or ""),
                     "model_version": str(trigger_manifest.get("model_version", "") or "0"),
@@ -2602,7 +2845,10 @@ class CloudContinualLearner:
         return os.path.join(self.weight_folder, "tmp_edge_model.pth")
 
     def _resolve_fixed_split_model_name(self, manifest: Mapping[str, object]) -> str:
-        bundle_model_id = str(manifest.get("model", {}).get("model_id", "")).strip()
+        model_meta = dict(manifest.get("model", {}) or {})
+        bundle_model_id = str(
+            model_meta.get("model_id") or manifest.get("model_id", "") or ""
+        ).strip()
         if bundle_model_id and bundle_model_id != self.edge_model_name:
             logger.warning(
                 "[FixedSplitCL] Using bundle model {} instead of configured server.edge_model_name {} for this retrain round.",
@@ -2938,6 +3184,9 @@ class CloudContinualLearner:
         self,
         manifest: dict[str, object],
     ) -> tuple[int, int]:
+        runtime_image_size = self._runtime_image_size_from_metadata(manifest)
+        if runtime_image_size is not None:
+            return runtime_image_size
         for sample in manifest.get("samples", []):
             runtime_image_size = self._runtime_image_size_from_metadata(sample)
             if runtime_image_size is not None:
@@ -3229,7 +3478,20 @@ class CloudContinualLearner:
                         f"batch size (payload_batch={getattr(batch_payload, 'batch_size', None)}, "
                         f"expected={execution_batch_size})."
                     )
-                payloads.extend([batch_payload] * actual_chunk_size)
+                for sample_offset in range(actual_chunk_size):
+                    sample_tensors = {
+                        str(label): tensor[sample_offset : sample_offset + 1].detach().cpu()
+                        for label, tensor in dict(batch_payload.tensors or {}).items()
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                    payloads.append(
+                        replace(
+                            batch_payload,
+                            batch_size=1,
+                            tensors=sample_tensors,
+                            passthrough_inputs={},
+                        )
+                    )
             return payloads
 
         return _batch_provider
@@ -3452,6 +3714,27 @@ class CloudContinualLearner:
         )
         self._log_stage_elapsed("Ariadne prepare_split", time.perf_counter() - trace_started)
         trace_signature = str(getattr(runtime, "graph_signature", "") or "")
+        verifier = UniversalModelSplitter(device=self.device).bind_runtime(
+            runtime,
+            model=split_model,
+            split_spec=split_spec,
+        )
+        canonical_key = str(
+            split_plan_payload.get("canonical_split_key")
+            or boundary
+            or ""
+        )
+        candidate_by_key = {}
+        for batch_candidate in verifier.enumerate_candidates():
+            try:
+                candidate_by_key[canonical_split_key_for_candidate(batch_candidate)] = batch_candidate
+            except RuntimeError:
+                continue
+        if canonical_key and canonical_key not in candidate_by_key:
+            raise RuntimeError(
+                "This split point is not stable across batch sizes. "
+                "Please choose a module-boundary split."
+            )
         logger.info(
             "[FixedSplitCL] runtime template prepared Ariadne split (model_name={}, model_family={}, split_id={}, trace_signature={}, mode={}, key={}).",
             model_name,
@@ -3802,20 +4085,6 @@ class CloudContinualLearner:
             kwargs["persistent_workers"] = True
         return kwargs
 
-    @staticmethod
-    def _load_low_quality_trigger_intermediate(feature_path: str) -> object:
-        payload = torch.load(feature_path, map_location="cpu", weights_only=False)
-        if isinstance(payload, Mapping) and "intermediate" in payload:
-            return payload["intermediate"]
-        if isinstance(payload, (BoundaryPayload, SplitPayload)):
-            return payload
-        if isinstance(payload, Mapping):
-            tensors = payload.get("tensors")
-            if isinstance(tensors, Mapping):
-                return SplitPayload.from_mapping(dict(tensors))
-            return SplitPayload.from_mapping(dict(payload))
-        raise TypeError(f"Unsupported low-quality trigger feature payload: {type(payload)!r}")
-
     def _prepare_low_quality_trigger_training_cache(
         self,
         model: torch.nn.Module,
@@ -3864,36 +4133,13 @@ class CloudContinualLearner:
                 else None
             )
 
-            intermediate = None
-            feature_relpath = sample.get("feature_relpath")
-            if feature_relpath:
-                feature_path = os.path.join(
-                    bundle_cache_path,
-                    str(feature_relpath).replace("/", os.sep),
-                )
-                if os.path.exists(feature_path) and self._low_quality_feature_matches_split_plan(
-                    feature_path,
-                    split_plan,
-                ):
-                    try:
-                        intermediate = self._load_low_quality_trigger_intermediate(feature_path)
-                    except Exception as exc:
-                        logger.warning(
-                            "[ShardCL][FeatureRebuild] Ignoring unreadable optional low-quality feature for sample {}: {}",
-                            sample_id,
-                            exc,
-                        )
-
             item = {
                 "sample": dict(sample),
                 "sample_id": sample_id,
                 "input_image_size": input_image_size,
                 "frame_path": frame_path,
             }
-            if intermediate is None:
-                pending_rebuilds.append({**item, "raw_path": raw_path})
-            else:
-                processed_items.append({**item, "intermediate": intermediate})
+            pending_rebuilds.append({**item, "raw_path": raw_path})
             all_sample_ids.append(sample_id)
 
         if pending_rebuilds:
@@ -3949,6 +4195,26 @@ class CloudContinualLearner:
                     "sample_id": sample_id,
                     "model_id": str(model_meta.get("model_id", "") or ""),
                     "model_version": str(model_meta.get("model_version", "") or ""),
+                    "split_config_id": str(
+                        manifest.get("split_config_id")
+                        or split_plan.get("split_config_id")
+                        or ""
+                    ),
+                    "front_version": str(
+                        manifest.get("front_version")
+                        or split_plan.get("front_version")
+                        or "0"
+                    ),
+                    "input_tensor_shape": list(
+                        manifest.get("input_tensor_shape")
+                        or split_plan.get("input_tensor_shape", [])
+                        or []
+                    ),
+                    "input_resize_mode": str(
+                        manifest.get("input_resize_mode")
+                        or split_plan.get("input_resize_mode")
+                        or "direct_resize"
+                    ),
                     **(
                         {"input_image_size": input_image_size}
                         if input_image_size is not None
@@ -3979,6 +4245,26 @@ class CloudContinualLearner:
                 "source_raw_bytes": int(sample.get("raw_bytes") or 0),
                 "model_id": str(model_meta.get("model_id", "") or ""),
                 "model_version": str(model_meta.get("model_version", "") or ""),
+                "split_config_id": str(
+                    manifest.get("split_config_id")
+                    or split_plan.get("split_config_id")
+                    or ""
+                ),
+                "front_version": str(
+                    manifest.get("front_version")
+                    or split_plan.get("front_version")
+                    or "0"
+                ),
+                "input_tensor_shape": list(
+                    manifest.get("input_tensor_shape")
+                    or split_plan.get("input_tensor_shape", [])
+                    or []
+                ),
+                "input_resize_mode": str(
+                    manifest.get("input_resize_mode")
+                    or split_plan.get("input_resize_mode")
+                    or "direct_resize"
+                ),
                 **(
                     {"input_image_size": input_image_size}
                     if input_image_size is not None
@@ -5108,7 +5394,7 @@ class CloudContinualLearner:
             )
             bundle_cache_path = str(workspace)
             manifest = _read_json_file(os.path.join(bundle_cache_path, "bundle_manifest.json"))
-            if manifest.get("protocol_version") != "high-quality-feature-label-shard.v1":
+            if manifest.get("protocol_version") != "high-quality-feature-label-shard.v2":
                 raise RuntimeError(
                     f"Unexpected sync protocol version: {manifest.get('protocol_version')!r}"
                 )
@@ -5119,10 +5405,10 @@ class CloudContinualLearner:
                 )
             if model_id and not manifest.get("model_id"):
                 manifest["model_id"] = str(model_id)
-            if model_version and not manifest.get("model_version"):
-                manifest["model_version"] = str(model_version)
             if split_config_id and not manifest.get("split_config_id"):
                 manifest["split_config_id"] = str(split_config_id)
+            manifest.setdefault("edge_id", int(edge_id))
+            manifest.setdefault("front_version", "0")
             with open(
                 os.path.join(bundle_cache_path, "bundle_manifest.json"),
                 "w",
@@ -5134,19 +5420,152 @@ class CloudContinualLearner:
                 edge_id=edge_id,
                 manifest=manifest,
             )
-            added = sample_pool.ingest_high_quality_feature_label_bundle(
-                bundle_cache_path,
+            trainable_samples: list[dict[str, object]] = []
+            unreadable_ids: list[str] = []
+            model_input_size = _size_pair_from_value(
+                [
+                    int(manifest.get("input_tensor_shape", [0, 0])[-2]),
+                    int(manifest.get("input_tensor_shape", [0, 0])[-1]),
+                ]
+                if isinstance(manifest.get("input_tensor_shape"), list)
+                and len(manifest.get("input_tensor_shape", [])) >= 3
+                else None
             )
+            label_metadata = {
+                "label_coordinate_space": str(
+                    manifest.get("label_coordinate_space")
+                    or POOL_LABEL_COORDINATE_SPACE
+                ),
+                "label_resize_mode": str(
+                    manifest.get("input_resize_mode") or "direct_resize"
+                ),
+                "label_runtime_version": POOL_LABEL_RUNTIME_VERSION,
+            }
+            if model_input_size is not None:
+                label_metadata["label_input_size"] = [
+                    int(model_input_size[0]),
+                    int(model_input_size[1]),
+                ]
+            for shard in list(manifest.get("shards", []) or []):
+                if not isinstance(shard, Mapping):
+                    continue
+                feature_file = shard.get("feature_file") or shard.get("feature_shard")
+                label_file = shard.get("label_file") or shard.get("label_shard")
+                if not feature_file or not label_file:
+                    continue
+                feature_path = os.path.join(
+                    bundle_cache_path,
+                    str(feature_file).replace("/", os.sep),
+                )
+                label_path = os.path.join(
+                    bundle_cache_path,
+                    str(label_file).replace("/", os.sep),
+                )
+                try:
+                    feature_payload = torch.load(
+                        feature_path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                    feature_samples = (
+                        feature_payload.get("samples")
+                        if isinstance(feature_payload, Mapping)
+                        else None
+                    )
+                    if not isinstance(feature_samples, Mapping):
+                        raise TypeError("feature shard does not contain a samples mapping")
+                    labels_by_id: dict[str, dict[str, object]] = {}
+                    with open(label_path, "r", encoding="utf-8") as handle:
+                        for line in handle:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            label_payload = json.loads(line)
+                            if (
+                                isinstance(label_payload, Mapping)
+                                and label_payload.get("sample_id")
+                            ):
+                                labels_by_id[str(label_payload["sample_id"])] = dict(label_payload)
+                except Exception:
+                    unreadable_ids.append(str(shard.get("shard_id") or feature_file or label_file))
+                    continue
+                for sample_id, feature_value in feature_samples.items():
+                    sample_key = str(sample_id)
+                    if sample_key not in labels_by_id or not isinstance(feature_value, Mapping):
+                        unreadable_ids.append(sample_key)
+                        continue
+                    try:
+                        tensors = normalise_feature_tensors(
+                            dict(feature_value.get("tensors") or {})
+                        )
+                    except Exception:
+                        unreadable_ids.append(sample_key)
+                        continue
+                    label_payload = dict(labels_by_id[sample_key])
+                    labels = {
+                        "boxes": list(label_payload.get("boxes") or []),
+                        "labels": list(label_payload.get("labels") or []),
+                        **(
+                            {"scores": list(label_payload.get("scores") or [])}
+                            if label_payload.get("scores") is not None
+                            else {}
+                        ),
+                        **label_metadata,
+                    }
+                    feature_record = {
+                        "sample_id": sample_key,
+                        "feature": tensors,
+                        "sample_source": "high_quality",
+                        "label_source": "edge_pseudo",
+                        "model_id": str(manifest.get("model_id", "") or ""),
+                        "split_config_id": str(manifest.get("split_config_id", "") or ""),
+                        "front_version": str(manifest.get("front_version", "0") or "0"),
+                        "input_tensor_shape": list(
+                            manifest.get("input_tensor_shape", []) or []
+                        ),
+                        "input_resize_mode": str(
+                            manifest.get("input_resize_mode", "")
+                            or "direct_resize"
+                        ),
+                    }
+                    trainable_samples.append(
+                        {
+                            "sample_id": sample_key,
+                            "feature_record": feature_record,
+                            "split_config_id": feature_record["split_config_id"],
+                            "front_version": feature_record["front_version"],
+                            "labels": labels,
+                            "created_at": time.time(),
+                        }
+                    )
+            representative_features = self._first_sample_feature_tensors(trainable_samples)
+            split_contract = self._get_or_create_split_runtime_contract(
+                edge_id=edge_id,
+                manifest=manifest,
+                feature_tensors=representative_features,
+                bundle_root=bundle_cache_path,
+            )
+            trainable_samples, commit_stats = self._filter_pool_samples_for_contract(
+                trainable_samples,
+                contract=split_contract,
+                source_label="high_quality",
+            )
+            if unreadable_ids:
+                commit_stats["skipped_unreadable"] = int(commit_stats.get("skipped_unreadable", 0)) + len(unreadable_ids)
+                commit_stats["skipped_unreadable_preview"] = self._preview_ids(unreadable_ids)
+            added = sample_pool.ingest_low_quality_processed_samples(trainable_samples)
             active_count = len(sample_pool.list_active_samples())
             message = (
                 f"Synced {added} high-quality sample(s); "
                 f"{active_count} active cloud sample-pool sample(s)."
             )
             logger.info(
-                "[ShardCL][SamplePoolCommit] {} edge_id={} pool={}",
+                "[ShardCL][SamplePoolCommit] {} edge_id={} pool={} committed_high_quality={} stats={}",
                 message,
                 edge_id,
                 sample_pool.root_dir,
+                added,
+                commit_stats,
             )
             return True, message, int(added)
         except Exception as exc:
@@ -5305,10 +5724,6 @@ class CloudContinualLearner:
                     edge_id=edge_id,
                     manifest=manifest,
                 )
-                self._disable_incompatible_low_quality_features(
-                    bundle_cache_path=bundle_cache_path,
-                    manifest=manifest,
-                )
                 next_checkpoint_model_version = _increment_model_version(
                     bundle_model_version,
                     field_name="bundle model version",
@@ -5416,6 +5831,31 @@ class CloudContinualLearner:
                     model_input_size=pool_model_input_size,
                     resize_mode=pool_input_resize_mode,
                 )
+                low_quality_candidate_count = len(low_quality_pool_samples)
+                representative_features = self._first_sample_feature_tensors(
+                    low_quality_pool_samples
+                )
+                if representative_features is None:
+                    raise RuntimeError(
+                        "No rebuilt low-quality feature sample was available to create "
+                        "the SplitRuntimeContract."
+                    )
+                split_contract = self._get_or_create_split_runtime_contract(
+                    edge_id=edge_id,
+                    manifest=manifest,
+                    feature_tensors=representative_features,
+                    model=tmp_model,
+                    splitter=prepared_splitter,
+                    candidate=prepared_candidate,
+                    bundle_root=bundle_cache_path,
+                )
+                low_quality_pool_samples, low_quality_commit_stats = (
+                    self._filter_pool_samples_for_contract(
+                        low_quality_pool_samples,
+                        contract=split_contract,
+                        source_label="low_quality",
+                    )
+                )
                 low_quality_added = sample_pool.ingest_low_quality_processed_samples(
                     low_quality_pool_samples,
                     skip_unchanged_existing=True,
@@ -5423,9 +5863,10 @@ class CloudContinualLearner:
                 sample_pool.maybe_compact()
                 self._log_stage_duration("low-quality sample-pool commit", stage_started)
                 logger.info(
-                    "[FixedSplitCL] Cloud sample pool committed {} / {} teacher-labeled low-quality sample(s).",
+                    "[FixedSplitCL] Cloud sample pool committed {} / {} teacher-labeled low-quality sample(s); validation_stats={}.",
                     low_quality_added,
-                    len(low_quality_pool_samples),
+                    low_quality_candidate_count,
+                    low_quality_commit_stats,
                 )
 
                 (
@@ -5435,11 +5876,7 @@ class CloudContinualLearner:
                     sample_metadata_by_id,
                 ) = self._build_pool_training_inputs(
                     sample_pool,
-                    expected_split_id=str(
-                        getattr(getattr(prepared_splitter, "runtime", None), "split_id", "")
-                        or ""
-                    )
-                    or None,
+                    contract=split_contract,
                     runtime_input_tensor_shape=pool_runtime_input_tensor_shape,
                     input_resize_mode=pool_input_resize_mode,
                 )

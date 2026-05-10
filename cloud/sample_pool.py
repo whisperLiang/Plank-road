@@ -15,14 +15,14 @@ from typing import Any
 
 import torch
 
-from model_management.payload import BoundaryPayload, SplitPayload, boundary_payload_from_tensors
+from model_management.payload import BoundaryPayload
+from model_management.split_contract import normalise_feature_tensors
 
 
 POOL_MANIFEST_FIELDS = (
     "model_id",
-    "model_version",
+    "front_version",
     "split_config_id",
-    "split_label",
     "boundary_tensor_labels",
 )
 
@@ -53,9 +53,6 @@ _RAW_METADATA_FIELDS = {
     "has_raw_sample",
     "frame_relpath",
     "frame_file_size",
-    "input_image_size",
-    "input_tensor_shape",
-    "input_resize_mode",
 }
 
 _LABEL_FIELDS = {
@@ -65,8 +62,6 @@ _LABEL_FIELDS = {
     "label_coordinate_space",
     "label_input_size",
     "label_resize_mode",
-    "label_split_id",
-    "label_graph_signature",
     "label_runtime_version",
 }
 
@@ -74,8 +69,6 @@ _LABEL_METADATA_FIELDS = {
     "label_coordinate_space",
     "label_input_size",
     "label_resize_mode",
-    "label_split_id",
-    "label_graph_signature",
     "label_runtime_version",
 }
 
@@ -136,16 +129,11 @@ def _pool_manifest_from_bundle_manifest(manifest: Mapping[str, Any]) -> dict[str
     split_plan = dict(manifest.get("split_plan", {}) or {})
     return {
         "model_id": str(manifest.get("model_id") or model_meta.get("model_id", "") or ""),
-        "model_version": str(
-            manifest.get("model_version") or model_meta.get("model_version", "") or ""
+        "front_version": str(
+            manifest.get("front_version") or split_plan.get("front_version") or "0"
         ),
         "split_config_id": str(
             manifest.get("split_config_id") or split_plan.get("split_config_id", "") or ""
-        ),
-        "split_label": (
-            None
-            if (manifest.get("split_label") if "split_label" in manifest else split_plan.get("split_label")) is None
-            else str(manifest.get("split_label") if "split_label" in manifest else split_plan.get("split_label"))
         ),
         "boundary_tensor_labels": [
             str(label)
@@ -158,62 +146,17 @@ def _pool_manifest_from_bundle_manifest(manifest: Mapping[str, Any]) -> dict[str
     }
 
 
-def _coerce_boundary_payload(payload: Any) -> BoundaryPayload:
-    if isinstance(payload, BoundaryPayload):
-        return payload
-    if isinstance(payload, torch.Tensor):
-        return SplitPayload.from_mapping({"payload": payload}, primary_label="payload")
-    if isinstance(payload, Mapping):
-        if "tensors" in payload and isinstance(payload.get("tensors"), Mapping):
-            tensors = dict(payload.get("tensors") or {})
-            return SplitPayload.from_mapping(
-                tensors,
-                primary_label=next(reversed(tensors), None) if tensors else None,
-            )
-        return SplitPayload.from_mapping(dict(payload))
-    raise TypeError(f"Unsupported split feature payload: {type(payload)!r}")
-
-
-def _boundary_payload_metadata(boundary: BoundaryPayload) -> dict[str, Any]:
-    return {
-        "split_id": str(boundary.split_id),
-        "graph_signature": str(boundary.graph_signature),
-        "batch_size": int(boundary.batch_size),
-        "schema": dict(boundary.schema or {}),
-        "requires_grad": dict(boundary.requires_grad or {}),
-        "weight_version": boundary.weight_version,
-        "passthrough_inputs": dict(boundary.passthrough_inputs or {}),
-    }
-
-
-def _boundary_payload_from_feature_sample(
-    sample_id: str,
-    tensors: Mapping[str, torch.Tensor],
-    boundary_metadata: Mapping[str, Any] | None,
-) -> BoundaryPayload:
-    clean_tensors = {
-        str(label): tensor.detach().cpu()
-        for label, tensor in dict(tensors or {}).items()
-        if isinstance(tensor, torch.Tensor)
-    }
-    metadata = dict(boundary_metadata or {})
-    split_id = str(metadata.get("split_id") or "").strip()
-    graph_signature = str(metadata.get("graph_signature") or "").strip()
-    if split_id and graph_signature:
-        return boundary_payload_from_tensors(
-            clean_tensors,
-            split_id=split_id,
-            graph_signature=graph_signature,
-            batch_size=metadata.get("batch_size"),
-            schema=metadata.get("schema"),
-            requires_grad=metadata.get("requires_grad"),
-            weight_version=metadata.get("weight_version"),
-            passthrough_inputs=dict(metadata.get("passthrough_inputs") or {}),
-        )
-    return SplitPayload.from_mapping(
-        clean_tensors,
-        primary_label=next(reversed(clean_tensors), None) if clean_tensors else None,
-    )
+def _feature_tensors_from_record(record: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    if "feature" in record:
+        return normalise_feature_tensors(record["feature"])
+    if "tensors" in record:
+        return normalise_feature_tensors(record["tensors"])
+    intermediate = record.get("intermediate")
+    if isinstance(intermediate, BoundaryPayload):
+        return normalise_feature_tensors(dict(intermediate.tensors))
+    if intermediate is not None:
+        return normalise_feature_tensors(intermediate)
+    return normalise_feature_tensors(record)
 
 
 def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -288,74 +231,38 @@ def _sanitize_feature_record(record: Mapping[str, Any]) -> dict[str, Any]:
 def _feature_record_from_tensors(
     sample_id: str,
     tensors: Mapping[str, torch.Tensor],
-    boundary_metadata: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    boundary = _boundary_payload_from_feature_sample(sample_id, tensors, boundary_metadata)
-    boundary_labels = list(
-        getattr(boundary, "boundary_tensor_labels", list(boundary.tensors.keys())) or []
-    )
+    clean_tensors = normalise_feature_tensors(tensors)
+    payload = dict(metadata or {})
     return {
+        **payload,
         "sample_id": str(sample_id),
-        "intermediate": boundary,
-        "boundary_tensor_labels": boundary_labels,
-        "split_label": getattr(boundary, "split_label", None),
+        "feature": clean_tensors,
+        "boundary_tensor_labels": list(clean_tensors.keys()),
     }
 
 
 def _feature_sample_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    intermediate = dict(record).get("intermediate", record)
-    boundary = _coerce_boundary_payload(intermediate)
+    source = dict(record)
+    tensors = _feature_tensors_from_record(source)
+    metadata_fields = (
+        "sample_source",
+        "label_source",
+        "split_config_id",
+        "front_version",
+        "input_tensor_shape",
+        "input_resize_mode",
+        "model_id",
+    )
     return {
-        "tensors": {
-            str(label): tensor.detach().cpu()
-            for label, tensor in dict(boundary.tensors).items()
-            if isinstance(tensor, torch.Tensor)
+        "tensors": tensors,
+        **{
+            field_name: source[field_name]
+            for field_name in metadata_fields
+            if source.get(field_name) is not None
         },
-        "boundary": _boundary_payload_metadata(boundary),
     }
-
-
-def _record_from_feature_payload(
-    payload: Mapping[str, Any],
-    *,
-    sample: Mapping[str, Any],
-    split_plan: Mapping[str, Any],
-) -> dict[str, Any]:
-    intermediate = _coerce_boundary_payload(payload.get("intermediate"))
-    boundary_labels = list(
-        getattr(
-            intermediate,
-            "boundary_tensor_labels",
-            list(getattr(intermediate, "tensors", {}).keys()),
-        )
-        or []
-    )
-    return _sanitize_feature_record(
-        {
-            "intermediate": intermediate,
-            "candidate_id": (
-                getattr(intermediate, "candidate_id", None)
-                or getattr(intermediate, "split_id", None)
-                or split_plan.get("candidate_id")
-            ),
-            "boundary_tensor_labels": boundary_labels
-            or list(split_plan.get("boundary_tensor_labels", []) or []),
-            "split_index": getattr(intermediate, "split_index", None)
-            or split_plan.get("split_index"),
-            "split_label": (
-                getattr(intermediate, "split_label", None)
-                or getattr(intermediate, "split_id", None)
-                or split_plan.get("split_label")
-            ),
-            "split_plan_candidate_id": split_plan.get("candidate_id"),
-            "split_plan_split_index": split_plan.get("split_index"),
-            "split_plan_split_label": split_plan.get("split_label"),
-            "split_plan_boundary_tensor_labels": list(
-                split_plan.get("boundary_tensor_labels", []) or []
-            ),
-            "sample_id": str(sample.get("sample_id", "")),
-        }
-    )
 
 
 @dataclass(frozen=True)
@@ -422,15 +329,8 @@ class FeatureLabelShardReader:
         if not isinstance(value, Mapping):
             raise TypeError(f"Unsupported feature record for {key!r}: {type(value)!r}")
         if "tensors" in value:
-            return _feature_record_from_tensors(
-                str(key),
-                dict(value.get("tensors") or {}),
-                boundary_metadata=(
-                    value.get("boundary")
-                    if isinstance(value.get("boundary"), Mapping)
-                    else value
-                ),
-            )
+            metadata = {name: item for name, item in dict(value).items() if name != "tensors"}
+            return _feature_record_from_tensors(str(key), dict(value.get("tensors") or {}), metadata)
         return dict(value)
 
     def load_label(self, shard: str, key: str) -> dict[str, Any]:
@@ -478,6 +378,7 @@ class CloudSamplePool:
         *,
         model_id: str | None = None,
         model_version: str | None = None,
+        front_version: str | None = None,
         split_config_id: str | None = None,
         split_label: str | None = None,
         boundary_tensor_labels: list[str] | tuple[str, ...] | None = None,
@@ -509,9 +410,8 @@ class CloudSamplePool:
         self._init_db()
         initial_manifest = {
             "model_id": str(model_id or ""),
-            "model_version": str(model_version or ""),
+            "front_version": str(front_version or "0"),
             "split_config_id": str(split_config_id or ""),
-            "split_label": split_label,
             "boundary_tensor_labels": [
                 str(label) for label in list(boundary_tensor_labels or [])
             ],
@@ -568,9 +468,8 @@ class CloudSamplePool:
     def _ensure_manifest(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
         expected = {
             "model_id": str(manifest.get("model_id", "") or ""),
-            "model_version": str(manifest.get("model_version", "") or ""),
+            "front_version": str(manifest.get("front_version", "") or "0"),
             "split_config_id": str(manifest.get("split_config_id", "") or ""),
-            "split_label": manifest.get("split_label"),
             "boundary_tensor_labels": [
                 str(label)
                 for label in list(manifest.get("boundary_tensor_labels", []) or [])
@@ -902,6 +801,11 @@ class CloudSamplePool:
                     "sample_id": sample["sample_id"],
                     "boxes": list(sample["labels"].get("boxes") or []),
                     "labels": list(sample["labels"].get("labels") or []),
+                    **(
+                        {"scores": list(sample["labels"].get("scores") or [])}
+                        if sample["labels"].get("scores") is not None
+                        else {}
+                    ),
                     **{
                         field_name: sample["labels"][field_name]
                         for field_name in sorted(_LABEL_METADATA_FIELDS)
@@ -980,67 +884,6 @@ class CloudSamplePool:
             )
         self._trim_to_capacity()
         return added + len(unchanged_existing)
-
-    def ingest_high_quality_feature_label_bundle(self, bundle_root: str) -> int:
-        manifest_path = os.path.join(bundle_root, "bundle_manifest.json")
-        manifest = _read_json(manifest_path)
-        self._ensure_manifest(_pool_manifest_from_bundle_manifest(manifest))
-        split_plan = dict(manifest.get("split_plan", {}) or {})
-        trainable_samples: list[dict[str, Any]] = []
-        shards = list(manifest.get("shards", []) or [])
-        if shards:
-            for shard in shards:
-                if not isinstance(shard, Mapping):
-                    continue
-                feature_file = shard.get("feature_file") or shard.get("feature_shard")
-                label_file = shard.get("label_file") or shard.get("label_shard")
-                if not feature_file or not label_file:
-                    continue
-                feature_path = _resolve_relpath(bundle_root, str(feature_file))
-                label_path = _resolve_relpath(bundle_root, str(label_file))
-                if not os.path.exists(feature_path) or not os.path.exists(label_path):
-                    continue
-                feature_payload = torch.load(feature_path, map_location="cpu", weights_only=False)
-                feature_samples = (
-                    feature_payload.get("samples")
-                    if isinstance(feature_payload, Mapping)
-                    else None
-                )
-                if not isinstance(feature_samples, Mapping):
-                    continue
-                labels_by_id: dict[str, dict[str, Any]] = {}
-                with open(label_path, "r", encoding="utf-8") as handle:
-                    for line in handle:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        label_payload = json.loads(line)
-                        if isinstance(label_payload, Mapping) and label_payload.get("sample_id"):
-                            labels_by_id[str(label_payload["sample_id"])] = dict(label_payload)
-                for sample_id, feature_value in feature_samples.items():
-                    sample_key = str(sample_id)
-                    if not isinstance(feature_value, Mapping):
-                        continue
-                    tensors = dict(feature_value.get("tensors") or {})
-                    if not tensors or sample_key not in labels_by_id:
-                        continue
-                    trainable_samples.append(
-                        {
-                            "sample_id": sample_key,
-                            "feature_record": _feature_record_from_tensors(
-                                sample_key,
-                                tensors,
-                                boundary_metadata=(
-                                    feature_value.get("boundary")
-                                    if isinstance(feature_value.get("boundary"), Mapping)
-                                    else feature_value
-                                ),
-                            ),
-                            "labels": _labels_from_result(labels_by_id[sample_key]),
-                            "created_at": _created_at_text(),
-                        }
-                    )
-        return self.ingest_low_quality_processed_samples(trainable_samples)
 
     def maybe_compact(self, *, force: bool = False) -> bool:
         with self._connection() as connection:

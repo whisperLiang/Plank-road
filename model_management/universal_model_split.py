@@ -12,7 +12,11 @@ from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
 from ariadne.planner.frontier import enumerate_frontier_splits
 from loguru import logger
 
-from model_management.payload import deserialize_boundary_payload, serialize_boundary_payload
+from model_management.payload import (
+    boundary_payload_from_tensors,
+    deserialize_boundary_payload,
+    serialize_boundary_payload,
+)
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_runtime import (
     compare_outputs,
@@ -977,14 +981,6 @@ def _target_for_split_training(
     return _target_with_split_metadata(target, record)
 
 
-def _splitter_dynamic_batch_min(splitter: UniversalModelSplitter) -> int:
-    split_spec = getattr(splitter, "split_spec", None)
-    dynamic_batch = getattr(split_spec, "dynamic_batch", None)
-    if isinstance(dynamic_batch, (list, tuple)) and dynamic_batch:
-        return max(1, int(dynamic_batch[0]))
-    return 1
-
-
 @dataclass
 class SplitRetrainProfile:
     training_batch_preparation_time: float = 0.0
@@ -1057,13 +1053,84 @@ def _detach_boundary_value(value: Any) -> Any:
     return value
 
 
+def _feature_tensors_from_record(record: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    if "feature" in record and isinstance(record.get("feature"), Mapping):
+        source = dict(record["feature"])
+    else:
+        intermediate = record.get("intermediate")
+        if isinstance(intermediate, BoundaryPayload):
+            source = dict(intermediate.tensors or {})
+        elif isinstance(intermediate, torch.Tensor):
+            source = {"payload": intermediate}
+        elif isinstance(intermediate, Mapping):
+            source = dict(intermediate.get("tensors") or intermediate)
+        else:
+            source = {
+                key: value
+                for key, value in dict(record).items()
+                if isinstance(value, torch.Tensor)
+            }
+    tensors = {
+        str(label): tensor.detach()
+        for label, tensor in source.items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    if not tensors:
+        raise RuntimeError("Split-tail training requires cached feature tensors.")
+    return tensors
+
+
+def _runtime_split_id(runtime: Any) -> str:
+    ariadne_runtime = _ariadne_runtime_from_splitter(runtime)
+    return str(getattr(ariadne_runtime, "split_id", "") or "split-tail")
+
+
+def _runtime_graph_signature(runtime: Any) -> str:
+    ariadne_runtime = _ariadne_runtime_from_splitter(runtime)
+    return str(getattr(ariadne_runtime, "graph_signature", "") or "split-runtime")
+
+
+def _build_boundary_batch_from_records(
+    records: list[Mapping[str, Any]],
+    *,
+    runtime: Any,
+) -> BoundaryPayload:
+    if not records:
+        raise RuntimeError("Cannot build an empty split-tail feature batch.")
+    tensor_groups = [_feature_tensors_from_record(record) for record in records]
+    labels = list(tensor_groups[0].keys())
+    for tensors in tensor_groups[1:]:
+        if list(tensors.keys()) != labels:
+            raise RuntimeError("Split-tail feature records have different boundary tensors.")
+    batched_tensors: dict[str, torch.Tensor] = {}
+    for label in labels:
+        pieces = []
+        for tensors in tensor_groups:
+            tensor = tensors[label]
+            if tensor.ndim == 0:
+                raise RuntimeError("Split-tail feature tensors must include a batch dimension.")
+            if int(tensor.shape[0]) != 1:
+                raise RuntimeError(
+                    "Split-tail feature records must be single-sample tensors; "
+                    f"got {label} shape {tuple(tensor.shape)}."
+                )
+            pieces.append(tensor)
+        batched_tensors[label] = torch.cat(pieces, dim=0)
+    return boundary_payload_from_tensors(
+        batched_tensors,
+        split_id=_runtime_split_id(runtime),
+        graph_signature=_runtime_graph_signature(runtime),
+        batch_size=len(records),
+    )
+
+
 def _load_cached_split_batches(
     *,
     cache_path: str,
     all_indices: list[Any],
     annotations: Mapping[Any, Any],
     batch_size: int,
-    dynamic_batch_min: int,
+    runtime: Any,
     preloaded_records: Mapping[Any, Mapping[str, Any]] | None = None,
     profile: SplitRetrainProfile | None = None,
 ) -> list[tuple[list[Any], BoundaryPayload, list[Any]]]:
@@ -1083,23 +1150,15 @@ def _load_cached_split_batches(
         return dict(cached)
 
     try:
+        epoch_batch_size = max(1, int(batch_size))
         start = 0
         while start < len(all_indices):
-            first_record = _record_for_index(all_indices[start])
-            boundary = first_record.get("intermediate")
-            if not isinstance(boundary, BoundaryPayload):
-                raise RuntimeError("Split-tail training requires cached Ariadne boundary records.")
-            boundary_batch_size = int(getattr(boundary, "batch_size", 0) or 0)
-            actual_batch_size = min(
-                len(all_indices) - start,
-                max(1, boundary_batch_size),
-            )
+            actual_batch_size = min(len(all_indices) - start, epoch_batch_size)
             batch_indices = list(all_indices[start : start + actual_batch_size])
             if not batch_indices:
                 break
             records = [
-                first_record,
-                *[_record_for_index(index) for index in batch_indices[1:]],
+                _record_for_index(index) for index in batch_indices
             ]
             target_started = time.perf_counter()
             targets = [
@@ -1111,14 +1170,7 @@ def _load_cached_split_batches(
                 "target_construction_time",
                 time.perf_counter() - target_started,
             )
-            required_batch_size = max(int(dynamic_batch_min), len(batch_indices))
-            if boundary_batch_size < required_batch_size:
-                raise RuntimeError(
-                    "Cached Ariadne boundary batch size is smaller than the training batch. "
-                    "Regenerate the cache with batched Ariadne prefix execution."
-                )
-            while len(targets) < boundary_batch_size:
-                targets.append(copy.deepcopy(targets[-1]))
+            boundary = _build_boundary_batch_from_records(records, runtime=runtime)
             batches.append((batch_indices, boundary, targets))
             start += actual_batch_size
     finally:
@@ -1329,7 +1381,7 @@ def universal_split_retrain(
         all_indices=list(all_indices),
         annotations=annotations,
         batch_size=epoch_batch_size,
-        dynamic_batch_min=_splitter_dynamic_batch_min(runtime),
+        runtime=runtime,
         preloaded_records=preloaded_records,
         profile=retrain_profile,
     )

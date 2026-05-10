@@ -18,10 +18,7 @@ from loguru import logger
 import edge.transmit as transmit
 from edge.quality_assessor import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
-from model_management.payload import BoundaryPayload
-
-
-HIGH_QUALITY_SYNC_PROTOCOL_VERSION = "high-quality-feature-label-shard.v1"
+HIGH_QUALITY_SYNC_PROTOCOL_VERSION = "high-quality-feature-label-shard.v2"
 UPLOAD_LEDGER_VERSION = "edge-sample-upload-ledger.v1"
 UPLOAD_LEDGER_FILENAME = "upload_ledger.json"
 UPLOAD_PENDING = "pending"
@@ -57,12 +54,10 @@ def _chunks(items: Sequence[StoredSampleRecord], size: int) -> list[list[StoredS
 
 
 def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
-    if isinstance(intermediate, BoundaryPayload):
-        source = dict(intermediate.tensors)
-    elif isinstance(intermediate, torch.Tensor):
+    if isinstance(intermediate, torch.Tensor):
         source = {"payload": intermediate}
     elif isinstance(intermediate, Mapping):
-        source = dict(intermediate)
+        source = dict(intermediate.get("tensors") or intermediate)
     else:
         raise TypeError(f"Unsupported intermediate feature type: {type(intermediate)!r}")
 
@@ -75,26 +70,8 @@ def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _boundary_payload_metadata(intermediate: Any) -> dict[str, Any] | None:
-    if not isinstance(intermediate, BoundaryPayload):
-        return None
-    return {
-        "split_id": str(intermediate.split_id),
-        "graph_signature": str(intermediate.graph_signature),
-        "batch_size": int(intermediate.batch_size),
-        "schema": dict(intermediate.schema or {}),
-        "requires_grad": dict(intermediate.requires_grad or {}),
-        "weight_version": intermediate.weight_version,
-        "passthrough_inputs": dict(intermediate.passthrough_inputs or {}),
-    }
-
-
 def _feature_sample_payload(intermediate: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {"tensors": _tensor_only_features(intermediate)}
-    metadata = _boundary_payload_metadata(intermediate)
-    if metadata is not None:
-        payload["boundary"] = metadata
-    return payload
+    return {"tensors": _tensor_only_features(intermediate)}
 
 
 def _image_size_from_value(value: object) -> tuple[int, int] | None:
@@ -236,13 +213,25 @@ def pack_high_quality_sync_bundle_to_file(
     context = dict(split_context or {})
     first_record = selected[0] if selected else None
     model_id = str(context.get("model_id") or getattr(first_record, "model_id", "") or "")
-    model_version = str(
-        context.get("model_version") or getattr(first_record, "model_version", "") or ""
+    front_version = str(
+        context.get("front_version") or getattr(first_record, "front_version", "") or "0"
     )
     split_config_id = str(
         context.get("split_config_id")
         or getattr(first_record, "split_config_id", "")
         or ""
+    )
+    canonical_split_key = str(context.get("canonical_split_key") or "").strip()
+    edge_split_id = str(context.get("edge_split_id") or canonical_split_key or "").strip()
+    input_tensor_shape = list(
+        context.get("input_tensor_shape")
+        or getattr(first_record, "input_tensor_shape", [])
+        or []
+    )
+    input_resize_mode = str(
+        context.get("input_resize_mode")
+        or getattr(first_record, "input_resize_mode", "")
+        or "direct_resize"
     )
     split_label = context.get("split_label")
     boundary_tensor_labels = [
@@ -263,13 +252,18 @@ def pack_high_quality_sync_bundle_to_file(
         "protocol_version": HIGH_QUALITY_SYNC_PROTOCOL_VERSION,
         "edge_id": int(edge_id),
         "model_id": model_id,
-        "model_version": model_version,
+        "front_version": front_version,
         "split_config_id": split_config_id,
-        "split_label": None if split_label is None else str(split_label),
+        "canonical_split_key": canonical_split_key,
+        "edge_split_id": edge_split_id,
+        "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
+        "input_resize_mode": input_resize_mode,
+        "label_coordinate_space": "model_input_xyxy",
         "boundary_tensor_labels": boundary_tensor_labels,
         "request_id": resolved_request_id,
         "created_at": _utc_now(),
         "shard_size": resolved_shard_size,
+        "sample_count": len(selected),
         "shards": [],
     }
 
@@ -294,6 +288,7 @@ def pack_high_quality_sync_bundle_to_file(
                                 "sample_id": sample_id,
                                 "boxes": labels["boxes"],
                                 "labels": labels["labels"],
+                                "scores": list(result.get("scores") or []),
                             },
                             sort_keys=True,
                             separators=(",", ":"),
@@ -614,6 +609,11 @@ class HighQualitySampleSyncer:
                 getattr(first_record, "model_version", ""),
                 provider_context.get("model_version"),
             ),
+            "front_version": _first_nonempty(
+                getattr(first_record, "front_version", ""),
+                provider_context.get("front_version"),
+                "0",
+            ),
             "split_config_id": _first_nonempty(
                 getattr(first_record, "split_config_id", ""),
                 provider_context.get("split_config_id"),
@@ -621,6 +621,12 @@ class HighQualitySampleSyncer:
         }
         provider_split = str(provider_context.get("split_config_id") or "").strip()
         if provider_split and provider_split == context["split_config_id"]:
+            context["canonical_split_key"] = provider_context.get("canonical_split_key")
+            context["edge_split_id"] = provider_context.get("edge_split_id")
+            context["input_tensor_shape"] = list(
+                provider_context.get("input_tensor_shape", []) or []
+            )
+            context["input_resize_mode"] = provider_context.get("input_resize_mode")
             context["split_label"] = provider_context.get("split_label")
             context["boundary_tensor_labels"] = list(
                 provider_context.get("boundary_tensor_labels", []) or []
@@ -691,7 +697,7 @@ class HighQualitySampleSyncer:
     def _record_context_key(record: StoredSampleRecord) -> tuple[str, str, str]:
         return (
             str(getattr(record, "model_id", "") or ""),
-            str(getattr(record, "model_version", "") or ""),
+            str(getattr(record, "front_version", "") or "0"),
             str(getattr(record, "split_config_id", "") or ""),
         )
 
