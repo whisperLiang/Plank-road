@@ -66,6 +66,40 @@ def test_split_choices_reject_non_experiment_boundary():
         experiments._split_choices(["auto"])
 
 
+def test_stable_split_boundary_filter_promotes_internal_ops_to_module_boundaries():
+    assert not experiments._is_stable_split_id(
+        "after:model.backbone.0.encoder.encoder.encoder.layer.6.mlp.fc2"
+    )
+    assert not experiments._is_stable_split_id(
+        "after:model.transformer.decoder.layers.0.self_attn"
+    )
+    assert not experiments._is_stable_split_id(
+        "after:model.backbone.0.projector.stages.0.0.m.2.cv2.bn"
+    )
+
+    assert (
+        experiments._module_level_boundary_for_split_id(
+            "after:model.backbone.0.encoder.encoder.encoder.layer.6.mlp.fc2"
+        )
+        == "after:model.backbone.0.encoder.encoder.encoder.layer.6"
+    )
+    assert (
+        experiments._module_level_boundary_for_split_id(
+            "after:model.transformer.decoder.layers.0.self_attn"
+        )
+        == "after:model.transformer.decoder.layers.0"
+    )
+    assert (
+        experiments._module_level_boundary_for_split_id(
+            "after:model.backbone.0.projector.stages.0.0.m.2.cv2.bn"
+        )
+        == "after:model.backbone.0.projector.stages.0"
+    )
+    assert experiments._is_stable_split_id(
+        "after:model.backbone.0.encoder.encoder.encoder.layer.6"
+    )
+
+
 def test_result_writers_emit_jsonl_and_summary_csv(tmp_path):
     rows = [
         {
@@ -249,8 +283,8 @@ def test_split_cached_training_rejects_mismatched_cached_boundary_split_id():
 
 
 def test_contiguous_boundary_payload_preserves_split_identity():
-    tensor = torch.arange(24).reshape(2, 3, 4).transpose(1, 2)
-    passthrough = torch.arange(12).reshape(3, 4).t()
+    tensor = torch.arange(24.0, requires_grad=True).reshape(2, 3, 4).transpose(1, 2)
+    passthrough = torch.arange(12.0, requires_grad=True).reshape(3, 4).t()
     assert not tensor.is_contiguous()
     assert not passthrough.is_contiguous()
     boundary = BoundaryPayload(
@@ -269,9 +303,11 @@ def test_contiguous_boundary_payload_preserves_split_identity():
     assert contiguous.graph_signature == boundary.graph_signature
     assert contiguous.tensors["x"].is_contiguous()
     assert contiguous.passthrough_inputs["input"].is_contiguous()
+    assert not contiguous.tensors["x"].requires_grad
+    assert not contiguous.passthrough_inputs["input"].requires_grad
 
 
-def test_split_cached_training_retries_cuda_lse_alignment_with_same_batch():
+def test_split_cached_training_does_not_retry_failed_backward():
     runtime = _FakeRuntime()
     runtime.fail_lse_once = True
     boundary = SimpleNamespace(split_id=runtime.split_id)
@@ -291,15 +327,15 @@ def test_split_cached_training_retries_cuda_lse_alignment_with_same_batch():
         runtime_build_time=2.0,
     )
 
-    metrics = experiments._train_split_cached_loop(
-        cached_split=cached_split,
-        epochs=1,
-        loss_fn=lambda _outputs, _targets: torch.tensor(0.25),
-        optimizer=None,
-        seed=3,
-        shuffle_samples=False,
-        device=torch.device("cuda"),
-    )
+    with pytest.raises(RuntimeError, match="LSE is not correctly aligned"):
+        experiments._train_split_cached_loop(
+            cached_split=cached_split,
+            epochs=1,
+            loss_fn=lambda _outputs, _targets: torch.tensor(0.25),
+            optimizer=None,
+            seed=3,
+            shuffle_samples=False,
+            device=torch.device("cuda"),
+        )
 
-    assert runtime.trained_boundaries == [boundary]
-    assert metrics["final_loss"] == pytest.approx(0.25)
+    assert runtime.trained_boundaries == []

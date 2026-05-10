@@ -6,9 +6,9 @@ import csv
 import hashlib
 import json
 import random
+import re
 import sys
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -61,12 +61,30 @@ SPLIT_BUCKET_BY_BOUNDARY = {
     "percent:75": "Late75%",
 }
 BUCKET_LABELS = tuple(SPLIT_BUCKET_BY_BOUNDARY[boundary] for boundary in DEFAULT_SPLIT_BOUNDARIES)
+UNSTABLE_SPLIT_ID_FRAGMENTS = (
+    ".self_attn",
+    ".multihead_attn",
+    ".mlp.",
+    ".fc1",
+    ".fc2",
+    ".q_proj",
+    ".k_proj",
+    ".v_proj",
+    ".out_proj",
+    ".bn",
+    ".norm",
+    ".dropout",
+    ".activation",
+    ".cv1",
+    ".cv2",
+)
 
 
 @dataclass(frozen=True)
 class SplitChoice:
     bucket: str
     boundary: str
+    resolved_boundary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +270,55 @@ def _synchronize(device: torch.device) -> None:
 def _clear_cuda_cache() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _cuda_sdp_flags() -> dict[str, Any]:
+    if not hasattr(torch.backends, "cuda"):
+        return {
+            "flash_sdp": None,
+            "mem_efficient_sdp": None,
+            "math_sdp": None,
+            "cudnn_sdp": None,
+        }
+    cuda_backend = torch.backends.cuda
+    cudnn_enabled = None
+    if hasattr(cuda_backend, "cudnn_sdp_enabled"):
+        cudnn_enabled = cuda_backend.cudnn_sdp_enabled()
+    return {
+        "flash_sdp": cuda_backend.flash_sdp_enabled(),
+        "mem_efficient_sdp": cuda_backend.mem_efficient_sdp_enabled(),
+        "math_sdp": cuda_backend.math_sdp_enabled(),
+        "cudnn_sdp": cudnn_enabled,
+    }
+
+
+def _log_cuda_sdp_flags(message: str) -> None:
+    flags = _cuda_sdp_flags()
+    logger.info(
+        "{}: flash_sdp={}, mem_efficient_sdp={}, math_sdp={}, cudnn_sdp={}",
+        message,
+        flags["flash_sdp"],
+        flags["mem_efficient_sdp"],
+        flags["math_sdp"],
+        flags["cudnn_sdp"],
+    )
+
+
+def _force_cuda_math_sdp(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+    if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        torch.backends.cuda.enable_cudnn_sdp(False)
+    logger.info(
+        "Forced CUDA SDPA backend to math mode: "
+        "flash_sdp={}, mem_efficient_sdp={}, math_sdp={}",
+        torch.backends.cuda.flash_sdp_enabled(),
+        torch.backends.cuda.mem_efficient_sdp_enabled(),
+        torch.backends.cuda.math_sdp_enabled(),
+    )
 
 
 def _resolve_local_weights_path(model_name: str) -> str:
@@ -575,6 +642,30 @@ def _split_choices(boundaries: list[str]) -> list[SplitChoice]:
     return choices
 
 
+def _is_stable_split_id(split_id: str) -> bool:
+    return not any(fragment in str(split_id) for fragment in UNSTABLE_SPLIT_ID_FRAGMENTS)
+
+
+def _module_level_boundary_for_split_id(split_id: str) -> str | None:
+    text = str(split_id)
+    for pattern in (
+        r"^(after:.*?\.encoder\.layer\.\d+)(?:\.|$)",
+        r"^(after:.*?\.decoder\.layers\.\d+)(?:\.|$)",
+        r"^(after:.*?\.projector\.stages\.\d+)(?:\.|$)",
+        r"^(after:.*?\.layer\.\d+)(?:\.|$)",
+        r"^(after:.*?\.layers\.\d+)(?:\.|$)",
+        r"^(after:.*?\.stages\.\d+)(?:\.|$)",
+    ):
+        match = re.match(pattern, text)
+        if match:
+            return match.group(1)
+    return text if _is_stable_split_id(text) else None
+
+
+def _runtime_boundary_for_choice(choice: SplitChoice) -> str:
+    return str(choice.resolved_boundary or choice.boundary)
+
+
 def _shuffled_epoch_batches(
     sample_ids: list[int],
     *,
@@ -657,7 +748,7 @@ def _require_boundary_split_id(boundary: Any) -> str:
 
 def _contiguous_tensor_tree(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
-        return value if value.is_contiguous() else value.contiguous()
+        return value.detach().contiguous()
     if isinstance(value, Mapping):
         return {key: _contiguous_tensor_tree(item) for key, item in value.items()}
     if isinstance(value, tuple):
@@ -688,16 +779,6 @@ def _contiguous_boundary_payload(boundary: Any) -> Any:
         tensors=contiguous_tensors,
         passthrough_inputs=contiguous_passthrough,
     )
-
-
-def _math_sdp_context(device: torch.device):
-    if device.type != "cuda":
-        return nullcontext()
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-    except Exception:  # noqa: BLE001
-        return nullcontext()
-    return sdpa_kernel(SDPBackend.MATH)
 
 
 def _raise_cached_split_id_mismatch(
@@ -953,35 +1034,16 @@ def _train_split_cached_loop(
             rng = np.random.default_rng(int(seed) + int(epoch))
             order = rng.permutation(np.arange(len(epoch_batches))).tolist()
             epoch_batches = [epoch_batches[index] for index in order]
-        for sample_index, cached_batch in enumerate(epoch_batches):
+        for cached_batch in epoch_batches:
             _synchronize(device)
             batch_started = time.perf_counter()
             boundary = _contiguous_boundary_payload(cached_batch.boundary)
-            targets = list(copy.deepcopy(cached_batch.targets))
-            try:
-                loss, _boundary_grads = runtime.train_suffix(
-                    boundary,
-                    targets,
-                    loss_fn=loss_fn,
-                    optimizer=optimizer,
-                )
-            except RuntimeError as exc:
-                if device.type != "cuda" or "LSE is not correctly aligned" not in str(exc):
-                    raise
-                logger.warning(
-                    "Cached split suffix hit CUDA SDPA LSE alignment issue "
-                    "(percent={}, split_id={}, sample_index={}); retrying with math SDP.",
-                    cached_split.percent,
-                    cached_split.split_id,
-                    sample_index,
-                )
-                with _math_sdp_context(device):
-                    loss, _boundary_grads = runtime.train_suffix(
-                        boundary,
-                        targets,
-                        loss_fn=loss_fn,
-                        optimizer=optimizer,
-                    )
+            loss, _boundary_grads = runtime.train_suffix(
+                boundary,
+                list(copy.deepcopy(cached_batch.targets)),
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+            )
             _synchronize(device)
             batch_times.append(time.perf_counter() - batch_started)
             losses.append(float(loss.detach().cpu().item()))
@@ -1045,6 +1107,7 @@ def _base_result_row(
         "mode": mode,
         "split_bucket": choice.bucket,
         "split_boundary": choice.boundary,
+        "resolved_split_boundary": _runtime_boundary_for_choice(choice),
         "actual_split_id": metadata.get("actual_split_id"),
         "repeat_id": int(repeat_id),
         "sample_count": int(sample_count),
@@ -1103,22 +1166,119 @@ def _build_runtime_for_choice(
     choice: SplitChoice,
     args: argparse.Namespace,
 ) -> tuple[Any, float]:
+    runtime_boundary = _runtime_boundary_for_choice(choice)
+    runtime, elapsed = _build_runtime_for_boundary(
+        split_model=split_model,
+        example_batch=example_batch,
+        boundary=runtime_boundary,
+        args=args,
+        warmup=True,
+    )
+    split_id = _require_runtime_split_id(runtime)
+    logger.info(
+        "Selected percent boundary {} -> runtime boundary {} -> exact Ariadne "
+        "split_id {} stable_boundary_passed={}",
+        choice.boundary,
+        runtime_boundary,
+        split_id,
+        _is_stable_split_id(split_id),
+    )
+    return runtime, elapsed
+
+
+def _build_runtime_for_boundary(
+    *,
+    split_model: torch.nn.Module,
+    example_batch: torch.Tensor,
+    boundary: str,
+    args: argparse.Namespace,
+    warmup: bool,
+) -> tuple[Any, float]:
     config = SplitRuntimeConfig(
-        boundary=choice.boundary,
+        boundary=str(boundary),
         dynamic_batch=(2, max(2, int(args.dynamic_batch_max), int(args.batch_size))),
         trace_batch_size=2,
         mode=str(args.ariadne_mode),
         trainable=True,
     )
+    _log_cuda_sdp_flags("CUDA SDPA backend flags before Ariadne runtime construction")
     started = time.perf_counter()
     runtime = build_split_runtime(split_model, example_batch, config)
-    maybe_warmup_runtime(runtime, example_batch)
-    logger.info(
-        "Resolved {} -> Ariadne split_id {}",
-        choice.boundary,
-        _require_runtime_split_id(runtime),
-    )
+    if warmup:
+        maybe_warmup_runtime(runtime, example_batch)
     return runtime, float(time.perf_counter() - started)
+
+
+def _resolve_stable_split_choices(
+    *,
+    split_model: torch.nn.Module,
+    example_batch: torch.Tensor,
+    choices: list[SplitChoice],
+    args: argparse.Namespace,
+) -> list[SplitChoice]:
+    resolved: list[SplitChoice] = []
+    for choice in choices:
+        probe_runtime, _elapsed = _build_runtime_for_boundary(
+            split_model=split_model,
+            example_batch=example_batch,
+            boundary=choice.boundary,
+            args=args,
+            warmup=False,
+        )
+        probe_split_id = _require_runtime_split_id(probe_runtime)
+        del probe_runtime
+        _clear_cuda_cache()
+        stable_boundary = probe_split_id
+        stable_passed = _is_stable_split_id(probe_split_id)
+        if not stable_passed:
+            stable_boundary = _module_level_boundary_for_split_id(probe_split_id)
+            if stable_boundary is None:
+                raise RuntimeError(
+                    "Ariadne percent boundary resolved to an unstable training split "
+                    f"with no module-level fallback: percent={choice.boundary!r}, "
+                    f"split_id={probe_split_id!r}."
+                )
+            logger.info(
+                "Percent boundary {} initially resolved to unstable split_id {}; "
+                "trying stable module-level boundary {}.",
+                choice.boundary,
+                probe_split_id,
+                stable_boundary,
+            )
+            stable_runtime, _stable_elapsed = _build_runtime_for_boundary(
+                split_model=split_model,
+                example_batch=example_batch,
+                boundary=stable_boundary,
+                args=args,
+                warmup=False,
+            )
+            stable_split_id = _require_runtime_split_id(stable_runtime)
+            del stable_runtime
+            _clear_cuda_cache()
+            stable_passed = _is_stable_split_id(stable_split_id)
+            if not stable_passed:
+                raise RuntimeError(
+                    "Ariadne stable boundary fallback still resolved to an unstable "
+                    "training split: "
+                    f"percent={choice.boundary!r}, requested={stable_boundary!r}, "
+                    f"split_id={stable_split_id!r}."
+                )
+            stable_boundary = stable_split_id
+        logger.info(
+            "Selected percent boundary {} -> exact Ariadne split_id {} "
+            "stable_boundary_passed={}",
+            choice.boundary,
+            stable_boundary,
+            stable_passed,
+        )
+        resolved.append(
+            SplitChoice(
+                bucket=choice.bucket,
+                boundary=choice.boundary,
+                resolved_boundary=stable_boundary,
+            )
+        )
+    return resolved
 
 
 def _build_cached_split_runtime(
@@ -1468,6 +1628,7 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("--device requested CUDA, but torch.cuda.is_available() is false.")
     if int(args.batch_size) < 2:
         raise ValueError("--batch-size must be at least 2 for Ariadne batch_gt1 tracing.")
+    _force_cuda_math_sdp(device)
     object_detection_module.device = device
     _set_random_seed(int(args.seed))
     sample_count = int(args.sample_count)
@@ -1521,6 +1682,12 @@ def main(argv: list[str] | None = None) -> int:
         sample_ids=sampled_ids,
         device=device,
         trace_batch_size=2,
+    )
+    choices = _resolve_stable_split_choices(
+        split_model=split_model,
+        example_batch=example_batch,
+        choices=choices,
+        args=args,
     )
     initial_state = _snapshot_model_state(edge_detector.model)
     learning_rate = _resolve_experiment_learning_rate(server_cfg, str(args.edge_model))
