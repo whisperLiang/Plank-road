@@ -1,75 +1,54 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
-import sqlite3
 import threading
 import time
-from collections import OrderedDict
 from collections.abc import Mapping
-from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 import torch
 
-from model_management.payload import BoundaryPayload
-from model_management.split_contract import normalise_feature_tensors
-
-
-POOL_MANIFEST_FIELDS = (
-    "model_id",
-    "front_version",
-    "split_config_id",
-    "boundary_tensor_labels",
+from model_management.split_contract import (
+    SplitRuntimeContract,
+    feature_layout_from_tensors,
+    normalise_feature_tensors,
 )
 
-_QUALITY_METADATA_FIELDS = {
-    "quality_bucket",
+
+POOL_LABEL_COORDINATE_SPACE = "model_input_xyxy"
+POOL_LABEL_RUNTIME_VERSION = "fixed-split-pool-labels.v1"
+POOL_LABEL_METADATA_FIELDS = (
+    "label_coordinate_space",
+    "label_input_size",
+    "label_resize_mode",
+    "label_runtime_version",
+)
+
+_CANONICAL_RECORD_VERSION = "canonical-sample-record.v1"
+_GENERATION_MANIFEST_VERSION = "canonical-cloud-sample-pool.v1"
+
+_CANONICAL_FEATURE_METADATA_FIELDS = {
+    "sample_id",
+    "contract_id",
+    "split_config_id",
+    "front_version",
+    "feature_layout_id",
+    "sample_source",
+    "label_source",
+    "input_tensor_shape",
+    "input_resize_mode",
+    "created_at",
     "quality_score",
     "risk_score",
-    "risk_reasons",
-    "evidence_count",
-    "covered_evidence_count",
-    "uncovered_evidence_count",
-    "uncovered_evidence_rate",
-    "candidate_uncovered_score",
-    "motion_uncovered_score",
-    "track_uncovered_score",
-    "window_id",
+    "object_count",
+    "class_counts",
     "in_drift_window",
-}
-
-_RAW_METADATA_FIELDS = {
-    "raw_relpath",
-    "raw_bytes",
-    "raw_sha256",
-    "source_raw_relpath",
-    "source_raw_bytes",
-    "source_raw_sha256",
-    "raw_cache_key",
-    "has_raw_sample",
-    "frame_relpath",
-    "frame_file_size",
-}
-
-_LABEL_FIELDS = {
-    "pseudo_boxes",
-    "pseudo_labels",
-    "pseudo_scores",
-    "label_coordinate_space",
-    "label_input_size",
-    "label_resize_mode",
-    "label_runtime_version",
-}
-
-_LABEL_METADATA_FIELDS = {
-    "label_coordinate_space",
-    "label_input_size",
-    "label_resize_mode",
-    "label_runtime_version",
+    "window_id",
 }
 
 
@@ -124,82 +103,16 @@ def _resolve_relpath(root_dir: str, relpath: str) -> str:
     return os.path.join(root_dir, str(relpath).replace("/", os.sep))
 
 
-def _pool_manifest_from_bundle_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    model_meta = dict(manifest.get("model", {}) or {})
-    split_plan = dict(manifest.get("split_plan", {}) or {})
-    return {
-        "model_id": str(manifest.get("model_id") or model_meta.get("model_id", "") or ""),
-        "front_version": str(
-            manifest.get("front_version") or split_plan.get("front_version") or "0"
-        ),
-        "split_config_id": str(
-            manifest.get("split_config_id") or split_plan.get("split_config_id", "") or ""
-        ),
-        "boundary_tensor_labels": [
-            str(label)
-            for label in list(
-                manifest.get("boundary_tensor_labels")
-                or split_plan.get("boundary_tensor_labels", [])
-                or []
-            )
-        ],
-    }
+def _sanitize_segment(value: object) -> str:
+    text = str(value or "").strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text)
+    return cleaned or "unknown"
 
 
-def _feature_tensors_from_record(record: Mapping[str, Any]) -> dict[str, torch.Tensor]:
-    if "feature" in record:
-        return normalise_feature_tensors(record["feature"])
-    if "tensors" in record:
-        return normalise_feature_tensors(record["tensors"])
-    intermediate = record.get("intermediate")
-    if isinstance(intermediate, BoundaryPayload):
-        return normalise_feature_tensors(dict(intermediate.tensors))
-    if intermediate is not None:
-        return normalise_feature_tensors(intermediate)
-    return normalise_feature_tensors(record)
-
-
-def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
-    result = dict(result or {})
-    labels = {
-        "boxes": list(result.get("boxes") or []),
-        "labels": list(result.get("labels") or []),
-    }
-    if "scores" in result:
-        labels["scores"] = list(result.get("scores") or [])
-    for field_name in _LABEL_METADATA_FIELDS:
-        if result.get(field_name) is not None:
-            labels[field_name] = result[field_name]
-    return labels
-
-
-def _class_counts(labels: Mapping[str, Any]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for label in list(labels.get("labels") or []):
-        key = str(label)
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
-
-def _dominant_class(class_counts: Mapping[str, int]) -> int | None:
-    if not class_counts:
-        return None
-    label = sorted(
-        ((int(count), str(label)) for label, count in class_counts.items()),
-        key=lambda item: (-item[0], item[1]),
-    )[0][1]
-    try:
-        return int(label)
-    except (TypeError, ValueError):
-        return None
-
-
-def _object_count(labels: Mapping[str, Any]) -> int:
-    boxes = list(labels.get("boxes") or [])
-    label_values = list(labels.get("labels") or [])
-    if boxes and label_values:
-        return min(len(boxes), len(label_values))
-    return max(len(boxes), len(label_values))
+def _sample_file_stem(sample_id: str) -> str:
+    safe = _sanitize_segment(sample_id)[:80]
+    digest = hashlib.sha1(str(sample_id).encode("utf-8")).hexdigest()[:10]
+    return f"{safe}-{digest}"
 
 
 def _created_at_text(value: object | None = None) -> str:
@@ -223,46 +136,307 @@ def _created_at_sort_value(value: object) -> float:
         return 0.0
 
 
-def _sanitize_feature_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    removed = _QUALITY_METADATA_FIELDS | _RAW_METADATA_FIELDS | _LABEL_FIELDS
-    return {str(key): value for key, value in dict(record).items() if str(key) not in removed}
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
-def _feature_record_from_tensors(
-    sample_id: str,
-    tensors: Mapping[str, torch.Tensor],
-    metadata: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    clean_tensors = normalise_feature_tensors(tensors)
-    payload = dict(metadata or {})
-    return {
-        **payload,
-        "sample_id": str(sample_id),
-        "feature": clean_tensors,
-        "boundary_tensor_labels": list(clean_tensors.keys()),
+def _single_sample_feature_tensors(value: object) -> dict[str, torch.Tensor]:
+    tensors = normalise_feature_tensors(value)
+    clean: dict[str, torch.Tensor] = {}
+    for label, tensor in sorted(tensors.items()):
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.ndim == 0 or int(tensor.shape[0]) != 1:
+            raise ValueError(
+                "Canonical sample features must be single-sample tensors with "
+                f"shape [1, ...]; got {label} shape {tuple(tensor.shape)}."
+            )
+        clean[str(label)] = tensor.detach().cpu()
+    if not clean:
+        raise ValueError("Canonical sample feature payload did not contain tensors.")
+    return clean
+
+
+def _feature_tensors_from_candidate(candidate: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    if "feature" in candidate:
+        return _single_sample_feature_tensors(candidate["feature"])
+    feature_record = candidate.get("feature_record") or candidate.get("record")
+    if isinstance(feature_record, Mapping):
+        if "feature" in feature_record:
+            return _single_sample_feature_tensors(feature_record["feature"])
+        if "tensors" in feature_record:
+            return _single_sample_feature_tensors(feature_record["tensors"])
+    if "tensors" in candidate:
+        return _single_sample_feature_tensors(candidate["tensors"])
+    raise ValueError("Canonical sample candidate has no feature tensors.")
+
+
+def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
+    result = dict(result or {})
+    labels = {
+        "boxes": list(result.get("boxes") or result.get("pseudo_boxes") or []),
+        "labels": list(result.get("labels") or result.get("pseudo_labels") or []),
     }
+    scores = result.get("scores")
+    if scores is None:
+        scores = result.get("pseudo_scores")
+    if scores is not None:
+        labels["scores"] = list(scores or [])
+    for field_name in POOL_LABEL_METADATA_FIELDS:
+        if result.get(field_name) is not None:
+            labels[field_name] = result[field_name]
+    return labels
 
 
-def _feature_sample_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    source = dict(record)
-    tensors = _feature_tensors_from_record(source)
-    metadata_fields = (
-        "sample_source",
-        "label_source",
-        "split_config_id",
-        "front_version",
-        "input_tensor_shape",
-        "input_resize_mode",
-        "model_id",
+def _class_counts(labels: Mapping[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for label in list(labels.get("labels") or []):
+        key = str(label)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _object_count(labels: Mapping[str, Any]) -> int:
+    boxes = list(labels.get("boxes") or [])
+    label_values = list(labels.get("labels") or [])
+    if boxes and label_values:
+        return min(len(boxes), len(label_values))
+    return max(len(boxes), len(label_values))
+
+
+def _dominant_class(class_counts: Mapping[str, int]) -> int | None:
+    if not class_counts:
+        return None
+    label = sorted(
+        ((int(count), str(label)) for label, count in class_counts.items()),
+        key=lambda item: (-item[0], item[1]),
+    )[0][1]
+    try:
+        return int(label)
+    except (TypeError, ValueError):
+        return None
+
+
+def _size_pair_from_value(value: object) -> tuple[int, int] | None:
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        height = int(value[0])
+        width = int(value[1])
+        if height > 0 and width > 0:
+            return height, width
+    return None
+
+
+def _labels_are_structurally_valid(labels: Mapping[str, Any]) -> bool:
+    boxes = list(labels.get("boxes") or [])
+    label_values = list(labels.get("labels") or [])
+    if bool(boxes) != bool(label_values):
+        return False
+    if boxes and len(boxes) != len(label_values):
+        return False
+    for box in boxes:
+        try:
+            values = [float(value) for value in list(box)[:4]]
+        except (TypeError, ValueError):
+            return False
+        if len(values) != 4:
+            return False
+    return True
+
+
+def _labels_fit_model_input(
+    labels: Mapping[str, Any],
+    *,
+    model_input_size: tuple[int, int] | None,
+) -> bool:
+    if model_input_size is None:
+        return True
+    model_h, model_w = model_input_size
+    epsilon = 1e-3
+    for box in list(labels.get("boxes") or []):
+        values = [float(value) for value in list(box or [])[:4]]
+        if len(values) < 4:
+            continue
+        if (
+            values[0] < -epsilon
+            or values[2] < -epsilon
+            or values[1] < -epsilon
+            or values[3] < -epsilon
+            or values[0] > float(model_w) + epsilon
+            or values[2] > float(model_w) + epsilon
+            or values[1] > float(model_h) + epsilon
+            or values[3] > float(model_h) + epsilon
+        ):
+            return False
+    return True
+
+
+def _pool_label_metadata_is_compatible(
+    labels: Mapping[str, Any],
+    *,
+    model_input_size: tuple[int, int] | None,
+    input_resize_mode: str | None,
+) -> tuple[bool, str | None]:
+    coordinate_space = str(labels.get("label_coordinate_space") or "").strip()
+    if coordinate_space and coordinate_space != POOL_LABEL_COORDINATE_SPACE:
+        return False, "coordinate_space"
+
+    label_input_size = _size_pair_from_value(labels.get("label_input_size"))
+    if (
+        label_input_size is not None
+        and model_input_size is not None
+        and label_input_size != model_input_size
+    ):
+        return False, "input_size"
+
+    label_resize_mode = str(labels.get("label_resize_mode") or "").strip()
+    if (
+        label_resize_mode
+        and input_resize_mode
+        and label_resize_mode != str(input_resize_mode).strip()
+    ):
+        return False, "resize_mode"
+
+    return True, None
+
+
+def _labels_with_default_metadata(
+    labels: Mapping[str, Any],
+    *,
+    input_tensor_shape: list[int],
+    input_resize_mode: str,
+) -> dict[str, Any]:
+    payload = _labels_from_result(labels)
+    payload.setdefault("label_coordinate_space", POOL_LABEL_COORDINATE_SPACE)
+    payload.setdefault("label_resize_mode", str(input_resize_mode or "direct_resize"))
+    payload.setdefault("label_runtime_version", POOL_LABEL_RUNTIME_VERSION)
+    if payload.get("label_input_size") is None and len(input_tensor_shape) >= 3:
+        payload["label_input_size"] = [
+            int(input_tensor_shape[-2]),
+            int(input_tensor_shape[-1]),
+        ]
+    return payload
+
+
+def _feature_metadata_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    source = dict(candidate.get("feature_record") or {})
+    source.update(
+        {
+            key: value
+            for key, value in dict(candidate).items()
+            if key not in {"feature", "tensors", "feature_record", "labels"}
+        }
     )
     return {
-        "tensors": tensors,
-        **{
-            field_name: source[field_name]
-            for field_name in metadata_fields
-            if source.get(field_name) is not None
-        },
+        key: source[key]
+        for key in _CANONICAL_FEATURE_METADATA_FIELDS
+        if source.get(key) is not None
     }
+
+
+@dataclass
+class CanonicalSampleRecord:
+    sample_id: str
+    contract_id: str
+    split_config_id: str
+    front_version: str
+    feature_layout_id: str
+    sample_source: str
+    label_source: str
+    feature: dict[str, torch.Tensor]
+    labels: dict[str, Any]
+    input_tensor_shape: list[int]
+    input_resize_mode: str
+    created_at: str
+    quality_score: float = 0.0
+    risk_score: float = 0.0
+    object_count: int = 0
+    class_counts: dict[str, int] = field(default_factory=dict)
+    in_drift_window: bool | None = None
+    window_id: str | None = None
+    source_feature_path: str | None = field(default=None, repr=False, compare=False)
+    source_label_path: str | None = field(default=None, repr=False, compare=False)
+    source_staging_path: str | None = field(default=None, repr=False, compare=False)
+
+    def feature_layout(self) -> dict[str, dict[str, Any]]:
+        return feature_layout_from_tensors(self.feature)
+
+    def to_feature_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": _CANONICAL_RECORD_VERSION,
+            "sample_id": self.sample_id,
+            "feature": {label: tensor.detach().cpu() for label, tensor in self.feature.items()},
+            "contract_id": self.contract_id,
+            "split_config_id": self.split_config_id,
+            "front_version": self.front_version,
+            "feature_layout_id": self.feature_layout_id,
+            "sample_source": self.sample_source,
+            "label_source": self.label_source,
+            "input_tensor_shape": list(self.input_tensor_shape),
+            "input_resize_mode": self.input_resize_mode,
+            "created_at": self.created_at,
+            "quality_score": float(self.quality_score),
+            "risk_score": float(self.risk_score),
+            "object_count": int(self.object_count),
+            "class_counts": dict(self.class_counts),
+            "in_drift_window": self.in_drift_window,
+            "window_id": self.window_id,
+        }
+
+    def to_label_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": _CANONICAL_RECORD_VERSION,
+            "sample_id": self.sample_id,
+            "boxes": list(self.labels.get("boxes") or []),
+            "labels": list(self.labels.get("labels") or []),
+            **(
+                {"scores": list(self.labels.get("scores") or [])}
+                if self.labels.get("scores") is not None
+                else {}
+            ),
+            **{
+                field_name: self.labels[field_name]
+                for field_name in POOL_LABEL_METADATA_FIELDS
+                if self.labels.get(field_name) is not None
+            },
+        }
+
+    def to_index_record(
+        self,
+        *,
+        feature_relpath: str,
+        label_relpath: str,
+        generation_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": _CANONICAL_RECORD_VERSION,
+            "sample_id": self.sample_id,
+            "contract_id": self.contract_id,
+            "split_config_id": self.split_config_id,
+            "front_version": self.front_version,
+            "feature_layout_id": self.feature_layout_id,
+            "sample_source": self.sample_source,
+            "label_source": self.label_source,
+            "feature_layout": self.feature_layout(),
+            "feature_shard": feature_relpath,
+            "feature_key": self.sample_id,
+            "label_shard": label_relpath,
+            "label_key": self.sample_id,
+            "object_count": int(self.object_count),
+            "class_counts": dict(self.class_counts),
+            "class_counts_json": _stable_json(self.class_counts),
+            "dominant_class": _dominant_class(self.class_counts),
+            "created_at": self.created_at,
+            "quality_score": float(self.quality_score),
+            "risk_score": float(self.risk_score),
+            "in_drift_window": self.in_drift_window,
+            "window_id": self.window_id,
+            "input_tensor_shape": list(self.input_tensor_shape),
+            "input_resize_mode": self.input_resize_mode,
+            "generation_id": generation_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -273,83 +447,40 @@ class FeatureLabelRecord:
 
 
 class FeatureLabelShardReader:
-    """LRU reader for cloud sample-pool feature and label shards."""
+    """Reader for the current canonical generation."""
 
-    def __init__(self, root_dir: str, *, cache_size: int = 4) -> None:
+    def __init__(self, root_dir: str) -> None:
         self.root_dir = os.path.abspath(root_dir)
-        self.cache_size = max(2, min(4, int(cache_size)))
-        self._feature_cache: OrderedDict[str, Mapping[str, Any]] = OrderedDict()
-        self._label_cache: OrderedDict[str, Mapping[str, Any]] = OrderedDict()
 
-    def _load_shard(
-        self,
-        cache: OrderedDict[str, Mapping[str, Any]],
-        relpath: str,
-        key_name: str,
-    ) -> Mapping[str, Any]:
-        shard_key = _normalise_relpath(relpath)
-        cached = cache.get(shard_key)
-        if cached is not None:
-            cache.move_to_end(shard_key)
-            return cached
-        shard_path = _resolve_relpath(self.root_dir, shard_key)
-        if shard_key.endswith(".jsonl"):
-            records = {}
-            with open(shard_path, "r", encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    entry = json.loads(line)
-                    if isinstance(entry, Mapping) and entry.get("sample_id"):
-                        records[str(entry["sample_id"])] = dict(entry)
-        else:
-            payload = torch.load(
-                shard_path,
-                map_location="cpu",
-                weights_only=False,
-            )
-            if isinstance(payload, Mapping) and key_name in payload:
-                records = payload[key_name]
-            elif key_name == "samples" and isinstance(payload, Mapping) and "records" in payload:
-                records = payload["records"]
-            else:
-                records = payload
-        if not isinstance(records, Mapping):
-            raise TypeError(f"Unsupported shard payload in {shard_key!r}: {type(records)!r}")
-        cache[shard_key] = records
-        cache.move_to_end(shard_key)
-        while len(cache) > self.cache_size:
-            cache.popitem(last=False)
-        return records
+    @staticmethod
+    def _entry_base_dir(entry: Mapping[str, Any]) -> str:
+        return os.path.abspath(str(entry.get("__generation_dir") or ""))
 
-    def load_feature(self, shard: str, key: str) -> dict[str, Any]:
-        records = self._load_shard(self._feature_cache, shard, "samples")
-        value = records[str(key)]
-        if not isinstance(value, Mapping):
-            raise TypeError(f"Unsupported feature record for {key!r}: {type(value)!r}")
-        if "tensors" in value:
-            metadata = {name: item for name, item in dict(value).items() if name != "tensors"}
-            return _feature_record_from_tensors(str(key), dict(value.get("tensors") or {}), metadata)
-        return dict(value)
-
-    def load_label(self, shard: str, key: str) -> dict[str, Any]:
-        records = self._load_shard(self._label_cache, shard, "labels")
-        value = records[str(key)]
-        if not isinstance(value, Mapping):
-            raise TypeError(f"Unsupported label record for {key!r}: {type(value)!r}")
-        return _labels_from_result(value)
+    def _resolve_entry_path(self, entry: Mapping[str, Any], key: str) -> str:
+        relpath = str(entry.get(key) or "")
+        if not relpath:
+            raise FileNotFoundError(f"Missing {key} for sample {entry.get('sample_id')!r}")
+        if os.path.isabs(relpath):
+            return relpath
+        base_dir = self._entry_base_dir(entry) or self.root_dir
+        return _resolve_relpath(base_dir, relpath)
 
     def read(self, entry: Mapping[str, Any]) -> FeatureLabelRecord:
         sample_id = str(entry["sample_id"])
-        feature_record = self.load_feature(
-            str(entry["feature_shard"]),
-            str(entry["feature_key"]),
-        )
-        labels = self.load_label(
-            str(entry["label_shard"]),
-            str(entry["label_key"]),
-        )
+        feature_path = self._resolve_entry_path(entry, "feature_shard")
+        label_path = self._resolve_entry_path(entry, "label_shard")
+        feature_payload = torch.load(feature_path, map_location="cpu", weights_only=False)
+        if not isinstance(feature_payload, Mapping):
+            raise TypeError(f"Unsupported canonical feature payload: {type(feature_payload)!r}")
+        labels_payload = _read_json(label_path)
+        if not labels_payload:
+            raise TypeError(f"Unsupported canonical label payload: {label_path!r}")
+        feature_record = {
+            key: value
+            for key, value in dict(feature_payload).items()
+            if key != "schema_version"
+        }
+        labels = _labels_from_result(labels_payload)
         return FeatureLabelRecord(
             sample_id=sample_id,
             feature_record=feature_record,
@@ -363,35 +494,37 @@ class FeatureLabelShardReader:
         training_record["pseudo_labels"] = list(record.labels.get("labels") or [])
         if "scores" in record.labels:
             training_record["pseudo_scores"] = list(record.labels.get("scores") or [])
-        for field_name in _LABEL_METADATA_FIELDS:
+        for field_name in POOL_LABEL_METADATA_FIELDS:
             if record.labels.get(field_name) is not None:
                 training_record[field_name] = record.labels[field_name]
         return training_record
 
 
 class CloudSamplePool:
-    """Durable cloud-side pool of split features and trainable labels."""
+    """Generation-based cloud-side pool of canonical split features and labels."""
 
     def __init__(
         self,
         root_dir: str,
         *,
         model_id: str | None = None,
-        model_version: str | None = None,
         front_version: str | None = None,
         split_config_id: str | None = None,
-        split_label: str | None = None,
+        edge_id: int | str | None = None,
+        staging_root: str | None = None,
         boundary_tensor_labels: list[str] | tuple[str, ...] | None = None,
         max_active_samples: int | None = None,
         max_samples: int | None = None,
         shard_size: int = 64,
         reader_cache_size: int = 4,
+        **_: Any,
     ) -> None:
         self.root_dir = os.path.abspath(root_dir)
-        self.db_path = os.path.join(self.root_dir, "samples.sqlite")
-        self.manifest_path = os.path.join(self.root_dir, "pool_manifest.json")
-        self.feature_dir = os.path.join(self.root_dir, "features")
-        self.label_dir = os.path.join(self.root_dir, "labels")
+        self.model_id = str(model_id or "")
+        self.front_version = str(front_version or "0")
+        self.split_config_id = str(split_config_id or "")
+        self.edge_id = "" if edge_id is None else str(edge_id)
+        self.boundary_tensor_labels = [str(label) for label in list(boundary_tensor_labels or [])]
         resolved_max_active = max_active_samples if max_active_samples is not None else max_samples
         self.max_active_samples = (
             None
@@ -399,459 +532,704 @@ class CloudSamplePool:
             else max(1, int(resolved_max_active))
         )
         self.shard_size = max(1, int(shard_size))
-        self.reader = FeatureLabelShardReader(
-            self.root_dir,
-            cache_size=reader_cache_size,
-        )
+        self.current_path = os.path.join(self.root_dir, "current.json")
+        self.generations_dir = os.path.join(self.root_dir, "generations")
+        self.reader = FeatureLabelShardReader(self.root_dir)
         self._lock = threading.RLock()
-        self._replacement_index: dict[str, Any] = {}
-        os.makedirs(self.feature_dir, exist_ok=True)
-        os.makedirs(self.label_dir, exist_ok=True)
-        self._init_db()
-        initial_manifest = {
-            "model_id": str(model_id or ""),
-            "front_version": str(front_version or "0"),
-            "split_config_id": str(split_config_id or ""),
-            "boundary_tensor_labels": [
-                str(label) for label in list(boundary_tensor_labels or [])
-            ],
+
+        if staging_root is None:
+            staging_root = os.path.join(os.path.dirname(self.root_dir), "staging")
+        self.staging_root = os.path.abspath(staging_root)
+        self.pending_high_quality_dir = os.path.join(self.staging_root, "pending_high_quality")
+        self.staging_low_quality_dir = os.path.join(self.staging_root, "staging_low_quality")
+        self.stale_dir = os.path.join(self.staging_root, "stale")
+        self.processed_dir = os.path.join(self.staging_root, "processed")
+        for directory in (
+            self.generations_dir,
+            self.pending_high_quality_dir,
+            self.staging_low_quality_dir,
+            self.stale_dir,
+            self.processed_dir,
+        ):
+            os.makedirs(directory, exist_ok=True)
+
+    def _stage_file_path(self, directory: str, sample_id: str) -> str:
+        return os.path.join(directory, f"{_sample_file_stem(sample_id)}.pt")
+
+    def _normalise_stage_candidate(
+        self,
+        sample: Mapping[str, Any],
+        *,
+        sample_source: str,
+        label_source: str,
+    ) -> dict[str, Any]:
+        sample_id = str(sample.get("sample_id", "") or "").strip()
+        if not sample_id:
+            raise ValueError("Staged sample is missing sample_id.")
+        feature_record = dict(sample.get("feature_record") or {})
+        tensors = _feature_tensors_from_candidate(sample)
+        input_tensor_shape = list(
+            feature_record.get("input_tensor_shape")
+            or sample.get("input_tensor_shape")
+            or []
+        )
+        input_resize_mode = str(
+            feature_record.get("input_resize_mode")
+            or sample.get("input_resize_mode")
+            or "direct_resize"
+        )
+        labels = _labels_with_default_metadata(
+            sample.get("labels") or sample.get("label") or sample.get("target") or {},
+            input_tensor_shape=[int(dim) for dim in input_tensor_shape],
+            input_resize_mode=input_resize_mode,
+        )
+        metadata = _feature_metadata_from_candidate(sample)
+        return {
+            "schema_version": _CANONICAL_RECORD_VERSION,
+            "sample_id": sample_id,
+            "feature": tensors,
+            "labels": labels,
+            "sample_source": sample_source,
+            "label_source": label_source,
+            "split_config_id": str(
+                metadata.get("split_config_id")
+                or sample.get("split_config_id")
+                or self.split_config_id
+                or ""
+            ),
+            "front_version": str(
+                metadata.get("front_version")
+                or sample.get("front_version")
+                or self.front_version
+                or "0"
+            ),
+            "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
+            "input_resize_mode": input_resize_mode,
+            "created_at": _created_at_text(sample.get("created_at")),
+            "quality_score": _to_float(
+                metadata.get("quality_score", sample.get("quality_score", 0.0))
+            ),
+            "risk_score": _to_float(metadata.get("risk_score", sample.get("risk_score", 0.0))),
+            "in_drift_window": sample.get("in_drift_window"),
+            "window_id": None if sample.get("window_id") is None else str(sample.get("window_id")),
         }
-        if any(initial_manifest.get(field) for field in POOL_MANIFEST_FIELDS):
-            self._ensure_manifest(initial_manifest)
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    @contextmanager
-    def _connection(self):
-        connection = self._connect()
-        try:
-            yield connection
-            connection.commit()
-        finally:
-            connection.close()
-
-    def _init_db(self) -> None:
-        os.makedirs(self.root_dir, exist_ok=True)
-        with self._connection() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS samples (
-                    sample_id TEXT PRIMARY KEY,
-                    feature_shard TEXT NOT NULL,
-                    feature_key TEXT NOT NULL,
-                    label_shard TEXT NOT NULL,
-                    label_key TEXT NOT NULL,
-                    object_count INTEGER NOT NULL,
-                    class_counts_json TEXT NOT NULL,
-                    dominant_class INTEGER,
-                    created_at TEXT,
-                    active INTEGER DEFAULT 1
+    def _write_stage_records(
+        self,
+        samples: list[Mapping[str, Any]],
+        *,
+        directory: str,
+        sample_source: str,
+        label_source: str,
+    ) -> dict[str, Any]:
+        accepted = 0
+        duplicate_ids: list[str] = []
+        invalid_ids: list[str] = []
+        seen: set[str] = set()
+        for sample in samples:
+            sample_id = str(sample.get("sample_id", "") or "").strip()
+            if not sample_id:
+                invalid_ids.append("")
+                continue
+            if sample_id in seen:
+                duplicate_ids.append(sample_id)
+                continue
+            seen.add(sample_id)
+            path = self._stage_file_path(directory, sample_id)
+            if os.path.exists(path):
+                duplicate_ids.append(sample_id)
+                continue
+            try:
+                record = self._normalise_stage_candidate(
+                    sample,
+                    sample_source=sample_source,
+                    label_source=label_source,
                 )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_samples_active_created "
-                "ON samples(active, created_at)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_samples_active_dominant "
-                "ON samples(active, dominant_class)"
-            )
-
-    def _read_manifest(self) -> dict[str, Any]:
-        payload = _read_json(self.manifest_path)
-        return {field: payload.get(field) for field in POOL_MANIFEST_FIELDS}
-
-    def _ensure_manifest(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
-        expected = {
-            "model_id": str(manifest.get("model_id", "") or ""),
-            "front_version": str(manifest.get("front_version", "") or "0"),
-            "split_config_id": str(manifest.get("split_config_id", "") or ""),
-            "boundary_tensor_labels": [
-                str(label)
-                for label in list(manifest.get("boundary_tensor_labels", []) or [])
-            ],
+            except Exception:
+                invalid_ids.append(sample_id)
+                continue
+            _atomic_torch_save(record, path)
+            accepted += 1
+        return {
+            "accepted_to_pending" if sample_source == "high_quality" else "accepted_to_staging": accepted,
+            "skipped_invalid": len(invalid_ids),
+            "duplicate": len(duplicate_ids),
+            "skipped_invalid_preview": invalid_ids[:10],
+            "duplicate_preview": duplicate_ids[:10],
         }
-        existing = self._read_manifest()
-        if not any(existing.get(field) for field in POOL_MANIFEST_FIELDS):
-            _atomic_json_dump(self.manifest_path, expected)
-            return expected
 
-        merged = dict(existing)
-        for field in POOL_MANIFEST_FIELDS:
-            old_value = existing.get(field)
-            new_value = expected.get(field)
-            if old_value in (None, "", []):
-                merged[field] = new_value
+    def store_pending_high_quality_samples(
+        self,
+        samples: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        return self._write_stage_records(
+            samples,
+            directory=self.pending_high_quality_dir,
+            sample_source="high_quality",
+            label_source="edge_pseudo",
+        )
+
+    def stage_low_quality_samples(
+        self,
+        samples: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        return self._write_stage_records(
+            samples,
+            directory=self.staging_low_quality_dir,
+            sample_source="low_quality",
+            label_source="teacher",
+        )
+
+    def _load_stage_directory(self, directory: str) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        if not os.path.isdir(directory):
+            return records
+        for name in sorted(os.listdir(directory)):
+            if not name.endswith(".pt"):
                 continue
-            if new_value in (None, "", []):
+            path = os.path.join(directory, name)
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception:
+                shutil.move(path, os.path.join(self.stale_dir, name))
                 continue
-            if old_value != new_value:
-                raise RuntimeError(
-                    "Cloud sample pool manifest mismatch for "
-                    f"{field}: existing={old_value!r}, incoming={new_value!r}."
-                )
-        _atomic_json_dump(self.manifest_path, merged)
-        return merged
+            if not isinstance(payload, Mapping):
+                shutil.move(path, os.path.join(self.stale_dir, name))
+                continue
+            record = dict(payload)
+            record["__staging_path"] = path
+            records.append(record)
+        return records
 
-    @staticmethod
-    def manifest_from_bundle(bundle_root: str) -> dict[str, Any]:
-        manifest = _read_json(os.path.join(bundle_root, "bundle_manifest.json"))
-        return _pool_manifest_from_bundle_manifest(manifest)
+    def load_pending_high_quality_samples(self) -> list[dict[str, Any]]:
+        return self._load_stage_directory(self.pending_high_quality_dir)
 
-    def _next_shard_name(self, prefix: str, suffix: str) -> str:
-        directory = self.feature_dir if prefix == "feature_shard" else self.label_dir
-        existing = [
-            name
-            for name in os.listdir(directory)
-            if name.startswith(f"{prefix}_") and name.endswith(suffix)
-        ]
-        return f"{prefix}_{len(existing) + 1:06d}{suffix}"
+    def load_staging_low_quality_samples(self) -> list[dict[str, Any]]:
+        return self._load_stage_directory(self.staging_low_quality_dir)
+
+    def current_generation_id(self) -> str | None:
+        payload = _read_json(self.current_path)
+        generation_id = payload.get("generation_id")
+        return str(generation_id) if generation_id else None
+
+    def current_generation_dir(self) -> str | None:
+        generation_id = self.current_generation_id()
+        if not generation_id:
+            return None
+        path = os.path.join(self.generations_dir, generation_id)
+        return path if os.path.isdir(path) else None
+
+    def _generation_samples_path(self, generation_dir: str) -> str:
+        return os.path.join(generation_dir, "samples.jsonl")
 
     def list_active_samples(self) -> list[dict[str, Any]]:
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT sample_id, feature_shard, feature_key, label_shard, label_key,
-                       object_count, class_counts_json, dominant_class, created_at, active
-                FROM samples
-                WHERE active = 1
-                ORDER BY created_at ASC, sample_id ASC
-                """
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def deactivate_sample(self, sample_id: str) -> bool:
-        with self._lock, self._connection() as connection:
-            cursor = connection.execute(
-                "UPDATE samples SET active = 0 WHERE sample_id = ? AND active = 1",
-                (str(sample_id),),
-            )
-            changed = cursor.rowcount > 0
-        if changed:
-            self.rebuild_replacement_index()
-        return bool(changed)
-
-    def rebuild_replacement_index(self) -> dict[str, Any]:
-        rows = self.list_active_samples()
-        by_dominant: dict[str, list[dict[str, Any]]] = {}
-        by_class: dict[str, list[dict[str, Any]]] = {}
-        aggregate_counts: dict[str, int] = {}
-        for row in rows:
-            dominant = str(row.get("dominant_class") or "")
-            by_dominant.setdefault(dominant, []).append(row)
-            try:
-                counts = json.loads(str(row.get("class_counts_json") or "{}"))
-            except json.JSONDecodeError:
-                counts = {}
-            if isinstance(counts, Mapping):
-                for label, count in counts.items():
-                    class_id = str(label)
-                    object_count = int(count)
-                    aggregate_counts[class_id] = aggregate_counts.get(class_id, 0) + object_count
-                    if object_count > 0:
-                        by_class.setdefault(class_id, []).append(row)
-        for bucket in list(by_dominant.values()) + list(by_class.values()):
-            bucket.sort(
-                key=lambda row: (
-                    int(row.get("object_count") or 0),
-                    _created_at_sort_value(row.get("created_at")),
-                    str(row.get("sample_id") or ""),
-                )
-            )
-        self._replacement_index = {
-            "active_count": len(rows),
-            "by_dominant": by_dominant,
-            "by_class": by_class,
-            "aggregate_counts": aggregate_counts,
-        }
-        return dict(self._replacement_index)
-
-    def select_victim_for_new_sample(
-        self,
-        sample: Mapping[str, Any] | None = None,
-        *,
-        force: bool = False,
-        **sample_fields: Any,
-    ) -> str | None:
-        if self.max_active_samples is None:
-            return None
-        candidate = dict(sample or {})
-        candidate.update(sample_fields)
-        labels = (
-            candidate.get("labels")
-            or candidate.get("label")
-            or candidate.get("target")
-        )
-        if not isinstance(labels, Mapping):
-            labels = {
-                "boxes": candidate.get("boxes", []),
-                "labels": candidate.get("labels", []),
-                "scores": candidate.get("scores", []),
-            }
-        candidate_counts = _class_counts(labels)
-        candidate_dominant = _dominant_class(candidate_counts) or ""
-        index = self.rebuild_replacement_index()
-        if not force and int(index.get("active_count", 0)) < int(self.max_active_samples):
-            return None
-        by_class = dict(index.get("by_class") or {})
-        aggregate_counts = dict(index.get("aggregate_counts") or {})
-        for class_id, _count in sorted(
-            aggregate_counts.items(),
-            key=lambda item: (-int(item[1]), str(item[0])),
-        ):
-            victim_bucket = list(by_class.get(str(class_id)) or [])
-            if victim_bucket:
-                return str(victim_bucket[0]["sample_id"])
-        active_rows = self.list_active_samples()
-        if not active_rows:
-            return None
-        active_rows.sort(
+        generation_dir = self.current_generation_dir()
+        if generation_dir is None:
+            return []
+        samples_path = self._generation_samples_path(generation_dir)
+        if not os.path.exists(samples_path):
+            return []
+        entries: list[dict[str, Any]] = []
+        with open(samples_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                if isinstance(payload, Mapping) and payload.get("sample_id"):
+                    entry = dict(payload)
+                    entry["__generation_dir"] = generation_dir
+                    entries.append(entry)
+        entries.sort(
             key=lambda row: (
-                int(row.get("object_count") or 0),
                 _created_at_sort_value(row.get("created_at")),
                 str(row.get("sample_id") or ""),
             )
         )
-        return str(active_rows[0]["sample_id"])
+        return entries
 
-    def _active_sample_count(self) -> int:
-        with self._connection() as connection:
-            return int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM samples WHERE active = 1"
-                ).fetchone()[0]
-            )
-
-    def _active_sample_entries_by_id(
-        self,
-        sample_ids: list[str] | tuple[str, ...] | set[str],
-    ) -> dict[str, dict[str, Any]]:
-        unique_ids = sorted({str(sample_id) for sample_id in sample_ids if str(sample_id)})
-        if not unique_ids:
-            return {}
-        placeholders = ",".join("?" for _ in unique_ids)
-        with self._connection() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT sample_id, feature_shard, feature_key, label_shard, label_key,
-                       object_count, class_counts_json, dominant_class, created_at, active
-                FROM samples
-                WHERE active = 1 AND sample_id IN ({placeholders})
-                """,
-                unique_ids,
-            ).fetchall()
-        return {str(row["sample_id"]): dict(row) for row in rows}
-
-    def _enforce_capacity_for_pending(self, samples: list[Mapping[str, Any]]) -> int:
-        if self.max_active_samples is None:
-            return 0
-        existing_ids = set(
-            self._active_sample_entries_by_id(
-                [
-                    str(sample.get("sample_id", "") or "")
-                    for sample in samples
-                ]
-            )
-        )
-        active_count = self._active_sample_count()
-        reserved_new_ids: set[str] = set()
-        replacement_count = 0
-        for sample in samples:
-            sample_id = str(sample.get("sample_id", "") or "")
-            if not sample_id:
-                continue
-            if sample_id in reserved_new_ids or sample_id in existing_ids:
-                continue
-            while (
-                active_count + len(reserved_new_ids) + 1
-                > int(self.max_active_samples)
-            ):
-                victim = self.select_victim_for_new_sample(sample, force=True)
-                if victim is None or victim == sample_id:
-                    break
-                if not self.deactivate_sample(victim):
-                    break
-                active_count = max(0, active_count - 1)
-                replacement_count += 1
-            reserved_new_ids.add(sample_id)
-        return replacement_count
-
-    def _unchanged_active_sample_ids(
-        self,
-        samples: list[Mapping[str, Any]],
-    ) -> set[str]:
-        entries_by_id = self._active_sample_entries_by_id(
-            [
-                str(sample.get("sample_id", "") or "")
-                for sample in samples
-            ]
-        )
-        if not entries_by_id:
-            return set()
-        unchanged: set[str] = set()
-        for sample in samples:
-            sample_id = str(sample.get("sample_id", "") or "")
-            entry = entries_by_id.get(sample_id)
-            if entry is None:
-                continue
-            labels = sample.get("labels") or sample.get("label") or sample.get("target")
-            if not isinstance(labels, Mapping):
-                continue
-            try:
-                existing_labels = self.reader.load_label(
-                    str(entry["label_shard"]),
-                    str(entry["label_key"]),
-                )
-            except Exception:
-                continue
-            if _stable_json(existing_labels) == _stable_json(_labels_from_result(labels)):
-                unchanged.add(sample_id)
-        return unchanged
-
-    def _trim_to_capacity(self) -> int:
-        if self.max_active_samples is None:
-            return 0
-        replacement_count = 0
-        while self._active_sample_count() > int(self.max_active_samples):
-            victim = self.select_victim_for_new_sample({}, force=True)
-            if victim is None:
-                break
-            if not self.deactivate_sample(victim):
-                break
-            replacement_count += 1
-        return replacement_count
-
-    def _prepare_db_rows(
-        self,
-        samples: list[Mapping[str, Any]],
-        *,
-        feature_shard: str,
-        label_shard: str,
-    ) -> list[tuple[Any, ...]]:
-        rows = []
-        for sample in samples:
-            sample_id = str(sample["sample_id"])
-            labels = _labels_from_result(sample.get("labels"))
-            class_counts = _class_counts(labels)
-            rows.append(
-                (
-                    sample_id,
-                    feature_shard,
-                    sample_id,
-                    label_shard,
-                    sample_id,
-                    _object_count(labels),
-                    _stable_json(class_counts),
-                    _dominant_class(class_counts),
-                    _created_at_text(sample.get("created_at")),
-                    1,
-                )
-            )
-        return rows
-
-    def append_feature_label_shard(self, samples: list[Mapping[str, Any]]) -> int:
-        prepared = []
-        for sample in samples:
-            if not sample.get("sample_id"):
-                continue
-            feature_record = (
-                sample.get("feature_record")
-                or sample.get("record")
-                or sample.get("feature")
-            )
-            labels = (
-                sample.get("labels")
-                or sample.get("label")
-                or sample.get("target")
-            )
-            if not isinstance(feature_record, Mapping) or not isinstance(labels, Mapping):
-                continue
-            sample_id = str(sample["sample_id"])
-            prepared.append(
+    def load_active_samples_for_rebuild(self) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        for entry in self.list_active_samples():
+            record = self.reader.read(entry)
+            feature_record = dict(record.feature_record)
+            samples.append(
                 {
-                    "sample_id": sample_id,
-                    "feature_record": _sanitize_feature_record(feature_record),
-                    "labels": _labels_from_result(labels),
-                    "created_at": _created_at_text(sample.get("created_at")),
+                    "sample_id": record.sample_id,
+                    "feature_record": feature_record,
+                    "feature": feature_record.get("feature"),
+                    "labels": record.labels,
+                    "contract_id": entry.get("contract_id") or feature_record.get("contract_id"),
+                    "split_config_id": entry.get("split_config_id"),
+                    "front_version": entry.get("front_version"),
+                    "feature_layout_id": entry.get("feature_layout_id"),
+                    "sample_source": entry.get("sample_source"),
+                    "label_source": entry.get("label_source"),
+                    "input_tensor_shape": entry.get("input_tensor_shape"),
+                    "input_resize_mode": entry.get("input_resize_mode"),
+                    "created_at": entry.get("created_at"),
+                    "quality_score": entry.get("quality_score"),
+                    "risk_score": entry.get("risk_score"),
+                    "in_drift_window": entry.get("in_drift_window"),
+                    "window_id": entry.get("window_id"),
                 }
             )
-        if not prepared:
-            return 0
+        return samples
 
-        feature_shard = _normalise_relpath(
-            os.path.join("features", self._next_shard_name("feature_shard", ".pt"))
+    def _candidate_to_canonical_record(
+        self,
+        candidate: Mapping[str, Any],
+        *,
+        split_contract: SplitRuntimeContract,
+    ) -> CanonicalSampleRecord:
+        sample_id = str(candidate.get("sample_id", "") or "").strip()
+        if not sample_id:
+            raise ValueError("Canonical sample is missing sample_id.")
+        feature = _feature_tensors_from_candidate(candidate)
+        labels = _labels_with_default_metadata(
+            candidate.get("labels") or {},
+            input_tensor_shape=list(split_contract.input_tensor_shape),
+            input_resize_mode=split_contract.input_resize_mode,
         )
-        label_shard = _normalise_relpath(
-            os.path.join("labels", self._next_shard_name("label_shard", ".jsonl"))
+        class_counts = _class_counts(labels)
+        object_count = _object_count(labels)
+        sample_source = str(candidate.get("sample_source") or "high_quality")
+        label_source = str(
+            candidate.get("label_source")
+            or ("teacher" if sample_source == "low_quality" else "edge_pseudo")
         )
-        feature_payload = {
-            "schema_version": 1,
-            "samples": {
-                sample["sample_id"]: _feature_sample_from_record(sample["feature_record"])
-                for sample in prepared
-            }
+        input_tensor_shape = [
+            int(dim)
+            for dim in list(candidate.get("input_tensor_shape") or split_contract.input_tensor_shape)
+        ]
+        input_resize_mode = str(
+            candidate.get("input_resize_mode") or split_contract.input_resize_mode
+        )
+        feature_layout = feature_layout_from_tensors(feature)
+        return CanonicalSampleRecord(
+            sample_id=sample_id,
+            contract_id=str(candidate.get("contract_id") or split_contract.contract_id),
+            split_config_id=str(candidate.get("split_config_id") or split_contract.split_config_id),
+            front_version=str(candidate.get("front_version") or split_contract.front_version),
+            feature_layout_id=str(
+                candidate.get("feature_layout_id")
+                or hashlib.sha1(_stable_json(feature_layout).encode("utf-8")).hexdigest()
+            ),
+            sample_source=sample_source,
+            label_source=label_source,
+            feature=feature,
+            labels=labels,
+            input_tensor_shape=input_tensor_shape,
+            input_resize_mode=input_resize_mode,
+            created_at=_created_at_text(candidate.get("created_at")),
+            quality_score=_to_float(candidate.get("quality_score"), 0.0),
+            risk_score=_to_float(candidate.get("risk_score"), 0.0),
+            object_count=object_count,
+            class_counts=class_counts,
+            in_drift_window=(
+                None
+                if candidate.get("in_drift_window") is None
+                else bool(candidate.get("in_drift_window"))
+            ),
+            window_id=(
+                None
+                if candidate.get("window_id") is None
+                else str(candidate.get("window_id"))
+            ),
+            source_staging_path=(
+                None
+                if candidate.get("__staging_path") is None
+                else str(candidate.get("__staging_path"))
+            ),
+        )
+
+    def _validate_canonical_record(
+        self,
+        record: CanonicalSampleRecord,
+        *,
+        split_contract: SplitRuntimeContract,
+    ) -> str | None:
+        if record.contract_id != split_contract.contract_id:
+            return "skipped_stale_contract"
+        if record.split_config_id != split_contract.split_config_id:
+            return "skipped_stale_contract"
+        if record.front_version != split_contract.front_version:
+            return "skipped_stale_contract"
+        if record.feature_layout_id != split_contract.feature_layout_id:
+            return "skipped_feature_layout"
+        try:
+            if feature_layout_from_tensors(record.feature) != split_contract.feature_layout:
+                return "skipped_feature_layout"
+        except Exception:
+            return "skipped_feature_layout"
+        model_input_size = (
+            (int(split_contract.input_tensor_shape[-2]), int(split_contract.input_tensor_shape[-1]))
+            if len(split_contract.input_tensor_shape) >= 3
+            else None
+        )
+        metadata_ok, _metadata_reason = _pool_label_metadata_is_compatible(
+            record.labels,
+            model_input_size=model_input_size,
+            input_resize_mode=split_contract.input_resize_mode,
+        )
+        if not metadata_ok:
+            return "skipped_label_metadata"
+        if not _labels_are_structurally_valid(record.labels):
+            return "skipped_label_metadata"
+        if not _labels_fit_model_input(record.labels, model_input_size=model_input_size):
+            return "skipped_label_bounds"
+        return None
+
+    @staticmethod
+    def _record_keep_score(
+        record: CanonicalSampleRecord,
+        *,
+        rarity_by_class: Mapping[str, float],
+        newest_created_at: float,
+    ) -> float:
+        is_teacher_labeled = 1.0 if record.label_source == "teacher" else 0.0
+        is_edge_pseudo = 1.0 if record.label_source == "edge_pseudo" else 0.0
+        in_drift_window = 1.0 if bool(record.in_drift_window) else 0.0
+        class_rarity_score = 0.0
+        if record.class_counts:
+            class_rarity_score = max(
+                float(rarity_by_class.get(str(label), 0.0))
+                for label in record.class_counts
+            )
+        created_at = _created_at_sort_value(record.created_at)
+        recency_score = 0.0 if newest_created_at <= 0 else min(1.0, created_at / newest_created_at)
+        return (
+            2.0 * is_teacher_labeled
+            + 1.5 * in_drift_window
+            + 1.0 * max(0.0, min(1.0, float(record.risk_score)))
+            + 0.8 * class_rarity_score
+            + 0.3 * recency_score
+            - 0.5 * is_edge_pseudo
+        )
+
+    def _select_records(
+        self,
+        records: list[CanonicalSampleRecord],
+        *,
+        max_samples: int | None,
+    ) -> tuple[list[CanonicalSampleRecord], list[CanonicalSampleRecord]]:
+        if not records:
+            return [], []
+        aggregate_counts: dict[str, int] = {}
+        for record in records:
+            for label, count in record.class_counts.items():
+                aggregate_counts[str(label)] = aggregate_counts.get(str(label), 0) + int(count)
+        rarity_by_class = {
+            label: 1.0 / float(max(1, count))
+            for label, count in aggregate_counts.items()
         }
-        label_payload = "\n".join(
-            json.dumps(
-                {
-                    "sample_id": sample["sample_id"],
-                    "boxes": list(sample["labels"].get("boxes") or []),
-                    "labels": list(sample["labels"].get("labels") or []),
-                    **(
-                        {"scores": list(sample["labels"].get("scores") or [])}
-                        if sample["labels"].get("scores") is not None
-                        else {}
-                    ),
+        newest_created_at = max(_created_at_sort_value(record.created_at) for record in records)
+
+        best_by_id: dict[str, tuple[float, CanonicalSampleRecord]] = {}
+        for record in records:
+            score = self._record_keep_score(
+                record,
+                rarity_by_class=rarity_by_class,
+                newest_created_at=newest_created_at,
+            )
+            current = best_by_id.get(record.sample_id)
+            if current is None or (score, _created_at_sort_value(record.created_at)) > (
+                current[0],
+                _created_at_sort_value(current[1].created_at),
+            ):
+                best_by_id[record.sample_id] = (score, record)
+
+        scored = sorted(
+            best_by_id.values(),
+            key=lambda item: (
+                -item[0],
+                -_created_at_sort_value(item[1].created_at),
+                item[1].sample_id,
+            ),
+        )
+        limit = (
+            max_samples
+            if max_samples is not None
+            else self.max_active_samples
+        )
+        if limit in (None, "", 0):
+            kept = [record for _score, record in scored]
+            return kept, []
+        kept_pairs = scored[: int(limit)]
+        dropped_pairs = scored[int(limit):]
+        kept_ids = {record.sample_id for _score, record in kept_pairs}
+        dropped = [record for _score, record in dropped_pairs]
+        for _score, record in scored:
+            if record.sample_id not in kept_ids and record not in dropped:
+                dropped.append(record)
+        return [record for _score, record in kept_pairs], dropped
+
+    def _next_generation_id(self) -> str:
+        existing_numbers: list[int] = []
+        if os.path.isdir(self.generations_dir):
+            for name in os.listdir(self.generations_dir):
+                if not name.startswith("gen_"):
+                    continue
+                try:
+                    existing_numbers.append(int(name.split("_", 1)[1]))
+                except (IndexError, ValueError):
+                    continue
+        return f"gen_{(max(existing_numbers) if existing_numbers else 0) + 1:06d}"
+
+    def _commit_generation(
+        self,
+        records: list[CanonicalSampleRecord],
+        *,
+        split_contract: SplitRuntimeContract,
+        stats: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        generation_id = self._next_generation_id()
+        tmp_id = f"gen_tmp_{int(time.time() * 1000)}_{threading.get_ident()}"
+        tmp_dir = os.path.join(self.generations_dir, tmp_id)
+        final_dir = os.path.join(self.generations_dir, generation_id)
+        features_dir = os.path.join(tmp_dir, "features")
+        labels_dir = os.path.join(tmp_dir, "labels")
+        os.makedirs(features_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+
+        index_records: list[dict[str, Any]] = []
+        for record in records:
+            stem = _sample_file_stem(record.sample_id)
+            feature_relpath = _normalise_relpath(os.path.join("features", f"{stem}.pt"))
+            label_relpath = _normalise_relpath(os.path.join("labels", f"{stem}.json"))
+            _atomic_torch_save(
+                record.to_feature_payload(),
+                _resolve_relpath(tmp_dir, feature_relpath),
+            )
+            _atomic_json_dump(
+                _resolve_relpath(tmp_dir, label_relpath),
+                record.to_label_payload(),
+            )
+            index_records.append(
+                record.to_index_record(
+                    feature_relpath=feature_relpath,
+                    label_relpath=label_relpath,
+                    generation_id=generation_id,
+                )
+            )
+
+        samples_payload = "".join(
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+            for record in index_records
+        )
+        _atomic_text_write(self._generation_samples_path(tmp_dir), samples_payload)
+
+        high_quality_count = sum(1 for record in records if record.sample_source == "high_quality")
+        low_quality_count = sum(1 for record in records if record.sample_source == "low_quality")
+        teacher_labeled_count = sum(1 for record in records if record.label_source == "teacher")
+        pseudo_labeled_count = sum(1 for record in records if record.label_source == "edge_pseudo")
+        manifest = {
+            "schema_version": _GENERATION_MANIFEST_VERSION,
+            "contract_id": split_contract.contract_id,
+            "split_config_id": split_contract.split_config_id,
+            "front_version": split_contract.front_version,
+            "feature_layout_id": split_contract.feature_layout_id,
+            "model_id": split_contract.model_id,
+            "edge_id": split_contract.edge_id,
+            "generation_id": generation_id,
+            "created_at": _created_at_text(),
+            "sample_count": len(records),
+            "high_quality_count": high_quality_count,
+            "low_quality_count": low_quality_count,
+            "teacher_labeled_count": teacher_labeled_count,
+            "pseudo_labeled_count": pseudo_labeled_count,
+        }
+        _atomic_json_dump(os.path.join(tmp_dir, "pool_manifest.json"), manifest)
+        _atomic_json_dump(os.path.join(tmp_dir, "stats.json"), dict(stats))
+
+        if os.path.exists(final_dir):
+            shutil.rmtree(final_dir)
+        os.rename(tmp_dir, final_dir)
+        _atomic_json_dump(
+            self.current_path,
+            {
+                "generation_id": generation_id,
+                "created_at": manifest["created_at"],
+                "manifest": manifest,
+            },
+        )
+
+        deleted_old_generations = 0
+        deleted_orphan_feature_files = 0
+        deleted_orphan_label_files = 0
+        for name in sorted(os.listdir(self.generations_dir)):
+            path = os.path.join(self.generations_dir, name)
+            if name == generation_id or not os.path.isdir(path):
+                continue
+            feature_dir = os.path.join(path, "features")
+            label_dir = os.path.join(path, "labels")
+            if os.path.isdir(feature_dir):
+                deleted_orphan_feature_files += len(os.listdir(feature_dir))
+            if os.path.isdir(label_dir):
+                deleted_orphan_label_files += len(os.listdir(label_dir))
+            shutil.rmtree(path, ignore_errors=True)
+            deleted_old_generations += 1
+
+        self.reader = FeatureLabelShardReader(self.root_dir)
+        commit_stats = {
+            "generation": generation_id,
+            "active": len(records),
+            "high_quality": high_quality_count,
+            "low_quality": low_quality_count,
+            "teacher_labeled": teacher_labeled_count,
+            "pseudo_labeled": pseudo_labeled_count,
+            "deleted_old_generations": deleted_old_generations,
+            "deleted_orphan_feature_files": deleted_orphan_feature_files,
+            "deleted_orphan_label_files": deleted_orphan_label_files,
+        }
+        return commit_stats
+
+    def _delete_staging_records(self, records: list[CanonicalSampleRecord]) -> int:
+        deleted = 0
+        seen_paths = {
+            record.source_staging_path
+            for record in records
+            if record.source_staging_path
+        }
+        for path in seen_paths:
+            try:
+                os.remove(str(path))
+                deleted += 1
+            except OSError:
+                pass
+        return deleted
+
+    @staticmethod
+    def _delete_staging_paths(paths: list[str]) -> int:
+        deleted = 0
+        for path in sorted({str(path) for path in paths if str(path)}):
+            try:
+                os.remove(str(path))
+                deleted += 1
+            except OSError:
+                pass
+        return deleted
+
+    def rebuild_canonical_training_pool(
+        self,
+        *,
+        split_contract: SplitRuntimeContract,
+        existing_active_samples: list[Mapping[str, Any]],
+        pending_high_quality_samples: list[Mapping[str, Any]],
+        new_low_quality_samples: list[Mapping[str, Any]],
+        max_samples: int | None = None,
+    ) -> tuple[dict[str, Any], list[CanonicalSampleRecord]]:
+        with self._lock:
+            validation_counts = {
+                "accepted_high_quality": 0,
+                "accepted_low_quality": 0,
+                "skipped_stale_contract": 0,
+                "skipped_feature_layout": 0,
+                "skipped_label_bounds": 0,
+                "skipped_label_metadata": 0,
+                "skipped_unreadable": 0,
+            }
+            validation_previews: dict[str, list[str]] = {
+                key: []
+                for key in validation_counts
+                if key.startswith("skipped_")
+            }
+            accepted: list[CanonicalSampleRecord] = []
+            invalid_records: list[CanonicalSampleRecord] = []
+            consumed_staging_paths: list[str] = []
+            all_inputs = (
+                list(existing_active_samples or [])
+                + list(pending_high_quality_samples or [])
+                + list(new_low_quality_samples or [])
+            )
+            for candidate in all_inputs:
+                sample_id = str(candidate.get("sample_id", "") or "")
+                if candidate.get("__staging_path"):
+                    consumed_staging_paths.append(str(candidate.get("__staging_path")))
+                try:
+                    record = self._candidate_to_canonical_record(
+                        candidate,
+                        split_contract=split_contract,
+                    )
+                except Exception:
+                    validation_counts["skipped_unreadable"] += 1
+                    validation_previews["skipped_unreadable"].append(sample_id)
+                    continue
+                skip_reason = self._validate_canonical_record(
+                    record,
+                    split_contract=split_contract,
+                )
+                if skip_reason is not None:
+                    validation_counts[skip_reason] += 1
+                    validation_previews[skip_reason].append(record.sample_id)
+                    invalid_records.append(record)
+                    continue
+                if record.sample_source == "low_quality":
+                    validation_counts["accepted_low_quality"] += 1
+                else:
+                    validation_counts["accepted_high_quality"] += 1
+                accepted.append(record)
+
+            kept, dropped = self._select_records(
+                accepted,
+                max_samples=max_samples,
+            )
+            replacement_stats = {
+                "before": len(existing_active_samples or []),
+                "incoming": len(pending_high_quality_samples or [])
+                + len(new_low_quality_samples or []),
+                "kept": len(kept),
+                "dropped": len(dropped) + len(invalid_records),
+                "dropped_high_quality": sum(
+                    1 for record in dropped if record.sample_source == "high_quality"
+                ),
+                "dropped_low_quality": sum(
+                    1 for record in dropped if record.sample_source == "low_quality"
+                ),
+                "dropped_stale": validation_counts["skipped_stale_contract"],
+                "dropped_invalid": sum(
+                    int(validation_counts[key])
+                    for key in (
+                        "skipped_feature_layout",
+                        "skipped_label_bounds",
+                        "skipped_label_metadata",
+                        "skipped_unreadable",
+                    )
+                ),
+            }
+            stats = {
+                "validation": {
+                    **validation_counts,
                     **{
-                        field_name: sample["labels"][field_name]
-                        for field_name in sorted(_LABEL_METADATA_FIELDS)
-                        if sample["labels"].get(field_name) is not None
+                        f"{key}_preview": value[:10]
+                        for key, value in validation_previews.items()
                     },
                 },
-                sort_keys=True,
-                separators=(",", ":"),
+                "replacement": replacement_stats,
+            }
+            commit_stats = self._commit_generation(
+                kept,
+                split_contract=split_contract,
+                stats=stats,
             )
-            for sample in prepared
-        )
-        if label_payload:
-            label_payload += "\n"
-        rows = self._prepare_db_rows(
-            prepared,
-            feature_shard=feature_shard,
-            label_shard=label_shard,
-        )
-        with self._lock:
-            _atomic_torch_save(feature_payload, _resolve_relpath(self.root_dir, feature_shard))
-            _atomic_text_write(_resolve_relpath(self.root_dir, label_shard), label_payload)
-            with self._connection() as connection:
-                connection.executemany(
-                    """
-                    INSERT OR REPLACE INTO samples (
-                        sample_id, feature_shard, feature_key, label_shard, label_key,
-                        object_count, class_counts_json, dominant_class, created_at, active
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
-        self.rebuild_replacement_index()
-        return len(prepared)
+            processed_count = self._delete_staging_records(kept + dropped + invalid_records)
+            processed_count += self._delete_staging_paths(consumed_staging_paths)
+            stats["generation_commit"] = {
+                **commit_stats,
+                "deleted_processed_staging_files": processed_count,
+            }
+            return stats, kept
 
+    # Compatibility shims intentionally commit through the canonical generation path.
     def add_trainable_sample(
         self,
         sample: Mapping[str, Any] | None = None,
         **sample_fields: Any,
     ) -> str:
-        payload = dict(sample or {})
-        payload.update(sample_fields)
-        sample_id = str(payload["sample_id"])
-        self._enforce_capacity_for_pending([payload])
-        self.append_feature_label_shard([payload])
-        self._trim_to_capacity()
-        return sample_id
+        raise RuntimeError(
+            "CloudSamplePool.add_trainable_sample is no longer a training-pool "
+            "write path; stage samples and rebuild a canonical generation instead."
+        )
 
     def ingest_low_quality_processed_samples(
         self,
@@ -859,71 +1237,16 @@ class CloudSamplePool:
         *,
         skip_unchanged_existing: bool = False,
     ) -> int:
-        pending: list[Mapping[str, Any]] = []
-        for sample in samples:
-            sample_id = str(sample.get("sample_id", "") or "")
-            if not sample_id:
-                continue
-            pending.append(sample)
-        unchanged_existing = (
-            self._unchanged_active_sample_ids(pending)
-            if skip_unchanged_existing
-            else set()
-        )
-        if unchanged_existing:
-            pending = [
-                sample
-                for sample in pending
-                if str(sample.get("sample_id", "") or "") not in unchanged_existing
-            ]
-        self._enforce_capacity_for_pending(pending)
-        added = 0
-        for offset in range(0, len(pending), self.shard_size):
-            added += self.append_feature_label_shard(
-                list(pending[offset:offset + self.shard_size])
-            )
-        self._trim_to_capacity()
-        return added + len(unchanged_existing)
+        stats = self.stage_low_quality_samples(samples)
+        return int(stats.get("accepted_to_staging", 0))
 
     def maybe_compact(self, *, force: bool = False) -> bool:
-        with self._connection() as connection:
-            active_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM samples WHERE active = 1"
-                ).fetchone()[0]
-            )
-            inactive_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM samples WHERE active = 0"
-                ).fetchone()[0]
-            )
-        if inactive_count <= 0:
-            return False
-        if not force and inactive_count < max(64, active_count):
-            return False
-        active_entries = self.list_active_samples()
-        active_samples = []
-        for entry in active_entries:
-            record = self.reader.read(entry)
-            active_samples.append(
-                {
-                    "sample_id": record.sample_id,
-                    "feature_record": record.feature_record,
-                    "labels": record.labels,
-                    "created_at": _created_at_text(entry.get("created_at")),
-                }
-            )
-        old_feature_dir = self.feature_dir
-        old_label_dir = self.label_dir
-        with self._lock:
-            for directory in (old_feature_dir, old_label_dir):
-                shutil.rmtree(directory, ignore_errors=True)
-                os.makedirs(directory, exist_ok=True)
-            with self._connection() as connection:
-                connection.execute("DELETE FROM samples")
-            self.reader = FeatureLabelShardReader(
-                self.root_dir,
-                cache_size=self.reader.cache_size,
-            )
-            self.append_feature_label_shard(active_samples)
-        return True
+        return False
+
+
+__all__ = [
+    "CanonicalSampleRecord",
+    "CloudSamplePool",
+    "FeatureLabelRecord",
+    "FeatureLabelShardReader",
+]

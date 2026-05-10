@@ -80,7 +80,9 @@ from model_management.payload import BoundaryPayload, boundary_payload_from_tens
 from model_management.fixed_split import canonical_split_key_for_candidate
 from model_management.split_contract import (
     SplitRuntimeContract,
+    contract_path,
     feature_layout_from_tensors,
+    feature_layout_id as make_feature_layout_id,
     normalise_feature_tensors,
 )
 from torchvision.models.detection.image_list import ImageList
@@ -1938,6 +1940,19 @@ class CloudContinualLearner:
             )
         )
         os.makedirs(self.sample_pool_root, exist_ok=True)
+        self.sample_pool_staging_root = os.path.abspath(
+            str(
+                getattr(
+                    sample_pool_cfg,
+                    "staging_root",
+                    os.path.join(
+                        os.path.dirname(self.sample_pool_root),
+                        "cloud_sample_staging",
+                    ),
+                )
+            )
+        )
+        os.makedirs(self.sample_pool_staging_root, exist_ok=True)
         self.split_contract_root = os.path.abspath(
             str(
                 getattr(
@@ -2090,6 +2105,30 @@ class CloudContinualLearner:
             _sanitize_cache_segment(split_key),
         )
 
+    def _cloud_sample_staging_path(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+    ) -> str:
+        context = self._sample_pool_manifest_context(manifest)
+        split_key = str(context.get("split_config_id", "") or "").strip()
+        if not split_key:
+            split_key = _json_fingerprint(
+                {
+                    "canonical_split_key": context.get("canonical_split_key"),
+                    "boundary_tensor_labels": list(
+                        context.get("boundary_tensor_labels", []) or []
+                    ),
+                }
+            )[:16]
+        return os.path.join(
+            self.sample_pool_staging_root,
+            f"edge_{_sanitize_cache_segment(edge_id)}",
+            _sanitize_cache_segment(context.get("model_id") or "unknown_model"),
+            _sanitize_cache_segment(split_key),
+        )
+
     def _cloud_sample_pool_for_manifest(
         self,
         *,
@@ -2102,6 +2141,8 @@ class CloudContinualLearner:
             model_id=str(context.get("model_id", "") or ""),
             front_version=str(context.get("front_version", "") or "0"),
             split_config_id=str(context.get("split_config_id", "") or ""),
+            edge_id=edge_id,
+            staging_root=self._cloud_sample_staging_path(edge_id=edge_id, manifest=manifest),
             boundary_tensor_labels=list(
                 context.get("boundary_tensor_labels", []) or []
             ),
@@ -2190,16 +2231,22 @@ class CloudContinualLearner:
             return None
         canonical_from_context = str(context.get("canonical_split_key") or "").strip()
         if canonical_from_context and canonical_from_context != existing.canonical_split_key:
-            raise RuntimeError(
-                "SplitRuntimeContract mismatch for canonical_split_key: "
-                f"existing={existing.canonical_split_key!r}, incoming={canonical_from_context!r}."
+            logger.info(
+                "[FixedSplitCL] Ignoring stale SplitRuntimeContract for sync/read: "
+                "existing canonical_split_key={!r}, incoming={!r}.",
+                existing.canonical_split_key,
+                canonical_from_context,
             )
+            return None
         front_from_context = str(context.get("front_version") or "0")
         if front_from_context != existing.front_version:
-            raise RuntimeError(
-                "SplitRuntimeContract mismatch for front_version: "
-                f"existing={existing.front_version!r}, incoming={front_from_context!r}."
+            logger.info(
+                "[FixedSplitCL] Ignoring stale SplitRuntimeContract for sync/read: "
+                "existing front_version={!r}, incoming={!r}.",
+                existing.front_version,
+                front_from_context,
             )
+            return None
         return existing
 
     @staticmethod
@@ -2216,6 +2263,97 @@ class CloudContinualLearner:
             or getattr(runtime, "split_id", "")
             or canonical_split_key
         )
+
+    def _stale_split_contract_path(
+        self,
+        *,
+        edge_id: int | str,
+        model_id: str,
+        split_config_id: str,
+    ) -> str:
+        source_path = contract_path(
+            self.split_contract_root,
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+        )
+        stale_dir = os.path.join(
+            self.split_contract_root,
+            "stale",
+            f"edge_{_sanitize_cache_segment(edge_id)}",
+            _sanitize_cache_segment(model_id),
+        )
+        os.makedirs(stale_dir, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        return source_path, os.path.join(
+            stale_dir,
+            f"{_sanitize_cache_segment(split_config_id)}.{stamp}.json",
+        )
+
+    def _move_stale_split_runtime_contract(
+        self,
+        *,
+        edge_id: int | str,
+        model_id: str,
+        split_config_id: str,
+        reason: str,
+    ) -> bool:
+        source_path, stale_path = self._stale_split_contract_path(
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+        )
+        if not os.path.exists(source_path):
+            return False
+        shutil.move(source_path, stale_path)
+        logger.info(
+            "[FixedSplitCL] Moved stale SplitRuntimeContract to {} reason={}.",
+            stale_path,
+            reason,
+        )
+        return True
+
+    def _runtime_identity_for_contract(
+        self,
+        *,
+        manifest: Mapping[str, object],
+        splitter: UniversalModelSplitter,
+        cloud_batch_split_id: str,
+        feature_layout_id: str,
+    ) -> dict[str, object]:
+        context = self._sample_pool_manifest_context(manifest)
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        runtime = getattr(splitter, "runtime", splitter)
+        dynamic_batch = _splitter_dynamic_batch_range(splitter)
+        trace_plan = getattr(runtime, "trace_plan", None)
+        symbolic_schema = getattr(runtime, "symbolic_input_schema", None)
+        return {
+            "model_id": str(context.get("model_id") or self.edge_model_name),
+            "front_version": str(context.get("front_version") or "0"),
+            "split_config_id": str(context.get("split_config_id") or ""),
+            "canonical_split_key": str(context.get("canonical_split_key") or ""),
+            "cloud_batch_split_id": str(cloud_batch_split_id),
+            "input_tensor_shape": [
+                int(dim) for dim in list(context.get("input_tensor_shape", []) or [])
+            ],
+            "input_resize_mode": str(context.get("input_resize_mode") or "direct_resize"),
+            "runtime_version": str(
+                getattr(runtime, "runtime_version", None)
+                or getattr(runtime, "version", None)
+                or type(runtime).__name__
+            ),
+            "adapter_version": str(getattr(runtime, "adapter_version", "") or ""),
+            "split_plan_hash": _json_fingerprint(split_plan),
+            "symbolic_input_schema_hash": _json_fingerprint(symbolic_schema or {}),
+            "dynamic_batch": (
+                [int(dynamic_batch[0]), int(dynamic_batch[1])]
+                if dynamic_batch is not None
+                else None
+            ),
+            "trace_batch_size": getattr(runtime, "trace_batch_size", None),
+            "mode": str(getattr(runtime, "mode", "") or ""),
+            "feature_layout_id": str(feature_layout_id),
+        }
 
     def _get_or_create_split_runtime_contract(
         self,
@@ -2234,21 +2372,35 @@ class CloudContinualLearner:
         split_config_id = str(context.get("split_config_id") or "").strip()
         if not split_config_id:
             raise RuntimeError("SplitRuntimeContract requires split_config_id.")
-        existing = self._load_split_runtime_contract(edge_id=edge_id, manifest=manifest)
+        existing = SplitRuntimeContract.load(
+            self.split_contract_root,
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+        )
+        stale_replaced = False
         if existing is not None:
-            if create_if_missing and splitter is not None and candidate is not None:
+            stale_reason = None
+            canonical_from_context = str(context.get("canonical_split_key") or "").strip()
+            front_from_context = str(context.get("front_version") or "0")
+            if canonical_from_context and canonical_from_context != existing.canonical_split_key:
+                stale_reason = "canonical_split_key"
+            elif front_from_context != existing.front_version:
+                stale_reason = "front_version"
+            if (
+                stale_reason is None
+                and create_if_missing
+                and splitter is not None
+                and candidate is not None
+            ):
                 runtime_split_id = self._candidate_cloud_batch_split_id(
                     splitter=splitter,
                     candidate=candidate,
                     canonical_split_key=existing.canonical_split_key,
                 )
                 if runtime_split_id != existing.cloud_batch_split_id:
-                    raise RuntimeError(
-                        "SplitRuntimeContract mismatch for cloud_batch_split_id: "
-                        f"existing={existing.cloud_batch_split_id!r}, "
-                        f"training_runtime={runtime_split_id!r}."
-                    )
-                layout_tensors = self._contract_layout_tensors_from_runtime(
+                    stale_reason = "cloud_batch_split_id"
+                layout_tensors_for_existing = self._contract_layout_tensors_from_runtime(
                     splitter=splitter,
                     candidate=candidate,
                     input_tensor_shape=[
@@ -2257,15 +2409,33 @@ class CloudContinualLearner:
                     ],
                 )
                 if (
-                    layout_tensors is not None
-                    and feature_layout_from_tensors(layout_tensors) != existing.feature_layout
+                    stale_reason is None
+                    and layout_tensors_for_existing is not None
+                    and feature_layout_from_tensors(layout_tensors_for_existing)
+                    != existing.feature_layout
                 ):
-                    raise RuntimeError(
-                        "SplitRuntimeContract feature layout does not match the "
-                        "training runtime boundary layout. Clear stale split_contracts "
-                        "or bump front_version before retraining."
+                    stale_reason = "feature_layout"
+                if stale_reason is None and layout_tensors_for_existing is not None:
+                    runtime_identity = self._runtime_identity_for_contract(
+                        manifest=manifest,
+                        splitter=splitter,
+                        cloud_batch_split_id=runtime_split_id,
+                        feature_layout_id=existing.feature_layout_id,
                     )
-            return existing
+                    if _stable_json_dumps(runtime_identity) != _stable_json_dumps(
+                        existing.runtime_identity
+                    ):
+                        stale_reason = "runtime_identity"
+            if stale_reason is not None:
+                stale_replaced = self._move_stale_split_runtime_contract(
+                    edge_id=edge_id,
+                    model_id=model_id,
+                    split_config_id=split_config_id,
+                    reason=stale_reason,
+                )
+                existing = None
+            else:
+                return existing
 
         if not create_if_missing:
             raise RuntimeError(
@@ -2276,7 +2446,7 @@ class CloudContinualLearner:
         bundle_model_version = str(
             dict(manifest.get("model", {}) or {}).get("model_version", "0") or "0"
         )
-        if front_version == "0" and bundle_model_version != "0":
+        if front_version == "0" and bundle_model_version != "0" and not stale_replaced:
             raise RuntimeError(
                 "SplitRuntimeContract for front_version=0 must be created from "
                 "native pretrained model_version=0, not tail checkpoint "
@@ -2329,6 +2499,19 @@ class CloudContinualLearner:
             candidate=batch_candidate,
             input_tensor_shape=[int(dim) for dim in list(context.get("input_tensor_shape", []) or [])],
         )
+        contract_feature_tensors = layout_tensors or feature_tensors
+        if contract_feature_tensors is None:
+            raise RuntimeError(
+                "SplitRuntimeContract creation requires a representative feature tensor."
+            )
+        contract_layout = feature_layout_from_tensors(contract_feature_tensors)
+        contract_layout_id = runtime_identity_id(contract_layout)
+        runtime_identity = self._runtime_identity_for_contract(
+            manifest=manifest,
+            splitter=splitter,
+            cloud_batch_split_id=cloud_batch_split_id,
+            feature_layout_id=contract_layout_id,
+        )
         edge_split_id = str(context.get("edge_split_id") or canonical_split_key)
         boundary_tensor_labels = list(
             getattr(batch_candidate, "boundary_tensor_labels", None)
@@ -2346,9 +2529,10 @@ class CloudContinualLearner:
             input_resize_mode=str(context.get("input_resize_mode") or "direct_resize"),
             boundary_tensor_labels=boundary_tensor_labels,
             front_version=str(context.get("front_version") or "0"),
-            feature_tensors=layout_tensors or feature_tensors,
+            feature_tensors=contract_feature_tensors,
             tail_version=str(dict(manifest.get("model", {}) or {}).get("model_version", "") or "")
             or None,
+            runtime_identity=runtime_identity,
         )
         path = contract.save(self.split_contract_root)
         logger.info(

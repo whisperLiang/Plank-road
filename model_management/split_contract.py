@@ -10,7 +10,7 @@ from typing import Any, Mapping
 import torch
 
 
-SPLIT_RUNTIME_CONTRACT_VERSION = "split-runtime-contract.v1"
+SPLIT_RUNTIME_CONTRACT_VERSION = "split-runtime-contract.v2"
 
 
 def _stable_json(payload: object) -> str:
@@ -103,6 +103,49 @@ def feature_layout_id(layout: Mapping[str, Mapping[str, Any]]) -> str:
     return hashlib.sha1(_stable_json(layout).encode("utf-8")).hexdigest()
 
 
+def runtime_identity_id(identity: Mapping[str, Any]) -> str:
+    return hashlib.sha1(_stable_json(dict(identity)).encode("utf-8")).hexdigest()
+
+
+def _runtime_identity_payload(
+    *,
+    model_id: str,
+    front_version: str,
+    split_config_id: str,
+    canonical_split_key: str,
+    cloud_batch_split_id: str,
+    input_tensor_shape: list[int],
+    input_resize_mode: str,
+    feature_layout_id_value: str,
+    runtime_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "model_id": str(model_id),
+        "front_version": str(front_version or "0"),
+        "split_config_id": str(split_config_id),
+        "canonical_split_key": str(canonical_split_key),
+        "cloud_batch_split_id": str(cloud_batch_split_id),
+        "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
+        "input_resize_mode": str(input_resize_mode or "direct_resize"),
+        "runtime_version": "",
+        "adapter_version": "",
+        "split_plan_hash": "",
+        "symbolic_input_schema_hash": "",
+        "dynamic_batch": None,
+        "trace_batch_size": None,
+        "mode": "",
+        "feature_layout_id": str(feature_layout_id_value),
+    }
+    if runtime_identity:
+        payload.update(dict(runtime_identity))
+        payload["input_tensor_shape"] = [
+            int(dim) for dim in list(payload.get("input_tensor_shape") or [])
+        ]
+        payload["input_resize_mode"] = str(payload.get("input_resize_mode") or "direct_resize")
+        payload["feature_layout_id"] = str(feature_layout_id_value)
+    return payload
+
+
 def feature_layout_matches(
     tensors: Mapping[str, torch.Tensor],
     layout: Mapping[str, Mapping[str, Any]],
@@ -114,6 +157,7 @@ def feature_layout_matches(
 @dataclass
 class SplitRuntimeContract:
     contract_version: str
+    contract_id: str
     edge_id: str
     model_id: str
     split_config_id: str
@@ -127,6 +171,7 @@ class SplitRuntimeContract:
     front_version: str
     tail_version: str | None = None
     feature_layout: dict[str, dict[str, Any]] = field(default_factory=dict)
+    runtime_identity: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -144,10 +189,24 @@ class SplitRuntimeContract:
         front_version: str,
         feature_tensors: Mapping[str, torch.Tensor],
         tail_version: str | None = None,
+        runtime_identity: Mapping[str, Any] | None = None,
     ) -> "SplitRuntimeContract":
         layout = feature_layout_from_tensors(feature_tensors)
+        layout_id = feature_layout_id(layout)
+        identity = _runtime_identity_payload(
+            model_id=str(model_id),
+            front_version=str(front_version or "0"),
+            split_config_id=str(split_config_id),
+            canonical_split_key=str(canonical_split_key),
+            cloud_batch_split_id=str(cloud_batch_split_id),
+            input_tensor_shape=[int(dim) for dim in input_tensor_shape],
+            input_resize_mode=str(input_resize_mode or "direct_resize"),
+            feature_layout_id_value=layout_id,
+            runtime_identity=runtime_identity,
+        )
         return cls(
             contract_version=SPLIT_RUNTIME_CONTRACT_VERSION,
+            contract_id=runtime_identity_id(identity),
             edge_id=str(edge_id),
             model_id=str(model_id),
             split_config_id=str(split_config_id),
@@ -157,18 +216,48 @@ class SplitRuntimeContract:
             input_tensor_shape=[int(dim) for dim in input_tensor_shape],
             input_resize_mode=str(input_resize_mode or "direct_resize"),
             boundary_tensor_labels=[str(label) for label in boundary_tensor_labels],
-            feature_layout_id=feature_layout_id(layout),
+            feature_layout_id=layout_id,
             front_version=str(front_version or "0"),
             tail_version=None if tail_version is None else str(tail_version),
             feature_layout=layout,
+            runtime_identity=identity,
         )
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "SplitRuntimeContract":
+        feature_layout_payload = {
+            str(label): dict(spec)
+            for label, spec in dict(payload.get("feature_layout") or {}).items()
+            if isinstance(spec, Mapping)
+        }
+        layout_id = str(
+            payload.get("feature_layout_id")
+            or (
+                feature_layout_id(feature_layout_payload)
+                if feature_layout_payload
+                else ""
+            )
+        )
+        identity = dict(payload.get("runtime_identity") or {})
+        if not identity:
+            identity = _runtime_identity_payload(
+                model_id=str(payload["model_id"]),
+                front_version=str(payload.get("front_version") or "0"),
+                split_config_id=str(payload["split_config_id"]),
+                canonical_split_key=str(payload["canonical_split_key"]),
+                cloud_batch_split_id=str(payload["cloud_batch_split_id"]),
+                input_tensor_shape=[
+                    int(dim) for dim in payload.get("input_tensor_shape", [])
+                ],
+                input_resize_mode=str(payload.get("input_resize_mode") or "direct_resize"),
+                feature_layout_id_value=layout_id,
+                runtime_identity=None,
+            )
         return cls(
             contract_version=str(
                 payload.get("contract_version") or SPLIT_RUNTIME_CONTRACT_VERSION
             ),
+            contract_id=str(payload.get("contract_id") or runtime_identity_id(identity)),
             edge_id=str(payload["edge_id"]),
             model_id=str(payload["model_id"]),
             split_config_id=str(payload["split_config_id"]),
@@ -180,16 +269,13 @@ class SplitRuntimeContract:
             boundary_tensor_labels=[
                 str(label) for label in list(payload.get("boundary_tensor_labels", []) or [])
             ],
-            feature_layout_id=str(payload["feature_layout_id"]),
+            feature_layout_id=layout_id,
             front_version=str(payload.get("front_version") or "0"),
             tail_version=(
                 None if payload.get("tail_version") is None else str(payload.get("tail_version"))
             ),
-            feature_layout={
-                str(label): dict(spec)
-                for label, spec in dict(payload.get("feature_layout") or {}).items()
-                if isinstance(spec, Mapping)
-            },
+            feature_layout=feature_layout_payload,
+            runtime_identity=identity,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -247,4 +333,5 @@ __all__ = [
     "feature_layout_id",
     "feature_layout_matches",
     "normalise_feature_tensors",
+    "runtime_identity_id",
 ]
