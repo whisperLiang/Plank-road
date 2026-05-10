@@ -27,7 +27,6 @@ from cloud_server import _evaluate_detection_proxy_map
 from config import load_runtime_config
 from model_management.fixed_split import (
     SplitConstraints,
-    load_or_compute_fixed_split_plan,
     min_edge_parameters_for_privacy,
 )
 from model_management.model_zoo import (
@@ -55,9 +54,10 @@ from model_management.universal_model_split import (
 )
 
 
-DEFAULT_MODES = ("full", "freeze", "split_cached", "split_rebuild")
-DEFAULT_SAMPLE_COUNTS = (64, 128, 256)
-DEFAULT_EPOCHS = (1, 3, 5, 10, 20)
+DEFAULT_MODES = ("freeze", "split_cached", "split_rebuild")
+DEFAULT_SAMPLE_COUNT = 512
+DEFAULT_EPOCHS = 10
+DEFAULT_REPEATS = 5
 DEFAULT_BOUNDARY_QUANTILES = (0.25, 0.50, 0.75)
 BUCKET_LABELS = ("Early", "Middle", "Late")
 
@@ -71,24 +71,14 @@ class CandidateChoice:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare full, freeze-prefix, and cached split-tail training.",
+        description="Compare freeze-prefix, cached split-tail, and rebuilt split-tail training.",
     )
     parser.add_argument("--yaml-path", default="./config/config.yaml")
     parser.add_argument("--video-path", default="./video_data/road.mp4")
     parser.add_argument("--edge-model", default="rfdetr_nano")
     parser.add_argument("--golden-model", default="rtdetr_x")
-    parser.add_argument(
-        "--sample-counts",
-        nargs="+",
-        type=int,
-        default=list(DEFAULT_SAMPLE_COUNTS),
-    )
-    parser.add_argument(
-        "--epochs",
-        nargs="+",
-        type=int,
-        default=list(DEFAULT_EPOCHS),
-    )
+    parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
         "--boundary-quantiles",
@@ -107,8 +97,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--repeats",
         type=int,
-        default=1,
-        help="Repeat the full experiment with seeds seed+i and aggregate mean/std in plots.",
+        default=DEFAULT_REPEATS,
+        help="Repeat training with fixed sampled frames and run seeds seed+i.",
     )
     parser.add_argument(
         "--device",
@@ -197,6 +187,7 @@ def _aggregate_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
         "feature_reconstruction_time",
         "feature_load_time",
         "training_time",
+        "effective_training_time",
         "epoch_time_mean",
         "batch_time_mean",
         "peak_cuda_memory_allocated",
@@ -296,37 +287,31 @@ def _resolve_local_weights_path(model_name: str) -> str:
 
 def _select_sample_frame_ids(
     total_frames: int,
-    sample_counts: list[int],
+    sample_count: int,
     *,
     seed: int,
-) -> dict[int, list[int]]:
+) -> list[int]:
     if total_frames <= 0:
         raise RuntimeError("Video contains no readable frames.")
-    max_count = max(int(count) for count in sample_counts)
-    if max_count <= 0:
-        raise ValueError("--sample-counts values must be positive.")
-    if max_count > total_frames:
+    sample_count = int(sample_count)
+    if sample_count <= 0:
+        raise ValueError("--sample-count must be positive.")
+    if sample_count > total_frames:
         raise RuntimeError(
-            f"Requested {max_count} samples but video only has {total_frames} frame(s)."
+            f"Requested {sample_count} samples but video only has {total_frames} frame(s)."
         )
 
     rng = np.random.default_rng(int(seed))
     permutation = rng.permutation(np.arange(1, total_frames + 1))
-    selected: dict[int, list[int]] = {}
-    for count in sample_counts:
-        count = int(count)
-        if count <= 0:
-            raise ValueError("--sample-counts values must be positive.")
-        selected[count] = sorted(int(value) for value in permutation[:count].tolist())
-    return selected
+    return sorted(int(value) for value in permutation[:sample_count].tolist())
 
 
 def _sample_video_frames(
     video_path: Path,
-    sample_counts: list[int],
+    sample_count: int,
     *,
     seed: int,
-) -> tuple[dict[int, np.ndarray], dict[int, list[int]]]:
+) -> tuple[dict[int, np.ndarray], list[int]]:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -344,12 +329,11 @@ def _sample_video_frames(
                 frames[frame_index] = frame
         finally:
             capture.release()
-        selected = _select_sample_frame_ids(len(frames), sample_counts, seed=seed)
-        selected_ids = {frame_id for ids in selected.values() for frame_id in ids}
-        return {frame_id: frames[frame_id] for frame_id in selected_ids}, selected
+        selected = _select_sample_frame_ids(len(frames), sample_count, seed=seed)
+        return {frame_id: frames[frame_id] for frame_id in selected}, selected
 
-    selected = _select_sample_frame_ids(total_frames, sample_counts, seed=seed)
-    needed_ids = {frame_id for ids in selected.values() for frame_id in ids}
+    selected = _select_sample_frame_ids(total_frames, sample_count, seed=seed)
+    needed_ids = set(selected)
     frames_by_id: dict[int, np.ndarray] = {}
     frame_index = 0
     try:
@@ -517,9 +501,8 @@ def _filter_candidates(
     return eligible
 
 
-def _select_candidate_choices(
+def _select_motivation_candidate_choices(
     eligible_candidates: list[SplitCandidate],
-    auto_candidate: SplitCandidate,
     boundary_quantiles: list[float],
 ) -> list[CandidateChoice]:
     if not eligible_candidates:
@@ -541,8 +524,14 @@ def _select_candidate_choices(
         )
         choices.append(CandidateChoice(bucket=bucket, target_ratio=target, candidate=candidate))
 
-    choices.append(CandidateChoice(bucket="Auto", target_ratio=None, candidate=auto_candidate))
     return choices
+
+
+def _select_candidate_choices(
+    eligible_candidates: list[SplitCandidate],
+    boundary_quantiles: list[float],
+) -> list[CandidateChoice]:
+    return _select_motivation_candidate_choices(eligible_candidates, boundary_quantiles)
 
 
 def _snapshot_model_state(model: torch.nn.Module) -> dict[str, Any]:
@@ -1120,6 +1109,7 @@ def _base_result_row(
         "feature_reconstruction_time": 0.0,
         "feature_load_time": 0.0,
         "training_time": 0.0,
+        "effective_training_time": 0.0,
         "epoch_time_mean": None,
         "batch_time_mean": None,
         "peak_cuda_memory_allocated": 0,
@@ -1160,11 +1150,45 @@ def _update_map_metrics(
         row["delta proxy_mAP@0.5"] = float(after_map) - float(before_map)
 
 
+def _seconds_or_zero(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return seconds if np.isfinite(seconds) else 0.0
+
+
+def _compute_effective_training_time(row: Mapping[str, Any]) -> float:
+    training_time = _seconds_or_zero(row.get("training_time"))
+    feature_load_time = _seconds_or_zero(row.get("feature_load_time"))
+    feature_reconstruction_time = _seconds_or_zero(row.get("feature_reconstruction_time"))
+    mode = str(row.get("mode") or "")
+    if mode == "split_cached":
+        return feature_load_time + training_time
+    if mode == "split_rebuild":
+        return feature_reconstruction_time + feature_load_time + training_time
+    return training_time
+
+
 def _successful_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows if bool(row.get("success"))]
 
 
-def plot_split_time_accuracy_boxplots(
+def _finite_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return number
+
+
+def _write_split_position_mode_boxplots(
     rows: list[Mapping[str, Any]],
     output_root: Path,
 ) -> None:
@@ -1176,90 +1200,14 @@ def plot_split_time_accuracy_boxplots(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError as exc:
-        logger.warning("matplotlib is unavailable; skipping split boxplot: {}", exc)
+        logger.warning("matplotlib is unavailable; skipping split-position boxplots: {}", exc)
         return
 
     successful = _successful_rows(rows)
-    split_rows = [
-        row
-        for row in successful
-        if row.get("split_bucket") is not None or row.get("candidate_id") is not None
-    ]
+    split_rows = [row for row in successful if row.get("split_bucket") in BUCKET_LABELS]
     if not split_rows:
-        logger.warning("No successful split-position rows are available for boxplot.")
+        logger.warning("No successful Early/Middle/Late rows are available for boxplots.")
         return
-
-    metric_fields = (
-        ("proxy_mAP@0.5 after", "mAP (%)"),
-        ("mAP after", "mAP (%)"),
-        ("map_after", "mAP (%)"),
-        ("accuracy after", "Accuracy (%)"),
-        ("accuracy_after", "Accuracy (%)"),
-        ("accuracy", "Accuracy (%)"),
-    )
-    metric_field: str | None = None
-    metric_label = "mAP (%)"
-    for field, label in metric_fields:
-        if any(row.get(field) is not None for row in split_rows):
-            metric_field = field
-            metric_label = label
-            break
-    if metric_field is None:
-        logger.warning("No accuracy or mAP field is available for split boxplot.")
-        return
-
-    def finite_float(value: Any) -> float | None:
-        if value is None:
-            return None
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return None
-        if not np.isfinite(number):
-            return None
-        return number
-
-    def split_label(row: Mapping[str, Any]) -> str | None:
-        label = row.get("split_bucket") or row.get("candidate_id")
-        if label is None:
-            return None
-        return str(label)
-
-    labels_seen = {label for row in split_rows if (label := split_label(row)) is not None}
-    preferred_order = [*BUCKET_LABELS, "Auto"]
-    labels = [label for label in preferred_order if label in labels_seen]
-    labels.extend(sorted(label for label in labels_seen if label not in set(preferred_order)))
-    if not labels:
-        logger.warning("No split-position labels are available for boxplot.")
-        return
-
-    groups: dict[str, dict[str, list[float]]] = {
-        label: {"time": [], "metric": []} for label in labels
-    }
-    for row in split_rows:
-        label = split_label(row)
-        if label not in groups:
-            continue
-
-        training_time = finite_float(row.get("training_time"))
-        if training_time is not None:
-            groups[label]["time"].append(training_time)
-
-        metric = finite_float(row.get(metric_field))
-        if metric is not None:
-            groups[label]["metric"].append(metric)
-
-    all_metrics = [
-        value
-        for label in labels
-        for value in groups[label]["metric"]
-    ]
-    scale_metric_to_percent = bool(all_metrics) and all(
-        0.0 <= value <= 1.0 for value in all_metrics
-    )
-    if scale_metric_to_percent:
-        for label in labels:
-            groups[label]["metric"] = [value * 100.0 for value in groups[label]["metric"]]
 
     plt.rcParams.update(
         {
@@ -1272,122 +1220,157 @@ def plot_split_time_accuracy_boxplots(
             "ps.fonttype": 42,
         }
     )
-    figure_width = max(4.8, min(7.0, 1.1 * len(labels) + 2.8))
-    fig, ax_time = plt.subplots(figsize=(figure_width, 3.2))
-    ax_acc = ax_time.twinx()
-    ax_acc.patch.set_visible(False)
+    fig, (ax_time, ax_delta) = plt.subplots(
+        nrows=2,
+        ncols=1,
+        sharex=True,
+        figsize=(6.6, 5.0),
+    )
 
+    mode_labels = {
+        "freeze": "freeze",
+        "split_cached": "split_cached",
+        "split_rebuild": "split_rebuild",
+    }
+    mode_offsets = {
+        "freeze": -0.24,
+        "split_cached": 0.0,
+        "split_rebuild": 0.24,
+    }
+    mode_faces = {
+        "freeze": "#083bff",
+        "split_cached": "#63c25f",
+        "split_rebuild": "#ffd95a",
+    }
+    mode_edges = {
+        "freeze": "#0627a8",
+        "split_cached": "#237a35",
+        "split_rebuild": "#a57600",
+    }
     edge_color = "#083bff"
-    time_face = "#63c25f"
-    metric_face = "#ffd95a"
-    x_positions = np.arange(1, len(labels) + 1, dtype=float)
-    time_data = [groups[label]["time"] for label in labels if groups[label]["time"]]
-    time_positions = [
-        position - 0.18
-        for position, label in zip(x_positions, labels)
-        if groups[label]["time"]
+    bucket_positions = {
+        bucket: float(index)
+        for index, bucket in enumerate(BUCKET_LABELS, start=1)
+    }
+    bucket_labels = [
+        f"{bucket} ({int(round(DEFAULT_BOUNDARY_QUANTILES[index] * 100.0))}%)"
+        for index, bucket in enumerate(BUCKET_LABELS)
     ]
-    metric_data = [groups[label]["metric"] for label in labels if groups[label]["metric"]]
-    metric_positions = [
-        position + 0.18
-        for position, label in zip(x_positions, labels)
-        if groups[label]["metric"]
-    ]
+
+    def collect_values(bucket: str, mode: str, field: str) -> list[float]:
+        values: list[float] = []
+        for row in split_rows:
+            if row.get("split_bucket") != bucket or row.get("mode") != mode:
+                continue
+            raw_value = (
+                _compute_effective_training_time(row)
+                if field == "effective_training_time" and row.get(field) is None
+                else row.get(field)
+            )
+            value = _finite_float(raw_value)
+            if value is not None:
+                values.append(value)
+        return values
 
     boxplot_style = {
         "patch_artist": True,
         "manage_ticks": False,
-        "widths": 0.28,
-        "medianprops": {"color": edge_color, "linewidth": 1.3},
-        "whiskerprops": {
-            "color": edge_color,
-            "linewidth": 1.1,
-            "linestyle": "-.",
-        },
-        "capprops": {"color": edge_color, "linewidth": 1.1},
+        "widths": 0.18,
+        "medianprops": {"color": edge_color, "linewidth": 1.45},
+        "whiskerprops": {"color": edge_color, "linewidth": 1.0},
+        "capprops": {"color": edge_color, "linewidth": 1.0},
         "flierprops": {
             "marker": "o",
             "markerfacecolor": "white",
             "markeredgecolor": edge_color,
-            "markersize": 3.0,
-            "alpha": 0.6,
+            "markersize": 2.8,
+            "alpha": 0.65,
         },
     }
 
-    if time_data:
-        time_plot = ax_time.boxplot(
-            time_data,
-            positions=time_positions,
-            boxprops={
-                "facecolor": time_face,
-                "edgecolor": edge_color,
-                "linewidth": 1.35,
-            },
-            **boxplot_style,
-        )
-        for patch in time_plot["boxes"]:
-            patch.set_alpha(0.82)
+    def apply_mode_style(plot: Mapping[str, Any], mode: str) -> None:
+        face_color = mode_faces[mode]
+        line_color = mode_edges[mode]
+        for patch in plot.get("boxes", []):
+            patch.set_facecolor(face_color)
+            patch.set_edgecolor(line_color)
+            patch.set_alpha(0.78)
+            patch.set_linewidth(1.25)
+        for key in ("whiskers", "caps", "medians"):
+            for line in plot.get(key, []):
+                line.set_color(line_color)
+                line.set_linewidth(1.2 if key != "medians" else 1.6)
+        for flier in plot.get("fliers", []):
+            flier.set_markeredgecolor(line_color)
 
-    if metric_data:
-        metric_plot = ax_acc.boxplot(
-            metric_data,
-            positions=metric_positions,
-            boxprops={
-                "facecolor": metric_face,
-                "edgecolor": edge_color,
-                "linewidth": 1.35,
-            },
-            **boxplot_style,
-        )
-        for patch in metric_plot["boxes"]:
-            patch.set_alpha(0.82)
+    plotted_any = False
+    missing: list[str] = []
+    for ax, field in (
+        (ax_time, "effective_training_time"),
+        (ax_delta, "delta proxy_mAP@0.5"),
+    ):
+        for bucket in BUCKET_LABELS:
+            for mode in DEFAULT_MODES:
+                values = collect_values(bucket, mode, field)
+                if not values:
+                    missing.append(f"{field}:{bucket}/{mode}")
+                    continue
+                position = bucket_positions[bucket] + mode_offsets[mode]
+                plot = ax.boxplot(
+                    [values],
+                    positions=[position],
+                    boxprops={
+                        "facecolor": mode_faces[mode],
+                        "edgecolor": mode_edges[mode],
+                        "linewidth": 1.2,
+                    },
+                    **boxplot_style,
+                )
+                apply_mode_style(plot, mode)
+                plotted_any = True
 
-    if not time_data and not metric_data:
-        logger.warning("No finite split-position training time or metric values to plot.")
+    if not plotted_any:
+        logger.warning("No finite effective training time or delta proxy mAP values to plot.")
         plt.close(fig)
         return
+    if missing:
+        logger.warning(
+            "Skipped split-position boxplot combinations without successful data: {}",
+            ", ".join(missing),
+        )
 
-    ax_time.set_xticks(x_positions)
-    ax_time.set_xticklabels(labels)
-    ax_time.set_xlabel("Split position")
-    ax_time.set_ylabel("Training time (s)")
-    ax_acc.set_ylabel(metric_label)
-    ax_time.grid(axis="y", linestyle="--", linewidth=0.75, alpha=0.4)
-    ax_time.set_axisbelow(True)
-    ax_time.set_xlim(0.45, len(labels) + 0.55)
+    x_positions = [bucket_positions[bucket] for bucket in BUCKET_LABELS]
+    ax_delta.set_xticks(x_positions)
+    ax_delta.set_xticklabels(bucket_labels)
+    ax_delta.set_xlabel("Split position")
+    ax_time.set_ylabel("Effective training time (s)")
+    ax_delta.set_ylabel("Delta proxy mAP@0.5")
+    ax_delta.axhline(0.0, color="0.45", linewidth=0.8, linestyle="--", alpha=0.7)
+    for ax in (ax_time, ax_delta):
+        ax.grid(axis="y", linestyle="--", linewidth=0.75, alpha=0.35)
+        ax.set_axisbelow(True)
+        ax.set_xlim(0.45, len(BUCKET_LABELS) + 0.55)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
     ax_time.set_ylim(bottom=0.0)
 
-    plotted_metrics = [value for values in metric_data for value in values]
-    if plotted_metrics:
-        min_metric = min(plotted_metrics)
-        max_metric = max(plotted_metrics)
-        pad = max(1.0, (max_metric - min_metric) * 0.16)
-        upper_limit = min(100.0, max_metric + pad)
-        if max_metric > 100.0:
-            upper_limit = max_metric + pad
-        ax_acc.set_ylim(max(0.0, min_metric - pad), upper_limit)
-
-    for spine in ("top",):
-        ax_time.spines[spine].set_visible(False)
-        ax_acc.spines[spine].set_visible(False)
-
-    ax_time.legend(
+    fig.legend(
         handles=[
-            plt.Rectangle((0, 0), 1, 1, facecolor=time_face, edgecolor=edge_color),
-            plt.Rectangle((0, 0), 1, 1, facecolor=metric_face, edgecolor=edge_color),
+            plt.Rectangle((0, 0), 1, 1, facecolor=mode_faces[mode], edgecolor=mode_edges[mode])
+            for mode in DEFAULT_MODES
         ],
-        labels=["Tail training time", metric_label.removesuffix(" (%)")],
+        labels=[mode_labels[mode] for mode in DEFAULT_MODES],
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.18),
-        ncol=2,
+        bbox_to_anchor=(0.5, 0.99),
+        ncol=3,
         frameon=True,
         fancybox=False,
         edgecolor="0.45",
     )
 
-    fig.subplots_adjust(top=0.78, bottom=0.20, left=0.12, right=0.86)
-    fig.savefig(plots_dir / "split_time_accuracy_boxplots.pdf")
-    fig.savefig(plots_dir / "split_time_accuracy_boxplots.png", dpi=220)
+    fig.subplots_adjust(top=0.87, bottom=0.12, left=0.13, right=0.98, hspace=0.12)
+    fig.savefig(plots_dir / "freeze_vs_split_cached_vs_rebuild_by_position.pdf")
+    fig.savefig(plots_dir / "freeze_vs_split_cached_vs_rebuild_by_position.png", dpi=220)
     plt.close(fig)
 
 
@@ -1456,28 +1439,40 @@ def _run_one_experiment(
         total_params = _total_parameter_count(split_model)
         row["total_parameter_count"] = total_params
 
-        split_cache_path: Path | None = None
-        split_candidate: SplitCandidate | None = None
+        if candidate is None:
+            raise RuntimeError(f"{mode} requires a split candidate.")
+        if mode not in DEFAULT_MODES:
+            raise RuntimeError(f"Unsupported mode: {mode}")
 
-        if mode == "full":
-            for parameter in split_model.parameters():
-                parameter.requires_grad_(True)
-            trainable_params = [
-                parameter
-                for parameter in split_model.parameters()
-                if parameter.requires_grad
-            ]
-            row["trainable_parameter_count"] = _count_parameters(trainable_params)
-            row["prefix_parameter_count"] = 0
-            row["suffix_parameter_count"] = total_params
-            row["prefix_parameter_ratio"] = 0.0
-            row["boundary_payload_bytes"] = 0
-            optimizer = _make_optimizer(
-                split_model,
-                runtime=None,
-                learning_rate=learning_rate,
-                optimizer_config=optimizer_config,
-            )
+        splitter.split(candidate=candidate)
+        suffix_params, suffix_names = _resolve_suffix_trainable_parameters(
+            split_model,
+            splitter,
+        )
+        suffix_param_count = _count_parameters(suffix_params)
+        candidate_total_params = int(
+            getattr(candidate, "total_parameter_count", 0) or total_params
+        )
+        candidate_prefix_params = int(getattr(candidate, "edge_parameter_count", 0) or 0)
+        if candidate_prefix_params <= 0:
+            candidate_prefix_params = max(0, total_params - suffix_param_count)
+        row["suffix_parameter_names"] = suffix_names
+        row["trainable_parameter_count"] = suffix_param_count
+        row["prefix_parameter_count"] = candidate_prefix_params
+        row["suffix_parameter_count"] = max(0, candidate_total_params - candidate_prefix_params)
+        row["prefix_parameter_ratio"] = _candidate_prefix_ratio(candidate)
+        row["boundary_payload_bytes"] = int(
+            getattr(candidate, "estimated_payload_bytes", 0) or 0
+        )
+        optimizer_runtime = splitter if mode.startswith("split_") else None
+        optimizer = _make_optimizer(
+            split_model,
+            runtime=optimizer_runtime,
+            learning_rate=learning_rate,
+            optimizer_config=optimizer_config,
+        )
+
+        if mode == "freeze":
             before_metrics = _evaluate_proxy_map(
                 model=edge_model,
                 model_name=model_name,
@@ -1510,129 +1505,69 @@ def _run_one_experiment(
                 batch_size=batch_size,
             )
         else:
-            if candidate is None:
-                raise RuntimeError(f"{mode} requires a split candidate.")
-            splitter.split(candidate=candidate)
-            suffix_params, suffix_names = _resolve_suffix_trainable_parameters(
-                split_model,
-                splitter,
-            )
-            suffix_param_count = _count_parameters(suffix_params)
-            row["suffix_parameter_names"] = suffix_names
-            row["trainable_parameter_count"] = suffix_param_count
-            row["suffix_parameter_count"] = suffix_param_count
-            row["prefix_parameter_count"] = max(0, total_params - suffix_param_count)
-            row["prefix_parameter_ratio"] = (
-                float(row["prefix_parameter_count"]) / float(total_params)
-                if total_params > 0
-                else 0.0
-            )
-            row["boundary_payload_bytes"] = int(
-                getattr(candidate, "estimated_payload_bytes", 0) or 0
-            )
-            optimizer_runtime = splitter if mode.startswith("split_") else None
-            optimizer = _make_optimizer(
-                split_model,
-                runtime=optimizer_runtime,
-                learning_rate=learning_rate,
-                optimizer_config=optimizer_config,
-            )
-
-            if mode == "freeze":
-                before_metrics = _evaluate_proxy_map(
-                    model=edge_model,
-                    model_name=model_name,
-                    frame_dir=frame_dir,
-                    annotations=annotations,
-                    device=device,
-                    batch_size=batch_size,
+            if mode == "split_cached":
+                if cached_feature_failure:
+                    raise RuntimeError(cached_feature_failure)
+                if cached_feature_path is None:
+                    raise RuntimeError("Missing cached BoundaryPayload feature cache.")
+                split_cache_path = cached_feature_path
+            elif mode == "split_rebuild":
+                split_cache_path = (
+                    Path("split_rebuild")
+                    / _safe_segment(choice.bucket)
+                    / _safe_segment(candidate.candidate_id)
+                    / f"samples_{sample_count}"
+                    / f"epochs_{epochs}"
+                    / f"repeat_{repeat_index}"
                 )
-                train_metrics = _train_raw_loop(
+                split_cache_path = frame_dir.parent / split_cache_path
+                rebuild_time, _records, actual_bytes = _rebuild_feature_cache(
+                    splitter=splitter,
                     edge_model=edge_model,
-                    split_model=split_model,
-                    model_name=model_name,
                     frames_by_id=frames_by_id,
                     sample_ids=sampled_frame_indices,
-                    annotations=annotations,
-                    num_epoch=epochs,
-                    batch_size=batch_size,
-                    device=device,
-                    loss_fn=loss_fn,
-                    optimizer=optimizer,
-                    seed=seed,
-                    shuffle_samples=bool(optimizer_config.get("shuffle_samples", False)),
-                )
-                after_metrics = _evaluate_proxy_map(
-                    model=edge_model,
-                    model_name=model_name,
-                    frame_dir=frame_dir,
-                    annotations=annotations,
-                    device=device,
-                    batch_size=batch_size,
-                )
-            else:
-                if mode == "split_cached":
-                    if cached_feature_failure:
-                        raise RuntimeError(cached_feature_failure)
-                    if cached_feature_path is None:
-                        raise RuntimeError("Missing cached BoundaryPayload feature cache.")
-                    split_cache_path = cached_feature_path
-                elif mode == "split_rebuild":
-                    split_cache_path = (
-                        Path("split_rebuild")
-                        / _safe_segment(choice.bucket)
-                        / _safe_segment(candidate.candidate_id)
-                        / f"samples_{sample_count}"
-                        / f"epochs_{epochs}"
-                    )
-                    split_cache_path = frame_dir.parent / split_cache_path
-                    rebuild_time, _records, actual_bytes = _rebuild_feature_cache(
-                        splitter=splitter,
-                        edge_model=edge_model,
-                        frames_by_id=frames_by_id,
-                        sample_ids=sampled_frame_indices,
-                        cache_path=split_cache_path,
-                        device=device,
-                    )
-                    row["feature_reconstruction_time"] = float(rebuild_time)
-                    if actual_bytes > 0:
-                        row["boundary_payload_bytes_actual"] = int(actual_bytes)
-                else:
-                    raise RuntimeError(f"Unsupported mode: {mode}")
-
-                split_candidate = candidate
-                before_metrics = _evaluate_proxy_map(
-                    model=edge_model,
-                    model_name=model_name,
-                    frame_dir=frame_dir,
-                    annotations=annotations,
-                    device=device,
-                    batch_size=batch_size,
-                )
-                train_metrics = _train_split_loop(
-                    split_model=split_model,
-                    splitter=splitter,
                     cache_path=split_cache_path,
-                    sample_ids=sampled_frame_indices,
-                    annotations=annotations,
-                    num_epoch=epochs,
-                    batch_size=batch_size,
                     device=device,
-                    loss_fn=loss_fn,
-                    optimizer=optimizer,
-                    seed=seed,
-                    shuffle_samples=bool(optimizer_config.get("shuffle_samples", False)),
                 )
-                after_metrics = _evaluate_proxy_map(
-                    model=edge_model,
-                    model_name=model_name,
-                    frame_dir=frame_dir,
-                    annotations=annotations,
-                    device=device,
-                    batch_size=batch_size,
-                )
+                row["feature_reconstruction_time"] = float(rebuild_time)
+                if actual_bytes > 0:
+                    row["boundary_payload_bytes_actual"] = int(actual_bytes)
+            else:
+                raise RuntimeError(f"Unsupported mode: {mode}")
+
+            before_metrics = _evaluate_proxy_map(
+                model=edge_model,
+                model_name=model_name,
+                frame_dir=frame_dir,
+                annotations=annotations,
+                device=device,
+                batch_size=batch_size,
+            )
+            train_metrics = _train_split_loop(
+                split_model=split_model,
+                splitter=splitter,
+                cache_path=split_cache_path,
+                sample_ids=sampled_frame_indices,
+                annotations=annotations,
+                num_epoch=epochs,
+                batch_size=batch_size,
+                device=device,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                seed=seed,
+                shuffle_samples=bool(optimizer_config.get("shuffle_samples", False)),
+            )
+            after_metrics = _evaluate_proxy_map(
+                model=edge_model,
+                model_name=model_name,
+                frame_dir=frame_dir,
+                annotations=annotations,
+                device=device,
+                batch_size=batch_size,
+            )
 
         row.update({key: value for key, value in train_metrics.items() if key in row})
+        row["effective_training_time"] = _compute_effective_training_time(row)
         row["success"] = True
         _update_map_metrics(row, before_metrics, after_metrics)
     except Exception as exc:  # noqa: BLE001 - experiment rows must capture failures and continue.
@@ -1651,6 +1586,7 @@ def _run_one_experiment(
         row["peak_cuda_memory_allocated"] = allocated
         row["peak_cuda_memory_reserved"] = reserved
         row["total_wall_time"] = float(time.perf_counter() - run_started)
+        row["effective_training_time"] = _compute_effective_training_time(row)
         try:
             if optimizer is not None:
                 del optimizer
@@ -1663,7 +1599,7 @@ def _run_one_experiment(
 
 
 def _write_plots(rows: list[Mapping[str, Any]], output_root: Path) -> None:
-    plot_split_time_accuracy_boxplots(rows, output_root)
+    _write_split_position_mode_boxplots(rows, output_root)
 
 
 def _prepare_configs(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -1675,7 +1611,7 @@ def _prepare_configs(args: argparse.Namespace) -> tuple[Any, Any]:
     server_cfg.edge_model_name = str(args.edge_model)
     server_cfg.golden = str(args.golden_model)
     server_cfg.weights_path = _resolve_local_weights_path(str(args.golden_model))
-    server_cfg.continual_learning.num_epoch = max(int(epoch) for epoch in args.epochs)
+    server_cfg.continual_learning.num_epoch = int(args.epochs)
     server_cfg.continual_learning.batch_size = int(args.batch_size)
     server_cfg.das.enabled = False
     return client_cfg, server_cfg
@@ -1688,7 +1624,7 @@ def _build_split_setup(
     first_frame: np.ndarray,
     trace_batch_size: int,
     fixed_split_cfg: Any,
-    cache_path: Path,
+    boundary_quantiles: list[float],
     device: torch.device,
 ) -> tuple[
     torch.nn.Module,
@@ -1726,38 +1662,13 @@ def _build_split_setup(
         max_payload_bytes=constraints.max_payload_bytes,
     )
     eligible = _filter_candidates(candidates, constraints)
-    auto_plan = load_or_compute_fixed_split_plan(
-        split_model,
-        constraints,
-        sample_input=sample_input,
-        device=device,
-        model_name=edge_model_name,
-        cache_path=str(cache_path),
-        splitter=splitter,
-    )
-    auto_candidate = splitter.split(candidate_id=auto_plan.candidate_id)
-    if not _candidate_satisfies_constraints(auto_candidate, constraints):
-        raise RuntimeError(
-            "The fixed split planner returned a candidate that does not satisfy "
-            "the experiment's trainable/constraint filters."
-        )
     choices = _select_candidate_choices(
         eligible,
-        auto_candidate,
-        list(DEFAULT_BOUNDARY_QUANTILES),
+        boundary_quantiles,
     )
     _synchronize(device)
     candidate_enumeration_time = time.perf_counter() - enum_started
     return split_model, splitter, choices, graph_build_time, candidate_enumeration_time
-
-
-def _replace_quantile_choices(
-    choices: list[CandidateChoice],
-    boundary_quantiles: list[float],
-    eligible_candidates: list[SplitCandidate],
-) -> list[CandidateChoice]:
-    auto = next(choice.candidate for choice in choices if choice.bucket == "Auto")
-    return _select_candidate_choices(eligible_candidates, auto, boundary_quantiles)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1776,28 +1687,19 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("--device requested CUDA, but torch.cuda.is_available() is false.")
     object_detection_module.device = device
     _set_random_seed(int(args.seed))
+    sample_count = int(args.sample_count)
+    epochs = int(args.epochs)
     repeats = max(1, int(args.repeats))
+    frame_seed = int(args.seed)
+    boundary_quantiles = [float(value) for value in args.boundary_quantiles]
 
     client_cfg, server_cfg = _prepare_configs(args)
 
     logger.info("Sampling frames from {}", args.video_path)
-    frames_by_id: dict[int, np.ndarray] = {}
-    sample_ids_by_repeat_count: dict[int, dict[int, list[int]]] = {}
-    for repeat_index in range(repeats):
-        repeat_frames, repeat_sample_ids = _sample_video_frames(
-            Path(args.video_path),
-            [int(count) for count in args.sample_counts],
-            seed=int(args.seed) + repeat_index,
-        )
-        frames_by_id.update(repeat_frames)
-        sample_ids_by_repeat_count[repeat_index] = repeat_sample_ids
-    max_sample_ids = sorted(
-        {
-            frame_id
-            for selected in sample_ids_by_repeat_count.values()
-            for ids in selected.values()
-            for frame_id in ids
-        }
+    frames_by_id, sampled_ids = _sample_video_frames(
+        Path(args.video_path),
+        sample_count,
+        seed=frame_seed,
     )
     frame_dir = output_root / "frames"
     _write_raw_frames(frame_dir, frames_by_id)
@@ -1815,7 +1717,7 @@ def main(argv: list[str] | None = None) -> int:
         cache_path=output_root / "teacher_labels.json",
         detector=teacher_detector,
         frames_by_id=frames_by_id,
-        frame_ids=max_sample_ids,
+        frame_ids=sampled_ids,
         golden_model=str(args.golden_model),
         video_path=Path(args.video_path),
         threshold=teacher_threshold,
@@ -1825,32 +1727,22 @@ def main(argv: list[str] | None = None) -> int:
         ),
         device=device,
     )
+    sample_annotations = {
+        str(frame_id): dict(annotations.get(str(frame_id), {"boxes": [], "labels": []}))
+        for frame_id in sampled_ids
+    }
 
-    first_frame = frames_by_id[max_sample_ids[0]]
-    split_model, splitter, default_choices, graph_build_time, candidate_enumeration_time = (
+    first_frame = frames_by_id[sampled_ids[0]]
+    split_model, splitter, choices, graph_build_time, candidate_enumeration_time = (
         _build_split_setup(
             edge_model=edge_detector.model,
             edge_model_name=str(args.edge_model),
             first_frame=first_frame,
             trace_batch_size=int(getattr(server_cfg.continual_learning, "trace_batch_size", 2)),
             fixed_split_cfg=client_cfg.split_learning.fixed_split,
-            cache_path=output_root / "fixed_split_plan.json",
+            boundary_quantiles=boundary_quantiles,
             device=device,
         )
-    )
-    constraints = SplitConstraints.from_config(client_cfg.split_learning.fixed_split)
-    eligible_candidates = _filter_candidates(
-        splitter.enumerate_candidates(
-            max_candidates=constraints.max_candidates,
-            max_boundary_count=constraints.max_boundary_count,
-            max_payload_bytes=constraints.max_payload_bytes,
-        ),
-        constraints,
-    )
-    choices = _replace_quantile_choices(
-        default_choices,
-        [float(value) for value in args.boundary_quantiles],
-        eligible_candidates,
     )
 
     logger.info("Selected split candidates:")
@@ -1881,7 +1773,7 @@ def main(argv: list[str] | None = None) -> int:
                     splitter=splitter,
                     edge_model=edge_detector.model,
                     frames_by_id=frames_by_id,
-                    sample_ids=max_sample_ids,
+                    sample_ids=sampled_ids,
                     cache_path=cache_path,
                     device=device,
                 )
@@ -1897,79 +1789,40 @@ def main(argv: list[str] | None = None) -> int:
 
     for repeat_index in range(repeats):
         run_seed = int(args.seed) + repeat_index
-        for sample_count in [int(count) for count in args.sample_counts]:
-            sampled_ids = list(sample_ids_by_repeat_count[repeat_index][int(sample_count)])
-            sample_annotations = {
-                str(frame_id): dict(annotations.get(str(frame_id), {"boxes": [], "labels": []}))
-                for frame_id in sampled_ids
-            }
-            for epochs in [int(epoch) for epoch in args.epochs]:
-                if "full" in args.modes:
-                    row = _run_one_experiment(
-                        mode="full",
-                        edge_model=edge_detector.model,
-                        split_model=split_model,
-                        model_name=str(args.edge_model),
-                        golden_model=str(args.golden_model),
-                        initial_state=initial_state,
-                        splitter=splitter,
-                        choice=None,
-                        cached_feature_path=None,
-                        cached_feature_failure=None,
-                        frame_dir=frame_dir,
-                        frames_by_id=frames_by_id,
-                        sampled_frame_indices=sampled_ids,
-                        annotations=sample_annotations,
-                        sample_count=sample_count,
-                        epochs=epochs,
-                        batch_size=int(args.batch_size),
-                        output_root=output_root,
-                        graph_build_time=graph_build_time,
-                        candidate_enumeration_time=candidate_enumeration_time,
-                        teacher_annotation_time=teacher_annotation_time,
-                        learning_rate=learning_rate,
-                        optimizer_config=optimizer_config,
-                        repeat_index=repeat_index,
-                        base_seed=int(args.seed),
-                        seed=run_seed,
-                        device=device,
-                    )
-                    rows.append(row)
-                    _append_jsonl(results_path, row)
-                for choice in choices:
-                    candidate_id = str(choice.candidate.candidate_id)
-                    for mode in [item for item in args.modes if item != "full"]:
-                        row = _run_one_experiment(
-                            mode=mode,
-                            edge_model=edge_detector.model,
-                            split_model=split_model,
-                            model_name=str(args.edge_model),
-                            golden_model=str(args.golden_model),
-                            initial_state=initial_state,
-                            splitter=splitter,
-                            choice=choice,
-                            cached_feature_path=cached_feature_paths.get(candidate_id),
-                            cached_feature_failure=cached_feature_failures.get(candidate_id),
-                            frame_dir=frame_dir,
-                            frames_by_id=frames_by_id,
-                            sampled_frame_indices=sampled_ids,
-                            annotations=sample_annotations,
-                            sample_count=sample_count,
-                            epochs=epochs,
-                            batch_size=int(args.batch_size),
-                            output_root=output_root,
-                            graph_build_time=graph_build_time,
-                            candidate_enumeration_time=candidate_enumeration_time,
-                            teacher_annotation_time=teacher_annotation_time,
-                            learning_rate=learning_rate,
-                            optimizer_config=optimizer_config,
-                            repeat_index=repeat_index,
-                            base_seed=int(args.seed),
-                            seed=run_seed,
-                            device=device,
-                        )
-                        rows.append(row)
-                        _append_jsonl(results_path, row)
+        for choice in choices:
+            candidate_id = str(choice.candidate.candidate_id)
+            for mode in args.modes:
+                row = _run_one_experiment(
+                    mode=mode,
+                    edge_model=edge_detector.model,
+                    split_model=split_model,
+                    model_name=str(args.edge_model),
+                    golden_model=str(args.golden_model),
+                    initial_state=initial_state,
+                    splitter=splitter,
+                    choice=choice,
+                    cached_feature_path=cached_feature_paths.get(candidate_id),
+                    cached_feature_failure=cached_feature_failures.get(candidate_id),
+                    frame_dir=frame_dir,
+                    frames_by_id=frames_by_id,
+                    sampled_frame_indices=sampled_ids,
+                    annotations=sample_annotations,
+                    sample_count=sample_count,
+                    epochs=epochs,
+                    batch_size=int(args.batch_size),
+                    output_root=output_root,
+                    graph_build_time=graph_build_time,
+                    candidate_enumeration_time=candidate_enumeration_time,
+                    teacher_annotation_time=teacher_annotation_time,
+                    learning_rate=learning_rate,
+                    optimizer_config=optimizer_config,
+                    repeat_index=repeat_index,
+                    base_seed=int(args.seed),
+                    seed=run_seed,
+                    device=device,
+                )
+                rows.append(row)
+                _append_jsonl(results_path, row)
 
     _write_summary_csv(summary_path, rows)
     _write_aggregate_summary_csv(aggregate_summary_path, rows)

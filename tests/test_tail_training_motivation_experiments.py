@@ -42,22 +42,38 @@ def test_parse_args_uses_requested_defaults():
     assert args.video_path == "./video_data/road.mp4"
     assert args.edge_model == "rfdetr_nano"
     assert args.golden_model == "rtdetr_x"
-    assert args.sample_counts == [64, 128, 256]
-    assert args.epochs == [1, 3, 5, 10, 20]
+    assert args.sample_count == 512
+    assert args.epochs == 10
     assert args.batch_size == 32
     assert args.boundary_quantiles == [0.25, 0.5, 0.75]
-    assert args.modes == ["full", "freeze", "split_cached", "split_rebuild"]
-    assert args.repeats == 1
+    assert args.modes == ["freeze", "split_cached", "split_rebuild"]
+    assert args.repeats == 5
 
 
-def test_seeded_frame_selection_is_deterministic_and_nested():
-    first = experiments._select_sample_frame_ids(20, [3, 7], seed=11)
-    second = experiments._select_sample_frame_ids(20, [3, 7], seed=11)
+def test_seeded_frame_selection_is_deterministic():
+    first = experiments._select_sample_frame_ids(20, 7, seed=11)
+    second = experiments._select_sample_frame_ids(20, 7, seed=11)
 
     assert first == second
-    assert set(first[3]).issubset(set(first[7]))
-    assert len(first[3]) == 3
-    assert len(first[7]) == 7
+    assert len(first) == 7
+    assert first == sorted(first)
+
+
+def test_repeat_frame_selection_uses_frame_seed_only():
+    args = SimpleNamespace(seed=11, sample_count=7, repeats=3)
+    frame_seed = args.seed
+
+    selected_by_repeat = [
+        experiments._select_sample_frame_ids(20, args.sample_count, seed=frame_seed)
+        for _repeat_index in range(args.repeats)
+    ]
+
+    assert selected_by_repeat == [selected_by_repeat[0]] * args.repeats
+    assert selected_by_repeat[0] != experiments._select_sample_frame_ids(
+        20,
+        args.sample_count,
+        seed=args.seed + 1,
+    )
 
 
 def test_make_trace_input_repeats_single_sample_for_dynamic_trace():
@@ -93,7 +109,7 @@ def test_split_boundary_payload_batch_slices_scaled_leading_dims():
     assert second.tensors["batched"].tolist() == [[3, 4, 5]]
 
 
-def test_candidate_choice_selects_nearest_quantile_and_auto():
+def test_candidate_choice_selects_nearest_quantiles_without_auto():
     candidates = [
         _candidate("c10", 0.10),
         _candidate("c26", 0.26),
@@ -103,7 +119,6 @@ def test_candidate_choice_selects_nearest_quantile_and_auto():
 
     choices = experiments._select_candidate_choices(
         candidates,
-        auto_candidate=candidates[1],
         boundary_quantiles=[0.25, 0.50, 0.75],
     )
 
@@ -111,20 +126,19 @@ def test_candidate_choice_selects_nearest_quantile_and_auto():
         ("Early", "c26"),
         ("Middle", "c49"),
         ("Late", "c77"),
-        ("Auto", "c26"),
     ]
 
 
 def test_result_writers_emit_jsonl_and_summary_csv(tmp_path):
     rows = [
         {
-            "mode": "full",
+            "mode": "freeze",
             "success": True,
             "sampled_frame_indices": [1, 5],
             "metrics": {"training_time": 1.25},
         },
         {
-            "mode": "freeze",
+            "mode": "split_cached",
             "success": False,
             "failure_reason": "boom",
         },
@@ -146,32 +160,35 @@ def test_aggregate_rows_reports_mean_std_and_success_rate():
     rows = [
         {
             "mode": "freeze",
-            "split_bucket": "Auto",
+            "split_bucket": "Early",
             "candidate_id": "c1",
             "sample_count": 2,
             "epochs": 1,
             "success": True,
             "training_time": 1.0,
+            "effective_training_time": 2.0,
             "delta proxy_mAP@0.5": 0.1,
         },
         {
             "mode": "freeze",
-            "split_bucket": "Auto",
+            "split_bucket": "Early",
             "candidate_id": "c1",
             "sample_count": 2,
             "epochs": 1,
             "success": True,
             "training_time": 3.0,
+            "effective_training_time": 4.0,
             "delta proxy_mAP@0.5": 0.3,
         },
         {
             "mode": "freeze",
-            "split_bucket": "Auto",
+            "split_bucket": "Early",
             "candidate_id": "c1",
             "sample_count": 2,
             "epochs": 1,
             "success": False,
             "training_time": 999.0,
+            "effective_training_time": 999.0,
         },
     ]
 
@@ -184,165 +201,88 @@ def test_aggregate_rows_reports_mean_std_and_success_rate():
     assert aggregate[0]["success_rate"] == pytest.approx(2 / 3)
     assert aggregate[0]["training_time_mean"] == pytest.approx(2.0)
     assert aggregate[0]["training_time_std"] == pytest.approx(2**0.5)
+    assert aggregate[0]["effective_training_time_mean"] == pytest.approx(3.0)
+    assert aggregate[0]["effective_training_time_std"] == pytest.approx(2**0.5)
     assert aggregate[0]["delta proxy_mAP@0.5_mean"] == pytest.approx(0.2)
 
 
-def test_time_reduction_rows_match_freeze_by_repeat_and_candidate():
-    rows = [
-        {
-            "mode": "freeze",
-            "split_bucket": "Auto",
-            "candidate_id": "c1",
-            "sample_count": 2,
-            "epochs": 1,
-            "repeat_index": 0,
-            "success": True,
-            "training_time": 10.0,
-        },
-        {
-            "mode": "freeze",
-            "split_bucket": "Auto",
-            "candidate_id": "c1",
-            "sample_count": 2,
-            "epochs": 1,
-            "repeat_index": 1,
-            "success": True,
-            "training_time": 12.0,
-        },
-        {
-            "mode": "split_cached",
-            "split_bucket": "Auto",
-            "candidate_id": "c1",
-            "sample_count": 2,
-            "epochs": 1,
-            "repeat_index": 0,
-            "success": True,
-            "training_time": 4.0,
-        },
-        {
-            "mode": "split_cached",
-            "split_bucket": "Auto",
-            "candidate_id": "c1",
-            "sample_count": 2,
-            "epochs": 1,
-            "repeat_index": 1,
-            "success": True,
-            "training_time": 5.0,
-        },
-        {
-            "mode": "split_rebuild",
-            "split_bucket": "Auto",
-            "candidate_id": "c1",
-            "sample_count": 2,
-            "epochs": 1,
-            "repeat_index": 0,
-            "success": True,
-            "training_time": 6.5,
-        },
-        {
-            "mode": "split_rebuild",
-            "split_bucket": "Auto",
-            "candidate_id": "c1",
-            "sample_count": 2,
-            "epochs": 1,
-            "repeat_index": 1,
-            "success": False,
-            "training_time": 99.0,
-        },
-    ]
-
-    reductions = experiments._time_reduction_rows(rows)
-
-    assert [
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"mode": "freeze", "training_time": 3.0}, 3.0),
         (
-            row["mode"],
-            row["repeat_index"],
-            row["reduction"],
-        )
-        for row in reductions
-    ] == [
-        ("split_cached", 0, pytest.approx(6.0)),
-        ("split_cached", 1, pytest.approx(7.0)),
-        ("split_rebuild", 0, pytest.approx(3.5)),
-    ]
+            {
+                "mode": "split_cached",
+                "feature_load_time": 0.4,
+                "training_time": 2.0,
+            },
+            2.4,
+        ),
+        (
+            {
+                "mode": "split_cached",
+                "training_time": 2.0,
+            },
+            2.0,
+        ),
+        (
+            {
+                "mode": "split_rebuild",
+                "feature_reconstruction_time": 1.5,
+                "feature_load_time": 0.4,
+                "training_time": 2.0,
+            },
+            3.9,
+        ),
+        (
+            {
+                "mode": "split_rebuild",
+                "feature_reconstruction_time": 1.5,
+                "training_time": 2.0,
+            },
+            3.5,
+        ),
+    ],
+)
+def test_compute_effective_training_time(row, expected):
+    assert experiments._compute_effective_training_time(row) == pytest.approx(expected)
 
 
-def test_training_time_reduction_boxplot_writes_pdf(tmp_path):
-    rows = []
-    for repeat_index, freeze_time in enumerate([10.0, 12.0, 11.0]):
-        rows.extend(
-            [
-                {
-                    "mode": "freeze",
-                    "split_bucket": "Auto",
-                    "candidate_id": "c1",
-                    "sample_count": 2,
-                    "epochs": 1,
-                    "repeat_index": repeat_index,
-                    "success": True,
-                    "training_time": freeze_time,
-                },
-                {
-                    "mode": "split_cached",
-                    "split_bucket": "Auto",
-                    "candidate_id": "c1",
-                    "sample_count": 2,
-                    "epochs": 1,
-                    "repeat_index": repeat_index,
-                    "success": True,
-                    "training_time": 4.0 + repeat_index,
-                },
-                {
-                    "mode": "split_rebuild",
-                    "split_bucket": "Auto",
-                    "candidate_id": "c1",
-                    "sample_count": 2,
-                    "epochs": 1,
-                    "repeat_index": repeat_index,
-                    "success": True,
-                    "training_time": 5.0 + repeat_index,
-                },
-            ]
-        )
-
-    experiments._write_training_time_reduction_boxplot(rows, tmp_path)
-
-    pdf_path = tmp_path / "plots" / "training_time_reduction_boxplot.pdf"
-    assert pdf_path.exists()
-    assert pdf_path.stat().st_size > 0
-
-
-def test_split_position_time_accuracy_plot_writes_pdf_and_png(tmp_path):
+def test_split_position_mode_boxplots_write_pdf_and_png(tmp_path):
     rows = []
     for repeat_index in range(3):
-        for mode, training_time, accuracy in [
-            ("freeze", 12.0 + repeat_index, 0.82 + 0.01 * repeat_index),
-            ("split_cached", 5.0 + repeat_index, 0.78 + 0.01 * repeat_index),
-            ("split_rebuild", 6.0 + repeat_index, 0.78 + 0.01 * repeat_index),
-        ]:
-            rows.append(
-                {
-                    "mode": mode,
-                    "split_bucket": "Early",
-                    "candidate_id": "c1",
-                    "sample_count": 2,
-                    "epochs": 1,
-                    "repeat_index": repeat_index,
-                    "success": True,
-                    "training_time": training_time,
-                    "proxy_mAP@0.5 after": accuracy,
-                    "prefix_parameter_ratio": 0.25,
-                }
-            )
+        for bucket, ratio in [("Early", 0.25), ("Middle", 0.50), ("Late", 0.75)]:
+            for mode, time_base, delta_base in [
+                ("freeze", 12.0, 0.05),
+                ("split_cached", 5.0, 0.03),
+                ("split_rebuild", 6.0, 0.04),
+            ]:
+                rows.append(
+                    {
+                        "mode": mode,
+                        "split_bucket": bucket,
+                        "candidate_id": f"{bucket}-candidate",
+                        "sample_count": 2,
+                        "epochs": 1,
+                        "repeat_index": repeat_index,
+                        "success": True,
+                        "effective_training_time": time_base + repeat_index,
+                        "delta proxy_mAP@0.5": delta_base + 0.01 * repeat_index,
+                        "prefix_parameter_ratio": ratio,
+                    }
+                )
 
-    experiments._write_split_position_time_accuracy_plot(rows, tmp_path)
+    experiments._write_split_position_mode_boxplots(rows, tmp_path)
 
-    pdf_path = tmp_path / "plots" / "split_position_time_accuracy_dual_axis.pdf"
-    png_path = tmp_path / "plots" / "split_position_time_accuracy_dual_axis.png"
+    pdf_path = tmp_path / "plots" / "freeze_vs_split_cached_vs_rebuild_by_position.pdf"
+    png_path = tmp_path / "plots" / "freeze_vs_split_cached_vs_rebuild_by_position.png"
     assert pdf_path.exists()
     assert pdf_path.stat().st_size > 0
     assert png_path.exists()
     assert png_path.stat().st_size > 0
+    assert not (tmp_path / "plots" / "training_time_reduction_boxplot.pdf").exists()
+    assert not (tmp_path / "plots" / "split_position_time_accuracy_dual_axis.pdf").exists()
+    assert not (tmp_path / "plots" / "split_position_time_accuracy_dual_axis.png").exists()
 
 
 def test_suffix_parameter_resolution_is_identical_for_freeze_and_split():
