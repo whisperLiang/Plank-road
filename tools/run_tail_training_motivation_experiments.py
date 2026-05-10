@@ -1160,136 +1160,14 @@ def _update_map_metrics(
         row["delta proxy_mAP@0.5"] = float(after_map) - float(before_map)
 
 
-def _label_for_row(row: Mapping[str, Any]) -> str:
-    mode = str(row.get("mode") or "")
-    bucket = row.get("split_bucket")
-    if bucket:
-        return f"{mode}/{bucket}"
-    return mode
-
-
 def _successful_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows if bool(row.get("success"))]
 
 
-def _speedup_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    successful = _successful_rows(rows)
-    freeze_by_key = {
-        (
-            int(row.get("repeat_index") or 0),
-            int(row.get("sample_count") or 0),
-            int(row.get("epochs") or 0),
-            str(row.get("candidate_id")),
-        ): row
-        for row in successful
-        if row.get("mode") == "freeze"
-    }
-    speedups: list[dict[str, Any]] = []
-    for row in successful:
-        if row.get("mode") not in {"split_cached", "split_rebuild"}:
-            continue
-        key = (
-            int(row.get("repeat_index") or 0),
-            int(row.get("sample_count") or 0),
-            int(row.get("epochs") or 0),
-            str(row.get("candidate_id")),
-        )
-        baseline = freeze_by_key.get(key)
-        if not baseline:
-            continue
-        split_time = float(row.get("training_time") or 0.0)
-        freeze_time = float(baseline.get("training_time") or 0.0)
-        if split_time <= 0.0:
-            continue
-        speedups.append(
-            {
-                "mode": row.get("mode"),
-                "split_bucket": row.get("split_bucket"),
-                "candidate_id": row.get("candidate_id"),
-                "sample_count": int(row.get("sample_count") or 0),
-                "epochs": int(row.get("epochs") or 0),
-                "prefix_parameter_ratio": float(row.get("prefix_parameter_ratio") or 0.0),
-                "speedup": freeze_time / split_time,
-            }
-        )
-    return speedups
-
-
-def _time_reduction_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    successful = _successful_rows(rows)
-    freeze_by_key = {
-        (
-            int(row.get("repeat_index") or 0),
-            int(row.get("sample_count") or 0),
-            int(row.get("epochs") or 0),
-            str(row.get("candidate_id")),
-        ): row
-        for row in successful
-        if row.get("mode") == "freeze"
-    }
-    reductions: list[dict[str, Any]] = []
-    for row in successful:
-        if row.get("mode") not in {"split_cached", "split_rebuild"}:
-            continue
-        key = (
-            int(row.get("repeat_index") or 0),
-            int(row.get("sample_count") or 0),
-            int(row.get("epochs") or 0),
-            str(row.get("candidate_id")),
-        )
-        baseline = freeze_by_key.get(key)
-        if not baseline:
-            continue
-        split_time = row.get("training_time")
-        freeze_time = baseline.get("training_time")
-        if split_time is None or freeze_time is None:
-            continue
-        reductions.append(
-            {
-                "mode": row.get("mode"),
-                "split_bucket": row.get("split_bucket"),
-                "candidate_id": row.get("candidate_id"),
-                "sample_count": int(row.get("sample_count") or 0),
-                "epochs": int(row.get("epochs") or 0),
-                "repeat_index": int(row.get("repeat_index") or 0),
-                "reduction": float(freeze_time) - float(split_time),
-            }
-        )
-    return reductions
-
-
-def _plot_mean_std_line(
-    ax: Any,
+def plot_split_time_accuracy_boxplots(
     rows: list[Mapping[str, Any]],
-    *,
-    x_field: str,
-    y_field: str,
-    label: str,
-    marker: str = "o",
+    output_root: Path,
 ) -> None:
-    by_x: dict[int, list[Any]] = {}
-    for row in rows:
-        by_x.setdefault(int(row.get(x_field) or 0), []).append(row.get(y_field))
-    xs = sorted(by_x)
-    means: list[float] = []
-    stds: list[float] = []
-    for x in xs:
-        mean, std = _mean_std(by_x[x])
-        if mean is None:
-            continue
-        means.append(mean)
-        stds.append(float(std or 0.0))
-    if not means:
-        return
-    xs = xs[: len(means)]
-    ax.plot(xs, means, marker=marker, linewidth=1.6, label=label)
-    lower = [mean - std for mean, std in zip(means, stds)]
-    upper = [mean + std for mean, std in zip(means, stds)]
-    if any(std > 0.0 for std in stds):
-        ax.fill_between(xs, lower, upper, alpha=0.16)
-
-
-def _write_overview_plot(rows: list[Mapping[str, Any]], output_root: Path) -> None:
     plots_dir = output_root / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1298,560 +1176,218 @@ def _write_overview_plot(rows: list[Mapping[str, Any]], output_root: Path) -> No
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError as exc:
-        logger.warning("matplotlib is unavailable; skipping overview plot: {}", exc)
+        logger.warning("matplotlib is unavailable; skipping split boxplot: {}", exc)
         return
 
     successful = _successful_rows(rows)
-    aggregate = _aggregate_rows(rows)
-    speedups = _speedup_rows(rows)
+    split_rows = [
+        row
+        for row in successful
+        if row.get("split_bucket") is not None or row.get("candidate_id") is not None
+    ]
+    if not split_rows:
+        logger.warning("No successful split-position rows are available for boxplot.")
+        return
+
+    metric_fields = (
+        ("proxy_mAP@0.5 after", "mAP (%)"),
+        ("mAP after", "mAP (%)"),
+        ("map_after", "mAP (%)"),
+        ("accuracy after", "Accuracy (%)"),
+        ("accuracy_after", "Accuracy (%)"),
+        ("accuracy", "Accuracy (%)"),
+    )
+    metric_field: str | None = None
+    metric_label = "mAP (%)"
+    for field, label in metric_fields:
+        if any(row.get(field) is not None for row in split_rows):
+            metric_field = field
+            metric_label = label
+            break
+    if metric_field is None:
+        logger.warning("No accuracy or mAP field is available for split boxplot.")
+        return
+
+    def finite_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(number):
+            return None
+        return number
+
+    def split_label(row: Mapping[str, Any]) -> str | None:
+        label = row.get("split_bucket") or row.get("candidate_id")
+        if label is None:
+            return None
+        return str(label)
+
+    labels_seen = {label for row in split_rows if (label := split_label(row)) is not None}
+    preferred_order = [*BUCKET_LABELS, "Auto"]
+    labels = [label for label in preferred_order if label in labels_seen]
+    labels.extend(sorted(label for label in labels_seen if label not in set(preferred_order)))
+    if not labels:
+        logger.warning("No split-position labels are available for boxplot.")
+        return
+
+    groups: dict[str, dict[str, list[float]]] = {
+        label: {"time": [], "metric": []} for label in labels
+    }
+    for row in split_rows:
+        label = split_label(row)
+        if label not in groups:
+            continue
+
+        training_time = finite_float(row.get("training_time"))
+        if training_time is not None:
+            groups[label]["time"].append(training_time)
+
+        metric = finite_float(row.get(metric_field))
+        if metric is not None:
+            groups[label]["metric"].append(metric)
+
+    all_metrics = [
+        value
+        for label in labels
+        for value in groups[label]["metric"]
+    ]
+    scale_metric_to_percent = bool(all_metrics) and all(
+        0.0 <= value <= 1.0 for value in all_metrics
+    )
+    if scale_metric_to_percent:
+        for label in labels:
+            groups[label]["metric"] = [value * 100.0 for value in groups[label]["metric"]]
 
     plt.rcParams.update(
         {
             "font.size": 9,
-            "axes.titlesize": 11,
             "axes.labelsize": 9,
-            "legend.fontsize": 7,
+            "legend.fontsize": 8,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
-    fig, axes = plt.subplots(2, 2, figsize=(11.0, 8.2), constrained_layout=True)
-    ax_time, ax_speed, ax_pareto, ax_status = axes.ravel()
-
-    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
-    for row in successful:
-        key = (
-            str(row.get("mode")),
-            str(row.get("split_bucket") or "Full"),
-            int(row.get("sample_count") or 0),
-        )
-        grouped.setdefault(key, []).append(row)
-    for key, items in sorted(grouped.items()):
-        mode, bucket, sample_count = key
-        _plot_mean_std_line(
-            ax_time,
-            items,
-            x_field="epochs",
-            y_field="training_time",
-            label=f"{mode}/{bucket}/n={sample_count}",
-        )
-    ax_time.set_title("A. Training Time Across Repeats")
-    ax_time.set_xlabel("Epochs")
-    ax_time.set_ylabel("Training time (s)")
-    if grouped:
-        ax_time.legend(ncol=2)
-    ax_time.grid(alpha=0.25)
-
-    speedup_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for row in speedups:
-        key = (
-            str(row.get("mode")),
-            str(row.get("split_bucket")),
-            str(row.get("candidate_id")),
-        )
-        speedup_groups.setdefault(key, []).append(row)
-    for key, items in sorted(speedup_groups.items()):
-        mode, bucket, _candidate_id = key
-        x_mean, x_std = _mean_std([item.get("prefix_parameter_ratio") for item in items])
-        y_mean, y_std = _mean_std([item.get("speedup") for item in items])
-        if x_mean is None or y_mean is None:
-            continue
-        ax_speed.errorbar(
-            x_mean,
-            y_mean,
-            xerr=x_std or 0.0,
-            yerr=y_std or 0.0,
-            marker="o",
-            capsize=3,
-            linestyle="none",
-            label=f"{mode}/{bucket}",
-        )
-    ax_speed.axhline(1.0, color="0.45", linestyle="--", linewidth=1.0)
-    ax_speed.set_title("B. Speedup vs Freeze@c")
-    ax_speed.set_xlabel("Prefix parameter ratio")
-    ax_speed.set_ylabel("Speedup (mean +/- std)")
-    if speedup_groups:
-        ax_speed.legend(ncol=2)
-    ax_speed.grid(alpha=0.25)
-
-    pareto_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for row in successful:
-        if row.get("delta proxy_mAP@0.5") is None:
-            continue
-        key = (str(row.get("mode")), str(row.get("split_bucket") or "Full"))
-        pareto_groups.setdefault(key, []).append(row)
-    for key, items in sorted(pareto_groups.items()):
-        x_mean, x_std = _mean_std([item.get("training_time") for item in items])
-        y_mean, y_std = _mean_std([item.get("delta proxy_mAP@0.5") for item in items])
-        if x_mean is None or y_mean is None:
-            continue
-        ax_pareto.errorbar(
-            x_mean,
-            y_mean,
-            xerr=x_std or 0.0,
-            yerr=y_std or 0.0,
-            marker="o",
-            capsize=3,
-            linestyle="none",
-            label="/".join(key),
-        )
-    ax_pareto.axhline(0.0, color="0.55", linestyle=":", linewidth=1.0)
-    ax_pareto.set_title("C. Time-Accuracy Pareto")
-    ax_pareto.set_xlabel("Training time (s)")
-    ax_pareto.set_ylabel("Delta proxy mAP@0.5")
-    if pareto_groups:
-        ax_pareto.legend(ncol=2)
-    ax_pareto.grid(alpha=0.25)
-
-    labels = [_label_for_row(row) for row in aggregate]
-    success_rates = [float(row.get("success_rate") or 0.0) for row in aggregate]
-    if labels:
-        y_positions = np.arange(len(labels))
-        colors = ["#2ca25f" if rate >= 1.0 else "#de8f05" for rate in success_rates]
-        ax_status.barh(y_positions, success_rates, color=colors, alpha=0.88)
-        ax_status.set_yticks(y_positions)
-        ax_status.set_yticklabels(labels)
-        ax_status.set_xlim(0.0, 1.05)
-        for pos, row in zip(y_positions, aggregate):
-            text = f"{int(row['success_count'])}/{int(row['run_count'])}"
-            ax_status.text(
-                min(1.01, float(row.get("success_rate") or 0.0) + 0.02),
-                pos,
-                text,
-                va="center",
-                fontsize=8,
-            )
-    ax_status.set_title("D. Successful Runs")
-    ax_status.set_xlabel("Success rate")
-    ax_status.grid(axis="x", alpha=0.25)
-
-    repeat_count = len({int(row.get("repeat_index") or 0) for row in rows})
-    sample_counts = sorted({int(row.get("sample_count") or 0) for row in rows})
-    epoch_counts = sorted({int(row.get("epochs") or 0) for row in rows})
-    fig.suptitle(
-        "Tail Training Motivation Overview "
-        f"(repeats={repeat_count}, samples={sample_counts}, epochs={epoch_counts})",
-        fontsize=13,
-    )
-    fig.savefig(plots_dir / "tail_training_motivation_overview.pdf")
-    plt.close(fig)
-
-
-def _write_training_time_reduction_boxplot(
-    rows: list[Mapping[str, Any]],
-    output_root: Path,
-) -> None:
-    plots_dir = output_root / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Patch
-    except ImportError as exc:
-        logger.warning("matplotlib is unavailable; skipping reduction boxplot: {}", exc)
-        return
-
-    reductions = _time_reduction_rows(rows)
-    bucket_order = [*BUCKET_LABELS, "Auto"]
-    mode_styles = (
-        ("split_cached", "Best-case: Cached", "solid", "o"),
-        ("split_rebuild", "Worst-case: Rebuild", (0, (4, 2)), "s"),
-    )
-    fill_color = "#19f419"
-    edge_color = "#083bff"
-
-    plt.rcParams.update(
-        {
-            "font.size": 10,
-            "axes.titlesize": 12,
-            "axes.labelsize": 10,
-            "legend.fontsize": 9,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
-    fig, ax = plt.subplots(figsize=(7.3, 4.6))
-    plotted = False
-    legend_handles: list[Any] = []
-    rng = np.random.default_rng(20240509)
-
-    for mode_index, (mode, label, linestyle, marker) in enumerate(mode_styles):
-        offset = -0.18 if mode_index == 0 else 0.18
-        data: list[list[float]] = []
-        positions: list[float] = []
-        for bucket_index, bucket in enumerate(bucket_order, start=1):
-            values: list[float] = []
-            for row in reductions:
-                if row.get("mode") != mode or row.get("split_bucket") != bucket:
-                    continue
-                reduction = row.get("reduction")
-                if reduction is None:
-                    continue
-                value = float(reduction)
-                if np.isfinite(value):
-                    values.append(value)
-            if values:
-                data.append(values)
-                positions.append(float(bucket_index) + offset)
-        if not data:
-            continue
-
-        plotted = True
-        boxplot = ax.boxplot(
-            data,
-            positions=positions,
-            widths=0.30,
-            patch_artist=True,
-            manage_ticks=False,
-            showmeans=True,
-            boxprops={
-                "facecolor": fill_color,
-                "edgecolor": edge_color,
-                "linewidth": 1.6,
-                "linestyle": linestyle,
-            },
-            medianprops={"color": edge_color, "linewidth": 1.5},
-            meanprops={
-                "marker": "D",
-                "markerfacecolor": "white",
-                "markeredgecolor": edge_color,
-                "markersize": 4.5,
-            },
-            whiskerprops={"color": edge_color, "linewidth": 1.3, "linestyle": linestyle},
-            capprops={"color": edge_color, "linewidth": 1.3, "linestyle": linestyle},
-            flierprops={
-                "marker": marker,
-                "markerfacecolor": "white",
-                "markeredgecolor": edge_color,
-                "markersize": 4,
-                "alpha": 0.55,
-            },
-        )
-        for patch in boxplot["boxes"]:
-            patch.set_linestyle(linestyle)
-            patch.set_alpha(0.78)
-
-        for position, values in zip(positions, data):
-            jitter = rng.uniform(-0.045, 0.045, size=len(values)) if len(values) > 1 else [0.0]
-            ax.scatter(
-                [position + float(delta) for delta in jitter],
-                values,
-                marker=marker,
-                facecolors="white",
-                edgecolors=edge_color,
-                linewidths=0.7,
-                s=20,
-                alpha=0.72,
-                zorder=3,
-            )
-
-        legend_handles.append(
-            Patch(
-                facecolor=fill_color,
-                edgecolor=edge_color,
-                linewidth=1.6,
-                linestyle=linestyle,
-                label=label,
-                alpha=0.78,
-            )
-        )
-
-    ax.axhline(0.0, color="0.42", linestyle="--", linewidth=1.0)
-    ax.set_xticks(np.arange(1, len(bucket_order) + 1))
-    ax.set_xticklabels(bucket_order)
-    ax.set_xlabel("Split candidate")
-    ax.set_ylabel("Reduction (s)")
-    ax.grid(axis="y", linestyle="--", linewidth=0.8, alpha=0.32)
-    ax.set_axisbelow(True)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-
-    repeat_count = len({int(row.get("repeat_index") or 0) for row in rows})
-    sample_counts = sorted({int(row.get("sample_count") or 0) for row in rows})
-    epoch_counts = sorted({int(row.get("epochs") or 0) for row in rows})
-    ax.set_title(
-        "Training Time Reduction vs Freeze@c\n"
-        f"repeats={repeat_count}, samples={sample_counts}, epochs={epoch_counts}",
-        pad=14,
-    )
-    if legend_handles:
-        ax.legend(
-            handles=legend_handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 1.26),
-            ncol=2,
-            frameon=True,
-            fancybox=False,
-            edgecolor="0.35",
-        )
-    if not plotted:
-        ax.text(
-            0.5,
-            0.52,
-            "No successful SplitTrain and Freeze@c pairs to compare.",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-            color="0.35",
-        )
-
-    fig.tight_layout()
-    fig.savefig(plots_dir / "training_time_reduction_boxplot.pdf")
-    plt.close(fig)
-
-
-def _write_split_position_time_accuracy_plot(
-    rows: list[Mapping[str, Any]],
-    output_root: Path,
-) -> None:
-    plots_dir = output_root / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Patch
-    except ImportError as exc:
-        logger.warning("matplotlib is unavailable; skipping split position plot: {}", exc)
-        return
-
-    successful = _successful_rows(rows)
-    bucket_order = [
-        bucket
-        for bucket in [*BUCKET_LABELS, "Auto"]
-        if any(row.get("split_bucket") == bucket for row in successful)
-    ]
-    if not bucket_order:
-        return
-
-    mode_styles = (
-        {
-            "mode": "freeze",
-            "label": "Freeze@c",
-            "offset": -0.26,
-            "face": "#d9d9d9",
-            "edge": "#4d4d4d",
-            "line": "solid",
-            "marker": "o",
-        },
-        {
-            "mode": "split_cached",
-            "label": "SplitTrain-Cached",
-            "offset": 0.0,
-            "face": "#33ff33",
-            "edge": "#083bff",
-            "line": "solid",
-            "marker": "s",
-        },
-        {
-            "mode": "split_rebuild",
-            "label": "SplitTrain-Rebuild",
-            "offset": 0.26,
-            "face": "#caff1a",
-            "edge": "#083bff",
-            "line": (0, (4, 2)),
-            "marker": "^",
-        },
-    )
-
-    plt.rcParams.update(
-        {
-            "font.size": 11,
-            "axes.titlesize": 12,
-            "axes.labelsize": 11,
-            "legend.fontsize": 10,
-            "xtick.labelsize": 11,
-            "ytick.labelsize": 11,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
-    fig, ax_time = plt.subplots(figsize=(8.4, 4.2))
+    figure_width = max(4.8, min(7.0, 1.1 * len(labels) + 2.8))
+    fig, ax_time = plt.subplots(figsize=(figure_width, 3.2))
     ax_acc = ax_time.twinx()
-    rng = np.random.default_rng(20240510)
-    x_positions = np.arange(1, len(bucket_order) + 1, dtype=float)
-    plotted_time = False
-    plotted_accuracy = False
-    accuracy_values: list[float] = []
+    ax_acc.patch.set_visible(False)
 
-    for style in mode_styles:
-        mode = str(style["mode"])
-        data: list[list[float]] = []
-        positions: list[float] = []
-        accuracy_means: list[float | None] = []
-        accuracy_stds: list[float] = []
-        accuracy_positions: list[float] = []
+    edge_color = "#083bff"
+    time_face = "#63c25f"
+    metric_face = "#ffd95a"
+    x_positions = np.arange(1, len(labels) + 1, dtype=float)
+    time_data = [groups[label]["time"] for label in labels if groups[label]["time"]]
+    time_positions = [
+        position - 0.18
+        for position, label in zip(x_positions, labels)
+        if groups[label]["time"]
+    ]
+    metric_data = [groups[label]["metric"] for label in labels if groups[label]["metric"]]
+    metric_positions = [
+        position + 0.18
+        for position, label in zip(x_positions, labels)
+        if groups[label]["metric"]
+    ]
 
-        for bucket_index, bucket in enumerate(bucket_order, start=1):
-            items = [
-                row
-                for row in successful
-                if row.get("mode") == mode and row.get("split_bucket") == bucket
-            ]
-            times = [
-                float(row.get("training_time"))
-                for row in items
-                if row.get("training_time") is not None
-                and np.isfinite(float(row.get("training_time")))
-            ]
-            if times:
-                data.append(times)
-                positions.append(float(bucket_index) + float(style["offset"]))
+    boxplot_style = {
+        "patch_artist": True,
+        "manage_ticks": False,
+        "widths": 0.28,
+        "medianprops": {"color": edge_color, "linewidth": 1.3},
+        "whiskerprops": {
+            "color": edge_color,
+            "linewidth": 1.1,
+            "linestyle": "-.",
+        },
+        "capprops": {"color": edge_color, "linewidth": 1.1},
+        "flierprops": {
+            "marker": "o",
+            "markerfacecolor": "white",
+            "markeredgecolor": edge_color,
+            "markersize": 3.0,
+            "alpha": 0.6,
+        },
+    }
 
-            mean, std = _mean_std(
-                [
-                    row.get("proxy_mAP@0.5 after")
-                    for row in items
-                    if row.get("proxy_mAP@0.5 after") is not None
-                ]
-            )
-            if mean is not None:
-                accuracy_means.append(mean)
-                accuracy_stds.append(float(std or 0.0))
-                accuracy_positions.append(float(bucket_index) + float(style["offset"]))
-                accuracy_values.append(mean)
+    if time_data:
+        time_plot = ax_time.boxplot(
+            time_data,
+            positions=time_positions,
+            boxprops={
+                "facecolor": time_face,
+                "edgecolor": edge_color,
+                "linewidth": 1.35,
+            },
+            **boxplot_style,
+        )
+        for patch in time_plot["boxes"]:
+            patch.set_alpha(0.82)
 
-        if data:
-            plotted_time = True
-            boxplot = ax_time.boxplot(
-                data,
-                positions=positions,
-                widths=0.22,
-                patch_artist=True,
-                manage_ticks=False,
-                showmeans=True,
-                boxprops={
-                    "facecolor": str(style["face"]),
-                    "edgecolor": str(style["edge"]),
-                    "linewidth": 1.6,
-                    "linestyle": style["line"],
-                },
-                medianprops={"color": str(style["edge"]), "linewidth": 1.4},
-                meanprops={
-                    "marker": "D",
-                    "markerfacecolor": "white",
-                    "markeredgecolor": str(style["edge"]),
-                    "markersize": 4,
-                },
-                whiskerprops={
-                    "color": str(style["edge"]),
-                    "linewidth": 1.2,
-                    "linestyle": style["line"],
-                },
-                capprops={"color": str(style["edge"]), "linewidth": 1.2},
-                flierprops={
-                    "marker": str(style["marker"]),
-                    "markerfacecolor": "white",
-                    "markeredgecolor": str(style["edge"]),
-                    "markersize": 4,
-                    "alpha": 0.6,
-                },
-            )
-            for patch in boxplot["boxes"]:
-                patch.set_alpha(0.78)
-                patch.set_linestyle(style["line"])
-            for position, values in zip(positions, data):
-                jitter = rng.uniform(-0.035, 0.035, size=len(values)) if len(values) > 1 else [0.0]
-                ax_time.scatter(
-                    [position + float(delta) for delta in jitter],
-                    values,
-                    marker=str(style["marker"]),
-                    facecolors="white",
-                    edgecolors=str(style["edge"]),
-                    linewidths=0.7,
-                    s=18,
-                    alpha=0.65,
-                    zorder=3,
-                )
+    if metric_data:
+        metric_plot = ax_acc.boxplot(
+            metric_data,
+            positions=metric_positions,
+            boxprops={
+                "facecolor": metric_face,
+                "edgecolor": edge_color,
+                "linewidth": 1.35,
+            },
+            **boxplot_style,
+        )
+        for patch in metric_plot["boxes"]:
+            patch.set_alpha(0.82)
 
-        if accuracy_positions:
-            plotted_accuracy = True
-            ax_acc.errorbar(
-                accuracy_positions,
-                accuracy_means,
-                yerr=accuracy_stds,
-                marker=str(style["marker"]),
-                linestyle=style["line"],
-                linewidth=1.5,
-                color=str(style["edge"]),
-                markerfacecolor=str(style["face"]),
-                markeredgecolor=str(style["edge"]),
-                capsize=3,
-                alpha=0.9,
-            )
-
-    labels: list[str] = []
-    for bucket in bucket_order:
-        ratios = [
-            float(row.get("prefix_parameter_ratio"))
-            for row in successful
-            if row.get("split_bucket") == bucket
-            and row.get("prefix_parameter_ratio") is not None
-            and np.isfinite(float(row.get("prefix_parameter_ratio")))
-        ]
-        if ratios:
-            labels.append(f"{bucket}\n{float(np.mean(ratios)):.0%}")
-        else:
-            labels.append(bucket)
+    if not time_data and not metric_data:
+        logger.warning("No finite split-position training time or metric values to plot.")
+        plt.close(fig)
+        return
 
     ax_time.set_xticks(x_positions)
     ax_time.set_xticklabels(labels)
     ax_time.set_xlabel("Split position")
     ax_time.set_ylabel("Training time (s)")
-    ax_acc.set_ylabel("Proxy mAP@0.5 after")
-    ax_time.grid(axis="y", linestyle="--", linewidth=0.8, alpha=0.34)
+    ax_acc.set_ylabel(metric_label)
+    ax_time.grid(axis="y", linestyle="--", linewidth=0.75, alpha=0.4)
     ax_time.set_axisbelow(True)
-    ax_time.set_xlim(0.45, len(bucket_order) + 0.55)
+    ax_time.set_xlim(0.45, len(labels) + 0.55)
     ax_time.set_ylim(bottom=0.0)
 
-    if accuracy_values:
-        min_acc = min(accuracy_values)
-        max_acc = max(accuracy_values)
-        pad = max(0.01, (max_acc - min_acc) * 0.18)
-        ax_acc.set_ylim(max(0.0, min_acc - pad), min(1.0, max_acc + pad))
+    plotted_metrics = [value for values in metric_data for value in values]
+    if plotted_metrics:
+        min_metric = min(plotted_metrics)
+        max_metric = max(plotted_metrics)
+        pad = max(1.0, (max_metric - min_metric) * 0.16)
+        upper_limit = min(100.0, max_metric + pad)
+        if max_metric > 100.0:
+            upper_limit = max_metric + pad
+        ax_acc.set_ylim(max(0.0, min_metric - pad), upper_limit)
 
     for spine in ("top",):
         ax_time.spines[spine].set_visible(False)
         ax_acc.spines[spine].set_visible(False)
 
-    legend_handles = [
-        Patch(
-            facecolor=str(style["face"]),
-            edgecolor=str(style["edge"]),
-            linewidth=1.6,
-            linestyle=style["line"],
-            label=str(style["label"]),
-            alpha=0.78,
-        )
-        for style in mode_styles
-    ]
     ax_time.legend(
-        handles=legend_handles,
+        handles=[
+            plt.Rectangle((0, 0), 1, 1, facecolor=time_face, edgecolor=edge_color),
+            plt.Rectangle((0, 0), 1, 1, facecolor=metric_face, edgecolor=edge_color),
+        ],
+        labels=["Tail training time", metric_label.removesuffix(" (%)")],
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.16),
-        ncol=3,
+        bbox_to_anchor=(0.5, 1.18),
+        ncol=2,
         frameon=True,
         fancybox=False,
-        edgecolor="0.35",
+        edgecolor="0.45",
     )
 
-    if not plotted_time and not plotted_accuracy:
-        ax_time.text(
-            0.5,
-            0.52,
-            "No successful split-position runs to plot.",
-            ha="center",
-            va="center",
-            transform=ax_time.transAxes,
-            color="0.35",
-        )
-
-    fig.subplots_adjust(top=0.82, bottom=0.19, left=0.10, right=0.88)
-    fig.savefig(plots_dir / "split_position_time_accuracy_dual_axis.pdf")
-    fig.savefig(plots_dir / "split_position_time_accuracy_dual_axis.png", dpi=220)
+    fig.subplots_adjust(top=0.78, bottom=0.20, left=0.12, right=0.86)
+    fig.savefig(plots_dir / "split_time_accuracy_boxplots.pdf")
+    fig.savefig(plots_dir / "split_time_accuracy_boxplots.png", dpi=220)
     plt.close(fig)
 
 
@@ -2127,93 +1663,7 @@ def _run_one_experiment(
 
 
 def _write_plots(rows: list[Mapping[str, Any]], output_root: Path) -> None:
-    _write_overview_plot(rows, output_root)
-    _write_split_position_time_accuracy_plot(rows, output_root)
-    _write_training_time_reduction_boxplot(rows, output_root)
-    plots_dir = output_root / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        logger.warning("matplotlib is unavailable; skipping PDF plot generation: {}", exc)
-        return
-
-    successful = [dict(row) for row in rows if bool(row.get("success"))]
-
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
-    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
-    for row in successful:
-        key = (
-            str(row.get("mode")),
-            str(row.get("split_bucket") or "Full"),
-            int(row.get("sample_count") or 0),
-        )
-        grouped.setdefault(key, []).append(row)
-    for (mode, bucket, sample_count), items in sorted(grouped.items()):
-        items.sort(key=lambda item: int(item.get("epochs") or 0))
-        ax.plot(
-            [int(item.get("epochs") or 0) for item in items],
-            [float(item.get("training_time") or 0.0) for item in items],
-            marker="o",
-            linewidth=1.5,
-            label=f"{mode}/{bucket}/n={sample_count}",
-        )
-    ax.set_xlabel("Epochs")
-    ax.set_ylabel("Training time (s)")
-    ax.set_title("Training Time vs Epochs")
-    if grouped:
-        ax.legend(fontsize=7, ncol=2)
-    fig.tight_layout()
-    fig.savefig(plots_dir / "training_time_vs_epochs.pdf")
-    plt.close(fig)
-
-    speedup_rows = _speedup_rows(rows)
-
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
-    for mode in ("split_cached", "split_rebuild"):
-        items = [row for row in speedup_rows if row["mode"] == mode]
-        if not items:
-            continue
-        ax.scatter(
-            [row["prefix_parameter_ratio"] for row in items],
-            [row["speedup"] for row in items],
-            label=mode,
-            alpha=0.85,
-        )
-    ax.axhline(1.0, color="0.5", linestyle="--", linewidth=1.0)
-    ax.set_xlabel("Prefix parameter ratio")
-    ax.set_ylabel("Speedup vs Freeze@c")
-    ax.set_title("Speedup vs Split Depth")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(plots_dir / "speedup_vs_split_depth.pdf")
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
-    for mode in DEFAULT_MODES:
-        items = [
-            row
-            for row in successful
-            if row.get("mode") == mode and row.get("delta proxy_mAP@0.5") is not None
-        ]
-        if not items:
-            continue
-        ax.scatter(
-            [float(row.get("training_time") or 0.0) for row in items],
-            [float(row.get("delta proxy_mAP@0.5") or 0.0) for row in items],
-            label=mode,
-            alpha=0.85,
-        )
-    ax.set_xlabel("Training time (s)")
-    ax.set_ylabel("Delta proxy mAP@0.5")
-    ax.set_title("Time-Accuracy Pareto")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(plots_dir / "time_accuracy_pareto.pdf")
-    plt.close(fig)
+    plot_split_time_accuracy_boxplots(rows, output_root)
 
 
 def _prepare_configs(args: argparse.Namespace) -> tuple[Any, Any]:
