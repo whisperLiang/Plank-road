@@ -4,13 +4,14 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
   "APScheduler",
-  "ariadne-split==0.1.0",
+  "ariadne-split==0.1.1",
   "grpcio-tools==1.78.1",
   "grpcio==1.78.1",
   "huggingface_hub==1.5.0",
   "imutils",
   "loguru==0.7.3",
   "mapcalc",
+  "matplotlib>=3.8",
   "numpy==2.2.6",
   "opencv-python==4.11.0.86",
   "ortools==9.14.6206",

@@ -89,16 +89,16 @@ wheels = [
 
 [[package]]
 name = "ariadne-split"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "torch" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3f/f8/c86c7e2496b42d538ee1b6b2b596bc26295e04ec5650a92a30ad102421d1/ariadne_split-0.1.0.tar.gz", hash = "sha256:57290863d31b790cbeaad8aee1264437d4f13a21f0c6dc48e2063677e501afb4", size = 213604, upload-time = "2026-04-28T02:59:27.759Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8b/8a/b3386cf1629ea9ff176ccdbc952e40f0a9914e417dc6cce55fdc9818c7f7/ariadne_split-0.1.1.tar.gz", hash = "sha256:76e957687268dee1b1f67ca693418d67eb6f097aabfe13d30f7e99e4165dd6a2", size = 247763, upload-time = "2026-05-09T14:04:42.693Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/c0/a74e4bf1ef7a1fd71ce5ecd9cb8fdb626eb930a3d5a3beb889c605db8ea7/ariadne_split-0.1.0-py3-none-any.whl", hash = "sha256:72c8318e7c6bdb53cb4af2882763a8777c15f57da3c0a41095a412ce360ed3b8", size = 36723, upload-time = "2026-04-28T02:59:25.504Z" },
+    { url = "https://files.pythonhosted.org/packages/db/a6/9401899665612c86eb3425120444de2dd62f80079a2eb63a24bd1912851c/ariadne_split-0.1.1-py3-none-any.whl", hash = "sha256:3b04386b9d720d3eccef8b7c84bfe096439355fc31b2fdfde1f0ed31a3b1af92", size = 60545, upload-time = "2026-05-09T14:04:41.04Z" },
 ]
 
 [[package]]
@@ -1840,6 +1840,7 @@ dependencies = [
     { name = "imutils" },
     { name = "loguru" },
     { name = "mapcalc" },
+    { name = "matplotlib" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "ortools" },
@@ -1869,13 +1870,14 @@ integration = [
 [package.metadata]
 requires-dist = [
     { name = "apscheduler" },
-    { name = "ariadne-split", specifier = "==0.1.0" },
+    { name = "ariadne-split", specifier = "==0.1.1" },
     { name = "grpcio", specifier = "==1.78.1" },
     { name = "grpcio-tools", specifier = "==1.78.1" },
     { name = "huggingface-hub", specifier = "==1.5.0" },
     { name = "imutils" },
     { name = "loguru", specifier = "==0.7.3" },
     { name = "mapcalc" },
+    { name = "matplotlib", specifier = ">=3.8" },
     { name = "numpy", specifier = "==2.2.6" },
     { name = "opencv-python", specifier = "==4.11.0.86" },
     { name = "ortools", specifier = "==9.14.6206" },

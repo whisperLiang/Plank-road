@@ -26,84 +26,6 @@ def _runtime_boundary_schema(runtime: SplitRuntime) -> dict[str, Any]:
     return dict(getattr(getattr(runtime, "candidate", None), "boundary_schema", {}) or {})
 
 
-def _runtime_graph_signature(runtime: SplitRuntime, fallback: str) -> str:
-    signature = getattr(runtime, "graph_signature", None)
-    return str(signature if signature is not None else fallback)
-
-
-def _tensor_matches_spec(tensor: torch.Tensor, tensor_spec: Any) -> bool:
-    if str(tensor.dtype) != str(getattr(tensor_spec, "dtype", tensor.dtype)):
-        return False
-    symbolic_shape = tuple(getattr(tensor_spec, "symbolic_shape", ()) or ())
-    if not symbolic_shape:
-        return tensor.ndim == 0
-    if tensor.ndim != len(symbolic_shape):
-        return False
-    for actual_dim, expected_dim in zip(tensor.shape[1:], symbolic_shape[1:]):
-        try:
-            if int(actual_dim) != int(expected_dim):
-                return False
-        except (TypeError, ValueError):
-            continue
-    return True
-
-
-def _align_boundary_payload_schema(
-    runtime: SplitRuntime,
-    boundary: BoundaryPayload,
-) -> BoundaryPayload:
-    schema = _runtime_boundary_schema(runtime)
-    if not schema:
-        return boundary
-    runtime_split_id = getattr(runtime, "split_id", None)
-    if runtime_split_id is not None and str(boundary.split_id) != str(runtime_split_id):
-        return boundary
-    tensors = dict(getattr(boundary, "tensors", {}) or {})
-    if list(tensors.keys()) == list(schema.keys()) and (
-        str(boundary.graph_signature) == _runtime_graph_signature(runtime, boundary.graph_signature)
-    ):
-        return boundary
-    if len(tensors) != len(schema):
-        return boundary
-
-    used_labels: set[str] = set()
-    remapped_tensors: dict[str, torch.Tensor] = {}
-    remapped_requires_grad: dict[str, bool] = {}
-    for target_label, tensor_spec in schema.items():
-        source_label = target_label if target_label in tensors else None
-        if source_label is None:
-            for candidate_label, candidate_tensor in tensors.items():
-                if candidate_label in used_labels or not isinstance(candidate_tensor, torch.Tensor):
-                    continue
-                if _tensor_matches_spec(candidate_tensor, tensor_spec):
-                    source_label = candidate_label
-                    break
-        if source_label is None:
-            return boundary
-        source_tensor = tensors[source_label]
-        if not isinstance(source_tensor, torch.Tensor) or not _tensor_matches_spec(
-            source_tensor,
-            tensor_spec,
-        ):
-            return boundary
-        used_labels.add(source_label)
-        remapped_tensors[str(target_label)] = source_tensor
-        remapped_requires_grad[str(target_label)] = bool(
-            getattr(boundary, "requires_grad", {}).get(source_label, source_tensor.requires_grad)
-        )
-
-    return BoundaryPayload(
-        split_id=str(runtime_split_id or boundary.split_id),
-        graph_signature=_runtime_graph_signature(runtime, boundary.graph_signature),
-        batch_size=boundary.batch_size,
-        tensors=remapped_tensors,
-        schema=schema,
-        requires_grad=remapped_requires_grad,
-        weight_version=boundary.weight_version,
-        passthrough_inputs=dict(boundary.passthrough_inputs or {}),
-    )
-
-
 def _move_value_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, torch.Tensor):
         return value.to(device)
@@ -208,7 +130,6 @@ def prepare_validated_boundary_payload(
     model_name: str | None = None,
     model_family: str | None = None,
 ) -> BoundaryPayload:
-    boundary = _align_boundary_payload_schema(runtime, boundary)
     boundary = _align_boundary_payload_device(runtime, boundary)
     try:
         runtime.validate_boundary(boundary)

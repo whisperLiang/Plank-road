@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -386,9 +386,13 @@ class UniversalModelSplitter:
         for candidate in candidates:
             if require_trainable and not bool(getattr(candidate, "trainable_suffix", False)):
                 continue
+            candidate_split_spec = replace(
+                runtime.split_spec,
+                boundary=str(getattr(candidate, "split_id", runtime.split_spec.boundary)),
+            )
             candidate_runtime = SplitRuntime(
                 trace_plan=runtime.trace_plan,
-                split_spec=runtime.split_spec,
+                split_spec=candidate_split_spec,
                 candidate=candidate,
                 segments=build_segments(runtime.trace_plan, candidate),
                 mode=mode,
@@ -491,16 +495,15 @@ class UniversalModelSplitter:
             )
         return self.runtime
 
-    def _find_ariadne_candidate(
+    def _find_ariadne_candidate_in_plan(
         self,
+        plan: Any,
         *,
         candidate: SplitCandidate | None = None,
         candidate_id: str | None = None,
         layer_label: str | None = None,
         boundary_tensor_labels: list[str] | None = None,
     ):
-        runtime = self._ensure_runtime()
-        plan = getattr(runtime, "trace_plan", None)
         if plan is None:
             raise KeyError("Ariadne runtime does not expose a trace plan.")
 
@@ -541,6 +544,23 @@ class UniversalModelSplitter:
         requested = candidate_id or getattr(candidate, "candidate_id", None) or layer_label
         raise KeyError(f"Ariadne split candidate {requested!r} is not available.")
 
+    def _find_ariadne_candidate(
+        self,
+        *,
+        candidate: SplitCandidate | None = None,
+        candidate_id: str | None = None,
+        layer_label: str | None = None,
+        boundary_tensor_labels: list[str] | None = None,
+    ):
+        runtime = self._ensure_runtime()
+        return self._find_ariadne_candidate_in_plan(
+            getattr(runtime, "trace_plan", None),
+            candidate=candidate,
+            candidate_id=candidate_id,
+            layer_label=layer_label,
+            boundary_tensor_labels=boundary_tensor_labels,
+        )
+
     def _bind_ariadne_candidate(
         self,
         *,
@@ -556,15 +576,44 @@ class UniversalModelSplitter:
             layer_label=layer_label,
             boundary_tensor_labels=boundary_tensor_labels,
         )
-        split_spec = self.split_spec or getattr(runtime, "split_spec", None) or SplitSpec(
+        base_split_spec = self.split_spec or getattr(runtime, "split_spec", None) or SplitSpec(
             boundary=getattr(ariadne_candidate, "split_id", "auto")
         )
+        split_spec = replace(
+            base_split_spec,
+            boundary=str(getattr(ariadne_candidate, "split_id", base_split_spec.boundary)),
+        )
+        variants = []
+        for variant in tuple(getattr(runtime, "variants", ()) or ()):
+            try:
+                variant_candidate = self._find_ariadne_candidate_in_plan(
+                    getattr(variant, "trace_plan", None),
+                    candidate=candidate,
+                    candidate_id=candidate_id or getattr(candidate, "candidate_id", None),
+                    layer_label=layer_label,
+                    boundary_tensor_labels=boundary_tensor_labels,
+                )
+            except KeyError:
+                continue
+            variants.append(
+                SplitRuntime(
+                    trace_plan=variant.trace_plan,
+                    split_spec=split_spec,
+                    candidate=variant_candidate,
+                    segments=build_segments(variant.trace_plan, variant_candidate),
+                    mode=variant.mode,
+                    variants=tuple(getattr(variant, "variants", ()) or ()),
+                    batch_range=getattr(variant, "batch_range", None),
+                )
+            )
         rebound = SplitRuntime(
             trace_plan=runtime.trace_plan,
             split_spec=split_spec,
             candidate=ariadne_candidate,
             segments=build_segments(runtime.trace_plan, ariadne_candidate),
             mode=runtime.mode,
+            variants=tuple(variants),
+            batch_range=getattr(runtime, "batch_range", None),
         )
         self.runtime = rebound
         self.graph = str(getattr(rebound, "graph_signature", ""))
@@ -972,46 +1021,6 @@ def _boundary_payload_to_device(
     )
 
 
-def _compatible_boundary_tensor(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    if str(lhs.dtype) != str(rhs.dtype):
-        return False
-    if lhs.ndim != rhs.ndim:
-        return False
-    if lhs.ndim == 0:
-        return True
-    return tuple(lhs.shape[1:]) == tuple(rhs.shape[1:])
-
-
-def _map_boundary_tensors_to_labels(
-    boundary: BoundaryPayload,
-    target_tensors: Mapping[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    source_tensors = dict(boundary.tensors)
-    used_labels: set[str] = set()
-    mapped: dict[str, torch.Tensor] = {}
-    for target_label, target_tensor in target_tensors.items():
-        source_label = target_label if target_label in source_tensors else None
-        if source_label is None:
-            for candidate_label, candidate_tensor in source_tensors.items():
-                if candidate_label in used_labels:
-                    continue
-                if _compatible_boundary_tensor(candidate_tensor, target_tensor):
-                    source_label = candidate_label
-                    break
-        if source_label is None:
-            raise RuntimeError(
-                "Cannot batch BoundaryPayload records with incompatible tensor labels."
-            )
-        source_tensor = source_tensors[source_label]
-        if not _compatible_boundary_tensor(source_tensor, target_tensor):
-            raise RuntimeError(
-                "Cannot batch BoundaryPayload records with incompatible tensor shapes."
-            )
-        used_labels.add(source_label)
-        mapped[target_label] = source_tensor
-    return mapped
-
-
 def _combine_boundary_payload_batch(
     boundaries: list[BoundaryPayload],
     *,
@@ -1036,9 +1045,29 @@ def _combine_boundary_payload_batch(
     for boundary in boundaries[1:]:
         if boundary.split_id != first.split_id:
             raise RuntimeError("Cannot batch BoundaryPayload records from different split ids.")
-        _map_boundary_tensors_to_labels(boundary, first.tensors)
+        if boundary.graph_signature != first.graph_signature:
+            raise RuntimeError(
+                "Cannot batch BoundaryPayload records from different graph signatures."
+            )
+        if list(boundary.tensors.keys()) != labels:
+            raise RuntimeError(
+                "Cannot batch BoundaryPayload records with different tensor labels."
+            )
+        for label in labels:
+            first_tensor = first.tensors[label]
+            tensor = boundary.tensors[label]
+            if not isinstance(first_tensor, torch.Tensor) or not isinstance(tensor, torch.Tensor):
+                continue
+            if str(first_tensor.dtype) != str(tensor.dtype) or first_tensor.ndim != tensor.ndim:
+                raise RuntimeError(
+                    "Cannot batch BoundaryPayload records with incompatible tensor shapes."
+                )
+            if first_tensor.ndim > 0 and tuple(first_tensor.shape[1:]) != tuple(tensor.shape[1:]):
+                raise RuntimeError(
+                    "Cannot batch BoundaryPayload records with incompatible tensor shapes."
+                )
     mapped_boundaries = [
-        _map_boundary_tensors_to_labels(boundary, first.tensors)
+        dict(boundary.tensors)
         for boundary in boundaries
     ]
     return BoundaryPayload(

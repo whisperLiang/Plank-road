@@ -33,6 +33,7 @@ from model_management.payload import BoundaryPayload, SplitPayload, boundary_pay
 from model_management.split_candidate import SplitCandidate
 from model_management.universal_model_split import (
     UniversalModelSplitter,
+    _combine_boundary_payload_batch,
     build_split_retrain_optimizer,
     load_split_feature_cache,
     prepare_split_train_batches_once,
@@ -710,9 +711,9 @@ def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
         passthrough_inputs={"input": torch.ones(1, 3)},
     )
     second = boundary_payload_from_tensors(
-        {"node_99": torch.tensor([[3.0, 4.0]])},
+        {"node_1": torch.tensor([[3.0, 4.0]])},
         split_id="after:node_1",
-        graph_signature="different-graph-sig",
+        graph_signature="graph-sig",
         passthrough_inputs={"input": torch.full((1, 3), 2.0)},
     )
     save_split_feature_cache(cache_path, "s1", first)
@@ -744,6 +745,35 @@ def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
 
     assert losses == [1.0]
     assert splitter.seen_boundary is not None
+
+
+def test_boundary_payload_batch_rejects_mismatched_candidate_cache_records():
+    first = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    different_label = boundary_payload_from_tensors(
+        {"node_99": torch.tensor([[3.0, 4.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    different_graph = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[3.0, 4.0]])},
+        split_id="after:node_1",
+        graph_signature="other-graph-sig",
+    )
+
+    with pytest.raises(RuntimeError, match="different tensor labels"):
+        _combine_boundary_payload_batch(
+            [first, different_label],
+            expected_batch_size=2,
+        )
+    with pytest.raises(RuntimeError, match="different graph signatures"):
+        _combine_boundary_payload_batch(
+            [first, different_graph],
+            expected_batch_size=2,
+        )
 
 
 def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(

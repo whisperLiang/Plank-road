@@ -1,6 +1,6 @@
 torch
 torchvision>=0.26.0
-ariadne-split==0.1.0
+ariadne-split==0.1.1
 numpy==2.2.6
 opencv-python==4.11.0.86
 pandas==2.3.3
@@ -12,6 +12,7 @@ ortools==9.14.6206
 grpcio-tools==1.78.1
 loguru==0.7.3
 mapcalc
+matplotlib>=3.8
 APScheduler
 imutils
 PyYAML==6.0.3
