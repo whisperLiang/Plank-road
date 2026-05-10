@@ -1,453 +1,258 @@
+"""Unit tests for the canonical cloud sample pool.
+
+The cloud pool follows a strict pending/staging → canonical rebuild →
+generation commit model. These tests exercise the new public surface:
+
+* ``store_pending_high_quality_samples`` for HIGH_QUALITY_FEATURE_LABEL_SHARD
+  sync uploads.
+* ``stage_low_quality_samples`` for low-quality teacher-annotated samples.
+* ``rebuild_canonical_training_pool`` for the training-time atomic rebuild.
+* ``list_active_samples`` / ``current_generation_id`` for reading the active
+  canonical generation.
+"""
+
 from __future__ import annotations
 
 import importlib
-import inspect
 import json
 
 import pytest
 import torch
-from model_management.payload import boundary_payload_from_tensors
+
+from model_management.split_contract import SplitRuntimeContract
 
 
 def _load_cloud_sample_pool():
-    for module_name in (
-        "cloud.sample_pool",
-        "model_management.sample_pool",
-        "sample_pool",
-        "cloud_server",
-    ):
-        try:
-            module = importlib.import_module(module_name)
-        except ModuleNotFoundError as exc:
-            if exc.name == module_name or module_name.startswith(f"{exc.name}."):
-                continue
-            raise
-        pool_cls = getattr(module, "CloudSamplePool", None)
-        if pool_cls is not None:
-            return pool_cls
-    pytest.skip("CloudSamplePool is not available yet")
+    module = importlib.import_module("cloud.sample_pool")
+    return module.CloudSamplePool
 
 
-def _accepted_kwargs(callable_obj, kwargs):
-    try:
-        signature = inspect.signature(callable_obj)
-    except (TypeError, ValueError):
-        return kwargs
-    parameters = signature.parameters
-    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        return kwargs
-    return {name: value for name, value in kwargs.items() if name in parameters}
-
-
-def _construct_pool(pool_cls, tmp_path, *, max_samples=2):
-    root = tmp_path / "pool"
-    candidates = [
-        {
-            "root_dir": str(root),
-            "max_active_samples": max_samples,
-            "reader_cache_size": 2,
-        },
-        {
-            "storage_root": str(root),
-            "max_samples": max_samples,
-            "shard_count": 1,
-            "replacement_policy": "oldest",
-        },
-        {
-            "root_dir": str(root),
-            "max_samples": max_samples,
-            "shard_count": 1,
-            "replacement_policy": "oldest",
-        },
-        {
-            "root": str(root),
-            "capacity": max_samples,
-            "num_shards": 1,
-            "replacement_strategy": "oldest",
-        },
-        {
-            "workspace_root": str(root),
-            "max_samples_per_edge": max_samples,
-            "num_shards": 1,
-            "policy": "oldest",
-        },
-    ]
-    errors = []
-    for candidate in candidates:
-        kwargs = _accepted_kwargs(pool_cls, candidate)
-        try:
-            return pool_cls(**kwargs)
-        except TypeError as exc:
-            errors.append(str(exc))
-    pytest.fail("CloudSamplePool could not be constructed: " + "; ".join(errors))
-
-
-def _call_variant(method, variants):
-    errors = []
-    for kwargs in variants:
-        try:
-            return method(**_accepted_kwargs(method, kwargs))
-        except TypeError as exc:
-            errors.append(str(exc))
-    pytest.fail(f"{method!r} did not accept any expected call shape: " + "; ".join(errors))
-
-
-def _store_sample(
-    pool,
-    tmp_path,
+def _build_split_contract(
     *,
-    edge_id,
-    sample_id,
-    raw_bytes,
-    feature_bytes=None,
-    frame_index=0,
-):
-    method = None
-    for name in (
-        "store_sample",
-        "add_sample",
-        "upsert_sample",
-        "put_sample",
-        "add_trainable_sample",
-        "append_feature_label_shard",
-        "ingest_low_quality_processed_samples",
-    ):
-        method = getattr(pool, name, None)
-        if method is not None:
-            break
-    if method is None:
-        pytest.fail("CloudSamplePool needs a store/add trainable sample method")
+    edge_id: int = 1,
+    model_id: str = "model-a",
+    split_config_id: str = "after:model.backbone",
+    front_version: str = "0",
+) -> SplitRuntimeContract:
+    return SplitRuntimeContract.create(
+        edge_id=edge_id,
+        model_id=model_id,
+        split_config_id=split_config_id,
+        canonical_split_key=split_config_id,
+        edge_split_id=split_config_id,
+        cloud_batch_split_id=split_config_id,
+        input_tensor_shape=[1, 3, 64, 64],
+        input_resize_mode="direct_resize",
+        boundary_tensor_labels=["node_0"],
+        front_version=front_version,
+        feature_tensors={"node_0": torch.ones(1, 4)},
+    )
 
-    payload_dir = tmp_path / "payloads"
-    payload_dir.mkdir(exist_ok=True)
-    raw_path = payload_dir / f"{sample_id}.jpg"
-    raw_path.write_bytes(raw_bytes)
-    feature_path = payload_dir / f"{sample_id}.pt"
-    if feature_bytes is not None:
-        feature_path.write_bytes(feature_bytes)
 
-    metadata = {
+def _high_quality_candidate(sample_id: str, *, created_at: float = 0.0) -> dict:
+    return {
         "sample_id": sample_id,
-        "edge_id": edge_id,
-        "frame_index": frame_index,
-        "has_feature": feature_bytes is not None,
-    }
-    trainable_sample = {
-        "sample_id": sample_id,
-        "feature_record": {
-            "sample_id": sample_id,
-            "intermediate": torch.ones(1, 2, 2) * float(frame_index + 1),
-        },
+        "feature": {"node_0": torch.ones(1, 4)},
         "labels": {
-            "boxes": [[0.0, 1.0, 2.0, 3.0]],
-            "labels": [frame_index % 2],
-            "scores": [0.9],
-        },
-        "created_at": float(frame_index),
-    }
-    return _call_variant(
-        method,
-        [
-            {"sample": trainable_sample},
-            {"samples": [trainable_sample]},
-            {
-                "edge_id": edge_id,
-                "sample_id": sample_id,
-                "raw_bytes": raw_bytes,
-                "feature_bytes": feature_bytes,
-                "metadata": metadata,
-            },
-            {
-                "edge_id": edge_id,
-                "sample_id": sample_id,
-                "raw_payload": raw_bytes,
-                "feature_payload": feature_bytes,
-                "metadata": metadata,
-            },
-            {
-                "edge_id": edge_id,
-                "sample_id": sample_id,
-                "raw_path": str(raw_path),
-                "feature_path": str(feature_path) if feature_bytes is not None else None,
-                "metadata": metadata,
-            },
-            {
-                "sample": {
-                    **metadata,
-                    "raw_bytes": raw_bytes,
-                    "feature_bytes": feature_bytes,
-                }
-            },
-        ],
-    )
-
-
-def _list_samples(pool, *, edge_id):
-    method = None
-    for name in ("list_active_samples", "list_samples", "samples", "iter_samples", "all_samples"):
-        method = getattr(pool, name, None)
-        if method is not None:
-            break
-    if method is None:
-        pytest.fail("CloudSamplePool needs a list_samples/samples method")
-
-    result = method(**_accepted_kwargs(method, {"edge_id": edge_id}))
-    if isinstance(result, dict):
-        if "samples" in result:
-            result = result["samples"]
-        else:
-            result = result.values()
-    return list(result)
-
-
-def _sample_value(sample, *names):
-    for name in names:
-        if isinstance(sample, dict) and name in sample:
-            return sample[name]
-        if hasattr(sample, name):
-            return getattr(sample, name)
-    metadata = (
-        sample.get("metadata")
-        if isinstance(sample, dict)
-        else getattr(sample, "metadata", None)
-    )
-    if isinstance(metadata, dict):
-        for name in names:
-            if name in metadata:
-                return metadata[name]
-    return None
-
-
-def _samples_by_id(samples):
-    by_id = {}
-    for sample in samples:
-        sample_id = _sample_value(sample, "sample_id", "id")
-        if sample_id is not None:
-            by_id[str(sample_id)] = sample
-    return by_id
-
-
-def _has_feature(sample):
-    explicit = _sample_value(sample, "has_feature", "feature_available")
-    if explicit is not None:
-        return bool(explicit)
-    return _sample_value(
-        sample,
-        "feature_shard",
-        "feature_path",
-        "feature_relpath",
-        "feature_bytes",
-        "feature_payload",
-    ) is not None
-
-
-def test_cloud_sample_pool_stores_and_lists_trainable_samples(tmp_path):
-    pool_cls = _load_cloud_sample_pool()
-    pool = _construct_pool(pool_cls, tmp_path, max_samples=4)
-
-    _store_sample(
-        pool,
-        tmp_path,
-        edge_id=7,
-        sample_id="raw-only",
-        raw_bytes=b"raw-a",
-        frame_index=1,
-    )
-    _store_sample(
-        pool,
-        tmp_path,
-        edge_id=7,
-        sample_id="raw-plus-feature",
-        raw_bytes=b"raw-b",
-        feature_bytes=b"feature-b",
-        frame_index=2,
-    )
-
-    samples = _list_samples(pool, edge_id=7)
-    by_id = _samples_by_id(samples)
-
-    assert {"raw-only", "raw-plus-feature"} <= set(by_id)
-    assert _has_feature(by_id["raw-only"]) is True
-    assert _has_feature(by_id["raw-plus-feature"]) is True
-
-
-def test_cloud_sample_pool_replaces_oldest_sample_when_capacity_is_exceeded(tmp_path):
-    pool_cls = _load_cloud_sample_pool()
-    pool = _construct_pool(pool_cls, tmp_path, max_samples=2)
-
-    for index in range(3):
-        _store_sample(
-            pool,
-            tmp_path,
-            edge_id=3,
-            sample_id=f"sample-{index}",
-            raw_bytes=f"raw-{index}".encode("ascii"),
-            feature_bytes=f"feature-{index}".encode("ascii"),
-            frame_index=index,
-        )
-
-    by_id = _samples_by_id(_list_samples(pool, edge_id=3))
-
-    assert len(by_id) == 2
-    assert "sample-0" not in by_id
-    assert {"sample-1", "sample-2"} == set(by_id)
-
-
-def test_cloud_sample_pool_enforces_capacity_for_batch_ingest(tmp_path):
-    pool_cls = _load_cloud_sample_pool()
-    pool = _construct_pool(pool_cls, tmp_path, max_samples=2)
-
-    batch = [
-        {
-            "sample_id": f"batch-{index}",
-            "feature_record": {
-                "sample_id": f"batch-{index}",
-                "intermediate": torch.ones(1, 2, 2) * float(index + 1),
-            },
-            "labels": {
-                "boxes": [[0.0, 1.0, 2.0, 3.0]],
-                "labels": [index % 2],
-            },
-            "created_at": float(index),
-        }
-        for index in range(5)
-    ]
-
-    pool.ingest_low_quality_processed_samples(batch)
-
-    by_id = _samples_by_id(_list_samples(pool, edge_id=3))
-    assert len(by_id) == 2
-
-
-def test_cloud_sample_pool_preserves_boundary_payload_metadata(tmp_path):
-    pool_cls = _load_cloud_sample_pool()
-    pool = _construct_pool(pool_cls, tmp_path, max_samples=4)
-    boundary = boundary_payload_from_tensors(
-        {"node_1": torch.ones(16, 384, 24, 24), "node_0": torch.ones(16, 384, 384)},
-        split_id="after:model.backbone.0.encoder.encoder.embeddings.patch_embeddings.projection",
-        graph_signature="runtime-signature",
-        batch_size=16,
-        passthrough_inputs={"split_label": "projection"},
-    )
-
-    pool.ingest_low_quality_processed_samples(
-        [
-            {
-                "sample_id": "boundary-sample",
-                "feature_record": {
-                    "sample_id": "boundary-sample",
-                    "intermediate": boundary,
-                },
-                "labels": {"boxes": [[0.0, 1.0, 2.0, 3.0]], "labels": [1]},
-                "created_at": 1.0,
-            }
-        ]
-    )
-
-    entry = _samples_by_id(_list_samples(pool, edge_id=1))["boundary-sample"]
-    training_record = pool.reader.training_record(entry)
-    restored = training_record["intermediate"]
-    assert restored.split_id == boundary.split_id
-    assert restored.graph_signature == boundary.graph_signature
-    assert restored.batch_size == boundary.batch_size
-
-
-def test_cloud_sample_pool_preserves_label_space_metadata(tmp_path):
-    pool_cls = _load_cloud_sample_pool()
-    pool = _construct_pool(pool_cls, tmp_path, max_samples=4)
-    boundary = boundary_payload_from_tensors(
-        {"node_1": torch.ones(1, 4)},
-        split_id="after:model.backbone",
-        graph_signature="runtime-signature",
-    )
-
-    pool.ingest_low_quality_processed_samples(
-        [
-            {
-                "sample_id": "label-meta",
-                "feature_record": {
-                    "sample_id": "label-meta",
-                    "intermediate": boundary,
-                },
-                "labels": {
-                    "boxes": [[1.0, 2.0, 3.0, 4.0]],
-                    "labels": [1],
-                    "label_coordinate_space": "model_input_xyxy",
-                    "label_input_size": [384, 384],
-                    "label_resize_mode": "direct_resize",
-                    "label_split_id": boundary.split_id,
-                    "label_graph_signature": boundary.graph_signature,
-                    "label_runtime_version": "fixed-split-pool-labels.v1",
-                },
-                "created_at": 1.0,
-            }
-        ]
-    )
-
-    entry = _samples_by_id(_list_samples(pool, edge_id=1))["label-meta"]
-    labels = pool.reader.read(entry).labels
-    training_record = pool.reader.training_record(entry)
-
-    assert labels["label_coordinate_space"] == "model_input_xyxy"
-    assert labels["label_input_size"] == [384, 384]
-    assert training_record["label_split_id"] == boundary.split_id
-
-
-def test_cloud_sample_pool_skips_unchanged_active_low_quality_samples(tmp_path):
-    pool_cls = _load_cloud_sample_pool()
-    pool = _construct_pool(pool_cls, tmp_path, max_samples=4)
-    first_boundary = boundary_payload_from_tensors(
-        {"node_1": torch.ones(1, 4)},
-        split_id="after:model.backbone",
-        graph_signature="runtime-signature",
-    )
-    sample = {
-        "sample_id": "unchanged-active",
-        "feature_record": {
-            "sample_id": "unchanged-active",
-            "intermediate": first_boundary,
-        },
-        "labels": {
-            "boxes": [[1.0, 2.0, 3.0, 4.0]],
+            "boxes": [[0.0, 0.0, 10.0, 10.0]],
             "labels": [1],
             "label_coordinate_space": "model_input_xyxy",
-            "label_input_size": [384, 384],
+            "label_input_size": [64, 64],
             "label_resize_mode": "direct_resize",
-            "label_split_id": first_boundary.split_id,
-            "label_graph_signature": first_boundary.graph_signature,
-            "label_runtime_version": "fixed-split-pool-labels.v1",
         },
-        "created_at": 1.0,
+        "sample_source": "high_quality",
+        "label_source": "edge_pseudo",
+        "split_config_id": "after:model.backbone",
+        "front_version": "0",
+        "input_tensor_shape": [1, 3, 64, 64],
+        "input_resize_mode": "direct_resize",
+        "created_at": created_at,
     }
 
-    assert pool.ingest_low_quality_processed_samples([sample]) == 1
-    feature_shards = sorted((tmp_path / "pool" / "features").glob("*.pt"))
-    assert len(feature_shards) == 1
 
-    assert (
-        pool.ingest_low_quality_processed_samples(
-            [sample],
-            skip_unchanged_existing=True,
-        )
-        == 1
+def _low_quality_candidate(sample_id: str, *, created_at: float = 0.0) -> dict:
+    return {
+        "sample_id": sample_id,
+        "feature": {"node_0": torch.ones(1, 4) * 2.0},
+        "labels": {
+            "boxes": [[1.0, 2.0, 3.0, 4.0]],
+            "labels": [2],
+            "label_coordinate_space": "model_input_xyxy",
+            "label_input_size": [64, 64],
+            "label_resize_mode": "direct_resize",
+        },
+        "sample_source": "low_quality",
+        "label_source": "teacher",
+        "split_config_id": "after:model.backbone",
+        "front_version": "0",
+        "input_tensor_shape": [1, 3, 64, 64],
+        "input_resize_mode": "direct_resize",
+        "created_at": created_at,
+    }
+
+
+def test_high_quality_sync_stages_to_pending_and_does_not_touch_active(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+
+    stats = pool.store_pending_high_quality_samples(
+        [_high_quality_candidate("hq-1"), _high_quality_candidate("hq-2")]
     )
-    assert sorted((tmp_path / "pool" / "features").glob("*.pt")) == feature_shards
+    assert stats["accepted_to_pending"] == 2
+    assert stats["skipped_invalid"] == 0
+    assert stats["duplicate"] == 0
 
-    changed_sample = dict(sample)
-    changed_labels = dict(sample["labels"])
-    changed_labels["boxes"] = [[10.0, 20.0, 30.0, 40.0]]
-    changed_sample["labels"] = changed_labels
-    assert (
-        pool.ingest_low_quality_processed_samples(
-            [changed_sample],
-            skip_unchanged_existing=True,
-        )
-        == 1
+    assert pool.current_generation_id() is None
+    assert pool.list_active_samples() == []
+    pending = pool.load_pending_high_quality_samples()
+    assert {record["sample_id"] for record in pending} == {"hq-1", "hq-2"}
+
+
+def test_high_quality_sync_deduplicates_pending_samples(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"))
+
+    pool.store_pending_high_quality_samples([_high_quality_candidate("hq-1")])
+    stats = pool.store_pending_high_quality_samples(
+        [_high_quality_candidate("hq-1"), _high_quality_candidate("hq-2")]
     )
-    assert len(sorted((tmp_path / "pool" / "features").glob("*.pt"))) == 2
+    assert stats["duplicate"] == 1
+    assert stats["accepted_to_pending"] == 1
 
-    entry = _samples_by_id(_list_samples(pool, edge_id=1))["unchanged-active"]
-    assert pool.reader.read(entry).labels["boxes"] == [[10.0, 20.0, 30.0, 40.0]]
+
+def test_canonical_rebuild_commits_active_generation_from_pending_and_staging(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = _build_split_contract()
+
+    pool.store_pending_high_quality_samples(
+        [_high_quality_candidate("hq-1", created_at=1.0)]
+    )
+    pool.stage_low_quality_samples(
+        [_low_quality_candidate("lq-1", created_at=2.0)]
+    )
+
+    pending = pool.load_pending_high_quality_samples()
+    staging = pool.load_staging_low_quality_samples()
+    stats, kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pending,
+        new_low_quality_samples=staging,
+    )
+
+    validation = stats["validation"]
+    assert validation["accepted_high_quality"] == 1
+    assert validation["accepted_low_quality"] == 1
+
+    active = pool.list_active_samples()
+    assert {entry["sample_id"] for entry in active} == {"hq-1", "lq-1"}
+
+    # The pending and staging directories are drained once they are committed.
+    assert pool.load_pending_high_quality_samples() == []
+    assert pool.load_staging_low_quality_samples() == []
+
+    # generation commit actually produced on-disk files.
+    generation_dir = pool.current_generation_dir()
+    assert generation_dir is not None
+    manifest_path = generation_dir + "/pool_manifest.json"
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert manifest["contract_id"] == contract.contract_id
+    assert manifest["sample_count"] == 2
+
+
+def test_canonical_rebuild_replaces_previous_generation_files(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = _build_split_contract()
+
+    pool.store_pending_high_quality_samples([_high_quality_candidate("hq-1", created_at=1.0)])
+    pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+    first_generation_id = pool.current_generation_id()
+    assert first_generation_id is not None
+
+    pool.stage_low_quality_samples([_low_quality_candidate("lq-1", created_at=2.0)])
+    pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(),
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    second_generation_id = pool.current_generation_id()
+    assert second_generation_id is not None
+    assert second_generation_id != first_generation_id
+
+    generations_dir = str(tmp_path / "pool" / "generations")
+    import os as _os
+
+    generation_names = sorted(_os.listdir(generations_dir))
+    assert generation_names == [second_generation_id]
+
+
+def test_canonical_rebuild_drops_samples_with_stale_contract(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = _build_split_contract(split_config_id="after:model.backbone")
+
+    stale = _high_quality_candidate("stale-1", created_at=1.0)
+    stale["split_config_id"] = "after:model.other_boundary"
+    pool.store_pending_high_quality_samples([stale])
+
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+    validation = stats["validation"]
+    assert validation["accepted_high_quality"] == 0
+    assert validation["skipped_stale_contract"] == 1
+    assert pool.list_active_samples() == []
+
+
+def test_canonical_rebuild_enforces_max_samples(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=2)
+    contract = _build_split_contract()
+
+    candidates = [_high_quality_candidate(f"hq-{index}", created_at=float(index)) for index in range(5)]
+    pool.store_pending_high_quality_samples(candidates)
+
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+    assert stats["generation_commit"]["active"] == 2
+    assert len(pool.list_active_samples()) == 2
+
+
+def test_canonical_rebuild_prefers_teacher_over_edge_pseudo(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=1)
+    contract = _build_split_contract()
+
+    pool.store_pending_high_quality_samples(
+        [_high_quality_candidate("hq-1", created_at=10.0)]
+    )
+    pool.stage_low_quality_samples(
+        [_low_quality_candidate("lq-1", created_at=1.0)]
+    )
+    pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    active = pool.list_active_samples()
+    assert [entry["sample_id"] for entry in active] == ["lq-1"]
 
 
 @pytest.mark.parametrize("mode", ["raw-only", "raw+feature"])

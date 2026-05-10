@@ -1947,7 +1947,7 @@ def test_cached_split_proxy_eval_pads_singleton_for_dynamic_runtime(tmp_path):
     assert prediction_cache["prediction_rows"][0][2]["labels"] == [1]
 
 
-def test_high_quality_sync_retries_until_split_contract_exists(tmp_path, monkeypatch):
+def test_high_quality_sync_stages_pending_without_creating_contract(tmp_path, monkeypatch):
     from cloud_server import CloudContinualLearner
 
     learner = CloudContinualLearner(
@@ -1993,9 +1993,11 @@ def test_high_quality_sync_retries_until_split_contract_exists(tmp_path, monkeyp
         split_config_id="split-a",
     )
 
-    assert success is False
-    assert "RETRY_LATER" in message
+    # Empty manifest (no shards) legitimately stages zero samples but still
+    # succeeds: sync never creates a contract and never touches active pool.
+    assert success is True
     assert committed == 0
+    assert "pending_high_quality" in message
     contract_files = [
         filename
         for _root, _dirs, filenames in os.walk(learner.split_contract_root)
@@ -2729,6 +2731,7 @@ def test_high_quality_sync_bundle_projects_boxes_to_model_input_without_size_met
 def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path):
     from cloud.sample_pool import CloudSamplePool
     from cloud_server import CloudContinualLearner
+    from model_management.split_contract import SplitRuntimeContract
 
     learner = CloudContinualLearner(
         config=SimpleNamespace(
@@ -2740,75 +2743,110 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
         large_object_detection=SimpleNamespace(),
     )
     pool = CloudSamplePool(root_dir=str(tmp_path / "pool"), max_active_samples=8)
-    payload = boundary_payload_from_tensors(
-        {"node_0": torch.ones(2, 4), "node_1": torch.ones(2, 4, 2, 2)},
-        split_id="after:model.backbone",
-        graph_signature="graph-sig",
+    contract = SplitRuntimeContract.create(
+        edge_id=1,
+        model_id="rfdetr_nano",
+        split_config_id="after:model.backbone",
+        canonical_split_key="after:model.backbone",
+        edge_split_id="after:model.backbone",
+        cloud_batch_split_id="after:model.backbone",
+        input_tensor_shape=[1, 3, 384, 384],
+        input_resize_mode="direct_resize",
+        boundary_tensor_labels=["node_0", "node_1"],
+        front_version="0",
+        feature_tensors={"node_0": torch.ones(1, 4), "node_1": torch.ones(1, 4, 2, 2)},
     )
-    pool.add_trainable_sample(
-        {
-            "sample_id": "pool-1",
-            "feature_record": {"sample_id": "pool-1", "intermediate": payload},
-            "labels": {"boxes": [[1, 2, 3, 4]], "labels": [2]},
-            "created_at": 1.0,
-        }
-    )
-    pool.add_trainable_sample(
-        {
-            "sample_id": "pool-meta",
-            "feature_record": {"sample_id": "pool-meta", "intermediate": payload},
-            "labels": {
-                "boxes": [[4, 5, 6, 7]],
-                "labels": [3],
-                "label_coordinate_space": "model_input_xyxy",
-                "label_input_size": [384, 384],
-                "label_resize_mode": "direct_resize",
-                "label_split_id": "after:model.backbone",
-                "label_graph_signature": "graph-sig",
-                "label_runtime_version": "fixed-split-pool-labels.v1",
+
+    def _candidate(sample_id: str, labels: dict, created_at: float) -> dict:
+        return {
+            "sample_id": sample_id,
+            "feature": {
+                "node_0": torch.ones(1, 4),
+                "node_1": torch.ones(1, 4, 2, 2),
             },
-            "created_at": 2.0,
+            "labels": labels,
+            "sample_source": "high_quality",
+            "label_source": "edge_pseudo",
+            "split_config_id": contract.split_config_id,
+            "front_version": contract.front_version,
+            "input_tensor_shape": [1, 3, 384, 384],
+            "input_resize_mode": "direct_resize",
+            "created_at": created_at,
         }
+
+    pool.store_pending_high_quality_samples(
+        [
+            _candidate(
+                "pool-1",
+                {
+                    "boxes": [[1, 2, 3, 4]],
+                    "labels": [2],
+                    "label_coordinate_space": "model_input_xyxy",
+                    "label_input_size": [384, 384],
+                    "label_resize_mode": "direct_resize",
+                },
+                1.0,
+            ),
+            _candidate(
+                "pool-meta",
+                {
+                    "boxes": [[4, 5, 6, 7]],
+                    "labels": [3],
+                    "label_coordinate_space": "model_input_xyxy",
+                    "label_input_size": [384, 384],
+                    "label_resize_mode": "direct_resize",
+                    "label_runtime_version": "fixed-split-pool-labels.v1",
+                },
+                2.0,
+            ),
+            _candidate(
+                "wrong-label-meta",
+                {
+                    "boxes": [[1, 2, 3, 4]],
+                    "labels": [2],
+                    "label_coordinate_space": "model_input_xyxy",
+                    "label_input_size": [640, 640],
+                    "label_resize_mode": "direct_resize",
+                },
+                3.0,
+            ),
+            _candidate(
+                "stale-raw-coords",
+                {
+                    "boxes": [[1, 2, 600, 700]],
+                    "labels": [2],
+                    "label_coordinate_space": "model_input_xyxy",
+                    "label_input_size": [384, 384],
+                    "label_resize_mode": "direct_resize",
+                },
+                4.0,
+            ),
+        ]
     )
-    pool.add_trainable_sample(
-        {
-            "sample_id": "wrong-label-meta",
-            "feature_record": {"sample_id": "wrong-label-meta", "intermediate": payload},
-            "labels": {
-                "boxes": [[1, 2, 3, 4]],
-                "labels": [2],
-                "label_coordinate_space": "model_input_xyxy",
-                "label_input_size": [640, 640],
-                "label_resize_mode": "direct_resize",
-            },
-            "created_at": 3.0,
-        }
-    )
-    pool.add_trainable_sample(
-        {
-            "sample_id": "stale-raw-coords",
-            "feature_record": {"sample_id": "stale-raw-coords", "intermediate": payload},
-            "labels": {"boxes": [[1, 2, 600, 700]], "labels": [2]},
-            "created_at": 4.0,
-        }
+    pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
     )
 
     bundle_info, preloaded_records, annotations, metadata = learner._build_pool_training_inputs(
         pool,
-        expected_split_id="after:model.backbone",
+        contract=contract,
         runtime_input_tensor_shape=(1, 3, 384, 384),
         input_resize_mode="direct_resize",
     )
 
-    assert bundle_info["all_sample_ids"] == ["pool-1", "pool-meta"]
+    assert set(bundle_info["all_sample_ids"]) == {"pool-1", "pool-meta"}
     assert "stale-raw-coords" not in preloaded_records
     assert "wrong-label-meta" not in preloaded_records
-    assert annotations["pool-1"] == {"boxes": [[1, 2, 3, 4]], "labels": [2]}
+    assert annotations["pool-1"]["boxes"] == [[1, 2, 3, 4]]
     assert annotations["pool-meta"]["label_input_size"] == [384, 384]
     assert preloaded_records["pool-1"]["input_tensor_shape"] == [1, 3, 384, 384]
     assert preloaded_records["pool-1"]["input_resize_mode"] == "direct_resize"
     assert metadata["pool-1"]["input_tensor_shape"] == [1, 3, 384, 384]
-    assert "input_image_size" not in pool.reader.read(pool.list_active_samples()[0]).feature_record
+    first_entry = pool.list_active_samples()[0]
+    assert "input_image_size" not in pool.reader.read(first_entry).feature_record
     assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"pool-1", "pool-meta"}
 
 

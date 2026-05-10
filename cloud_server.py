@@ -2169,17 +2169,20 @@ class CloudContinualLearner:
         return normalise_feature_tensors(record)
 
     @staticmethod
-    def _first_sample_feature_tensors(
-        samples: list[Mapping[str, object]],
+    def _first_candidate_feature_tensors(
+        candidates: list[Mapping[str, object]],
     ) -> dict[str, torch.Tensor] | None:
-        for sample in samples:
-            feature_record = sample.get("feature_record")
-            if not isinstance(feature_record, Mapping):
-                continue
-            try:
-                return CloudContinualLearner._feature_tensors_from_record(feature_record)
-            except Exception:
-                continue
+        """Return the first usable feature tensor dict from canonical candidates."""
+        for candidate in candidates:
+            feature = candidate.get("feature")
+            if isinstance(feature, Mapping):
+                tensors = {
+                    str(label): tensor
+                    for label, tensor in dict(feature).items()
+                    if isinstance(tensor, torch.Tensor)
+                }
+                if tensors:
+                    return tensors
         return None
 
     def _contract_layout_tensors_from_runtime(
@@ -2505,7 +2508,7 @@ class CloudContinualLearner:
                 "SplitRuntimeContract creation requires a representative feature tensor."
             )
         contract_layout = feature_layout_from_tensors(contract_feature_tensors)
-        contract_layout_id = runtime_identity_id(contract_layout)
+        contract_layout_id = make_feature_layout_id(contract_layout)
         runtime_identity = self._runtime_identity_for_contract(
             manifest=manifest,
             splitter=splitter,
@@ -2548,99 +2551,6 @@ class CloudContinualLearner:
         return contract
 
     @staticmethod
-    def _labels_are_structurally_valid(labels: Mapping[str, object]) -> bool:
-        boxes = list(labels.get("boxes") or [])
-        label_values = list(labels.get("labels") or [])
-        if bool(boxes) != bool(label_values):
-            return False
-        if boxes and len(boxes) != len(label_values):
-            return False
-        for box in boxes:
-            try:
-                values = [float(value) for value in list(box)[:4]]
-            except (TypeError, ValueError):
-                return False
-            if len(values) != 4:
-                return False
-        return True
-
-    def _filter_pool_samples_for_contract(
-        self,
-        samples: list[Mapping[str, object]],
-        *,
-        contract: SplitRuntimeContract,
-        source_label: str,
-    ) -> tuple[list[dict[str, object]], dict[str, object]]:
-        accepted: list[dict[str, object]] = []
-        skipped: dict[str, list[str]] = {
-            "skipped_contract_mismatch": [],
-            "skipped_front_version_mismatch": [],
-            "skipped_feature_layout_mismatch": [],
-            "skipped_label_invalid": [],
-            "skipped_label_metadata": [],
-            "skipped_label_bounds": [],
-            "skipped_unreadable": [],
-        }
-        model_input_size = (
-            (int(contract.input_tensor_shape[-2]), int(contract.input_tensor_shape[-1]))
-            if len(contract.input_tensor_shape) >= 3
-            else None
-        )
-        for sample in samples:
-            sample_id = str(sample.get("sample_id", "") or "")
-            feature_record = sample.get("feature_record")
-            labels = sample.get("labels")
-            if not sample_id or not isinstance(feature_record, Mapping) or not isinstance(labels, Mapping):
-                skipped["skipped_unreadable"].append(sample_id)
-                continue
-            record = dict(feature_record)
-            split_config_id = str(record.get("split_config_id") or sample.get("split_config_id") or "")
-            front_version = str(record.get("front_version") or sample.get("front_version") or "0")
-            if split_config_id != contract.split_config_id:
-                skipped["skipped_contract_mismatch"].append(sample_id)
-                continue
-            if front_version != contract.front_version:
-                skipped["skipped_front_version_mismatch"].append(sample_id)
-                continue
-            try:
-                tensors = self._feature_tensors_from_record(record)
-            except Exception:
-                skipped["skipped_unreadable"].append(sample_id)
-                continue
-            try:
-                if feature_layout_from_tensors(tensors) != contract.feature_layout:
-                    skipped["skipped_feature_layout_mismatch"].append(sample_id)
-                    continue
-            except Exception:
-                skipped["skipped_feature_layout_mismatch"].append(sample_id)
-                continue
-            labels_payload = dict(labels)
-            metadata_ok, _metadata_reason = _pool_label_metadata_is_compatible(
-                labels_payload,
-                model_input_size=model_input_size,
-                input_resize_mode=contract.input_resize_mode,
-            )
-            if not metadata_ok:
-                skipped["skipped_label_metadata"].append(sample_id)
-                continue
-            if not self._labels_are_structurally_valid(labels_payload):
-                skipped["skipped_label_invalid"].append(sample_id)
-                continue
-            if not _labels_fit_model_input(labels_payload, model_input_size=model_input_size):
-                skipped["skipped_label_bounds"].append(sample_id)
-                continue
-            accepted.append(dict(sample))
-
-        stats: dict[str, object] = {
-            "source": source_label,
-            "accepted": len(accepted),
-        }
-        for key, sample_ids in skipped.items():
-            stats[key] = len(sample_ids)
-            stats[f"{key}_preview"] = self._preview_ids(sample_ids)
-        return accepted, stats
-
-    @staticmethod
     def _pool_annotations_from_labels(
         labels: Mapping[str, object],
     ) -> dict[str, object]:
@@ -2676,7 +2586,7 @@ class CloudContinualLearner:
                 return max(candidate_sizes, key=lambda item: item[0] * item[1])
         return None
 
-    def _build_low_quality_pool_samples(
+    def _build_low_quality_staging_candidates(
         self,
         *,
         manifest: Mapping[str, object],
@@ -2687,6 +2597,13 @@ class CloudContinualLearner:
         model_input_size: tuple[int, int] | None = None,
         resize_mode: str = "direct_resize",
     ) -> list[dict[str, object]]:
+        """Build canonical-pool staging candidates from low-quality trigger samples.
+
+        Each candidate contains a single-sample feature tensor, teacher labels
+        projected into ``model_input_xyxy`` coordinates, and the contract
+        reference metadata required by
+        :meth:`CloudSamplePool.rebuild_canonical_training_pool`.
+        """
         prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
         processed_samples: list[dict[str, object]] = []
         for sample in manifest.get("samples", []):
@@ -2706,7 +2623,7 @@ class CloudContinualLearner:
                     record = load_split_feature_cache(working_cache, sample_id)
                 except FileNotFoundError:
                     logger.warning(
-                        "[FixedSplitCL] Low-quality sample {} was teacher-labeled but has no cached split feature record; skipping pool commit.",
+                        "[FixedSplitCL] Low-quality sample {} was teacher-labeled but has no cached split feature record; skipping staging.",
                         sample_id,
                     )
                     continue
@@ -2727,6 +2644,22 @@ class CloudContinualLearner:
                     resize_mode=resize_mode,
                 )
             )
+            try:
+                tensors = self._feature_tensors_from_record(dict(record))
+                single_tensors = {
+                    label: tensor[:1].detach().cpu()
+                    for label, tensor in tensors.items()
+                    if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1
+                }
+                if not single_tensors:
+                    raise ValueError("low-quality record has no feature tensors")
+            except Exception as exc:
+                logger.warning(
+                    "[FixedSplitCL] Skipping low-quality sample {} with unreadable feature tensors: {}",
+                    sample_id,
+                    exc,
+                )
+                continue
             model_meta = dict(manifest.get("model", {}) or {})
             split_plan = dict(manifest.get("split_plan", {}) or {})
             input_tensor_shape = (
@@ -2735,38 +2668,32 @@ class CloudContinualLearner:
                 or split_plan.get("input_tensor_shape", [])
                 or []
             )
-            feature_record = {
-                "sample_id": sample_id,
-                "feature": self._feature_tensors_from_record(dict(record)),
-                "sample_source": "low_quality",
-                "label_source": "teacher",
-                "model_id": str(model_meta.get("model_id", "") or manifest.get("model_id", "") or ""),
-                "split_config_id": str(
-                    manifest.get("split_config_id")
-                    or split_plan.get("split_config_id")
-                    or ""
-                ),
-                "front_version": str(
-                    manifest.get("front_version")
-                    or split_plan.get("front_version")
-                    or "0"
-                ),
-                "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape)],
-                "input_resize_mode": str(
-                    record.get("input_resize_mode")
-                    or manifest.get("input_resize_mode")
-                    or split_plan.get("input_resize_mode")
-                    or resize_mode
-                    or "direct_resize"
-                ),
-            }
             processed_samples.append(
                 {
                     "sample_id": sample_id,
-                    "feature_record": feature_record,
-                    "split_config_id": feature_record["split_config_id"],
-                    "front_version": feature_record["front_version"],
+                    "feature": single_tensors,
                     "labels": self._pool_annotations_from_labels(trainable_labels),
+                    "sample_source": "low_quality",
+                    "label_source": "teacher",
+                    "model_id": str(model_meta.get("model_id", "") or manifest.get("model_id", "") or ""),
+                    "split_config_id": str(
+                        manifest.get("split_config_id")
+                        or split_plan.get("split_config_id")
+                        or ""
+                    ),
+                    "front_version": str(
+                        manifest.get("front_version")
+                        or split_plan.get("front_version")
+                        or "0"
+                    ),
+                    "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape)],
+                    "input_resize_mode": str(
+                        record.get("input_resize_mode")
+                        or manifest.get("input_resize_mode")
+                        or split_plan.get("input_resize_mode")
+                        or resize_mode
+                        or "direct_resize"
+                    ),
                     "created_at": time.time(),
                 }
             )
@@ -2777,7 +2704,6 @@ class CloudContinualLearner:
         sample_pool: CloudSamplePool,
         *,
         contract: SplitRuntimeContract,
-        expected_split_id: str | None = None,
         runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
         input_resize_mode: str | None = None,
     ) -> tuple[
@@ -2786,123 +2712,70 @@ class CloudContinualLearner:
         dict[str, dict[str, object]],
         dict[str, dict[str, object]],
     ]:
+        """Read the current canonical generation into training-ready structures.
+
+        The canonical rebuild that commits the current generation already
+        validated every record against ``contract``. This function therefore
+        performs no filtering, deactivation, or legacy-format cleanup: it only
+        materialises the feature tensors and labels that training needs.
+        """
         active_entries = sample_pool.list_active_samples()
         sample_ids: list[str] = []
         preloaded_records: dict[str, dict[str, object]] = {}
         annotations: dict[str, dict[str, object]] = {}
         sample_metadata_by_id: dict[str, dict[str, object]] = {}
-        scanned_count = 0
-        accepted_high_quality = 0
-        accepted_low_quality = 0
-        skipped_contract_mismatch: list[str] = []
-        skipped_front_version_mismatch: list[str] = []
-        skipped_feature_layout_mismatch: list[str] = []
-        skipped_label_bounds: list[str] = []
-        skipped_label_metadata: list[str] = []
-        skipped_unreadable: list[str] = []
-        model_input_size = (
-            (int(contract.input_tensor_shape[-2]), int(contract.input_tensor_shape[-1]))
-            if len(contract.input_tensor_shape) >= 3
-            else None
-        )
+        high_quality_count = 0
+        low_quality_count = 0
+        teacher_count = 0
+        pseudo_count = 0
+        runtime_shape = [
+            int(dim)
+            for dim in (runtime_input_tensor_shape or contract.input_tensor_shape)
+        ]
+        effective_resize_mode = str(input_resize_mode or contract.input_resize_mode)
         for entry in active_entries:
-            scanned_count += 1
             sample_id = str(entry.get("sample_id", "") or "")
             if not sample_id:
                 continue
-            try:
-                feature_label = sample_pool.reader.read(entry)
-                training_record = sample_pool.reader.training_record(entry)
-            except Exception as exc:
-                logger.warning(
-                    "[FixedSplitCL] Skipping active pool sample {} because its shard record could not be loaded: {}",
-                    sample_id,
-                    exc,
-                )
-                skipped_unreadable.append(sample_id)
-                continue
-            training_record = dict(training_record)
-            split_config_id = str(training_record.get("split_config_id") or "")
-            front_version = str(training_record.get("front_version") or "0")
-            if split_config_id != contract.split_config_id:
-                skipped_contract_mismatch.append(sample_id)
-                continue
-            if front_version != contract.front_version:
-                skipped_front_version_mismatch.append(sample_id)
-                continue
-            try:
-                tensors = self._feature_tensors_from_record(training_record)
-                if feature_layout_from_tensors(tensors) != contract.feature_layout:
-                    skipped_feature_layout_mismatch.append(sample_id)
-                    continue
-            except Exception:
-                skipped_feature_layout_mismatch.append(sample_id)
-                continue
-            training_record["feature"] = tensors
+            feature_label = sample_pool.reader.read(entry)
+            feature_tensors = self._feature_tensors_from_record(feature_label.feature_record)
+            training_record = dict(feature_label.feature_record)
+            training_record["sample_id"] = sample_id
+            training_record["feature"] = feature_tensors
             training_record["cloud_batch_split_id"] = contract.cloud_batch_split_id
-            training_record["input_tensor_shape"] = [
-                int(dim) for dim in (
-                    runtime_input_tensor_shape or contract.input_tensor_shape
-                )
-            ]
-            training_record["input_resize_mode"] = str(
-                input_resize_mode or contract.input_resize_mode
-            )
+            training_record["input_tensor_shape"] = list(runtime_shape)
+            training_record["input_resize_mode"] = effective_resize_mode
             labels = self._pool_annotations_from_labels(feature_label.labels)
-            metadata_compatible, _metadata_reason = _pool_label_metadata_is_compatible(
-                labels,
-                model_input_size=model_input_size,
-                input_resize_mode=input_resize_mode or contract.input_resize_mode,
-            )
-            if not metadata_compatible:
-                skipped_label_metadata.append(sample_id)
-                continue
-            if not _labels_fit_model_input(labels, model_input_size=model_input_size):
-                skipped_label_bounds.append(sample_id)
-                continue
-            source = str(training_record.get("sample_source") or "")
-            if source == "high_quality":
-                accepted_high_quality += 1
-            elif source == "low_quality":
-                accepted_low_quality += 1
             sample_ids.append(sample_id)
             preloaded_records[sample_id] = training_record
             annotations[sample_id] = labels
             sample_metadata_by_id[sample_id] = dict(training_record)
+            source = str(entry.get("sample_source") or training_record.get("sample_source") or "")
+            label_source = str(entry.get("label_source") or training_record.get("label_source") or "")
+            if source == "high_quality":
+                high_quality_count += 1
+            elif source == "low_quality":
+                low_quality_count += 1
+            if label_source == "teacher":
+                teacher_count += 1
+            elif label_source == "edge_pseudo":
+                pseudo_count += 1
+        generation_id = sample_pool.current_generation_id() or "<none>"
         logger.info(
-            "[FixedSplitCL] Cloud sample-pool training input scan: scanned={} "
-            "accepted={} accepted_high_quality={} accepted_low_quality={} "
-            "skipped_contract_mismatch={} skipped_front_version_mismatch={} "
-            "skipped_feature_layout_mismatch={} skipped_label_bounds={} "
-            "skipped_label_metadata={} skipped_unreadable={}.",
-            scanned_count,
+            "[FixedSplitCL] Training from canonical pool: generation={} active={} "
+            "high_quality={} low_quality={} teacher_labeled={} pseudo_labeled={}.",
+            generation_id,
             len(sample_ids),
-            accepted_high_quality,
-            accepted_low_quality,
-            len(skipped_contract_mismatch),
-            len(skipped_front_version_mismatch),
-            len(skipped_feature_layout_mismatch),
-            len(skipped_label_bounds),
-            len(skipped_label_metadata),
-            len(skipped_unreadable),
+            high_quality_count,
+            low_quality_count,
+            teacher_count,
+            pseudo_count,
         )
-        skipped_preview = {
-            "contract_mismatch": self._preview_ids(skipped_contract_mismatch),
-            "front_version_mismatch": self._preview_ids(skipped_front_version_mismatch),
-            "feature_layout_mismatch": self._preview_ids(skipped_feature_layout_mismatch),
-            "label_bounds": self._preview_ids(skipped_label_bounds),
-            "label_metadata": self._preview_ids(skipped_label_metadata),
-            "unreadable": self._preview_ids(skipped_unreadable),
-        }
-        if any(skipped_preview.values()):
-            logger.info(
-                "[FixedSplitCL] Cloud sample-pool skipped preview ids (max 10 each): {}",
-                skipped_preview,
-            )
         bundle_info = {
             "manifest": {},
             "all_sample_ids": sample_ids,
             "from_sample_pool": True,
+            "generation_id": generation_id,
         }
         return bundle_info, preloaded_records, annotations, sample_metadata_by_id
 
@@ -5756,7 +5629,14 @@ class CloudContinualLearner:
         model_version: str = "",
         split_config_id: str = "",
     ) -> tuple[bool, str, int]:
-        """Ingest high-quality feature-label samples into the cloud pool."""
+        """Stage high-quality feature-label samples into the cloud pending area.
+
+        The canonical rebuild is always performed inside a training job after the
+        cloud batch runtime is bound and the :class:`SplitRuntimeContract` is
+        created/validated. Sync therefore only writes into
+        ``pending_high_quality`` staging; it never touches the active
+        generation.
+        """
         try:
             if str(sync_type or "") != "HIGH_QUALITY_FEATURE_LABEL_SHARD":
                 raise RuntimeError(
@@ -5793,173 +5673,144 @@ class CloudContinualLearner:
             ) as handle:
                 json.dump(manifest, handle, indent=2, sort_keys=True)
                 handle.write("\n")
-            split_contract = self._load_split_runtime_contract(
-                edge_id=edge_id,
-                manifest=manifest,
-            )
-            if split_contract is None:
-                message = (
-                    "RETRY_LATER: SplitRuntimeContract is not ready for this "
-                    "split_config_id; a continual learning training job must create "
-                    "the contract before high-quality feature-label shards can be "
-                    "committed."
-                )
-                logger.info(
-                    "[ShardCL][SamplePoolCommit] {} edge_id={} model_id={} split_config_id={}",
-                    message,
-                    edge_id,
-                    manifest.get("model_id"),
-                    manifest.get("split_config_id"),
-                )
-                return False, message, 0
             sample_pool = self._cloud_sample_pool_for_manifest(
                 edge_id=edge_id,
                 manifest=manifest,
             )
-            trainable_samples: list[dict[str, object]] = []
-            unreadable_ids: list[str] = []
-            model_input_size = _size_pair_from_value(
-                [
-                    int(manifest.get("input_tensor_shape", [0, 0])[-2]),
-                    int(manifest.get("input_tensor_shape", [0, 0])[-1]),
-                ]
-                if isinstance(manifest.get("input_tensor_shape"), list)
-                and len(manifest.get("input_tensor_shape", [])) >= 3
-                else None
+            pending_candidates, unreadable_ids = self._load_high_quality_shard_candidates(
+                manifest=manifest,
+                bundle_cache_path=bundle_cache_path,
             )
-            label_metadata = {
-                "label_coordinate_space": str(
-                    manifest.get("label_coordinate_space")
-                    or POOL_LABEL_COORDINATE_SPACE
-                ),
-                "label_resize_mode": str(
-                    manifest.get("input_resize_mode") or "direct_resize"
-                ),
-                "label_runtime_version": POOL_LABEL_RUNTIME_VERSION,
-            }
-            if model_input_size is not None:
-                label_metadata["label_input_size"] = [
-                    int(model_input_size[0]),
-                    int(model_input_size[1]),
-                ]
-            for shard in list(manifest.get("shards", []) or []):
-                if not isinstance(shard, Mapping):
-                    continue
-                feature_file = shard.get("feature_file") or shard.get("feature_shard")
-                label_file = shard.get("label_file") or shard.get("label_shard")
-                if not feature_file or not label_file:
-                    continue
-                feature_path = os.path.join(
-                    bundle_cache_path,
-                    str(feature_file).replace("/", os.sep),
-                )
-                label_path = os.path.join(
-                    bundle_cache_path,
-                    str(label_file).replace("/", os.sep),
-                )
-                try:
-                    feature_payload = torch.load(
-                        feature_path,
-                        map_location="cpu",
-                        weights_only=False,
-                    )
-                    feature_samples = (
-                        feature_payload.get("samples")
-                        if isinstance(feature_payload, Mapping)
-                        else None
-                    )
-                    if not isinstance(feature_samples, Mapping):
-                        raise TypeError("feature shard does not contain a samples mapping")
-                    labels_by_id: dict[str, dict[str, object]] = {}
-                    with open(label_path, "r", encoding="utf-8") as handle:
-                        for line in handle:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            label_payload = json.loads(line)
-                            if (
-                                isinstance(label_payload, Mapping)
-                                and label_payload.get("sample_id")
-                            ):
-                                labels_by_id[str(label_payload["sample_id"])] = dict(label_payload)
-                except Exception:
-                    unreadable_ids.append(str(shard.get("shard_id") or feature_file or label_file))
-                    continue
-                for sample_id, feature_value in feature_samples.items():
-                    sample_key = str(sample_id)
-                    if sample_key not in labels_by_id or not isinstance(feature_value, Mapping):
-                        unreadable_ids.append(sample_key)
-                        continue
-                    try:
-                        tensors = normalise_feature_tensors(
-                            dict(feature_value.get("tensors") or {})
-                        )
-                    except Exception:
-                        unreadable_ids.append(sample_key)
-                        continue
-                    label_payload = dict(labels_by_id[sample_key])
-                    labels = {
-                        "boxes": list(label_payload.get("boxes") or []),
-                        "labels": list(label_payload.get("labels") or []),
-                        **(
-                            {"scores": list(label_payload.get("scores") or [])}
-                            if label_payload.get("scores") is not None
-                            else {}
-                        ),
-                        **label_metadata,
-                    }
-                    feature_record = {
-                        "sample_id": sample_key,
-                        "feature": tensors,
-                        "sample_source": "high_quality",
-                        "label_source": "edge_pseudo",
-                        "model_id": str(manifest.get("model_id", "") or ""),
-                        "split_config_id": str(manifest.get("split_config_id", "") or ""),
-                        "front_version": str(manifest.get("front_version", "0") or "0"),
-                        "input_tensor_shape": list(
-                            manifest.get("input_tensor_shape", []) or []
-                        ),
-                        "input_resize_mode": str(
-                            manifest.get("input_resize_mode", "")
-                            or "direct_resize"
-                        ),
-                    }
-                    trainable_samples.append(
-                        {
-                            "sample_id": sample_key,
-                            "feature_record": feature_record,
-                            "split_config_id": feature_record["split_config_id"],
-                            "front_version": feature_record["front_version"],
-                            "labels": labels,
-                            "created_at": time.time(),
-                        }
-                    )
-            trainable_samples, commit_stats = self._filter_pool_samples_for_contract(
-                trainable_samples,
-                contract=split_contract,
-                source_label="high_quality",
+            stage_stats = sample_pool.store_pending_high_quality_samples(pending_candidates)
+            accepted = int(stage_stats.get("accepted_to_pending", 0))
+            message = (
+                f"Staged {accepted} high-quality sample(s) to pending_high_quality; "
+                f"they will enter training on the next canonical rebuild."
             )
             if unreadable_ids:
-                commit_stats["skipped_unreadable"] = int(commit_stats.get("skipped_unreadable", 0)) + len(unreadable_ids)
-                commit_stats["skipped_unreadable_preview"] = self._preview_ids(unreadable_ids)
-            added = sample_pool.ingest_low_quality_processed_samples(trainable_samples)
-            active_count = len(sample_pool.list_active_samples())
-            message = (
-                f"Synced {added} high-quality sample(s); "
-                f"{active_count} active cloud sample-pool sample(s)."
-            )
+                stage_stats = dict(stage_stats)
+                stage_stats["skipped_unreadable"] = (
+                    int(stage_stats.get("skipped_unreadable", 0)) + len(unreadable_ids)
+                )
+                stage_stats["skipped_unreadable_preview"] = self._preview_ids(unreadable_ids)
             logger.info(
-                "[ShardCL][SamplePoolCommit] {} edge_id={} pool={} committed_high_quality={} stats={}",
+                "[ShardCL][SamplePoolCommit] {} edge_id={} pending_dir={} stats={}",
                 message,
                 edge_id,
-                sample_pool.root_dir,
-                added,
-                commit_stats,
+                sample_pool.pending_high_quality_dir,
+                stage_stats,
             )
-            return True, message, int(added)
+            return True, message, accepted
         except Exception as exc:
             logger.exception("[FixedSplitCL] Sample sync failed for edge {}: {}", edge_id, exc)
             return False, str(exc), 0
+
+    def _load_high_quality_shard_candidates(
+        self,
+        *,
+        manifest: Mapping[str, object],
+        bundle_cache_path: str,
+    ) -> tuple[list[dict[str, object]], list[str]]:
+        """Extract the minimal pending record for each high-quality shard sample."""
+        candidates: list[dict[str, object]] = []
+        unreadable_ids: list[str] = []
+        manifest_input_tensor_shape = list(manifest.get("input_tensor_shape", []) or [])
+        manifest_resize_mode = str(manifest.get("input_resize_mode", "") or "direct_resize")
+        manifest_model_id = str(manifest.get("model_id", "") or "")
+        manifest_split_config_id = str(manifest.get("split_config_id", "") or "")
+        manifest_front_version = str(manifest.get("front_version", "0") or "0")
+        label_coordinate_space = str(
+            manifest.get("label_coordinate_space") or POOL_LABEL_COORDINATE_SPACE
+        )
+        for shard in list(manifest.get("shards", []) or []):
+            if not isinstance(shard, Mapping):
+                continue
+            feature_file = shard.get("feature_file") or shard.get("feature_shard")
+            label_file = shard.get("label_file") or shard.get("label_shard")
+            if not feature_file or not label_file:
+                continue
+            feature_path = os.path.join(
+                bundle_cache_path,
+                str(feature_file).replace("/", os.sep),
+            )
+            label_path = os.path.join(
+                bundle_cache_path,
+                str(label_file).replace("/", os.sep),
+            )
+            try:
+                feature_payload = torch.load(
+                    feature_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                feature_samples = (
+                    feature_payload.get("samples")
+                    if isinstance(feature_payload, Mapping)
+                    else None
+                )
+                if not isinstance(feature_samples, Mapping):
+                    raise TypeError("feature shard does not contain a samples mapping")
+                labels_by_id: dict[str, dict[str, object]] = {}
+                with open(label_path, "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        label_payload = json.loads(line)
+                        if (
+                            isinstance(label_payload, Mapping)
+                            and label_payload.get("sample_id")
+                        ):
+                            labels_by_id[str(label_payload["sample_id"])] = dict(label_payload)
+            except Exception:
+                unreadable_ids.append(str(shard.get("shard_id") or feature_file or label_file))
+                continue
+            for sample_id, feature_value in feature_samples.items():
+                sample_key = str(sample_id)
+                if sample_key not in labels_by_id or not isinstance(feature_value, Mapping):
+                    unreadable_ids.append(sample_key)
+                    continue
+                try:
+                    tensors = normalise_feature_tensors(
+                        dict(feature_value.get("tensors") or {})
+                    )
+                    single_tensors = {
+                        label: tensor[:1].detach().cpu()
+                        for label, tensor in tensors.items()
+                        if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1
+                    }
+                    if not single_tensors:
+                        raise ValueError("shard sample contained no tensor features")
+                except Exception:
+                    unreadable_ids.append(sample_key)
+                    continue
+                label_payload = dict(labels_by_id[sample_key])
+                candidates.append(
+                    {
+                        "sample_id": sample_key,
+                        "feature": single_tensors,
+                        "labels": {
+                            "boxes": list(label_payload.get("boxes") or []),
+                            "labels": list(label_payload.get("labels") or []),
+                            **(
+                                {"scores": list(label_payload.get("scores") or [])}
+                                if label_payload.get("scores") is not None
+                                else {}
+                            ),
+                            "label_coordinate_space": label_coordinate_space,
+                            "label_resize_mode": manifest_resize_mode,
+                        },
+                        "sample_source": "high_quality",
+                        "label_source": "edge_pseudo",
+                        "model_id": manifest_model_id,
+                        "split_config_id": manifest_split_config_id,
+                        "front_version": manifest_front_version,
+                        "input_tensor_shape": manifest_input_tensor_shape,
+                        "input_resize_mode": manifest_resize_mode,
+                        "created_at": time.time(),
+                    }
+                )
+        return candidates, unreadable_ids
 
     def get_ground_truth_and_retrain(
         self,
@@ -6232,7 +6083,7 @@ class CloudContinualLearner:
                 )
                 self._log_stage_duration("teacher annotation", stage_started)
                 stage_started = time.perf_counter()
-                low_quality_pool_samples = self._build_low_quality_pool_samples(
+                low_quality_staging_candidates = self._build_low_quality_staging_candidates(
                     manifest=manifest,
                     prepared_sample_ids=bundle_info["all_sample_ids"],
                     working_cache=working_cache,
@@ -6241,9 +6092,8 @@ class CloudContinualLearner:
                     model_input_size=pool_model_input_size,
                     resize_mode=pool_input_resize_mode,
                 )
-                low_quality_candidate_count = len(low_quality_pool_samples)
-                representative_features = self._first_sample_feature_tensors(
-                    low_quality_pool_samples
+                representative_features = self._first_candidate_feature_tensors(
+                    low_quality_staging_candidates
                 )
                 if representative_features is None:
                     raise RuntimeError(
@@ -6260,24 +6110,80 @@ class CloudContinualLearner:
                     bundle_root=bundle_cache_path,
                     create_if_missing=True,
                 )
-                low_quality_pool_samples, low_quality_commit_stats = (
-                    self._filter_pool_samples_for_contract(
-                        low_quality_pool_samples,
-                        contract=split_contract,
-                        source_label="low_quality",
-                    )
+                staging_stats = sample_pool.stage_low_quality_samples(
+                    low_quality_staging_candidates
                 )
-                low_quality_added = sample_pool.ingest_low_quality_processed_samples(
-                    low_quality_pool_samples,
-                    skip_unchanged_existing=True,
+                pending_high_quality = sample_pool.load_pending_high_quality_samples()
+                staging_low_quality = sample_pool.load_staging_low_quality_samples()
+                existing_active = sample_pool.load_active_samples_for_rebuild()
+                rebuild_stats, kept_records = sample_pool.rebuild_canonical_training_pool(
+                    split_contract=split_contract,
+                    existing_active_samples=existing_active,
+                    pending_high_quality_samples=pending_high_quality,
+                    new_low_quality_samples=staging_low_quality,
                 )
-                sample_pool.maybe_compact()
-                self._log_stage_duration("low-quality sample-pool commit", stage_started)
+                self._log_stage_duration("canonical sample-pool rebuild", stage_started)
                 logger.info(
-                    "[FixedSplitCL] Cloud sample pool committed {} / {} teacher-labeled low-quality sample(s); validation_stats={}.",
-                    low_quality_added,
-                    low_quality_candidate_count,
-                    low_quality_commit_stats,
+                    "[SamplePool] canonical rebuild started: "
+                    "existing_active={} pending_high_quality={} new_low_quality={} "
+                    "contract_id={} feature_layout_id={}.",
+                    len(existing_active),
+                    len(pending_high_quality),
+                    len(staging_low_quality),
+                    split_contract.contract_id,
+                    split_contract.feature_layout_id,
+                )
+                validation_stats = dict(rebuild_stats.get("validation", {}) or {})
+                replacement_stats = dict(rebuild_stats.get("replacement", {}) or {})
+                commit_stats = dict(rebuild_stats.get("generation_commit", {}) or {})
+                logger.info(
+                    "[SamplePool] canonical validation: "
+                    "accepted_high_quality={} accepted_low_quality={} "
+                    "skipped_stale_contract={} skipped_feature_layout={} "
+                    "skipped_label_bounds={} skipped_label_metadata={} "
+                    "skipped_unreadable={}.",
+                    validation_stats.get("accepted_high_quality", 0),
+                    validation_stats.get("accepted_low_quality", 0),
+                    validation_stats.get("skipped_stale_contract", 0),
+                    validation_stats.get("skipped_feature_layout", 0),
+                    validation_stats.get("skipped_label_bounds", 0),
+                    validation_stats.get("skipped_label_metadata", 0),
+                    validation_stats.get("skipped_unreadable", 0),
+                )
+                logger.info(
+                    "[SamplePool] replacement: before={} incoming={} kept={} "
+                    "dropped={} dropped_high_quality={} dropped_low_quality={} "
+                    "dropped_stale={} dropped_invalid={}.",
+                    replacement_stats.get("before", 0),
+                    replacement_stats.get("incoming", 0),
+                    replacement_stats.get("kept", 0),
+                    replacement_stats.get("dropped", 0),
+                    replacement_stats.get("dropped_high_quality", 0),
+                    replacement_stats.get("dropped_low_quality", 0),
+                    replacement_stats.get("dropped_stale", 0),
+                    replacement_stats.get("dropped_invalid", 0),
+                )
+                logger.info(
+                    "[SamplePool] generation commit: generation={} active={} "
+                    "high_quality={} low_quality={} teacher_labeled={} "
+                    "pseudo_labeled={} deleted_old_generations={} "
+                    "deleted_orphan_feature_files={} deleted_orphan_label_files={} "
+                    "deleted_processed_staging_files={}.",
+                    commit_stats.get("generation"),
+                    commit_stats.get("active", 0),
+                    commit_stats.get("high_quality", 0),
+                    commit_stats.get("low_quality", 0),
+                    commit_stats.get("teacher_labeled", 0),
+                    commit_stats.get("pseudo_labeled", 0),
+                    commit_stats.get("deleted_old_generations", 0),
+                    commit_stats.get("deleted_orphan_feature_files", 0),
+                    commit_stats.get("deleted_orphan_label_files", 0),
+                    commit_stats.get("deleted_processed_staging_files", 0),
+                )
+                logger.info(
+                    "[FixedSplitCL] Low-quality staging stats={} (candidates={}).",
+                    staging_stats,
+                    len(low_quality_staging_candidates),
                 )
 
                 (

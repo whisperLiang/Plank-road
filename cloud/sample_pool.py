@@ -1220,29 +1220,6 @@ class CloudSamplePool:
             }
             return stats, kept
 
-    # Compatibility shims intentionally commit through the canonical generation path.
-    def add_trainable_sample(
-        self,
-        sample: Mapping[str, Any] | None = None,
-        **sample_fields: Any,
-    ) -> str:
-        raise RuntimeError(
-            "CloudSamplePool.add_trainable_sample is no longer a training-pool "
-            "write path; stage samples and rebuild a canonical generation instead."
-        )
-
-    def ingest_low_quality_processed_samples(
-        self,
-        samples: list[Mapping[str, Any]],
-        *,
-        skip_unchanged_existing: bool = False,
-    ) -> int:
-        stats = self.stage_low_quality_samples(samples)
-        return int(stats.get("accepted_to_staging", 0))
-
-    def maybe_compact(self, *, force: bool = False) -> bool:
-        return False
-
 
 __all__ = [
     "CanonicalSampleRecord",

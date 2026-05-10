@@ -481,6 +481,11 @@ class HighQualitySampleSyncer:
             if not _reply_succeeded(reply):
                 self._mark_samples(sample_ids, UPLOAD_FAILED, error=_reply_message(reply))
                 return False
+            # Cloud sync only stages samples into the pending area; the active
+            # canonical generation is committed later during the training-job
+            # canonical rebuild. From the edge's perspective the sample has
+            # been durably uploaded and no retry is required: the commit state
+            # is therefore the terminal "uploaded to cloud pending" marker.
             self._mark_samples(
                 sample_ids,
                 UPLOAD_COMMITTED,
