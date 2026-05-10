@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import time
 from collections.abc import Iterable, Mapping
@@ -958,6 +959,7 @@ def _load_cached_split_batches(
     all_indices: list[Any],
     annotations: Mapping[Any, Any],
     batch_size: int,
+    dynamic_batch_min: int,
     preloaded_records: Mapping[Any, Mapping[str, Any]] | None = None,
     profile: SplitRetrainProfile | None = None,
 ) -> list[tuple[list[Any], BoundaryPayload, list[Any]]]:
@@ -996,11 +998,15 @@ def _load_cached_split_batches(
             boundary = records[0].get("intermediate")
             if not isinstance(boundary, BoundaryPayload):
                 raise RuntimeError("Split-tail training requires cached Ariadne boundary records.")
-            if int(boundary.batch_size) != len(batch_indices):
+            boundary_batch_size = int(getattr(boundary, "batch_size", 0) or 0)
+            required_batch_size = max(int(dynamic_batch_min), len(batch_indices))
+            if boundary_batch_size < required_batch_size:
                 raise RuntimeError(
-                    "Cached Ariadne boundary batch size must match the training batch. "
+                    "Cached Ariadne boundary batch size is smaller than the training batch. "
                     "Regenerate the cache with batched Ariadne prefix execution."
                 )
+            while len(targets) < boundary_batch_size:
+                targets.append(copy.deepcopy(targets[-1]))
             batches.append((batch_indices, boundary, targets))
     finally:
         _add_profile_time(
@@ -1210,6 +1216,7 @@ def universal_split_retrain(
         all_indices=list(all_indices),
         annotations=annotations,
         batch_size=epoch_batch_size,
+        dynamic_batch_min=_splitter_dynamic_batch_min(runtime),
         preloaded_records=preloaded_records,
         profile=retrain_profile,
     )

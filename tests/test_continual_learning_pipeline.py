@@ -1150,12 +1150,12 @@ def test_split_retrain_rejects_per_sample_cached_boundaries(
         )
 
 
-def test_split_retrain_uses_cached_pseudo_targets_without_padding_singleton_batch(
+def test_split_retrain_uses_cached_pseudo_targets_with_padded_ariadne_batch(
     tmp_path,
 ):
     cache_path = str(tmp_path / "cache")
     payload = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0, 2.0]])},
+        {"node_1": torch.tensor([[1.0, 2.0], [1.0, 2.0]])},
         split_id="after:node_1",
         graph_signature="graph-sig",
     )
@@ -1181,12 +1181,13 @@ def test_split_retrain_uses_cached_pseudo_targets_without_padding_singleton_batc
         def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
             self.seen_boundary = boundary
             self.seen_targets = targets
-            assert boundary.batch_size == 1
-            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0]]
-            assert len(targets) == 1
+            assert boundary.batch_size == 2
+            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0], [1.0, 2.0]]
+            assert len(targets) == 2
             assert targets[0]["boxes"] == [[1.0, 2.0, 3.0, 4.0]]
             assert targets[0]["labels"] == [1]
             assert targets[0]["_split_meta"]["input_tensor_shape"] == [1, 3, 8, 16]
+            assert targets[1] == targets[0]
             return torch.tensor(0.5), {}
 
     splitter = DynamicBatchSplitter()
@@ -1785,7 +1786,7 @@ def test_working_cache_manifest_fingerprint_matches_current_bundle():
     assert identity["model_version"] == "v1"
     assert identity["sample_ids"] == ["s1", "s2"]
     assert identity["fingerprint"]
-    assert identity["cache_version"] == 2
+    assert identity["cache_version"] == 3
 
     assert CloudContinualLearner._working_cache_manifest_matches(identity, identity) is True
 
@@ -2177,33 +2178,6 @@ def test_cloud_fixed_split_cache_hit_preloads_without_double_deserialize(
     assert list(preloaded) == ["s1"]
 
 
-def test_cloud_reconstruction_splits_batched_boundary_payload(tmp_path):
-    from cloud_server import CloudContinualLearner
-
-    learner = CloudContinualLearner(
-        config=SimpleNamespace(
-            edge_model_name="rfdetr_nano",
-            continual_learning=SimpleNamespace(batch_size=3),
-            das=SimpleNamespace(enabled=False),
-            workspace_root=str(tmp_path),
-        ),
-        large_object_detection=SimpleNamespace(),
-    )
-    payload = boundary_payload_from_tensors(
-        {"node_1": torch.arange(6, dtype=torch.float32).reshape(3, 2)},
-        split_id="after:node_1",
-        graph_signature="graph-sig",
-        passthrough_inputs={"input": torch.ones(3, 4)},
-    )
-
-    split_payloads = learner._split_batched_payload(payload, batch_size=3)
-
-    assert [item.batch_size for item in split_payloads] == [1, 1, 1]
-    assert split_payloads[0].tensors["node_1"].shape == (1, 2)
-    assert split_payloads[2].tensors["node_1"].tolist() == [[4.0, 5.0]]
-    assert split_payloads[1].passthrough_inputs["input"].shape == (1, 4)
-
-
 def test_cloud_batch_feature_provider_uses_actual_short_final_chunk(
     tmp_path,
     sample_bgr_frame,
@@ -2262,8 +2236,9 @@ def test_cloud_batch_feature_provider_uses_actual_short_final_chunk(
 
     assert fake_splitter.seen_shapes == [(3, 1)]
     assert len(payloads) == 3
-    assert [payload.batch_size for payload in payloads] == [1, 1, 1]
-    assert payloads[2].tensors["node_1"].tolist() == [[2.0]]
+    assert [payload.batch_size for payload in payloads] == [3, 3, 3]
+    assert payloads[0].tensors["node_1"].tolist() == [[0.0], [1.0], [2.0]]
+    assert all(payload is payloads[0] for payload in payloads)
 
 
 def test_cloud_batch_feature_provider_pads_single_sample_to_runtime_minimum(
@@ -2319,7 +2294,8 @@ def test_cloud_batch_feature_provider_pads_single_sample_to_runtime_minimum(
 
     assert fake_splitter.seen_shapes == [(2, 1)]
     assert len(payloads) == 1
-    assert payloads[0].tensors["node_1"].tolist() == [[7.0]]
+    assert payloads[0].batch_size == 2
+    assert payloads[0].tensors["node_1"].tolist() == [[7.0], [7.0]]
 
 
 _FORBIDDEN_SHARD_METADATA = {
@@ -2491,7 +2467,7 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
     )
     pool = CloudSamplePool(root_dir=str(tmp_path / "pool"), max_active_samples=8)
     payload = boundary_payload_from_tensors(
-        {"node_0": torch.ones(1, 4), "node_1": torch.ones(1, 4, 2, 2)},
+        {"node_0": torch.ones(2, 4), "node_1": torch.ones(2, 4, 2, 2)},
         split_id="after:model.backbone",
         graph_signature="graph-sig",
     )

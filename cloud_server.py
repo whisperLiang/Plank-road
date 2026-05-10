@@ -85,7 +85,7 @@ def _collate_fn(batch):
     return tuple(zip(*batch))
 
 
-_FIXED_SPLIT_WORKING_CACHE_VERSION = 2
+_FIXED_SPLIT_WORKING_CACHE_VERSION = 3
 _FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
 _FIXED_SPLIT_DYNAMIC_BATCH_MIN = _FIXED_SPLIT_DYNAMIC_BATCH[0]
 _FIXED_SPLIT_DYNAMIC_BATCH_MAX = _FIXED_SPLIT_DYNAMIC_BATCH[1]
@@ -1219,16 +1219,13 @@ def _build_detection_proxy_prediction_cache(
                 batch = pending_samples[start : start + batch_size]
                 batch_payloads = [payload for _, _, payload, _ in batch]
                 actual_batch_size = len(batch_payloads)
-                execution_batch_size = max(
-                    _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
-                    actual_batch_size,
-                )
                 batched_payload = batch_payloads[0]
                 if not isinstance(batched_payload, BoundaryPayload):
                     raise RuntimeError(
                         "Cached split proxy evaluation requires Ariadne BoundaryPayload records."
                     )
-                if int(getattr(batched_payload, "batch_size", 0)) != execution_batch_size:
+                execution_batch_size = int(getattr(batched_payload, "batch_size", 0) or 0)
+                if execution_batch_size < max(_FIXED_SPLIT_DYNAMIC_BATCH_MIN, actual_batch_size):
                     raise RuntimeError(
                         "Cached split proxy evaluation received per-sample payloads. "
                         "Regenerate the cache with batched Ariadne prefix execution."
@@ -2159,6 +2156,15 @@ class CloudContinualLearner:
                 sample_pool.deactivate_sample(sample_id)
                 deactivated_by_split.append(sample_id)
                 continue
+            if (
+                expected_split_id
+                and isinstance(intermediate, BoundaryPayload)
+                and int(getattr(intermediate, "batch_size", 0) or 0)
+                < _FIXED_SPLIT_DYNAMIC_BATCH_MIN
+            ):
+                sample_pool.deactivate_sample(sample_id)
+                deactivated_by_split.append(sample_id)
+                continue
             training_record = dict(training_record)
             if runtime_input_tensor_shape is not None:
                 training_record["input_tensor_shape"] = [
@@ -3083,66 +3089,6 @@ class CloudContinualLearner:
         )
         return batch_input
 
-    def _split_batched_payload(
-        self,
-        batch_payload: BoundaryPayload,
-        *,
-        batch_size: int,
-    ) -> list[BoundaryPayload]:
-        if not isinstance(batch_payload, BoundaryPayload):
-            raise TypeError(
-                "Cloud batch reconstruction expected Ariadne BoundaryPayload output, "
-                f"got {type(batch_payload).__name__}."
-            )
-        if int(getattr(batch_payload, "batch_size", 0)) != int(batch_size):
-            raise RuntimeError(
-                "Cloud batch reconstruction produced a BoundaryPayload with the wrong batch size "
-                f"(payload_batch={getattr(batch_payload, 'batch_size', None)}, expected={batch_size})."
-            )
-        return [
-            BoundaryPayload(
-                split_id=batch_payload.split_id,
-                graph_signature=batch_payload.graph_signature,
-                batch_size=1,
-                tensors={
-                    label: self._slice_batch_value(tensor, index, batch_size)
-                    for label, tensor in dict(batch_payload.tensors).items()
-                },
-                schema=dict(batch_payload.schema),
-                requires_grad=dict(batch_payload.requires_grad),
-                weight_version=batch_payload.weight_version,
-                passthrough_inputs=self._slice_batch_value(
-                    dict(batch_payload.passthrough_inputs or {}),
-                    index,
-                    batch_size,
-                ),
-            )
-            for index in range(batch_size)
-        ]
-
-    @staticmethod
-    def _slice_batch_value(value: object, index: int, batch_size: int) -> object:
-        if isinstance(value, torch.Tensor):
-            if value.ndim > 0 and int(value.shape[0]) == int(batch_size):
-                return value[index:index + 1]
-            return value
-        if isinstance(value, dict):
-            return {
-                key: CloudContinualLearner._slice_batch_value(item, index, batch_size)
-                for key, item in value.items()
-            }
-        if isinstance(value, tuple):
-            return tuple(
-                CloudContinualLearner._slice_batch_value(item, index, batch_size)
-                for item in value
-            )
-        if isinstance(value, list):
-            return [
-                CloudContinualLearner._slice_batch_value(item, index, batch_size)
-                for item in value
-            ]
-        return value
-
     @staticmethod
     def _pad_runtime_batch_inputs(
         prepared_inputs: list[torch.Tensor],
@@ -3272,13 +3218,18 @@ class CloudContinualLearner:
                     context="Cloud fixed-split feature reconstruction",
                 )
                 batch_payload = splitter.edge_forward(inputs, candidate=candidate)
-                chunk_payloads = self._split_batched_payload(
-                    batch_payload,
-                    batch_size=execution_batch_size,
-                )
-                payloads.extend(
-                    chunk_payloads[:actual_chunk_size]
-                )
+                if not isinstance(batch_payload, BoundaryPayload):
+                    raise RuntimeError(
+                        "Cloud feature reconstruction expected an Ariadne BoundaryPayload "
+                        f"from prefix execution, got {type(batch_payload).__name__}."
+                    )
+                if int(getattr(batch_payload, "batch_size", 0)) != execution_batch_size:
+                    raise RuntimeError(
+                        "Cloud feature reconstruction produced a BoundaryPayload with the wrong "
+                        f"batch size (payload_batch={getattr(batch_payload, 'batch_size', None)}, "
+                        f"expected={execution_batch_size})."
+                    )
+                payloads.extend([batch_payload] * actual_chunk_size)
             return payloads
 
         return _batch_provider
