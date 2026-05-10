@@ -1211,20 +1211,19 @@ def _build_detection_proxy_prediction_cache(
         prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
         _set_detection_model_eval_mode(model)
         with torch.no_grad():
-            batch_size = min(
-                max(1, int(inference_batch_size)),
-                _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-            )
-            for start in range(0, len(pending_samples), batch_size):
-                batch = pending_samples[start : start + batch_size]
-                batch_payloads = [payload for _, _, payload, _ in batch]
-                actual_batch_size = len(batch_payloads)
-                batched_payload = batch_payloads[0]
+            start = 0
+            while start < len(pending_samples):
+                batched_payload = pending_samples[start][2]
                 if not isinstance(batched_payload, BoundaryPayload):
                     raise RuntimeError(
                         "Cached split proxy evaluation requires Ariadne BoundaryPayload records."
                     )
                 execution_batch_size = int(getattr(batched_payload, "batch_size", 0) or 0)
+                actual_batch_size = min(
+                    len(pending_samples) - start,
+                    max(1, execution_batch_size),
+                )
+                batch = pending_samples[start : start + actual_batch_size]
                 if execution_batch_size < max(_FIXED_SPLIT_DYNAMIC_BATCH_MIN, actual_batch_size):
                     raise RuntimeError(
                         "Cached split proxy evaluation received per-sample payloads. "
@@ -1260,6 +1259,7 @@ def _build_detection_proxy_prediction_cache(
                     low_threshold_predictions,
                 ):
                     prediction_rows.append((gt_boxes, gt_labels, prediction))
+                start += actual_batch_size
 
         return {
             "prediction_rows": prediction_rows,

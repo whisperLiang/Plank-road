@@ -739,6 +739,89 @@ def test_split_retrain_uses_batched_ariadne_boundary_payloads(tmp_path):
     assert splitter.seen_boundary is not None
 
 
+def test_split_retrain_uses_cached_boundary_batch_size_as_execution_unit(tmp_path):
+    cache_path = str(tmp_path / "cache")
+    first_payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0], [2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    second_payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[3.0], [4.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    save_split_feature_cache(cache_path, "s1", first_payload)
+    save_split_feature_cache(cache_path, "s2", first_payload)
+    save_split_feature_cache(cache_path, "s3", second_payload)
+
+    class DummySplitter:
+        def __init__(self):
+            self.seen = []
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del loss_fn, optimizer
+            self.seen.append(
+                (
+                    boundary.batch_size,
+                    [target["label"] for target in targets],
+                )
+            )
+            return torch.tensor(0.5), {}
+
+    splitter = DummySplitter()
+    losses = universal_split_retrain(
+        model=torch.nn.Linear(1, 1),
+        sample_input=torch.ones(1, 1),
+        cache_path=cache_path,
+        all_indices=["s1", "s2", "s3"],
+        gt_annotations={
+            "s1": {"label": 1},
+            "s2": {"label": 2},
+            "s3": {"label": 3},
+        },
+        loss_fn=lambda outputs, targets: torch.tensor(0.5),
+        splitter=splitter,
+        batch_size=3,
+    )
+
+    assert losses == [0.5]
+    assert splitter.seen == [(2, [1, 2]), (2, [3, 3])]
+
+
+def test_cached_boundary_can_be_moved_to_runtime_device_contract():
+    from ariadne.runtime.boundary import BoundaryTensorSpec
+    from model_management import universal_model_split as split_module
+
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.ones(2, 2)},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.ones(2, 3)},
+    )
+    runtime = SimpleNamespace(
+        candidate=SimpleNamespace(
+            boundary_schema={
+                "node_1": BoundaryTensorSpec(
+                    label="node_1",
+                    symbolic_shape=("B", 2),
+                    dtype="torch.float32",
+                    requires_grad=False,
+                    device_type="meta",
+                )
+            }
+        ),
+        variants=(),
+    )
+
+    moved = split_module._move_boundary_to_runtime_device(runtime, payload)
+
+    assert moved is not payload
+    assert moved.tensors["node_1"].device.type == "meta"
+    assert moved.passthrough_inputs["input"].device.type == "meta"
+    assert payload.tensors["node_1"].device.type == "cpu"
+
+
 def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
     tmp_path,
     monkeypatch,
@@ -1144,7 +1227,10 @@ def test_split_retrain_rejects_per_sample_cached_boundaries(
             gt_annotations={},
             device=torch.device("meta"),
             loss_fn=lambda outputs, targets: torch.tensor(0.5),
-            splitter=SimpleNamespace(train_suffix=lambda *args, **kwargs: None),
+            splitter=SimpleNamespace(
+                split_spec=SimpleNamespace(dynamic_batch=(2, 64)),
+                train_suffix=lambda *args, **kwargs: None,
+            ),
             batch_size=2,
             preloaded_records=preloaded_records,
         )
@@ -1735,6 +1821,62 @@ def test_cached_split_proxy_eval_batches_schema_payloads(tmp_path):
     assert splitter.seen_boundary is not None
     assert len(prediction_cache["prediction_rows"]) == 2
     assert prediction_cache["prediction_rows"][0][2]["scores"] == pytest.approx([0.9])
+
+
+def test_cached_split_proxy_eval_uses_cached_boundary_batch_size(tmp_path):
+    from cloud_server import _build_detection_proxy_prediction_cache
+
+    cache_path = str(tmp_path / "cache")
+    first_payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0], [2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    second_payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[3.0], [4.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    save_split_feature_cache(cache_path, "s1", first_payload)
+    save_split_feature_cache(cache_path, "s2", first_payload)
+    save_split_feature_cache(cache_path, "s3", second_payload)
+
+    class DummySplitter:
+        def __init__(self):
+            self.seen_batch_sizes = []
+
+        def cloud_forward(self, boundary, *, candidate=None):
+            del candidate
+            self.seen_batch_sizes.append(boundary.batch_size)
+            return [
+                {
+                    "boxes": torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+                    "labels": torch.tensor([1]),
+                    "scores": torch.tensor([0.9]),
+                }
+                for _ in range(boundary.batch_size)
+            ]
+
+    splitter = DummySplitter()
+    prediction_cache = _build_detection_proxy_prediction_cache(
+        torch.nn.Identity(),
+        frame_dir=str(tmp_path),
+        gt_annotations={
+            "s1": {"boxes": [[0.0, 0.0, 1.0, 1.0]], "labels": [1]},
+            "s2": {"boxes": [[1.0, 1.0, 2.0, 2.0]], "labels": [2]},
+            "s3": {"boxes": [[2.0, 2.0, 3.0, 3.0]], "labels": [3]},
+        },
+        device=torch.device("cpu"),
+        threshold_low=0.1,
+        model_name="rfdetr_nano",
+        inference_batch_size=3,
+        split_cache_path=cache_path,
+        splitter=splitter,
+        split_candidate="candidate-1",
+    )
+
+    assert splitter.seen_batch_sizes == [2, 2]
+    assert len(prediction_cache["prediction_rows"]) == 3
 
 
 def test_cached_split_proxy_eval_rejects_singleton_cached_boundary(tmp_path):

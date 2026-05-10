@@ -43,6 +43,106 @@ def _runtime_args(sample_input: Any) -> tuple[Any, ...]:
     return (sample_input,)
 
 
+def _move_boundary_value_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, Mapping):
+        return {
+            key: _move_boundary_value_to_device(item, device)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_move_boundary_value_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_boundary_value_to_device(item, device) for item in value]
+    return value
+
+
+def _boundary_values_on_device(value: Any, device: torch.device) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.device == device
+    if isinstance(value, Mapping):
+        return all(_boundary_values_on_device(item, device) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_boundary_values_on_device(item, device) for item in value)
+    return True
+
+
+def _runtime_variant_for_boundary(
+    runtime: Any,
+    boundary: BoundaryPayload,
+) -> Any:
+    for variant in tuple(getattr(runtime, "variants", ()) or ()):
+        if (
+            getattr(variant, "graph_signature", None) == boundary.graph_signature
+            and getattr(variant, "split_id", None) == boundary.split_id
+        ):
+            return variant
+    return runtime
+
+
+def _first_module_device(module: Any) -> torch.device | None:
+    if not isinstance(module, torch.nn.Module):
+        return None
+    for parameter in module.parameters(recurse=True):
+        return parameter.device
+    for buffer in module.buffers(recurse=True):
+        return buffer.device
+    return None
+
+
+def _runtime_boundary_device(runtime: Any, boundary: BoundaryPayload) -> torch.device | None:
+    resolved_runtime = _runtime_variant_for_boundary(runtime, boundary)
+    schema = getattr(getattr(resolved_runtime, "candidate", None), "boundary_schema", None)
+    if not isinstance(schema, Mapping):
+        schema = getattr(boundary, "schema", None)
+
+    schema_device_type: str | None = None
+    if isinstance(schema, Mapping):
+        for label in dict(getattr(boundary, "tensors", {}) or {}):
+            spec = schema.get(label)
+            device_type = getattr(spec, "device_type", None)
+            if device_type:
+                schema_device_type = str(device_type)
+                break
+
+    for module_name in ("suffix_segment", "prefix_segment", "training_prefix_segment"):
+        module_device = _first_module_device(getattr(resolved_runtime, module_name, None))
+        if module_device is None:
+            continue
+        if schema_device_type is None or module_device.type == schema_device_type:
+            return module_device
+
+    if schema_device_type:
+        return torch.device(schema_device_type)
+    return None
+
+
+def _move_boundary_to_runtime_device(
+    runtime: Any,
+    boundary: BoundaryPayload,
+) -> BoundaryPayload:
+    device = _runtime_boundary_device(runtime, boundary)
+    if device is None:
+        return boundary
+    if (
+        _boundary_values_on_device(dict(getattr(boundary, "tensors", {}) or {}), device)
+        and _boundary_values_on_device(
+            dict(getattr(boundary, "passthrough_inputs", {}) or {}),
+            device,
+        )
+    ):
+        return boundary
+    return replace(
+        boundary,
+        tensors=_move_boundary_value_to_device(boundary.tensors, device),
+        passthrough_inputs=_move_boundary_value_to_device(
+            boundary.passthrough_inputs,
+            device,
+        ),
+    )
+
+
 def _runtime_replay_report(
     runtime: SplitRuntime,
     model: torch.nn.Module,
@@ -631,7 +731,8 @@ class UniversalModelSplitter:
         **kwargs: Any,
     ) -> Any:
         del args, candidate, kwargs
-        return self._ensure_runtime().run_suffix(payload)
+        runtime = self._ensure_runtime()
+        return runtime.run_suffix(_move_boundary_to_runtime_device(runtime, payload))
 
     run_suffix = cloud_forward
 
@@ -646,8 +747,9 @@ class UniversalModelSplitter:
         **_: Any,
     ) -> tuple[None, torch.Tensor]:
         del candidate
-        loss, _grads = self._ensure_runtime().train_suffix(
-            payload,
+        runtime = self._ensure_runtime()
+        loss, _grads = runtime.train_suffix(
+            _move_boundary_to_runtime_device(runtime, payload),
             targets,
             loss_fn=loss_fn or self.trainability_loss_fn,
             optimizer=optimizer,
@@ -662,8 +764,9 @@ class UniversalModelSplitter:
         loss_fn=None,
         optimizer=None,
     ):
-        return self._ensure_runtime().train_suffix(
-            boundary,
+        runtime = self._ensure_runtime()
+        return runtime.train_suffix(
+            _move_boundary_to_runtime_device(runtime, boundary),
             targets,
             loss_fn=loss_fn or self.trainability_loss_fn,
             optimizer=optimizer,
@@ -679,8 +782,9 @@ class UniversalModelSplitter:
         profile: dict[str, float] | None = None,
     ):
         del profile
-        return self._ensure_runtime().train_suffix(
-            boundary,
+        runtime = self._ensure_runtime()
+        return runtime.train_suffix(
+            _move_boundary_to_runtime_device(runtime, boundary),
             targets,
             loss_fn=loss_fn or self.trainability_loss_fn,
             optimizer=optimizer,
@@ -965,7 +1069,6 @@ def _load_cached_split_batches(
 ) -> list[tuple[list[Any], BoundaryPayload, list[Any]]]:
     prepare_started = time.perf_counter()
     batches: list[tuple[list[Any], BoundaryPayload, list[Any]]] = []
-    epoch_batch_size = max(1, int(batch_size))
     disk_record_cache: dict[Any, dict[str, Any]] = {}
 
     def _record_for_index(index: Any) -> dict[str, Any]:
@@ -980,11 +1083,24 @@ def _load_cached_split_batches(
         return dict(cached)
 
     try:
-        for start in range(0, len(all_indices), epoch_batch_size):
-            batch_indices = list(all_indices[start : start + epoch_batch_size])
+        start = 0
+        while start < len(all_indices):
+            first_record = _record_for_index(all_indices[start])
+            boundary = first_record.get("intermediate")
+            if not isinstance(boundary, BoundaryPayload):
+                raise RuntimeError("Split-tail training requires cached Ariadne boundary records.")
+            boundary_batch_size = int(getattr(boundary, "batch_size", 0) or 0)
+            actual_batch_size = min(
+                len(all_indices) - start,
+                max(1, boundary_batch_size),
+            )
+            batch_indices = list(all_indices[start : start + actual_batch_size])
             if not batch_indices:
-                continue
-            records = [_record_for_index(index) for index in batch_indices]
+                break
+            records = [
+                first_record,
+                *[_record_for_index(index) for index in batch_indices[1:]],
+            ]
             target_started = time.perf_counter()
             targets = [
                 _detach_boundary_value(_target_for_split_training(index, annotations, record))
@@ -995,10 +1111,6 @@ def _load_cached_split_batches(
                 "target_construction_time",
                 time.perf_counter() - target_started,
             )
-            boundary = records[0].get("intermediate")
-            if not isinstance(boundary, BoundaryPayload):
-                raise RuntimeError("Split-tail training requires cached Ariadne boundary records.")
-            boundary_batch_size = int(getattr(boundary, "batch_size", 0) or 0)
             required_batch_size = max(int(dynamic_batch_min), len(batch_indices))
             if boundary_batch_size < required_batch_size:
                 raise RuntimeError(
@@ -1008,6 +1120,7 @@ def _load_cached_split_batches(
             while len(targets) < boundary_batch_size:
                 targets.append(copy.deepcopy(targets[-1]))
             batches.append((batch_indices, boundary, targets))
+            start += actual_batch_size
     finally:
         _add_profile_time(
             profile,
@@ -1256,6 +1369,7 @@ def universal_split_retrain(
             for batch_number, (_batch_indices, boundary, targets) in enumerate(epoch_batches, 1):
                 data_load_time.append(0.0)
                 train_started = time.perf_counter()
+                boundary = _move_boundary_to_runtime_device(runtime, boundary)
                 loss, _grads = runtime.train_suffix(
                     boundary,
                     targets,
