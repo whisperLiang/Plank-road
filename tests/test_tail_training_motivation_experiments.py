@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tools import run_tail_training_motivation_experiments as experiments
 
@@ -158,3 +159,85 @@ def test_split_position_mode_boxplots_write_pdf_and_png(tmp_path):
     assert pdf_path.stat().st_size > 0
     assert png_path.exists()
     assert png_path.stat().st_size > 0
+
+
+class _FakeRuntime:
+    split_id = "after:exact"
+
+    def __init__(self):
+        self.trained_boundaries = []
+
+    def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+        del targets, loss_fn, optimizer
+        self.trained_boundaries.append(boundary)
+        return torch.tensor(0.25), None
+
+
+def test_split_cached_training_uses_cached_runtime_and_boundary_split_id():
+    runtime = _FakeRuntime()
+    boundary = SimpleNamespace(split_id=runtime.split_id)
+    cached_split = experiments.CachedSplitRuntime(
+        percent="percent:50",
+        split_id=runtime.split_id,
+        runtime=runtime,
+        cached_batches=[
+            experiments.CachedSplitBatch(
+                sample_ids=(1, 2),
+                boundary=boundary,
+                boundary_split_id=boundary.split_id,
+                targets=({"boxes": [], "labels": []}, {"boxes": [], "labels": []}),
+            )
+        ],
+        cache_build_time=1.0,
+        runtime_build_time=2.0,
+    )
+
+    metrics = experiments._train_split_cached_loop(
+        cached_split=cached_split,
+        epochs=2,
+        loss_fn=lambda _outputs, _targets: torch.tensor(0.25),
+        optimizer=None,
+        seed=3,
+        shuffle_samples=False,
+        device=torch.device("cpu"),
+    )
+
+    assert runtime.trained_boundaries == [boundary, boundary]
+    assert metrics["final_loss"] == pytest.approx(0.25)
+
+
+def test_split_cached_training_rejects_mismatched_cached_boundary_split_id():
+    runtime = _FakeRuntime()
+    cached_split = experiments.CachedSplitRuntime(
+        percent="percent:75",
+        split_id=runtime.split_id,
+        runtime=runtime,
+        cached_batches=[
+            experiments.CachedSplitBatch(
+                sample_ids=(7, 8),
+                boundary=SimpleNamespace(split_id="after:different"),
+                boundary_split_id="after:different",
+                targets=(),
+            )
+        ],
+        cache_build_time=1.0,
+        runtime_build_time=2.0,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        experiments._train_split_cached_loop(
+            cached_split=cached_split,
+            epochs=1,
+            loss_fn=lambda _outputs, _targets: torch.tensor(0.25),
+            optimizer=None,
+            seed=3,
+            shuffle_samples=False,
+            device=torch.device("cpu"),
+        )
+
+    message = str(exc_info.value)
+    assert "cached sample split_id='after:different'" in message
+    assert "cached runtime split_id='after:exact'" in message
+    assert "percent='percent:75'" in message
+    assert "sample index=0" in message
+    assert "same SplitPlan" in message

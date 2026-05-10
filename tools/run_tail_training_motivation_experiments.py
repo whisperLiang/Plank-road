@@ -72,7 +72,22 @@ class SplitChoice:
 class CachedSplitBatch:
     sample_ids: tuple[int, ...]
     boundary: Any
+    boundary_split_id: str
     targets: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class CachedSplitRuntime:
+    percent: str
+    split_id: str
+    runtime: Any
+    cached_batches: list[CachedSplitBatch]
+    cache_build_time: float
+    runtime_build_time: float
+
+    @property
+    def cached_sample_count(self) -> int:
+        return sum(len(batch.sample_ids) for batch in self.cached_batches)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -623,6 +638,69 @@ def _make_optimizer(
     return optimizer
 
 
+def _require_runtime_split_id(runtime: Any) -> str:
+    split_id = getattr(runtime, "split_id", None)
+    if split_id is None:
+        split_id = get_split_runtime_metadata(runtime).get("actual_split_id")
+    if not split_id:
+        raise RuntimeError("Ariadne runtime did not expose an authoritative split_id.")
+    return str(split_id)
+
+
+def _require_boundary_split_id(boundary: Any) -> str:
+    split_id = getattr(boundary, "split_id", None)
+    if not split_id:
+        raise RuntimeError("Cached Ariadne boundary payload did not expose split_id.")
+    return str(split_id)
+
+
+def _raise_cached_split_id_mismatch(
+    *,
+    cached_sample_split_id: str,
+    cached_runtime_split_id: str,
+    percent: str,
+    sample_index: int,
+) -> None:
+    raise RuntimeError(
+        "Cached Ariadne boundary split_id mismatch before split_cached training: "
+        f"cached sample split_id={cached_sample_split_id!r}; "
+        f"cached runtime split_id={cached_runtime_split_id!r}; "
+        f"percent={percent!r}; "
+        f"sample index={int(sample_index)}. "
+        "The cache must be rebuilt with the same SplitPlan used for training."
+    )
+
+
+def _validate_cached_split_runtime(cached_split: CachedSplitRuntime) -> None:
+    runtime_split_id = _require_runtime_split_id(cached_split.runtime)
+    if runtime_split_id != cached_split.split_id:
+        raise RuntimeError(
+            "Cached Ariadne runtime split_id changed before split_cached training: "
+            f"cached sample split_id={cached_split.split_id!r}; "
+            f"cached runtime split_id={runtime_split_id!r}; "
+            f"percent={cached_split.percent!r}; sample index=0. "
+            "The cache must be rebuilt with the same SplitPlan used for training."
+        )
+    for sample_index, cached_batch in enumerate(cached_split.cached_batches):
+        boundary_split_id = _require_boundary_split_id(cached_batch.boundary)
+        if boundary_split_id != cached_batch.boundary_split_id:
+            raise RuntimeError(
+                "Cached Ariadne boundary split_id metadata mismatch: "
+                f"cached sample split_id={boundary_split_id!r}; "
+                f"recorded sample split_id={cached_batch.boundary_split_id!r}; "
+                f"cached runtime split_id={cached_split.split_id!r}; "
+                f"percent={cached_split.percent!r}; sample index={sample_index}. "
+                "The cache must be rebuilt with the same SplitPlan used for training."
+            )
+        if boundary_split_id != cached_split.split_id:
+            _raise_cached_split_id_mismatch(
+                cached_sample_split_id=boundary_split_id,
+                cached_runtime_split_id=cached_split.split_id,
+                percent=cached_split.percent,
+                sample_index=sample_index,
+            )
+
+
 def _train_freeze_loop(
     *,
     edge_model: torch.nn.Module,
@@ -746,6 +824,8 @@ def _train_split_rebuild_loop(
 def _build_cached_batches(
     *,
     runtime: Any,
+    percent: str,
+    split_id: str,
     edge_model: torch.nn.Module,
     frames_by_id: Mapping[int, np.ndarray],
     sample_ids: list[int],
@@ -774,10 +854,19 @@ def _build_cached_batches(
         )
         with torch.no_grad():
             boundary = runtime.run_prefix(inputs)
+        boundary_split_id = _require_boundary_split_id(boundary)
+        if boundary_split_id != split_id:
+            _raise_cached_split_id_mismatch(
+                cached_sample_split_id=boundary_split_id,
+                cached_runtime_split_id=split_id,
+                percent=percent,
+                sample_index=len(batches),
+            )
         batches.append(
             CachedSplitBatch(
                 sample_ids=tuple(int(item) for item in batch_ids),
                 boundary=boundary,
+                boundary_split_id=boundary_split_id,
                 targets=tuple(copy.deepcopy(target) for target in targets),
             )
         )
@@ -787,8 +876,7 @@ def _build_cached_batches(
 
 def _train_split_cached_loop(
     *,
-    runtime: Any,
-    cached_batches: list[CachedSplitBatch],
+    cached_split: CachedSplitRuntime,
     epochs: int,
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
@@ -796,6 +884,16 @@ def _train_split_cached_loop(
     shuffle_samples: bool,
     device: torch.device,
 ) -> dict[str, Any]:
+    _validate_cached_split_runtime(cached_split)
+    runtime = cached_split.runtime
+    cached_batches = list(cached_split.cached_batches)
+    logger.info(
+        "Training split_cached percent={} split_id={} cached_boundary_count={} samples_used={}",
+        cached_split.percent,
+        cached_split.split_id,
+        len(cached_batches),
+        cached_split.cached_sample_count,
+    )
     epoch_times: list[float] = []
     batch_times: list[float] = []
     losses: list[float] = []
@@ -948,7 +1046,67 @@ def _build_runtime_for_choice(
     started = time.perf_counter()
     runtime = build_split_runtime(split_model, example_batch, config)
     maybe_warmup_runtime(runtime, example_batch)
+    logger.info(
+        "Resolved {} -> Ariadne split_id {}",
+        choice.boundary,
+        _require_runtime_split_id(runtime),
+    )
     return runtime, float(time.perf_counter() - started)
+
+
+def _build_cached_split_runtime(
+    *,
+    choice: SplitChoice,
+    split_model: torch.nn.Module,
+    example_batch: torch.Tensor,
+    edge_model: torch.nn.Module,
+    frames_by_id: Mapping[int, np.ndarray],
+    sample_ids: list[int],
+    annotations: Mapping[str, Mapping[str, Any]],
+    batch_size: int,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> CachedSplitRuntime:
+    runtime, runtime_build_time = _build_runtime_for_choice(
+        split_model=split_model,
+        example_batch=example_batch,
+        choice=choice,
+        args=args,
+    )
+    split_id = _require_runtime_split_id(runtime)
+    logger.info(
+        "Prebuilding cached Ariadne boundaries for {} using split_id {}",
+        choice.boundary,
+        split_id,
+    )
+    cached_batches, cache_build_time = _build_cached_batches(
+        runtime=runtime,
+        percent=choice.boundary,
+        split_id=split_id,
+        edge_model=edge_model,
+        frames_by_id=frames_by_id,
+        sample_ids=sample_ids,
+        annotations=annotations,
+        batch_size=int(batch_size),
+        device=device,
+    )
+    cached_split = CachedSplitRuntime(
+        percent=choice.boundary,
+        split_id=split_id,
+        runtime=runtime,
+        cached_batches=cached_batches,
+        cache_build_time=cache_build_time,
+        runtime_build_time=runtime_build_time,
+    )
+    _validate_cached_split_runtime(cached_split)
+    logger.info(
+        "Cached {} boundary batch(es) for {} split_id={} samples={}",
+        len(cached_batches),
+        choice.boundary,
+        split_id,
+        cached_split.cached_sample_count,
+    )
+    return cached_split
 
 
 def _write_split_position_mode_boxplots(rows: list[Mapping[str, Any]], output_root: Path) -> None:
@@ -1089,8 +1247,7 @@ def _run_one_experiment(
     golden_model: str,
     initial_state: Mapping[str, Any],
     example_batch: torch.Tensor,
-    cached_batches: list[CachedSplitBatch] | None,
-    cache_build_time: float,
+    cached_split: CachedSplitRuntime | None,
     frame_dir: Path,
     frames_by_id: Mapping[int, np.ndarray],
     sampled_frame_indices: list[int],
@@ -1117,13 +1274,16 @@ def _run_one_experiment(
     runtime = None
     runtime_build_time = 0.0
     if mode == "split_cached":
-        if cached_batches is None:
-            raise RuntimeError("Missing cached Ariadne boundary batches.")
-        runtime, runtime_build_time = _build_runtime_for_choice(
-            split_model=split_model,
-            example_batch=example_batch,
-            choice=choice,
-            args=args,
+        if cached_split is None:
+            raise RuntimeError("Missing cached Ariadne split runtime.")
+        _validate_cached_split_runtime(cached_split)
+        runtime = cached_split.runtime
+        runtime_build_time = cached_split.runtime_build_time
+        logger.info(
+            "Using cached Ariadne runtime for {} split_id={} samples={}",
+            cached_split.percent,
+            cached_split.split_id,
+            cached_split.cached_sample_count,
         )
     elif mode in {"freeze", "split_rebuild"}:
         runtime, runtime_build_time = _build_runtime_for_choice(
@@ -1149,7 +1309,7 @@ def _run_one_experiment(
         seed=seed,
         ariadne_mode=str(args.ariadne_mode),
         teacher_annotation_time=teacher_annotation_time,
-        cache_build_time=cache_build_time if mode == "split_cached" else 0.0,
+        cache_build_time=cached_split.cache_build_time if mode == "split_cached" else 0.0,
         sampled_frame_indices=sampled_frame_indices,
     )
     row["runtime_build_time_sec"] = runtime_build_time
@@ -1204,8 +1364,7 @@ def _run_one_experiment(
         )
     else:
         train_metrics = _train_split_cached_loop(
-            runtime=runtime,
-            cached_batches=list(cached_batches or []),
+            cached_split=cached_split,
             epochs=epochs,
             loss_fn=loss_fn,
             optimizer=optimizer,
@@ -1300,24 +1459,20 @@ def main(argv: list[str] | None = None) -> int:
     learning_rate = _resolve_experiment_learning_rate(server_cfg, str(args.edge_model))
     optimizer_config = _optimizer_overrides(str(args.edge_model))
 
-    cached_by_boundary: dict[str, tuple[list[CachedSplitBatch], float]] = {}
+    cached_by_boundary: dict[str, CachedSplitRuntime] = {}
     if "split_cached" in set(args.modes):
         for choice in choices:
             _restore_model_state(edge_detector.model, initial_state)
-            runtime, _runtime_build_time = _build_runtime_for_choice(
+            cached_by_boundary[choice.boundary] = _build_cached_split_runtime(
+                choice=choice,
                 split_model=split_model,
                 example_batch=example_batch,
-                choice=choice,
-                args=args,
-            )
-            logger.info("Prebuilding cached Ariadne boundaries for {}", choice.boundary)
-            cached_by_boundary[choice.boundary] = _build_cached_batches(
-                runtime=runtime,
                 edge_model=edge_detector.model,
                 frames_by_id=frames_by_id,
                 sample_ids=sampled_ids,
                 annotations=sample_annotations,
                 batch_size=int(args.batch_size),
+                args=args,
                 device=device,
             )
         _restore_model_state(edge_detector.model, initial_state)
@@ -1326,7 +1481,7 @@ def main(argv: list[str] | None = None) -> int:
     for repeat_id in range(repeat):
         run_seed = int(args.seed) + repeat_id
         for choice in choices:
-            cached_batches, cache_build_time = cached_by_boundary.get(choice.boundary, (None, 0.0))
+            cached_split = cached_by_boundary.get(choice.boundary)
             for mode in args.modes:
                 row = _run_one_experiment(
                     mode=str(mode),
@@ -1337,8 +1492,7 @@ def main(argv: list[str] | None = None) -> int:
                     golden_model=str(args.golden_model),
                     initial_state=initial_state,
                     example_batch=example_batch,
-                    cached_batches=cached_batches,
-                    cache_build_time=cache_build_time,
+                    cached_split=cached_split,
                     frame_dir=frame_dir,
                     frames_by_id=frames_by_id,
                     sampled_frame_indices=sampled_ids,
