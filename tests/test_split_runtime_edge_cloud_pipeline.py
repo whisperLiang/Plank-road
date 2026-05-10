@@ -6,15 +6,11 @@ from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
 
 from model_management.payload import deserialize_boundary_payload, serialize_boundary_payload
 from model_management.split_runtime import (
-    BatchSuffixReplayError,
-    SplitTailTrainingError,
     compare_outputs,
     fixed_split_runtime_template_key,
     make_runtime_cache_key,
     make_split_spec,
     prepare_split_runtime,
-    run_batch_suffix,
-    train_batch_suffix,
 )
 from model_management.split_runtime.template import (
     FixedSplitRuntimeTemplate,
@@ -158,31 +154,24 @@ def test_tinynext_cross_batch_split_train():
     _assert_cross_batch_train("tinynext")
 
 
-def test_batch_replay_failure_does_not_fallback_to_single_sample():
+def test_batch_replay_failure_is_not_retried_per_sample():
     _model, _spec, runtime = _prepare_detector_runtime("yolo")
     boundary = runtime.run_prefix(_example(3))
     fake_runtime = CountingRuntime(fail_replay=True)
 
-    with pytest.raises(BatchSuffixReplayError):
-        run_batch_suffix(fake_runtime, boundary, model_name="toy", model_family="yolo")
+    with pytest.raises(RuntimeError):
+        fake_runtime.run_suffix(boundary)
 
     assert fake_runtime.suffix_calls == 1
 
 
-def test_batch_train_failure_does_not_fallback_to_single_sample():
+def test_batch_train_failure_is_not_retried_per_sample():
     _model, _spec, runtime = _prepare_detector_runtime("tinynext")
     boundary = runtime.run_prefix(_example(3))
     fake_runtime = CountingRuntime(fail_train=True)
 
-    with pytest.raises(SplitTailTrainingError):
-        train_batch_suffix(
-            fake_runtime,
-            boundary,
-            targets=[{} for _ in range(3)],
-            loss_fn=toy_loss,
-            model_name="toy",
-            model_family="tinynext",
-        )
+    with pytest.raises(RuntimeError):
+        fake_runtime.train_suffix(boundary, targets=[{} for _ in range(3)], loss_fn=toy_loss)
 
     assert fake_runtime.train_calls == 1
 

@@ -8,7 +8,6 @@ import json
 import random
 import sys
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -25,15 +24,10 @@ if str(PROJECT_ROOT) not in sys.path:
 import model_management.object_detection as object_detection_module
 from cloud_server import _evaluate_detection_proxy_map
 from config import load_runtime_config
-from model_management.fixed_split import (
-    SplitConstraints,
-    min_edge_parameters_for_privacy,
-)
 from model_management.model_zoo import (
     ensure_local_model_artifact,
     get_model_artifact_path,
     get_model_detection_thresholds,
-    get_model_family,
     set_detection_finetune_mode,
 )
 from model_management.object_detection import Object_Detection
@@ -43,35 +37,47 @@ from model_management.split_model_adapters import (
     get_split_runtime_model,
     prepare_split_runtime_input,
 )
+from model_management.split_runtime import (
+    SplitRuntimeConfig,
+    build_split_runtime,
+    get_split_runtime_metadata,
+    maybe_warmup_runtime,
+)
 from model_management.universal_model_split import (
-    BoundaryPayload,
-    SplitCandidate,
-    UniversalModelSplitter,
     build_split_retrain_optimizer,
     collect_suffix_trainable_parameters,
-    prepare_split_train_batches_once,
-    save_split_feature_cache,
 )
 
 
-DEFAULT_MODES = ("freeze", "split_cached", "split_rebuild")
+DEFAULT_MODES = ("freeze", "split_rebuild", "split_cached")
 DEFAULT_SAMPLE_COUNT = 512
 DEFAULT_EPOCHS = 10
-DEFAULT_REPEATS = 5
-DEFAULT_BOUNDARY_QUANTILES = (0.25, 0.50, 0.75)
-BUCKET_LABELS = ("Early", "Middle", "Late")
+DEFAULT_REPEAT = 5
+DEFAULT_SPLIT_BOUNDARIES = ("percent:25", "percent:50", "percent:75")
+SPLIT_BUCKET_BY_BOUNDARY = {
+    "percent:25": "Early25%",
+    "percent:50": "Middle50%",
+    "percent:75": "Late75%",
+}
+BUCKET_LABELS = tuple(SPLIT_BUCKET_BY_BOUNDARY[boundary] for boundary in DEFAULT_SPLIT_BOUNDARIES)
 
 
 @dataclass(frozen=True)
-class CandidateChoice:
+class SplitChoice:
     bucket: str
-    target_ratio: float | None
-    candidate: SplitCandidate
+    boundary: str
+
+
+@dataclass(frozen=True)
+class CachedSplitBatch:
+    sample_ids: tuple[int, ...]
+    boundary: Any
+    targets: tuple[Any, ...]
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare freeze-prefix, cached split-tail, and rebuilt split-tail training.",
+        description="Compare freeze, rebuilt Ariadne split, and cached Ariadne split training.",
     )
     parser.add_argument("--yaml-path", default="./config/config.yaml")
     parser.add_argument("--video-path", default="./video_data/road.mp4")
@@ -79,27 +85,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--golden-model", default="rtdetr_x")
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--repeat", type=int, default=DEFAULT_REPEAT)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument(
-        "--boundary-quantiles",
-        nargs="+",
-        type=float,
-        default=list(DEFAULT_BOUNDARY_QUANTILES),
-    )
     parser.add_argument(
         "--modes",
         nargs="+",
         choices=DEFAULT_MODES,
         default=list(DEFAULT_MODES),
     )
+    parser.add_argument(
+        "--split-boundaries",
+        nargs="+",
+        default=list(DEFAULT_SPLIT_BOUNDARIES),
+    )
+    parser.add_argument(
+        "--ariadne-mode",
+        choices=("generated_eager", "compiled"),
+        default="generated_eager",
+    )
+    parser.add_argument("--dynamic-batch-max", type=int, default=64)
     parser.add_argument("--output-root", default="./tmp/tail_training_motivation")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=DEFAULT_REPEATS,
-        help="Repeat training with fixed sampled frames and run seeds seed+i.",
-    )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -176,50 +182,34 @@ def _aggregate_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
         key = (
             row.get("mode"),
             row.get("split_bucket"),
-            row.get("candidate_id"),
+            row.get("split_boundary"),
             int(row.get("sample_count") or 0),
             int(row.get("epochs") or 0),
         )
         groups.setdefault(key, []).append(row)
 
     metric_fields = (
-        "total_wall_time",
-        "feature_reconstruction_time",
-        "feature_load_time",
-        "training_time",
-        "effective_training_time",
-        "epoch_time_mean",
-        "batch_time_mean",
-        "peak_cuda_memory_allocated",
-        "peak_cuda_memory_reserved",
-        "trainable_parameter_count",
-        "total_parameter_count",
-        "prefix_parameter_count",
-        "suffix_parameter_count",
-        "prefix_parameter_ratio",
-        "boundary_payload_bytes",
-        "proxy_mAP@0.5 before",
-        "proxy_mAP@0.5 after",
-        "delta proxy_mAP@0.5",
+        "train_time_sec",
+        "metric_before",
+        "metric_after",
+        "metric_delta",
         "final_loss",
+        "runtime_build_time_sec",
+        "cache_build_time_sec",
     )
     aggregated: list[dict[str, Any]] = []
     for key, items in sorted(groups.items(), key=lambda item: tuple(str(part) for part in item[0])):
-        mode, split_bucket, candidate_id, sample_count, epochs = key
-        success_items = [item for item in items if bool(item.get("success"))]
+        mode, split_bucket, split_boundary, sample_count, epochs = key
         row = {
             "mode": mode,
             "split_bucket": split_bucket,
-            "candidate_id": candidate_id,
+            "split_boundary": split_boundary,
             "sample_count": sample_count,
             "epochs": epochs,
             "run_count": len(items),
-            "success_count": len(success_items),
-            "failure_count": len(items) - len(success_items),
-            "success_rate": len(success_items) / float(max(1, len(items))),
         }
         for field in metric_fields:
-            mean, std = _mean_std([item.get(field) for item in success_items])
+            mean, std = _mean_std([item.get(field) for item in items])
             row[f"{field}_mean"] = mean
             row[f"{field}_std"] = std
         aggregated.append(row)
@@ -243,36 +233,9 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _reset_cuda_peak(device: torch.device) -> None:
-    if device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(device)
-
-
-def _cuda_peak(device: torch.device) -> tuple[int, int]:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return 0, 0
-    return (
-        int(torch.cuda.max_memory_allocated(device)),
-        int(torch.cuda.max_memory_reserved(device)),
-    )
-
-
 def _clear_cuda_cache() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-def _load_existing_results(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(dict(json.loads(line)))
-    return rows
 
 
 def _resolve_local_weights_path(model_name: str) -> str:
@@ -357,9 +320,8 @@ def _write_raw_frames(frame_dir: Path, frames_by_id: Mapping[int, np.ndarray]) -
     frame_dir.mkdir(parents=True, exist_ok=True)
     for frame_id, frame in frames_by_id.items():
         path = frame_dir / f"{int(frame_id)}.jpg"
-        if not path.exists():
-            if not cv2.imwrite(str(path), frame):
-                raise RuntimeError(f"Failed to write sampled frame: {path}")
+        if not path.exists() and not cv2.imwrite(str(path), frame):
+            raise RuntimeError(f"Failed to write sampled frame: {path}")
 
 
 def _teacher_target_from_prediction(
@@ -374,10 +336,7 @@ def _teacher_target_from_prediction(
     if count <= 0:
         return {"boxes": [], "labels": []}
     return {
-        "boxes": [
-            [float(coord) for coord in list(box)[:4]]
-            for box in boxes[:count]
-        ],
+        "boxes": [[float(coord) for coord in list(box)[:4]] for box in boxes[:count]],
         "labels": [int(label) for label in labels[:count]],
     }
 
@@ -423,7 +382,7 @@ def _load_or_collect_teacher_annotations(
                     "Teacher batch inference returned "
                     f"{len(predictions)} result(s) for {len(batch_ids)} frame(s)."
                 )
-            for frame_id, prediction in zip(batch_ids, predictions):
+            for frame_id, prediction in zip(batch_ids, predictions, strict=True):
                 pred_boxes = pred_class = pred_score = None
                 if isinstance(prediction, (list, tuple)):
                     if len(prediction) >= 1:
@@ -451,89 +410,6 @@ def _load_or_collect_teacher_annotations(
     return annotations, elapsed
 
 
-def _candidate_prefix_ratio(candidate: SplitCandidate) -> float:
-    total = int(getattr(candidate, "total_parameter_count", 0) or 0)
-    if total <= 0:
-        return float(getattr(candidate, "edge_parameter_ratio", 0.0) or 0.0)
-    return float(getattr(candidate, "edge_parameter_count", 0) or 0) / float(total)
-
-
-def _candidate_satisfies_constraints(
-    candidate: SplitCandidate,
-    constraints: SplitConstraints,
-) -> bool:
-    if not bool(getattr(candidate, "is_trainable_tail", False)):
-        return False
-    if int(getattr(candidate, "boundary_count", 0) or 0) > int(constraints.max_boundary_count):
-        return False
-    if int(getattr(candidate, "estimated_payload_bytes", 0) or 0) > int(
-        constraints.max_payload_bytes
-    ):
-        return False
-    if _candidate_prefix_ratio(candidate) > float(constraints.max_layer_freezing_ratio):
-        return False
-    if float(constraints.privacy_leakage_upper_bound) > 0.0:
-        required_prefix_params = min_edge_parameters_for_privacy(
-            float(constraints.privacy_leakage_upper_bound),
-            epsilon=float(constraints.privacy_leakage_epsilon),
-        )
-        if int(getattr(candidate, "edge_parameter_count", 0) or 0) < required_prefix_params:
-            return False
-    return True
-
-
-def _filter_candidates(
-    candidates: list[SplitCandidate],
-    constraints: SplitConstraints,
-) -> list[SplitCandidate]:
-    eligible = [
-        candidate
-        for candidate in candidates
-        if _candidate_satisfies_constraints(candidate, constraints)
-    ]
-    eligible.sort(
-        key=lambda candidate: (
-            _candidate_prefix_ratio(candidate),
-            int(getattr(candidate, "estimated_payload_bytes", 0) or 0),
-            str(getattr(candidate, "candidate_id", "")),
-        )
-    )
-    return eligible
-
-
-def _select_motivation_candidate_choices(
-    eligible_candidates: list[SplitCandidate],
-    boundary_quantiles: list[float],
-) -> list[CandidateChoice]:
-    if not eligible_candidates:
-        raise RuntimeError("No trainable split candidates satisfy the fixed_split constraints.")
-    quantiles = list(boundary_quantiles)
-    if len(quantiles) != 3:
-        raise ValueError("--boundary-quantiles must contain exactly three values.")
-
-    choices: list[CandidateChoice] = []
-    for bucket, target in zip(BUCKET_LABELS, quantiles):
-        target = float(target)
-        candidate = min(
-            eligible_candidates,
-            key=lambda item: (
-                abs(_candidate_prefix_ratio(item) - target),
-                int(getattr(item, "estimated_payload_bytes", 0) or 0),
-                str(getattr(item, "candidate_id", "")),
-            ),
-        )
-        choices.append(CandidateChoice(bucket=bucket, target_ratio=target, candidate=candidate))
-
-    return choices
-
-
-def _select_candidate_choices(
-    eligible_candidates: list[SplitCandidate],
-    boundary_quantiles: list[float],
-) -> list[CandidateChoice]:
-    return _select_motivation_candidate_choices(eligible_candidates, boundary_quantiles)
-
-
 def _snapshot_model_state(model: torch.nn.Module) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
     for key, value in model.state_dict().items():
@@ -546,30 +422,8 @@ def _snapshot_model_state(model: torch.nn.Module) -> dict[str, Any]:
 
 def _restore_model_state(model: torch.nn.Module, state: Mapping[str, Any]) -> None:
     model.load_state_dict(dict(state), strict=False)
-
-
-def _count_parameters(parameters: Any) -> int:
-    return int(sum(int(parameter.numel()) for parameter in parameters))
-
-
-def _total_parameter_count(model: torch.nn.Module) -> int:
-    return _count_parameters(model.parameters())
-
-
-def _resolve_suffix_trainable_parameters(
-    split_model: torch.nn.Module,
-    splitter: Any,
-    *,
-    collector: Callable[[Any], list[torch.nn.Parameter]] = collect_suffix_trainable_parameters,
-) -> tuple[list[torch.nn.Parameter], list[str]]:
-    params = list(collector(splitter))
-    param_ids = {id(parameter) for parameter in params}
-    names = [
-        name
-        for name, parameter in split_model.named_parameters()
-        if id(parameter) in param_ids
-    ]
-    return params, names
+    for parameter in model.parameters():
+        parameter.grad = None
 
 
 def _first_tensor_shape(value: Any) -> list[int] | None:
@@ -590,115 +444,43 @@ def _first_tensor_shape(value: Any) -> list[int] | None:
 
 def _runtime_input_batch_size(value: Any) -> int:
     shape = _first_tensor_shape(value)
-    if shape and len(shape) >= 4:
-        return int(shape[0])
-    return 1
+    if not shape:
+        raise RuntimeError("Runtime input does not contain a batched tensor.")
+    return int(shape[0])
 
 
 def _combine_runtime_inputs(inputs: list[Any]) -> Any:
     if not inputs:
-        raise RuntimeError("Cannot combine an empty runtime-input batch.")
-    if all(isinstance(item, torch.Tensor) for item in inputs):
-        tensors = [
-            item if int(item.ndim) >= 4 else item.unsqueeze(0)
-            for item in inputs
-            if isinstance(item, torch.Tensor)
+        raise ValueError("Cannot combine an empty runtime input list.")
+    first = inputs[0]
+    if isinstance(first, torch.Tensor):
+        tensors = [item for item in inputs if isinstance(item, torch.Tensor)]
+        if len(tensors) != len(inputs):
+            raise TypeError("Runtime input batch contains mixed tensor/non-tensor values.")
+        if all(tensor.ndim > 0 and int(tensor.shape[0]) == 1 for tensor in tensors):
+            return torch.cat(tensors, dim=0)
+        return torch.stack(tensors, dim=0)
+    if isinstance(first, tuple):
+        return tuple(
+            _combine_runtime_inputs([item[index] for item in inputs])
+            for index in range(len(first))
+        )
+    if isinstance(first, list):
+        return [
+            _combine_runtime_inputs([item[index] for item in inputs])
+            for index in range(len(first))
         ]
-        return torch.cat(tensors, dim=0)
-    if all(isinstance(item, list) for item in inputs):
-        combined: list[Any] = []
-        for item in inputs:
-            combined.extend(item)
-        return combined
-    if all(isinstance(item, tuple) for item in inputs):
-        combined_items = []
-        length = len(inputs[0])
-        if not all(len(item) == length for item in inputs):
-            raise RuntimeError("Cannot batch runtime input tuples with different lengths.")
-        for index in range(length):
-            combined_items.append(_combine_runtime_inputs([item[index] for item in inputs]))
-        return tuple(combined_items)
-    raise RuntimeError(
-        "Unsupported mixed runtime input batch: "
-        + ", ".join(type(item).__name__ for item in inputs)
-    )
-
-
-def _make_trace_input(sample_input: Any, trace_batch_size: int) -> Any:
-    trace_batch_size = max(1, int(trace_batch_size))
-    current_batch = max(1, _runtime_input_batch_size(sample_input))
-    if current_batch >= trace_batch_size:
-        return sample_input
-    return _combine_runtime_inputs([sample_input for _ in range(trace_batch_size)])
-
-
-def _splitter_dynamic_batch_min(splitter: UniversalModelSplitter) -> int:
-    split_spec = getattr(splitter, "split_spec", None)
-    dynamic_batch = getattr(split_spec, "dynamic_batch", None)
-    if isinstance(dynamic_batch, (list, tuple)) and dynamic_batch:
-        return max(1, int(dynamic_batch[0]))
-    return 1
-
-
-def _slice_batch_value(value: Any, index: int, batch_size: int) -> Any:
-    if isinstance(value, torch.Tensor):
-        if value.ndim > 0:
-            leading = int(value.shape[0])
-            if leading == int(batch_size):
-                return value[index:index + 1].contiguous()
-            if leading > 0 and leading % int(batch_size) == 0:
-                chunk = leading // int(batch_size)
-                return value[index * chunk:(index + 1) * chunk].contiguous()
-        return value
-    if isinstance(value, Mapping):
-        return {
-            key: _slice_batch_value(item, index, batch_size)
-            for key, item in value.items()
-        }
-    if isinstance(value, tuple):
-        return tuple(_slice_batch_value(item, index, batch_size) for item in value)
-    if isinstance(value, list):
-        return [_slice_batch_value(item, index, batch_size) for item in value]
-    return value
-
-
-def _split_boundary_payload_batch(
-    payload: BoundaryPayload,
-    *,
-    batch_size: int,
-) -> list[BoundaryPayload]:
-    if int(getattr(payload, "batch_size", 0)) != int(batch_size):
-        raise RuntimeError(
-            "BoundaryPayload batch size does not match the split request "
-            f"(payload_batch={getattr(payload, 'batch_size', None)}, expected={batch_size})."
-        )
-    return [
-        BoundaryPayload(
-            split_id=payload.split_id,
-            graph_signature=payload.graph_signature,
-            batch_size=1,
-            tensors={
-                label: _slice_batch_value(tensor, index, batch_size)
-                for label, tensor in dict(payload.tensors).items()
-            },
-            schema=dict(payload.schema),
-            requires_grad=dict(payload.requires_grad),
-            weight_version=payload.weight_version,
-            passthrough_inputs=_slice_batch_value(
-                dict(payload.passthrough_inputs or {}),
-                index,
-                batch_size,
-            ),
-        )
-        for index in range(int(batch_size))
-    ]
+    if isinstance(first, Mapping):
+        keys = list(first.keys())
+        return {key: _combine_runtime_inputs([item[key] for item in inputs]) for key in keys}
+    return list(inputs)
 
 
 def _target_with_metadata(
+    frame_id: int,
     annotation: Mapping[str, Any] | None,
-    *,
-    frame: np.ndarray,
     runtime_input: Any,
+    frame: np.ndarray,
     resize_mode: str | None,
 ) -> dict[str, Any]:
     target = {
@@ -706,8 +488,9 @@ def _target_with_metadata(
         "labels": list((annotation or {}).get("labels") or []),
     }
     target["_split_meta"] = {
-        "input_image_size": [int(frame.shape[0]), int(frame.shape[1])],
+        "sample_id": int(frame_id),
         "input_tensor_shape": _first_tensor_shape(runtime_input),
+        "input_image_size": [int(frame.shape[0]), int(frame.shape[1])],
         "input_resize_mode": resize_mode or "direct_resize",
     }
     return target
@@ -721,72 +504,103 @@ def _prepare_raw_batch(
     annotations: Mapping[str, Mapping[str, Any]],
     device: torch.device,
     resize_mode: str | None,
-) -> tuple[Any, list[dict[str, Any]]]:
+) -> tuple[Any, list[Any]]:
     runtime_inputs: list[Any] = []
-    targets: list[dict[str, Any]] = []
+    targets: list[Any] = []
     for frame_id in frame_ids:
         frame = frames_by_id[int(frame_id)]
         runtime_input = prepare_split_runtime_input(model, frame, device=device)
         runtime_inputs.append(runtime_input)
         targets.append(
             _target_with_metadata(
+                int(frame_id),
                 annotations.get(str(int(frame_id))),
-                frame=frame,
-                runtime_input=runtime_input,
-                resize_mode=resize_mode,
+                runtime_input,
+                frame,
+                resize_mode,
             )
         )
     return _combine_runtime_inputs(runtime_inputs), targets
 
 
-@contextmanager
-def _forbid_prefix_execution(splitter: Any):
-    runtime = splitter._ensure_runtime() if hasattr(splitter, "_ensure_runtime") else None
-    original_runtime_prefix = getattr(runtime, "run_prefix", None)
-    original_edge_forward = getattr(splitter, "edge_forward", None)
-    original_run_prefix = getattr(splitter, "run_prefix", None)
+def _make_trace_batch(
+    *,
+    model: torch.nn.Module,
+    frames_by_id: Mapping[int, np.ndarray],
+    sample_ids: list[int],
+    device: torch.device,
+    trace_batch_size: int,
+) -> torch.Tensor:
+    if int(trace_batch_size) <= 1:
+        raise ValueError("Ariadne batch_gt1 tracing requires trace_batch_size > 1.")
+    if len(sample_ids) < int(trace_batch_size):
+        raise ValueError("--sample-count must be at least the Ariadne trace batch size.")
+    runtime_inputs = [
+        prepare_split_runtime_input(model, frames_by_id[int(frame_id)], device=device)
+        for frame_id in sample_ids[: int(trace_batch_size)]
+    ]
+    batch = _combine_runtime_inputs(runtime_inputs)
+    if not isinstance(batch, torch.Tensor):
+        raise TypeError("Ariadne split experiments expect a tensor runtime input.")
+    if _runtime_input_batch_size(batch) <= 1:
+        raise RuntimeError("Ariadne example batch must contain at least two samples.")
+    return batch
 
-    def _blocked_prefix(*_: Any, **__: Any) -> Any:
-        raise RuntimeError("Prefix forward is forbidden during split-tail training.")
 
-    if runtime is not None and original_runtime_prefix is not None:
-        setattr(runtime, "run_prefix", _blocked_prefix)
-    if original_edge_forward is not None:
-        setattr(splitter, "edge_forward", _blocked_prefix)
-    if original_run_prefix is not None:
-        setattr(splitter, "run_prefix", _blocked_prefix)
-    try:
-        yield
-    finally:
-        if runtime is not None and original_runtime_prefix is not None:
-            setattr(runtime, "run_prefix", original_runtime_prefix)
-        if original_edge_forward is not None:
-            setattr(splitter, "edge_forward", original_edge_forward)
-        if original_run_prefix is not None:
-            setattr(splitter, "run_prefix", original_run_prefix)
+def _split_choices(boundaries: list[str]) -> list[SplitChoice]:
+    choices: list[SplitChoice] = []
+    for boundary in boundaries:
+        if boundary not in SPLIT_BUCKET_BY_BOUNDARY:
+            raise ValueError(
+                "Unsupported split boundary for this experiment: "
+                f"{boundary}. Expected percent:25, percent:50, or percent:75."
+            )
+        choices.append(SplitChoice(bucket=SPLIT_BUCKET_BY_BOUNDARY[boundary], boundary=boundary))
+    return choices
+
+
+def _shuffled_epoch_batches(
+    sample_ids: list[int],
+    *,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+    epoch: int,
+) -> list[list[int]]:
+    ids = list(sample_ids)
+    if shuffle and len(ids) > 1:
+        rng = np.random.default_rng(int(seed) + int(epoch))
+        order = rng.permutation(np.arange(len(ids))).tolist()
+        ids = [ids[index] for index in order]
+    batches = [ids[start : start + batch_size] for start in range(0, len(ids), batch_size)]
+    if any(len(batch) < 2 for batch in batches):
+        raise ValueError(
+            "Ariadne batch_gt1 experiments require every training batch to contain "
+            "at least two samples. Adjust --sample-count or --batch-size to avoid "
+            "a singleton final batch."
+        )
+    return batches
 
 
 def _resolve_experiment_learning_rate(config: Any, model_name: str) -> float:
-    cl_cfg = getattr(config, "continual_learning", None)
-    family = get_model_family(str(model_name))
-    if family == "tinynext":
+    cl_cfg = config.continual_learning
+    normalized = str(model_name).lower()
+    if "tinynext" in normalized:
         return float(getattr(cl_cfg, "tinynext_fixed_split_learning_rate", 1e-3))
-    if family == "rfdetr":
+    if "rfdetr" in normalized:
         return float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
-    if family in {"yolo", "detr", "rtdetr"}:
+    if "yolo" in normalized:
         return float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
     return float(getattr(cl_cfg, "split_learning_rate", 1e-3))
 
 
 def _optimizer_overrides(model_name: str) -> dict[str, Any]:
-    if get_model_family(str(model_name)) in {"rfdetr", "yolo", "tinynext"}:
-        return {
-            "optimizer_name": "adamw",
-            "weight_decay": 1e-4,
-            "grad_clip_norm": 1.0,
-            "shuffle_samples": True,
-        }
-    return {"optimizer_name": "adam", "weight_decay": 0.0, "shuffle_samples": False}
+    normalized = str(model_name).lower()
+    if "rfdetr" in normalized:
+        return {"optimizer_name": "adamw", "weight_decay": 1e-4, "grad_clip_norm": 1.0}
+    if "tinynext" in normalized:
+        return {"optimizer_name": "adam", "weight_decay": 0.0, "grad_clip_norm": 5.0}
+    return {"optimizer_name": "adam", "weight_decay": 0.0, "grad_clip_norm": None}
 
 
 def _make_optimizer(
@@ -805,27 +619,11 @@ def _make_optimizer(
         grad_clip_norm=optimizer_config.get("grad_clip_norm"),
     )
     if optimizer is None:
-        raise RuntimeError("No trainable parameters were available for this run.")
+        raise RuntimeError("No trainable suffix parameters were available for this run.")
     return optimizer
 
 
-def _shuffled_epoch_batches(
-    sample_ids: list[int],
-    *,
-    batch_size: int,
-    shuffle: bool,
-    seed: int,
-    epoch: int,
-) -> list[list[int]]:
-    ids = list(sample_ids)
-    if shuffle and len(ids) > 1:
-        rng = np.random.default_rng(int(seed) + int(epoch))
-        order = rng.permutation(np.arange(len(ids))).tolist()
-        ids = [ids[index] for index in order]
-    return [ids[start : start + batch_size] for start in range(0, len(ids), batch_size)]
-
-
-def _train_raw_loop(
+def _train_freeze_loop(
     *,
     edge_model: torch.nn.Module,
     split_model: torch.nn.Module,
@@ -833,7 +631,7 @@ def _train_raw_loop(
     frames_by_id: Mapping[int, np.ndarray],
     sample_ids: list[int],
     annotations: Mapping[str, Mapping[str, Any]],
-    num_epoch: int,
+    epochs: int,
     batch_size: int,
     device: torch.device,
     loss_fn: Callable[[Any, Any], torch.Tensor],
@@ -847,13 +645,12 @@ def _train_raw_loop(
     losses: list[float] = []
     _synchronize(device)
     training_started = time.perf_counter()
-    for epoch in range(int(num_epoch)):
+    for epoch in range(int(epochs)):
         set_detection_finetune_mode(edge_model, model_name)
         epoch_started = time.perf_counter()
-        epoch_losses: list[float] = []
         for batch_ids in _shuffled_epoch_batches(
             sample_ids,
-            batch_size=max(1, int(batch_size)),
+            batch_size=max(2, int(batch_size)),
             shuffle=bool(shuffle_samples),
             seed=int(seed),
             epoch=epoch,
@@ -868,170 +665,168 @@ def _train_raw_loop(
                 device=device,
                 resize_mode=resize_mode,
             )
+            optimizer.zero_grad()
             outputs = split_model(inputs)
             loss = loss_fn(outputs, targets)
-            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             _synchronize(device)
             batch_times.append(time.perf_counter() - batch_started)
-            loss_value = float(loss.detach().cpu().item())
-            epoch_losses.append(loss_value)
-            losses.append(loss_value)
+            losses.append(float(loss.detach().cpu().item()))
         epoch_times.append(time.perf_counter() - epoch_started)
     _synchronize(device)
-    training_time = time.perf_counter() - training_started
     return {
-        "training_time": float(training_time),
-        "epoch_time_mean": float(np.mean(epoch_times)) if epoch_times else None,
-        "batch_time_mean": float(np.mean(batch_times)) if batch_times else None,
+        "train_time_sec": float(time.perf_counter() - training_started),
+        "epoch_time_mean_sec": float(np.mean(epoch_times)) if epoch_times else None,
+        "batch_time_mean_sec": float(np.mean(batch_times)) if batch_times else None,
         "final_loss": float(losses[-1]) if losses else None,
-        "epoch_times": epoch_times,
-        "batch_times": batch_times,
     }
 
 
-def _boundary_payload_bytes(payload: BoundaryPayload) -> int:
-    total = 0
-    for tensor in dict(getattr(payload, "tensors", {}) or {}).values():
-        if isinstance(tensor, torch.Tensor):
-            total += int(tensor.numel()) * int(tensor.element_size())
-    return int(total)
-
-
-def _rebuild_feature_cache(
+def _train_split_rebuild_loop(
     *,
-    splitter: UniversalModelSplitter,
+    runtime: Any,
     edge_model: torch.nn.Module,
     frames_by_id: Mapping[int, np.ndarray],
     sample_ids: list[int],
-    cache_path: Path,
-    device: torch.device,
-) -> tuple[float, dict[str, Mapping[str, Any]], int]:
-    cache_path.mkdir(parents=True, exist_ok=True)
-    records: dict[str, Mapping[str, Any]] = {}
-    payload_bytes = 0
-    resize_mode = get_split_runtime_input_resize_mode(edge_model)
-    _synchronize(device)
-    started = time.perf_counter()
-    try:
-        runtime_min_batch = _splitter_dynamic_batch_min(splitter)
-        for start in range(0, len(sample_ids), runtime_min_batch):
-            chunk_ids = list(sample_ids[start:start + runtime_min_batch])
-            runtime_inputs = [
-                prepare_split_runtime_input(edge_model, frames_by_id[int(frame_id)], device=device)
-                for frame_id in chunk_ids
-            ]
-            while len(runtime_inputs) < runtime_min_batch:
-                runtime_inputs.append(runtime_inputs[-1])
-            batch_input = _combine_runtime_inputs(runtime_inputs)
-            with torch.inference_mode():
-                batch_payload = splitter.edge_forward(batch_input)
-            split_payloads = _split_boundary_payload_batch(
-                batch_payload,
-                batch_size=runtime_min_batch,
-            )
-            for frame_id, runtime_input, payload in zip(
-                chunk_ids,
-                runtime_inputs[:len(chunk_ids)],
-                split_payloads[:len(chunk_ids)],
-                strict=True,
-            ):
-                frame = frames_by_id[int(frame_id)]
-                payload_bytes += _boundary_payload_bytes(payload)
-                record = save_split_feature_cache(
-                    str(cache_path),
-                    int(frame_id),
-                    payload,
-                    input_image_size=[int(frame.shape[0]), int(frame.shape[1])],
-                    input_tensor_shape=_first_tensor_shape(runtime_input),
-                    input_resize_mode=resize_mode or "direct_resize",
-                )
-                records[str(int(frame_id))] = record
-    finally:
-        _synchronize(device)
-    return time.perf_counter() - started, records, payload_bytes
-
-
-def _train_split_loop(
-    *,
-    split_model: torch.nn.Module,
-    splitter: UniversalModelSplitter,
-    cache_path: Path,
-    sample_ids: list[int],
     annotations: Mapping[str, Mapping[str, Any]],
-    num_epoch: int,
+    epochs: int,
     batch_size: int,
     device: torch.device,
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
     seed: int,
     shuffle_samples: bool,
-    preloaded_records: Mapping[Any, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    del split_model
-    _synchronize(device)
-    load_started = time.perf_counter()
-    prepared_batches = prepare_split_train_batches_once(
-        splitter=splitter,
-        cache_path=str(cache_path),
-        all_indices=[int(sample_id) for sample_id in sample_ids],
-        annotations=annotations,
-        batch_size=max(1, int(batch_size)),
-        device=device,
-        preloaded_records=preloaded_records,
-        move_to_device=True,
-        validate=True,
-    )
-    _synchronize(device)
-    feature_load_time = time.perf_counter() - load_started
-    if not prepared_batches:
-        raise RuntimeError("Split-tail training did not prepare any batches.")
-
+    resize_mode = get_split_runtime_input_resize_mode(edge_model)
     epoch_times: list[float] = []
     batch_times: list[float] = []
     losses: list[float] = []
     _synchronize(device)
     training_started = time.perf_counter()
-    with _forbid_prefix_execution(splitter):
-        for epoch in range(int(num_epoch)):
-            epoch_started = time.perf_counter()
-            epoch_batches = list(prepared_batches)
-            if shuffle_samples and len(epoch_batches) > 1:
-                rng = np.random.default_rng(int(seed) + int(epoch))
-                order = rng.permutation(np.arange(len(epoch_batches))).tolist()
-                epoch_batches = [epoch_batches[index] for index in order]
-            for prepared_batch in epoch_batches:
-                _synchronize(device)
-                batch_started = time.perf_counter()
-                if prepared_batch.validated and hasattr(splitter, "train_suffix_fast"):
-                    loss, _grads = splitter.train_suffix_fast(
-                        prepared_batch.boundary,
-                        prepared_batch.targets,
-                        loss_fn=loss_fn,
-                        optimizer=optimizer,
-                    )
-                else:
-                    loss, _grads = splitter.train_suffix(
-                        prepared_batch.boundary,
-                        prepared_batch.targets,
-                        loss_fn=loss_fn,
-                        optimizer=optimizer,
-                    )
-                _synchronize(device)
-                batch_times.append(time.perf_counter() - batch_started)
-                losses.append(float(loss.detach().cpu().item()))
-            epoch_times.append(time.perf_counter() - epoch_started)
+    for epoch in range(int(epochs)):
+        epoch_started = time.perf_counter()
+        for batch_ids in _shuffled_epoch_batches(
+            sample_ids,
+            batch_size=max(2, int(batch_size)),
+            shuffle=bool(shuffle_samples),
+            seed=int(seed),
+            epoch=epoch,
+        ):
+            _synchronize(device)
+            batch_started = time.perf_counter()
+            inputs, targets = _prepare_raw_batch(
+                model=edge_model,
+                frame_ids=batch_ids,
+                frames_by_id=frames_by_id,
+                annotations=annotations,
+                device=device,
+                resize_mode=resize_mode,
+            )
+            boundary = runtime.run_training_prefix(inputs)
+            loss, _boundary_grads = runtime.train_suffix(
+                boundary,
+                targets,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+            )
+            _synchronize(device)
+            batch_times.append(time.perf_counter() - batch_started)
+            losses.append(float(loss.detach().cpu().item()))
+        epoch_times.append(time.perf_counter() - epoch_started)
     _synchronize(device)
-    training_time = time.perf_counter() - training_started
     return {
-        "feature_load_time": float(feature_load_time),
-        "training_time": float(training_time),
-        "epoch_time_mean": float(np.mean(epoch_times)) if epoch_times else None,
-        "batch_time_mean": float(np.mean(batch_times)) if batch_times else None,
+        "train_time_sec": float(time.perf_counter() - training_started),
+        "epoch_time_mean_sec": float(np.mean(epoch_times)) if epoch_times else None,
+        "batch_time_mean_sec": float(np.mean(batch_times)) if batch_times else None,
         "final_loss": float(losses[-1]) if losses else None,
-        "epoch_times": epoch_times,
-        "batch_times": batch_times,
+    }
+
+
+def _build_cached_batches(
+    *,
+    runtime: Any,
+    edge_model: torch.nn.Module,
+    frames_by_id: Mapping[int, np.ndarray],
+    sample_ids: list[int],
+    annotations: Mapping[str, Mapping[str, Any]],
+    batch_size: int,
+    device: torch.device,
+) -> tuple[list[CachedSplitBatch], float]:
+    resize_mode = get_split_runtime_input_resize_mode(edge_model)
+    batches: list[CachedSplitBatch] = []
+    _synchronize(device)
+    started = time.perf_counter()
+    for batch_ids in _shuffled_epoch_batches(
+        sample_ids,
+        batch_size=max(2, int(batch_size)),
+        shuffle=False,
+        seed=0,
+        epoch=0,
+    ):
+        inputs, targets = _prepare_raw_batch(
+            model=edge_model,
+            frame_ids=batch_ids,
+            frames_by_id=frames_by_id,
+            annotations=annotations,
+            device=device,
+            resize_mode=resize_mode,
+        )
+        with torch.no_grad():
+            boundary = runtime.run_prefix(inputs)
+        batches.append(
+            CachedSplitBatch(
+                sample_ids=tuple(int(item) for item in batch_ids),
+                boundary=boundary,
+                targets=tuple(copy.deepcopy(target) for target in targets),
+            )
+        )
+    _synchronize(device)
+    return batches, float(time.perf_counter() - started)
+
+
+def _train_split_cached_loop(
+    *,
+    runtime: Any,
+    cached_batches: list[CachedSplitBatch],
+    epochs: int,
+    loss_fn: Callable[[Any, Any], torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    seed: int,
+    shuffle_samples: bool,
+    device: torch.device,
+) -> dict[str, Any]:
+    epoch_times: list[float] = []
+    batch_times: list[float] = []
+    losses: list[float] = []
+    _synchronize(device)
+    training_started = time.perf_counter()
+    for epoch in range(int(epochs)):
+        epoch_started = time.perf_counter()
+        epoch_batches = list(cached_batches)
+        if shuffle_samples and len(epoch_batches) > 1:
+            rng = np.random.default_rng(int(seed) + int(epoch))
+            order = rng.permutation(np.arange(len(epoch_batches))).tolist()
+            epoch_batches = [epoch_batches[index] for index in order]
+        for cached_batch in epoch_batches:
+            _synchronize(device)
+            batch_started = time.perf_counter()
+            loss, _boundary_grads = runtime.train_suffix(
+                cached_batch.boundary,
+                list(copy.deepcopy(cached_batch.targets)),
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+            )
+            _synchronize(device)
+            batch_times.append(time.perf_counter() - batch_started)
+            losses.append(float(loss.detach().cpu().item()))
+        epoch_times.append(time.perf_counter() - epoch_started)
+    _synchronize(device)
+    return {
+        "train_time_sec": float(time.perf_counter() - training_started),
+        "epoch_time_mean_sec": float(np.mean(epoch_times)) if epoch_times else None,
+        "batch_time_mean_sec": float(np.mean(batch_times)) if batch_times else None,
+        "final_loss": float(losses[-1]) if losses else None,
     }
 
 
@@ -1043,9 +838,6 @@ def _evaluate_proxy_map(
     annotations: Mapping[str, Mapping[str, Any]],
     device: torch.device,
     batch_size: int,
-    split_cache_path: Path | None = None,
-    splitter: UniversalModelSplitter | None = None,
-    split_candidate: SplitCandidate | None = None,
 ) -> dict[str, Any]:
     threshold_low, threshold_high = get_model_detection_thresholds(model, model_name)
     return dict(
@@ -1058,548 +850,70 @@ def _evaluate_proxy_map(
             threshold_high=float(threshold_high),
             model_name=model_name,
             inference_batch_size=max(1, int(batch_size)),
-            split_cache_path=str(split_cache_path) if split_cache_path is not None else None,
-            splitter=splitter,
-            split_candidate=split_candidate,
         )
     )
+
+
+def _metric_value(metrics: Mapping[str, Any]) -> float | None:
+    value = metrics.get("map")
+    return None if value is None else float(value)
 
 
 def _base_result_row(
     *,
     mode: str,
+    choice: SplitChoice,
+    metadata: Mapping[str, Any],
     edge_model: str,
     golden_model: str,
     sample_count: int,
     epochs: int,
     batch_size: int,
-    split_bucket: str | None,
-    target_prefix_ratio: float | None,
-    candidate: SplitCandidate | None,
-    sampled_frame_indices: list[int],
-    graph_build_time: float,
-    candidate_enumeration_time: float,
-    teacher_annotation_time: float,
-    repeat_index: int,
-    base_seed: int,
+    repeat_id: int,
     seed: int,
-    device: torch.device,
+    ariadne_mode: str,
+    teacher_annotation_time: float,
+    cache_build_time: float,
+    sampled_frame_indices: list[int],
 ) -> dict[str, Any]:
     return {
         "mode": mode,
-        "edge_model": edge_model,
-        "golden_model": golden_model,
+        "split_bucket": choice.bucket,
+        "split_boundary": choice.boundary,
+        "actual_split_id": metadata.get("actual_split_id"),
+        "repeat_id": int(repeat_id),
         "sample_count": int(sample_count),
         "epochs": int(epochs),
+        "train_time_sec": 0.0,
+        "metric_before": None,
+        "metric_after": None,
+        "metric_delta": None,
         "batch_size": int(batch_size),
-        "split_bucket": split_bucket,
-        "target_prefix_ratio": target_prefix_ratio,
-        "candidate_id": getattr(candidate, "candidate_id", None),
-        "sampled_frame_indices": [int(item) for item in sampled_frame_indices],
-        "repeat_index": int(repeat_index),
-        "base_seed": int(base_seed),
+        "ariadne_mode": ariadne_mode,
+        "edge_model": edge_model,
+        "golden_model": golden_model,
         "seed": int(seed),
-        "device": str(device),
-        "success": False,
-        "failure_reason": None,
-        "total_wall_time": 0.0,
-        "graph_build_time": float(graph_build_time),
-        "candidate_enumeration_time": float(candidate_enumeration_time),
-        "teacher_annotation_time": float(teacher_annotation_time),
-        "feature_reconstruction_time": 0.0,
-        "feature_load_time": 0.0,
-        "training_time": 0.0,
-        "effective_training_time": 0.0,
-        "epoch_time_mean": None,
-        "batch_time_mean": None,
-        "peak_cuda_memory_allocated": 0,
-        "peak_cuda_memory_reserved": 0,
-        "trainable_parameter_count": None,
-        "total_parameter_count": None,
-        "prefix_parameter_count": None,
-        "suffix_parameter_count": None,
-        "prefix_parameter_ratio": None,
-        "boundary_payload_bytes": int(getattr(candidate, "estimated_payload_bytes", 0) or 0)
-        if candidate is not None
-        else 0,
-        "proxy_mAP@0.5 before": None,
-        "proxy_mAP@0.5 after": None,
-        "delta proxy_mAP@0.5": None,
+        "teacher_annotation_time_sec": float(teacher_annotation_time),
+        "cache_build_time_sec": float(cache_build_time),
+        "runtime_build_time_sec": 0.0,
         "final_loss": None,
-        "epoch_times": [],
-        "batch_times": [],
+        "epoch_time_mean_sec": None,
+        "batch_time_mean_sec": None,
+        "sampled_frame_indices": [int(item) for item in sampled_frame_indices],
+        **dict(metadata),
     }
 
 
-def _mark_failure(row: dict[str, Any], reason: object) -> dict[str, Any]:
-    row["success"] = False
-    row["failure_reason"] = str(reason)
-    return row
-
-
-def _update_map_metrics(
+def _update_metrics(
     row: dict[str, Any],
-    before: Mapping[str, Any],
-    after: Mapping[str, Any],
+    before_metrics: Mapping[str, Any],
+    after_metrics: Mapping[str, Any],
 ) -> None:
-    before_map = before.get("map")
-    after_map = after.get("map")
-    row["proxy_mAP@0.5 before"] = None if before_map is None else float(before_map)
-    row["proxy_mAP@0.5 after"] = None if after_map is None else float(after_map)
-    if before_map is not None and after_map is not None:
-        row["delta proxy_mAP@0.5"] = float(after_map) - float(before_map)
-
-
-def _seconds_or_zero(value: Any) -> float:
-    if value is None:
-        return 0.0
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return seconds if np.isfinite(seconds) else 0.0
-
-
-def _compute_effective_training_time(row: Mapping[str, Any]) -> float:
-    training_time = _seconds_or_zero(row.get("training_time"))
-    feature_load_time = _seconds_or_zero(row.get("feature_load_time"))
-    feature_reconstruction_time = _seconds_or_zero(row.get("feature_reconstruction_time"))
-    mode = str(row.get("mode") or "")
-    if mode == "split_cached":
-        return feature_load_time + training_time
-    if mode == "split_rebuild":
-        return feature_reconstruction_time + feature_load_time + training_time
-    return training_time
-
-
-def _successful_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(row) for row in rows if bool(row.get("success"))]
-
-
-def _finite_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(number):
-        return None
-    return number
-
-
-def _write_split_position_mode_boxplots(
-    rows: list[Mapping[str, Any]],
-    output_root: Path,
-) -> None:
-    plots_dir = output_root / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        logger.warning("matplotlib is unavailable; skipping split-position boxplots: {}", exc)
-        return
-
-    successful = _successful_rows(rows)
-    split_rows = [row for row in successful if row.get("split_bucket") in BUCKET_LABELS]
-    if not split_rows:
-        logger.warning("No successful Early/Middle/Late rows are available for boxplots.")
-        return
-
-    plt.rcParams.update(
-        {
-            "font.size": 9,
-            "axes.labelsize": 9,
-            "legend.fontsize": 8,
-            "xtick.labelsize": 8,
-            "ytick.labelsize": 8,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
-    fig, (ax_time, ax_delta) = plt.subplots(
-        nrows=2,
-        ncols=1,
-        sharex=True,
-        figsize=(6.6, 5.0),
-    )
-
-    mode_labels = {
-        "freeze": "freeze",
-        "split_cached": "split_cached",
-        "split_rebuild": "split_rebuild",
-    }
-    mode_offsets = {
-        "freeze": -0.24,
-        "split_cached": 0.0,
-        "split_rebuild": 0.24,
-    }
-    mode_faces = {
-        "freeze": "#083bff",
-        "split_cached": "#63c25f",
-        "split_rebuild": "#ffd95a",
-    }
-    mode_edges = {
-        "freeze": "#0627a8",
-        "split_cached": "#237a35",
-        "split_rebuild": "#a57600",
-    }
-    edge_color = "#083bff"
-    bucket_positions = {
-        bucket: float(index)
-        for index, bucket in enumerate(BUCKET_LABELS, start=1)
-    }
-    bucket_labels = [
-        f"{bucket} ({int(round(DEFAULT_BOUNDARY_QUANTILES[index] * 100.0))}%)"
-        for index, bucket in enumerate(BUCKET_LABELS)
-    ]
-
-    def collect_values(bucket: str, mode: str, field: str) -> list[float]:
-        values: list[float] = []
-        for row in split_rows:
-            if row.get("split_bucket") != bucket or row.get("mode") != mode:
-                continue
-            raw_value = (
-                _compute_effective_training_time(row)
-                if field == "effective_training_time" and row.get(field) is None
-                else row.get(field)
-            )
-            value = _finite_float(raw_value)
-            if value is not None:
-                values.append(value)
-        return values
-
-    boxplot_style = {
-        "patch_artist": True,
-        "manage_ticks": False,
-        "widths": 0.18,
-        "medianprops": {"color": edge_color, "linewidth": 1.45},
-        "whiskerprops": {"color": edge_color, "linewidth": 1.0},
-        "capprops": {"color": edge_color, "linewidth": 1.0},
-        "flierprops": {
-            "marker": "o",
-            "markerfacecolor": "white",
-            "markeredgecolor": edge_color,
-            "markersize": 2.8,
-            "alpha": 0.65,
-        },
-    }
-
-    def apply_mode_style(plot: Mapping[str, Any], mode: str) -> None:
-        face_color = mode_faces[mode]
-        line_color = mode_edges[mode]
-        for patch in plot.get("boxes", []):
-            patch.set_facecolor(face_color)
-            patch.set_edgecolor(line_color)
-            patch.set_alpha(0.78)
-            patch.set_linewidth(1.25)
-        for key in ("whiskers", "caps", "medians"):
-            for line in plot.get(key, []):
-                line.set_color(line_color)
-                line.set_linewidth(1.2 if key != "medians" else 1.6)
-        for flier in plot.get("fliers", []):
-            flier.set_markeredgecolor(line_color)
-
-    plotted_any = False
-    missing: list[str] = []
-    for ax, field in (
-        (ax_time, "effective_training_time"),
-        (ax_delta, "delta proxy_mAP@0.5"),
-    ):
-        for bucket in BUCKET_LABELS:
-            for mode in DEFAULT_MODES:
-                values = collect_values(bucket, mode, field)
-                if not values:
-                    missing.append(f"{field}:{bucket}/{mode}")
-                    continue
-                position = bucket_positions[bucket] + mode_offsets[mode]
-                plot = ax.boxplot(
-                    [values],
-                    positions=[position],
-                    boxprops={
-                        "facecolor": mode_faces[mode],
-                        "edgecolor": mode_edges[mode],
-                        "linewidth": 1.2,
-                    },
-                    **boxplot_style,
-                )
-                apply_mode_style(plot, mode)
-                plotted_any = True
-
-    if not plotted_any:
-        logger.warning("No finite effective training time or delta proxy mAP values to plot.")
-        plt.close(fig)
-        return
-    if missing:
-        logger.warning(
-            "Skipped split-position boxplot combinations without successful data: {}",
-            ", ".join(missing),
-        )
-
-    x_positions = [bucket_positions[bucket] for bucket in BUCKET_LABELS]
-    ax_delta.set_xticks(x_positions)
-    ax_delta.set_xticklabels(bucket_labels)
-    ax_delta.set_xlabel("Split position")
-    ax_time.set_ylabel("Effective training time (s)")
-    ax_delta.set_ylabel("Delta proxy mAP@0.5")
-    ax_delta.axhline(0.0, color="0.45", linewidth=0.8, linestyle="--", alpha=0.7)
-    for ax in (ax_time, ax_delta):
-        ax.grid(axis="y", linestyle="--", linewidth=0.75, alpha=0.35)
-        ax.set_axisbelow(True)
-        ax.set_xlim(0.45, len(BUCKET_LABELS) + 0.55)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-    ax_time.set_ylim(bottom=0.0)
-
-    fig.legend(
-        handles=[
-            plt.Rectangle((0, 0), 1, 1, facecolor=mode_faces[mode], edgecolor=mode_edges[mode])
-            for mode in DEFAULT_MODES
-        ],
-        labels=[mode_labels[mode] for mode in DEFAULT_MODES],
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.99),
-        ncol=3,
-        frameon=True,
-        fancybox=False,
-        edgecolor="0.45",
-    )
-
-    fig.subplots_adjust(top=0.87, bottom=0.12, left=0.13, right=0.98, hspace=0.12)
-    fig.savefig(plots_dir / "freeze_vs_split_cached_vs_rebuild_by_position.pdf")
-    fig.savefig(plots_dir / "freeze_vs_split_cached_vs_rebuild_by_position.png", dpi=220)
-    plt.close(fig)
-
-
-def _run_one_experiment(
-    *,
-    mode: str,
-    edge_model: torch.nn.Module,
-    split_model: torch.nn.Module,
-    model_name: str,
-    golden_model: str,
-    initial_state: Mapping[str, Any],
-    splitter: UniversalModelSplitter,
-    choice: CandidateChoice | None,
-    cached_feature_path: Path | None,
-    cached_feature_failure: str | None,
-    frame_dir: Path,
-    frames_by_id: Mapping[int, np.ndarray],
-    sampled_frame_indices: list[int],
-    annotations: Mapping[str, Mapping[str, Any]],
-    sample_count: int,
-    epochs: int,
-    batch_size: int,
-    output_root: Path,
-    graph_build_time: float,
-    candidate_enumeration_time: float,
-    teacher_annotation_time: float,
-    learning_rate: float,
-    optimizer_config: Mapping[str, Any],
-    repeat_index: int,
-    base_seed: int,
-    seed: int,
-    device: torch.device,
-) -> dict[str, Any]:
-    candidate = choice.candidate if choice is not None else None
-    row = _base_result_row(
-        mode=mode,
-        edge_model=model_name,
-        golden_model=golden_model,
-        sample_count=sample_count,
-        epochs=epochs,
-        batch_size=batch_size,
-        split_bucket=choice.bucket if choice is not None else None,
-        target_prefix_ratio=choice.target_ratio if choice is not None else None,
-        candidate=candidate,
-        sampled_frame_indices=sampled_frame_indices,
-        graph_build_time=graph_build_time,
-        candidate_enumeration_time=candidate_enumeration_time,
-        teacher_annotation_time=teacher_annotation_time,
-        repeat_index=repeat_index,
-        base_seed=base_seed,
-        seed=seed,
-        device=device,
-    )
-    del output_root
-    run_started = time.perf_counter()
-    _reset_cuda_peak(device)
-    optimizer = None
-    try:
-        _set_random_seed(seed)
-        _restore_model_state(edge_model, initial_state)
-        edge_model.to(device)
-        loss_fn = build_split_training_loss(edge_model)
-        if loss_fn is None:
-            raise RuntimeError(f"No split-training loss is available for {model_name}.")
-
-        total_params = _total_parameter_count(split_model)
-        row["total_parameter_count"] = total_params
-
-        if candidate is None:
-            raise RuntimeError(f"{mode} requires a split candidate.")
-        if mode not in DEFAULT_MODES:
-            raise RuntimeError(f"Unsupported mode: {mode}")
-
-        splitter.split(candidate=candidate)
-        suffix_params, suffix_names = _resolve_suffix_trainable_parameters(
-            split_model,
-            splitter,
-        )
-        suffix_param_count = _count_parameters(suffix_params)
-        candidate_total_params = int(
-            getattr(candidate, "total_parameter_count", 0) or total_params
-        )
-        candidate_prefix_params = int(getattr(candidate, "edge_parameter_count", 0) or 0)
-        if candidate_prefix_params <= 0:
-            candidate_prefix_params = max(0, total_params - suffix_param_count)
-        row["suffix_parameter_names"] = suffix_names
-        row["trainable_parameter_count"] = suffix_param_count
-        row["prefix_parameter_count"] = candidate_prefix_params
-        row["suffix_parameter_count"] = max(0, candidate_total_params - candidate_prefix_params)
-        row["prefix_parameter_ratio"] = _candidate_prefix_ratio(candidate)
-        row["boundary_payload_bytes"] = int(
-            getattr(candidate, "estimated_payload_bytes", 0) or 0
-        )
-        optimizer_runtime = splitter if mode.startswith("split_") else None
-        optimizer = _make_optimizer(
-            split_model,
-            runtime=optimizer_runtime,
-            learning_rate=learning_rate,
-            optimizer_config=optimizer_config,
-        )
-
-        if mode == "freeze":
-            before_metrics = _evaluate_proxy_map(
-                model=edge_model,
-                model_name=model_name,
-                frame_dir=frame_dir,
-                annotations=annotations,
-                device=device,
-                batch_size=batch_size,
-            )
-            train_metrics = _train_raw_loop(
-                edge_model=edge_model,
-                split_model=split_model,
-                model_name=model_name,
-                frames_by_id=frames_by_id,
-                sample_ids=sampled_frame_indices,
-                annotations=annotations,
-                num_epoch=epochs,
-                batch_size=batch_size,
-                device=device,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                seed=seed,
-                shuffle_samples=bool(optimizer_config.get("shuffle_samples", False)),
-            )
-            after_metrics = _evaluate_proxy_map(
-                model=edge_model,
-                model_name=model_name,
-                frame_dir=frame_dir,
-                annotations=annotations,
-                device=device,
-                batch_size=batch_size,
-            )
-        else:
-            if mode == "split_cached":
-                if cached_feature_failure:
-                    raise RuntimeError(cached_feature_failure)
-                if cached_feature_path is None:
-                    raise RuntimeError("Missing cached BoundaryPayload feature cache.")
-                split_cache_path = cached_feature_path
-            elif mode == "split_rebuild":
-                split_cache_path = (
-                    Path("split_rebuild")
-                    / _safe_segment(choice.bucket)
-                    / _safe_segment(candidate.candidate_id)
-                    / f"samples_{sample_count}"
-                    / f"epochs_{epochs}"
-                    / f"repeat_{repeat_index}"
-                )
-                split_cache_path = frame_dir.parent / split_cache_path
-                rebuild_time, _records, actual_bytes = _rebuild_feature_cache(
-                    splitter=splitter,
-                    edge_model=edge_model,
-                    frames_by_id=frames_by_id,
-                    sample_ids=sampled_frame_indices,
-                    cache_path=split_cache_path,
-                    device=device,
-                )
-                row["feature_reconstruction_time"] = float(rebuild_time)
-                if actual_bytes > 0:
-                    row["boundary_payload_bytes_actual"] = int(actual_bytes)
-            else:
-                raise RuntimeError(f"Unsupported mode: {mode}")
-
-            before_metrics = _evaluate_proxy_map(
-                model=edge_model,
-                model_name=model_name,
-                frame_dir=frame_dir,
-                annotations=annotations,
-                device=device,
-                batch_size=batch_size,
-            )
-            train_metrics = _train_split_loop(
-                split_model=split_model,
-                splitter=splitter,
-                cache_path=split_cache_path,
-                sample_ids=sampled_frame_indices,
-                annotations=annotations,
-                num_epoch=epochs,
-                batch_size=batch_size,
-                device=device,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                seed=seed,
-                shuffle_samples=bool(optimizer_config.get("shuffle_samples", False)),
-            )
-            after_metrics = _evaluate_proxy_map(
-                model=edge_model,
-                model_name=model_name,
-                frame_dir=frame_dir,
-                annotations=annotations,
-                device=device,
-                batch_size=batch_size,
-            )
-
-        row.update({key: value for key, value in train_metrics.items() if key in row})
-        row["effective_training_time"] = _compute_effective_training_time(row)
-        row["success"] = True
-        _update_map_metrics(row, before_metrics, after_metrics)
-    except Exception as exc:  # noqa: BLE001 - experiment rows must capture failures and continue.
-        logger.exception(
-            "Experiment failed mode={} samples={} epochs={} bucket={} candidate={}: {}",
-            mode,
-            sample_count,
-            epochs,
-            choice.bucket if choice is not None else None,
-            getattr(candidate, "candidate_id", None),
-            exc,
-        )
-        _mark_failure(row, exc)
-    finally:
-        allocated, reserved = _cuda_peak(device)
-        row["peak_cuda_memory_allocated"] = allocated
-        row["peak_cuda_memory_reserved"] = reserved
-        row["total_wall_time"] = float(time.perf_counter() - run_started)
-        row["effective_training_time"] = _compute_effective_training_time(row)
-        try:
-            if optimizer is not None:
-                del optimizer
-        finally:
-            _restore_model_state(edge_model, initial_state)
-            for parameter in split_model.parameters():
-                parameter.grad = None
-            _clear_cuda_cache()
-    return row
-
-
-def _write_plots(rows: list[Mapping[str, Any]], output_root: Path) -> None:
-    _write_split_position_mode_boxplots(rows, output_root)
+    before = _metric_value(before_metrics)
+    after = _metric_value(after_metrics)
+    row["metric_before"] = before
+    row["metric_after"] = after
+    row["metric_delta"] = None if before is None or after is None else after - before
 
 
 def _prepare_configs(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -1617,58 +931,299 @@ def _prepare_configs(args: argparse.Namespace) -> tuple[Any, Any]:
     return client_cfg, server_cfg
 
 
-def _build_split_setup(
+def _build_runtime_for_choice(
     *,
+    split_model: torch.nn.Module,
+    example_batch: torch.Tensor,
+    choice: SplitChoice,
+    args: argparse.Namespace,
+) -> tuple[Any, float]:
+    config = SplitRuntimeConfig(
+        boundary=choice.boundary,
+        dynamic_batch=(2, max(2, int(args.dynamic_batch_max), int(args.batch_size))),
+        trace_batch_size=2,
+        mode=str(args.ariadne_mode),
+        trainable=True,
+    )
+    started = time.perf_counter()
+    runtime = build_split_runtime(split_model, example_batch, config)
+    maybe_warmup_runtime(runtime, example_batch)
+    return runtime, float(time.perf_counter() - started)
+
+
+def _write_split_position_mode_boxplots(rows: list[Mapping[str, Any]], output_root: Path) -> None:
+    plots_dir = output_root / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("matplotlib is unavailable; skipping split-position boxplot: {}", exc)
+        return
+
+    modes = [mode for mode in DEFAULT_MODES if any(row.get("mode") == mode for row in rows)]
+    mode_offsets = {
+        "freeze": -0.24,
+        "split_rebuild": 0.0,
+        "split_cached": 0.24,
+    }
+    mode_faces = {
+        "freeze": "#6aa6d8",
+        "split_rebuild": "#f2c94c",
+        "split_cached": "#65b96a",
+    }
+    mode_edges = {
+        "freeze": "#24567a",
+        "split_rebuild": "#8f6b00",
+        "split_cached": "#266b32",
+    }
+    bucket_positions = {bucket: index + 1 for index, bucket in enumerate(BUCKET_LABELS)}
+
+    fig, ax_time = plt.subplots(figsize=(10.5, 5.2))
+    ax_delta = ax_time.twinx()
+    plotted_any = False
+
+    def values(bucket: str, mode: str, field: str) -> list[float]:
+        result: list[float] = []
+        for row in rows:
+            if row.get("split_bucket") != bucket or row.get("mode") != mode:
+                continue
+            value = row.get(field)
+            if value is None:
+                continue
+            number = float(value)
+            if np.isfinite(number):
+                result.append(number)
+        return result
+
+    for bucket in BUCKET_LABELS:
+        base = bucket_positions[bucket]
+        for mode in modes:
+            offset = mode_offsets[mode]
+            time_values = values(bucket, mode, "train_time_sec")
+            delta_values = values(bucket, mode, "metric_delta")
+            if time_values:
+                plot = ax_time.boxplot(
+                    time_values,
+                    positions=[base + offset - 0.045],
+                    widths=0.08,
+                    patch_artist=True,
+                    manage_ticks=False,
+                    showmeans=True,
+                    meanline=True,
+                )
+                for patch in plot["boxes"]:
+                    patch.set_facecolor(mode_faces[mode])
+                    patch.set_edgecolor(mode_edges[mode])
+                    patch.set_alpha(0.82)
+                for key in ("whiskers", "caps", "medians", "means"):
+                    for line in plot[key]:
+                        line.set_color(mode_edges[mode])
+                        line.set_linewidth(1.05)
+                plotted_any = True
+            if delta_values:
+                plot = ax_delta.boxplot(
+                    delta_values,
+                    positions=[base + offset + 0.045],
+                    widths=0.08,
+                    patch_artist=True,
+                    manage_ticks=False,
+                    showmeans=True,
+                    meanline=True,
+                )
+                for patch in plot["boxes"]:
+                    patch.set_facecolor("white")
+                    patch.set_edgecolor(mode_edges[mode])
+                    patch.set_hatch("///")
+                    patch.set_alpha(0.85)
+                for key in ("whiskers", "caps", "medians", "means"):
+                    for line in plot[key]:
+                        line.set_color(mode_edges[mode])
+                        line.set_linewidth(1.05)
+                plotted_any = True
+
+    if not plotted_any:
+        logger.warning("No finite train time or metric delta values to plot.")
+        plt.close(fig)
+        return
+
+    ax_delta.axhline(0.0, color="0.45", linewidth=0.8, linestyle="--", alpha=0.7)
+    ax_time.set_xticks([bucket_positions[bucket] for bucket in BUCKET_LABELS])
+    ax_time.set_xticklabels(BUCKET_LABELS)
+    ax_time.set_ylabel("Training time (sec)")
+    ax_delta.set_ylabel("Proxy mAP@0.5 delta")
+    ax_time.set_xlabel("Ariadne split boundary")
+    ax_time.set_xlim(0.45, len(BUCKET_LABELS) + 0.55)
+    ax_time.set_ylim(bottom=0.0)
+    ax_time.grid(axis="y", linestyle="--", linewidth=0.75, alpha=0.35)
+    ax_time.set_axisbelow(True)
+    ax_time.spines["top"].set_visible(False)
+    ax_delta.spines["top"].set_visible(False)
+
+    from matplotlib.patches import Patch
+
+    mode_handles = [
+        Patch(facecolor=mode_faces[mode], edgecolor=mode_edges[mode], label=mode)
+        for mode in modes
+    ]
+    metric_handles = [
+        Patch(facecolor="0.65", edgecolor="0.35", label="time"),
+        Patch(facecolor="white", edgecolor="0.35", hatch="///", label="metric delta"),
+    ]
+    ax_time.legend(handles=mode_handles + metric_handles, loc="upper center", ncol=5)
+    fig.tight_layout()
+    fig.savefig(plots_dir / "freeze_vs_split_cached_vs_rebuild_by_position.pdf")
+    fig.savefig(plots_dir / "freeze_vs_split_cached_vs_rebuild_by_position.png", dpi=220)
+    plt.close(fig)
+
+
+def _run_one_experiment(
+    *,
+    mode: str,
+    choice: SplitChoice,
     edge_model: torch.nn.Module,
-    edge_model_name: str,
-    first_frame: np.ndarray,
-    trace_batch_size: int,
-    fixed_split_cfg: Any,
-    boundary_quantiles: list[float],
+    split_model: torch.nn.Module,
+    model_name: str,
+    golden_model: str,
+    initial_state: Mapping[str, Any],
+    example_batch: torch.Tensor,
+    cached_batches: list[CachedSplitBatch] | None,
+    cache_build_time: float,
+    frame_dir: Path,
+    frames_by_id: Mapping[int, np.ndarray],
+    sampled_frame_indices: list[int],
+    annotations: Mapping[str, Mapping[str, Any]],
+    sample_count: int,
+    epochs: int,
+    batch_size: int,
+    teacher_annotation_time: float,
+    learning_rate: float,
+    optimizer_config: Mapping[str, Any],
+    repeat_id: int,
+    seed: int,
+    args: argparse.Namespace,
     device: torch.device,
-) -> tuple[
-    torch.nn.Module,
-    UniversalModelSplitter,
-    list[CandidateChoice],
-    float,
-    float,
-]:
-    split_model = get_split_runtime_model(edge_model)
+) -> dict[str, Any]:
+    _set_random_seed(seed)
+    _restore_model_state(edge_model, initial_state)
+    edge_model.to(device)
     split_model.to(device)
     loss_fn = build_split_training_loss(edge_model)
-    splitter = UniversalModelSplitter(device=device)
-    splitter.trainability_loss_fn = loss_fn
-    sample_input = prepare_split_runtime_input(edge_model, first_frame, device=device)
-    sample_input = _make_trace_input(sample_input, trace_batch_size)
-    model_family = get_model_family(edge_model_name)
+    if loss_fn is None:
+        raise RuntimeError(f"No split-training loss is available for {model_name}.")
 
-    _synchronize(device)
-    graph_started = time.perf_counter()
-    splitter.trace(
+    runtime = None
+    runtime_build_time = 0.0
+    if mode == "split_cached":
+        if cached_batches is None:
+            raise RuntimeError("Missing cached Ariadne boundary batches.")
+        runtime, runtime_build_time = _build_runtime_for_choice(
+            split_model=split_model,
+            example_batch=example_batch,
+            choice=choice,
+            args=args,
+        )
+    elif mode in {"freeze", "split_rebuild"}:
+        runtime, runtime_build_time = _build_runtime_for_choice(
+            split_model=split_model,
+            example_batch=example_batch,
+            choice=choice,
+            args=args,
+        )
+    else:
+        raise RuntimeError(f"Unsupported mode: {mode}")
+
+    metadata = get_split_runtime_metadata(runtime)
+    row = _base_result_row(
+        mode=mode,
+        choice=choice,
+        metadata=metadata,
+        edge_model=model_name,
+        golden_model=golden_model,
+        sample_count=sample_count,
+        epochs=epochs,
+        batch_size=batch_size,
+        repeat_id=repeat_id,
+        seed=seed,
+        ariadne_mode=str(args.ariadne_mode),
+        teacher_annotation_time=teacher_annotation_time,
+        cache_build_time=cache_build_time if mode == "split_cached" else 0.0,
+        sampled_frame_indices=sampled_frame_indices,
+    )
+    row["runtime_build_time_sec"] = runtime_build_time
+    row["trainable_parameter_count"] = sum(
+        parameter.numel() for parameter in collect_suffix_trainable_parameters(runtime)
+    )
+    optimizer = _make_optimizer(
         split_model,
-        sample_input,
-        model_name=edge_model_name,
-        model_family=model_family,
+        runtime=runtime,
+        learning_rate=learning_rate,
+        optimizer_config=optimizer_config,
     )
-    _synchronize(device)
-    graph_build_time = time.perf_counter() - graph_started
 
-    constraints = SplitConstraints.from_config(fixed_split_cfg)
-    _synchronize(device)
-    enum_started = time.perf_counter()
-    candidates = splitter.enumerate_candidates(
-        max_candidates=constraints.max_candidates,
-        max_boundary_count=constraints.max_boundary_count,
-        max_payload_bytes=constraints.max_payload_bytes,
+    before_metrics = _evaluate_proxy_map(
+        model=edge_model,
+        model_name=model_name,
+        frame_dir=frame_dir,
+        annotations=annotations,
+        device=device,
+        batch_size=batch_size,
     )
-    eligible = _filter_candidates(candidates, constraints)
-    choices = _select_candidate_choices(
-        eligible,
-        boundary_quantiles,
+    if mode == "freeze":
+        train_metrics = _train_freeze_loop(
+            edge_model=edge_model,
+            split_model=split_model,
+            model_name=model_name,
+            frames_by_id=frames_by_id,
+            sample_ids=sampled_frame_indices,
+            annotations=annotations,
+            epochs=epochs,
+            batch_size=batch_size,
+            device=device,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            seed=seed,
+            shuffle_samples=False,
+        )
+    elif mode == "split_rebuild":
+        train_metrics = _train_split_rebuild_loop(
+            runtime=runtime,
+            edge_model=edge_model,
+            frames_by_id=frames_by_id,
+            sample_ids=sampled_frame_indices,
+            annotations=annotations,
+            epochs=epochs,
+            batch_size=batch_size,
+            device=device,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            seed=seed,
+            shuffle_samples=False,
+        )
+    else:
+        train_metrics = _train_split_cached_loop(
+            runtime=runtime,
+            cached_batches=list(cached_batches or []),
+            epochs=epochs,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            seed=seed,
+            shuffle_samples=False,
+            device=device,
+        )
+    after_metrics = _evaluate_proxy_map(
+        model=edge_model,
+        model_name=model_name,
+        frame_dir=frame_dir,
+        annotations=annotations,
+        device=device,
+        batch_size=batch_size,
     )
-    _synchronize(device)
-    candidate_enumeration_time = time.perf_counter() - enum_started
-    return split_model, splitter, choices, graph_build_time, candidate_enumeration_time
+    row.update(train_metrics)
+    _update_metrics(row, before_metrics, after_metrics)
+    return row
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1685,21 +1240,22 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device(str(args.device))
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device requested CUDA, but torch.cuda.is_available() is false.")
+    if int(args.batch_size) < 2:
+        raise ValueError("--batch-size must be at least 2 for Ariadne batch_gt1 tracing.")
     object_detection_module.device = device
     _set_random_seed(int(args.seed))
     sample_count = int(args.sample_count)
     epochs = int(args.epochs)
-    repeats = max(1, int(args.repeats))
-    frame_seed = int(args.seed)
-    boundary_quantiles = [float(value) for value in args.boundary_quantiles]
+    repeat = max(1, int(args.repeat))
+    choices = _split_choices([str(boundary) for boundary in args.split_boundaries])
 
     client_cfg, server_cfg = _prepare_configs(args)
 
-    logger.info("Sampling frames from {}", args.video_path)
+    logger.info("Sampling {} frames from {}", sample_count, args.video_path)
     frames_by_id, sampled_ids = _sample_video_frames(
         Path(args.video_path),
         sample_count,
-        seed=frame_seed,
+        seed=int(args.seed),
     )
     frame_dir = output_root / "frames"
     _write_raw_frames(frame_dir, frames_by_id)
@@ -1732,77 +1288,57 @@ def main(argv: list[str] | None = None) -> int:
         for frame_id in sampled_ids
     }
 
-    first_frame = frames_by_id[sampled_ids[0]]
-    split_model, splitter, choices, graph_build_time, candidate_enumeration_time = (
-        _build_split_setup(
-            edge_model=edge_detector.model,
-            edge_model_name=str(args.edge_model),
-            first_frame=first_frame,
-            trace_batch_size=int(getattr(server_cfg.continual_learning, "trace_batch_size", 2)),
-            fixed_split_cfg=client_cfg.split_learning.fixed_split,
-            boundary_quantiles=boundary_quantiles,
-            device=device,
-        )
+    split_model = get_split_runtime_model(edge_detector.model)
+    example_batch = _make_trace_batch(
+        model=edge_detector.model,
+        frames_by_id=frames_by_id,
+        sample_ids=sampled_ids,
+        device=device,
+        trace_batch_size=2,
     )
-
-    logger.info("Selected split candidates:")
-    for choice in choices:
-        logger.info(
-            "  {} target={} candidate={} prefix_ratio={:.4f} payload={} bytes",
-            choice.bucket,
-            choice.target_ratio,
-            choice.candidate.candidate_id,
-            _candidate_prefix_ratio(choice.candidate),
-            int(choice.candidate.estimated_payload_bytes),
-        )
-
     initial_state = _snapshot_model_state(edge_detector.model)
-    cached_feature_paths: dict[str, Path] = {}
-    cached_feature_failures: dict[str, str] = {}
-    if "split_cached" in set(args.modes):
-        unique_candidates = {
-            str(choice.candidate.candidate_id): choice.candidate
-            for choice in choices
-        }
-        for candidate_id, candidate in unique_candidates.items():
-            cache_path = output_root / "cached_features" / _safe_segment(candidate_id)
-            try:
-                logger.info("Building pre-cached BoundaryPayload records for {}", candidate_id)
-                splitter.split(candidate=candidate)
-                _rebuild_feature_cache(
-                    splitter=splitter,
-                    edge_model=edge_detector.model,
-                    frames_by_id=frames_by_id,
-                    sample_ids=sampled_ids,
-                    cache_path=cache_path,
-                    device=device,
-                )
-                cached_feature_paths[candidate_id] = cache_path
-            except Exception as exc:  # noqa: BLE001 - cached mode rows should report failures.
-                cached_feature_failures[candidate_id] = str(exc)
-                logger.exception("Failed to prebuild cached features for {}: {}", candidate_id, exc)
-        _restore_model_state(edge_detector.model, initial_state)
-
     learning_rate = _resolve_experiment_learning_rate(server_cfg, str(args.edge_model))
     optimizer_config = _optimizer_overrides(str(args.edge_model))
-    rows: list[dict[str, Any]] = []
 
-    for repeat_index in range(repeats):
-        run_seed = int(args.seed) + repeat_index
+    cached_by_boundary: dict[str, tuple[list[CachedSplitBatch], float]] = {}
+    if "split_cached" in set(args.modes):
         for choice in choices:
-            candidate_id = str(choice.candidate.candidate_id)
+            _restore_model_state(edge_detector.model, initial_state)
+            runtime, _runtime_build_time = _build_runtime_for_choice(
+                split_model=split_model,
+                example_batch=example_batch,
+                choice=choice,
+                args=args,
+            )
+            logger.info("Prebuilding cached Ariadne boundaries for {}", choice.boundary)
+            cached_by_boundary[choice.boundary] = _build_cached_batches(
+                runtime=runtime,
+                edge_model=edge_detector.model,
+                frames_by_id=frames_by_id,
+                sample_ids=sampled_ids,
+                annotations=sample_annotations,
+                batch_size=int(args.batch_size),
+                device=device,
+            )
+        _restore_model_state(edge_detector.model, initial_state)
+
+    rows: list[dict[str, Any]] = []
+    for repeat_id in range(repeat):
+        run_seed = int(args.seed) + repeat_id
+        for choice in choices:
+            cached_batches, cache_build_time = cached_by_boundary.get(choice.boundary, (None, 0.0))
             for mode in args.modes:
                 row = _run_one_experiment(
-                    mode=mode,
+                    mode=str(mode),
+                    choice=choice,
                     edge_model=edge_detector.model,
                     split_model=split_model,
                     model_name=str(args.edge_model),
                     golden_model=str(args.golden_model),
                     initial_state=initial_state,
-                    splitter=splitter,
-                    choice=choice,
-                    cached_feature_path=cached_feature_paths.get(candidate_id),
-                    cached_feature_failure=cached_feature_failures.get(candidate_id),
+                    example_batch=example_batch,
+                    cached_batches=cached_batches,
+                    cache_build_time=cache_build_time,
                     frame_dir=frame_dir,
                     frames_by_id=frames_by_id,
                     sampled_frame_indices=sampled_ids,
@@ -1810,23 +1346,22 @@ def main(argv: list[str] | None = None) -> int:
                     sample_count=sample_count,
                     epochs=epochs,
                     batch_size=int(args.batch_size),
-                    output_root=output_root,
-                    graph_build_time=graph_build_time,
-                    candidate_enumeration_time=candidate_enumeration_time,
                     teacher_annotation_time=teacher_annotation_time,
                     learning_rate=learning_rate,
                     optimizer_config=optimizer_config,
-                    repeat_index=repeat_index,
-                    base_seed=int(args.seed),
+                    repeat_id=repeat_id,
                     seed=run_seed,
+                    args=args,
                     device=device,
                 )
                 rows.append(row)
                 _append_jsonl(results_path, row)
+                _restore_model_state(edge_detector.model, initial_state)
+                _clear_cuda_cache()
 
     _write_summary_csv(summary_path, rows)
     _write_aggregate_summary_csv(aggregate_summary_path, rows)
-    _write_plots(rows, output_root)
+    _write_split_position_mode_boxplots(rows, output_root)
     logger.info("Wrote {}", results_path)
     logger.info("Wrote {}", summary_path)
     logger.info("Wrote {}", aggregate_summary_path)

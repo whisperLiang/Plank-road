@@ -3,9 +3,15 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from ariadne import BoundaryPayload, SplitRuntime, SplitSpec, prepare_split
+from ariadne import (
+    BoundaryPayload,
+    SplitRuntime,
+    SplitSpec,
+    prepare_split,
+    prepare_split_replay,
+)
 
-ARIADNE_RUNTIME_ADAPTER_VERSION = "plank-road-ariadne-runtime-v2"
+ARIADNE_RUNTIME_ADAPTER_VERSION = "plank-road-ariadne-runtime-v3"
 DEFAULT_SPLIT_MODE = "generated_eager"
 
 
@@ -55,6 +61,25 @@ def prepare_split_runtime(
     )
 
 
+def prepare_split_replay_runtime(
+    model,
+    example_inputs: Sequence[Any] | Any,
+    split_spec: SplitSpec | str,
+    mode: str = DEFAULT_SPLIT_MODE,
+):
+    """Prepare a replay runtime using the public ariadne-split API."""
+
+    split = SplitSpec(boundary=split_spec) if isinstance(split_spec, str) else split_spec
+    return prepare_split_replay(
+        model,
+        example_inputs=normalize_example_inputs(example_inputs),
+        split=split,
+        mode=mode,
+        validation="strict",
+        materialize_boundary=True,
+    )
+
+
 __all__ = [
     "ARIADNE_RUNTIME_ADAPTER_VERSION",
     "BoundaryPayload",
@@ -63,5 +88,6 @@ __all__ = [
     "SplitSpec",
     "make_split_spec",
     "normalize_example_inputs",
+    "prepare_split_replay_runtime",
     "prepare_split_runtime",
 ]

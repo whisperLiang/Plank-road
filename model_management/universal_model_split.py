@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
-from ariadne.codegen.segment_builder import build_segments
 from ariadne.planner.frontier import enumerate_frontier_splits
 from loguru import logger
 
@@ -17,12 +16,7 @@ from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_runtime import (
     compare_outputs,
     make_split_spec,
-    prepare_validated_boundary_payload,
     prepare_split_runtime,
-    run_batch_prefix,
-    run_batch_suffix,
-    train_batch_suffix,
-    train_batch_suffix_fast,
 )
 
 
@@ -351,70 +345,6 @@ class UniversalModelSplitter:
         self._trace_sample_input: Any = None
         self._last_replay_validation: dict[str, Any] | None = None
 
-    def _select_replayable_auto_runtime(
-        self,
-        runtime: SplitRuntime,
-        model: torch.nn.Module,
-        sample_input: Any,
-        *,
-        mode: str,
-        require_trainable: bool,
-    ) -> SplitRuntime:
-        report = _runtime_replay_report(
-            runtime,
-            model,
-            sample_input,
-            require_trainable=require_trainable,
-        )
-        if bool(report.get("success", False)):
-            self._last_replay_validation = report
-            return runtime
-
-        if getattr(getattr(runtime, "split_spec", None), "boundary", None) != "auto":
-            self._last_replay_validation = report
-            return runtime
-
-        failures: list[str] = [str(report.get("error") or "unknown")]
-        candidates = sorted(
-            enumerate_frontier_splits(runtime.trace_plan),
-            key=lambda candidate: (
-                0 if bool(getattr(candidate, "trainable_suffix", False)) else 1,
-                _candidate_payload_bytes(candidate),
-                str(getattr(candidate, "split_id", "")),
-            ),
-        )
-        for candidate in candidates:
-            if require_trainable and not bool(getattr(candidate, "trainable_suffix", False)):
-                continue
-            candidate_split_spec = replace(
-                runtime.split_spec,
-                boundary=str(getattr(candidate, "split_id", runtime.split_spec.boundary)),
-            )
-            candidate_runtime = SplitRuntime(
-                trace_plan=runtime.trace_plan,
-                split_spec=candidate_split_spec,
-                candidate=candidate,
-                segments=build_segments(runtime.trace_plan, candidate),
-                mode=mode,
-            )
-            candidate_report = _runtime_replay_report(
-                candidate_runtime,
-                model,
-                sample_input,
-                require_trainable=require_trainable,
-            )
-            if bool(candidate_report.get("success", False)):
-                self._last_replay_validation = candidate_report
-                return candidate_runtime
-            failures.append(str(candidate_report.get("error") or "unknown"))
-
-        self._last_replay_validation = report
-        detail = "; ".join(dict.fromkeys(failures[:4]))
-        raise RuntimeError(
-            "No replayable Ariadne split candidate satisfied the fixed split request"
-            + (f": {detail}" if detail else ".")
-        )
-
     def trace(
         self,
         model: torch.nn.Module,
@@ -453,11 +383,10 @@ class UniversalModelSplitter:
             self.split_spec,
             mode=mode,
         )
-        self.runtime = self._select_replayable_auto_runtime(
+        self._last_replay_validation = _runtime_replay_report(
             self.runtime,
             model,
             sample_input,
-            mode=mode,
             require_trainable=bool(self.split_spec.trainable),
         )
         self.graph = str(getattr(self.runtime, "graph_signature", ""))
@@ -583,41 +512,19 @@ class UniversalModelSplitter:
             base_split_spec,
             boundary=str(getattr(ariadne_candidate, "split_id", base_split_spec.boundary)),
         )
-        variants = []
-        for variant in tuple(getattr(runtime, "variants", ()) or ()):
-            try:
-                variant_candidate = self._find_ariadne_candidate_in_plan(
-                    getattr(variant, "trace_plan", None),
-                    candidate=candidate,
-                    candidate_id=candidate_id or getattr(candidate, "candidate_id", None),
-                    layer_label=layer_label,
-                    boundary_tensor_labels=boundary_tensor_labels,
-                )
-            except KeyError:
-                continue
-            variants.append(
-                SplitRuntime(
-                    trace_plan=variant.trace_plan,
-                    split_spec=split_spec,
-                    candidate=variant_candidate,
-                    segments=build_segments(variant.trace_plan, variant_candidate),
-                    mode=variant.mode,
-                    variants=tuple(getattr(variant, "variants", ()) or ()),
-                    batch_range=getattr(variant, "batch_range", None),
-                )
+        if self.model is None or self._trace_sample_input is None:
+            raise RuntimeError(
+                "Switching Ariadne split candidates requires the original example input; "
+                "prepare a runtime for the desired boundary directly."
             )
-        rebound = SplitRuntime(
-            trace_plan=runtime.trace_plan,
-            split_spec=split_spec,
-            candidate=ariadne_candidate,
-            segments=build_segments(runtime.trace_plan, ariadne_candidate),
-            mode=runtime.mode,
-            variants=tuple(variants),
-            batch_range=getattr(runtime, "batch_range", None),
+        self.runtime = prepare_split_runtime(
+            self.model,
+            self._trace_sample_input,
+            split_spec,
+            mode=str(getattr(runtime, "mode", "generated_eager")),
         )
-        self.runtime = rebound
-        self.graph = str(getattr(rebound, "graph_signature", ""))
-        self.current_candidate = _candidate_from_runtime(rebound, split_spec)
+        self.graph = str(getattr(self.runtime, "graph_signature", ""))
+        self.current_candidate = _candidate_from_runtime(self.runtime, split_spec)
         return self.current_candidate
 
     def split(
@@ -711,12 +618,7 @@ class UniversalModelSplitter:
         del candidate
         if kwargs:
             raise RuntimeError("Ariadne prefix execution expects positional runtime inputs.")
-        return run_batch_prefix(
-            self._ensure_runtime(),
-            *args,
-            model_name=self.model_name,
-            model_family=self.model_family,
-        )
+        return self._ensure_runtime().run_prefix(*args)
 
     run_prefix = edge_forward
 
@@ -728,12 +630,7 @@ class UniversalModelSplitter:
         **kwargs: Any,
     ) -> Any:
         del args, candidate, kwargs
-        return run_batch_suffix(
-            self._ensure_runtime(),
-            payload,
-            model_name=self.model_name,
-            model_family=self.model_family,
-        )
+        return self._ensure_runtime().run_suffix(payload)
 
     run_suffix = cloud_forward
 
@@ -748,14 +645,11 @@ class UniversalModelSplitter:
         **_: Any,
     ) -> tuple[None, torch.Tensor]:
         del candidate
-        loss, _grads = train_batch_suffix(
-            self._ensure_runtime(),
+        loss, _grads = self._ensure_runtime().train_suffix(
             payload,
             targets,
             loss_fn=loss_fn or self.trainability_loss_fn,
             optimizer=optimizer,
-            model_name=self.model_name,
-            model_family=self.model_family,
         )
         return None, loss
 
@@ -767,14 +661,11 @@ class UniversalModelSplitter:
         loss_fn=None,
         optimizer=None,
     ):
-        return train_batch_suffix(
-            self._ensure_runtime(),
+        return self._ensure_runtime().train_suffix(
             boundary,
             targets,
             loss_fn=loss_fn or self.trainability_loss_fn,
             optimizer=optimizer,
-            model_name=self.model_name,
-            model_family=self.model_family,
         )
 
     def train_suffix_fast(
@@ -786,15 +677,12 @@ class UniversalModelSplitter:
         optimizer=None,
         profile: dict[str, float] | None = None,
     ):
-        return train_batch_suffix_fast(
-            self._ensure_runtime(),
+        del profile
+        return self._ensure_runtime().train_suffix(
             boundary,
             targets,
             loss_fn=loss_fn or self.trainability_loss_fn,
             optimizer=optimizer,
-            model_name=self.model_name,
-            model_family=self.model_family,
-            profile=profile,
         )
 
     def replay_inference(self, sample_input: Any, *, return_split_output: bool = False):
@@ -928,167 +816,6 @@ def _get_preloaded_split_feature_record(
     return None
 
 
-def _combine_boundary_values(values: list[Any]) -> Any:
-    first = values[0]
-    if all(isinstance(value, torch.Tensor) for value in values):
-        tensors = [value for value in values if isinstance(value, torch.Tensor)]
-        if all(tensor.ndim > 0 for tensor in tensors):
-            return torch.cat(tensors, dim=0)
-        return torch.stack(tensors, dim=0)
-    if all(isinstance(value, dict) for value in values):
-        keys = list(first.keys())
-        if not all(list(value.keys()) == keys for value in values if isinstance(value, dict)):
-            raise RuntimeError("Cannot batch BoundaryPayload dictionaries with different keys.")
-        return {
-            key: _combine_boundary_values([value[key] for value in values])
-            for key in keys
-        }
-    if all(isinstance(value, tuple) for value in values):
-        length = len(first)
-        if not all(len(value) == length for value in values if isinstance(value, tuple)):
-            raise RuntimeError("Cannot batch BoundaryPayload tuples with different lengths.")
-        return tuple(
-            _combine_boundary_values([value[index] for value in values])
-            for index in range(length)
-        )
-    if all(isinstance(value, list) for value in values):
-        length = len(first)
-        if not all(len(value) == length for value in values if isinstance(value, list)):
-            raise RuntimeError("Cannot batch BoundaryPayload lists with different lengths.")
-        return [
-            _combine_boundary_values([value[index] for value in values])
-            for index in range(length)
-        ]
-    try:
-        if all(value == first for value in values):
-            return first
-    except Exception:
-        pass
-    return list(values)
-
-
-def _move_boundary_value_to_device(value: Any, device: torch.device) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.to(device)
-    if isinstance(value, dict):
-        return {
-            key: _move_boundary_value_to_device(item, device)
-            for key, item in value.items()
-        }
-    if isinstance(value, tuple):
-        return tuple(_move_boundary_value_to_device(item, device) for item in value)
-    if isinstance(value, list):
-        return [_move_boundary_value_to_device(item, device) for item in value]
-    return value
-
-
-def _boundary_value_needs_device_move(value: Any, device: torch.device) -> bool:
-    if isinstance(value, torch.Tensor):
-        return value.device != device
-    if isinstance(value, dict):
-        return any(
-            _boundary_value_needs_device_move(item, device)
-            for item in value.values()
-        )
-    if isinstance(value, (tuple, list)):
-        return any(_boundary_value_needs_device_move(item, device) for item in value)
-    return False
-
-
-def _boundary_payload_to_device(
-    boundary: BoundaryPayload,
-    device: torch.device,
-) -> BoundaryPayload:
-    tensors = getattr(boundary, "tensors", {}) or {}
-    passthrough_inputs = getattr(boundary, "passthrough_inputs", {}) or {}
-    if all(
-        not isinstance(tensor, torch.Tensor) or tensor.device == device
-        for tensor in tensors.values()
-    ) and not _boundary_value_needs_device_move(passthrough_inputs, device):
-        return boundary
-    return BoundaryPayload(
-        split_id=boundary.split_id,
-        graph_signature=boundary.graph_signature,
-        batch_size=boundary.batch_size,
-        tensors={
-            label: tensor.to(device) if isinstance(tensor, torch.Tensor) else tensor
-            for label, tensor in tensors.items()
-        },
-        schema=boundary.schema,
-        requires_grad=boundary.requires_grad,
-        weight_version=boundary.weight_version,
-        passthrough_inputs=_move_boundary_value_to_device(passthrough_inputs, device),
-    )
-
-
-def _combine_boundary_payload_batch(
-    boundaries: list[BoundaryPayload],
-    *,
-    expected_batch_size: int,
-    device: str | torch.device | None = None,
-) -> BoundaryPayload:
-    if device is not None:
-        target_device = torch.device(device)
-        boundaries = [
-            _boundary_payload_to_device(boundary, target_device)
-            for boundary in boundaries
-        ]
-    first = boundaries[0]
-    if int(first.batch_size) == int(expected_batch_size):
-        return first
-    if not all(int(boundary.batch_size) == 1 for boundary in boundaries):
-        raise RuntimeError(
-            "Cached BoundaryPayload batch size does not match training batch "
-            f"(payload_batch={first.batch_size}, requested_batch={expected_batch_size})."
-        )
-    labels = list(first.tensors.keys())
-    for boundary in boundaries[1:]:
-        if boundary.split_id != first.split_id:
-            raise RuntimeError("Cannot batch BoundaryPayload records from different split ids.")
-        if boundary.graph_signature != first.graph_signature:
-            raise RuntimeError(
-                "Cannot batch BoundaryPayload records from different graph signatures."
-            )
-        if list(boundary.tensors.keys()) != labels:
-            raise RuntimeError(
-                "Cannot batch BoundaryPayload records with different tensor labels."
-            )
-        for label in labels:
-            first_tensor = first.tensors[label]
-            tensor = boundary.tensors[label]
-            if not isinstance(first_tensor, torch.Tensor) or not isinstance(tensor, torch.Tensor):
-                continue
-            if str(first_tensor.dtype) != str(tensor.dtype) or first_tensor.ndim != tensor.ndim:
-                raise RuntimeError(
-                    "Cannot batch BoundaryPayload records with incompatible tensor shapes."
-                )
-            if first_tensor.ndim > 0 and tuple(first_tensor.shape[1:]) != tuple(tensor.shape[1:]):
-                raise RuntimeError(
-                    "Cannot batch BoundaryPayload records with incompatible tensor shapes."
-                )
-    mapped_boundaries = [
-        dict(boundary.tensors)
-        for boundary in boundaries
-    ]
-    return BoundaryPayload(
-        split_id=first.split_id,
-        graph_signature=first.graph_signature,
-        batch_size=int(expected_batch_size),
-        tensors={
-            label: _combine_boundary_values(
-                [mapped_tensors[label] for mapped_tensors in mapped_boundaries]
-            )
-            for label in labels
-        },
-        schema=dict(first.schema),
-        requires_grad=dict(first.requires_grad),
-        weight_version=first.weight_version,
-        passthrough_inputs=_combine_boundary_values(
-            [dict(boundary.passthrough_inputs or {}) for boundary in boundaries]
-        ),
-    )
-
-
 _SPLIT_TARGET_METADATA_FIELDS = (
     "input_image_size",
     "input_tensor_shape",
@@ -1172,16 +899,6 @@ class SplitRetrainProfile:
         )
 
 
-@dataclass
-class PreparedSplitTrainBatch:
-    sample_ids: list[Any]
-    boundary: BoundaryPayload
-    targets: list[Any]
-    is_padded: bool
-    original_batch_size: int
-    validated: bool
-
-
 def log_split_retrain_profile(profile: SplitRetrainProfile) -> None:
     logger.info(
         "[FixedSplitCL][RetrainProfile] "
@@ -1220,24 +937,6 @@ def _ariadne_runtime_from_splitter(splitter: Any) -> Any:
     return splitter
 
 
-def _splitter_supports_preparation_validation(splitter: Any) -> bool:
-    runtime = _ariadne_runtime_from_splitter(splitter)
-    return callable(getattr(runtime, "validate_boundary", None)) and callable(
-        getattr(runtime, "run_suffix", None)
-    )
-
-
-def _splitter_model_context(splitter: Any) -> tuple[str | None, str | None]:
-    return (
-        getattr(splitter, "model_name", None),
-        getattr(splitter, "model_family", None),
-    )
-
-
-def _move_target_to_device(target: Any, device: torch.device) -> Any:
-    return _detach_boundary_value(_move_boundary_value_to_device(target, device))
-
-
 def _detach_boundary_value(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach()
@@ -1253,44 +952,18 @@ def _detach_boundary_value(value: Any) -> Any:
     return value
 
 
-def _detach_boundary_payload(boundary: BoundaryPayload) -> BoundaryPayload:
-    return BoundaryPayload(
-        split_id=boundary.split_id,
-        graph_signature=boundary.graph_signature,
-        batch_size=boundary.batch_size,
-        tensors={
-            label: _detach_boundary_value(tensor)
-            for label, tensor in dict(boundary.tensors).items()
-        },
-        schema=boundary.schema,
-        requires_grad=boundary.requires_grad,
-        weight_version=boundary.weight_version,
-        passthrough_inputs=_detach_boundary_value(
-            dict(boundary.passthrough_inputs or {})
-        ),
-    )
-
-
-def prepare_split_train_batches_once(
+def _load_cached_split_batches(
     *,
-    splitter: Any,
     cache_path: str,
     all_indices: list[Any],
     annotations: Mapping[Any, Any],
     batch_size: int,
-    device: str | torch.device,
     preloaded_records: Mapping[Any, Mapping[str, Any]] | None = None,
-    move_to_device: bool = True,
-    validate: bool = True,
     profile: SplitRetrainProfile | None = None,
-) -> list[PreparedSplitTrainBatch]:
+) -> list[tuple[list[Any], BoundaryPayload, list[Any]]]:
     prepare_started = time.perf_counter()
-    prepared_batches: list[PreparedSplitTrainBatch] = []
-    runtime_min_batch = _splitter_dynamic_batch_min(splitter)
-    target_device = torch.device(device)
+    batches: list[tuple[list[Any], BoundaryPayload, list[Any]]] = []
     epoch_batch_size = max(1, int(batch_size))
-    ariadne_runtime = _ariadne_runtime_from_splitter(splitter)
-    model_name, model_family = _splitter_model_context(splitter)
     disk_record_cache: dict[Any, dict[str, Any]] = {}
 
     def _record_for_index(index: Any) -> dict[str, Any]:
@@ -1310,17 +983,9 @@ def prepare_split_train_batches_once(
             if not batch_indices:
                 continue
             records = [_record_for_index(index) for index in batch_indices]
-            boundaries = [record.get("intermediate") for record in records]
-            if not boundaries or not all(
-                isinstance(boundary, BoundaryPayload) for boundary in boundaries
-            ):
-                raise RuntimeError(
-                    "Split-tail training requires cached BoundaryPayload records."
-                )
-
             target_started = time.perf_counter()
             targets = [
-                _target_for_split_training(index, annotations, record)
+                _detach_boundary_value(_target_for_split_training(index, annotations, record))
                 for index, record in zip(batch_indices, records)
             ]
             _add_profile_time(
@@ -1328,89 +993,22 @@ def prepare_split_train_batches_once(
                 "target_construction_time",
                 time.perf_counter() - target_started,
             )
-
-            execution_boundaries = list(boundaries)
-            execution_targets = list(targets)
-            original_batch_size = len(batch_indices)
-            execution_batch_size = original_batch_size
-            is_padded = False
-            if execution_batch_size < runtime_min_batch:
-                pad_count = runtime_min_batch - execution_batch_size
-                execution_boundaries.extend([boundaries[-1]] * pad_count)
-                execution_targets.extend([targets[-1]] * pad_count)
-                execution_batch_size = runtime_min_batch
-                is_padded = True
-
-            execution_boundaries = [
-                _detach_boundary_payload(boundary)
-                for boundary in execution_boundaries
-            ]
-            execution_targets = [
-                _detach_boundary_value(target)
-                for target in execution_targets
-            ]
-
-            if move_to_device:
-                device_started = time.perf_counter()
-                execution_boundaries = [
-                    _boundary_payload_to_device(boundary, target_device)
-                    for boundary in execution_boundaries
-                ]
-                execution_targets = [
-                    _move_target_to_device(target, target_device)
-                    for target in execution_targets
-                ]
-                _add_profile_time(
-                    profile,
-                    "device_transfer_time",
-                    time.perf_counter() - device_started,
+            boundary = records[0].get("intermediate")
+            if not isinstance(boundary, BoundaryPayload):
+                raise RuntimeError("Split-tail training requires cached Ariadne boundary records.")
+            if int(boundary.batch_size) != len(batch_indices):
+                raise RuntimeError(
+                    "Cached Ariadne boundary batch size must match the training batch. "
+                    "Regenerate the cache with batched Ariadne prefix execution."
                 )
-
-            batching_started = time.perf_counter()
-            boundary = _combine_boundary_payload_batch(
-                execution_boundaries,
-                expected_batch_size=execution_batch_size,
-                device=None,
-            )
-            _add_profile_time(
-                profile,
-                "boundary_payload_batching_time",
-                time.perf_counter() - batching_started,
-            )
-
-            validated = False
-            if validate and _splitter_supports_preparation_validation(splitter):
-                validation_started = time.perf_counter()
-                boundary = prepare_validated_boundary_payload(
-                    ariadne_runtime,
-                    boundary,
-                    model_name=model_name,
-                    model_family=model_family,
-                )
-                _add_profile_time(
-                    profile,
-                    "validation_time",
-                    time.perf_counter() - validation_started,
-                )
-                validated = True
-
-            prepared_batches.append(
-                PreparedSplitTrainBatch(
-                    sample_ids=batch_indices,
-                    boundary=boundary,
-                    targets=execution_targets,
-                    is_padded=is_padded,
-                    original_batch_size=original_batch_size,
-                    validated=validated,
-                )
-            )
+            batches.append((batch_indices, boundary, targets))
     finally:
         _add_profile_time(
             profile,
             "training_batch_preparation_time",
             time.perf_counter() - prepare_started,
         )
-    return prepared_batches
+    return batches
 
 
 class _GradClippingOptimizer:
@@ -1607,16 +1205,12 @@ def universal_split_retrain(
         else max(1, total_epochs)
     )
     epoch_batch_size = max(1, int(batch_size))
-    prepared_batches = prepare_split_train_batches_once(
-        splitter=runtime,
+    prepared_batches = _load_cached_split_batches(
         cache_path=cache_path,
         all_indices=list(all_indices),
         annotations=annotations,
         batch_size=epoch_batch_size,
-        device=device,
         preloaded_records=preloaded_records,
-        move_to_device=True,
-        validate=_splitter_supports_preparation_validation(runtime),
         profile=retrain_profile,
     )
     if not prepared_batches:
@@ -1652,40 +1246,20 @@ def universal_split_retrain(
             epoch_started = time.perf_counter()
             data_load_time: list[float] = []
             train_process_time: list[float] = []
-            for batch_number, prepared_batch in enumerate(epoch_batches, 1):
+            for batch_number, (_batch_indices, boundary, targets) in enumerate(epoch_batches, 1):
                 data_load_time.append(0.0)
                 train_started = time.perf_counter()
-                if prepared_batch.validated and hasattr(runtime, "train_suffix_fast"):
-                    fast_profile: dict[str, float] = {}
-                    loss, _grads = runtime.train_suffix_fast(
-                        prepared_batch.boundary,
-                        prepared_batch.targets,
-                        loss_fn=loss_fn,
-                        optimizer=optimizer,
-                        profile=fast_profile,
-                    )
-                    _add_profile_time(
-                        retrain_profile,
-                        "suffix_forward_backward_time",
-                        float(fast_profile.get("suffix_forward_backward_time", 0.0)),
-                    )
-                    _add_profile_time(
-                        retrain_profile,
-                        "optimizer_step_time",
-                        float(fast_profile.get("optimizer_step_time", 0.0)),
-                    )
-                else:
-                    loss, _grads = runtime.train_suffix(
-                        prepared_batch.boundary,
-                        prepared_batch.targets,
-                        loss_fn=loss_fn,
-                        optimizer=optimizer,
-                    )
-                    _add_profile_time(
-                        retrain_profile,
-                        "suffix_forward_backward_time",
-                        time.perf_counter() - train_started,
-                    )
+                loss, _grads = runtime.train_suffix(
+                    boundary,
+                    targets,
+                    loss_fn=loss_fn,
+                    optimizer=optimizer,
+                )
+                _add_profile_time(
+                    retrain_profile,
+                    "suffix_forward_backward_time",
+                    time.perf_counter() - train_started,
+                )
                 train_process_time.append(time.perf_counter() - train_started)
                 loss_value = float(loss.detach().cpu().item())
                 epoch_losses.append(loss_value)
@@ -1732,7 +1306,6 @@ __all__ = [
     "CandidateProfile",
     "LayerInfo",
     "LayerProfile",
-    "PreparedSplitTrainBatch",
     "SplitCandidate",
     "SplitCandidateSelector",
     "SplitPointSelector",
@@ -1749,7 +1322,6 @@ __all__ = [
     "load_split_feature_cache",
     "log_split_retrain_profile",
     "reconstruct_candidate_from_descriptor",
-    "prepare_split_train_batches_once",
     "save_split_feature_cache",
     "serialize_boundary_payload",
     "universal_split_retrain",

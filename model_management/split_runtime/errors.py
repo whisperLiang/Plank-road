@@ -13,10 +13,6 @@ class BatchPrefixError(SplitRuntimeError):
     """Raised when Ariadne prefix execution fails for a batch."""
 
 
-class BoundaryPayloadValidationError(SplitRuntimeError):
-    """Raised when an Ariadne boundary payload fails runtime validation."""
-
-
 class BatchSuffixReplayError(SplitRuntimeError):
     """Raised when Ariadne suffix replay fails for a batch."""
 

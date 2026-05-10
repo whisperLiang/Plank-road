@@ -238,7 +238,7 @@ def test_collect_teacher_annotations_keeps_request_level_batching(tmp_path, monk
     monkeypatch.setattr(
         learner,
         "_teacher_inference",
-        lambda _frame: pytest.fail("Expected batched teacher inference, not per-image fallback."),
+        lambda _frame: pytest.fail("Expected batched teacher inference, not per-image retry."),
     )
 
     annotations = learner._collect_teacher_annotations(str(frame_dir), ["0", "1", "2"])
@@ -247,7 +247,7 @@ def test_collect_teacher_annotations_keeps_request_level_batching(tmp_path, monk
     assert sorted(annotations) == ["0", "1", "2"]
 
 
-def test_collect_teacher_annotations_rejects_invalid_batch_without_single_fallback(
+def test_collect_teacher_annotations_rejects_invalid_batch_without_per_image_retry(
     tmp_path,
     monkeypatch,
 ):
@@ -259,14 +259,14 @@ def test_collect_teacher_annotations_rejects_invalid_batch_without_single_fallba
     monkeypatch.setattr(
         learner,
         "_teacher_inference",
-        lambda _frame: pytest.fail("Expected batch-level failure, not per-image fallback."),
+        lambda _frame: pytest.fail("Expected batch-level failure, not per-image retry."),
     )
 
     with pytest.raises(RuntimeError, match="invalid result count"):
         learner._collect_teacher_annotations(str(frame_dir), ["0", "1"])
 
 
-def test_collect_teacher_annotations_requires_batch_teacher_without_single_fallback(
+def test_collect_teacher_annotations_requires_batch_teacher_without_per_image_retry(
     tmp_path,
     monkeypatch,
 ):
@@ -275,7 +275,7 @@ def test_collect_teacher_annotations_requires_batch_teacher_without_single_fallb
     _write_frames(frame_dir, ["0", "1"])
     learner.large_od = SimpleNamespace(
         large_inference=lambda _frame, **_kwargs: pytest.fail(
-            "Expected missing batch inference to fail, not run single-sample inference."
+            "Expected missing batch inference to fail, not run per-image inference."
         )
     )
 

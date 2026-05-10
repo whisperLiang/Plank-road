@@ -60,7 +60,6 @@ from model_management.split_model_adapters import (
 from model_management.universal_model_split import (
     SplitRetrainProfile,
     UniversalModelSplitter,
-    _combine_boundary_payload_batch,
     build_split_retrain_optimizer,
     log_split_retrain_profile,
     universal_split_retrain,
@@ -1224,36 +1223,15 @@ def _build_detection_proxy_prediction_cache(
                     _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
                     actual_batch_size,
                 )
-                execution_payloads = list(batch_payloads)
-                if len(execution_payloads) < execution_batch_size:
-                    execution_payloads.extend(
-                        [execution_payloads[-1]]
-                        * (execution_batch_size - len(execution_payloads))
-                    )
                 batched_payload = batch_payloads[0]
                 if not isinstance(batched_payload, BoundaryPayload):
                     raise RuntimeError(
                         "Cached split proxy evaluation requires Ariadne BoundaryPayload records."
                     )
                 if int(getattr(batched_payload, "batch_size", 0)) != execution_batch_size:
-                    if not all(
-                        isinstance(payload, BoundaryPayload)
-                        and bool(getattr(payload, "schema", None))
-                        for payload in execution_payloads
-                    ):
-                        raise RuntimeError(
-                            "Cached split proxy evaluation received per-sample payloads. "
-                            "Plank-road no longer guesses batched cat/stack payloads without Ariadne schema."
-                        )
-                    batched_payload = _combine_boundary_payload_batch(
-                        execution_payloads,
-                        expected_batch_size=execution_batch_size,
-                        device=device,
-                    )
-                if int(getattr(batched_payload, "batch_size", 0)) != execution_batch_size:
                     raise RuntimeError(
                         "Cached split proxy evaluation received per-sample payloads. "
-                        "Plank-road no longer guesses batched cat/stack payloads without Ariadne schema."
+                        "Regenerate the cache with batched Ariadne prefix execution."
                     )
                 raw_outputs = splitter.cloud_forward(
                     batched_payload,
@@ -2927,7 +2905,7 @@ class CloudContinualLearner:
         if batch_inference is None:
             raise RuntimeError(
                 "Teacher annotation requires large_inference_batch; "
-                "single-sample inference fallback is disabled."
+                "per-image retry is disabled."
             )
         try:
             return batch_inference(

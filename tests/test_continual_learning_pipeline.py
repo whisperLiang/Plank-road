@@ -33,10 +33,8 @@ from model_management.payload import BoundaryPayload, SplitPayload, boundary_pay
 from model_management.split_candidate import SplitCandidate
 from model_management.universal_model_split import (
     UniversalModelSplitter,
-    _combine_boundary_payload_batch,
     build_split_retrain_optimizer,
     load_split_feature_cache,
-    prepare_split_train_batches_once,
     save_split_feature_cache,
     universal_split_retrain,
 )
@@ -702,22 +700,16 @@ def test_sample_store_stats_are_incremental_and_recovered(tmp_path, sample_bgr_f
     assert recovered.stats() == stats
 
 
-def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
+def test_split_retrain_uses_batched_ariadne_boundary_payloads(tmp_path):
     cache_path = str(tmp_path / "cache")
-    first = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0, 2.0]])},
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
         split_id="after:node_1",
         graph_signature="graph-sig",
-        passthrough_inputs={"input": torch.ones(1, 3)},
+        passthrough_inputs={"input": torch.stack([torch.ones(3), torch.full((3,), 2.0)])},
     )
-    second = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[3.0, 4.0]])},
-        split_id="after:node_1",
-        graph_signature="graph-sig",
-        passthrough_inputs={"input": torch.full((1, 3), 2.0)},
-    )
-    save_split_feature_cache(cache_path, "s1", first)
-    save_split_feature_cache(cache_path, "s2", second)
+    save_split_feature_cache(cache_path, "s1", payload)
+    save_split_feature_cache(cache_path, "s2", payload)
 
     class DummySplitter:
         def __init__(self):
@@ -747,35 +739,6 @@ def test_split_retrain_batches_single_sample_boundary_payloads(tmp_path):
     assert splitter.seen_boundary is not None
 
 
-def test_boundary_payload_batch_rejects_mismatched_candidate_cache_records():
-    first = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0, 2.0]])},
-        split_id="after:node_1",
-        graph_signature="graph-sig",
-    )
-    different_label = boundary_payload_from_tensors(
-        {"node_99": torch.tensor([[3.0, 4.0]])},
-        split_id="after:node_1",
-        graph_signature="graph-sig",
-    )
-    different_graph = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[3.0, 4.0]])},
-        split_id="after:node_1",
-        graph_signature="other-graph-sig",
-    )
-
-    with pytest.raises(RuntimeError, match="different tensor labels"):
-        _combine_boundary_payload_batch(
-            [first, different_label],
-            expected_batch_size=2,
-        )
-    with pytest.raises(RuntimeError, match="different graph signatures"):
-        _combine_boundary_payload_batch(
-            [first, different_graph],
-            expected_batch_size=2,
-        )
-
-
 def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
     tmp_path,
     monkeypatch,
@@ -783,12 +746,12 @@ def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
     cache_path = str(tmp_path / "cache")
     preloaded_records = {}
     sample_ids = [f"s{index}" for index in range(16)]
-    for index, sample_id in enumerate(sample_ids):
-        payload = boundary_payload_from_tensors(
-            {"node_1": torch.tensor([[float(index)]])},
-            split_id="after:node_1",
-            graph_signature="graph-sig",
-        )
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.arange(16, dtype=torch.float32).reshape(16, 1)},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    for sample_id in sample_ids:
         preloaded_records[sample_id] = save_split_feature_cache(
             cache_path,
             sample_id,
@@ -842,9 +805,8 @@ def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
     assert splitter.seen_batch_sizes == [16]
 
 
-def test_split_retrain_prepares_batches_once_and_reuses_across_epochs(
+def test_split_retrain_loads_cached_batches_once_and_reuses_across_epochs(
     tmp_path,
-    monkeypatch,
 ):
     cache_path = str(tmp_path / "cache")
     payload = boundary_payload_from_tensors(
@@ -853,21 +815,6 @@ def test_split_retrain_prepares_batches_once_and_reuses_across_epochs(
         graph_signature="graph-sig",
     )
     preloaded_records = {"s1": {"intermediate": payload}}
-    combine_calls = 0
-    original_combine = __import__(
-        "model_management.universal_model_split",
-        fromlist=["_combine_boundary_payload_batch"],
-    )._combine_boundary_payload_batch
-
-    def counting_combine(*args, **kwargs):
-        nonlocal combine_calls
-        combine_calls += 1
-        return original_combine(*args, **kwargs)
-
-    monkeypatch.setattr(
-        "model_management.universal_model_split._combine_boundary_payload_batch",
-        counting_combine,
-    )
 
     class DummySplitter:
         def __init__(self):
@@ -893,11 +840,10 @@ def test_split_retrain_prepares_batches_once_and_reuses_across_epochs(
     )
 
     assert losses == [0.5, 0.5, 0.5]
-    assert combine_calls == 1
     assert len(set(splitter.boundary_ids)) == 1
 
 
-def test_prepare_split_train_batches_once_prefers_preloaded_records(
+def test_split_retrain_prefers_preloaded_records(
     tmp_path,
     monkeypatch,
 ):
@@ -914,98 +860,38 @@ def test_prepare_split_train_batches_once_prefers_preloaded_records(
     )
 
     class DummySplitter:
-        pass
-
-    batches = prepare_split_train_batches_once(
-        splitter=DummySplitter(),
-        cache_path=str(tmp_path / "cache"),
-        all_indices=["s1"],
-        annotations={},
-        batch_size=1,
-        device="cpu",
-        preloaded_records=preloaded_records,
-        validate=False,
-    )
-
-    assert len(batches) == 1
-    assert batches[0].sample_ids == ["s1"]
-    assert batches[0].boundary.tensors["node_1"].tolist() == [[2.0]]
-
-
-def test_split_retrain_fast_path_validates_once_not_every_epoch(tmp_path):
-    payload = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0]])},
-        split_id="after:node_1",
-        graph_signature="graph-sig",
-    )
-    preloaded_records = {"s1": {"intermediate": payload}}
-
-    class Runtime:
-        split_id = "after:node_1"
-        graph_signature = "graph-sig"
-        candidate = SimpleNamespace(boundary_schema={})
-        trace_plan = None
-
         def __init__(self):
-            self.validation_calls = 0
+            self.boundary = None
 
-        def validate_boundary(self, boundary):
-            del boundary
-            self.validation_calls += 1
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del targets, loss_fn, optimizer
+            self.boundary = boundary
+            return torch.tensor(0.5), {}
 
-        def run_suffix(self, boundary):
-            return next(iter(boundary.tensors.values()))
-
-    class FastSplitter:
-        split_spec = None
-        model_name = "toy"
-        model_family = "yolo"
-
-        def __init__(self):
-            self.runtime = Runtime()
-            self.fast_calls = 0
-
-        def _ensure_runtime(self):
-            return self.runtime
-
-        def train_suffix_fast(self, boundary, targets, *, loss_fn, optimizer, profile):
-            del boundary, targets, loss_fn, optimizer
-            self.fast_calls += 1
-            profile["suffix_forward_backward_time"] = profile.get(
-                "suffix_forward_backward_time",
-                0.0,
-            )
-            return torch.tensor(0.25), {}
-
-        def train_suffix(self, *args, **kwargs):
-            raise AssertionError("validated batches should use the fast path")
-
-    splitter = FastSplitter()
+    splitter = DummySplitter()
     losses = universal_split_retrain(
         model=torch.nn.Linear(1, 1),
         sample_input=torch.ones(1, 1),
         cache_path=str(tmp_path / "cache"),
         all_indices=["s1"],
         gt_annotations={},
-        loss_fn=lambda outputs, targets: torch.tensor(0.25),
+        loss_fn=lambda outputs, targets: torch.tensor(0.5),
         splitter=splitter,
         batch_size=1,
-        num_epoch=3,
         preloaded_records=preloaded_records,
     )
 
-    assert losses == [0.25, 0.25, 0.25]
-    assert splitter.fast_calls == 3
-    assert splitter.runtime.validation_calls == 1
+    assert losses == [0.5]
+    assert splitter.boundary is payload
 
 
 def test_split_retrain_detaches_prepared_boundary_graph_for_reuse(tmp_path):
     base = torch.ones(1, 1, requires_grad=True)
     payload = boundary_payload_from_tensors(
-        {"node_1": base * 2.0},
+        {"node_1": (base * 2.0).detach()},
         split_id="after:node_1",
         graph_signature="graph-sig",
-        passthrough_inputs={"input": base * 3.0},
+        passthrough_inputs={"input": (base * 3.0).detach()},
     )
     preloaded_records = {"s1": {"intermediate": payload}}
     model = torch.nn.Linear(1, 1, bias=False)
@@ -1025,6 +911,14 @@ def test_split_retrain_detaches_prepared_boundary_graph_for_reuse(tmp_path):
 
         def run_suffix(self, boundary):
             return self.tail(boundary.tensors["node_1"])
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del targets, optimizer
+            output = self.run_suffix(boundary)
+            loss = loss_fn(output, None)
+            if loss.requires_grad:
+                loss.backward()
+            return loss, {}
 
     splitter = UniversalModelSplitter()
     splitter.runtime = Runtime(model)
@@ -1221,7 +1115,7 @@ def test_split_retrain_raises_when_no_trainable_parameters(tmp_path):
         )
 
 
-def test_split_retrain_moves_mixed_preloaded_boundary_devices_to_training_device(
+def test_split_retrain_rejects_per_sample_cached_boundaries(
     tmp_path,
 ):
     cpu_payload = boundary_payload_from_tensors(
@@ -1241,38 +1135,22 @@ def test_split_retrain_moves_mixed_preloaded_boundary_devices_to_training_device
         "device-sample": {"intermediate": device_payload},
     }
 
-    class DummySplitter:
-        def __init__(self):
-            self.seen_boundary = None
-
-        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
-            self.seen_boundary = boundary
-            assert boundary.batch_size == 2
-            assert boundary.tensors["node_1"].shape == (2, 2)
-            assert boundary.tensors["node_1"].device.type == "meta"
-            assert boundary.passthrough_inputs["input"].shape == (2, 3)
-            assert boundary.passthrough_inputs["input"].device.type == "meta"
-            return torch.tensor(0.5), {}
-
-    splitter = DummySplitter()
-    losses = universal_split_retrain(
-        model=torch.nn.Module(),
-        sample_input=torch.ones(1, 1),
-        cache_path=str(tmp_path / "cache"),
-        all_indices=["cpu-sample", "device-sample"],
-        gt_annotations={},
-        device=torch.device("meta"),
-        loss_fn=lambda outputs, targets: torch.tensor(0.5),
-        splitter=splitter,
-        batch_size=2,
-        preloaded_records=preloaded_records,
-    )
-
-    assert losses == [0.5]
-    assert splitter.seen_boundary is not None
+    with pytest.raises(RuntimeError, match="batched Ariadne prefix execution"):
+        universal_split_retrain(
+            model=torch.nn.Module(),
+            sample_input=torch.ones(1, 1),
+            cache_path=str(tmp_path / "cache"),
+            all_indices=["cpu-sample", "device-sample"],
+            gt_annotations={},
+            device=torch.device("meta"),
+            loss_fn=lambda outputs, targets: torch.tensor(0.5),
+            splitter=SimpleNamespace(train_suffix=lambda *args, **kwargs: None),
+            batch_size=2,
+            preloaded_records=preloaded_records,
+        )
 
 
-def test_split_retrain_uses_cached_pseudo_targets_and_pads_singleton_dynamic_batch(
+def test_split_retrain_uses_cached_pseudo_targets_without_padding_singleton_batch(
     tmp_path,
 ):
     cache_path = str(tmp_path / "cache")
@@ -1303,13 +1181,12 @@ def test_split_retrain_uses_cached_pseudo_targets_and_pads_singleton_dynamic_bat
         def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
             self.seen_boundary = boundary
             self.seen_targets = targets
-            assert boundary.batch_size == 2
-            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0], [1.0, 2.0]]
-            assert len(targets) == 2
+            assert boundary.batch_size == 1
+            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0]]
+            assert len(targets) == 1
             assert targets[0]["boxes"] == [[1.0, 2.0, 3.0, 4.0]]
             assert targets[0]["labels"] == [1]
             assert targets[0]["_split_meta"]["input_tensor_shape"] == [1, 3, 8, 16]
-            assert targets[1] == targets[0]
             return torch.tensor(0.5), {}
 
     splitter = DynamicBatchSplitter()
@@ -1744,20 +1621,15 @@ def test_split_retrain_honors_optimizer_overrides(tmp_path):
 
 def test_split_retrain_attaches_cache_metadata_to_targets(tmp_path):
     cache_path = str(tmp_path / "cache")
-    first = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0, 2.0]])},
-        split_id="after:node_1",
-        graph_signature="graph-sig",
-    )
-    second = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[3.0, 4.0]])},
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
         split_id="after:node_1",
         graph_signature="graph-sig",
     )
     save_split_feature_cache(
         cache_path,
         "s1",
-        first,
+        payload,
         extra_metadata={
             "input_image_size": [1080, 1920],
             "input_tensor_shape": [1, 3, 384, 384],
@@ -1767,7 +1639,7 @@ def test_split_retrain_attaches_cache_metadata_to_targets(tmp_path):
     save_split_feature_cache(
         cache_path,
         "s2",
-        second,
+        payload,
         extra_metadata={
             "input_image_size": [720, 1280],
             "input_tensor_shape": [1, 3, 384, 384],
@@ -1810,20 +1682,14 @@ def test_cached_split_proxy_eval_batches_schema_payloads(tmp_path):
     from cloud_server import _build_detection_proxy_prediction_cache
 
     cache_path = str(tmp_path / "cache")
-    first = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0, 2.0]])},
+    payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
         split_id="after:node_1",
         graph_signature="graph-sig",
-        passthrough_inputs={"input": torch.ones(1, 3)},
+        passthrough_inputs={"input": torch.stack([torch.ones(3), torch.full((3,), 2.0)])},
     )
-    second = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[3.0, 4.0]])},
-        split_id="after:node_1",
-        graph_signature="graph-sig",
-        passthrough_inputs={"input": torch.full((1, 3), 2.0)},
-    )
-    save_split_feature_cache(cache_path, "s1", first)
-    save_split_feature_cache(cache_path, "s2", second)
+    save_split_feature_cache(cache_path, "s1", payload)
+    save_split_feature_cache(cache_path, "s2", payload)
 
     class DummySplitter:
         def __init__(self):
@@ -1870,7 +1736,7 @@ def test_cached_split_proxy_eval_batches_schema_payloads(tmp_path):
     assert prediction_cache["prediction_rows"][0][2]["scores"] == pytest.approx([0.9])
 
 
-def test_cached_split_proxy_eval_pads_singleton_dynamic_batch(tmp_path):
+def test_cached_split_proxy_eval_rejects_singleton_cached_boundary(tmp_path):
     from cloud_server import _build_detection_proxy_prediction_cache
 
     cache_path = str(tmp_path / "cache")
@@ -1882,48 +1748,21 @@ def test_cached_split_proxy_eval_pads_singleton_dynamic_batch(tmp_path):
     )
     save_split_feature_cache(cache_path, "s1", payload)
 
-    class DummySplitter:
-        def __init__(self):
-            self.seen_boundary = None
-
-        def cloud_forward(self, boundary, *, candidate=None):
-            self.seen_boundary = boundary
-            assert candidate == "candidate-1"
-            assert boundary.batch_size == 2
-            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0], [1.0, 2.0]]
-            assert boundary.passthrough_inputs["input"].shape == (2, 3)
-            return [
-                {
-                    "boxes": torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
-                    "labels": torch.tensor([1]),
-                    "scores": torch.tensor([0.9]),
-                },
-                {
-                    "boxes": torch.tensor([[2.0, 2.0, 3.0, 3.0]]),
-                    "labels": torch.tensor([2]),
-                    "scores": torch.tensor([0.8]),
-                },
-            ]
-
-    splitter = DummySplitter()
-    prediction_cache = _build_detection_proxy_prediction_cache(
-        torch.nn.Identity(),
-        frame_dir=str(tmp_path),
-        gt_annotations={
-            "s1": {"boxes": [[0.0, 0.0, 1.0, 1.0]], "labels": [1]},
-        },
-        device=torch.device("cpu"),
-        threshold_low=0.1,
-        model_name="rfdetr_nano",
-        inference_batch_size=16,
-        split_cache_path=cache_path,
-        splitter=splitter,
-        split_candidate="candidate-1",
-    )
-
-    assert splitter.seen_boundary is not None
-    assert len(prediction_cache["prediction_rows"]) == 1
-    assert prediction_cache["prediction_rows"][0][2]["scores"] == pytest.approx([0.9])
+    with pytest.raises(RuntimeError, match="batched Ariadne prefix execution"):
+        _build_detection_proxy_prediction_cache(
+            torch.nn.Identity(),
+            frame_dir=str(tmp_path),
+            gt_annotations={
+                "s1": {"boxes": [[0.0, 0.0, 1.0, 1.0]], "labels": [1]},
+            },
+            device=torch.device("cpu"),
+            threshold_low=0.1,
+            model_name="rfdetr_nano",
+            inference_batch_size=16,
+            split_cache_path=cache_path,
+            splitter=SimpleNamespace(cloud_forward=lambda *args, **kwargs: None),
+            split_candidate="candidate-1",
+        )
 
 
 def test_working_cache_manifest_fingerprint_matches_current_bundle():

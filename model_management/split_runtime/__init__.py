@@ -4,12 +4,20 @@ from typing import Any
 
 import torch
 
+from .ariadne_adapter import (
+    SplitRuntimeConfig,
+    build_replay_runtime,
+    build_split_runtime,
+    get_split_runtime_metadata,
+    maybe_warmup_runtime,
+)
 from .ariadne_runtime import (
     ARIADNE_RUNTIME_ADAPTER_VERSION,
     BoundaryPayload,
     SplitRuntime,
     SplitSpec,
     make_split_spec,
+    prepare_split_replay_runtime,
     prepare_split_runtime,
 )
 from .detection_adapters import (
@@ -20,7 +28,6 @@ from .detection_adapters import (
 from .errors import (
     BatchPrefixError,
     BatchSuffixReplayError,
-    BoundaryPayloadValidationError,
     InvalidOutputStructureError,
     MissingLossFunctionError,
     SplitRuntimeError,
@@ -37,14 +44,6 @@ from .template import (
     bind_request_runtime_from_template,
     fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
-)
-from .validators import (
-    prepare_validated_boundary_payload,
-    run_batch_prefix,
-    run_batch_suffix,
-    train_batch_suffix,
-    train_batch_suffix_fast,
-    validate_boundary_payload,
 )
 
 
@@ -113,7 +112,6 @@ __all__ = [
     "BatchPrefixError",
     "BatchSuffixReplayError",
     "BoundaryPayload",
-    "BoundaryPayloadValidationError",
     "DetectionSplitAdapter",
     "FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION",
     "FixedSplitRuntimeTemplate",
@@ -125,24 +123,24 @@ __all__ = [
     "PlankDetectionSplitAdapter",
     "RuntimeCache",
     "RuntimeCacheKey",
+    "SplitRuntimeConfig",
     "SplitRuntime",
     "SplitRuntimeError",
     "SplitSpec",
     "SplitTailTrainingError",
     "UnsupportedModelAdapterError",
     "bind_request_runtime_from_template",
+    "build_replay_runtime",
+    "build_split_runtime",
     "compare_outputs",
     "fixed_split_runtime_template_key",
     "get_fixed_split_runtime_template_cache",
+    "get_split_runtime_metadata",
     "make_runtime_cache_key",
     "make_split_spec",
     "prepare_split_runtime",
-    "prepare_validated_boundary_payload",
+    "prepare_split_replay_runtime",
     "reduce_output_to_loss",
-    "run_batch_prefix",
-    "run_batch_suffix",
     "select_detection_adapter",
-    "train_batch_suffix",
-    "train_batch_suffix_fast",
-    "validate_boundary_payload",
+    "maybe_warmup_runtime",
 ]
