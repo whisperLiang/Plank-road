@@ -1168,13 +1168,108 @@ def _proxy_boundary_batch(
                 )
             pieces.append(tensor)
         batched_tensors[label] = torch.cat(pieces, dim=0)
+    passthrough_groups: list[Mapping[str, object]] = []
+    for record in records:
+        intermediate = record.get("intermediate")
+        if isinstance(intermediate, BoundaryPayload):
+            passthrough_groups.append(dict(intermediate.passthrough_inputs or {}))
+        else:
+            passthrough_groups.append({})
+    batched_passthrough: dict[str, object] = {}
+    for key in list(passthrough_groups[0].keys()) if passthrough_groups else []:
+        pieces = []
+        for passthrough in passthrough_groups:
+            value = passthrough.get(key)
+            if not isinstance(value, torch.Tensor):
+                pieces = []
+                break
+            if value.ndim == 0 or int(value.shape[0]) != 1:
+                pieces = []
+                break
+            pieces.append(value)
+        if pieces:
+            batched_passthrough[str(key)] = torch.cat(pieces, dim=0)
     runtime = getattr(splitter, "runtime", splitter)
     return boundary_payload_from_tensors(
         batched_tensors,
         split_id=str(getattr(runtime, "split_id", "") or "split-tail"),
         graph_signature=str(getattr(runtime, "graph_signature", "") or "split-runtime"),
         batch_size=len(records),
+        passthrough_inputs=batched_passthrough,
     )
+
+
+def _splitter_dynamic_batch_range(
+    splitter: object | None,
+) -> tuple[int, int] | None:
+    sources = [
+        getattr(splitter, "split_spec", None),
+        getattr(getattr(splitter, "runtime", None), "split_spec", None),
+    ]
+    for split_spec in sources:
+        dynamic_batch = getattr(split_spec, "dynamic_batch", None)
+        if dynamic_batch is None:
+            continue
+        try:
+            lower, upper = list(dynamic_batch)[:2]
+            lower_int = max(1, int(lower))
+            upper_int = max(lower_int, int(upper))
+        except (TypeError, ValueError):
+            continue
+        return lower_int, upper_int
+    return None
+
+
+def _splitter_dynamic_batch_min(splitter: object | None) -> int:
+    dynamic_batch = _splitter_dynamic_batch_range(splitter)
+    return int(dynamic_batch[0]) if dynamic_batch is not None else 1
+
+
+def _runtime_batch_spans(
+    total_count: int,
+    *,
+    preferred_batch_size: int,
+    dynamic_batch_min: int = 1,
+    dynamic_batch_max: int | None = None,
+) -> list[tuple[int, int]]:
+    total = max(0, int(total_count))
+    if total == 0:
+        return []
+    batch_min = max(1, int(dynamic_batch_min))
+    batch_max = max(batch_min, int(dynamic_batch_max or preferred_batch_size or batch_min))
+    preferred = min(batch_max, max(batch_min, int(preferred_batch_size or batch_min)))
+    if total < batch_min:
+        raise RuntimeError(
+            "Not enough compatible samples for dynamic batch runtime: "
+            f"active_samples={total}, required_min={batch_min}."
+        )
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < total:
+        remaining = total - start
+        actual = min(remaining, preferred)
+        leftover = remaining - actual
+        if 0 < leftover < batch_min:
+            needed = batch_min - leftover
+            if actual - needed >= batch_min:
+                actual -= needed
+            elif actual + leftover <= batch_max:
+                actual += leftover
+            else:
+                raise RuntimeError(
+                    "Cannot form a valid dynamic batch runtime group: "
+                    f"remaining={remaining}, preferred={preferred}, "
+                    f"dynamic_batch=[{batch_min}, {batch_max}]."
+                )
+        if actual < batch_min:
+            raise RuntimeError(
+                "Not enough compatible samples for dynamic batch runtime: "
+                f"active_samples={actual}, required_min={batch_min}."
+            )
+        spans.append((start, start + actual))
+        start += actual
+    return spans
 
 
 def _build_detection_proxy_prediction_cache(
@@ -1247,16 +1342,48 @@ def _build_detection_proxy_prediction_cache(
 
         prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
         _set_detection_model_eval_mode(model)
+        dynamic_batch = _splitter_dynamic_batch_range(splitter) or _FIXED_SPLIT_DYNAMIC_BATCH
+        dynamic_batch_min = int(dynamic_batch[0]) if dynamic_batch is not None else 1
+        dynamic_batch_max = int(dynamic_batch[1]) if dynamic_batch is not None else None
+        preferred_batch_size = max(1, int(inference_batch_size))
+
+        def _execution_batch(
+            batch: list[
+                tuple[
+                    list[object],
+                    list[object],
+                    Mapping[str, object],
+                    Mapping[str, object] | None,
+                ]
+            ],
+        ) -> list[
+            tuple[
+                list[object],
+                list[object],
+                Mapping[str, object],
+                Mapping[str, object] | None,
+            ]
+        ]:
+            execution = list(batch)
+            if execution and len(execution) < dynamic_batch_min:
+                execution.extend([execution[-1]] * (dynamic_batch_min - len(execution)))
+            return execution
+
         with torch.no_grad():
-            start = 0
-            while start < len(pending_samples):
-                actual_batch_size = min(
-                    len(pending_samples) - start,
-                    max(1, int(inference_batch_size)),
+            if pending_samples and len(pending_samples) < dynamic_batch_min:
+                spans = [(0, len(pending_samples))]
+            else:
+                spans = _runtime_batch_spans(
+                    len(pending_samples),
+                    preferred_batch_size=preferred_batch_size,
+                    dynamic_batch_min=dynamic_batch_min,
+                    dynamic_batch_max=dynamic_batch_max,
                 )
-                batch = pending_samples[start : start + actual_batch_size]
+            for start, stop in spans:
+                batch = pending_samples[start:stop]
+                execution_batch = _execution_batch(batch)
                 batched_payload = _proxy_boundary_batch(
-                    [record for _, _, record, _ in batch],
+                    [record for _, _, record, _ in execution_batch],
                     splitter=splitter,
                 )
                 execution_batch_size = int(batched_payload.batch_size)
@@ -1270,7 +1397,7 @@ def _build_detection_proxy_prediction_cache(
                     model_name=model_name,
                     batch_metadata=[
                         metadata
-                        for _, _, _, metadata in batch
+                        for _, _, _, metadata in execution_batch
                     ],
                     threshold_low=threshold_low,
                     device=device,
@@ -1287,7 +1414,6 @@ def _build_detection_proxy_prediction_cache(
                     low_threshold_predictions,
                 ):
                     prediction_rows.append((gt_boxes, gt_labels, prediction))
-                start += actual_batch_size
 
         return {
             "prediction_rows": prediction_rows,
@@ -2043,17 +2169,12 @@ class CloudContinualLearner:
                 tensors[str(label)] = tensor[:1].detach().cpu()
         return tensors or None
 
-    def _get_or_create_split_runtime_contract(
+    def _load_split_runtime_contract(
         self,
         *,
         edge_id: int | str,
         manifest: Mapping[str, object],
-        feature_tensors: Mapping[str, torch.Tensor] | None = None,
-        model: torch.nn.Module | None = None,
-        splitter: UniversalModelSplitter | None = None,
-        candidate: object | None = None,
-        bundle_root: str | None = None,
-    ) -> SplitRuntimeContract:
+    ) -> SplitRuntimeContract | None:
         context = self._sample_pool_manifest_context(manifest)
         model_id = str(context.get("model_id") or self.edge_model_name)
         split_config_id = str(context.get("split_config_id") or "").strip()
@@ -2065,20 +2186,102 @@ class CloudContinualLearner:
             model_id=model_id,
             split_config_id=split_config_id,
         )
+        if existing is None:
+            return None
+        canonical_from_context = str(context.get("canonical_split_key") or "").strip()
+        if canonical_from_context and canonical_from_context != existing.canonical_split_key:
+            raise RuntimeError(
+                "SplitRuntimeContract mismatch for canonical_split_key: "
+                f"existing={existing.canonical_split_key!r}, incoming={canonical_from_context!r}."
+            )
+        front_from_context = str(context.get("front_version") or "0")
+        if front_from_context != existing.front_version:
+            raise RuntimeError(
+                "SplitRuntimeContract mismatch for front_version: "
+                f"existing={existing.front_version!r}, incoming={front_from_context!r}."
+            )
+        return existing
+
+    @staticmethod
+    def _candidate_cloud_batch_split_id(
+        *,
+        splitter: UniversalModelSplitter,
+        candidate: object | None,
+        canonical_split_key: str,
+    ) -> str:
+        runtime = getattr(splitter, "runtime", None)
+        return str(
+            getattr(candidate, "candidate_id", None)
+            or getattr(candidate, "split_id", None)
+            or getattr(runtime, "split_id", "")
+            or canonical_split_key
+        )
+
+    def _get_or_create_split_runtime_contract(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+        feature_tensors: Mapping[str, torch.Tensor] | None = None,
+        model: torch.nn.Module | None = None,
+        splitter: UniversalModelSplitter | None = None,
+        candidate: object | None = None,
+        bundle_root: str | None = None,
+        create_if_missing: bool = False,
+    ) -> SplitRuntimeContract:
+        context = self._sample_pool_manifest_context(manifest)
+        model_id = str(context.get("model_id") or self.edge_model_name)
+        split_config_id = str(context.get("split_config_id") or "").strip()
+        if not split_config_id:
+            raise RuntimeError("SplitRuntimeContract requires split_config_id.")
+        existing = self._load_split_runtime_contract(edge_id=edge_id, manifest=manifest)
         if existing is not None:
-            canonical_from_context = str(context.get("canonical_split_key") or "").strip()
-            if canonical_from_context and canonical_from_context != existing.canonical_split_key:
-                raise RuntimeError(
-                    "SplitRuntimeContract mismatch for canonical_split_key: "
-                    f"existing={existing.canonical_split_key!r}, incoming={canonical_from_context!r}."
+            if create_if_missing and splitter is not None and candidate is not None:
+                runtime_split_id = self._candidate_cloud_batch_split_id(
+                    splitter=splitter,
+                    candidate=candidate,
+                    canonical_split_key=existing.canonical_split_key,
                 )
-            front_from_context = str(context.get("front_version") or "0")
-            if front_from_context != existing.front_version:
-                raise RuntimeError(
-                    "SplitRuntimeContract mismatch for front_version: "
-                    f"existing={existing.front_version!r}, incoming={front_from_context!r}."
+                if runtime_split_id != existing.cloud_batch_split_id:
+                    raise RuntimeError(
+                        "SplitRuntimeContract mismatch for cloud_batch_split_id: "
+                        f"existing={existing.cloud_batch_split_id!r}, "
+                        f"training_runtime={runtime_split_id!r}."
+                    )
+                layout_tensors = self._contract_layout_tensors_from_runtime(
+                    splitter=splitter,
+                    candidate=candidate,
+                    input_tensor_shape=[
+                        int(dim)
+                        for dim in list(context.get("input_tensor_shape", []) or [])
+                    ],
                 )
+                if (
+                    layout_tensors is not None
+                    and feature_layout_from_tensors(layout_tensors) != existing.feature_layout
+                ):
+                    raise RuntimeError(
+                        "SplitRuntimeContract feature layout does not match the "
+                        "training runtime boundary layout. Clear stale split_contracts "
+                        "or bump front_version before retraining."
+                    )
             return existing
+
+        if not create_if_missing:
+            raise RuntimeError(
+                "SplitRuntimeContract is not ready for this split_config_id; "
+                "wait for a continual learning training job to create it."
+            )
+        front_version = str(context.get("front_version") or "0")
+        bundle_model_version = str(
+            dict(manifest.get("model", {}) or {}).get("model_version", "0") or "0"
+        )
+        if front_version == "0" and bundle_model_version != "0":
+            raise RuntimeError(
+                "SplitRuntimeContract for front_version=0 must be created from "
+                "native pretrained model_version=0, not tail checkpoint "
+                f"model_version={bundle_model_version}."
+            )
 
         canonical_split_key = str(context.get("canonical_split_key") or "").strip()
         if not canonical_split_key:
@@ -2090,33 +2293,10 @@ class CloudContinualLearner:
             raise RuntimeError(
                 "SplitRuntimeContract creation requires a representative feature tensor."
             )
-        if splitter is None:
-            if model is None:
-                model = self._load_edge_training_model(
-                    model_name=model_id,
-                    edge_id=edge_id,
-                    cache_policy="auto",
-                )
-            manifest_for_runtime = dict(manifest)
-            if not isinstance(manifest_for_runtime.get("split_plan"), Mapping):
-                manifest_for_runtime["split_plan"] = {
-                    "split_config_id": split_config_id,
-                    "canonical_split_key": canonical_split_key,
-                    "edge_split_id": context.get("edge_split_id") or canonical_split_key,
-                    "input_tensor_shape": list(context.get("input_tensor_shape", []) or []),
-                    "input_resize_mode": str(
-                        context.get("input_resize_mode") or "direct_resize"
-                    ),
-                    "front_version": str(context.get("front_version") or "0"),
-                    "boundary_tensor_labels": list(
-                        context.get("boundary_tensor_labels", []) or []
-                    ),
-                }
-            splitter, candidate = self._build_bundle_splitter(
-                model,
-                manifest_for_runtime,
-                bundle_root=bundle_root or self.workspace_root,
-                runtime_batch_size=_FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+        if splitter is None or candidate is None:
+            raise RuntimeError(
+                "SplitRuntimeContract creation requires the training job's "
+                "already-bound cloud batch runtime."
             )
 
         candidates_by_key: dict[str, object] = {}
@@ -2126,20 +2306,27 @@ class CloudContinualLearner:
             except RuntimeError:
                 continue
             candidates_by_key[key] = batch_candidate
-        batch_candidate = candidates_by_key.get(canonical_split_key)
+        batch_candidate = None
+        try:
+            if canonical_split_key_for_candidate(candidate) == canonical_split_key:
+                batch_candidate = candidate
+        except RuntimeError:
+            batch_candidate = None
+        if batch_candidate is None:
+            batch_candidate = candidates_by_key.get(canonical_split_key)
         if batch_candidate is None:
             raise RuntimeError(
                 "This split point is not stable across batch sizes. "
                 "Please choose a module-boundary split."
             )
-        cloud_batch_split_id = str(
-            getattr(batch_candidate, "candidate_id", None)
-            or getattr(getattr(splitter, "runtime", None), "split_id", "")
-            or canonical_split_key
+        cloud_batch_split_id = self._candidate_cloud_batch_split_id(
+            splitter=splitter,
+            candidate=batch_candidate,
+            canonical_split_key=canonical_split_key,
         )
         layout_tensors = self._contract_layout_tensors_from_runtime(
             splitter=splitter,
-            candidate=candidate,
+            candidate=batch_candidate,
             input_tensor_shape=[int(dim) for dim in list(context.get("input_tensor_shape", []) or [])],
         )
         edge_split_id = str(context.get("edge_split_id") or canonical_split_key)
@@ -4042,13 +4229,19 @@ class CloudContinualLearner:
         *,
         num_train_samples: int,
     ) -> int:
-        configured_batch_size = max(1, int(self.batch_size))
+        configured_batch_size = max(
+            _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+            int(self.batch_size),
+        )
         target_steps = self._resolve_fixed_split_target_steps_per_round(model_name)
         if target_steps is None:
             return configured_batch_size
         effective_batch_size = min(
             configured_batch_size,
-            max(1, math.ceil(max(0, int(num_train_samples)) / target_steps)),
+            max(
+                _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+                math.ceil(max(0, int(num_train_samples)) / target_steps),
+            ),
         )
         return int(effective_batch_size)
 
@@ -5416,6 +5609,25 @@ class CloudContinualLearner:
             ) as handle:
                 json.dump(manifest, handle, indent=2, sort_keys=True)
                 handle.write("\n")
+            split_contract = self._load_split_runtime_contract(
+                edge_id=edge_id,
+                manifest=manifest,
+            )
+            if split_contract is None:
+                message = (
+                    "RETRY_LATER: SplitRuntimeContract is not ready for this "
+                    "split_config_id; a continual learning training job must create "
+                    "the contract before high-quality feature-label shards can be "
+                    "committed."
+                )
+                logger.info(
+                    "[ShardCL][SamplePoolCommit] {} edge_id={} model_id={} split_config_id={}",
+                    message,
+                    edge_id,
+                    manifest.get("model_id"),
+                    manifest.get("split_config_id"),
+                )
+                return False, message, 0
             sample_pool = self._cloud_sample_pool_for_manifest(
                 edge_id=edge_id,
                 manifest=manifest,
@@ -5538,13 +5750,6 @@ class CloudContinualLearner:
                             "created_at": time.time(),
                         }
                     )
-            representative_features = self._first_sample_feature_tensors(trainable_samples)
-            split_contract = self._get_or_create_split_runtime_contract(
-                edge_id=edge_id,
-                manifest=manifest,
-                feature_tensors=representative_features,
-                bundle_root=bundle_cache_path,
-            )
             trainable_samples, commit_stats = self._filter_pool_samples_for_contract(
                 trainable_samples,
                 contract=split_contract,
@@ -5729,6 +5934,27 @@ class CloudContinualLearner:
                     field_name="bundle model version",
                 )
                 baseline_source = f"native {self._native_training_source_label(current_model_name)}"
+                existing_contract = self._load_split_runtime_contract(
+                    edge_id=edge_id,
+                    manifest=manifest,
+                )
+                front_version = str(
+                    self._sample_pool_manifest_context(manifest).get("front_version") or "0"
+                )
+                if (
+                    existing_contract is None
+                    and front_version == "0"
+                    and bundle_model_version != "0"
+                ):
+                    message = (
+                        "Missing SplitRuntimeContract for front_version=0; refusing "
+                        f"to create it from tail checkpoint model_version={bundle_model_version}. "
+                        "Run a model_version=0 training job first so the contract is "
+                        "created from native pretrained front weights."
+                    )
+                    logger.warning("[FixedSplitCL] {}", message)
+                    self._log_stage_duration("total round time", total_round_started)
+                    return False, "", message
 
                 if bundle_model_version == "0":
                     logger.info(
@@ -5848,6 +6074,7 @@ class CloudContinualLearner:
                     splitter=prepared_splitter,
                     candidate=prepared_candidate,
                     bundle_root=bundle_cache_path,
+                    create_if_missing=True,
                 )
                 low_quality_pool_samples, low_quality_commit_stats = (
                     self._filter_pool_samples_for_contract(
@@ -5880,13 +6107,23 @@ class CloudContinualLearner:
                     runtime_input_tensor_shape=pool_runtime_input_tensor_shape,
                     input_resize_mode=pool_input_resize_mode,
                 )
-                if not bundle_info["all_sample_ids"]:
-                    raise RuntimeError(
-                        "No active cloud sample-pool samples were available for fixed-split retraining."
+                active_sample_count = len(bundle_info["all_sample_ids"])
+                required_dynamic_batch_min = max(
+                    _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+                    _splitter_dynamic_batch_min(prepared_splitter),
+                )
+                if active_sample_count < required_dynamic_batch_min:
+                    message = (
+                        "Not enough compatible samples for dynamic batch runtime: "
+                        f"active_samples={active_sample_count}, "
+                        f"required_min={required_dynamic_batch_min}."
                     )
+                    logger.warning("[FixedSplitCL] {}", message)
+                    self._log_stage_duration("total round time", total_round_started)
+                    return False, "", message
                 effective_batch_size = self._resolve_fixed_split_runtime_batch_size(
                     current_model_name,
-                    num_train_samples=len(bundle_info["all_sample_ids"]),
+                    num_train_samples=active_sample_count,
                 )
                 working_cache = sample_pool.root_dir
                 frame_dir = os.path.join(sample_pool.root_dir, "frames")

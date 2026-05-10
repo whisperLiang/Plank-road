@@ -1090,6 +1090,133 @@ def _runtime_graph_signature(runtime: Any) -> str:
     return str(getattr(ariadne_runtime, "graph_signature", "") or "split-runtime")
 
 
+def _runtime_dynamic_batch_range(runtime: Any) -> tuple[int, int] | None:
+    sources = [runtime]
+    try:
+        sources.append(_ariadne_runtime_from_splitter(runtime))
+    except Exception:
+        pass
+    for source in sources:
+        split_spec = getattr(source, "split_spec", None)
+        dynamic_batch = getattr(split_spec, "dynamic_batch", None)
+        if dynamic_batch is None:
+            continue
+        try:
+            lower, upper = list(dynamic_batch)[:2]
+            lower_int = max(1, int(lower))
+            upper_int = max(lower_int, int(upper))
+        except (TypeError, ValueError):
+            continue
+        return lower_int, upper_int
+    return None
+
+
+def _runtime_batch_spans(
+    total_count: int,
+    *,
+    preferred_batch_size: int,
+    dynamic_batch_min: int = 1,
+    dynamic_batch_max: int | None = None,
+) -> list[tuple[int, int]]:
+    total = max(0, int(total_count))
+    if total == 0:
+        return []
+    batch_min = max(1, int(dynamic_batch_min))
+    batch_max = max(batch_min, int(dynamic_batch_max or preferred_batch_size or batch_min))
+    preferred = min(batch_max, max(batch_min, int(preferred_batch_size or batch_min)))
+    if total < batch_min:
+        return [(0, total)]
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < total:
+        remaining = total - start
+        actual = min(remaining, preferred)
+        leftover = remaining - actual
+        if 0 < leftover < batch_min:
+            needed = batch_min - leftover
+            if actual - needed >= batch_min:
+                actual -= needed
+            elif actual + leftover <= batch_max:
+                actual += leftover
+            else:
+                raise RuntimeError(
+                    "Cannot form a valid dynamic batch runtime group: "
+                    f"remaining={remaining}, preferred={preferred}, "
+                    f"dynamic_batch=[{batch_min}, {batch_max}]."
+                )
+        spans.append((start, start + actual))
+        start += actual
+    return spans
+
+
+def _cached_boundary_payload(record: Mapping[str, Any]) -> BoundaryPayload | None:
+    intermediate = record.get("intermediate")
+    return intermediate if isinstance(intermediate, BoundaryPayload) else None
+
+
+def _cached_boundary_batch_size(record: Mapping[str, Any]) -> int | None:
+    payload = _cached_boundary_payload(record)
+    if payload is None:
+        return None
+    batch_size = int(getattr(payload, "batch_size", 0) or 0)
+    if batch_size <= 0:
+        for tensor in dict(payload.tensors or {}).values():
+            if isinstance(tensor, torch.Tensor) and tensor.ndim > 0:
+                batch_size = int(tensor.shape[0])
+                break
+    return batch_size if batch_size > 1 else None
+
+
+def _tensor_payloads_equal(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+) -> bool:
+    if list(first.keys()) != list(second.keys()):
+        return False
+    for key in first.keys():
+        left = first[key]
+        right = second[key]
+        if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+            if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+                return False
+            if left.shape != right.shape or left.device != right.device:
+                return False
+            try:
+                if not bool(torch.equal(left, right)):
+                    return False
+            except Exception:
+                return False
+        elif left != right:
+            return False
+    return True
+
+
+def _same_cached_boundary_payload(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+) -> bool:
+    first_payload = _cached_boundary_payload(first)
+    second_payload = _cached_boundary_payload(second)
+    if first_payload is None or second_payload is None:
+        return False
+    if int(first_payload.batch_size) != int(second_payload.batch_size):
+        return False
+    if str(first_payload.split_id) != str(second_payload.split_id):
+        return False
+    if str(first_payload.graph_signature) != str(second_payload.graph_signature):
+        return False
+    if not _tensor_payloads_equal(
+        dict(first_payload.tensors or {}),
+        dict(second_payload.tensors or {}),
+    ):
+        return False
+    return _tensor_payloads_equal(
+        dict(first_payload.passthrough_inputs or {}),
+        dict(second_payload.passthrough_inputs or {}),
+    )
+
+
 def _build_boundary_batch_from_records(
     records: list[Mapping[str, Any]],
     *,
@@ -1097,6 +1224,18 @@ def _build_boundary_batch_from_records(
 ) -> BoundaryPayload:
     if not records:
         raise RuntimeError("Cannot build an empty split-tail feature batch.")
+    first_payload = _cached_boundary_payload(records[0])
+    first_payload_batch_size = _cached_boundary_batch_size(records[0])
+    if len(records) == 1 and first_payload is not None and first_payload_batch_size is None:
+        return first_payload
+    if first_payload is not None and first_payload_batch_size is not None:
+        if len(records) > first_payload_batch_size:
+            raise RuntimeError(
+                "Cached split-tail boundary batch has fewer rows than requested targets."
+            )
+        if all(_same_cached_boundary_payload(records[0], record) for record in records[1:]):
+            return first_payload
+
     tensor_groups = [_feature_tensors_from_record(record) for record in records]
     labels = list(tensor_groups[0].keys())
     for tensors in tensor_groups[1:]:
@@ -1115,12 +1254,37 @@ def _build_boundary_batch_from_records(
                     f"got {label} shape {tuple(tensor.shape)}."
                 )
             pieces.append(tensor)
+        devices = {piece.device for piece in pieces}
+        if len(devices) > 1:
+            raise RuntimeError(
+                "Split-tail training requires batched Ariadne prefix execution "
+                "records on a single device."
+            )
         batched_tensors[label] = torch.cat(pieces, dim=0)
+    passthrough_groups: list[Mapping[str, Any]] = []
+    for record in records:
+        payload = _cached_boundary_payload(record)
+        passthrough_groups.append(dict(payload.passthrough_inputs or {}) if payload else {})
+    batched_passthrough: dict[str, Any] = {}
+    for key in list(passthrough_groups[0].keys()) if passthrough_groups else []:
+        pieces = []
+        for passthrough in passthrough_groups:
+            value = passthrough.get(key)
+            if not isinstance(value, torch.Tensor):
+                pieces = []
+                break
+            if value.ndim == 0 or int(value.shape[0]) != 1:
+                pieces = []
+                break
+            pieces.append(value)
+        if pieces and len({piece.device for piece in pieces}) == 1:
+            batched_passthrough[str(key)] = torch.cat(pieces, dim=0)
     return boundary_payload_from_tensors(
         batched_tensors,
         split_id=_runtime_split_id(runtime),
         graph_signature=_runtime_graph_signature(runtime),
         batch_size=len(records),
+        passthrough_inputs=batched_passthrough,
     )
 
 
@@ -1150,16 +1314,16 @@ def _load_cached_split_batches(
         return dict(cached)
 
     try:
-        epoch_batch_size = max(1, int(batch_size))
-        start = 0
-        while start < len(all_indices):
-            actual_batch_size = min(len(all_indices) - start, epoch_batch_size)
-            batch_indices = list(all_indices[start : start + actual_batch_size])
-            if not batch_indices:
-                break
-            records = [
-                _record_for_index(index) for index in batch_indices
-            ]
+        dynamic_batch = _runtime_dynamic_batch_range(runtime)
+        dynamic_batch_min = int(dynamic_batch[0]) if dynamic_batch is not None else 1
+        dynamic_batch_max = int(dynamic_batch[1]) if dynamic_batch is not None else None
+        epoch_batch_size = max(dynamic_batch_min, int(batch_size))
+        position = 0
+
+        def _append_batch(
+            batch_indices: list[Any],
+            records: list[Mapping[str, Any]],
+        ) -> None:
             target_started = time.perf_counter()
             targets = [
                 _detach_boundary_value(_target_for_split_training(index, annotations, record))
@@ -1170,9 +1334,63 @@ def _load_cached_split_batches(
                 "target_construction_time",
                 time.perf_counter() - target_started,
             )
-            boundary = _build_boundary_batch_from_records(records, runtime=runtime)
-            batches.append((batch_indices, boundary, targets))
-            start += actual_batch_size
+            boundary = _build_boundary_batch_from_records(list(records), runtime=runtime)
+            batches.append((list(batch_indices), boundary, targets))
+
+        while position < len(all_indices):
+            first_index = all_indices[position]
+            first_record = _record_for_index(first_index)
+            cached_batch_size = _cached_boundary_batch_size(first_record)
+            if cached_batch_size is not None:
+                batch_indices = [first_index]
+                records = [first_record]
+                consumed = 1
+                while (
+                    consumed < cached_batch_size
+                    and position + consumed < len(all_indices)
+                ):
+                    next_index = all_indices[position + consumed]
+                    next_record = _record_for_index(next_index)
+                    if not _same_cached_boundary_payload(first_record, next_record):
+                        break
+                    batch_indices.append(next_index)
+                    records.append(next_record)
+                    consumed += 1
+                consumed_count = len(batch_indices)
+                while len(batch_indices) < cached_batch_size:
+                    batch_indices.append(batch_indices[-1])
+                    records.append(records[-1])
+                _append_batch(batch_indices, records)
+                position += consumed_count
+                continue
+
+            segment_indices: list[Any] = []
+            segment_records: list[Mapping[str, Any]] = []
+            while position < len(all_indices):
+                index = all_indices[position]
+                record = first_record if not segment_indices else _record_for_index(index)
+                if _cached_boundary_batch_size(record) is not None:
+                    break
+                segment_indices.append(index)
+                segment_records.append(record)
+                position += 1
+
+            for start, stop in _runtime_batch_spans(
+                len(segment_indices),
+                preferred_batch_size=epoch_batch_size,
+                dynamic_batch_min=dynamic_batch_min,
+                dynamic_batch_max=dynamic_batch_max,
+            ):
+                batch_indices = list(segment_indices[start:stop])
+                records = list(segment_records[start:stop])
+                if not batch_indices:
+                    continue
+                if len(batch_indices) < dynamic_batch_min:
+                    batch_indices.extend(
+                        [batch_indices[-1]] * (dynamic_batch_min - len(batch_indices))
+                    )
+                    records.extend([records[-1]] * (dynamic_batch_min - len(records)))
+                _append_batch(batch_indices, records)
     finally:
         _add_profile_time(
             profile,

@@ -1241,7 +1241,7 @@ def test_split_retrain_uses_cached_pseudo_targets_with_padded_ariadne_batch(
 ):
     cache_path = str(tmp_path / "cache")
     payload = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0, 2.0], [1.0, 2.0]])},
+        {"node_1": torch.tensor([[1.0, 2.0]])},
         split_id="after:node_1",
         graph_signature="graph-sig",
     )
@@ -1769,14 +1769,20 @@ def test_cached_split_proxy_eval_batches_schema_payloads(tmp_path):
     from cloud_server import _build_detection_proxy_prediction_cache
 
     cache_path = str(tmp_path / "cache")
-    payload = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
+    first_payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[1.0, 2.0]])},
         split_id="after:node_1",
         graph_signature="graph-sig",
-        passthrough_inputs={"input": torch.stack([torch.ones(3), torch.full((3,), 2.0)])},
+        passthrough_inputs={"input": torch.ones(1, 3)},
     )
-    save_split_feature_cache(cache_path, "s1", payload)
-    save_split_feature_cache(cache_path, "s2", payload)
+    second_payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[3.0, 4.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": torch.full((1, 3), 2.0)},
+    )
+    save_split_feature_cache(cache_path, "s1", first_payload)
+    save_split_feature_cache(cache_path, "s2", second_payload)
 
     class DummySplitter:
         def __init__(self):
@@ -1828,18 +1834,23 @@ def test_cached_split_proxy_eval_uses_cached_boundary_batch_size(tmp_path):
 
     cache_path = str(tmp_path / "cache")
     first_payload = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[1.0], [2.0]])},
+        {"node_1": torch.tensor([[1.0]])},
         split_id="after:node_1",
         graph_signature="graph-sig",
     )
     second_payload = boundary_payload_from_tensors(
-        {"node_1": torch.tensor([[3.0], [4.0]])},
+        {"node_1": torch.tensor([[2.0]])},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+    )
+    third_payload = boundary_payload_from_tensors(
+        {"node_1": torch.tensor([[3.0]])},
         split_id="after:node_1",
         graph_signature="graph-sig",
     )
     save_split_feature_cache(cache_path, "s1", first_payload)
-    save_split_feature_cache(cache_path, "s2", first_payload)
-    save_split_feature_cache(cache_path, "s3", second_payload)
+    save_split_feature_cache(cache_path, "s2", second_payload)
+    save_split_feature_cache(cache_path, "s3", third_payload)
 
     class DummySplitter:
         def __init__(self):
@@ -1875,11 +1886,11 @@ def test_cached_split_proxy_eval_uses_cached_boundary_batch_size(tmp_path):
         split_candidate="candidate-1",
     )
 
-    assert splitter.seen_batch_sizes == [2, 2]
+    assert splitter.seen_batch_sizes == [3]
     assert len(prediction_cache["prediction_rows"]) == 3
 
 
-def test_cached_split_proxy_eval_rejects_singleton_cached_boundary(tmp_path):
+def test_cached_split_proxy_eval_pads_singleton_for_dynamic_runtime(tmp_path):
     from cloud_server import _build_detection_proxy_prediction_cache
 
     cache_path = str(tmp_path / "cache")
@@ -1891,20 +1902,138 @@ def test_cached_split_proxy_eval_rejects_singleton_cached_boundary(tmp_path):
     )
     save_split_feature_cache(cache_path, "s1", payload)
 
-    with pytest.raises(RuntimeError, match="batched Ariadne prefix execution"):
-        _build_detection_proxy_prediction_cache(
-            torch.nn.Identity(),
-            frame_dir=str(tmp_path),
-            gt_annotations={
-                "s1": {"boxes": [[0.0, 0.0, 1.0, 1.0]], "labels": [1]},
-            },
-            device=torch.device("cpu"),
-            threshold_low=0.1,
-            model_name="rfdetr_nano",
-            inference_batch_size=16,
-            split_cache_path=cache_path,
-            splitter=SimpleNamespace(cloud_forward=lambda *args, **kwargs: None),
-            split_candidate="candidate-1",
+    class DynamicBatchSplitter:
+        split_spec = SimpleNamespace(dynamic_batch=(2, 64))
+
+        def __init__(self):
+            self.seen_boundary = None
+
+        def cloud_forward(self, boundary, *, candidate=None):
+            del candidate
+            self.seen_boundary = boundary
+            assert boundary.batch_size == 2
+            assert boundary.tensors["node_1"].tolist() == [[1.0, 2.0], [1.0, 2.0]]
+            return [
+                {
+                    "boxes": torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+                    "labels": torch.tensor([1]),
+                    "scores": torch.tensor([0.9]),
+                },
+                {
+                    "boxes": torch.tensor([[9.0, 9.0, 10.0, 10.0]]),
+                    "labels": torch.tensor([9]),
+                    "scores": torch.tensor([0.1]),
+                },
+            ]
+
+    splitter = DynamicBatchSplitter()
+    prediction_cache = _build_detection_proxy_prediction_cache(
+        torch.nn.Identity(),
+        frame_dir=str(tmp_path),
+        gt_annotations={
+            "s1": {"boxes": [[0.0, 0.0, 1.0, 1.0]], "labels": [1]},
+        },
+        device=torch.device("cpu"),
+        threshold_low=0.1,
+        model_name="rfdetr_nano",
+        inference_batch_size=16,
+        split_cache_path=cache_path,
+        splitter=splitter,
+        split_candidate="candidate-1",
+    )
+
+    assert splitter.seen_boundary is not None
+    assert len(prediction_cache["prediction_rows"]) == 1
+    assert prediction_cache["prediction_rows"][0][2]["labels"] == [1]
+
+
+def test_high_quality_sync_retries_until_split_contract_exists(tmp_path, monkeypatch):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="dummy-model",
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path / "workspace"),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_get_or_create_split_runtime_contract",
+        lambda *args, **kwargs: pytest.fail("sync must not create a split contract"),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_load_edge_training_model",
+        lambda *args, **kwargs: pytest.fail("sync must not load edge model weights"),
+    )
+
+    manifest = {
+        "protocol_version": "high-quality-feature-label-shard.v2",
+        "model_id": "dummy-model",
+        "split_config_id": "split-a",
+        "canonical_split_key": "after:node_1",
+        "front_version": "0",
+        "input_tensor_shape": [1, 3, 8, 8],
+        "input_resize_mode": "direct_resize",
+        "shards": [],
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("bundle_manifest.json", json.dumps(manifest))
+
+    success, message, committed = learner.sync_samples(
+        edge_id=7,
+        protocol_version="high-quality-feature-label-shard.v2",
+        sync_type="HIGH_QUALITY_FEATURE_LABEL_SHARD",
+        payload_zip=buffer.getvalue(),
+        model_id="dummy-model",
+        split_config_id="split-a",
+    )
+
+    assert success is False
+    assert "RETRY_LATER" in message
+    assert committed == 0
+    contract_files = [
+        filename
+        for _root, _dirs, filenames in os.walk(learner.split_contract_root)
+        for filename in filenames
+    ]
+    assert contract_files == []
+
+
+def test_split_contract_creation_rejects_tail_checkpoint_for_front_version_zero(tmp_path):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="dummy-model",
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path / "workspace"),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    manifest = {
+        "model": {"model_id": "dummy-model", "model_version": "1"},
+        "split_plan": {
+            "split_config_id": "split-a",
+            "canonical_split_key": "after:node_1",
+            "front_version": "0",
+            "input_tensor_shape": [1, 3, 8, 8],
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="native pretrained model_version=0"):
+        learner._get_or_create_split_runtime_contract(
+            edge_id=7,
+            manifest=manifest,
+            feature_tensors={"node_1": torch.ones(1, 2)},
+            splitter=SimpleNamespace(),
+            candidate=object(),
+            create_if_missing=True,
         )
 
 
@@ -2378,9 +2507,12 @@ def test_cloud_batch_feature_provider_uses_actual_short_final_chunk(
 
     assert fake_splitter.seen_shapes == [(3, 1)]
     assert len(payloads) == 3
-    assert [payload.batch_size for payload in payloads] == [3, 3, 3]
-    assert payloads[0].tensors["node_1"].tolist() == [[0.0], [1.0], [2.0]]
-    assert all(payload is payloads[0] for payload in payloads)
+    assert [payload.batch_size for payload in payloads] == [1, 1, 1]
+    assert [payload.tensors["node_1"].tolist() for payload in payloads] == [
+        [[0.0]],
+        [[1.0]],
+        [[2.0]],
+    ]
 
 
 def test_cloud_batch_feature_provider_pads_single_sample_to_runtime_minimum(
@@ -2436,8 +2568,8 @@ def test_cloud_batch_feature_provider_pads_single_sample_to_runtime_minimum(
 
     assert fake_splitter.seen_shapes == [(2, 1)]
     assert len(payloads) == 1
-    assert payloads[0].batch_size == 2
-    assert payloads[0].tensors["node_1"].tolist() == [[7.0], [7.0]]
+    assert payloads[0].batch_size == 1
+    assert payloads[0].tensors["node_1"].tolist() == [[7.0]]
 
 
 _FORBIDDEN_SHARD_METADATA = {
