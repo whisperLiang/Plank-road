@@ -29,7 +29,6 @@ from model_management.model_zoo import (
     ensure_local_model_artifact,
     get_model_artifact_path,
     get_model_detection_thresholds,
-    set_detection_finetune_mode,
 )
 from model_management.object_detection import Object_Detection
 from model_management.split_model_adapters import (
@@ -850,8 +849,9 @@ def _train_freeze_loop(
     losses: list[float] = []
     _synchronize(device)
     training_started = time.perf_counter()
+    del model_name
     for epoch in range(int(epochs)):
-        set_detection_finetune_mode(edge_model, model_name)
+        edge_model.train()
         epoch_started = time.perf_counter()
         for batch_ids in _shuffled_epoch_batches(
             sample_ids,

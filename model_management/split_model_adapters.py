@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
@@ -485,65 +486,7 @@ def build_split_training_loss(model: torch.nn.Module):
         return _loss_fn
 
     if _is_anchor_detector(model):
-        def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
-            head_outputs = _extract_anchor_detector_outputs(outputs)
-            device = next(iter(head_outputs.values())).device
-            
-            target_list = targets if isinstance(targets, list) else [targets]
-            
-            image_targets = []
-            dummy_images = []
-            
-            for target_item in target_list:
-                original_image_size, model_input_size = _infer_original_and_model_input_image_sizes(target_item)
-                resize_mode = _resolve_anchor_resize_mode(model, target_item)
-                dummy_image = torch.zeros(
-                    (3, model_input_size[0], model_input_size[1]),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                dummy_images.append(dummy_image)
-                image_targets.append(
-                    _build_anchor_training_target(
-                        target_item,
-                        device=device,
-                        original_image_size=original_image_size,
-                        model_input_size=model_input_size,
-                        resize_mode=resize_mode,
-                    )
-                )
-            
-            transformed_images, transformed_targets = model.transform(dummy_images, image_targets)
-            features = model.backbone(transformed_images.tensors)
-            if isinstance(features, torch.Tensor):
-                features = OrderedDict([("0", features)])
-            feature_list = list(features.values()) if isinstance(features, dict) else list(features)
-            anchors = model.anchor_generator(transformed_images, feature_list)
-            if isinstance(model, SSD):
-                matched_idxs = _match_anchor_targets(model, anchors, transformed_targets)
-                loss_dict = model.compute_loss(
-                    transformed_targets,
-                    head_outputs,
-                    anchors,
-                    matched_idxs,
-                )
-            elif isinstance(model, FCOS):
-                num_anchors_per_level = [int(x.size(2) * x.size(3)) for x in feature_list]
-                loss_dict = model.compute_loss(
-                    transformed_targets,
-                    head_outputs,
-                    anchors,
-                    num_anchors_per_level,
-                )
-            else:
-                loss_dict = model.compute_loss(
-                    transformed_targets,
-                    head_outputs,
-                    anchors,
-                )
-            return sum(loss_dict.values())
-
-        return _loss_fn
+        return build_anchor_detector_training_loss(model)
 
     if hasattr(model, "roi_heads"):
         def _loss_fn(
@@ -567,6 +510,379 @@ def build_split_training_loss(model: torch.nn.Module):
         return _loss_fn
 
     return None
+
+
+def build_anchor_detector_training_loss(model: torch.nn.Module):
+    """Build a split-tail loss for torchvision anchor detectors.
+
+    The split runtime returns suffix-replayed head outputs.  Anchors only need
+    feature-map shapes, so this path reconstructs dummy feature tensors from the
+    head output shape instead of running the detector backbone again.
+    """
+
+    def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
+        head_outputs = _extract_anchor_detector_outputs(outputs)
+        batch_size = _anchor_head_output_batch_size(head_outputs)
+        image_targets, transformed_images, feature_list = _build_anchor_loss_inputs(
+            model,
+            head_outputs,
+            targets,
+            batch_size=batch_size,
+        )
+        anchors = model.anchor_generator(transformed_images, feature_list)
+        if isinstance(model, SSD):
+            matched_idxs = _match_anchor_targets(model, anchors, image_targets)
+            loss_dict = model.compute_loss(
+                image_targets,
+                head_outputs,
+                anchors,
+                matched_idxs,
+            )
+        elif isinstance(model, FCOS):
+            num_anchors_per_level = [
+                int(feature.shape[-2] * feature.shape[-1])
+                for feature in feature_list
+            ]
+            loss_dict = model.compute_loss(
+                image_targets,
+                head_outputs,
+                anchors,
+                num_anchors_per_level,
+            )
+        else:
+            loss_dict = model.compute_loss(
+                image_targets,
+                head_outputs,
+                anchors,
+            )
+        return _sum_anchor_loss_dict(loss_dict, head_outputs)
+
+    return _loss_fn
+
+
+def build_ssd_split_training_loss(model: torch.nn.Module):
+    if not isinstance(model, SSD):
+        raise TypeError("build_ssd_split_training_loss() requires a torchvision SSD model.")
+    return build_anchor_detector_training_loss(model)
+
+
+def _sum_anchor_loss_dict(
+    loss_dict: Mapping[str, torch.Tensor],
+    head_outputs: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    losses = [
+        loss
+        for loss in loss_dict.values()
+        if isinstance(loss, torch.Tensor)
+    ]
+    if losses:
+        total = losses[0]
+        for loss in losses[1:]:
+            total = total + loss
+        return total
+    first = next(iter(head_outputs.values()))
+    return first.sum() * 0.0
+
+
+def _anchor_head_output_batch_size(head_outputs: Mapping[str, torch.Tensor]) -> int:
+    first = next(iter(head_outputs.values()))
+    if first.ndim == 0:
+        raise RuntimeError("Anchor-detector head outputs must include a batch dimension.")
+    return int(first.shape[0])
+
+
+def _anchor_head_output_anchor_count(head_outputs: Mapping[str, torch.Tensor]) -> int:
+    bbox_regression = head_outputs.get("bbox_regression")
+    cls_logits = head_outputs.get("cls_logits")
+    if not isinstance(bbox_regression, torch.Tensor) or bbox_regression.ndim < 2:
+        raise RuntimeError("Anchor-detector bbox_regression output must have shape [N, anchors, 4].")
+    if isinstance(cls_logits, torch.Tensor) and cls_logits.ndim >= 2:
+        if int(cls_logits.shape[1]) != int(bbox_regression.shape[1]):
+            raise RuntimeError(
+                "Anchor-detector cls_logits and bbox_regression disagree on anchor count."
+            )
+    return int(bbox_regression.shape[1])
+
+
+def _anchor_num_classes(head_outputs: Mapping[str, torch.Tensor]) -> int | None:
+    cls_logits = head_outputs.get("cls_logits")
+    if isinstance(cls_logits, torch.Tensor) and cls_logits.ndim >= 3:
+        return int(cls_logits.shape[-1])
+    return None
+
+
+def _anchor_generator_num_anchors_per_location(model: torch.nn.Module) -> list[int]:
+    generator = getattr(model, "anchor_generator", None)
+    value = getattr(generator, "num_anchors_per_location", None)
+    if callable(value):
+        anchors = [int(item) for item in value()]
+        if anchors:
+            return anchors
+    wh_pairs = getattr(generator, "_wh_pairs", None)
+    if isinstance(wh_pairs, (list, tuple)) and wh_pairs:
+        return [int(len(item)) for item in wh_pairs]
+    out_channels = getattr(getattr(model, "backbone", None), "out_channels", None)
+    if isinstance(out_channels, (list, tuple)) and out_channels:
+        return [1 for _ in out_channels]
+    raise RuntimeError("Unable to infer anchor counts per feature level.")
+
+
+def _anchor_generator_steps(model: torch.nn.Module) -> list[int] | None:
+    steps = getattr(getattr(model, "anchor_generator", None), "steps", None)
+    if not isinstance(steps, (list, tuple)) or not steps:
+        return None
+    normalized = [int(step) for step in steps]
+    return normalized if all(step > 0 for step in normalized) else None
+
+
+def _infer_anchor_feature_shapes_from_head_outputs(
+    model: torch.nn.Module,
+    head_outputs: Mapping[str, torch.Tensor],
+    *,
+    model_input_size: tuple[int, int],
+) -> list[tuple[int, int]]:
+    total_anchors = _anchor_head_output_anchor_count(head_outputs)
+    anchors_per_location = _anchor_generator_num_anchors_per_location(model)
+    steps = _anchor_generator_steps(model)
+    height, width = model_input_size
+
+    if steps is not None and len(steps) == len(anchors_per_location):
+        shapes = [
+            (
+                max(1, int(math.ceil(float(height) / float(step)))),
+                max(1, int(math.ceil(float(width) / float(step)))),
+            )
+            for step in steps
+        ]
+        expected = sum(
+            int(level_height * level_width * anchors)
+            for (level_height, level_width), anchors in zip(shapes, anchors_per_location, strict=True)
+        )
+        if expected == total_anchors:
+            return shapes
+
+    out_channels = getattr(getattr(model, "backbone", None), "out_channels", None)
+    level_count = len(out_channels) if isinstance(out_channels, (list, tuple)) else len(anchors_per_location)
+    if level_count != len(anchors_per_location):
+        level_count = len(anchors_per_location)
+    if level_count <= 0:
+        raise RuntimeError("Unable to infer anchor feature levels from detector metadata.")
+
+    common_strides = [2 ** (index + 3) for index in range(level_count)]
+    shapes = [
+        (
+            max(1, int(math.ceil(float(height) / float(stride)))),
+            max(1, int(math.ceil(float(width) / float(stride)))),
+        )
+        for stride in common_strides
+    ]
+    expected = sum(
+        int(level_height * level_width * anchors)
+        for (level_height, level_width), anchors in zip(shapes, anchors_per_location, strict=True)
+    )
+    if expected == total_anchors:
+        return shapes
+
+    raise RuntimeError(
+        "Unable to infer anchor feature-map shapes from split head outputs "
+        f"(anchors={total_anchors}, input_size={model_input_size}, "
+        f"anchors_per_location={anchors_per_location})."
+    )
+
+
+def _make_dummy_features_for_anchor_generator(
+    head_outputs: Mapping[str, torch.Tensor],
+    feature_shapes: list[tuple[int, int]],
+    *,
+    batch_size: int,
+) -> list[torch.Tensor]:
+    first = next(iter(head_outputs.values()))
+    return [
+        torch.zeros(
+            (batch_size, 1, int(height), int(width)),
+            dtype=first.dtype,
+            device=first.device,
+        )
+        for height, width in feature_shapes
+    ]
+
+
+def _make_anchor_image_list(
+    head_outputs: Mapping[str, torch.Tensor],
+    *,
+    model_input_size: tuple[int, int],
+    batch_size: int,
+) -> ImageList:
+    first = next(iter(head_outputs.values()))
+    height, width = model_input_size
+    tensors = torch.zeros(
+        (batch_size, 3, int(height), int(width)),
+        dtype=first.dtype,
+        device=first.device,
+    )
+    return ImageList(tensors, [model_input_size for _ in range(batch_size)])
+
+
+def _target_value_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0:
+            return int(value.numel())
+        return int(value.shape[0])
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
+def _target_has_anchor_labels(targets: Any) -> bool:
+    if not isinstance(targets, Mapping):
+        return False
+    boxes = targets.get("boxes")
+    labels = targets.get("labels")
+    return _target_value_count(boxes) > 0 or _target_value_count(labels) > 0
+
+
+def _fallback_anchor_model_input_size(model: torch.nn.Module) -> tuple[int, int] | None:
+    fixed_size = getattr(getattr(model, "transform", None), "fixed_size", None)
+    if isinstance(fixed_size, (list, tuple)) and len(fixed_size) >= 2:
+        height = int(fixed_size[0])
+        width = int(fixed_size[1])
+        if height > 0 and width > 0:
+            return height, width
+    size = getattr(model, "size", None)
+    if isinstance(size, (list, tuple)) and len(size) >= 2:
+        height = int(size[0])
+        width = int(size[1])
+        if height > 0 and width > 0:
+            return height, width
+    return None
+
+
+def _anchor_target_sizes(
+    model: torch.nn.Module,
+    target_item: Any,
+) -> tuple[tuple[int, int], tuple[int, int], str]:
+    if isinstance(target_item, Mapping):
+        try:
+            original_image_size, model_input_size = _infer_original_and_model_input_image_sizes(target_item)
+            resize_mode = _resolve_anchor_resize_mode(model, target_item)
+            return original_image_size, model_input_size, resize_mode
+        except RuntimeError:
+            if _target_has_anchor_labels(target_item):
+                raise
+
+    fallback = _fallback_anchor_model_input_size(model)
+    if fallback is None:
+        raise RuntimeError(
+            "Anchor-detector split loss requires coordinate metadata or a fixed model input size."
+        )
+    return fallback, fallback, "direct_resize"
+
+
+def _normalize_anchor_training_targets(targets: Any, *, batch_size: int) -> list[Any]:
+    if targets is None:
+        return [None for _ in range(batch_size)]
+    if isinstance(targets, (list, tuple)):
+        target_list = list(targets)
+    else:
+        target_list = [targets]
+    if len(target_list) < batch_size:
+        target_list.extend([None for _ in range(batch_size - len(target_list))])
+    if len(target_list) > batch_size:
+        target_list = target_list[:batch_size]
+    return target_list
+
+
+def _build_transformed_targets_for_anchor_loss(
+    model: torch.nn.Module,
+    targets: Any,
+    head_outputs: Mapping[str, torch.Tensor],
+    *,
+    batch_size: int,
+) -> tuple[list[dict[str, torch.Tensor]], tuple[int, int]]:
+    device = next(iter(head_outputs.values())).device
+    num_classes = _anchor_num_classes(head_outputs)
+    target_list = _normalize_anchor_training_targets(targets, batch_size=batch_size)
+    image_targets: list[dict[str, torch.Tensor]] = []
+    model_input_size: tuple[int, int] | None = None
+
+    for target_item in target_list:
+        original_size, sample_model_input_size, resize_mode = _anchor_target_sizes(model, target_item)
+        if model_input_size is None:
+            model_input_size = sample_model_input_size
+        elif model_input_size != sample_model_input_size:
+            raise RuntimeError(
+                "Anchor-detector split retraining expects a consistent model input size within a batch. "
+                f"Got {model_input_size} and {sample_model_input_size}."
+            )
+        target_dict = dict(target_item) if isinstance(target_item, Mapping) else {}
+        image_targets.append(
+            _build_anchor_training_target(
+                target_dict,
+                device=device,
+                original_image_size=original_size,
+                model_input_size=sample_model_input_size,
+                resize_mode=resize_mode,
+                num_classes=num_classes,
+            )
+        )
+
+    if model_input_size is None:
+        fallback = _fallback_anchor_model_input_size(model)
+        if fallback is None:
+            raise RuntimeError("Unable to resolve anchor-detector model input size.")
+        model_input_size = fallback
+    return image_targets, model_input_size
+
+
+def _build_anchor_loss_inputs(
+    model: torch.nn.Module,
+    head_outputs: Mapping[str, torch.Tensor],
+    targets: Any,
+    *,
+    batch_size: int,
+) -> tuple[list[dict[str, torch.Tensor]], ImageList, list[torch.Tensor]]:
+    image_targets, model_input_size = _build_transformed_targets_for_anchor_loss(
+        model,
+        targets,
+        head_outputs,
+        batch_size=batch_size,
+    )
+    feature_shapes = _infer_anchor_feature_shapes_from_head_outputs(
+        model,
+        head_outputs,
+        model_input_size=model_input_size,
+    )
+    transformed_images = _make_anchor_image_list(
+        head_outputs,
+        model_input_size=model_input_size,
+        batch_size=batch_size,
+    )
+    feature_list = _make_dummy_features_for_anchor_generator(
+        head_outputs,
+        feature_shapes,
+        batch_size=batch_size,
+    )
+    return image_targets, transformed_images, feature_list
+
+
+def _num_anchors_per_level_for_split(
+    model: torch.nn.Module,
+    head_outputs: Mapping[str, torch.Tensor],
+    feature_list: list[torch.Tensor],
+) -> list[int]:
+    num_locations_per_level = [
+        int(feature.shape[-2] * feature.shape[-1])
+        for feature in feature_list
+    ]
+    if isinstance(model, FCOS):
+        return num_locations_per_level
+    total_locations = sum(num_locations_per_level)
+    total_anchors = _anchor_head_output_anchor_count(head_outputs)
+    anchors_per_location = max(1, total_anchors // max(1, total_locations))
+    return [locations * anchors_per_location for locations in num_locations_per_level]
 
 
 def _empty_detection_result(device: torch.device) -> list[dict[str, torch.Tensor]]:
@@ -742,13 +1058,27 @@ def _postprocess_anchor_detector_output(
     else:
         raise RuntimeError("Anchor-detector split postprocess requires the runtime model input.")
 
-    features = model.backbone(transformed_images.tensors)
-    if isinstance(features, torch.Tensor):
-        features = OrderedDict([("0", features)])
-    feature_list = list(features.values()) if isinstance(features, dict) else list(features)
+    model_input_size = (
+        int(transformed_images.tensors.shape[-2]),
+        int(transformed_images.tensors.shape[-1]),
+    )
+    feature_shapes = _infer_anchor_feature_shapes_from_head_outputs(
+        model,
+        head_outputs,
+        model_input_size=model_input_size,
+    )
+    feature_list = _make_dummy_features_for_anchor_generator(
+        head_outputs,
+        feature_shapes,
+        batch_size=int(transformed_images.tensors.shape[0]),
+    )
     anchors = model.anchor_generator(transformed_images, feature_list)
     if isinstance(model, (RetinaNet, FCOS)):
-        num_anchors_per_level = [int(x.size(2) * x.size(3)) for x in feature_list]
+        num_anchors_per_level = _num_anchors_per_level_for_split(
+            model,
+            head_outputs,
+            feature_list,
+        )
         split_head_outputs = {
             key: list(value.split(num_anchors_per_level, dim=1))
             for key, value in head_outputs.items()
@@ -1283,6 +1613,7 @@ def _build_anchor_training_target(
     original_image_size: tuple[int, int],
     model_input_size: tuple[int, int],
     resize_mode: str = "letterbox",
+    num_classes: int | None = None,
 ) -> dict[str, torch.Tensor]:
     _assert_original_xyxy_targets(targets)
     boxes = _clamp_xyxy_boxes(
@@ -1302,6 +1633,12 @@ def _build_anchor_training_target(
         count = min(int(boxes.shape[0]), int(labels.shape[0]))
         boxes = boxes[:count]
         labels = labels[:count]
+    if labels.numel():
+        valid_labels = labels > 0
+        if num_classes is not None:
+            valid_labels = valid_labels & (labels < int(num_classes))
+        boxes = boxes[valid_labels]
+        labels = labels[valid_labels]
     if boxes.numel():
         valid_geometry = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
         boxes = boxes[valid_geometry]

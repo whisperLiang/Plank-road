@@ -1184,8 +1184,15 @@ def test_split_retrain_raises_when_no_trainable_parameters(tmp_path):
     model = torch.nn.Linear(1, 1)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
+    runtime = SimpleNamespace(
+        trace_plan=SimpleNamespace(
+            root_module=model,
+            nodes=[SimpleNamespace(name="suffix_node", param_refs=[])],
+        ),
+        candidate=SimpleNamespace(suffix_nodes=["suffix_node"]),
+    )
 
-    with pytest.raises(RuntimeError, match="no trainable parameters"):
+    with pytest.raises(RuntimeError, match="suffix parameter refs"):
         universal_split_retrain(
             model=model,
             sample_input=torch.ones(1, 1),
@@ -1193,7 +1200,7 @@ def test_split_retrain_raises_when_no_trainable_parameters(tmp_path):
             all_indices=["s1"],
             gt_annotations={},
             loss_fn=lambda outputs, targets: torch.tensor(1.0),
-            splitter=SimpleNamespace(),
+            splitter=runtime,
             batch_size=1,
         )
 
@@ -1293,6 +1300,25 @@ def test_split_retrain_uses_cached_pseudo_targets_with_padded_ariadne_batch(
     assert splitter.seen_targets is not None
 
 
+def _fake_suffix_splitter_for_model(model: torch.nn.Module):
+    return SimpleNamespace(
+        split_spec=SimpleNamespace(dynamic_batch=(1, 64)),
+        trace_plan=SimpleNamespace(
+            root_module=model,
+            nodes=[
+                SimpleNamespace(
+                    name="suffix_node",
+                    param_refs=[
+                        SimpleNamespace(name=name)
+                        for name, _parameter in model.named_parameters()
+                    ],
+                )
+            ],
+        ),
+        candidate=SimpleNamespace(suffix_nodes=["suffix_node"]),
+    )
+
+
 @pytest.mark.parametrize("model_name", ["rfdetr_nano", "yolov8n"])
 def test_proxy_selected_fixed_split_reuses_optimizer_across_outer_rounds(
     tmp_path,
@@ -1338,7 +1364,7 @@ def test_proxy_selected_fixed_split_reuses_optimizer_across_outer_rounds(
         num_epoch=2,
         proxy_metrics_before={"map": 0.1, "evaluated_samples": 1},
         prepared_trace_sample_input=None,
-        prepared_splitter=SimpleNamespace(split_spec=SimpleNamespace(dynamic_batch=(1, 64))),
+        prepared_splitter=_fake_suffix_splitter_for_model(model),
         prepared_candidate=object(),
         effective_batch_size=2,
         sample_metadata_by_id={},
@@ -1493,7 +1519,7 @@ def test_fixed_split_no_gt_uses_unified_outer_round_loop_without_reset(
         num_epoch=2,
         proxy_metrics_before={"map": None, "evaluated_samples": 0},
         prepared_trace_sample_input=None,
-        prepared_splitter=SimpleNamespace(split_spec=SimpleNamespace(dynamic_batch=(1, 64))),
+        prepared_splitter=_fake_suffix_splitter_for_model(model),
         prepared_candidate=object(),
         effective_batch_size=2,
         sample_metadata_by_id={},
@@ -1579,7 +1605,7 @@ def test_rfdetr_adaptive_early_stop_keeps_best_proxy_state(
         num_epoch=50,
         proxy_metrics_before={"map": 0.94, "evaluated_samples": 40},
         prepared_trace_sample_input=None,
-        prepared_splitter=SimpleNamespace(split_spec=SimpleNamespace(dynamic_batch=(1, 64))),
+        prepared_splitter=_fake_suffix_splitter_for_model(model),
         prepared_candidate=object(),
         effective_batch_size=20,
         sample_metadata_by_id={},
@@ -1654,7 +1680,7 @@ def test_rfdetr_subset_early_stop_waits_for_full_proxy_confirmation(
         num_epoch=25,
         proxy_metrics_before={"map": 0.94, "evaluated_samples": 40},
         prepared_trace_sample_input=None,
-        prepared_splitter=SimpleNamespace(split_spec=SimpleNamespace(dynamic_batch=(1, 64))),
+        prepared_splitter=_fake_suffix_splitter_for_model(model),
         prepared_candidate=object(),
         effective_batch_size=20,
         sample_metadata_by_id={},
@@ -1674,19 +1700,33 @@ def test_split_retrain_honors_optimizer_overrides(tmp_path):
         graph_signature="graph-sig",
     )
     save_split_feature_cache(cache_path, "s1", payload)
+    model = torch.nn.Linear(1, 1)
 
     class DummySplitter:
-        def __init__(self):
+        def __init__(self, root_model):
             self.optimizer = None
+            self.trace_plan = SimpleNamespace(
+                root_module=root_model,
+                nodes=[
+                    SimpleNamespace(
+                        name="suffix_node",
+                        param_refs=[
+                            SimpleNamespace(name=name)
+                            for name, _parameter in root_model.named_parameters()
+                        ],
+                    )
+                ],
+            )
+            self.candidate = SimpleNamespace(suffix_nodes=["suffix_node"])
 
         def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
             del boundary, targets, loss_fn
             self.optimizer = optimizer
             return torch.tensor(0.25), {}
 
-    splitter = DummySplitter()
+    splitter = DummySplitter(model)
     losses = universal_split_retrain(
-        model=torch.nn.Linear(1, 1),
+        model=model,
         sample_input=torch.ones(1, 1),
         cache_path=cache_path,
         all_indices=["s1"],

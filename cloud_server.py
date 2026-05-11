@@ -24,7 +24,6 @@ import torch
 from datetime import datetime, timezone
 import grpc
 from concurrent import futures
-from torch.utils.data import DataLoader
 from mapcalc import calculate_map
 
 from config import load_runtime_config
@@ -38,9 +37,6 @@ from cloud.sample_pool import CloudSamplePool
 
 import model_management.model_zoo as model_zoo
 from model_management.object_detection import Object_Detection
-from model_management.detection_annotations import load_annotation_targets
-from model_management.detection_dataset import DetectionDataset
-from model_management.detection_metric import RetrainMetric
 from model_management.detection_box_projection import (
     ORIGINAL_XYXY,
     infer_model_input_size,
@@ -53,7 +49,6 @@ from model_management.model_zoo import (
     get_detection_thresholds,
     get_model_detection_thresholds,
     invalidate_wrapper_predictor,
-    set_detection_finetune_mode,
     set_model_detection_thresholds,
 )
 from model_management.split_model_adapters import (
@@ -68,6 +63,7 @@ from model_management.universal_model_split import (
     SplitRetrainProfile,
     UniversalModelSplitter,
     build_split_retrain_optimizer,
+    collect_suffix_trainable_parameters,
     log_split_retrain_profile,
     universal_split_retrain,
     load_split_feature_cache,
@@ -3738,6 +3734,29 @@ class CloudContinualLearner:
                     "Cloud batch reconstruction expects one sample metadata record per raw path."
                 )
 
+            def _slice_payload_value(value: object, sample_offset: int, batch_size: int):
+                if isinstance(value, torch.Tensor):
+                    sliced = value
+                    if value.ndim > 0 and int(value.shape[0]) == batch_size:
+                        sliced = value[sample_offset : sample_offset + 1]
+                    return sliced.detach().cpu()
+                if isinstance(value, Mapping):
+                    return {
+                        key: _slice_payload_value(item, sample_offset, batch_size)
+                        for key, item in value.items()
+                    }
+                if isinstance(value, tuple):
+                    return tuple(
+                        _slice_payload_value(item, sample_offset, batch_size)
+                        for item in value
+                    )
+                if isinstance(value, list):
+                    return [
+                        _slice_payload_value(item, sample_offset, batch_size)
+                        for item in value
+                    ]
+                return value
+
             payloads: list[BoundaryPayload] = []
             chunk_size = max(
                 1,
@@ -3784,12 +3803,20 @@ class CloudContinualLearner:
                         for label, tensor in dict(batch_payload.tensors or {}).items()
                         if isinstance(tensor, torch.Tensor)
                     }
+                    sample_passthrough = {
+                        str(label): _slice_payload_value(
+                            value,
+                            sample_offset,
+                            execution_batch_size,
+                        )
+                        for label, value in dict(batch_payload.passthrough_inputs or {}).items()
+                    }
                     payloads.append(
                         replace(
                             batch_payload,
                             batch_size=1,
                             tensors=sample_tensors,
-                            passthrough_inputs={},
+                            passthrough_inputs=sample_passthrough,
                         )
                     )
             return payloads
@@ -4999,155 +5026,6 @@ class CloudContinualLearner:
             )
         return dict(metrics)
 
-    @staticmethod
-    def _build_training_frames(
-        *,
-        frame_dir: str,
-        frame_ids,
-        gt_annotations: Mapping[str, Mapping[str, object]],
-    ) -> list[dict[str, object]]:
-        frames: list[dict[str, object]] = []
-        for frame_id in frame_ids:
-            frame_key = str(frame_id)
-            target = gt_annotations.get(frame_key) or {}
-            boxes = list(target.get("boxes") or [])
-            labels = list(target.get("labels") or [])
-            if not boxes or not labels:
-                continue
-            frame_path = os.path.join(frame_dir, f"{frame_key}.jpg")
-            if not os.path.exists(frame_path):
-                logger.warning("[CL] Raw retrain frame {} not found at {}, skipping.", frame_key, frame_path)
-                continue
-            frames.append(
-                {
-                    "path": frame_path,
-                    "frame_index": frame_key,
-                    "boxes": boxes,
-                    "labels": labels,
-                }
-            )
-        return frames
-
-    def _retrain_edge_model_with_targets(
-        self,
-        *,
-        frame_dir: str,
-        frame_ids,
-        gt_annotations: Mapping[str, Mapping[str, object]],
-        num_epoch: int,
-        model_name: str | None = None,
-        edge_id: int | str | None = None,
-    ) -> bytes:
-        from model_management.model_zoo import (
-            get_model_family,
-            is_wrapper_model,
-            set_detection_trainable_params,
-        )
-
-        model_name = str(model_name or self.edge_model_name)
-        edge_weights = self._edge_weights_path(model_name, edge_id=edge_id)
-        model_family = get_model_family(model_name)
-
-        if is_wrapper_model(model_name):
-            raise NotImplementedError(
-                f"[CL] {model_name} is a wrapper model (YOLO/DETR/RT-DETR) and "
-                f"does not support torchvision-style retraining."
-            )
-
-        tmp_model = self._load_edge_training_model(model_name=model_name, edge_id=edge_id)
-        set_detection_trainable_params(tmp_model, model_name)
-
-        frames = self._build_training_frames(
-            frame_dir=frame_dir,
-            frame_ids=frame_ids,
-            gt_annotations=gt_annotations,
-        )
-        if not frames:
-            raise ValueError("No annotated raw frames were available for retraining.")
-
-        dataset = DetectionDataset(frames)
-        batch_size = self.batch_size
-        logger.info("[CL] Starting retraining with batch_size={}", batch_size)
-        data_loader = DataLoader(
-            dataset=dataset,
-            batch_size=batch_size,
-            collate_fn=_collate_fn,
-            **self._cloud_dataloader_kwargs(len(dataset)),
-        )
-        tr_metric = RetrainMetric()
-
-        roi_params = [p for p in tmp_model.parameters() if p.requires_grad]
-        if model_family == "tinynext":
-            optimizer = torch.optim.AdamW(roi_params, lr=5e-5, weight_decay=1e-4)
-            lr_scheduler = None
-        else:
-            optimizer = torch.optim.SGD(roi_params, lr=0.005, momentum=0.9, weight_decay=5e-4)
-            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
-
-        best_state = _snapshot_model_state(tmp_model)
-        best_metrics = None
-        if model_family == "tinynext" and gt_annotations:
-            best_metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
-                tmp_model,
-                frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
-                device=self.device,
-                model_name=model_name,
-            )
-            best_state = _snapshot_model_state(tmp_model)
-            if abs(calibrated_high - initial_high) > 1e-6:
-                logger.info(
-                    "[CL] Calibrated {} threshold_high {} -> {} on proxy set (proxy_mAP@0.5={:.4f}).",
-                    model_name,
-                    initial_high,
-                    calibrated_high,
-                    float(best_metrics.get("map") or 0.0),
-                )
-
-        for epoch in range(num_epoch):
-            set_detection_finetune_mode(tmp_model, model_name)
-            for images, targets in tr_metric.log_iter(epoch, num_epoch, data_loader):
-                images = [img.to(self.device) for img in images]
-                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
-                loss_dict = tmp_model(images, targets)
-                losses = sum(loss_dict.values())
-                optimizer.zero_grad()
-                losses.backward()
-                if model_family == "tinynext":
-                    torch.nn.utils.clip_grad_norm_(roi_params, 1.0)
-                optimizer.step()
-                tr_metric.update(loss_dict, losses)
-            if lr_scheduler is not None:
-                lr_scheduler.step()
-            if model_family == "tinynext" and gt_annotations:
-                candidate_metrics, _, calibrated_high = _calibrate_tinynext_proxy_thresholds(
-                    tmp_model,
-                    frame_dir=frame_dir,
-                    gt_annotations=gt_annotations,
-                    device=self.device,
-                    model_name=model_name,
-                )
-                if _proxy_metrics_are_better(candidate_metrics, best_metrics):
-                    best_metrics = candidate_metrics
-                    best_state = _snapshot_model_state(tmp_model)
-                    logger.info(
-                        "[CL] Kept TinyNeXt candidate from epoch {} with proxy_mAP@0.5={:.4f} and threshold_high={}.",
-                        epoch + 1,
-                        float(candidate_metrics.get("map") or 0.0),
-                        calibrated_high,
-                    )
-
-        if best_metrics is not None:
-            tmp_model.load_state_dict(best_state, strict=False)
-
-        torch.save(tmp_model.state_dict(), edge_weights)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        buf = io.BytesIO()
-        torch.save(tmp_model.state_dict(), buf)
-        return buf.getvalue()
-
     def _run_fixed_split_retrain(
         self,
         model: torch.nn.Module,
@@ -5169,21 +5047,24 @@ class CloudContinualLearner:
         proxy_eval_frame_cache: dict[str, np.ndarray | None] | None = None,
         preloaded_records: Mapping[str, Mapping[str, object]] | None = None,
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
-        model_zoo.set_detection_trainable_params(model, current_model_name)
-        trainable_param_count = sum(
-            int(parameter.numel())
-            for parameter in get_split_runtime_model(model).parameters()
-            if parameter.requires_grad
-        )
-        if trainable_param_count <= 0:
-            raise RuntimeError(
-                f"[FixedSplitCL] {current_model_name} has no trainable split-tail parameters."
+        split_runtime_model = get_split_runtime_model(model)
+        if prepared_splitter is not None:
+            suffix_params = collect_suffix_trainable_parameters(prepared_splitter)
+            trainable_param_count = sum(int(parameter.numel()) for parameter in suffix_params)
+            if trainable_param_count <= 0:
+                raise RuntimeError(
+                    f"[FixedSplitCL] {current_model_name} has no trainable split-tail parameters."
+                )
+            logger.info(
+                "[FixedSplitCL] {} split retrain enabled {} suffix parameter(s).",
+                self._resolve_fixed_split_training_label(current_model_name),
+                trainable_param_count,
             )
-        logger.info(
-            "[FixedSplitCL] {} split retrain enabled {} trainable parameter(s).",
-            self._resolve_fixed_split_training_label(current_model_name),
-            trainable_param_count,
-        )
+        else:
+            logger.info(
+                "[FixedSplitCL] {} split retrain will resolve suffix parameters after tracing.",
+                self._resolve_fixed_split_training_label(current_model_name),
+            )
         baseline_state = _snapshot_model_state(model)
         effective_num_epoch = num_epoch
         effective_learning_rate = self.default_split_learning_rate
@@ -5233,7 +5114,7 @@ class CloudContinualLearner:
 
         retrain_profile = SplitRetrainProfile()
         split_retrain_kwargs = {
-            "model": get_split_runtime_model(model),
+            "model": split_runtime_model,
             "sample_input": prepared_trace_sample_input,
             "cache_path": working_cache,
             "all_indices": bundle_info["all_sample_ids"],
@@ -5925,41 +5806,10 @@ class CloudContinualLearner:
         frame_indices: list[int],
         cache_path: str,
     ) -> tuple[bool, str, str]:
-        """Label frames with large model, retrain edge model, return weights.
-
-        Returns
-        -------
-        (success, base64_model_data, message)
-        """
-        num_epoch = self.default_num_epoch
-
-        if not frame_indices:
-            return False, "", "No frame indices provided."
-
-        with self._training_job_scope(edge_id):
-            try:
-                logger.info(
-                    f"[CL] Starting cloud retraining for edge {edge_id}: "
-                    f"{len(frame_indices)} frames, {num_epoch} epochs."
-                )
-                self._generate_annotations(
-                    edge_id, frame_indices, cache_path
-                )
-                model_bytes = self._retrain_edge_model(
-                    cache_path,
-                    frame_indices,
-                    num_epoch,
-                    edge_id=edge_id,
-                )
-                encoded = base64.b64encode(model_bytes).decode("utf-8")
-                logger.success(
-                    f"[CL] Retraining done for edge {edge_id}. "
-                    f"Model size: {len(model_bytes) // 1024} KB."
-                )
-                return True, encoded, "Retraining successful"
-            except Exception as exc:
-                logger.exception(f"[CL] Retraining failed for edge {edge_id}: {exc}")
-                return False, "", str(exc)
+        del edge_id, frame_indices, cache_path
+        message = "fixed-split training failed; legacy full-image retrain has been removed"
+        logger.error("[CL] {}", message)
+        return False, "", message
 
     # ------------------------------------------------------------------
     # Split-learning continual learning (HSFL-style)
@@ -6559,8 +6409,9 @@ class CloudContinualLearner:
                 return True, encoded, success_message
             except Exception as exc:
                 self._log_stage_duration("total round time", total_round_started)
-                logger.exception("[FixedSplitCL] Retraining failed for edge {}: {}", edge_id, exc)
-                return False, "", str(exc)
+                message = "fixed-split training failed; legacy full-image retrain has been removed"
+                logger.exception("[FixedSplitCL] {} for edge {}: {}", message, edge_id, exc)
+                return False, "", f"{message}: {exc}"
 
     def _split_retrain_edge_model(
         self,
@@ -6628,85 +6479,6 @@ class CloudContinualLearner:
         )
 
         return self._serialise_model_bytes(tmp_model, edge_id=edge_id)
-
-    # ------------------------------------------------------------------
-    # Internal helpers (original full-image retraining)
-    # ------------------------------------------------------------------
-
-    def _generate_annotations(
-        self, edge_id: int, frame_indices: list[int], cache_path: str
-    ) -> str:
-        """Run large model on frames; save annotation CSV; return its path."""
-        frame_dir = os.path.join(cache_path, "frames")
-        annotation_path = os.path.join(cache_path, "annotation.txt")
-        import cv2
-
-        rows: list[tuple] = []
-        pending_frames: list[tuple[int, np.ndarray]] = []
-        for idx in frame_indices:
-            img_path = os.path.join(frame_dir, f"{idx}.jpg")
-            if not os.path.exists(img_path):
-                logger.warning(f"[CL] Frame {idx} not found at {img_path}, skipping.")
-                continue
-            frame = cv2.imread(img_path)
-            if frame is None:
-                continue
-            pending_frames.append((idx, frame))
-
-        if not pending_frames:
-            self._finalize_teacher_ticket(
-                self._current_teacher_ticket(),
-                stage_label="legacy teacher annotation",
-                reason="no frames were available for teacher annotation",
-            )
-        else:
-            with self._teacher_annotation_scope(
-                "legacy teacher annotation",
-                sample_count=len(pending_frames),
-            ):
-                for idx, frame in pending_frames:
-                    pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
-                    if pred_boxes is None:
-                        pred_boxes, pred_class, pred_score = [], [], []
-                    for box, label, score in zip(pred_boxes, pred_class, pred_score):
-                        rows.append((idx, label, box[0], box[1], box[2], box[3], score, ""))
-
-        with open(annotation_path, "w", encoding="utf-8") as handle:
-            for row in rows:
-                frame_index, label, x1, y1, x2, y2, score, object_category = row
-                handle.write(
-                    (
-                        f"{int(frame_index)},{int(label)},"
-                        f"{float(x1):.6f},{float(y1):.6f},{float(x2):.6f},{float(y2):.6f},"
-                        f"{float(score):.6f},{object_category}\n"
-                    )
-                )
-        logger.info(f"[CL] Saved {len(rows)} annotations to {annotation_path}")
-        return annotation_path
-
-    def _retrain_edge_model(
-        self,
-        cache_path: str,
-        frame_indices,
-        num_epoch: int,
-        *,
-        model_name: str | None = None,
-        edge_id: int | str | None = None,
-    ) -> bytes:
-        """Fine-tune the lightweight model; return its state-dict as bytes."""
-        model_name = str(model_name or self.edge_model_name)
-        annotation_path = os.path.join(cache_path, "annotation.txt")
-        frame_dir = os.path.join(cache_path, "frames")
-        gt_annotations = load_annotation_targets(annotation_path)
-        return self._retrain_edge_model_with_targets(
-            frame_dir=frame_dir,
-            frame_ids=frame_indices,
-            gt_annotations=gt_annotations,
-            num_epoch=num_epoch,
-            model_name=model_name,
-            edge_id=edge_id,
-        )
-
 
 class CloudServer:
     def __init__(self, config):

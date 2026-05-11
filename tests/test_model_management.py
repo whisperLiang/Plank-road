@@ -48,8 +48,6 @@ from model_management.model_zoo import (
     get_model_family,
     is_wrapper_model,
     model_has_roi_heads,
-    set_detection_finetune_mode,
-    set_detection_trainable_params,
     set_model_detection_thresholds,
 )
 from model_management.object_detection import bgr_image_to_tensor
@@ -811,15 +809,6 @@ class TestModelZoo:
         assert cls_bias[12].item() == pytest.approx(80.0)
         assert cls_bias[COCO_80_TO_91[11]].item() == pytest.approx(11.0)
 
-    def test_set_detection_trainable_params_unfreezes_tinynext_extra_and_head(self):
-        model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
-
-        set_detection_trainable_params(model, "tinynext_s")
-
-        assert any(param.requires_grad for param in model.backbone.extra.parameters())
-        assert any(param.requires_grad for param in model.head.parameters())
-        assert not any(param.requires_grad for param in model.backbone.backbone.parameters())
-
     def test_tinynext_detection_thresholds_roundtrip_through_state_dict(self):
         model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
         set_model_detection_thresholds(
@@ -833,51 +822,6 @@ class TestModelZoo:
         reloaded.load_state_dict(model.state_dict(), strict=False)
 
         assert get_model_detection_thresholds(reloaded, "tinynext_s") == pytest.approx((0.02, 0.098))
-
-    def test_set_detection_finetune_mode_keeps_tinynext_batch_norm_in_eval(self):
-        model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
-        set_detection_trainable_params(model, "tinynext_s")
-
-        set_detection_finetune_mode(model, "tinynext_s")
-
-        assert model.training is True
-        assert model.head.training is True
-        batch_norm_layers = [
-            module for module in model.modules()
-            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
-        ]
-        assert batch_norm_layers
-        assert all(layer.training is False for layer in batch_norm_layers)
-
-    def test_set_detection_trainable_params_targets_rfdetr_transformer_tail(self):
-        class DummyCore(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.backbone = nn.Module()
-                self.backbone.projector = nn.Linear(4, 4)
-                self.transformer = nn.Module()
-                self.transformer.decoder = nn.Linear(4, 4)
-                self.transformer.enc_output = nn.Linear(4, 4)
-                self.transformer.enc_out_class_embed = nn.Linear(4, 4)
-
-        class DummyWrapper(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self._core = DummyCore()
-                self.rfdetr = SimpleNamespace(
-                    model=SimpleNamespace(model=self._core)
-                )
-
-            def parameters(self, recurse: bool = True):
-                return self._core.parameters(recurse=recurse)
-
-        model = DummyWrapper()
-        set_detection_trainable_params(model, "rfdetr_nano")
-
-        assert model._core.transformer.decoder.weight.requires_grad is True
-        assert model._core.transformer.enc_output.weight.requires_grad is True
-        assert model._core.transformer.enc_out_class_embed.weight.requires_grad is True
-        assert model._core.backbone.projector.weight.requires_grad is False
 
     def test_rfdetr_training_labels_keep_coco_category_ids(self):
         labels = _build_rfdetr_training_labels(

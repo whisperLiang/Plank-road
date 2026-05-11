@@ -852,18 +852,14 @@ class UniversalModelSplitter:
 
     def unfreeze_tail(self, chosen: SplitCandidate | None = None) -> None:
         del chosen
-        if self.model is not None:
-            for parameter in self.model.parameters():
-                parameter.requires_grad_(True)
+        collect_suffix_trainable_parameters(self)
 
     def get_tail_trainable_params(
         self,
         chosen: SplitCandidate | None = None,
     ) -> Iterable[torch.nn.Parameter]:
         del chosen
-        if self.model is None:
-            return []
-        return [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        return collect_suffix_trainable_parameters(self)
 
 
 def extract_split_features(splitter: UniversalModelSplitter, sample_input: Any) -> BoundaryPayload:
@@ -1437,10 +1433,67 @@ def _runtime_has_suffix_parameter_metadata(runtime: Any) -> bool:
     if runtime is None:
         return False
     ariadne_runtime = _ariadne_runtime_from_splitter(runtime)
+    suffix_segment = getattr(ariadne_runtime, "suffix_segment", None)
+    if isinstance(suffix_segment, torch.nn.Module):
+        return True
     return (
         getattr(ariadne_runtime, "trace_plan", None) is not None
         and getattr(ariadne_runtime, "candidate", None) is not None
     )
+
+
+def _runtime_requires_strict_suffix_optimizer(runtime: Any) -> bool:
+    if runtime is None:
+        return False
+    ariadne_runtime = _ariadne_runtime_from_splitter(runtime)
+    if _runtime_has_suffix_parameter_metadata(ariadne_runtime):
+        return True
+    module_name = str(type(ariadne_runtime).__module__)
+    return module_name.startswith("ariadne.")
+
+
+def _unique_parameters(parameters: Iterable[torch.nn.Parameter]) -> list[torch.nn.Parameter]:
+    unique: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for parameter in parameters:
+        if id(parameter) in seen:
+            continue
+        seen.add(id(parameter))
+        unique.append(parameter)
+    return unique
+
+
+def _runtime_root_module(ariadne_runtime: Any) -> torch.nn.Module | None:
+    trace_plan = getattr(ariadne_runtime, "trace_plan", None)
+    root_module = getattr(trace_plan, "root_module", None)
+    return root_module if isinstance(root_module, torch.nn.Module) else None
+
+
+def _set_suffix_training_state(ariadne_runtime: Any) -> None:
+    prefix_segment = getattr(ariadne_runtime, "prefix_segment", None)
+    training_prefix_segment = getattr(ariadne_runtime, "training_prefix_segment", None)
+    suffix_segment = getattr(ariadne_runtime, "suffix_segment", None)
+
+    for segment in (prefix_segment, training_prefix_segment):
+        if isinstance(segment, torch.nn.Module):
+            segment.eval()
+            for parameter in segment.parameters(recurse=True):
+                parameter.requires_grad_(False)
+    if isinstance(suffix_segment, torch.nn.Module):
+        suffix_segment.train()
+
+
+def _apply_batch_norm_suffix_training_state(root_module: torch.nn.Module | None) -> None:
+    if root_module is None:
+        return
+    for module in root_module.modules():
+        if not isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            continue
+        affine_params = list(module.parameters(recurse=False))
+        if affine_params and any(parameter.requires_grad for parameter in affine_params):
+            module.train()
+        else:
+            module.eval()
 
 
 def _suffix_parameter_names(runtime: Any) -> list[str]:
@@ -1472,9 +1525,44 @@ def _suffix_parameter_names(runtime: Any) -> list[str]:
 
 def collect_suffix_trainable_parameters(runtime: Any) -> list[torch.nn.Parameter]:
     ariadne_runtime = _ariadne_runtime_from_splitter(runtime)
+    _set_suffix_training_state(ariadne_runtime)
+
+    root_module = _runtime_root_module(ariadne_runtime)
+    suffix_segment = getattr(ariadne_runtime, "suffix_segment", None)
+    if isinstance(suffix_segment, torch.nn.Module):
+        suffix_params = _unique_parameters(suffix_segment.parameters(recurse=True))
+        if suffix_params:
+            prefix_segment = getattr(ariadne_runtime, "prefix_segment", None)
+            prefix_param_ids: set[int] = set()
+            if isinstance(prefix_segment, torch.nn.Module):
+                prefix_param_ids = {
+                    id(parameter)
+                    for parameter in prefix_segment.parameters(recurse=True)
+                }
+            overlaps_prefix = any(id(parameter) in prefix_param_ids for parameter in suffix_params)
+            if overlaps_prefix:
+                if (
+                    getattr(ariadne_runtime, "trace_plan", None) is None
+                    or getattr(ariadne_runtime, "candidate", None) is None
+                ):
+                    raise RuntimeError(
+                        "Ariadne suffix_segment parameters overlap prefix parameters and "
+                        "no suffix param_refs are available to construct a suffix-only optimizer."
+                    )
+            else:
+                if root_module is not None:
+                    for parameter in root_module.parameters():
+                        parameter.requires_grad_(False)
+                for parameter in suffix_params:
+                    parameter.requires_grad_(True)
+                _apply_batch_norm_suffix_training_state(root_module)
+                return suffix_params
+
     trace_plan = getattr(ariadne_runtime, "trace_plan", None)
     if trace_plan is None:
-        raise RuntimeError("Ariadne suffix optimizer requires runtime.trace_plan.")
+        raise RuntimeError(
+            "Ariadne suffix optimizer requires runtime.suffix_segment or runtime.trace_plan."
+        )
     root_module = getattr(trace_plan, "root_module", None)
     if root_module is None:
         raise RuntimeError("Ariadne suffix optimizer requires trace_plan.root_module.")
@@ -1498,6 +1586,7 @@ def collect_suffix_trainable_parameters(runtime: Any) -> list[torch.nn.Parameter
             params.append(parameter)
     if not params:
         raise RuntimeError("Ariadne suffix optimizer found no trainable suffix parameters.")
+    _apply_batch_norm_suffix_training_state(root_module)
     return params
 
 
@@ -1510,11 +1599,8 @@ def build_split_retrain_optimizer(
     weight_decay: float = 0.0,
     grad_clip_norm: float | None = None,
 ) -> torch.optim.Optimizer | _GradClippingOptimizer | None:
-    params = (
-        collect_suffix_trainable_parameters(runtime)
-        if _runtime_has_suffix_parameter_metadata(runtime)
-        else [parameter for parameter in model.parameters() if parameter.requires_grad]
-    )
+    del model
+    params = collect_suffix_trainable_parameters(runtime)
     if not params:
         return None
     normalized_name = str(optimizer_name or "adam").strip().lower()
@@ -1575,22 +1661,17 @@ def universal_split_retrain(
         raise RuntimeError("Split-tail training requires an explicit loss function.")
     runtime = splitter or UniversalModelSplitter(device=device).trace(model, sample_input)
     if optimizer is None:
-        optimizer = build_split_retrain_optimizer(
-            model,
-            runtime=runtime,
-            learning_rate=float(learning_rate),
-            optimizer_name=optimizer_name,
-            weight_decay=float(weight_decay),
-            grad_clip_norm=grad_clip_norm,
-        )
-    if optimizer is None and (
-        _runtime_has_suffix_parameter_metadata(runtime)
-        or any(True for _parameter in model.parameters())
-    ):
-        raise RuntimeError(
-            "Split-tail training found no trainable parameters; enable trainable "
-            "suffix parameters before retraining."
-        )
+        if _runtime_requires_strict_suffix_optimizer(runtime):
+            optimizer = build_split_retrain_optimizer(
+                model,
+                runtime=runtime,
+                learning_rate=float(learning_rate),
+                optimizer_name=optimizer_name,
+                weight_decay=float(weight_decay),
+                grad_clip_norm=grad_clip_norm,
+            )
+        else:
+            optimizer = None
     losses: list[float] = []
     annotations = dict(gt_annotations or {})
 
