@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 from loguru import logger
@@ -292,14 +292,21 @@ class SplitPlan:
         model_name: str,
         constraints: SplitConstraints,
         trace_signature: str | None,
+        input_tensor_shape: Sequence[int] | None = None,
         input_resize_mode: str = "direct_resize",
         front_version: str = "0",
     ) -> bool:
+        expected_shape = (
+            [int(dim) for dim in list(input_tensor_shape)]
+            if input_tensor_shape is not None
+            else None
+        )
         return (
             self.plan_version == FIXED_SPLIT_PLAN_VERSION
             and self.model_name == model_name
             and self.constraints == _constraints_payload(constraints)
             and self.trace_signature == trace_signature
+            and (expected_shape is None or self.input_tensor_shape == expected_shape)
             and self.input_resize_mode == str(input_resize_mode or "direct_resize")
             and self.front_version == str(front_version or "0")
         )
@@ -797,6 +804,7 @@ def load_or_compute_fixed_split_plan(
             time.perf_counter() - trace_started,
         )
     trace_signature = _trace_signature(runtime)
+    sample_input_shape = _input_tensor_shape_from_sample(sample_input)
     model_key = model_name or model.__class__.__name__
 
     if cache_path:
@@ -805,6 +813,7 @@ def load_or_compute_fixed_split_plan(
             model_name=model_key,
             constraints=constraints,
             trace_signature=trace_signature,
+            input_tensor_shape=sample_input_shape,
             input_resize_mode=input_resize_mode,
             front_version=front_version,
         ):

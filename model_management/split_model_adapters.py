@@ -670,6 +670,32 @@ def _infer_anchor_feature_shapes_from_head_outputs(
     if level_count <= 0:
         raise RuntimeError("Unable to infer anchor feature levels from detector metadata.")
 
+    if steps is not None and len(steps) >= 2:
+        shapes = [
+            (
+                max(1, int(math.ceil(float(height) / float(steps[0])))),
+                max(1, int(math.ceil(float(width) / float(steps[0])))),
+            ),
+            (
+                max(1, int(math.ceil(float(height) / float(steps[1])))),
+                max(1, int(math.ceil(float(width) / float(steps[1])))),
+            ),
+        ][:level_count]
+        while len(shapes) < level_count:
+            previous_height, previous_width = shapes[-1]
+            shapes.append(
+                (
+                    max(1, int(math.ceil(float(previous_height) / 2.0))),
+                    max(1, int(math.ceil(float(previous_width) / 2.0))),
+                )
+            )
+        expected = sum(
+            int(level_height * level_width * anchors)
+            for (level_height, level_width), anchors in zip(shapes, anchors_per_location, strict=True)
+        )
+        if expected == total_anchors:
+            return shapes
+
     common_strides = [2 ** (index + 3) for index in range(level_count)]
     shapes = [
         (

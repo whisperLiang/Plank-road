@@ -56,6 +56,7 @@ from model_management.split_model_adapters import (
     _build_rfdetr_training_labels,
     _build_ultralytics_training_batch,
     RFDETRReplay,
+    build_split_runtime_sample_input,
     get_split_runtime_model,
     get_split_runtime_input_resize_mode,
 )
@@ -896,6 +897,25 @@ class TestModelZoo:
         model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
 
         assert get_split_runtime_input_resize_mode(get_split_runtime_model(model)) == "direct_resize"
+
+    def test_tinynext_custom_input_size_preserves_direct_resize_contract(self):
+        model = build_detection_model(
+            "tinynext_s",
+            pretrained=False,
+            device="cpu",
+            tinynext_input_size=640,
+        )
+
+        sample_input = build_split_runtime_sample_input(
+            model,
+            image_size=(1080, 1920),
+            device="cpu",
+        )
+
+        assert model.transform.fixed_size == (640, 640)
+        assert model.anchor_generator.scales[0] == pytest.approx(48 / 640)
+        assert tuple(sample_input.shape) == (1, 3, 640, 640)
+        assert get_split_runtime_input_resize_mode(model) == "direct_resize"
 
     def test_ultralytics_core_split_runtime_resize_mode_is_letterbox(self):
         class FakeUltralyticsDetectionCore(torch.nn.Module):

@@ -208,6 +208,43 @@ def test_tinynext_split_loss_uses_suffix_head_outputs_without_backbone(monkeypat
     assert torch.isfinite(loss)
 
 
+def test_tinynext_split_loss_infers_high_resolution_feature_shapes():
+    model = build_detection_model(
+        "tinynext_s",
+        pretrained=False,
+        device="cpu",
+        tinynext_input_size=640,
+    )
+    runtime_model = get_split_runtime_model(model)
+    sample_input = build_split_runtime_sample_input(
+        model,
+        image_size=(1080, 1920),
+        device="cpu",
+    )
+    outputs = runtime_model(sample_input)
+    target = {
+        "boxes": [[1476.0, 281.0, 1566.0, 320.0]],
+        "labels": [3],
+        "label_coordinate_space": "original_xyxy",
+        "_split_meta": {
+            "input_image_size": [1080, 1920],
+            "input_tensor_shape": [1, 3, 640, 640],
+            "input_resize_mode": "direct_resize",
+        },
+    }
+
+    loss = build_split_training_loss(model)(outputs, [target])
+    loss.backward()
+
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    assert any(
+        parameter.grad is not None
+        for parameter in model.head.parameters()
+        if parameter.requires_grad
+    )
+
+
 def test_tinynext_split_replay_matches_full_runtime_structure():
     _model, runtime_model, sample_input, splitter = _tinynext_split_context()
     runtime_model.eval()

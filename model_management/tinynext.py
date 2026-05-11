@@ -335,10 +335,22 @@ def build_tinynext_detector(
     num_classes: int = 91,
     device: str | torch.device = "cpu",
     backbone_weights_path: str | Path | None = None,
+    image_size: int | tuple[int, int] = 320,
 ) -> SSD:
     name = variant.lower().replace("-", "_")
     if name not in TINYNEXT_VARIANTS:
         raise ValueError(f"Unsupported TinyNeXt detector variant: {variant}")
+    if isinstance(image_size, tuple):
+        if len(image_size) != 2:
+            raise ValueError("TinyNeXt image_size tuple must be (height, width).")
+        height, width = int(image_size[0]), int(image_size[1])
+        if height != width:
+            raise ValueError("TinyNeXt SSD detector requires a square fixed image_size.")
+        detector_size = height
+    else:
+        detector_size = int(image_size)
+    if detector_size <= 0:
+        raise ValueError("TinyNeXt image_size must be positive.")
 
     variant_cfg = TINYNEXT_VARIANTS[name]
     norm_layer = partial(nn.BatchNorm2d, eps=0.001, momentum=0.03)
@@ -355,7 +367,15 @@ def build_tinynext_detector(
 
     anchor_generator = DefaultBoxGenerator(
         [[2, 3] for _ in range(6)],
-        scales=[48 / 320, 100 / 320, 150 / 320, 202 / 320, 253 / 320, 304 / 320, 1.0],
+        scales=[
+            48 / detector_size,
+            100 / detector_size,
+            150 / detector_size,
+            202 / detector_size,
+            253 / detector_size,
+            304 / detector_size,
+            1.0,
+        ],
         steps=[16, 32, 64, 107, 160, 320],
     )
     head = SSDLiteHead(
@@ -367,7 +387,7 @@ def build_tinynext_detector(
     model = SSD(
         extractor,
         anchor_generator,
-        (320, 320),
+        (detector_size, detector_size),
         num_classes,
         head=head,
         score_thresh=0.02,

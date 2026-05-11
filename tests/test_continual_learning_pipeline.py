@@ -66,6 +66,7 @@ def _dummy_plan() -> SplitPlan:
             "max_payload_bytes": 32 * 1024 * 1024,
         },
         trace_signature="sig",
+        input_tensor_shape=[1],
     )
 
 

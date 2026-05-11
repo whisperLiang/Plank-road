@@ -37,7 +37,9 @@ server:
     assert config.client.resource_aware_trigger.probe_timeout_sec == pytest.approx(3.0)
     assert config.client.resource_aware_trigger.bandwidth_probe_size_bytes == 65536
     assert config.client.final_detection_threshold == 0.5
+    assert config.client.tinynext_input_size == 320
     assert config.server.golden == "yolo26x"
+    assert config.server.tinynext_input_size == 320
     assert config.server.workspace_root == "./cache/cloud-workspace"
     assert config.server.listen_address == "[::]:50051"
 
@@ -102,6 +104,7 @@ server:
             "resource_aware_trigger:\n    bandwidth_probe_size_bytes: 0",
             "client.resource_aware_trigger.bandwidth_probe_size_bytes",
         ),
+        ("tinynext_input_size: 0", "client.tinynext_input_size"),
         (
             "resource_aware_trigger:\n    bundle_min_bytes: 10\n    bundle_max_bytes: 5",
             "bundle_min_bytes must be <=",
@@ -185,6 +188,26 @@ server:
     config = load_runtime_config(config_path)
 
     assert config.client.final_detection_threshold == 0.65
+
+
+def test_load_runtime_config_reads_tinynext_input_size(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 10.0.0.1:50051
+  tinynext_input_size: 640
+server:
+  listen_address: "[::]:50051"
+  tinynext_input_size: 640
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.client.tinynext_input_size == 640
+    assert config.server.tinynext_input_size == 640
 
 
 def test_load_runtime_config_reads_das_strategy(tmp_path):

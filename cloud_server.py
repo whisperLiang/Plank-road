@@ -3145,12 +3145,49 @@ class CloudContinualLearner:
     def _native_training_source_label(self, model_name: str) -> str:
         return "pretrained" if model_name in model_lib else "randomly initialised"
 
-    def _build_native_training_model(self, model_name: str) -> torch.nn.Module:
+    def _detection_model_build_kwargs(
+        self,
+        model_name: str,
+        *,
+        runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
+    ) -> dict[str, object]:
+        if model_zoo.get_model_family(str(model_name)) != "tinynext":
+            return {}
+
+        input_size = int(getattr(self.config, "tinynext_input_size", 320))
+        shape = list(runtime_input_tensor_shape or [])
+        if len(shape) >= 4:
+            height = int(shape[-2])
+            width = int(shape[-1])
+            if height <= 0 or width <= 0:
+                raise RuntimeError(
+                    f"Invalid TinyNeXt runtime input shape: {runtime_input_tensor_shape!r}"
+                )
+            if height != width:
+                raise RuntimeError(
+                    "TinyNeXt SSD split runtime expects a square transformed input, "
+                    f"got {runtime_input_tensor_shape!r}."
+                )
+            input_size = height
+        return {"tinynext_input_size": input_size}
+
+    def _build_native_training_model(
+        self,
+        model_name: str,
+        *,
+        runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
+    ) -> torch.nn.Module:
         source_label = self._native_training_source_label(model_name)
         build_kwargs = {
             "pretrained": source_label == "pretrained",
             "device": self.device,
         }
+        build_kwargs.update(
+            self._detection_model_build_kwargs(
+                model_name,
+                runtime_input_tensor_shape=runtime_input_tensor_shape,
+            )
+        )
         if source_label == "pretrained":
             try:
                 artifact_path = model_zoo.ensure_local_model_artifact(model_name)
@@ -3220,6 +3257,7 @@ class CloudContinualLearner:
         model_name: str | None = None,
         edge_id: int | str | None = None,
         cache_policy: str = "auto",
+        runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
     ) -> torch.nn.Module:
         model_name = str(model_name or self.edge_model_name)
         cache_policy = str(cache_policy or "auto").strip().lower()
@@ -3235,7 +3273,10 @@ class CloudContinualLearner:
         native_source_label = self._native_training_source_label(model_name)
 
         if cache_policy == "native_only":
-            tmp_model = self._build_native_training_model(model_name)
+            tmp_model = self._build_native_training_model(
+                model_name,
+                runtime_input_tensor_shape=runtime_input_tensor_shape,
+            )
             tmp_model.to(self.device)
             get_split_runtime_model(tmp_model).eval()
             return tmp_model
@@ -3276,6 +3317,10 @@ class CloudContinualLearner:
                         model_name,
                         pretrained=False,
                         device=self.device,
+                        **self._detection_model_build_kwargs(
+                            model_name,
+                            runtime_input_tensor_shape=runtime_input_tensor_shape,
+                        ),
                     )
                     try:
                         load_result = tmp_model.load_state_dict(state, strict=False)
@@ -3310,7 +3355,10 @@ class CloudContinualLearner:
                     native_source_label,
                     model_name,
                 )
-                tmp_model = self._build_native_training_model(model_name)
+                tmp_model = self._build_native_training_model(
+                    model_name,
+                    runtime_input_tensor_shape=runtime_input_tensor_shape,
+                )
                 torch.save(tmp_model.state_dict(), edge_weights)
                 logger.info(
                     "[CL] Refreshed {} edge cache at {} using native {} weights.",
@@ -3329,7 +3377,10 @@ class CloudContinualLearner:
                 model_name,
                 native_source_label,
             )
-            tmp_model = self._build_native_training_model(model_name)
+            tmp_model = self._build_native_training_model(
+                model_name,
+                runtime_input_tensor_shape=runtime_input_tensor_shape,
+            )
         tmp_model.to(self.device)
         get_split_runtime_model(tmp_model).eval()
         return tmp_model
@@ -5939,6 +5990,9 @@ class CloudContinualLearner:
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
                     )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
+                manifest_runtime_input_shape = _runtime_input_tensor_shape_from_metadata(
+                    manifest
+                )
                 bundle_sample_count = self._count_manifest_training_samples(manifest)
                 effective_batch_size = self._resolve_fixed_split_runtime_batch_size(
                     current_model_name,
@@ -5990,6 +6044,7 @@ class CloudContinualLearner:
                         model_name=current_model_name,
                         edge_id=edge_id,
                         cache_policy="native_only",
+                        runtime_input_tensor_shape=manifest_runtime_input_shape,
                     )
                 else:
                     metadata = self._require_matching_edge_weights_metadata(
@@ -6008,6 +6063,7 @@ class CloudContinualLearner:
                         model_name=current_model_name,
                         edge_id=edge_id,
                         cache_policy="edge_only",
+                        runtime_input_tensor_shape=manifest_runtime_input_shape,
                     )
                 weights_metadata = {
                     "edge_id": int(edge_id),
@@ -6016,6 +6072,14 @@ class CloudContinualLearner:
                     "source_base_model_version": bundle_model_version,
                     "updated_at_ms": int(time.time() * 1000),
                 }
+                if (
+                    manifest_runtime_input_shape
+                    and len(manifest_runtime_input_shape) >= 4
+                    and model_zoo.get_model_family(str(current_model_name)) == "tinynext"
+                ):
+                    weights_metadata["tinynext_input_size"] = int(
+                        manifest_runtime_input_shape[-1]
+                    )
                 working_cache = self._fixed_split_working_cache_path(
                     edge_id=edge_id,
                     model_name=current_model_name,
@@ -6283,7 +6347,10 @@ class CloudContinualLearner:
                             current_model_name,
                             len(gt_annotations),
                         )
-                        tmp_model = self._build_native_training_model(current_model_name)
+                        tmp_model = self._build_native_training_model(
+                            current_model_name,
+                            runtime_input_tensor_shape=manifest_runtime_input_shape,
+                        )
                         baseline_source = "native pretrained"
                         tmp_model.to(self.device)
                         get_split_runtime_model(tmp_model).eval()

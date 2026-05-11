@@ -1332,6 +1332,9 @@ def build_detection_model(
     if name_lower in _TINYNEXT_MODELS:
         checkpoint_state_dict: dict[str, torch.Tensor] | None = None
         backbone_weights_path = None
+        tinynext_input_size = int(
+            kwargs.pop("tinynext_input_size", kwargs.pop("image_size", 320))
+        )
         if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
         if artifact_path is not None and artifact_path.is_file():
@@ -1347,6 +1350,7 @@ def build_detection_model(
             num_classes=num_classes,
             device=device,
             backbone_weights_path=backbone_weights_path,
+            image_size=tinynext_input_size,
         )
         ensure_detection_threshold_state(model, name_lower)
         if checkpoint_state_dict is not None and backbone_weights_path is None:

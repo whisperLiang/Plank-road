@@ -167,6 +167,7 @@ class ClientConfig(ConfigSection):
     frame_cache_maxsize: int = 100
     lightweight: str = "yolo26n"
     final_detection_threshold: float = 0.5
+    tinynext_input_size: int = 320
     server_ip: str = "192.168.66.205:50051"
     edge_id: int = 1
     edge_num: int = 1
@@ -185,6 +186,7 @@ class ServerConfig(ConfigSection):
     server_id: int = 0
     golden: str = "rtdetr_x"
     edge_model_name: str = "yolo26n"
+    tinynext_input_size: int = 320
     local_queue_maxsize: int = 10
     wait_thresh: int = 10
     listen_address: str = "[::]:50051"
@@ -438,6 +440,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "client.final_detection_threshold must be within [0, 1], "
             f"got {config.client.final_detection_threshold!r}"
         )
+    _validate_positive(
+        "client.tinynext_input_size",
+        int(config.client.tinynext_input_size),
+    )
     for name in (
         "coverage_iou_threshold",
         "quality_risk_threshold",
@@ -470,6 +476,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     _validate_positive("server.local_queue_maxsize", int(config.server.local_queue_maxsize))
     _validate_positive("server.wait_thresh", int(config.server.wait_thresh))
+    _validate_positive(
+        "server.tinynext_input_size",
+        int(config.server.tinynext_input_size),
+    )
     _validate_positive(
         "server.continual_learning.num_epoch",
         int(config.server.continual_learning.num_epoch),
