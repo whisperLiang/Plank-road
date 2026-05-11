@@ -647,6 +647,7 @@ class CloudSamplePool:
         accepted = 0
         duplicate_ids: list[str] = []
         invalid_ids: list[str] = []
+        invalid_reasons: dict[str, int] = {}
         seen: set[str] = set()
         for sample in samples:
             sample_id = str(sample.get("sample_id", "") or "").strip()
@@ -667,8 +668,10 @@ class CloudSamplePool:
                     sample_source=sample_source,
                     label_source=label_source,
                 )
-            except Exception:
+            except Exception as exc:
                 invalid_ids.append(sample_id)
+                reason = str(exc).strip() or type(exc).__name__
+                invalid_reasons[reason] = invalid_reasons.get(reason, 0) + 1
                 continue
             _atomic_torch_save(record, path)
             accepted += 1
@@ -677,6 +680,7 @@ class CloudSamplePool:
             "skipped_invalid": len(invalid_ids),
             "duplicate": len(duplicate_ids),
             "skipped_invalid_preview": invalid_ids[:10],
+            "skipped_invalid_reasons": invalid_reasons,
             "duplicate_preview": duplicate_ids[:10],
         }
 

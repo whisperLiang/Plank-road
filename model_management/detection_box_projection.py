@@ -187,19 +187,47 @@ def project_model_input_xyxy_to_original_xyxy(
     return _return_boxes(_clamp_xyxy(projected, original_size), was_tensor)
 
 
+def _list_or_empty(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return list(value)
+
+
+def _box_values(box: Any) -> list[float] | None:
+    try:
+        values = [float(value) for value in list(box)[:4]]
+    except (TypeError, ValueError):
+        return None
+    return values if len(values) == 4 else None
+
+
+def _normalise_boxes(boxes: Any) -> list[list[float]]:
+    normalised: list[list[float]] = []
+    for box in _list_or_empty(boxes):
+        values = _box_values(box)
+        if values is None:
+            raise ValueError("Detection boxes must be xyxy values.")
+        normalised.append(values)
+    return normalised
+
+
+def _normalise_ints(values: Any) -> list[int]:
+    return [int(value) for value in _list_or_empty(values)]
+
+
+def _normalise_floats(values: Any) -> list[float]:
+    return [float(value) for value in _list_or_empty(values)]
+
+
 def _labels_are_structurally_valid(labels: Mapping[str, Any]) -> bool:
-    boxes = list(labels.get("boxes") or [])
-    label_values = list(labels.get("labels") or [])
+    boxes = _list_or_empty(labels.get("boxes"))
+    label_values = _list_or_empty(labels.get("labels"))
     if bool(boxes) != bool(label_values):
         return False
     if boxes and len(boxes) != len(label_values):
         return False
     for box in boxes:
-        try:
-            values = [float(value) for value in list(box)[:4]]
-        except (TypeError, ValueError):
-            return False
-        if len(values) != 4:
+        if _box_values(box) is None:
             return False
     return True
 
@@ -207,9 +235,9 @@ def _labels_are_structurally_valid(labels: Mapping[str, Any]) -> bool:
 def _boxes_fit_size(labels: Mapping[str, Any], image_size: tuple[int, int]) -> bool:
     height, width = image_size
     epsilon = 1e-3
-    for box in list(labels.get("boxes") or []):
-        values = [float(value) for value in list(box or [])[:4]]
-        if len(values) != 4:
+    for box in _list_or_empty(labels.get("boxes")):
+        values = _box_values(box)
+        if values is None:
             return False
         if (
             values[0] < -epsilon
@@ -278,14 +306,14 @@ def canonicalize_labels_to_original_xyxy(
 
     original_size, model_input_size, resize_mode = require_coordinate_metadata(metadata)
     canonical = {
-        "boxes": list(labels.get("boxes") or []),
-        "labels": list(labels.get("labels") or []),
+        "boxes": _normalise_boxes(labels.get("boxes")),
+        "labels": _normalise_ints(labels.get("labels")),
         "label_coordinate_space": ORIGINAL_XYXY,
         "label_image_size": [int(original_size[0]), int(original_size[1])],
         "label_resize_mode": resize_mode,
     }
     if labels.get("scores") is not None:
-        canonical["scores"] = list(labels.get("scores") or [])
+        canonical["scores"] = _normalise_floats(labels.get("scores"))
     coordinate_space = str(labels.get("label_coordinate_space") or "").strip()
     if coordinate_space == MODEL_INPUT_XYXY:
         canonical["boxes"] = project_model_input_xyxy_to_original_xyxy(

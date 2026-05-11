@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 import json
 
+import numpy as np
 import pytest
 import torch
 
@@ -91,6 +92,29 @@ def _low_quality_candidate(sample_id: str, *, created_at: float = 0.0) -> dict:
         "input_resize_mode": "direct_resize",
         "created_at": created_at,
     }
+
+
+def test_stage_low_quality_accepts_teacher_numpy_boxes(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"))
+    candidate = _low_quality_candidate("teacher-numpy")
+    candidate["labels"] = {
+        "boxes": [np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)],
+        "labels": [np.int64(2)],
+        "scores": [np.float32(0.9)],
+        "label_coordinate_space": "original_xyxy",
+        "label_image_size": [64, 64],
+        "label_resize_mode": "direct_resize",
+    }
+
+    stats = pool.stage_low_quality_samples([candidate])
+
+    assert stats["accepted_to_staging"] == 1
+    assert stats["skipped_invalid"] == 0
+    staged = pool.load_staging_low_quality_samples()
+    assert staged[0]["labels"]["boxes"] == [[1.0, 2.0, 3.0, 4.0]]
+    assert staged[0]["labels"]["labels"] == [2]
+    assert staged[0]["labels"]["scores"] == pytest.approx([0.9])
 
 
 def test_high_quality_sync_stages_to_pending_and_does_not_touch_active(tmp_path):
