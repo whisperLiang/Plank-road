@@ -18,6 +18,8 @@ from loguru import logger
 import edge.transmit as transmit
 from edge.quality_assessor import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
+from model_management.detection_box_projection import ORIGINAL_XYXY
+from model_management.payload import BoundaryPayload
 HIGH_QUALITY_SYNC_PROTOCOL_VERSION = "high-quality-feature-label-shard.v2"
 UPLOAD_LEDGER_VERSION = "edge-sample-upload-ledger.v1"
 UPLOAD_LEDGER_FILENAME = "upload_ledger.json"
@@ -54,7 +56,9 @@ def _chunks(items: Sequence[StoredSampleRecord], size: int) -> list[list[StoredS
 
 
 def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
-    if isinstance(intermediate, torch.Tensor):
+    if isinstance(intermediate, BoundaryPayload):
+        source = dict(intermediate.tensors or {})
+    elif isinstance(intermediate, torch.Tensor):
         source = {"payload": intermediate}
     elif isinstance(intermediate, Mapping):
         source = dict(intermediate.get("tensors") or intermediate)
@@ -71,99 +75,22 @@ def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
 
 
 def _feature_sample_payload(intermediate: Any) -> dict[str, Any]:
+    if isinstance(intermediate, BoundaryPayload):
+        return {"boundary_payload": intermediate}
     return {"tensors": _tensor_only_features(intermediate)}
 
 
-def _image_size_from_value(value: object) -> tuple[int, int] | None:
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        height = int(value[0])
-        width = int(value[1])
-        if height > 0 and width > 0:
-            return height, width
-    return None
-
-
-def _model_input_size_from_shape(value: object) -> tuple[int, int] | None:
-    if isinstance(value, (list, tuple)) and len(value) >= 3:
-        height = int(value[-2])
-        width = int(value[-1])
-        if height > 0 and width > 0:
-            return height, width
-    return None
-
-
-def _project_box_to_model_input(
-    box: object,
-    *,
-    original_size: tuple[int, int],
-    model_input_size: tuple[int, int],
-    resize_mode: str,
-) -> list[float]:
-    values = [float(value) for value in list(box or [])[:4]]
-    if len(values) < 4:
-        return values
-    orig_h, orig_w = original_size
-    model_h, model_w = model_input_size
-    if str(resize_mode).strip().lower() == "letterbox":
-        scale = min(float(model_w) / float(orig_w), float(model_h) / float(orig_h))
-        resized_w = float(orig_w) * scale
-        resized_h = float(orig_h) * scale
-        pad_x = (float(model_w) - resized_w) * 0.5
-        pad_y = (float(model_h) - resized_h) * 0.5
-        values[0] = values[0] * scale + pad_x
-        values[2] = values[2] * scale + pad_x
-        values[1] = values[1] * scale + pad_y
-        values[3] = values[3] * scale + pad_y
-    else:
-        values[0] = values[0] * (float(model_w) / float(orig_w))
-        values[2] = values[2] * (float(model_w) / float(orig_w))
-        values[1] = values[1] * (float(model_h) / float(orig_h))
-        values[3] = values[3] * (float(model_h) / float(orig_h))
-    values[0] = max(0.0, min(float(model_w), values[0]))
-    values[2] = max(0.0, min(float(model_w), values[2]))
-    values[1] = max(0.0, min(float(model_h), values[1]))
-    values[3] = max(0.0, min(float(model_h), values[3]))
-    return values
-
-
-def _project_labels_to_model_input(
-    labels: Mapping[str, Any],
-    *,
-    record: StoredSampleRecord,
-) -> dict[str, Any]:
-    original_size = _image_size_from_value(getattr(record, "input_image_size", None))
-    model_input_size = _model_input_size_from_shape(
-        getattr(record, "input_tensor_shape", None)
-    )
-    if original_size is None or model_input_size is None:
-        return dict(labels)
-    if original_size == model_input_size:
-        return dict(labels)
-    projected = dict(labels)
-    projected["boxes"] = [
-        _project_box_to_model_input(
-            box,
-            original_size=original_size,
-            model_input_size=model_input_size,
-            resize_mode=str(getattr(record, "input_resize_mode", "") or "direct_resize"),
-        )
-        for box in list(labels.get("boxes") or [])
-    ]
-    return projected
-
-
 def _training_labels(result: Mapping[str, Any], record: StoredSampleRecord) -> dict[str, Any]:
-    labels = _project_labels_to_model_input(
-        {
-            "boxes": list(result.get("boxes") or []),
-            "labels": list(result.get("labels") or []),
-        },
-        record=record,
-    )
-    return {
-        "boxes": list(labels.get("boxes") or []),
-        "labels": list(labels.get("labels") or []),
+    labels: dict[str, Any] = {
+        "boxes": list(result.get("boxes") or []),
+        "labels": list(result.get("labels") or []),
+        "label_coordinate_space": ORIGINAL_XYXY,
     }
+    if getattr(record, "input_image_size", None) is not None:
+        labels["label_image_size"] = list(record.input_image_size or [])
+    if getattr(record, "input_resize_mode", None):
+        labels["label_resize_mode"] = str(record.input_resize_mode)
+    return labels
 
 
 def pack_high_quality_sync_bundle(
@@ -258,7 +185,7 @@ def pack_high_quality_sync_bundle_to_file(
         "edge_split_id": edge_split_id,
         "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
         "input_resize_mode": input_resize_mode,
-        "label_coordinate_space": "model_input_xyxy",
+        "label_coordinate_space": ORIGINAL_XYXY,
         "boundary_tensor_labels": boundary_tensor_labels,
         "request_id": resolved_request_id,
         "created_at": _utc_now(),
@@ -280,7 +207,14 @@ def pack_high_quality_sync_bundle_to_file(
                     sample_id = str(record.sample_id)
                     intermediate = sample_store.load_intermediate(record)
                     result = sample_store.load_inference_result(record)
-                    feature_payload["samples"][sample_id] = _feature_sample_payload(intermediate)
+                    feature_sample = _feature_sample_payload(intermediate)
+                    if record.input_image_size is not None:
+                        feature_sample["input_image_size"] = list(record.input_image_size)
+                    if record.input_tensor_shape is not None:
+                        feature_sample["input_tensor_shape"] = list(record.input_tensor_shape)
+                    if record.input_resize_mode is not None:
+                        feature_sample["input_resize_mode"] = str(record.input_resize_mode)
+                    feature_payload["samples"][sample_id] = feature_sample
                     labels = _training_labels(result, record)
                     label_lines.append(
                         json.dumps(
@@ -289,6 +223,32 @@ def pack_high_quality_sync_bundle_to_file(
                                 "boxes": labels["boxes"],
                                 "labels": labels["labels"],
                                 "scores": list(result.get("scores") or []),
+                                "label_coordinate_space": labels["label_coordinate_space"],
+                                **(
+                                    {"label_image_size": labels["label_image_size"]}
+                                    if labels.get("label_image_size") is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"label_resize_mode": labels["label_resize_mode"]}
+                                    if labels.get("label_resize_mode") is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"input_image_size": list(record.input_image_size or [])}
+                                    if record.input_image_size is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"input_tensor_shape": list(record.input_tensor_shape or [])}
+                                    if record.input_tensor_shape is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"input_resize_mode": str(record.input_resize_mode)}
+                                    if record.input_resize_mode is not None
+                                    else {}
+                                ),
                             },
                             sort_keys=True,
                             separators=(",", ":"),

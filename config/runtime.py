@@ -143,6 +143,7 @@ class SamplePoolConfig(ConfigSection):
     root_dir: str = "./cache/cloud_sample_pool"
     compact_threshold: float = 0.3
     enable_timing_logs: bool = False
+    enable_coordinate_debug: bool = False
 
 
 @dataclass
@@ -335,6 +336,11 @@ def _validate_sample_pool_config(name: str, value: SamplePoolConfig) -> None:
         raise ValueError(
             f"{name}.enable_timing_logs must be a boolean, "
             f"got {value.enable_timing_logs!r}"
+        )
+    if not isinstance(value.enable_coordinate_debug, bool):
+        raise ValueError(
+            f"{name}.enable_coordinate_debug must be a boolean, "
+            f"got {value.enable_coordinate_debug!r}"
         )
 
 

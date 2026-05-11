@@ -25,6 +25,11 @@ from model_management.model_zoo import (
     YOLODetectionModel,
     _postprocess_rfdetr_predictions,
 )
+from model_management.detection_box_projection import (
+    ORIGINAL_XYXY,
+    project_original_xyxy_to_model_input_xyxy,
+    require_coordinate_metadata,
+)
 from model_management.ultralytics_parity import (
     postprocess_predictions,
     preprocess_bgr_images,
@@ -1217,35 +1222,37 @@ def _infer_input_image_size(targets: Any) -> tuple[int, int]:
     split_meta = targets.get("_split_meta", {})
     input_tensor_shape = split_meta.get("input_tensor_shape")
     if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
-        return int(input_tensor_shape[-2]), int(input_tensor_shape[-1])
-    input_image_size = split_meta.get("input_image_size")
-    if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
-        return int(input_image_size[0]), int(input_image_size[1])
-    raise RuntimeError("Missing input image size metadata required for wrapper-model split retraining.")
+        height = int(input_tensor_shape[-2])
+        width = int(input_tensor_shape[-1])
+        if height > 0 and width > 0:
+            return height, width
+    raise RuntimeError("Missing input_tensor_shape metadata required for wrapper-model split retraining.")
 
 
 def _infer_original_and_model_input_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:
     if not isinstance(targets, dict):
         raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
     split_meta = targets.get("_split_meta", {})
-
-    original_image_size = None
-    input_image_size = split_meta.get("input_image_size")
-    if isinstance(input_image_size, (list, tuple)) and len(input_image_size) >= 2:
-        original_image_size = (int(input_image_size[0]), int(input_image_size[1]))
-
-    model_input_size = None
-    input_tensor_shape = split_meta.get("input_tensor_shape")
-    if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
-        model_input_size = (int(input_tensor_shape[-2]), int(input_tensor_shape[-1]))
-
-    if original_image_size is None and model_input_size is None:
-        raise RuntimeError("Missing input image size metadata required for wrapper-model split retraining.")
-    if original_image_size is None:
-        original_image_size = model_input_size
-    if model_input_size is None:
-        model_input_size = original_image_size
+    original_image_size, model_input_size, _resize_mode = require_coordinate_metadata(split_meta)
     return original_image_size, model_input_size
+
+
+def _infer_split_resize_mode(targets: Any) -> str:
+    if not isinstance(targets, dict):
+        raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
+    _original_image_size, _model_input_size, resize_mode = require_coordinate_metadata(
+        targets.get("_split_meta", {})
+    )
+    return resize_mode
+
+
+def _assert_original_xyxy_targets(targets: dict[str, Any]) -> None:
+    coordinate_space = str(targets.get("label_coordinate_space") or "").strip()
+    has_targets = bool(targets.get("boxes") or targets.get("labels"))
+    if coordinate_space != ORIGINAL_XYXY and (coordinate_space or has_targets):
+        raise RuntimeError(
+            "Split training targets must use original_xyxy canonical labels before model-specific loss conversion."
+        )
 
 
 def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -1260,6 +1267,7 @@ def _build_anchor_training_target(
     model_input_size: tuple[int, int],
     resize_mode: str = "letterbox",
 ) -> dict[str, torch.Tensor]:
+    _assert_original_xyxy_targets(targets)
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
         original_image_size,
@@ -1354,38 +1362,19 @@ def _project_boxes_to_model_input(
     model_input_size: tuple[int, int],
     resize_mode: str = "letterbox",
 ) -> torch.Tensor:
-    if boxes_xyxy.numel() == 0:
-        return boxes_xyxy.reshape(0, 4)
-
-    orig_height, orig_width = original_image_size
-    model_height, model_width = model_input_size
-    if orig_height <= 0 or orig_width <= 0 or model_height <= 0 or model_width <= 0:
-        raise RuntimeError("Image sizes must be positive for wrapper-model split retraining.")
-
-    if str(resize_mode).strip().lower() == "direct_resize":
-        projected = boxes_xyxy.clone()
-        projected[..., 0::2] = projected[..., 0::2] * (float(model_width) / float(orig_width))
-        projected[..., 1::2] = projected[..., 1::2] * (float(model_height) / float(orig_height))
-        return _clamp_xyxy_boxes(projected, model_input_size)
-
-    scale = min(float(model_width) / float(orig_width), float(model_height) / float(orig_height))
-    resized_width = float(orig_width) * scale
-    resized_height = float(orig_height) * scale
-    pad_x = (float(model_width) - resized_width) * 0.5
-    pad_y = (float(model_height) - resized_height) * 0.5
-
-    projected = boxes_xyxy.clone()
-    projected[..., 0::2] = projected[..., 0::2] * scale + pad_x
-    projected[..., 1::2] = projected[..., 1::2] * scale + pad_y
-    return _clamp_xyxy_boxes(projected, model_input_size)
+    projected = project_original_xyxy_to_model_input_xyxy(
+        boxes_xyxy,
+        original_image_size,
+        model_input_size,
+        resize_mode,
+    )
+    if not isinstance(projected, torch.Tensor):
+        projected = torch.as_tensor(projected, dtype=boxes_xyxy.dtype, device=boxes_xyxy.device)
+    return projected.to(device=boxes_xyxy.device, dtype=boxes_xyxy.dtype).reshape(-1, 4)
 
 
 def _resolve_anchor_resize_mode(model: torch.nn.Module, targets: Any) -> str:
-    split_meta = targets.get("_split_meta", {}) if isinstance(targets, dict) else {}
-    metadata_mode = str(split_meta.get("input_resize_mode", "")).strip().lower()
-    if metadata_mode in {"direct_resize", "letterbox"}:
-        return metadata_mode
-    return get_split_runtime_input_resize_mode(model) or "letterbox"
+    return _infer_split_resize_mode(targets)
 
 
 def _prepare_coco80_targets(
@@ -1394,6 +1383,8 @@ def _prepare_coco80_targets(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
     original_image_size, model_input_size = _infer_ultralytics_image_sizes(targets)
+    resize_mode = _infer_split_resize_mode(targets)
+    _assert_original_xyxy_targets(targets)
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
         original_image_size,
@@ -1428,6 +1419,7 @@ def _prepare_coco80_targets(
         boxes.index_select(0, keep_tensor),
         original_image_size=original_image_size,
         model_input_size=model_input_size,
+        resize_mode=resize_mode,
     )
     labels = torch.as_tensor(mapped_labels, dtype=torch.int64, device=device)
     valid_geometry = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
@@ -1472,7 +1464,9 @@ def _build_ultralytics_training_batch(
             else:
                 batch_idx_pieces.append(torch.full((labels.shape[0],), int(batch_index), dtype=torch.long, device=device))
 
-        height, width = image_size if image_size is not None else (224, 224)
+        if image_size is None:
+            raise RuntimeError("Missing model input size metadata for wrapper-model split retraining batch.")
+        height, width = image_size
         bboxes = torch.cat(box_pieces, dim=0) if box_pieces else torch.zeros((0, 4), dtype=torch.float32, device=device)
         cls = torch.cat(label_pieces, dim=0) if label_pieces else torch.zeros((0, 1), dtype=torch.float32, device=device)
         batch_idx = (
@@ -1498,17 +1492,20 @@ def _build_detr_training_labels(
     device: torch.device,
     num_labels: int,
 ) -> list[dict[str, torch.Tensor]]:
-    image_size = _infer_input_image_size(targets)
-    split_meta = targets.get("_split_meta", {}) if isinstance(targets, dict) else {}
-    original_image_size = split_meta.get("input_image_size")
-    if isinstance(original_image_size, (list, tuple)) and len(original_image_size) >= 2:
-        original_image_size = (int(original_image_size[0]), int(original_image_size[1]))
-    else:
-        original_image_size = image_size
+    original_image_size, image_size = _infer_original_and_model_input_image_sizes(targets)
+    resize_mode = _infer_split_resize_mode(targets)
+    _assert_original_xyxy_targets(targets)
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
-        image_size if original_image_size != image_size else original_image_size,
+        original_image_size,
     )
+    if original_image_size != image_size:
+        boxes = _project_boxes_to_model_input(
+            boxes,
+            original_image_size=original_image_size,
+            model_input_size=image_size,
+            resize_mode=resize_mode,
+        )
     boxes = _clamp_xyxy_boxes(boxes, image_size)
     labels = _as_labels_tensor(targets.get("labels"), device=device)
     if boxes.shape[0] != labels.shape[0]:
@@ -1534,20 +1531,13 @@ def _build_rfdetr_training_labels(
     device: torch.device,
     num_classes: int,
 ) -> list[dict[str, torch.Tensor]]:
-    image_size = _infer_input_image_size(targets)
-    split_meta = targets.get("_split_meta", {}) if isinstance(targets, dict) else {}
-    original_image_size = split_meta.get("input_image_size")
-    if isinstance(original_image_size, (list, tuple)) and len(original_image_size) >= 2:
-        original_image_size = (int(original_image_size[0]), int(original_image_size[1]))
-    else:
-        original_image_size = image_size
+    original_image_size, image_size = _infer_original_and_model_input_image_sizes(targets)
+    resize_mode = _infer_split_resize_mode(targets)
+    _assert_original_xyxy_targets(targets)
     boxes = _clamp_xyxy_boxes(
         _as_boxes_tensor(targets.get("boxes"), device=device),
         original_image_size,
     )
-    resize_mode = str(split_meta.get("input_resize_mode", "")).strip().lower()
-    if resize_mode not in {"direct_resize", "letterbox"}:
-        resize_mode = "direct_resize"
     if original_image_size != image_size:
         boxes = _project_boxes_to_model_input(
             boxes,

@@ -12,7 +12,7 @@ import cv2
 import torch
 
 from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY
-from model_management.payload import BoundaryPayload
+from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 
 
 SAMPLE_STORE_VERSION = "edge-sample-store.v2"
@@ -71,16 +71,50 @@ def _from_relpath(root_dir: str, relpath: str | None) -> str | None:
     return os.path.join(root_dir, relpath.replace("/", os.sep))
 
 
+def _detach_cpu_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {str(key): _detach_cpu_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_detach_cpu_value(item) for item in value)
+    if isinstance(value, list):
+        return [_detach_cpu_value(item) for item in value]
+    return value
+
+
+def _detach_boundary_payload(payload: BoundaryPayload) -> BoundaryPayload:
+    tensors = {
+        str(label): tensor.detach().cpu()
+        for label, tensor in dict(payload.tensors or {}).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    passthrough_inputs = {
+        str(label): _detach_cpu_value(value)
+        for label, value in dict(payload.passthrough_inputs or {}).items()
+    }
+    return boundary_payload_from_tensors(
+        tensors,
+        split_id=str(payload.split_id),
+        graph_signature=str(payload.graph_signature),
+        batch_size=int(payload.batch_size),
+        schema=dict(getattr(payload, "schema", {}) or {}),
+        requires_grad=dict(getattr(payload, "requires_grad", {}) or {}),
+        weight_version=getattr(payload, "weight_version", None),
+        passthrough_inputs=passthrough_inputs,
+    )
+
+
 def _normalise_payload(
     intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     if isinstance(intermediate, BoundaryPayload):
         source = dict(getattr(intermediate, "tensors", {}) or {})
-    if isinstance(intermediate, torch.Tensor):
+    elif isinstance(intermediate, torch.Tensor):
         source = {"payload": intermediate}
     elif isinstance(intermediate, dict):
         source = dict(intermediate.get("tensors") or intermediate)
-    elif not isinstance(intermediate, BoundaryPayload):
+    else:
         raise TypeError(f"Unsupported split feature type: {type(intermediate)!r}")
     tensors = {
         str(key): value.detach().cpu()
@@ -90,6 +124,14 @@ def _normalise_payload(
     if not tensors:
         raise ValueError("Cached split feature did not contain tensor values.")
     return tensors
+
+
+def _payload_for_storage(
+    intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
+) -> BoundaryPayload | dict[str, torch.Tensor]:
+    if isinstance(intermediate, BoundaryPayload):
+        return _detach_boundary_payload(intermediate)
+    return _normalise_payload(intermediate)
 
 
 @dataclass
@@ -395,7 +437,7 @@ class EdgeSampleStore:
         )
 
         ts = timestamp or datetime.now(timezone.utc).isoformat()
-        payload = _normalise_payload(intermediate)
+        payload = _payload_for_storage(intermediate)
 
         feature_path = os.path.join(self.features_dir, f"{sample_key}.pt")
         result_path = os.path.join(self.results_dir, f"{sample_key}.json")
@@ -527,13 +569,13 @@ class EdgeSampleStore:
             with open(result_path, "r", encoding="utf-8") as handle:
                 return json.load(handle)
 
-    def load_intermediate(self, record: StoredSampleRecord) -> dict[str, torch.Tensor]:
+    def load_intermediate(self, record: StoredSampleRecord) -> BoundaryPayload | dict[str, torch.Tensor]:
         with self._lock:
             feature_path = _from_relpath(self.root_dir, record.feature_relpath)
             payload = torch.load(feature_path, map_location="cpu", weights_only=False)
             feature = payload.get("feature") if isinstance(payload, dict) else payload
             if isinstance(feature, BoundaryPayload):
-                return _normalise_payload(feature)
+                return _detach_boundary_payload(feature)
             if isinstance(feature, dict):
                 return _normalise_payload(feature)
             if isinstance(feature, torch.Tensor):

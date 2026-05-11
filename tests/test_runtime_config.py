@@ -727,6 +727,7 @@ server:
     assert config.sample_pool.root_dir == "./cache/cloud_sample_pool"
     assert config.sample_pool.compact_threshold == pytest.approx(0.3)
     assert config.sample_pool.enable_timing_logs is False
+    assert config.sample_pool.enable_coordinate_debug is False
     assert config.client.sample_pool is config.sample_pool
     assert config.server.sample_pool is config.sample_pool
 
@@ -765,6 +766,7 @@ server:
         ("compact_threshold", "1.1"),
         ("root_dir", '""'),
         ("enable_timing_logs", "1"),
+        ("enable_coordinate_debug", "1"),
     ],
 )
 def test_load_runtime_config_rejects_invalid_sample_pool_settings(

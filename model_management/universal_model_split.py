@@ -1168,6 +1168,14 @@ def _cached_boundary_batch_size(record: Mapping[str, Any]) -> int | None:
     return batch_size if batch_size > 1 else None
 
 
+def _record_runtime_signature(record: Mapping[str, Any]) -> tuple[tuple[int, ...], str]:
+    input_tensor_shape = tuple(
+        int(dim) for dim in list(record.get("input_tensor_shape") or [])
+    )
+    input_resize_mode = str(record.get("input_resize_mode") or "")
+    return input_tensor_shape, input_resize_mode
+
+
 def _tensor_payloads_equal(
     first: Mapping[str, Any],
     second: Mapping[str, Any],
@@ -1370,6 +1378,9 @@ def _load_cached_split_batches(
                 index = all_indices[position]
                 record = first_record if not segment_indices else _record_for_index(index)
                 if _cached_boundary_batch_size(record) is not None:
+                    break
+                record_signature = _record_runtime_signature(record)
+                if segment_records and record_signature != _record_runtime_signature(segment_records[0]):
                     break
                 segment_indices.append(index)
                 segment_records.append(record)

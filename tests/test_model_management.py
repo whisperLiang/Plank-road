@@ -32,6 +32,9 @@ from model_management.utils import (
 from model_management.detection_transforms import Compose, ToTensor, Resize
 from model_management.detection_metric import RetrainMetric
 from model_management.detection_dataset import DetectionDataset
+from model_management.detection_box_projection import (
+    project_original_xyxy_to_model_input_xyxy,
+)
 from model_management.model_zoo import (
     COCO_80_TO_91,
     build_detection_model,
@@ -881,9 +884,11 @@ class TestModelZoo:
             {
                 "boxes": [[1.0, 2.0, 6.0, 7.0], [1.0, 2.0, 5.0, 6.0]],
                 "labels": [13, 90],
+                "label_coordinate_space": "original_xyxy",
                 "_split_meta": {
                     "input_image_size": [8, 8],
                     "input_tensor_shape": [1, 3, 8, 8],
+                    "input_resize_mode": "direct_resize",
                 },
             },
             device=torch.device("cpu"),
@@ -892,11 +897,12 @@ class TestModelZoo:
 
         assert labels[0]["labels"].tolist() == [13, 90]
 
-    def test_rfdetr_training_labels_project_direct_resize_geometry(self):
+    def test_rfdetr_training_targets_use_expected_normalized_format(self):
         labels = _build_rfdetr_training_labels(
             {
                 "boxes": [[192.0, 270.0, 960.0, 810.0]],
                 "labels": [3],
+                "label_coordinate_space": "original_xyxy",
                 "_split_meta": {
                     "input_image_size": [1080, 1920],
                     "input_tensor_shape": [1, 3, 384, 384],
@@ -911,16 +917,37 @@ class TestModelZoo:
         assert labels[0]["boxes"].shape == (1, 4)
         assert labels[0]["boxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.5])
 
+    def test_project_original_xyxy_to_model_input_letterbox_yolo(self):
+        projected = project_original_xyxy_to_model_input_xyxy(
+            [[1000.0, 300.0, 1020.0, 320.0]],
+            (720, 1280),
+            (640, 640),
+            "letterbox",
+        )
+
+        assert projected[0] == pytest.approx([500.0, 290.0, 510.0, 300.0])
+
+    def test_project_original_xyxy_to_model_input_direct_resize_tinynext(self):
+        projected = project_original_xyxy_to_model_input_xyxy(
+            [[1000.0, 300.0, 1020.0, 320.0]],
+            (720, 1280),
+            (384, 384),
+            "direct_resize",
+        )
+
+        assert projected[0] == pytest.approx([300.0, 160.0, 306.0, 170.6666667])
+
     def test_rfdetr_split_runtime_resize_mode_is_direct_resize(self):
         model = build_detection_model("rfdetr_nano", pretrained=False, device="cpu")
 
         assert get_split_runtime_input_resize_mode(model) == "direct_resize"
 
-    def test_ultralytics_training_batch_ignores_stale_resize_metadata(self):
+    def test_ultralytics_training_batch_uses_resize_metadata(self):
         batch = _build_ultralytics_training_batch(
             {
                 "boxes": [[64.0, 96.0, 320.0, 384.0]],
                 "labels": [3],
+                "label_coordinate_space": "original_xyxy",
                 "_split_meta": {
                     "input_image_size": [480, 640],
                     "input_tensor_shape": [1, 3, 640, 640],
@@ -932,16 +959,18 @@ class TestModelZoo:
 
         assert tuple(batch["img"].shape) == (1, 3, 640, 640)
         assert batch["bboxes"].shape == (1, 4)
-        assert batch["bboxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.45])
+        assert batch["bboxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.6])
 
-    def test_ultralytics_training_batch_keeps_legacy_letterbox_projection_without_resize_mode(self):
+    def test_yolo_training_targets_are_letterboxed_once_only(self):
         batch = _build_ultralytics_training_batch(
             {
-                "boxes": [[64.0, 96.0, 320.0, 384.0]],
+                "boxes": [[1000.0, 300.0, 1020.0, 320.0]],
                 "labels": [3],
+                "label_coordinate_space": "original_xyxy",
                 "_split_meta": {
-                    "input_image_size": [480, 640],
+                    "input_image_size": [720, 1280],
                     "input_tensor_shape": [1, 3, 640, 640],
+                    "input_resize_mode": "letterbox",
                 },
             },
             device=torch.device("cpu"),
@@ -949,22 +978,71 @@ class TestModelZoo:
 
         assert tuple(batch["img"].shape) == (1, 3, 640, 640)
         assert batch["bboxes"].shape == (1, 4)
-        assert batch["bboxes"][0].tolist() == pytest.approx([0.3, 0.5, 0.4, 0.45])
+        assert batch["bboxes"][0].tolist() == pytest.approx(
+            [505.0 / 640.0, 295.0 / 640.0, 10.0 / 640.0, 10.0 / 640.0]
+        )
 
-    def test_anchor_training_target_uses_direct_resize_for_fixed_size_anchor_detectors(self):
+    def test_cloud_training_rejects_missing_coordinate_metadata(self):
+        with pytest.raises(RuntimeError, match="input_image_size"):
+            _build_ultralytics_training_batch(
+                {
+                    "boxes": [[1000.0, 300.0, 1020.0, 320.0]],
+                    "labels": [3],
+                    "label_coordinate_space": "original_xyxy",
+                    "_split_meta": {
+                        "input_tensor_shape": [1, 3, 640, 640],
+                        "input_resize_mode": "letterbox",
+                    },
+                },
+                device=torch.device("cpu"),
+            )
+        with pytest.raises(RuntimeError, match="input_image_size"):
+            _build_ultralytics_training_batch(
+                {
+                    "boxes": [[1000.0, 300.0, 1020.0, 320.0]],
+                    "labels": [3],
+                    "label_coordinate_space": "original_xyxy",
+                    "_split_meta": {
+                        "label_image_size": [720, 1280],
+                        "input_tensor_shape": [1, 3, 640, 640],
+                        "input_resize_mode": "letterbox",
+                    },
+                },
+                device=torch.device("cpu"),
+            )
+
+    def test_training_targets_require_explicit_coordinate_space(self):
+        with pytest.raises(RuntimeError, match="original_xyxy"):
+            _build_ultralytics_training_batch(
+                {
+                    "boxes": [[1000.0, 300.0, 1020.0, 320.0]],
+                    "labels": [3],
+                    "_split_meta": {
+                        "input_image_size": [720, 1280],
+                        "input_tensor_shape": [1, 3, 640, 640],
+                        "input_resize_mode": "letterbox",
+                    },
+                },
+                device=torch.device("cpu"),
+            )
+
+    def test_anchor_training_targets_use_transformed_coordinate_space(self):
         target = _build_anchor_training_target(
             {
-                "boxes": [[64.0, 96.0, 320.0, 384.0]],
+                "boxes": [[1000.0, 300.0, 1020.0, 320.0]],
                 "labels": [3],
+                "label_coordinate_space": "original_xyxy",
             },
             device=torch.device("cpu"),
-            original_image_size=(480, 640),
-            model_input_size=(320, 320),
+            original_image_size=(720, 1280),
+            model_input_size=(384, 384),
             resize_mode="direct_resize",
         )
 
         assert target["boxes"].shape == (1, 4)
-        assert target["boxes"][0].tolist() == pytest.approx([32.0, 64.0, 160.0, 256.0])
+        assert target["boxes"][0].tolist() == pytest.approx(
+            [300.0, 160.0, 306.0, 170.6666667]
+        )
 
     def test_build_yolo26_detector_from_yaml_when_pretrained_false(self):
         model = build_detection_model("yolo26n", pretrained=False, device="cpu")

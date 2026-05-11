@@ -420,7 +420,7 @@ class EdgeWorker:
                     get_split_runtime_input_resize_mode(split_model)
                     or "direct_resize"
                 ),
-                front_version=self.front_version,
+                front_version=str(getattr(self, "front_version", "0") or "0"),
             )
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
@@ -1036,7 +1036,7 @@ class EdgeWorker:
             "split_config_id": self.fixed_split_plan.split_config_id,
             "model_id": self.model_id,
             "model_version": self.model_version,
-            "front_version": self.front_version,
+            "front_version": str(getattr(self, "front_version", "0") or "0"),
             "quality_bucket": quality.quality_bucket,
             "quality_score": quality.quality_score,
             "risk_score": quality.risk_score,

@@ -2096,7 +2096,9 @@ def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
             "split_label": "after:model.backbone.0.encoder.encoder.embeddings.patch_embeddings.projection",
             "trace_signature": "edge-trace",
         },
-        "samples": [{"sample_id": "s1"}],
+        "input_tensor_shape": [1, 3, 384, 384],
+        "input_resize_mode": "direct_resize",
+        "samples": [{"sample_id": "s1", "input_tensor_shape": [1, 3, 384, 384]}],
     }
 
     key = learner._fixed_split_runtime_template_key(
@@ -2112,6 +2114,7 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     tmp_path,
     monkeypatch,
 ):
+    import cloud_server
     from cloud_server import CloudContinualLearner
 
     learner = CloudContinualLearner(
@@ -2127,7 +2130,9 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "0"},
         "split_plan": {"split_label": "after:node_1"},
-        "samples": [{"sample_id": "s1"}],
+        "input_tensor_shape": [1, 3, 4, 4],
+        "input_resize_mode": "direct_resize",
+        "samples": [{"sample_id": "s1", "input_tensor_shape": [1, 3, 4, 4]}],
     }
 
     def fake_build_trace_input(model, bundle_root, manifest, *, runtime_batch_size=None):
@@ -2158,6 +2163,23 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         "_prepare_replayable_split_runtime",
         fake_prepare_replayable_split_runtime,
     )
+    monkeypatch.setattr(
+        cloud_server,
+        "canonical_split_key_for_candidate",
+        lambda _candidate: "after:node_1",
+    )
+
+    class FakeVerifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def bind_runtime(self, *args, **kwargs):
+            return self
+
+        def enumerate_candidates(self):
+            return [object()]
+
+    monkeypatch.setattr(cloud_server, "UniversalModelSplitter", FakeVerifier)
 
     template_key = learner._fixed_split_runtime_template_key(
         model_name="rfdetr_nano",
@@ -2205,7 +2227,9 @@ def test_cloud_fixed_split_working_cache_rebuild_with_template_hit_skips_trace_i
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "1"},
         "split_plan": {"split_label": "after:node_1"},
-        "samples": [{"sample_id": "s1"}],
+        "input_tensor_shape": [1, 3, 4, 4],
+        "input_resize_mode": "direct_resize",
+        "samples": [{"sample_id": "s1", "input_tensor_shape": [1, 3, 4, 4]}],
     }
     template_key = learner._fixed_split_runtime_template_key(
         model_name="rfdetr_nano",
@@ -2586,10 +2610,6 @@ _FORBIDDEN_SHARD_METADATA = {
     "motion_uncovered_score",
     "track_uncovered_score",
     "window_id",
-    "input_image_size",
-    "input_tensor_shape",
-    "input_resize_mode",
-    "scores",
 }
 
 
@@ -2606,6 +2626,9 @@ def _store_high_quality_for_shard(store, *, sample_id, frame_index, plan):
         risk_score=0.01,
         inference_result={"boxes": [[1, 2, 3, 4]], "labels": [frame_index % 3], "scores": [0.9]},
         intermediate=_planned_payload(plan),
+        input_image_size=[64, 64],
+        input_tensor_shape=[1, 3, 64, 64],
+        input_resize_mode="direct_resize",
     )
 
 
@@ -2657,7 +2680,7 @@ def test_high_quality_sync_bundle_uses_feature_label_shards_without_metadata(tmp
         output_dir=str(tmp_path),
     )
     try:
-        assert manifest["protocol_version"] == "high-quality-feature-label-shard.v1"
+        assert manifest["protocol_version"] == "high-quality-feature-label-shard.v2"
         assert manifest["shard_size"] == 64
         assert manifest["shards"][0]["sample_count"] == 5
         assert stats["shard_count"] == 1
@@ -2676,16 +2699,18 @@ def test_high_quality_sync_bundle_uses_feature_label_shards_without_metadata(tmp
             )
             assert feature_payload["schema_version"] == 1
             assert set(feature_payload["samples"]) == {f"high-{index}" for index in range(5)}
-            assert "tensors" in feature_payload["samples"]["high-0"]
+            assert "boundary_payload" in feature_payload["samples"]["high-0"]
+            assert "tensors" not in feature_payload["samples"]["high-0"]
             label_lines = archive.read(shard["label_file"]).decode("utf-8").splitlines()
             assert len(label_lines) == 5
             label_entry = json.loads(label_lines[0])
-            assert set(label_entry) == {"sample_id", "boxes", "labels"}
+            assert label_entry["label_coordinate_space"] == "original_xyxy"
+            assert label_entry["input_tensor_shape"] == [1, 3, 64, 64]
     finally:
         os.remove(zip_path)
 
 
-def test_high_quality_sync_bundle_projects_boxes_to_model_input_without_size_metadata(tmp_path):
+def test_high_quality_sync_bundle_keeps_original_boxes_with_coordinate_metadata(tmp_path):
     store = EdgeSampleStore(str(tmp_path / "store"))
     plan = _dummy_plan()
     record = store.store_sample(
@@ -2718,12 +2743,13 @@ def test_high_quality_sync_bundle_projects_boxes_to_model_input_without_size_met
     try:
         manifest_text = json.dumps(manifest, sort_keys=True)
         assert "input_image_size" not in manifest_text
-        assert "input_tensor_shape" not in manifest_text
         with zipfile.ZipFile(zip_path, "r") as archive:
             label_file = manifest["shards"][0]["label_file"]
             label_entry = json.loads(archive.read(label_file).decode("utf-8").splitlines()[0])
-        assert label_entry["boxes"] == [[10.0, 20.0, 30.0, 40.0]]
-        assert set(label_entry) == {"sample_id", "boxes", "labels"}
+        assert label_entry["boxes"] == [[100, 200, 300, 400]]
+        assert label_entry["label_coordinate_space"] == "original_xyxy"
+        assert label_entry["label_image_size"] == [1000, 1000]
+        assert label_entry["input_tensor_shape"] == [1, 3, 100, 100]
     finally:
         os.remove(zip_path)
 
@@ -2769,6 +2795,7 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
             "label_source": "edge_pseudo",
             "split_config_id": contract.split_config_id,
             "front_version": contract.front_version,
+            "input_image_size": [384, 384],
             "input_tensor_shape": [1, 3, 384, 384],
             "input_resize_mode": "direct_resize",
             "created_at": created_at,
@@ -2781,8 +2808,8 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
                 {
                     "boxes": [[1, 2, 3, 4]],
                     "labels": [2],
-                    "label_coordinate_space": "model_input_xyxy",
-                    "label_input_size": [384, 384],
+                    "label_coordinate_space": "original_xyxy",
+                    "label_image_size": [384, 384],
                     "label_resize_mode": "direct_resize",
                 },
                 1.0,
@@ -2792,8 +2819,8 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
                 {
                     "boxes": [[4, 5, 6, 7]],
                     "labels": [3],
-                    "label_coordinate_space": "model_input_xyxy",
-                    "label_input_size": [384, 384],
+                    "label_coordinate_space": "original_xyxy",
+                    "label_image_size": [384, 384],
                     "label_resize_mode": "direct_resize",
                     "label_runtime_version": "fixed-split-pool-labels.v1",
                 },
@@ -2804,8 +2831,8 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
                 {
                     "boxes": [[1, 2, 3, 4]],
                     "labels": [2],
-                    "label_coordinate_space": "model_input_xyxy",
-                    "label_input_size": [640, 640],
+                    "label_coordinate_space": "original_xyxy",
+                    "label_image_size": [640, 640],
                     "label_resize_mode": "direct_resize",
                 },
                 3.0,
@@ -2815,8 +2842,8 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
                 {
                     "boxes": [[1, 2, 600, 700]],
                     "labels": [2],
-                    "label_coordinate_space": "model_input_xyxy",
-                    "label_input_size": [384, 384],
+                    "label_coordinate_space": "original_xyxy",
+                    "label_image_size": [384, 384],
                     "label_resize_mode": "direct_resize",
                 },
                 4.0,
@@ -2841,13 +2868,142 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
     assert "stale-raw-coords" not in preloaded_records
     assert "wrong-label-meta" not in preloaded_records
     assert annotations["pool-1"]["boxes"] == [[1, 2, 3, 4]]
-    assert annotations["pool-meta"]["label_input_size"] == [384, 384]
+    assert annotations["pool-meta"]["label_image_size"] == [384, 384]
     assert preloaded_records["pool-1"]["input_tensor_shape"] == [1, 3, 384, 384]
     assert preloaded_records["pool-1"]["input_resize_mode"] == "direct_resize"
     assert metadata["pool-1"]["input_tensor_shape"] == [1, 3, 384, 384]
     first_entry = pool.list_active_samples()[0]
-    assert "input_image_size" not in pool.reader.read(first_entry).feature_record
+    assert pool.reader.read(first_entry).feature_record["input_image_size"] == [384, 384]
     assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"pool-1", "pool-meta"}
+
+
+def test_cloud_trace_uses_input_tensor_shape_not_224_fallback():
+    from cloud_server import CloudContinualLearner
+
+    learner = object.__new__(CloudContinualLearner)
+
+    assert learner._infer_bundle_trace_image_size(
+        {"input_image_size": [720, 1280], "input_tensor_shape": [1, 3, 640, 640]}
+    ) == (640, 640)
+    with pytest.raises(RuntimeError, match="input_tensor_shape"):
+        learner._infer_bundle_trace_image_size({"samples": [{}]})
+
+
+def test_boundary_payload_passthrough_survives_sample_store_roundtrip(tmp_path):
+    from ariadne.runtime.boundary import BoundaryTensorSpec
+    from cloud.sample_pool import CloudSamplePool
+    from cloud_server import CloudContinualLearner
+    from model_management.split_contract import SplitRuntimeContract
+
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    schema = {
+        "node_0": BoundaryTensorSpec(
+            label="node_0",
+            symbolic_shape=("B", "features"),
+            dtype="torch.float32",
+            requires_grad=True,
+            device_type="cuda",
+        )
+    }
+    payload = boundary_payload_from_tensors(
+        {"node_0": torch.ones(1, 4)},
+        split_id="after:node_0",
+        graph_signature="graph-sig",
+        schema=schema,
+        requires_grad={"node_0": True},
+        passthrough_inputs={"image": torch.arange(3, dtype=torch.float32).view(1, 3)},
+    )
+    record = store.store_sample(
+        sample_id="boundary-sync",
+        frame_index=1,
+        confidence=0.95,
+        split_config_id="after:node_0",
+        model_id="model-a",
+        model_version="1",
+        quality_bucket=HIGH_QUALITY,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=payload,
+        input_image_size=[64, 64],
+        input_tensor_shape=[1, 3, 64, 64],
+        input_resize_mode="direct_resize",
+    )
+
+    roundtripped = store.load_intermediate(record)
+    assert isinstance(roundtripped, BoundaryPayload)
+    assert torch.equal(roundtripped.passthrough_inputs["image"], payload.passthrough_inputs["image"])
+    assert roundtripped.schema["node_0"].symbolic_shape == ("B", "features")
+    assert roundtripped.schema["node_0"].device_type == "cuda"
+    assert roundtripped.schema["node_0"].requires_grad is True
+    assert roundtripped.requires_grad["node_0"] is True
+    assert roundtripped.tensors["node_0"].requires_grad is False
+
+    zip_path, manifest, _stats = pack_high_quality_sync_bundle_to_file(
+        store,
+        [record],
+        edge_id=1,
+        shard_size=1,
+        split_context={
+            "model_id": "model-a",
+            "model_version": "1",
+            "split_config_id": "after:node_0",
+            "canonical_split_key": "after:node_0",
+            "edge_split_id": "after:node_0",
+            "input_tensor_shape": [1, 3, 64, 64],
+            "input_resize_mode": "direct_resize",
+            "boundary_tensor_labels": ["node_0"],
+        },
+        output_dir=str(tmp_path),
+    )
+    extract_dir = tmp_path / "bundle"
+    extract_dir.mkdir()
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(extract_dir)
+        learner = object.__new__(CloudContinualLearner)
+        candidates, unreadable = learner._load_high_quality_shard_candidates(
+            manifest=manifest,
+            bundle_cache_path=str(extract_dir),
+        )
+        assert unreadable == []
+        assert isinstance(candidates[0]["intermediate"], BoundaryPayload)
+        assert candidates[0]["intermediate"].schema["node_0"].symbolic_shape == ("B", "features")
+        assert candidates[0]["intermediate"].requires_grad["node_0"] is True
+
+        pool = CloudSamplePool(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+        pool.store_pending_high_quality_samples(candidates)
+        contract = SplitRuntimeContract.create(
+            edge_id=1,
+            model_id="model-a",
+            split_config_id="after:node_0",
+            canonical_split_key="after:node_0",
+            edge_split_id="after:node_0",
+            cloud_batch_split_id="after:node_0",
+            input_tensor_shape=[1, 3, 64, 64],
+            input_resize_mode="direct_resize",
+            boundary_tensor_labels=["node_0"],
+            front_version="0",
+            feature_tensors={"node_0": torch.ones(1, 4)},
+        )
+        pool.rebuild_canonical_training_pool(
+            split_contract=contract,
+            existing_active_samples=[],
+            pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+            new_low_quality_samples=[],
+        )
+        active = pool.list_active_samples()
+        assert len(active) == 1
+        feature_label = pool.reader.read(active[0])
+        stored_payload = feature_label.feature_record["intermediate"]
+        assert isinstance(stored_payload, BoundaryPayload)
+        assert torch.equal(
+            stored_payload.passthrough_inputs["image"],
+            payload.passthrough_inputs["image"],
+        )
+        assert stored_payload.schema["node_0"].symbolic_shape == ("B", "features")
+        assert stored_payload.schema["node_0"].device_type == "cuda"
+        assert stored_payload.requires_grad["node_0"] is True
+    finally:
+        os.remove(zip_path)
 
 
 def test_high_quality_syncer_groups_retryable_samples_by_record_context(tmp_path):

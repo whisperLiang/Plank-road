@@ -41,6 +41,12 @@ from model_management.object_detection import Object_Detection
 from model_management.detection_annotations import load_annotation_targets
 from model_management.detection_dataset import DetectionDataset
 from model_management.detection_metric import RetrainMetric
+from model_management.detection_box_projection import (
+    ORIGINAL_XYXY,
+    infer_model_input_size,
+    infer_original_image_size,
+    project_original_xyxy_to_model_input_xyxy,
+)
 from model_management.model_info import model_lib
 from model_management.model_delta_payload import build_state_dict_delta_payload
 from model_management.model_zoo import (
@@ -99,10 +105,11 @@ _FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
 _FIXED_SPLIT_DYNAMIC_BATCH_MIN = _FIXED_SPLIT_DYNAMIC_BATCH[0]
 _FIXED_SPLIT_DYNAMIC_BATCH_MAX = _FIXED_SPLIT_DYNAMIC_BATCH[1]
 LOW_QUALITY_TRIGGER_PROTOCOL_VERSION = "low-quality-trigger-shard.v1"
-POOL_LABEL_COORDINATE_SPACE = "model_input_xyxy"
+POOL_LABEL_COORDINATE_SPACE = ORIGINAL_XYXY
 POOL_LABEL_RUNTIME_VERSION = "fixed-split-pool-labels.v1"
 POOL_LABEL_METADATA_FIELDS = (
     "label_coordinate_space",
+    "label_image_size",
     "label_input_size",
     "label_resize_mode",
     "label_runtime_version",
@@ -455,147 +462,24 @@ def _runtime_input_tensor_shape_from_metadata(
     return (1, 3, runtime_image_size[0], runtime_image_size[1])
 
 
-def _project_box_to_model_input(
-    box: object,
-    *,
-    original_size: tuple[int, int],
-    model_input_size: tuple[int, int],
-    resize_mode: str,
-) -> list[float]:
-    values = [float(value) for value in list(box or [])[:4]]
-    if len(values) < 4:
-        return values
-    orig_h, orig_w = original_size
-    model_h, model_w = model_input_size
-    if str(resize_mode).strip().lower() == "letterbox":
-        scale = min(float(model_w) / float(orig_w), float(model_h) / float(orig_h))
-        resized_w = float(orig_w) * scale
-        resized_h = float(orig_h) * scale
-        pad_x = (float(model_w) - resized_w) * 0.5
-        pad_y = (float(model_h) - resized_h) * 0.5
-        values[0] = values[0] * scale + pad_x
-        values[2] = values[2] * scale + pad_x
-        values[1] = values[1] * scale + pad_y
-        values[3] = values[3] * scale + pad_y
-    else:
-        values[0] = values[0] * (float(model_w) / float(orig_w))
-        values[2] = values[2] * (float(model_w) / float(orig_w))
-        values[1] = values[1] * (float(model_h) / float(orig_h))
-        values[3] = values[3] * (float(model_h) / float(orig_h))
-    values[0] = max(0.0, min(float(model_w), values[0]))
-    values[2] = max(0.0, min(float(model_w), values[2]))
-    values[1] = max(0.0, min(float(model_h), values[1]))
-    values[3] = max(0.0, min(float(model_h), values[3]))
-    return values
-
-
-def _project_label_boxes_to_model_input(
-    labels: Mapping[str, object],
-    *,
-    original_size: tuple[int, int] | None,
-    model_input_size: tuple[int, int] | None,
-    resize_mode: str,
-) -> dict[str, object]:
-    projected = {
-        "boxes": list(labels.get("boxes") or []),
-        "labels": list(labels.get("labels") or []),
-    }
-    if original_size is None or model_input_size is None or original_size == model_input_size:
-        return projected
-    projected["boxes"] = [
-        _project_box_to_model_input(
-            box,
-            original_size=original_size,
-            model_input_size=model_input_size,
-            resize_mode=resize_mode,
-        )
-        for box in list(projected.get("boxes") or [])
-    ]
-    return projected
-
-
-def _labels_fit_model_input(
-    labels: Mapping[str, object],
-    *,
-    model_input_size: tuple[int, int] | None,
-) -> bool:
-    if model_input_size is None:
-        return True
-    model_h, model_w = model_input_size
-    epsilon = 1e-3
-    for box in list(labels.get("boxes") or []):
-        values = [float(value) for value in list(box or [])[:4]]
-        if len(values) < 4:
-            continue
-        if (
-            values[0] < -epsilon
-            or values[2] < -epsilon
-            or values[1] < -epsilon
-            or values[3] < -epsilon
-            or values[0] > float(model_w) + epsilon
-            or values[2] > float(model_w) + epsilon
-            or values[1] > float(model_h) + epsilon
-            or values[3] > float(model_h) + epsilon
-        ):
-            return False
-    return True
-
-
-def _size_pair_from_value(value: object) -> tuple[int, int] | None:
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        height = int(value[0])
-        width = int(value[1])
-        if height > 0 and width > 0:
-            return height, width
-    return None
-
-
 def _pool_label_metadata_from_record(
     record: Mapping[str, object],
     *,
     model_input_size: tuple[int, int] | None,
     resize_mode: str,
 ) -> dict[str, object]:
+    original_size = _original_image_size_from_metadata(record)
     metadata: dict[str, object] = {
         "label_coordinate_space": POOL_LABEL_COORDINATE_SPACE,
         "label_resize_mode": str(resize_mode or "direct_resize"),
         "label_runtime_version": POOL_LABEL_RUNTIME_VERSION,
     }
-    if model_input_size is not None:
-        metadata["label_input_size"] = [
-            int(model_input_size[0]),
-            int(model_input_size[1]),
+    if original_size is not None:
+        metadata["label_image_size"] = [
+            int(original_size[0]),
+            int(original_size[1]),
         ]
     return metadata
-
-
-def _pool_label_metadata_is_compatible(
-    labels: Mapping[str, object],
-    *,
-    model_input_size: tuple[int, int] | None,
-    input_resize_mode: str | None,
-) -> tuple[bool, str | None]:
-    coordinate_space = str(labels.get("label_coordinate_space") or "").strip()
-    if coordinate_space and coordinate_space != POOL_LABEL_COORDINATE_SPACE:
-        return False, "coordinate_space"
-
-    label_input_size = _size_pair_from_value(labels.get("label_input_size"))
-    if (
-        label_input_size is not None
-        and model_input_size is not None
-        and label_input_size != model_input_size
-    ):
-        return False, "input_size"
-
-    label_resize_mode = str(labels.get("label_resize_mode") or "").strip()
-    if (
-        label_resize_mode
-        and input_resize_mode
-        and label_resize_mode != str(input_resize_mode).strip()
-    ):
-        return False, "resize_mode"
-
-    return True, None
 
 
 def _build_synthetic_runtime_input(
@@ -1993,6 +1877,11 @@ class CloudContinualLearner:
             if sample_pool_cfg is not None
             else False
         )
+        self.sample_pool_enable_coordinate_debug = (
+            bool(getattr(sample_pool_cfg, "enable_coordinate_debug", False))
+            if sample_pool_cfg is not None
+            else False
+        )
         self._fixed_split_runtime_template_cache = (
             get_fixed_split_runtime_template_cache()
         )
@@ -2600,9 +2489,8 @@ class CloudContinualLearner:
         """Build canonical-pool staging candidates from low-quality trigger samples.
 
         Each candidate contains a single-sample feature tensor, teacher labels
-        projected into ``model_input_xyxy`` coordinates, and the contract
-        reference metadata required by
-        :meth:`CloudSamplePool.rebuild_canonical_training_pool`.
+        in canonical ``original_xyxy`` coordinates, and the contract reference
+        metadata required by :meth:`CloudSamplePool.rebuild_canonical_training_pool`.
         """
         prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
         processed_samples: list[dict[str, object]] = []
@@ -2627,21 +2515,52 @@ class CloudContinualLearner:
                         sample_id,
                     )
                     continue
+            split_plan = dict(manifest.get("split_plan", {}) or {})
             original_size = _original_image_size_from_metadata(record)
             resolved_model_input_size = (
                 model_input_size or self._model_input_size_from_record(record)
             )
-            trainable_labels = _project_label_boxes_to_model_input(
-                labels,
-                original_size=original_size,
-                model_input_size=resolved_model_input_size,
-                resize_mode=resize_mode,
+            input_tensor_shape = (
+                record.get("input_tensor_shape")
+                or manifest.get("input_tensor_shape")
+                or split_plan.get("input_tensor_shape", [])
+                or []
             )
+            resolved_resize_mode = str(
+                record.get("input_resize_mode")
+                or manifest.get("input_resize_mode")
+                or split_plan.get("input_resize_mode")
+                or ""
+            )
+            if (
+                original_size is None
+                or resolved_model_input_size is None
+                or not input_tensor_shape
+                or not resolved_resize_mode
+            ):
+                logger.warning(
+                    "[FixedSplitCL] Skipping low-quality sample {} with incomplete coordinate metadata "
+                    "(input_image_size={}, input_tensor_shape={}, input_resize_mode={}).",
+                    sample_id,
+                    original_size,
+                    input_tensor_shape,
+                    resolved_resize_mode,
+                )
+                continue
+            trainable_labels = {
+                "boxes": list(labels.get("boxes") or []),
+                "labels": list(labels.get("labels") or []),
+                **(
+                    {"scores": list(labels.get("scores") or [])}
+                    if labels.get("scores") is not None
+                    else {}
+                ),
+            }
             trainable_labels.update(
                 _pool_label_metadata_from_record(
                     record,
                     model_input_size=resolved_model_input_size,
-                    resize_mode=resize_mode,
+                    resize_mode=resolved_resize_mode,
                 )
             )
             try:
@@ -2661,13 +2580,6 @@ class CloudContinualLearner:
                 )
                 continue
             model_meta = dict(manifest.get("model", {}) or {})
-            split_plan = dict(manifest.get("split_plan", {}) or {})
-            input_tensor_shape = (
-                record.get("input_tensor_shape")
-                or manifest.get("input_tensor_shape")
-                or split_plan.get("input_tensor_shape", [])
-                or []
-            )
             processed_samples.append(
                 {
                     "sample_id": sample_id,
@@ -2686,14 +2598,9 @@ class CloudContinualLearner:
                         or split_plan.get("front_version")
                         or "0"
                     ),
+                    "input_image_size": [int(dim) for dim in list(original_size)],
                     "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape)],
-                    "input_resize_mode": str(
-                        record.get("input_resize_mode")
-                        or manifest.get("input_resize_mode")
-                        or split_plan.get("input_resize_mode")
-                        or resize_mode
-                        or "direct_resize"
-                    ),
+                    "input_resize_mode": resolved_resize_mode,
                     "created_at": time.time(),
                 }
             )
@@ -2728,6 +2635,7 @@ class CloudContinualLearner:
         low_quality_count = 0
         teacher_count = 0
         pseudo_count = 0
+        skipped_coordinate_reasons: dict[str, int] = {}
         runtime_shape = [
             int(dim)
             for dim in (runtime_input_tensor_shape or contract.input_tensor_shape)
@@ -2740,12 +2648,60 @@ class CloudContinualLearner:
             feature_label = sample_pool.reader.read(entry)
             feature_tensors = self._feature_tensors_from_record(feature_label.feature_record)
             training_record = dict(feature_label.feature_record)
+            record_shape = [
+                int(dim)
+                for dim in list(
+                    training_record.get("input_tensor_shape")
+                    or entry.get("input_tensor_shape")
+                    or []
+                )
+            ]
+            record_resize_mode = str(
+                training_record.get("input_resize_mode")
+                or entry.get("input_resize_mode")
+                or ""
+            )
+            record_image_size = (
+                training_record.get("input_image_size")
+                or entry.get("input_image_size")
+            )
+            if record_shape != list(runtime_shape) or record_resize_mode != effective_resize_mode:
+                skipped_coordinate_reasons["runtime_metadata_mismatch"] = (
+                    skipped_coordinate_reasons.get("runtime_metadata_mismatch", 0) + 1
+                )
+                logger.warning(
+                    "[FixedSplitCL] Skipping pool sample {} with mismatched runtime metadata "
+                    "(sample_shape={}, sample_resize_mode={}, runtime_shape={}, runtime_resize_mode={}).",
+                    sample_id,
+                    record_shape,
+                    record_resize_mode,
+                    list(runtime_shape),
+                    effective_resize_mode,
+                )
+                continue
+            if record_image_size is None:
+                skipped_coordinate_reasons["missing_input_image_size"] = (
+                    skipped_coordinate_reasons.get("missing_input_image_size", 0) + 1
+                )
+                logger.warning(
+                    "[FixedSplitCL] Skipping pool sample {} with missing input_image_size metadata.",
+                    sample_id,
+                )
+                continue
             training_record["sample_id"] = sample_id
             training_record["feature"] = feature_tensors
             training_record["cloud_batch_split_id"] = contract.cloud_batch_split_id
-            training_record["input_tensor_shape"] = list(runtime_shape)
-            training_record["input_resize_mode"] = effective_resize_mode
+            training_record["input_image_size"] = list(record_image_size)
+            training_record["input_tensor_shape"] = record_shape
+            training_record["input_resize_mode"] = record_resize_mode
             labels = self._pool_annotations_from_labels(feature_label.labels)
+            if self.sample_pool_enable_coordinate_debug:
+                self._log_coordinate_debug_summary(
+                    model_name=str(contract.model_id),
+                    sample_id=sample_id,
+                    metadata=training_record,
+                    labels=labels,
+                )
             sample_ids.append(sample_id)
             preloaded_records[sample_id] = training_record
             annotations[sample_id] = labels
@@ -2771,6 +2727,12 @@ class CloudContinualLearner:
             teacher_count,
             pseudo_count,
         )
+        if self.sample_pool_enable_coordinate_debug:
+            logger.info(
+                "[CoordinateDebug] skipped_sample_count={} reasons={}",
+                sum(skipped_coordinate_reasons.values()),
+                skipped_coordinate_reasons,
+            )
         bundle_info = {
             "manifest": {},
             "all_sample_ids": sample_ids,
@@ -2778,6 +2740,56 @@ class CloudContinualLearner:
             "generation_id": generation_id,
         }
         return bundle_info, preloaded_records, annotations, sample_metadata_by_id
+
+    @staticmethod
+    def _log_coordinate_debug_summary(
+        *,
+        model_name: str,
+        sample_id: str,
+        metadata: Mapping[str, object],
+        labels: Mapping[str, object],
+    ) -> None:
+        boxes = list(labels.get("boxes") or [])
+        original_size = infer_original_image_size(metadata)
+        model_input_size = infer_model_input_size(metadata)
+        resize_mode = str(metadata.get("input_resize_mode") or "")
+        after_boxes: object = []
+        if original_size is not None and model_input_size is not None and resize_mode:
+            try:
+                after_boxes = project_original_xyxy_to_model_input_xyxy(
+                    boxes[:3],
+                    original_size,
+                    model_input_size,
+                    resize_mode,
+                )
+            except Exception as exc:  # noqa: BLE001 - debug path only.
+                after_boxes = f"<projection_error:{exc}>"
+        flat_values: list[float] = []
+        for box in boxes:
+            try:
+                flat_values.extend(float(value) for value in list(box)[:4])
+            except (TypeError, ValueError):
+                continue
+        min_coord = min(flat_values) if flat_values else None
+        max_coord = max(flat_values) if flat_values else None
+        logger.info(
+            "[CoordinateDebug] model_name={} sample_id={} input_image_size={} "
+            "input_tensor_shape={} input_resize_mode={} label_coordinate_space={} "
+            "label_input_size={} label_resize_mode={} boxes_before={} boxes_after={} "
+            "min_coord={} max_coord={}",
+            model_name,
+            sample_id,
+            metadata.get("input_image_size"),
+            metadata.get("input_tensor_shape"),
+            metadata.get("input_resize_mode"),
+            labels.get("label_coordinate_space"),
+            labels.get("label_input_size") or labels.get("label_image_size"),
+            labels.get("label_resize_mode"),
+            boxes[:3],
+            after_boxes,
+            min_coord,
+            max_coord,
+        )
 
     def _materialize_low_quality_trigger_bundle(
         self,
@@ -3435,7 +3447,9 @@ class CloudContinualLearner:
             runtime_image_size = self._runtime_image_size_from_metadata(sample)
             if runtime_image_size is not None:
                 return runtime_image_size
-        return 224, 224
+        raise RuntimeError(
+            "Missing input_tensor_shape/input_image_size metadata required to build cloud split-runtime trace input."
+        )
 
     def _normalize_bundle_runtime_tensor(
         self,
@@ -5771,9 +5785,15 @@ class CloudContinualLearner:
                     unreadable_ids.append(sample_key)
                     continue
                 try:
-                    tensors = normalise_feature_tensors(
-                        dict(feature_value.get("tensors") or {})
-                    )
+                    boundary_payload = feature_value.get("boundary_payload")
+                    if isinstance(boundary_payload, BoundaryPayload):
+                        tensors = normalise_feature_tensors(
+                            dict(boundary_payload.tensors or {})
+                        )
+                    else:
+                        tensors = normalise_feature_tensors(
+                            dict(feature_value.get("tensors") or {})
+                        )
                     single_tensors = {
                         label: tensor[:1].detach().cpu()
                         for label, tensor in tensors.items()
@@ -5785,10 +5805,31 @@ class CloudContinualLearner:
                     unreadable_ids.append(sample_key)
                     continue
                 label_payload = dict(labels_by_id[sample_key])
+                sample_input_image_size = (
+                    label_payload.get("input_image_size")
+                    or feature_value.get("input_image_size")
+                )
+                sample_input_tensor_shape = list(
+                    label_payload.get("input_tensor_shape")
+                    or feature_value.get("input_tensor_shape")
+                    or manifest_input_tensor_shape
+                    or []
+                )
+                sample_resize_mode = str(
+                    label_payload.get("input_resize_mode")
+                    or feature_value.get("input_resize_mode")
+                    or manifest_resize_mode
+                    or ""
+                )
                 candidates.append(
                     {
                         "sample_id": sample_key,
                         "feature": single_tensors,
+                        **(
+                            {"intermediate": boundary_payload}
+                            if isinstance(boundary_payload, BoundaryPayload)
+                            else {}
+                        ),
                         "labels": {
                             "boxes": list(label_payload.get("boxes") or []),
                             "labels": list(label_payload.get("labels") or []),
@@ -5797,16 +5838,39 @@ class CloudContinualLearner:
                                 if label_payload.get("scores") is not None
                                 else {}
                             ),
-                            "label_coordinate_space": label_coordinate_space,
-                            "label_resize_mode": manifest_resize_mode,
+                            "label_coordinate_space": str(
+                                label_payload.get("label_coordinate_space")
+                                or label_coordinate_space
+                            ),
+                            **(
+                                {"label_image_size": list(label_payload.get("label_image_size") or [])}
+                                if label_payload.get("label_image_size") is not None
+                                else {}
+                            ),
+                            **(
+                                {"label_input_size": list(label_payload.get("label_input_size") or [])}
+                                if label_payload.get("label_input_size") is not None
+                                else {}
+                            ),
+                            "label_resize_mode": str(
+                                label_payload.get("label_resize_mode")
+                                or sample_resize_mode
+                            ),
                         },
                         "sample_source": "high_quality",
                         "label_source": "edge_pseudo",
                         "model_id": manifest_model_id,
                         "split_config_id": manifest_split_config_id,
                         "front_version": manifest_front_version,
-                        "input_tensor_shape": manifest_input_tensor_shape,
-                        "input_resize_mode": manifest_resize_mode,
+                        "input_image_size": (
+                            [int(dim) for dim in list(sample_input_image_size)]
+                            if sample_input_image_size is not None
+                            else None
+                        ),
+                        "input_tensor_shape": [
+                            int(dim) for dim in list(sample_input_tensor_shape)
+                        ],
+                        "input_resize_mode": sample_resize_mode,
                         "created_at": time.time(),
                     }
                 )
@@ -6496,9 +6560,13 @@ class CloudContinualLearner:
 
             # The graph-based split runtime now infers the selected candidate
             # directly from cached Ariadne BoundaryPayload records.
+            if runtime_image_size is None:
+                raise RuntimeError(
+                    "Missing input_tensor_shape/input_image_size metadata required to build cloud split-runtime sample input."
+                )
             sample_input = build_split_runtime_sample_input(
                 tmp_model,
-                image_size=runtime_image_size or (224, 224),
+                image_size=runtime_image_size,
                 device=self.device,
             )
         universal_split_retrain(

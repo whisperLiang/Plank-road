@@ -13,6 +13,12 @@ from typing import Any
 
 import torch
 
+from model_management.detection_box_projection import (
+    ORIGINAL_XYXY,
+    canonicalize_labels_to_original_xyxy,
+    validate_box_coordinate_space,
+)
+from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_contract import (
     SplitRuntimeContract,
     feature_layout_from_tensors,
@@ -20,10 +26,11 @@ from model_management.split_contract import (
 )
 
 
-POOL_LABEL_COORDINATE_SPACE = "model_input_xyxy"
+POOL_LABEL_COORDINATE_SPACE = ORIGINAL_XYXY
 POOL_LABEL_RUNTIME_VERSION = "fixed-split-pool-labels.v1"
 POOL_LABEL_METADATA_FIELDS = (
     "label_coordinate_space",
+    "label_image_size",
     "label_input_size",
     "label_resize_mode",
     "label_runtime_version",
@@ -40,6 +47,7 @@ _CANONICAL_FEATURE_METADATA_FIELDS = {
     "feature_layout_id",
     "sample_source",
     "label_source",
+    "input_image_size",
     "input_tensor_shape",
     "input_resize_mode",
     "created_at",
@@ -143,8 +151,67 @@ def _to_float(value: object, default: float = 0.0) -> float:
         return float(default)
 
 
+def _detach_cpu_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {str(key): _detach_cpu_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_detach_cpu_value(item) for item in value)
+    if isinstance(value, list):
+        return [_detach_cpu_value(item) for item in value]
+    return value
+
+
+def _detach_boundary_payload(payload: BoundaryPayload) -> BoundaryPayload:
+    tensors = {
+        str(label): tensor.detach().cpu()
+        for label, tensor in dict(payload.tensors or {}).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    passthrough_inputs = {
+        str(label): _detach_cpu_value(value)
+        for label, value in dict(payload.passthrough_inputs or {}).items()
+    }
+    return boundary_payload_from_tensors(
+        tensors,
+        split_id=str(payload.split_id),
+        graph_signature=str(payload.graph_signature),
+        batch_size=int(payload.batch_size),
+        schema=dict(getattr(payload, "schema", {}) or {}),
+        requires_grad=dict(getattr(payload, "requires_grad", {}) or {}),
+        weight_version=getattr(payload, "weight_version", None),
+        passthrough_inputs=passthrough_inputs,
+    )
+
+
+def _boundary_payload_from_value(value: object) -> BoundaryPayload | None:
+    if isinstance(value, BoundaryPayload):
+        return _detach_boundary_payload(value)
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("intermediate", "boundary_payload"):
+        candidate = value.get(key)
+        if isinstance(candidate, BoundaryPayload):
+            return _detach_boundary_payload(candidate)
+    feature = value.get("feature")
+    if isinstance(feature, BoundaryPayload):
+        return _detach_boundary_payload(feature)
+    if isinstance(feature, Mapping):
+        return _boundary_payload_from_value(feature)
+    return None
+
+
 def _single_sample_feature_tensors(value: object) -> dict[str, torch.Tensor]:
-    tensors = normalise_feature_tensors(value)
+    boundary_payload = _boundary_payload_from_value(value)
+    if boundary_payload is not None:
+        tensors = {
+            str(label): tensor.detach().cpu()
+            for label, tensor in dict(boundary_payload.tensors or {}).items()
+            if isinstance(tensor, torch.Tensor)
+        }
+    else:
+        tensors = normalise_feature_tensors(value)
     clean: dict[str, torch.Tensor] = {}
     for label, tensor in sorted(tensors.items()):
         if not isinstance(tensor, torch.Tensor):
@@ -161,6 +228,9 @@ def _single_sample_feature_tensors(value: object) -> dict[str, torch.Tensor]:
 
 
 def _feature_tensors_from_candidate(candidate: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    boundary_payload = _boundary_payload_from_value(candidate)
+    if boundary_payload is not None:
+        return _single_sample_feature_tensors(boundary_payload)
     if "feature" in candidate:
         return _single_sample_feature_tensors(candidate["feature"])
     feature_record = candidate.get("feature_record") or candidate.get("record")
@@ -172,6 +242,16 @@ def _feature_tensors_from_candidate(candidate: Mapping[str, Any]) -> dict[str, t
     if "tensors" in candidate:
         return _single_sample_feature_tensors(candidate["tensors"])
     raise ValueError("Canonical sample candidate has no feature tensors.")
+
+
+def _boundary_payload_from_candidate(candidate: Mapping[str, Any]) -> BoundaryPayload | None:
+    boundary_payload = _boundary_payload_from_value(candidate)
+    if boundary_payload is not None:
+        return boundary_payload
+    feature_record = candidate.get("feature_record") or candidate.get("record")
+    if isinstance(feature_record, Mapping):
+        return _boundary_payload_from_value(feature_record)
+    return None
 
 
 def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -220,104 +300,27 @@ def _dominant_class(class_counts: Mapping[str, int]) -> int | None:
         return None
 
 
-def _size_pair_from_value(value: object) -> tuple[int, int] | None:
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        height = int(value[0])
-        width = int(value[1])
-        if height > 0 and width > 0:
-            return height, width
-    return None
-
-
-def _labels_are_structurally_valid(labels: Mapping[str, Any]) -> bool:
-    boxes = list(labels.get("boxes") or [])
-    label_values = list(labels.get("labels") or [])
-    if bool(boxes) != bool(label_values):
-        return False
-    if boxes and len(boxes) != len(label_values):
-        return False
-    for box in boxes:
-        try:
-            values = [float(value) for value in list(box)[:4]]
-        except (TypeError, ValueError):
-            return False
-        if len(values) != 4:
-            return False
-    return True
-
-
-def _labels_fit_model_input(
-    labels: Mapping[str, Any],
-    *,
-    model_input_size: tuple[int, int] | None,
-) -> bool:
-    if model_input_size is None:
-        return True
-    model_h, model_w = model_input_size
-    epsilon = 1e-3
-    for box in list(labels.get("boxes") or []):
-        values = [float(value) for value in list(box or [])[:4]]
-        if len(values) < 4:
-            continue
-        if (
-            values[0] < -epsilon
-            or values[2] < -epsilon
-            or values[1] < -epsilon
-            or values[3] < -epsilon
-            or values[0] > float(model_w) + epsilon
-            or values[2] > float(model_w) + epsilon
-            or values[1] > float(model_h) + epsilon
-            or values[3] > float(model_h) + epsilon
-        ):
-            return False
-    return True
-
-
-def _pool_label_metadata_is_compatible(
-    labels: Mapping[str, Any],
-    *,
-    model_input_size: tuple[int, int] | None,
-    input_resize_mode: str | None,
-) -> tuple[bool, str | None]:
-    coordinate_space = str(labels.get("label_coordinate_space") or "").strip()
-    if coordinate_space and coordinate_space != POOL_LABEL_COORDINATE_SPACE:
-        return False, "coordinate_space"
-
-    label_input_size = _size_pair_from_value(labels.get("label_input_size"))
-    if (
-        label_input_size is not None
-        and model_input_size is not None
-        and label_input_size != model_input_size
-    ):
-        return False, "input_size"
-
-    label_resize_mode = str(labels.get("label_resize_mode") or "").strip()
-    if (
-        label_resize_mode
-        and input_resize_mode
-        and label_resize_mode != str(input_resize_mode).strip()
-    ):
-        return False, "resize_mode"
-
-    return True, None
-
-
 def _labels_with_default_metadata(
     labels: Mapping[str, Any],
     *,
+    input_image_size: list[int] | tuple[int, int] | None,
     input_tensor_shape: list[int],
     input_resize_mode: str,
 ) -> dict[str, Any]:
     payload = _labels_from_result(labels)
-    payload.setdefault("label_coordinate_space", POOL_LABEL_COORDINATE_SPACE)
-    payload.setdefault("label_resize_mode", str(input_resize_mode or "direct_resize"))
+    if not str(payload.get("label_coordinate_space") or "").strip():
+        if payload.get("boxes"):
+            raise ValueError("Sample labels are missing label_coordinate_space.")
+        payload["label_coordinate_space"] = POOL_LABEL_COORDINATE_SPACE
     payload.setdefault("label_runtime_version", POOL_LABEL_RUNTIME_VERSION)
-    if payload.get("label_input_size") is None and len(input_tensor_shape) >= 3:
-        payload["label_input_size"] = [
-            int(input_tensor_shape[-2]),
-            int(input_tensor_shape[-1]),
-        ]
-    return payload
+    metadata = {
+        "input_image_size": list(input_image_size) if input_image_size is not None else None,
+        "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
+        "input_resize_mode": str(input_resize_mode or ""),
+    }
+    canonical = canonicalize_labels_to_original_xyxy(payload, metadata)
+    canonical.setdefault("label_runtime_version", POOL_LABEL_RUNTIME_VERSION)
+    return canonical
 
 
 def _feature_metadata_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -326,7 +329,7 @@ def _feature_metadata_from_candidate(candidate: Mapping[str, Any]) -> dict[str, 
         {
             key: value
             for key, value in dict(candidate).items()
-            if key not in {"feature", "tensors", "feature_record", "labels"}
+            if key not in {"feature", "tensors", "feature_record", "labels", "intermediate", "boundary_payload"}
         }
     )
     return {
@@ -347,6 +350,7 @@ class CanonicalSampleRecord:
     label_source: str
     feature: dict[str, torch.Tensor]
     labels: dict[str, Any]
+    input_image_size: list[int]
     input_tensor_shape: list[int]
     input_resize_mode: str
     created_at: str
@@ -356,6 +360,7 @@ class CanonicalSampleRecord:
     class_counts: dict[str, int] = field(default_factory=dict)
     in_drift_window: bool | None = None
     window_id: str | None = None
+    boundary_payload: BoundaryPayload | None = field(default=None, repr=False, compare=False)
     source_feature_path: str | None = field(default=None, repr=False, compare=False)
     source_label_path: str | None = field(default=None, repr=False, compare=False)
     source_staging_path: str | None = field(default=None, repr=False, compare=False)
@@ -364,7 +369,7 @@ class CanonicalSampleRecord:
         return feature_layout_from_tensors(self.feature)
 
     def to_feature_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": _CANONICAL_RECORD_VERSION,
             "sample_id": self.sample_id,
             "feature": {label: tensor.detach().cpu() for label, tensor in self.feature.items()},
@@ -374,6 +379,7 @@ class CanonicalSampleRecord:
             "feature_layout_id": self.feature_layout_id,
             "sample_source": self.sample_source,
             "label_source": self.label_source,
+            "input_image_size": list(self.input_image_size),
             "input_tensor_shape": list(self.input_tensor_shape),
             "input_resize_mode": self.input_resize_mode,
             "created_at": self.created_at,
@@ -384,6 +390,9 @@ class CanonicalSampleRecord:
             "in_drift_window": self.in_drift_window,
             "window_id": self.window_id,
         }
+        if self.boundary_payload is not None:
+            payload["intermediate"] = _detach_boundary_payload(self.boundary_payload)
+        return payload
 
     def to_label_payload(self) -> dict[str, Any]:
         return {
@@ -433,6 +442,7 @@ class CanonicalSampleRecord:
             "risk_score": float(self.risk_score),
             "in_drift_window": self.in_drift_window,
             "window_id": self.window_id,
+            "input_image_size": list(self.input_image_size),
             "input_tensor_shape": list(self.input_tensor_shape),
             "input_resize_mode": self.input_resize_mode,
             "generation_id": generation_id,
@@ -568,6 +578,10 @@ class CloudSamplePool:
             raise ValueError("Staged sample is missing sample_id.")
         feature_record = dict(sample.get("feature_record") or {})
         tensors = _feature_tensors_from_candidate(sample)
+        input_image_size = (
+            feature_record.get("input_image_size")
+            or sample.get("input_image_size")
+        )
         input_tensor_shape = list(
             feature_record.get("input_tensor_shape")
             or sample.get("input_tensor_shape")
@@ -576,18 +590,25 @@ class CloudSamplePool:
         input_resize_mode = str(
             feature_record.get("input_resize_mode")
             or sample.get("input_resize_mode")
-            or "direct_resize"
+            or ""
         )
         labels = _labels_with_default_metadata(
             sample.get("labels") or sample.get("label") or sample.get("target") or {},
+            input_image_size=list(input_image_size) if input_image_size is not None else None,
             input_tensor_shape=[int(dim) for dim in input_tensor_shape],
             input_resize_mode=input_resize_mode,
         )
         metadata = _feature_metadata_from_candidate(sample)
+        boundary_payload = _boundary_payload_from_candidate(sample)
         return {
             "schema_version": _CANONICAL_RECORD_VERSION,
             "sample_id": sample_id,
             "feature": tensors,
+            **(
+                {"intermediate": boundary_payload}
+                if boundary_payload is not None
+                else {}
+            ),
             "labels": labels,
             "sample_source": sample_source,
             "label_source": label_source,
@@ -603,6 +624,7 @@ class CloudSamplePool:
                 or self.front_version
                 or "0"
             ),
+            "input_image_size": list(input_image_size) if input_image_size is not None else None,
             "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
             "input_resize_mode": input_resize_mode,
             "created_at": _created_at_text(sample.get("created_at")),
@@ -765,6 +787,7 @@ class CloudSamplePool:
                     "feature_layout_id": entry.get("feature_layout_id"),
                     "sample_source": entry.get("sample_source"),
                     "label_source": entry.get("label_source"),
+                    "input_image_size": entry.get("input_image_size"),
                     "input_tensor_shape": entry.get("input_tensor_shape"),
                     "input_resize_mode": entry.get("input_resize_mode"),
                     "created_at": entry.get("created_at"),
@@ -786,10 +809,35 @@ class CloudSamplePool:
         if not sample_id:
             raise ValueError("Canonical sample is missing sample_id.")
         feature = _feature_tensors_from_candidate(candidate)
+        feature_record = dict(candidate.get("feature_record") or {})
+        input_image_size = (
+            candidate.get("input_image_size")
+            or feature_record.get("input_image_size")
+        )
+        input_tensor_shape = [
+            int(dim)
+            for dim in list(
+                candidate.get("input_tensor_shape")
+                or feature_record.get("input_tensor_shape")
+                or []
+            )
+        ]
+        input_resize_mode = str(
+            candidate.get("input_resize_mode")
+            or feature_record.get("input_resize_mode")
+            or ""
+        )
+        if not input_image_size:
+            raise ValueError("Canonical sample is missing input_image_size.")
+        if not input_tensor_shape:
+            raise ValueError("Canonical sample is missing input_tensor_shape.")
+        if not input_resize_mode:
+            raise ValueError("Canonical sample is missing input_resize_mode.")
         labels = _labels_with_default_metadata(
             candidate.get("labels") or {},
-            input_tensor_shape=list(split_contract.input_tensor_shape),
-            input_resize_mode=split_contract.input_resize_mode,
+            input_image_size=list(input_image_size),
+            input_tensor_shape=input_tensor_shape,
+            input_resize_mode=input_resize_mode,
         )
         class_counts = _class_counts(labels)
         object_count = _object_count(labels)
@@ -797,13 +845,6 @@ class CloudSamplePool:
         label_source = str(
             candidate.get("label_source")
             or ("teacher" if sample_source == "low_quality" else "edge_pseudo")
-        )
-        input_tensor_shape = [
-            int(dim)
-            for dim in list(candidate.get("input_tensor_shape") or split_contract.input_tensor_shape)
-        ]
-        input_resize_mode = str(
-            candidate.get("input_resize_mode") or split_contract.input_resize_mode
         )
         feature_layout = feature_layout_from_tensors(feature)
         return CanonicalSampleRecord(
@@ -819,6 +860,7 @@ class CloudSamplePool:
             label_source=label_source,
             feature=feature,
             labels=labels,
+            input_image_size=[int(dim) for dim in list(input_image_size)[:2]],
             input_tensor_shape=input_tensor_shape,
             input_resize_mode=input_resize_mode,
             created_at=_created_at_text(candidate.get("created_at")),
@@ -836,6 +878,7 @@ class CloudSamplePool:
                 if candidate.get("window_id") is None
                 else str(candidate.get("window_id"))
             ),
+            boundary_payload=_boundary_payload_from_candidate(candidate),
             source_staging_path=(
                 None
                 if candidate.get("__staging_path") is None
@@ -862,22 +905,27 @@ class CloudSamplePool:
                 return "skipped_feature_layout"
         except Exception:
             return "skipped_feature_layout"
-        model_input_size = (
-            (int(split_contract.input_tensor_shape[-2]), int(split_contract.input_tensor_shape[-1]))
-            if len(split_contract.input_tensor_shape) >= 3
-            else None
-        )
-        metadata_ok, _metadata_reason = _pool_label_metadata_is_compatible(
+        if [int(dim) for dim in record.input_tensor_shape] != [
+            int(dim) for dim in split_contract.input_tensor_shape
+        ]:
+            return "skipped_label_metadata"
+        if str(record.input_resize_mode).strip().lower() != str(
+            split_contract.input_resize_mode
+        ).strip().lower():
+            return "skipped_label_metadata"
+        metadata = {
+            "input_image_size": list(record.input_image_size),
+            "input_tensor_shape": list(record.input_tensor_shape),
+            "input_resize_mode": record.input_resize_mode,
+        }
+        coordinate_validation = validate_box_coordinate_space(
             record.labels,
-            model_input_size=model_input_size,
-            input_resize_mode=split_contract.input_resize_mode,
+            metadata,
         )
-        if not metadata_ok:
+        if not coordinate_validation.ok:
+            if coordinate_validation.reason == "label_bounds":
+                return "skipped_label_bounds"
             return "skipped_label_metadata"
-        if not _labels_are_structurally_valid(record.labels):
-            return "skipped_label_metadata"
-        if not _labels_fit_model_input(record.labels, model_input_size=model_input_size):
-            return "skipped_label_bounds"
         return None
 
     @staticmethod
