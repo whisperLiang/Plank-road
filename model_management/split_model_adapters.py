@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import cv2
 import numpy as np
@@ -168,6 +168,21 @@ def _is_anchor_detector(model: torch.nn.Module) -> bool:
     )
 
 
+def _is_ultralytics_detection_core(model: torch.nn.Module) -> bool:
+    model_type = type(model)
+    if not str(getattr(model_type, "__module__", "")).startswith("ultralytics."):
+        return False
+    if str(getattr(model, "task", "")).strip().lower() == "detect":
+        return True
+    yaml = getattr(model, "yaml", None)
+    return (
+        isinstance(yaml, Mapping)
+        and "backbone" in yaml
+        and "head" in yaml
+        and ("nc" in yaml or "names" in yaml)
+    )
+
+
 def get_split_runtime_model(model: torch.nn.Module) -> torch.nn.Module:
     if isinstance(model, YOLODetectionModel):
         return model.yolo.model
@@ -226,6 +241,8 @@ def build_split_runtime_sample_input(
 
 def get_split_runtime_input_resize_mode(model: torch.nn.Module) -> str | None:
     if isinstance(model, (YOLODetectionModel, RTDETRDetectionModel)):
+        return "letterbox"
+    if _is_ultralytics_detection_core(model):
         return "letterbox"
     if isinstance(model, RFDETRDetectionModel):
         return "direct_resize"

@@ -942,6 +942,17 @@ class TestModelZoo:
 
         assert get_split_runtime_input_resize_mode(model) == "direct_resize"
 
+    def test_ultralytics_core_split_runtime_resize_mode_is_letterbox(self):
+        class FakeUltralyticsDetectionCore(torch.nn.Module):
+            __module__ = "ultralytics.nn.tasks"
+
+            def __init__(self):
+                super().__init__()
+                self.task = "detect"
+                self.yaml = {"backbone": [], "head": [], "nc": 80}
+
+        assert get_split_runtime_input_resize_mode(FakeUltralyticsDetectionCore()) == "letterbox"
+
     def test_ultralytics_training_batch_uses_resize_metadata(self):
         batch = _build_ultralytics_training_batch(
             {

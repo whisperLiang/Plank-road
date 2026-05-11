@@ -2877,6 +2877,47 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
     assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"pool-1", "pool-meta"}
 
 
+def test_low_quality_staging_uses_runtime_resize_mode_over_stale_manifest():
+    from cloud_server import CloudContinualLearner
+
+    learner = object.__new__(CloudContinualLearner)
+    record = {
+        "feature": {"node_1": torch.ones(1, 4, 2, 2)},
+        "input_image_size": [1080, 1920],
+        "input_tensor_shape": [1, 3, 384, 640],
+        "input_resize_mode": "direct_resize",
+    }
+    manifest = {
+        "protocol_version": "low-quality-trigger-shard.v1",
+        "model_id": "yolo26n",
+        "front_version": "0",
+        "split_config_id": "split-1",
+        "input_tensor_shape": [1, 3, 384, 640],
+        "input_resize_mode": "direct_resize",
+        "model": {"model_id": "yolo26n"},
+        "split_plan": {
+            "split_config_id": "split-1",
+            "input_tensor_shape": [1, 3, 384, 640],
+            "input_resize_mode": "direct_resize",
+        },
+        "samples": [{"sample_id": "s1", "raw_relpath": "low_quality_staging/raw/s1.jpg"}],
+    }
+
+    candidates = learner._build_low_quality_staging_candidates(
+        manifest=manifest,
+        prepared_sample_ids=["s1"],
+        working_cache="unused",
+        gt_annotations={"s1": {"boxes": [[1000, 300, 1020, 320]], "labels": [1]}},
+        preloaded_records={"s1": record},
+        model_input_size=(384, 640),
+        resize_mode="letterbox",
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["input_resize_mode"] == "letterbox"
+    assert candidates[0]["labels"]["label_resize_mode"] == "letterbox"
+
+
 def test_cloud_trace_uses_input_tensor_shape_not_224_fallback():
     from cloud_server import CloudContinualLearner
 

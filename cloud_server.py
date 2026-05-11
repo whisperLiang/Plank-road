@@ -2484,7 +2484,7 @@ class CloudContinualLearner:
         gt_annotations: Mapping[str, Mapping[str, object]],
         preloaded_records: Mapping[object, Mapping[str, object]] | None,
         model_input_size: tuple[int, int] | None = None,
-        resize_mode: str = "direct_resize",
+        resize_mode: str | None = None,
     ) -> list[dict[str, object]]:
         """Build canonical-pool staging candidates from low-quality trigger samples.
 
@@ -2526,12 +2526,13 @@ class CloudContinualLearner:
                 or split_plan.get("input_tensor_shape", [])
                 or []
             )
-            resolved_resize_mode = str(
+            metadata_resize_mode = str(
                 record.get("input_resize_mode")
                 or manifest.get("input_resize_mode")
                 or split_plan.get("input_resize_mode")
                 or ""
             )
+            resolved_resize_mode = str(resize_mode or metadata_resize_mode or "")
             if (
                 original_size is None
                 or resolved_model_input_size is None
