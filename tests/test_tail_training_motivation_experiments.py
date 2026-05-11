@@ -160,7 +160,7 @@ def test_aggregate_rows_reports_mean_std():
     assert aggregate[0]["metric_delta_mean"] == pytest.approx(0.2)
 
 
-def test_split_position_mode_boxplots_write_pdf_and_png(tmp_path):
+def test_split_time_accuracy_subplots_write_pdf_and_png(tmp_path):
     rows = []
     for repeat_id in range(3):
         for bucket, boundary in [
@@ -168,10 +168,10 @@ def test_split_position_mode_boxplots_write_pdf_and_png(tmp_path):
             ("Middle50%", "percent:50"),
             ("Late75%", "percent:75"),
         ]:
-            for mode, time_base, delta_base in [
-                ("freeze", 12.0, 0.05),
-                ("split_rebuild", 6.0, 0.04),
-                ("split_cached", 5.0, 0.03),
+            for mode, time_base, acc_base in [
+                ("freeze", 12.0, 0.55),
+                ("split_rebuild", 6.0, 0.58),
+                ("split_cached", 5.0, 0.60),
             ]:
                 rows.append(
                     {
@@ -182,11 +182,11 @@ def test_split_position_mode_boxplots_write_pdf_and_png(tmp_path):
                         "sample_count": 2,
                         "epochs": 1,
                         "train_time_sec": time_base + repeat_id,
-                        "metric_delta": delta_base + 0.01 * repeat_id,
+                        "metric_after": acc_base + 0.01 * repeat_id,
                     }
                 )
 
-    experiments._write_split_position_mode_boxplots(rows, tmp_path)
+    experiments.plot_split_time_accuracy_subplots(rows, tmp_path)
 
     pdf_path = tmp_path / "plots" / "freeze_vs_split_cached_vs_rebuild_by_position.pdf"
     png_path = tmp_path / "plots" / "freeze_vs_split_cached_vs_rebuild_by_position.png"

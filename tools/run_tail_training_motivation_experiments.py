@@ -1336,7 +1336,24 @@ def _build_cached_split_runtime(
     return cached_split
 
 
-def _write_split_position_mode_boxplots(rows: list[Mapping[str, Any]], output_root: Path) -> None:
+def plot_split_time_accuracy_subplots(
+    rows: list[Mapping[str, Any]],
+    output_root: Path,
+) -> None:
+    """Generate a two-subplot figure with stacked panels sharing the x-axis.
+
+    Upper panel: training time (s) boxplots grouped by split position and mode.
+    Lower panel: mAP (%) boxplots grouped by split position and mode.
+
+    Parameters
+    ----------
+    rows:
+        Raw per-repeat experiment records produced by the experiment loop.
+        Each record must contain at least: ``split_bucket``, ``mode``,
+        ``train_time_sec``, and ``metric_after``.
+    output_root:
+        Root directory under which a ``plots/`` sub-directory is created.
+    """
     plots_dir = output_root / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1344,16 +1361,24 @@ def _write_split_position_mode_boxplots(rows: list[Mapping[str, Any]], output_ro
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
     except Exception as exc:  # noqa: BLE001
-        logger.warning("matplotlib is unavailable; skipping split-position boxplot: {}", exc)
+        logger.warning("matplotlib is unavailable; skipping split-position subplot figure: {}", exc)
         return
 
+    # Only include modes that actually appear in the collected rows.
     modes = [mode for mode in DEFAULT_MODES if any(row.get("mode") == mode for row in rows)]
-    mode_offsets = {
-        "freeze": -0.24,
-        "split_rebuild": 0.0,
-        "split_cached": 0.24,
-    }
+    if not modes:
+        logger.warning("No recognised modes found in rows; skipping subplot figure.")
+        return
+
+    # Horizontal offsets so boxes for different modes don't overlap.
+    n_modes = len(modes)
+    total_spread = 0.48  # total width occupied by all mode boxes at one x-tick
+    box_width = min(0.12, total_spread / max(n_modes, 1) * 0.85)
+    offsets = np.linspace(-total_spread / 2, total_spread / 2, n_modes) if n_modes > 1 else [0.0]
+    mode_offsets = {mode: float(offsets[i]) for i, mode in enumerate(modes)}
+
     mode_faces = {
         "freeze": "#6aa6d8",
         "split_rebuild": "#f2c94c",
@@ -1364,13 +1389,17 @@ def _write_split_position_mode_boxplots(rows: list[Mapping[str, Any]], output_ro
         "split_rebuild": "#8f6b00",
         "split_cached": "#266b32",
     }
+    # Fallback colours for any unexpected mode names.
+    _fallback_faces = ["#d08080", "#80d0d0", "#d0a0d0"]
+    _fallback_edges = ["#803030", "#307070", "#703070"]
+    for i, mode in enumerate(modes):
+        if mode not in mode_faces:
+            mode_faces[mode] = _fallback_faces[i % len(_fallback_faces)]
+            mode_edges[mode] = _fallback_edges[i % len(_fallback_edges)]
+
     bucket_positions = {bucket: index + 1 for index, bucket in enumerate(BUCKET_LABELS)}
 
-    fig, ax_time = plt.subplots(figsize=(10.5, 5.2))
-    ax_delta = ax_time.twinx()
-    plotted_any = False
-
-    def values(bucket: str, mode: str, field: str) -> list[float]:
+    def _collect(bucket: str, mode: str, field: str) -> list[float]:
         result: list[float] = []
         for row in rows:
             if row.get("split_bucket") != bucket or row.get("mode") != mode:
@@ -1378,90 +1407,123 @@ def _write_split_position_mode_boxplots(rows: list[Mapping[str, Any]], output_ro
             value = row.get(field)
             if value is None:
                 continue
-            number = float(value)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
             if np.isfinite(number):
                 result.append(number)
         return result
 
+    def _draw_boxes(
+        ax: "plt.Axes",
+        data: list[float],
+        position: float,
+        mode: str,
+    ) -> bool:
+        if not data:
+            return False
+        bp = ax.boxplot(
+            data,
+            positions=[position],
+            widths=box_width,
+            patch_artist=True,
+            manage_ticks=False,
+            showfliers=True,
+            showmeans=False,
+        )
+        for patch in bp["boxes"]:
+            patch.set_facecolor(mode_faces[mode])
+            patch.set_edgecolor(mode_edges[mode])
+            patch.set_linewidth(1.1)
+            patch.set_alpha(0.82)
+        for key in ("whiskers", "caps"):
+            for line in bp[key]:
+                line.set_color(mode_edges[mode])
+                line.set_linewidth(0.9)
+        for line in bp["medians"]:
+            line.set_color(mode_edges[mode])
+            line.set_linewidth(1.6)
+        for flier in bp["fliers"]:
+            flier.set_markerfacecolor(mode_faces[mode])
+            flier.set_markeredgecolor(mode_edges[mode])
+            flier.set_markersize(3.0)
+            flier.set_alpha(0.7)
+        return True
+
+    fig, (ax_time, ax_acc) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(7.5, 6.0),
+        gridspec_kw={"height_ratios": [1, 1]},
+    )
+
+    plotted_time = False
+    plotted_acc = False
+
     for bucket in BUCKET_LABELS:
-        base = bucket_positions[bucket]
+        base = float(bucket_positions[bucket])
         for mode in modes:
             offset = mode_offsets[mode]
-            time_values = values(bucket, mode, "train_time_sec")
-            delta_values = values(bucket, mode, "metric_delta")
-            if time_values:
-                plot = ax_time.boxplot(
-                    time_values,
-                    positions=[base + offset - 0.045],
-                    widths=0.08,
-                    patch_artist=True,
-                    manage_ticks=False,
-                    showmeans=True,
-                    meanline=True,
-                )
-                for patch in plot["boxes"]:
-                    patch.set_facecolor(mode_faces[mode])
-                    patch.set_edgecolor(mode_edges[mode])
-                    patch.set_alpha(0.82)
-                for key in ("whiskers", "caps", "medians", "means"):
-                    for line in plot[key]:
-                        line.set_color(mode_edges[mode])
-                        line.set_linewidth(1.05)
-                plotted_any = True
-            if delta_values:
-                plot = ax_delta.boxplot(
-                    delta_values,
-                    positions=[base + offset + 0.045],
-                    widths=0.08,
-                    patch_artist=True,
-                    manage_ticks=False,
-                    showmeans=True,
-                    meanline=True,
-                )
-                for patch in plot["boxes"]:
-                    patch.set_facecolor("white")
-                    patch.set_edgecolor(mode_edges[mode])
-                    patch.set_hatch("///")
-                    patch.set_alpha(0.85)
-                for key in ("whiskers", "caps", "medians", "means"):
-                    for line in plot[key]:
-                        line.set_color(mode_edges[mode])
-                        line.set_linewidth(1.05)
-                plotted_any = True
+            pos = base + offset
 
-    if not plotted_any:
-        logger.warning("No finite train time or metric delta values to plot.")
+            time_vals = _collect(bucket, mode, "train_time_sec")
+            if _draw_boxes(ax_time, time_vals, pos, mode):
+                plotted_time = True
+
+            # metric_after is in [0, 1]; convert to percentage for the plot.
+            acc_vals = [v * 100.0 for v in _collect(bucket, mode, "metric_after")]
+            if _draw_boxes(ax_acc, acc_vals, pos, mode):
+                plotted_acc = True
+
+    if not plotted_time and not plotted_acc:
+        logger.warning("No finite values to plot; skipping subplot figure.")
         plt.close(fig)
         return
 
-    ax_delta.axhline(0.0, color="0.45", linewidth=0.8, linestyle="--", alpha=0.7)
-    ax_time.set_xticks([bucket_positions[bucket] for bucket in BUCKET_LABELS])
-    ax_time.set_xticklabels(BUCKET_LABELS)
-    ax_time.set_ylabel("Training time (sec)")
-    ax_delta.set_ylabel("Proxy mAP@0.5 delta")
-    ax_time.set_xlabel("Ariadne split boundary")
-    ax_time.set_xlim(0.45, len(BUCKET_LABELS) + 0.55)
+    # ── Axes decoration ──────────────────────────────────────────────────────
+    x_ticks = [bucket_positions[b] for b in BUCKET_LABELS]
+    x_lim = (0.45, len(BUCKET_LABELS) + 0.55)
+
+    for ax in (ax_time, ax_acc):
+        ax.set_xticks(x_ticks)
+        ax.set_xlim(x_lim)
+        ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.45)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    ax_time.set_xticklabels([])  # shared axis; labels only on bottom panel
+    ax_time.set_ylabel("Training time (s)", fontsize=9)
     ax_time.set_ylim(bottom=0.0)
-    ax_time.grid(axis="y", linestyle="--", linewidth=0.75, alpha=0.35)
-    ax_time.set_axisbelow(True)
-    ax_time.spines["top"].set_visible(False)
-    ax_delta.spines["top"].set_visible(False)
 
-    from matplotlib.patches import Patch
+    ax_acc.set_xticklabels(BUCKET_LABELS, fontsize=9)
+    ax_acc.set_xlabel("Split position", fontsize=9)
+    ax_acc.set_ylabel("mAP (%)", fontsize=9)
 
-    mode_handles = [
+    # ── Legend centred above the upper subplot ────────────────────────────────
+    legend_handles = [
         Patch(facecolor=mode_faces[mode], edgecolor=mode_edges[mode], label=mode)
         for mode in modes
     ]
-    metric_handles = [
-        Patch(facecolor="0.65", edgecolor="0.35", label="time"),
-        Patch(facecolor="white", edgecolor="0.35", hatch="///", label="metric delta"),
-    ]
-    ax_time.legend(handles=mode_handles + metric_handles, loc="upper center", ncol=5)
+    ax_time.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.18),
+        ncol=len(modes),
+        fontsize=8,
+        frameon=True,
+        framealpha=0.9,
+        edgecolor="0.75",
+    )
+
     fig.tight_layout()
-    fig.savefig(plots_dir / "freeze_vs_split_cached_vs_rebuild_by_position.pdf")
-    fig.savefig(plots_dir / "freeze_vs_split_cached_vs_rebuild_by_position.png", dpi=220)
+    stem = "freeze_vs_split_cached_vs_rebuild_by_position"
+    fig.savefig(plots_dir / f"{stem}.pdf", bbox_inches="tight")
+    fig.savefig(plots_dir / f"{stem}.png", dpi=220, bbox_inches="tight")
     plt.close(fig)
+    logger.info("Saved subplot figure to {}", plots_dir / f"{stem}.pdf")
 
 
 def _run_one_experiment(
@@ -1749,7 +1811,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _write_summary_csv(summary_path, rows)
     _write_aggregate_summary_csv(aggregate_summary_path, rows)
-    _write_split_position_mode_boxplots(rows, output_root)
+    plot_split_time_accuracy_subplots(rows, output_root)
     logger.info("Wrote {}", results_path)
     logger.info("Wrote {}", summary_path)
     logger.info("Wrote {}", aggregate_summary_path)
