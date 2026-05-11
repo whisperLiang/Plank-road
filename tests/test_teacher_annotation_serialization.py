@@ -247,6 +247,28 @@ def test_collect_teacher_annotations_keeps_request_level_batching(tmp_path, monk
     assert sorted(annotations) == ["0", "1", "2"]
 
 
+def test_collect_teacher_annotations_clips_teacher_boxes_to_frame_bounds(tmp_path, monkeypatch):
+    learner = _build_learner(tmp_path / "clipped", teacher_batch_size=1)
+    frame_dir = tmp_path / "clipped-frames"
+    _write_frames(frame_dir, ["0"])
+
+    def _batch_stub(frames):
+        assert frames[0].shape[:2] == (12, 12)
+        return [(
+            [[-1.0, -2.0, 14.0, 13.0], [20.0, 20.0, 30.0, 30.0]],
+            [1, 2],
+            [0.95, 0.50],
+        )]
+
+    monkeypatch.setattr(learner, "_teacher_inference_batch", _batch_stub)
+
+    annotations = learner._collect_teacher_annotations(str(frame_dir), ["0"])
+
+    assert annotations["0"]["boxes"] == [[0.0, 0.0, 12.0, 12.0]]
+    assert annotations["0"]["labels"] == [1]
+    assert annotations["0"]["scores"] == pytest.approx([0.95])
+
+
 def test_collect_teacher_annotations_rejects_invalid_batch_without_per_image_retry(
     tmp_path,
     monkeypatch,

@@ -3366,6 +3366,8 @@ class CloudContinualLearner:
         pred_boxes,
         pred_class,
         pred_score=None,
+        *,
+        image_size: tuple[int, int] | list[int] | None = None,
     ) -> dict[str, object] | None:
         if pred_boxes is None or pred_class is None:
             return None
@@ -3379,10 +3381,48 @@ class CloudContinualLearner:
         if count <= 0:
             return None
 
-        return {
-            "boxes": boxes[:count],
-            "labels": labels[:count],
+        image_height: float | None = None
+        image_width: float | None = None
+        if isinstance(image_size, (list, tuple)) and len(image_size) >= 2:
+            image_height = float(image_size[0])
+            image_width = float(image_size[1])
+            if image_height <= 0.0 or image_width <= 0.0:
+                image_height = None
+                image_width = None
+
+        target_boxes: list[list[float]] = []
+        target_labels: list[int] = []
+        target_scores: list[float] = []
+        scores = list(pred_score) if pred_score is not None else None
+        for index in range(count):
+            try:
+                values = [float(value) for value in list(boxes[index])[:4]]
+            except (TypeError, ValueError):
+                continue
+            if len(values) != 4:
+                continue
+            if image_height is not None and image_width is not None:
+                values[0] = max(0.0, min(float(image_width), values[0]))
+                values[2] = max(0.0, min(float(image_width), values[2]))
+                values[1] = max(0.0, min(float(image_height), values[1]))
+                values[3] = max(0.0, min(float(image_height), values[3]))
+            if values[2] <= values[0] or values[3] <= values[1]:
+                continue
+            target_boxes.append(values)
+            target_labels.append(int(labels[index]))
+            if scores is not None and index < len(scores):
+                target_scores.append(float(scores[index]))
+
+        if not target_boxes:
+            return None
+
+        targets: dict[str, object] = {
+            "boxes": target_boxes,
+            "labels": target_labels,
         }
+        if scores is not None:
+            targets["scores"] = target_scores
+        return targets
 
     @staticmethod
     def _runtime_image_size_from_metadata(
@@ -3429,6 +3469,7 @@ class CloudContinualLearner:
             pred_boxes,
             pred_class,
             pred_score,
+            image_size=tuple(int(value) for value in frame.shape[:2]),
         )
 
     def _proxy_eval_frame_cache(self) -> dict[str, np.ndarray | None] | None:
@@ -4756,7 +4797,7 @@ class CloudContinualLearner:
                         f"{len(predictions) if isinstance(predictions, (list, tuple)) else type(predictions).__name__})."
                     )
 
-                for (sample_id, _), prediction in zip(batch, predictions):
+                for (sample_id, frame), prediction in zip(batch, predictions):
                     pred_boxes = pred_class = pred_score = None
                     if isinstance(prediction, (list, tuple)):
                         if len(prediction) >= 1:
@@ -4769,6 +4810,7 @@ class CloudContinualLearner:
                         pred_boxes,
                         pred_class,
                         pred_score,
+                        image_size=tuple(int(value) for value in frame.shape[:2]),
                     )
                     if teacher_targets is None:
                         if include_empty:
