@@ -56,6 +56,7 @@ from model_management.split_model_adapters import (
     _build_rfdetr_training_labels,
     _build_ultralytics_training_batch,
     RFDETRReplay,
+    get_split_runtime_model,
     get_split_runtime_input_resize_mode,
 )
 
@@ -885,6 +886,16 @@ class TestModelZoo:
         model = build_detection_model("rfdetr_nano", pretrained=False, device="cpu")
 
         assert get_split_runtime_input_resize_mode(model) == "direct_resize"
+
+    def test_rfdetr_replay_resize_mode_is_direct_resize(self):
+        model = build_detection_model("rfdetr_nano", pretrained=False, device="cpu")
+
+        assert get_split_runtime_input_resize_mode(get_split_runtime_model(model)) == "direct_resize"
+
+    def test_tinynext_replay_resize_mode_is_direct_resize(self):
+        model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
+
+        assert get_split_runtime_input_resize_mode(get_split_runtime_model(model)) == "direct_resize"
 
     def test_ultralytics_core_split_runtime_resize_mode_is_letterbox(self):
         class FakeUltralyticsDetectionCore(torch.nn.Module):

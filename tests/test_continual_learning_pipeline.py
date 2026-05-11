@@ -1987,6 +1987,60 @@ def test_cached_split_proxy_eval_pads_singleton_for_dynamic_runtime(tmp_path):
     assert prediction_cache["prediction_rows"][0][2]["labels"] == [1]
 
 
+def test_cached_tinynext_fallback_postprocess_uses_original_image_metadata(monkeypatch):
+    from cloud_server import _postprocess_cached_tinynext_outputs
+
+    class DummyAnchorGenerator:
+        steps = [16]
+
+        def num_anchors_per_location(self):
+            return [6]
+
+    class DummyTinyNeXt:
+        anchor_generator = DummyAnchorGenerator()
+
+    captured = {}
+
+    def fake_postprocess(model, outputs, *, threshold, model_input=None, orig_image=None):
+        del model, outputs, threshold
+        captured["model_input_shape"] = tuple(model_input.shape)
+        captured["orig_image_shape"] = tuple(orig_image.shape)
+        return [
+            {
+                "boxes": torch.tensor([[100.0, 50.0, 120.0, 70.0]]),
+                "labels": torch.tensor([3]),
+                "scores": torch.tensor([0.9]),
+            }
+        ]
+
+    monkeypatch.setattr(
+        "cloud_server.postprocess_split_runtime_output",
+        fake_postprocess,
+    )
+
+    predictions = _postprocess_cached_tinynext_outputs(
+        DummyTinyNeXt(),
+        {
+            "cls_logits": torch.zeros((1, 1, 91), dtype=torch.float32),
+            "bbox_regression": torch.zeros((1, 1, 4), dtype=torch.float32),
+        },
+        batch_metadata=[
+            {
+                "input_image_size": [720, 1280],
+                "input_tensor_shape": [1, 3, 320, 320],
+                "input_resize_mode": "direct_resize",
+            }
+        ],
+        threshold_low=0.1,
+        device=torch.device("cpu"),
+    )
+
+    assert captured["model_input_shape"] == (1, 3, 320, 320)
+    assert captured["orig_image_shape"] == (720, 1280, 3)
+    assert predictions[0]["boxes"] == [[100.0, 50.0, 120.0, 70.0]]
+    assert predictions[0]["labels"] == [3]
+
+
 def test_high_quality_sync_stages_pending_without_creating_contract(tmp_path, monkeypatch):
     from cloud_server import CloudContinualLearner
 

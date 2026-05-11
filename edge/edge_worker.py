@@ -14,6 +14,7 @@ from loguru import logger
 from difference.diff import DiffProcessor
 from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
 from edge.info import TASK_STATE
+from edge.box_motion import compensate_boxes_between_frames
 from edge.quality_assessor import LOW_QUALITY, QualityAssessor
 from edge.resource_aware_trigger import (
     CloudResourceState,
@@ -291,6 +292,7 @@ class EdgeWorker:
             "boxes": [],
             "labels": [],
             "scores": [],
+            "frame": None,
         }
 
         self.collect_flag = bool(self.config.retrain.flag)
@@ -691,12 +693,14 @@ class EdgeWorker:
 
     def _remember_latest_result(self, task: Task) -> None:
         detection_boxes, detection_class, detection_score = self._snapshot_result(task)
+        frame = getattr(task, "frame_edge", None)
         with self.latest_result_lock:
             self.latest_result = {
                 "frame_index": task.frame_index,
                 "boxes": detection_boxes,
                 "labels": detection_class,
                 "scores": detection_score,
+                "frame": frame.copy() if hasattr(frame, "copy") else None,
             }
 
     def _reuse_latest_result(self, task: Task) -> None:
@@ -706,11 +710,33 @@ class EdgeWorker:
                 "boxes": [list(box) for box in self.latest_result["boxes"]],
                 "labels": list(self.latest_result["labels"]),
                 "scores": list(self.latest_result["scores"]),
+                "frame": self.latest_result.get("frame"),
             }
+        boxes = cached["boxes"]
+        labels = cached["labels"]
+        scores = cached["scores"]
+        if boxes and cached["frame"] is not None and getattr(task, "frame_edge", None) is not None:
+            compensated_boxes, keep_indices = compensate_boxes_between_frames(
+                boxes,
+                cached["frame"],
+                task.frame_edge,
+            )
+            kept = [
+                (box, labels[index], scores[index])
+                for box, index in zip(compensated_boxes, keep_indices)
+                if index < len(labels) and index < len(scores)
+            ]
+            boxes = [item[0] for item in kept]
+            labels = [item[1] for item in kept]
+            scores = [item[2] for item in kept]
+        elif boxes:
+            boxes = []
+            labels = []
+            scores = []
         task.replace_result(
-            cached["boxes"],
-            cached["labels"],
-            cached["scores"],
+            boxes,
+            labels,
+            scores,
         )
         if cached["frame_index"] is not None:
             task.ref = cached["frame_index"]

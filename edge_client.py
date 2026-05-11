@@ -10,6 +10,7 @@ from config import load_runtime_config
 from edge.edge_worker import EdgeWorker
 from edge.info import TASK_STATE
 from edge.task import Task
+from edge.box_motion import compensate_boxes_between_frames
 from model_management.utils import draw_detection
 from tools.file_op import clear_folder
 from tools.video_processor import VideoProcessor
@@ -111,6 +112,7 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
         "latency_ms": None,
         "ref": None,
         "frame_index": None,
+        "frame": None,
     }
 
     with result_path.open("w", encoding="utf-8") as result_file:
@@ -184,7 +186,8 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
                         "mode": mode,
                         "latency_ms": latency_ms,
                         "ref": task.ref,
-                        "frame_index": index if task.ref is None else task.ref,
+                        "frame_index": index,
+                        "frame": frame.copy(),
                     }
                     _write_task_result(result_file, task)
                     display_frame = _build_display_frame(
@@ -202,19 +205,40 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
                         detection_count=len(last_visual["boxes"]),
                     )
                 else:
+                    display_boxes = last_visual["boxes"]
+                    display_labels = last_visual["labels"]
+                    display_scores = last_visual["scores"]
+                    if display_boxes and last_visual.get("frame") is not None:
+                        compensated_boxes, keep_indices = compensate_boxes_between_frames(
+                            display_boxes,
+                            last_visual["frame"],
+                            frame,
+                        )
+                        kept = [
+                            (box, display_labels[item_index], display_scores[item_index])
+                            for box, item_index in zip(compensated_boxes, keep_indices)
+                            if item_index < len(display_labels) and item_index < len(display_scores)
+                        ]
+                        display_boxes = [item[0] for item in kept]
+                        display_labels = [item[1] for item in kept]
+                        display_scores = [item[2] for item in kept]
+                    elif display_boxes:
+                        display_boxes = []
+                        display_labels = []
+                        display_scores = []
                     display_frame = _build_display_frame(
                         frame,
                         frame_index=index,
-                        detection_boxes=last_visual["boxes"],
-                        detection_class=last_visual["labels"],
-                        detection_score=last_visual["scores"],
+                        detection_boxes=display_boxes,
+                        detection_class=display_labels,
+                        detection_score=display_scores,
                         mode=last_visual["mode"],
                         sampled=False,
                         latency_ms=last_visual["latency_ms"],
                         ref=last_visual["ref"],
                         latest_result_frame=last_visual["frame_index"],
-                        show_boxes=bool(last_visual["boxes"]),
-                        detection_count=len(last_visual["boxes"]),
+                        show_boxes=bool(display_boxes),
+                        detection_count=len(display_boxes),
                     )
 
                 cv2.imshow(window_name, display_frame)

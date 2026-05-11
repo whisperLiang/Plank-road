@@ -794,17 +794,12 @@ def _postprocess_cached_tinynext_outputs(
         return None
     anchors_per_level = list(num_anchors_per_location())
     if not isinstance(steps, (list, tuple)) or len(steps) != len(anchors_per_level):
-        processed = postprocess_split_runtime_output(
+        return _postprocess_cached_tinynext_outputs_via_split_postprocess(
             model,
             outputs,
-            threshold=threshold_low,
-            model_input=transformed_batch,
-        )
-        return _batched_predictions_from_model_output(
-            processed,
-            batch_size=batch_size,
+            batch_metadata=batch_metadata,
             threshold_low=threshold_low,
-            threshold_high=threshold_low,
+            device=device,
         )
 
     grid_sizes: list[tuple[int, int]] = []
@@ -827,17 +822,12 @@ def _postprocess_cached_tinynext_outputs(
     )
     actual_anchor_count = int(bbox_regression.shape[1])
     if actual_anchor_count != expected_anchor_count:
-        processed = postprocess_split_runtime_output(
+        return _postprocess_cached_tinynext_outputs_via_split_postprocess(
             model,
             outputs,
-            threshold=threshold_low,
-            model_input=transformed_batch,
-        )
-        return _batched_predictions_from_model_output(
-            processed,
-            batch_size=batch_size,
+            batch_metadata=batch_metadata,
             threshold_low=threshold_low,
-            threshold_high=threshold_low,
+            device=device,
         )
 
     dummy_feature_maps = [
@@ -866,6 +856,47 @@ def _postprocess_cached_tinynext_outputs(
         threshold_low=threshold_low,
         threshold_high=threshold_low,
     )
+
+
+def _postprocess_cached_tinynext_outputs_via_split_postprocess(
+    model: torch.nn.Module,
+    outputs: object,
+    *,
+    batch_metadata: list[Mapping[str, object] | None],
+    threshold_low: float,
+    device: torch.device,
+) -> list[dict[str, list]] | None:
+    predictions: list[dict[str, list]] = []
+    batch_size = len(batch_metadata)
+    for index, metadata in enumerate(batch_metadata):
+        runtime_input = _build_synthetic_runtime_input(metadata, device=device)
+        original_frame = _build_synthetic_original_frame(metadata)
+        if runtime_input is None or original_frame is None:
+            return None
+        single_outputs = _slice_batched_runtime_outputs(
+            outputs,
+            index,
+            batch_size=batch_size,
+        )
+        processed = postprocess_split_runtime_output(
+            model,
+            single_outputs,
+            threshold=threshold_low,
+            model_input=runtime_input,
+            orig_image=original_frame,
+        )
+        single_prediction = _batched_predictions_from_model_output(
+            processed,
+            batch_size=1,
+            threshold_low=threshold_low,
+            threshold_high=threshold_low,
+        )
+        predictions.append(
+            dict(single_prediction[0])
+            if single_prediction
+            else {"labels": [], "boxes": [], "scores": []}
+        )
+    return predictions
 
 
 def _postprocess_cached_split_proxy_outputs(

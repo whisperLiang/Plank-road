@@ -245,8 +245,10 @@ def get_split_runtime_input_resize_mode(model: torch.nn.Module) -> str | None:
         return "letterbox"
     if _is_ultralytics_detection_core(model):
         return "letterbox"
-    if isinstance(model, RFDETRDetectionModel):
+    if isinstance(model, (RFDETRDetectionModel, RFDETRReplay)):
         return "direct_resize"
+    if isinstance(model, TorchvisionAnchorDetectorReplay):
+        model = model.detector
     if _is_anchor_detector(model):
         fixed_size = getattr(getattr(model, "transform", None), "fixed_size", None)
         if isinstance(fixed_size, (list, tuple)) and len(fixed_size) >= 2:

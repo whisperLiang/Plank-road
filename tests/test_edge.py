@@ -19,6 +19,7 @@ import torch
 
 from edge.task import Task
 from edge.info import FRAME_TYPE, TASK_STATE
+from edge.box_motion import compensate_boxes_between_frames, estimate_frame_translation
 from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY, QualityAssessment
 from edge.resample import history_sample, annotion_process
 from edge.resource_aware_trigger import (
@@ -92,6 +93,55 @@ class TestTask:
 
 
 class TestEdgeWorkerRouting:
+
+    def test_cached_box_motion_compensation_tracks_shifted_frame(self):
+        reference = np.zeros((96, 128, 3), dtype=np.uint8)
+        reference[30:58, 36:72] = 255
+        current = np.zeros_like(reference)
+        current[34:62, 43:79] = 255
+
+        shift = estimate_frame_translation(reference, current)
+        assert shift is not None
+        assert shift[0] == pytest.approx(7.0, abs=0.5)
+        assert shift[1] == pytest.approx(4.0, abs=0.5)
+
+        boxes, keep_indices = compensate_boxes_between_frames(
+            [[36.0, 30.0, 72.0, 58.0]],
+            reference,
+            current,
+        )
+
+        assert keep_indices == [0]
+        assert boxes[0] == pytest.approx([43.0, 34.0, 79.0, 62.0], abs=0.75)
+
+    def test_reuse_latest_result_motion_compensates_cached_boxes(self):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.latest_result_lock = threading.Lock()
+        worker.latest_result = {
+            "frame_index": None,
+            "boxes": [],
+            "labels": [],
+            "scores": [],
+            "frame": None,
+        }
+        reference = np.zeros((96, 128, 3), dtype=np.uint8)
+        reference[30:58, 36:72] = 255
+        current = np.zeros_like(reference)
+        current[34:62, 43:79] = 255
+
+        source_task = Task(1, 10, reference, time.time(), reference.shape)
+        source_task.add_result([[36.0, 30.0, 72.0, 58.0]], [3], [0.9])
+        worker._remember_latest_result(source_task)
+
+        cached_task = Task(1, 11, current, time.time(), current.shape)
+        worker._reuse_latest_result(cached_task)
+
+        boxes, labels, scores = cached_task.get_result()
+        assert cached_task.ref == 10
+        assert cached_task.result_source == "cached"
+        assert labels == [3]
+        assert scores == [0.9]
+        assert boxes[0] == pytest.approx([43.0, 34.0, 79.0, 62.0], abs=0.75)
 
     def test_filtered_frames_only_enter_local_inference_queue(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
