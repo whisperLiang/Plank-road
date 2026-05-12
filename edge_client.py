@@ -97,7 +97,7 @@ def _build_display_frame(
     return rendered
 
 
-def _run_video_loop(config, edge: EdgeWorker) -> None:
+def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None:
     result_path = Path("log") / "client" / "latest_inference_results.jsonl"
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -148,7 +148,7 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
                         )
                     split_runtime_prepared = True
 
-                if not window_created:
+                if not headless and not window_created:
                     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
                     window_created = True
 
@@ -241,11 +241,12 @@ def _run_video_loop(config, edge: EdgeWorker) -> None:
                         detection_count=len(display_boxes),
                     )
 
-                cv2.imshow(window_name, display_frame)
-                key = cv2.waitKey(display_delay_ms) & 0xFF
-                if key in (27, ord("q")):
-                    logger.info("Video display stopped by user.")
-                    break
+                if not headless:
+                    cv2.imshow(window_name, display_frame)
+                    key = cv2.waitKey(display_delay_ms) & 0xFF
+                    if key in (27, ord("q")):
+                        logger.info("Video display stopped by user.")
+                        break
 
     logger.info("Saved local inference results to {}", result_path)
 
@@ -257,6 +258,8 @@ if __name__ == '__main__':
     parser.add_argument("--cache_path", type=str, default=None, help="override client.retrain.cache_path (must be unique per edge)")
     parser.add_argument("--video_path", type=str, default=None, help="override client.source.video_path")
     parser.add_argument("--server_ip", type=str, default=None, help="override client.server_ip")
+    parser.add_argument("--max_count", type=int, default=None, help="override client.source.max_count")
+    parser.add_argument("--headless", action="store_true", help="run without OpenCV display windows")
     args = parser.parse_args()
 
     config = load_runtime_config(args.yaml_path).client
@@ -271,6 +274,8 @@ if __name__ == '__main__':
         config.retrain.cache_path = f"./cache/edge_{args.edge_id}"
     if args.video_path is not None:
         config.source.video_path = args.video_path
+    if args.max_count is not None:
+        config.source.max_count = args.max_count
     if args.server_ip is not None:
         config.server_ip = args.server_ip
 
@@ -287,9 +292,10 @@ if __name__ == '__main__':
     edge = EdgeWorker(config)
 
     try:
-        _run_video_loop(config, edge)
+        _run_video_loop(config, edge, headless=args.headless)
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
     finally:
         edge.close()
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
