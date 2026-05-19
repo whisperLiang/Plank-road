@@ -1,0 +1,65 @@
+experiment:
+  name: baselines_real_advantage
+  seed: 2026
+  repeats: 3
+  results_dir: results/baselines_real_advantage
+  methods:
+    - plank_road_multi_device
+    - ekya_style_centralized_scheduling
+    - accuracy_trigger_cloud_retraining
+    - pure_edge_local_updating
+
+dataset:
+  videos:
+    - id: road
+      path: ./video_data/road.mp4
+      labels: ./cache/teacher_labels/road
+  total_frames: 512
+  window_seconds: 10
+  window_frames: null
+
+model:
+  student_model: yolo26
+  teacher_label_dir: ./cache/teacher_labels/road
+  initial_checkpoint: null
+
+runtime:
+  device: cuda
+  batch_size: 2
+  epochs: 1
+  num_edges: [1, 2, 4, 8]
+  bandwidth_mbps: [5, 10, 20, 50, 80]
+  max_concurrent_train_jobs: [1]
+  f1_threshold: 0.50
+  map50_threshold: 0.50
+  recovery_sla_sec: 120
+  latency_sla_ms: null
+
+plank_road_ablation:
+  enabled: true
+  variants:
+    full:
+      enable_feature_cache: true
+      enable_split_tail_training: true
+      enable_resource_aware_trigger: true
+      enable_feature_upload: true
+    no_feature_cache:
+      enable_feature_cache: false
+      enable_split_tail_training: true
+      enable_resource_aware_trigger: true
+      enable_feature_upload: true
+    no_resource_aware_trigger:
+      enable_feature_cache: true
+      enable_split_tail_training: true
+      enable_resource_aware_trigger: false
+      enable_feature_upload: true
+    no_feature_upload:
+      enable_feature_cache: true
+      enable_split_tail_training: true
+      enable_resource_aware_trigger: true
+      enable_feature_upload: false
+    no_split_tail:
+      enable_feature_cache: false
+      enable_split_tail_training: false
+      enable_resource_aware_trigger: true
+      enable_feature_upload: false

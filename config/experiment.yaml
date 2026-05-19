@@ -7,15 +7,25 @@ experiment:
   results_dir: results/baselines_real_smoke
   video_path: ./video_data/road.mp4
   student_model: yolo26
-  teacher_model: cv_oracle
+  teacher_model: ./cache/teacher_labels/road
+  initial_checkpoint:
+  seed: 2026
+  repeat_id: 0
+  run_id: baselines_real_smoke
+  method_variant: default
   window_seconds: 10
   window_frames:
   batch_size: 2
   epochs: 1
   device: cpu
+  bandwidth_mbps: 50
+  max_concurrent_train_jobs: 1
+  real_sleep_upload: false
   reuse_teacher_cache: true
   quick_smoke: false
   f1_threshold:
+  map50_threshold:
+  recovery_sla_sec: 120
   latency_sla_ms:
   capacity_mode: false
 
@@ -25,6 +35,10 @@ baselines:
     allow_resource_aware_feature_upload: true
     collect_num: 20
     f1_trigger_threshold: 0.55
+    enable_feature_cache: true
+    enable_split_tail_training: true
+    enable_resource_aware_trigger: true
+    enable_feature_upload: true
 
   ekya_style_centralized_scheduling:
     inference_reserved_ratio: 0.6

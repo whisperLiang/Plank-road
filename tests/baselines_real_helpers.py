@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -29,7 +31,25 @@ def make_frame_dir(tmp_path: Path, count: int = 8) -> Path:
     return frame_dir
 
 
+def make_label_dir(frame_dir: Path, *, label_root: Path | None = None) -> Path:
+    label_dir = label_root or frame_dir.parent / "labels"
+    label_dir.mkdir(parents=True, exist_ok=True)
+    for frame_path in sorted(frame_dir.glob("*.jpg")):
+        index = int(frame_path.stem)
+        offset = index % 4
+        labels = [
+            {
+                "bbox": [float(20 + offset), 20.0, float(44 + offset), 44.0],
+                "score": 1.0,
+                "class_id": 1,
+            }
+        ]
+        (label_dir / f"{frame_path.stem}.json").write_text(json.dumps(labels), encoding="utf-8")
+    return label_dir
+
+
 def make_config(method: str, *, total_frames: int = 8) -> ExperimentConfig:
+    label_dir = Path(tempfile.mkdtemp(prefix="plank_road_test_labels_"))
     config = ExperimentConfig(
         method=method,
         num_devices=1,
@@ -37,7 +57,7 @@ def make_config(method: str, *, total_frames: int = 8) -> ExperimentConfig:
         results_dir="unused",
         video_path="unused",
         student_model="yolo26",
-        teacher_model="cv_oracle",
+        teacher_model=str(label_dir),
         batch_size=2,
         epochs=1,
         device="cpu",
@@ -55,6 +75,8 @@ def make_config(method: str, *, total_frames: int = 8) -> ExperimentConfig:
 
 def build_context(tmp_path: Path, *, method_name: str, cache_features: bool = False) -> RealBaselineContext:
     results_dir = tmp_path / "results"
+    label_dir = results_dir / "teacher_labels"
+    label_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_manager = CheckpointManager(results_dir)
     evaluator = DetectionEvaluator()
     inferencer = StudentInferencer(
@@ -68,10 +90,9 @@ def build_context(tmp_path: Path, *, method_name: str, cache_features: bool = Fa
     initial = checkpoint_manager.create_initial(method_name, base_checkpoint)
     inferencer.load_checkpoint(initial)
     teacher = TeacherAnnotator(
-        teacher_model="cv_oracle",
+        teacher_model=str(label_dir),
         results_dir=results_dir,
         reuse_cache=True,
-        allow_cv_oracle=True,
     )
     trainer = RealTrainer(
         model=inferencer.model,
@@ -109,6 +130,7 @@ def populate_context(
     device_id: int = 0,
 ) -> list[InferenceResult]:
     results: list[InferenceResult] = []
+    make_label_dir(frame_dir, label_root=Path(context.teacher_annotator.ground_truth_dir))
     for index, frame_path in enumerate(sorted(frame_dir.glob("*.jpg"))[:count]):
         student = context.student_inferencer.infer(frame_path, device_id=device_id, frame_index=index)
         teacher = context.teacher_annotator.annotate(frame_path)

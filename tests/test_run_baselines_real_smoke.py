@@ -4,12 +4,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from baselines.runtime.teacher_annotator import TeacherAnnotator
-from tests.baselines_real_helpers import make_frame_dir
+from tests.baselines_real_helpers import make_frame_dir, make_label_dir
 
 
 def test_run_baselines_real_smoke(tmp_path: Path):
     frame_dir = make_frame_dir(tmp_path, count=32)
+    label_dir = make_label_dir(frame_dir)
     results_dir = tmp_path / "real_results"
     cmd = [
         sys.executable,
@@ -20,6 +23,8 @@ def test_run_baselines_real_smoke(tmp_path: Path):
         "pure_edge_local_updating,accuracy_trigger_cloud_retraining",
         "--student-model",
         "yolo26",
+        "--teacher-model",
+        str(label_dir),
         "--window-frames",
         "4",
         "--total-frames",
@@ -53,6 +58,14 @@ def test_run_baselines_real_smoke(tmp_path: Path):
     assert frame_rows
     assert update_rows
     assert all(row["is_real"] == "True" for row in frame_rows)
+    by_method: dict[str, list[dict[str, str]]] = {}
+    for row in frame_rows:
+        by_method.setdefault(row["method_name"], []).append(row)
+    assert set(by_method) == {"pure_edge_local_updating", "accuracy_trigger_cloud_retraining"}
+    assert all(
+        any(row["teacher_from_cache"] == "False" for row in rows)
+        for rows in by_method.values()
+    )
 
 
 def test_teacher_cache_is_namespaced_by_teacher_source(tmp_path: Path):
@@ -82,3 +95,48 @@ def test_teacher_cache_is_namespaced_by_teacher_source(tmp_path: Path):
 
     assert first.label_path != second.label_path
     assert Path(second.label_path).read_text(encoding="utf-8") != "[]"
+
+
+def test_teacher_annotator_requires_existing_label_dir(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        TeacherAnnotator(
+            teacher_model=str(tmp_path / "missing_labels"),
+            results_dir=tmp_path / "results",
+        )
+
+
+def test_teacher_annotator_missing_frame_label_raises(tmp_path: Path):
+    frame_dir = make_frame_dir(tmp_path, count=1)
+    labels = tmp_path / "labels"
+    labels.mkdir()
+    annotator = TeacherAnnotator(
+        teacher_model=str(labels),
+        results_dir=tmp_path / "results",
+    )
+    with pytest.raises(FileNotFoundError):
+        annotator.annotate(next(frame_dir.glob("*.jpg")))
+
+
+def test_run_baselines_real_requires_teacher_model(tmp_path: Path):
+    frame_dir = make_frame_dir(tmp_path, count=1)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "tools/run_baselines_real.py",
+            "--video",
+            str(frame_dir),
+            "--methods",
+            "pure_edge_local_updating",
+            "--total-frames",
+            "1",
+            "--device",
+            "cpu",
+            "--results-dir",
+            str(tmp_path / "results"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "--teacher-model" in result.stderr

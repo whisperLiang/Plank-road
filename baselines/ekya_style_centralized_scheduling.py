@@ -189,7 +189,7 @@ class EkyaStyleCentralizedScheduling(BaseMethod):
             sample_paths=[sample.frame_path for sample in samples],
             label_paths=[sample.label_path for sample in samples],
             prediction_paths=[sample.prediction_path for sample in samples],
-            measured_upload_bytes=upload.bytes,
+            measured_upload_bytes=upload.total_upload_bytes,
             update_config={"candidate": asdict(candidate), "train_mode": "raw_full"},
             is_real=True,
             is_central=True,
@@ -202,6 +202,7 @@ class EkyaStyleCentralizedScheduling(BaseMethod):
                 "measured_map50": candidate.measured_map50,
                 "utility": candidate.utility,
                 "upload_serialization_time_sec": upload.serialization_time_sec,
+                **upload.to_event_fields(),
                 "bundle_path": upload.bundle_path,
             },
         )
@@ -218,7 +219,6 @@ class EkyaStyleCentralizedScheduling(BaseMethod):
         )
 
         arrival_time = float(plan.metadata.get("arrival_time_sec", time.perf_counter()))
-        queue_wait = max(0.0, self._server_available_at - arrival_time)
         candidate = plan.update_config.get("candidate", {})
         report = context.get_trainer(plan.device_id).train_raw_frames(
             samples,
@@ -231,25 +231,32 @@ class EkyaStyleCentralizedScheduling(BaseMethod):
             report.checkpoint_path,
         )
 
-        upload_time = float(plan.metadata.get("upload_serialization_time_sec", 0.0))
+        upload_time = float(plan.metadata.get("upload_time_sec", 0.0))
+        upload_serialization_time = float(plan.metadata.get("upload_serialization_time_sec", 0.0))
         microprofile_time = float(plan.metadata.get("microprofile_time_sec", 0.0))
         label_time = sum(sample.teacher_latency_sec for sample in samples)
+        queue_record = context.schedule_cloud_training(
+            plan=plan,
+            ready_time_sec=arrival_time + upload_time + label_time + microprofile_time,
+            train_duration_sec=report.training_time_sec + report.model_update_time_sec,
+        )
+        queue_wait = queue_record.queue_wait_sec
         recovery_time = (
-            queue_wait
-            + upload_time
+            upload_time
             + microprofile_time
             + label_time
+            + queue_wait
             + report.training_time_sec
+            + report.model_update_time_sec
             + checkpoint_load_time
         )
-        self._server_available_at = arrival_time + recovery_time
         upload_bytes = int(plan.measured_upload_bytes or 0)
         dev.record_update(
             wait_time_sec=queue_wait,
             training_time_sec=report.training_time_sec + microprofile_time,
             upload_bytes=upload_bytes,
             is_central=True,
-            upload_serialization_time_sec=upload_time,
+            upload_serialization_time_sec=upload_serialization_time,
             teacher_label_time_sec=label_time,
             microprofile_time_sec=microprofile_time,
             raw_replay_time_sec=report.raw_replay_time_sec,
@@ -265,13 +272,20 @@ class EkyaStyleCentralizedScheduling(BaseMethod):
             {
                 "method_name": self.method_name,
                 "device_id": plan.device_id,
+                "window_id": samples[-1].window_id if samples else "",
                 "trigger_reason": plan.trigger_reason,
                 "num_samples": plan.num_samples,
                 "upload_mode": plan.upload_mode,
+                "raw_bytes": int(plan.metadata.get("raw_bytes", 0) or 0),
+                "feature_bytes": 0,
+                "metadata_bytes": int(plan.metadata.get("metadata_bytes", 0) or 0),
+                "total_upload_bytes": int(plan.metadata.get("total_upload_bytes", upload_bytes) or 0),
                 "measured_upload_bytes": upload_bytes,
-                "upload_serialization_time_sec": upload_time,
+                "upload_time_sec": upload_time,
+                "upload_serialization_time_sec": upload_serialization_time,
                 "teacher_label_time_sec": label_time,
                 "microprofile_time_sec": microprofile_time,
+                "queue_wait_sec": queue_wait,
                 "queue_wait_time_sec": queue_wait,
                 "raw_replay_time_sec": report.raw_replay_time_sec,
                 "feature_reconstruction_time_sec": report.feature_reconstruction_time_sec,
@@ -284,6 +298,10 @@ class EkyaStyleCentralizedScheduling(BaseMethod):
                 "optimizer_steps": report.optimizer_steps,
                 "accuracy_before_update": report.accuracy_before_update,
                 "accuracy_after_update": report.accuracy_after_update,
+                "metric_f1_before": report.f1_before_update,
+                "metric_f1_after": report.f1_after_update,
+                "metric_map50_before": report.map50_before_update,
+                "metric_map50_after": report.map50_after_update,
                 "cached_feature_ratio": report.cached_feature_ratio,
                 "reconstructed_feature_ratio": report.reconstructed_feature_ratio,
                 "selected_candidate": candidate.get("name"),

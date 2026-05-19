@@ -12,6 +12,7 @@ from typing import Any, Iterable
 import cv2
 
 from baselines.runtime.sample_store import SampleRecord
+from baselines.runtime.resource_meter import BandwidthEmulator, UploadAccounting
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,27 @@ class UploadRecord:
     bytes: int
     serialization_time_sec: float
     bundle_path: str
+    raw_bytes: int = 0
+    feature_bytes: int = 0
+    metadata_bytes: int = 0
+    upload_time_sec: float = 0.0
+
+    @property
+    def total_upload_bytes(self) -> int:
+        return int(self.bytes)
+
+    def accounting(self) -> UploadAccounting:
+        return UploadAccounting(
+            raw_bytes=int(self.raw_bytes),
+            feature_bytes=int(self.feature_bytes),
+            metadata_bytes=int(self.metadata_bytes),
+            total_upload_bytes=int(self.bytes),
+            upload_time_sec=float(self.upload_time_sec),
+            upload_mode=self.upload_mode,
+        )
+
+    def to_event_fields(self) -> dict[str, int | float | str]:
+        return self.accounting().to_dict()
 
 
 def _directory_size(path: Path) -> int:
@@ -35,10 +57,16 @@ def _directory_size(path: Path) -> int:
 class UploadMeter:
     """Serialize selected samples and measure real bytes on disk."""
 
-    def __init__(self, results_dir: str | Path) -> None:
+    def __init__(
+        self,
+        results_dir: str | Path,
+        *,
+        bandwidth_emulator: BandwidthEmulator | None = None,
+    ) -> None:
         self.results_dir = Path(results_dir)
         self.bundle_root = self.results_dir / "upload_bundles"
         self.bundle_root.mkdir(parents=True, exist_ok=True)
+        self.bandwidth_emulator = bandwidth_emulator or BandwidthEmulator(None)
 
     def measure_samples(
         self,
@@ -105,7 +133,13 @@ class UploadMeter:
         mode = upload_mode.lower()
         if mode in {"none", "local"}:
             elapsed = time.perf_counter() - start
-            return UploadRecord(upload_mode=upload_mode, bytes=0, serialization_time_sec=elapsed, bundle_path=str(bundle))
+            return UploadRecord(
+                upload_mode=upload_mode,
+                bytes=0,
+                serialization_time_sec=elapsed,
+                bundle_path=str(bundle),
+                upload_time_sec=0.0,
+            )
         if mode == "raw_only":
             self._copy_many(raw_paths, bundle / "raw")
         elif mode == "raw+feature":
@@ -135,11 +169,26 @@ class UploadMeter:
             raise ValueError(f"Unsupported upload mode: {upload_mode}")
 
         elapsed = time.perf_counter() - start
+        raw_bytes = _directory_size(bundle / "raw") if (bundle / "raw").exists() else 0
+        feature_bytes = _directory_size(bundle / "features") if (bundle / "features").exists() else 0
+        metadata_bytes = 0
+        metadata_path = bundle / "metadata.json"
+        if metadata_path.exists():
+            metadata_bytes += metadata_path.stat().st_size
+        for extra_name in ("labels", "predictions"):
+            extra_path = bundle / extra_name
+            if extra_path.exists():
+                metadata_bytes += _directory_size(extra_path)
+        total = _directory_size(bundle)
         return UploadRecord(
             upload_mode=upload_mode,
-            bytes=_directory_size(bundle),
+            bytes=total,
             serialization_time_sec=elapsed,
             bundle_path=str(bundle),
+            raw_bytes=raw_bytes,
+            feature_bytes=feature_bytes,
+            metadata_bytes=metadata_bytes,
+            upload_time_sec=self.bandwidth_emulator.upload_time_sec(total),
         )
 
     @staticmethod

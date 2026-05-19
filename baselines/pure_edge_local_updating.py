@@ -99,7 +99,7 @@ class PureEdgeLocalUpdating(BaseMethod):
             report.checkpoint_path,
         )
         label_time = sum(sample.teacher_latency_sec for sample in samples)
-        recovery_time = report.training_time_sec + checkpoint_load_time
+        recovery_time = report.training_time_sec + report.model_update_time_sec + checkpoint_load_time
         dev.record_update(
             wait_time_sec=0.0,
             training_time_sec=report.training_time_sec,
@@ -119,11 +119,18 @@ class PureEdgeLocalUpdating(BaseMethod):
             {
                 "method_name": self.method_name,
                 "device_id": plan.device_id,
+                "window_id": samples[-1].window_id if samples else "",
                 "trigger_reason": plan.trigger_reason,
                 "num_samples": plan.num_samples,
                 "upload_mode": plan.upload_mode,
+                "raw_bytes": 0,
+                "feature_bytes": 0,
+                "metadata_bytes": 0,
+                "total_upload_bytes": 0,
                 "measured_upload_bytes": 0,
+                "upload_time_sec": 0.0,
                 "teacher_label_time_sec": label_time,
+                "queue_wait_sec": 0.0,
                 "queue_wait_time_sec": 0.0,
                 "raw_replay_time_sec": report.raw_replay_time_sec,
                 "feature_reconstruction_time_sec": report.feature_reconstruction_time_sec,
@@ -137,6 +144,10 @@ class PureEdgeLocalUpdating(BaseMethod):
                 "optimizer_steps": report.optimizer_steps,
                 "accuracy_before_update": report.accuracy_before_update,
                 "accuracy_after_update": report.accuracy_after_update,
+                "metric_f1_before": report.f1_before_update,
+                "metric_f1_after": report.f1_after_update,
+                "metric_map50_before": report.map50_before_update,
+                "metric_map50_after": report.map50_after_update,
                 "cached_feature_ratio": report.cached_feature_ratio,
                 "reconstructed_feature_ratio": report.reconstructed_feature_ratio,
                 "is_real": True,

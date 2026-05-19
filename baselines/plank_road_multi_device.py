@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict, deque
+from dataclasses import replace
 from typing import Any
 
 from baselines.base_method import BaseMethod, InferenceResult, UpdatePlan
@@ -24,6 +25,10 @@ class PlankRoadMultiDevice(BaseMethod):
         self.allow_feature_upload = bool(
             getattr(cfg, "allow_resource_aware_feature_upload", True)
         )
+        self.enable_feature_cache = bool(getattr(cfg, "enable_feature_cache", True))
+        self.enable_split_tail_training = bool(getattr(cfg, "enable_split_tail_training", True))
+        self.enable_resource_aware_trigger = bool(getattr(cfg, "enable_resource_aware_trigger", True))
+        self.enable_feature_upload = bool(getattr(cfg, "enable_feature_upload", True))
         self._collect_num = int(getattr(cfg, "collect_num", 20))
         self._metric_trigger_threshold = float(getattr(cfg, "f1_trigger_threshold", 0.55))
 
@@ -58,17 +63,30 @@ class PlankRoadMultiDevice(BaseMethod):
     def should_trigger(self, device_id: int) -> bool:
         if self._triggered[device_id]:
             return False
-        return self._sample_counts[device_id] >= self._collect_num or self._drift_counts[device_id] > 0
+        if self.enable_resource_aware_trigger and self._drift_counts[device_id] > 0:
+            return True
+        return self._sample_counts[device_id] >= self._collect_num
 
     def build_update_plan(self, device_id: int) -> UpdatePlan:
         context = self._require_context()
         window = self._get_window(device_id)
-        upload_mode = self.upload_mode_default
-        if self.allow_feature_upload and window.confidence_drop > 0.2:
-            upload_mode = "raw+feature"
         samples = context.sample_store.get_recent_samples(device_id, self._sample_counts[device_id])
         if not samples:
             raise RuntimeError(f"No real samples available for Plank-road device {device_id}")
+        feature_ready = all(sample.feature_tensor_path for sample in samples)
+        upload_mode = self.upload_mode_default
+        if (
+            self.enable_feature_upload
+            and self.allow_feature_upload
+            and self.enable_feature_cache
+            and feature_ready
+        ):
+            if self.enable_resource_aware_trigger and window.confidence_drop <= 0.2:
+                upload_mode = "feature_only"
+            else:
+                upload_mode = "feature_only"
+        else:
+            upload_mode = "raw_only"
         upload = context.measure_upload(
             samples,
             upload_mode=upload_mode,
@@ -76,7 +94,12 @@ class PlankRoadMultiDevice(BaseMethod):
             device_id=device_id,
             metadata={"selected_by": "resource_aware_trigger"},
         )
-        reason = "drift_detected" if self._drift_counts[device_id] > 0 else "resource_aware_trigger"
+        if self.enable_resource_aware_trigger and self._drift_counts[device_id] > 0:
+            reason = "drift_detected"
+        elif self.enable_resource_aware_trigger:
+            reason = "resource_aware_trigger"
+        else:
+            reason = "fixed_collect_window"
         context.sample_store.mark_selected(
             [sample.sample_id for sample in samples],
             upload_mode=upload_mode,
@@ -92,12 +115,16 @@ class PlankRoadMultiDevice(BaseMethod):
             sample_paths=[sample.frame_path for sample in samples],
             label_paths=[sample.label_path for sample in samples],
             prediction_paths=[sample.prediction_path for sample in samples],
-            measured_upload_bytes=upload.bytes,
-            update_config={"train_mode": "split_tail"},
+            measured_upload_bytes=upload.total_upload_bytes,
+            update_config={
+                "train_mode": "split_tail" if self.enable_split_tail_training else "raw_full",
+                "use_uploaded_features": upload.feature_bytes > 0,
+            },
             is_real=True,
             is_central=True,
             metadata={
                 "upload_serialization_time_sec": upload.serialization_time_sec,
+                **upload.to_event_fields(),
                 "bundle_path": upload.bundle_path,
             },
         )
@@ -114,8 +141,16 @@ class PlankRoadMultiDevice(BaseMethod):
         )
 
         arrival_time = float(plan.metadata.get("arrival_time_sec", time.perf_counter()))
-        queue_wait = max(0.0, self._server_available_at - arrival_time)
-        report = context.get_trainer(plan.device_id).train_split_tail(samples)
+        training_samples = samples
+        if not bool(plan.update_config.get("use_uploaded_features", False)):
+            training_samples = [replace(sample, feature_tensor_path=None) for sample in samples]
+        if self.enable_split_tail_training:
+            report = context.get_trainer(plan.device_id).train_split_tail(training_samples)
+        else:
+            report = context.get_trainer(plan.device_id).train_raw_frames(
+                training_samples,
+                trainable_scope="full",
+            )
         checkpoint_load_time = context.load_checkpoint_for_device(
             self.method_name,
             plan.device_id,
@@ -123,18 +158,34 @@ class PlankRoadMultiDevice(BaseMethod):
         )
 
         upload_bytes = int(plan.measured_upload_bytes or 0)
-        upload_time = float(plan.metadata.get("upload_serialization_time_sec", 0.0))
-        recovery_time = queue_wait + upload_time + report.training_time_sec + checkpoint_load_time
-        self._server_available_at = arrival_time + recovery_time
+        upload_time = float(plan.metadata.get("upload_time_sec", 0.0))
+        upload_serialization_time = float(plan.metadata.get("upload_serialization_time_sec", 0.0))
+        label_time = sum(sample.teacher_latency_sec for sample in samples)
+        queue_record = context.schedule_cloud_training(
+            plan=plan,
+            ready_time_sec=arrival_time + upload_time + label_time,
+            train_duration_sec=report.training_time_sec + report.model_update_time_sec,
+        )
+        queue_wait = queue_record.queue_wait_sec
+        recovery_time = (
+            upload_time
+            + label_time
+            + queue_wait
+            + report.training_time_sec
+            + report.model_update_time_sec
+            + checkpoint_load_time
+        )
         dev.record_update(
             wait_time_sec=queue_wait,
             training_time_sec=report.training_time_sec,
             upload_bytes=upload_bytes,
             is_central=True,
-            upload_serialization_time_sec=upload_time,
+            upload_serialization_time_sec=upload_serialization_time,
+            teacher_label_time_sec=label_time,
             raw_replay_time_sec=report.raw_replay_time_sec,
             feature_reconstruction_time_sec=report.feature_reconstruction_time_sec,
             tail_training_time_sec=report.tail_training_time_sec,
+            full_training_time_sec=report.full_training_time_sec,
             model_update_time_sec=report.model_update_time_sec,
             checkpoint_load_time_sec=checkpoint_load_time,
             accuracy_before_update=report.accuracy_before_update,
@@ -148,11 +199,19 @@ class PlankRoadMultiDevice(BaseMethod):
             {
                 "method_name": self.method_name,
                 "device_id": plan.device_id,
+                "window_id": samples[-1].window_id if samples else "",
                 "trigger_reason": plan.trigger_reason,
                 "num_samples": plan.num_samples,
                 "upload_mode": plan.upload_mode,
+                "raw_bytes": int(plan.metadata.get("raw_bytes", 0) or 0),
+                "feature_bytes": int(plan.metadata.get("feature_bytes", 0) or 0),
+                "metadata_bytes": int(plan.metadata.get("metadata_bytes", 0) or 0),
+                "total_upload_bytes": int(plan.metadata.get("total_upload_bytes", upload_bytes) or 0),
                 "measured_upload_bytes": upload_bytes,
-                "upload_serialization_time_sec": upload_time,
+                "upload_time_sec": upload_time,
+                "upload_serialization_time_sec": upload_serialization_time,
+                "teacher_label_time_sec": label_time,
+                "queue_wait_sec": queue_wait,
                 "queue_wait_time_sec": queue_wait,
                 "raw_replay_time_sec": report.raw_replay_time_sec,
                 "feature_reconstruction_time_sec": report.feature_reconstruction_time_sec,
@@ -165,6 +224,10 @@ class PlankRoadMultiDevice(BaseMethod):
                 "optimizer_steps": report.optimizer_steps,
                 "accuracy_before_update": report.accuracy_before_update,
                 "accuracy_after_update": report.accuracy_after_update,
+                "metric_f1_before": report.f1_before_update,
+                "metric_f1_after": report.f1_after_update,
+                "metric_map50_before": report.map50_before_update,
+                "metric_map50_after": report.map50_after_update,
                 "cached_feature_ratio": report.cached_feature_ratio,
                 "reconstructed_feature_ratio": report.reconstructed_feature_ratio,
                 "is_real": True,

@@ -23,6 +23,10 @@ class PlankRoadMultiDeviceConfig:
     allow_resource_aware_feature_upload: bool = True
     collect_num: int = 20
     f1_trigger_threshold: float = 0.55
+    enable_feature_cache: bool = True
+    enable_split_tail_training: bool = True
+    enable_resource_aware_trigger: bool = True
+    enable_feature_upload: bool = True
 
 
 @dataclass
@@ -67,15 +71,25 @@ class ExperimentConfig:
     results_dir: str = "results/baselines_real"
     video_path: str = "./video_data/road.mp4"
     student_model: str = "yolo26"
-    teacher_model: str = "cv_oracle"
+    teacher_model: str | None = None
+    initial_checkpoint: str | None = None
+    seed: int = 2026
+    repeat_id: int = 0
+    run_id: str = ""
+    method_variant: str = "default"
     window_seconds: float | None = 10.0
     window_frames: int | None = None
     batch_size: int = 2
     epochs: int = 1
     device: str = "cpu"
+    bandwidth_mbps: float = 50.0
+    max_concurrent_train_jobs: int = 1
+    real_sleep_upload: bool = False
     reuse_teacher_cache: bool = True
     quick_smoke: bool = False
     f1_threshold: float | None = None
+    map50_threshold: float | None = None
+    recovery_sla_sec: float = 120.0
     latency_sla_ms: float | None = None
     capacity_mode: bool = False
 
@@ -93,6 +107,21 @@ class ExperimentConfig:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.epochs < 1:
             raise ValueError(f"epochs must be >= 1, got {self.epochs}")
+        if self.max_concurrent_train_jobs < 1:
+            raise ValueError(
+                f"max_concurrent_train_jobs must be >= 1, got {self.max_concurrent_train_jobs}"
+            )
+        teacher_model = str(self.teacher_model or "").strip()
+        if not teacher_model:
+            raise ValueError("teacher_model must be an existing teacher label directory")
+        teacher_path = Path(teacher_model)
+        if not teacher_path.exists() or not teacher_path.is_dir():
+            raise FileNotFoundError(
+                f"teacher_model must be an existing teacher label directory: {teacher_path}"
+            )
+        self.teacher_model = str(teacher_path)
+        if self.method != "plank_road_multi_device" and self.method_variant != "default":
+            raise ValueError("method_variant values other than 'default' are only valid for plank_road_multi_device")
 
 
 def _build_section(cls, data: Mapping[str, Any] | None):
@@ -118,14 +147,24 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         "video_path",
         "student_model",
         "teacher_model",
+        "initial_checkpoint",
+        "seed",
+        "repeat_id",
+        "run_id",
+        "method_variant",
         "window_seconds",
         "window_frames",
         "batch_size",
         "epochs",
         "device",
+        "bandwidth_mbps",
+        "max_concurrent_train_jobs",
+        "real_sleep_upload",
         "reuse_teacher_cache",
         "quick_smoke",
         "f1_threshold",
+        "map50_threshold",
+        "recovery_sla_sec",
         "latency_sla_ms",
         "capacity_mode",
     }

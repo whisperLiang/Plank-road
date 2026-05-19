@@ -42,6 +42,10 @@ class TrainingReport:
     reconstructed_feature_ratio: float = 0.0
     accuracy_before_update: float | None = None
     accuracy_after_update: float | None = None
+    f1_before_update: float | None = None
+    f1_after_update: float | None = None
+    map50_before_update: float | None = None
+    map50_after_update: float | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,7 @@ class RealTrainer:
             raise ValueError("train_split_tail requires at least one real sample")
         selected = self._limit_samples(samples)
         before = self._mean_f1(selected)
+        before_map50 = self._mean_map50(selected)
         sample_input = self._prepare_split_input(selected[0])
         core_model = get_split_runtime_model(self.model)
         splitter = UniversalModelSplitter(device=self.device).trace(
@@ -181,6 +186,7 @@ class RealTrainer:
         core_model.eval()
         self.model.eval()
         after = self._evaluate_model_f1(self.model, selected)
+        after_map50 = self._evaluate_model_map50(self.model, selected)
         self._set_detection_trainable_scope(core_model, "full")
         checkpoint_path, model_update_time = self._save_update_checkpoint()
         total = reconstruction_time + tail_training
@@ -198,6 +204,10 @@ class RealTrainer:
             reconstructed_feature_ratio=float(reconstructed_count) / total_samples,
             accuracy_before_update=before,
             accuracy_after_update=after,
+            f1_before_update=before,
+            f1_after_update=after,
+            map50_before_update=before_map50,
+            map50_after_update=after_map50,
         )
 
     def microprofile(
@@ -270,6 +280,7 @@ class RealTrainer:
     ) -> TrainingReport:
         selected = self._limit_samples(samples)
         before = self._mean_f1(selected)
+        before_map50 = self._mean_map50(selected)
         core_model = get_split_runtime_model(self.model)
         loss_fn = self._build_loss_fn()
         self._set_detection_trainable_scope(core_model, trainable_scope)
@@ -300,6 +311,7 @@ class RealTrainer:
         training_time = time.perf_counter() - start
         core_model.eval()
         after = self._evaluate_model_f1(self.model, selected)
+        after_map50 = self._evaluate_model_map50(self.model, selected)
         checkpoint_path, model_update_time = self._save_update_checkpoint()
         return TrainingReport(
             checkpoint_path=checkpoint_path,
@@ -310,6 +322,10 @@ class RealTrainer:
             model_update_time_sec=model_update_time,
             accuracy_before_update=before,
             accuracy_after_update=after,
+            f1_before_update=before,
+            f1_after_update=after,
+            map50_before_update=before_map50,
+            map50_after_update=after_map50,
         )
 
     def _build_loss_fn(self):
@@ -420,6 +436,10 @@ class RealTrainer:
 
     def _mean_f1(self, samples: list[SampleRecord]) -> float:
         values = [sample.metric_f1 for sample in samples if sample.metric_f1 is not None]
+        return sum(values) / len(values) if values else 0.0
+
+    def _mean_map50(self, samples: list[SampleRecord]) -> float:
+        values = [sample.metric_map50 for sample in samples if sample.metric_map50 is not None]
         return sum(values) / len(values) if values else 0.0
 
     def _evaluate_model_f1(self, model: torch.nn.Module, samples: list[SampleRecord]) -> float:

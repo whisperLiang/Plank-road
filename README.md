@@ -6,19 +6,19 @@ The current implementation uses a fixed split plan that is computed once at star
 
 ## Real Baseline Experiments
 
-Baselines are real-execution continual learning experiments over video object detection streams. They share the same student model, teacher annotator, evaluator, trainer, and metric logger, while preserving each baseline's original trigger/scheduling/update strategy.
+Baselines are real-execution continual learning experiments over video object detection streams. They share the same student model, teacher label directory, evaluator, trainer, upload meter, cloud queue, and metric logger, while preserving each baseline's original trigger/scheduling/update strategy.
 
-Quick-smoke runs may use the local `cv_oracle` labeler to validate the real execution path:
+Smoke runs still require a real teacher label directory:
 
 ```bash
-python tools/run_baselines_real.py --video ./video_data/road.mp4 --methods pure_edge_local_updating,accuracy_trigger_cloud_retraining,ekya_style_centralized_scheduling,plank_road_multi_device --student-model yolo26 --window-seconds 10 --total-frames 128 --epochs 1 --batch-size 2 --device cpu --results-dir results/baselines_real_smoke --reuse-teacher-cache --quick-smoke
+python tools/run_baselines_real.py --video ./video_data/road.mp4 --methods pure_edge_local_updating,accuracy_trigger_cloud_retraining,ekya_style_centralized_scheduling,plank_road_multi_device --student-model yolo26 --teacher-model ./cache/teacher_labels/road --window-seconds 10 --total-frames 128 --epochs 1 --batch-size 2 --device cpu --results-dir results/baselines_real_smoke --reuse-teacher-cache --quick-smoke
 
 python tools/plot_baselines_real_results.py --results-dir results/baselines_real_smoke
 ```
 
-For paper experiments, provide a real teacher/ground-truth label directory via `--teacher-model /path/to/labels` and omit `--quick-smoke`; the smoke-only `cv_oracle` labeler is rejected unless quick smoke is explicitly enabled.
+For paper experiments, provide a real teacher/ground-truth label directory via `--teacher-model /path/to/labels`. Quick smoke only reduces frames and training budgets; it does not switch to generated labels.
 
-The runner writes `summary.json`, `per_device_metrics.csv`, `per_frame_metrics.csv`, and `update_events.csv` with measured inference latency, teacher labeling time, upload bytes, optimizer steps, training time, queue wait, recovery time, F1, and mAP@0.5. `proxy_map` remains only as a compatibility field and is not used for real accuracy or trigger decisions.
+The runner writes `summary.json`, `per_device_metrics.csv`, `per_frame_metrics.csv`, `update_events.csv`, `upload_events.csv`, and `training_breakdown.csv` with measured inference latency, teacher labeling time, upload bytes, optimizer steps, training time, queue wait, recovery time, F1, and mAP@0.5. `proxy_map` remains only as a compatibility field and is not used for real accuracy or trigger decisions.
 
 ## Overview
 
