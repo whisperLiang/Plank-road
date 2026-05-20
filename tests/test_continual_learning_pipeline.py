@@ -3025,6 +3025,56 @@ def test_cloud_trace_uses_input_tensor_shape_not_224_fallback():
         learner._infer_bundle_trace_image_size({"samples": [{}]})
 
 
+def test_cloud_batch_trace_preprocessing_uses_sample_input_shape(
+    tmp_path,
+    sample_bgr_frame,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    raw_root = tmp_path / "low_quality_staging" / "raw"
+    raw_root.mkdir(parents=True)
+    raw_path = raw_root / "sample.jpg"
+    large_frame = cv2.resize(sample_bgr_frame, (1280, 736))
+    assert cv2.imwrite(str(raw_path), large_frame)
+    manifest = {
+        "input_tensor_shape": [1, 3, 384, 640],
+        "samples": [
+            {
+                "sample_id": "sample",
+                "raw_relpath": "low_quality_staging/raw/sample.jpg",
+                "input_tensor_shape": [1, 3, 384, 640],
+            }
+        ],
+    }
+
+    def fake_prepare(_model, frame, *, device, input_tensor_shape=None):
+        shape = tuple(input_tensor_shape or (1, 3, frame.shape[0], frame.shape[1]))
+        return torch.zeros(shape, device=torch.device(device))
+
+    monkeypatch.setattr(cloud_server, "prepare_split_runtime_input", fake_prepare)
+    learner = object.__new__(CloudContinualLearner)
+    learner.device = torch.device("cpu")
+    learner.batch_size = 2
+
+    batch = learner._build_bundle_batch_trace_sample_input(
+        torch.nn.Identity(),
+        str(tmp_path),
+        manifest,
+        runtime_batch_size=2,
+    )
+    inferred = learner._infer_pool_runtime_input_tensor_shape(
+        torch.nn.Identity(),
+        bundle_root=str(tmp_path),
+        manifest=manifest,
+        prepared_trace_sample_input=None,
+    )
+
+    assert tuple(batch.shape) == (2, 3, 384, 640)
+    assert inferred == (1, 3, 384, 640)
+
+
 def test_boundary_payload_passthrough_survives_sample_store_roundtrip(tmp_path):
     from ariadne.runtime.boundary import BoundaryTensorSpec
     from cloud.sample_pool import CloudSamplePool

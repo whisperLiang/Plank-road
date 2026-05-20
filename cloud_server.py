@@ -3692,7 +3692,12 @@ class CloudContinualLearner:
         *,
         sample_metadata: Mapping[str, object] | None = None,
     ):
-        return prepare_split_runtime_input(model, frame, device=self.device)
+        return prepare_split_runtime_input(
+            model,
+            frame,
+            device=self.device,
+            input_tensor_shape=_runtime_input_tensor_shape_from_metadata(sample_metadata),
+        )
 
     def _teacher_inference(self, frame):
         try:
@@ -3803,7 +3808,11 @@ class CloudContinualLearner:
             frame = cv2.imread(raw_path)
             if frame is None:
                 continue
-            sample_input = self._prepare_split_runtime_input(model, frame)
+            sample_input = self._prepare_split_runtime_input(
+                model,
+                frame,
+                sample_metadata=sample,
+            )
             if isinstance(sample_input, torch.Tensor):
                 logger.info(
                     "[FixedSplitCL] Tracing split runtime with single-sample input (input_tensor_shape={}).",
@@ -6751,7 +6760,16 @@ class CloudContinualLearner:
             frame = cv2.imread(frame_path)
             if frame is None:
                 continue
-            sample_input = self._prepare_split_runtime_input(tmp_model, frame)
+            sample_metadata = None
+            try:
+                sample_metadata = load_split_feature_cache(cache_path, frame_index)
+            except FileNotFoundError:
+                sample_metadata = None
+            sample_input = self._prepare_split_runtime_input(
+                tmp_model,
+                frame,
+                sample_metadata=sample_metadata,
+            )
             break
 
         if sample_input is None:

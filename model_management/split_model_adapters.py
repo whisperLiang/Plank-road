@@ -212,6 +212,7 @@ def build_split_runtime_sample_input(
             model.yolo,
             [sample],
             conf=model.confidence,
+            imgsz=(height, width),
         )
         return tensor.to(device)
     if isinstance(model, RTDETRDetectionModel):
@@ -220,6 +221,7 @@ def build_split_runtime_sample_input(
             model.rtdetr,
             [sample],
             conf=model.confidence,
+            imgsz=(height, width),
         )
         return tensor.to(device)
     if isinstance(model, DETRDetectionModel):
@@ -256,13 +258,30 @@ def get_split_runtime_input_resize_mode(model: torch.nn.Module) -> str | None:
     return None
 
 
+def _ultralytics_imgsz_from_input_shape(
+    input_tensor_shape: tuple[int, ...] | list[int] | None,
+) -> tuple[int, int] | None:
+    if not input_tensor_shape:
+        return None
+    shape = [int(dim) for dim in list(input_tensor_shape)]
+    if len(shape) < 4:
+        return None
+    height = int(shape[-2])
+    width = int(shape[-1])
+    if height <= 0 or width <= 0:
+        return None
+    return height, width
+
+
 def prepare_split_runtime_input(
     model: torch.nn.Module,
     frame: np.ndarray,
     *,
     device: str | torch.device,
+    input_tensor_shape: tuple[int, ...] | list[int] | None = None,
 ):
     device = torch.device(device)
+    target_imgsz = _ultralytics_imgsz_from_input_shape(input_tensor_shape)
     if isinstance(model, DETRDetectionModel):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pixel_values = model.processor(
@@ -286,6 +305,7 @@ def prepare_split_runtime_input(
             model.yolo,
             [frame],
             conf=model.confidence,
+            imgsz=target_imgsz,
         )
         return tensor.to(device)
     if isinstance(model, RTDETRDetectionModel):
@@ -293,6 +313,7 @@ def prepare_split_runtime_input(
             model.rtdetr,
             [frame],
             conf=model.confidence,
+            imgsz=target_imgsz,
         )
         return tensor.to(device)
 

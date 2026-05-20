@@ -7,7 +7,7 @@ import shutil
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +21,7 @@ from model_management.detection_box_projection import (
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_contract import (
     SplitRuntimeContract,
+    feature_layout_id as make_feature_layout_id,
     feature_layout_from_tensors,
     normalise_feature_tensors,
 )
@@ -242,6 +243,138 @@ def _feature_tensors_from_candidate(candidate: Mapping[str, Any]) -> dict[str, t
     if "tensors" in candidate:
         return _single_sample_feature_tensors(candidate["tensors"])
     raise ValueError("Canonical sample candidate has no feature tensors.")
+
+
+def _layout_spec_matches(
+    actual: Mapping[str, Any] | None,
+    expected: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        return False
+    return (
+        str(actual.get("dtype")) == str(expected.get("dtype"))
+        and [int(dim) for dim in list(actual.get("shape_without_batch") or [])]
+        == [int(dim) for dim in list(expected.get("shape_without_batch") or [])]
+    )
+
+
+def _contract_boundary_order(split_contract: SplitRuntimeContract) -> list[str]:
+    expected_layout = dict(split_contract.feature_layout or {})
+    ordered = [
+        str(label)
+        for label in list(split_contract.boundary_tensor_labels or [])
+        if str(label) in expected_layout
+    ]
+    seen = set(ordered)
+    for label in expected_layout.keys():
+        label = str(label)
+        if label not in seen:
+            ordered.append(label)
+            seen.add(label)
+    return ordered
+
+
+def _feature_tensors_for_contract(
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    split_contract: SplitRuntimeContract,
+    boundary_payload: BoundaryPayload | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, str]] | None:
+    expected_layout = {
+        str(label): dict(spec)
+        for label, spec in dict(split_contract.feature_layout or {}).items()
+        if isinstance(spec, Mapping)
+    }
+    if not expected_layout:
+        return None
+
+    source_tensors = {
+        str(label): tensor
+        for label, tensor in dict(tensors or {}).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    actual_layout = feature_layout_from_tensors(source_tensors)
+
+    direct: dict[str, torch.Tensor] = {}
+    source_to_target: dict[str, str] = {}
+    for label in _contract_boundary_order(split_contract):
+        if label not in source_tensors:
+            direct = {}
+            source_to_target = {}
+            break
+        if not _layout_spec_matches(actual_layout.get(label), expected_layout.get(label)):
+            direct = {}
+            source_to_target = {}
+            break
+        direct[label] = source_tensors[label]
+        source_to_target[label] = label
+    if direct and len(direct) == len(expected_layout):
+        return direct, source_to_target
+
+    if boundary_payload is None:
+        return None
+    source_labels = [
+        str(label)
+        for label in dict(boundary_payload.tensors or {}).keys()
+        if str(label) in source_tensors
+    ]
+    target_labels = _contract_boundary_order(split_contract)
+    if len(source_labels) != len(target_labels):
+        return None
+
+    renamed: dict[str, torch.Tensor] = {}
+    source_to_target = {}
+    for source_label, target_label in zip(source_labels, target_labels):
+        if not _layout_spec_matches(
+            actual_layout.get(source_label),
+            expected_layout.get(target_label),
+        ):
+            return None
+        renamed[target_label] = source_tensors[source_label]
+        source_to_target[source_label] = target_label
+    return renamed, source_to_target
+
+
+def _normalise_boundary_payload_for_contract(
+    payload: BoundaryPayload | None,
+    *,
+    tensors: Mapping[str, torch.Tensor],
+    source_to_target: Mapping[str, str],
+) -> BoundaryPayload | None:
+    if payload is None:
+        return None
+    payload_schema = dict(payload.schema or {})
+    payload_requires_grad = dict(payload.requires_grad or {})
+    schema = {}
+    requires_grad = {}
+    for source_label, target_label in dict(source_to_target).items():
+        source_label = str(source_label)
+        target_label = str(target_label)
+        spec = payload_schema.get(source_label) or payload_schema.get(target_label)
+        if spec is not None:
+            try:
+                schema[target_label] = replace(spec, label=target_label)
+            except TypeError:
+                schema[target_label] = spec
+        requires_grad[target_label] = bool(
+            payload_requires_grad.get(
+                source_label,
+                payload_requires_grad.get(
+                    target_label,
+                    bool(dict(tensors)[target_label].requires_grad),
+                ),
+            )
+        )
+    return boundary_payload_from_tensors(
+        {str(label): tensor for label, tensor in dict(tensors).items()},
+        split_id=str(payload.split_id),
+        graph_signature=str(payload.graph_signature),
+        batch_size=1,
+        schema=schema or None,
+        requires_grad=requires_grad or None,
+        weight_version=getattr(payload, "weight_version", None),
+        passthrough_inputs=dict(getattr(payload, "passthrough_inputs", {}) or {}),
+    )
 
 
 def _boundary_payload_from_candidate(candidate: Mapping[str, Any]) -> BoundaryPayload | None:
@@ -902,13 +1035,27 @@ class CloudSamplePool:
             return "skipped_stale_contract"
         if record.front_version != split_contract.front_version:
             return "skipped_stale_contract"
-        if record.feature_layout_id != split_contract.feature_layout_id:
-            return "skipped_feature_layout"
         try:
-            if feature_layout_from_tensors(record.feature) != split_contract.feature_layout:
+            normalised = _feature_tensors_for_contract(
+                record.feature,
+                split_contract=split_contract,
+                boundary_payload=record.boundary_payload,
+            )
+            if normalised is None:
                 return "skipped_feature_layout"
         except Exception:
             return "skipped_feature_layout"
+        record.feature, source_to_target = normalised
+        record.feature_layout_id = make_feature_layout_id(
+            feature_layout_from_tensors(record.feature)
+        )
+        if record.feature_layout_id != split_contract.feature_layout_id:
+            return "skipped_feature_layout"
+        record.boundary_payload = _normalise_boundary_payload_for_contract(
+            record.boundary_payload,
+            tensors=record.feature,
+            source_to_target=source_to_target,
+        )
         if [int(dim) for dim in record.input_tensor_shape] != [
             int(dim) for dim in split_contract.input_tensor_shape
         ]:

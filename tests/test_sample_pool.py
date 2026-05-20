@@ -188,6 +188,88 @@ def test_canonical_rebuild_commits_active_generation_from_pending_and_staging(tm
     assert manifest["sample_count"] == 2
 
 
+def test_canonical_rebuild_accepts_high_quality_with_extra_boundary_tensors(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = _build_split_contract()
+    candidate = _high_quality_candidate("hq-extra", created_at=1.0)
+    candidate["feature"] = {
+        "node_0": torch.ones(1, 4),
+        "edge_debug_tensor": torch.zeros(1, 2),
+    }
+
+    pool.store_pending_high_quality_samples([candidate])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+
+    validation = stats["validation"]
+    assert validation["accepted_high_quality"] == 1
+    assert validation["skipped_feature_layout"] == 0
+    active = pool.list_active_samples()
+    assert len(active) == 1
+    assert active[0]["feature_layout_id"] == contract.feature_layout_id
+    feature_label = pool.reader.read(active[0])
+    assert set(feature_label.feature_record["feature"]) == {"node_0"}
+
+
+def test_canonical_rebuild_renames_high_quality_boundary_payload_to_contract_layout(tmp_path):
+    from model_management.payload import boundary_payload_from_tensors
+
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = _build_split_contract()
+    candidate = _high_quality_candidate("hq-renamed", created_at=1.0)
+    candidate.pop("feature")
+    candidate["intermediate"] = boundary_payload_from_tensors(
+        {"edge_runtime_node": torch.ones(1, 4)},
+        split_id="after:edge_runtime_node",
+        graph_signature="edge-graph",
+    )
+
+    pool.store_pending_high_quality_samples([candidate])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+
+    validation = stats["validation"]
+    assert validation["accepted_high_quality"] == 1
+    assert validation["skipped_feature_layout"] == 0
+    active = pool.list_active_samples()
+    feature_label = pool.reader.read(active[0])
+    assert set(feature_label.feature_record["feature"]) == {"node_0"}
+    stored_payload = feature_label.feature_record["intermediate"]
+    assert set(stored_payload.tensors) == {"node_0"}
+    assert stored_payload.schema["node_0"].label == "node_0"
+
+
+def test_canonical_rebuild_rejects_high_quality_missing_contract_tensor(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = _build_split_contract()
+    candidate = _high_quality_candidate("hq-missing", created_at=1.0)
+    candidate["feature"] = {"edge_only_tensor": torch.ones(1, 4)}
+
+    pool.store_pending_high_quality_samples([candidate])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+
+    validation = stats["validation"]
+    assert validation["accepted_high_quality"] == 0
+    assert validation["skipped_feature_layout"] == 1
+    assert pool.list_active_samples() == []
+
+
 def test_canonical_rebuild_replaces_previous_generation_files(tmp_path):
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)

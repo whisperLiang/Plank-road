@@ -29,6 +29,7 @@ def _predictor_overrides(
     engine: Any,
     *,
     conf: float,
+    imgsz: int | tuple[int, int] | list[int] | None = None,
 ) -> dict[str, Any]:
     custom = {
         "conf": float(conf),
@@ -37,6 +38,8 @@ def _predictor_overrides(
         "mode": "predict",
         "rect": True,
     }
+    if imgsz is not None:
+        custom["imgsz"] = list(imgsz) if isinstance(imgsz, tuple) else imgsz
     return {**getattr(engine, "overrides", {}), **custom}
 
 
@@ -44,8 +47,9 @@ def ensure_predictor(
     engine: Any,
     *,
     conf: float,
+    imgsz: int | tuple[int, int] | list[int] | None = None,
 ):
-    args = _predictor_overrides(engine, conf=conf)
+    args = _predictor_overrides(engine, conf=conf, imgsz=imgsz)
     predictor = getattr(engine, "predictor", None)
     current_device = getattr(getattr(predictor, "args", None), "device", None)
     requested_device = args.get("device", current_device)
@@ -88,10 +92,11 @@ def preprocess_bgr_images(
     images_bgr: list[np.ndarray],
     *,
     conf: float,
+    imgsz: int | tuple[int, int] | list[int] | None = None,
 ) -> tuple[Any, torch.Tensor]:
     grad_state = _parameter_grad_state(getattr(engine, "model", None))
     try:
-        predictor = ensure_predictor(engine, conf=conf)
+        predictor = ensure_predictor(engine, conf=conf, imgsz=imgsz)
         predictor.batch = ([f"image{i}.jpg" for i in range(len(images_bgr))], None, None)
         prepared = [np.ascontiguousarray(image) for image in images_bgr]
         return predictor, predictor.preprocess(prepared)
