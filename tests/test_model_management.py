@@ -1034,3 +1034,15 @@ class TestModelZoo:
         model = build_detection_model("yolo26n", pretrained=False, device="cpu")
         assert is_wrapper_model(model) is True
         assert get_model_family("yolo26n") == "yolo"
+
+    def test_build_yolo26_detector_from_yaml_honors_custom_num_classes(self):
+        model = build_detection_model(
+            "yolo26n",
+            pretrained=False,
+            device="cpu",
+            num_classes=8,
+        )
+
+        state = model.state_dict()
+        assert tuple(state["model.23.cv3.0.2.weight"].shape) == (8, 64, 1, 1)
+        assert tuple(state["model.23.cv3.0.2.bias"].shape) == (8,)

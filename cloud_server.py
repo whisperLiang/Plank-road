@@ -312,6 +312,66 @@ def _build_tinynext_threshold_candidates(
     )
 
 
+def _proxy_prediction_cache_threshold_low(
+    current_low: float,
+    threshold_highs: list[float] | tuple[float, ...],
+) -> float:
+    finite_highs = [
+        float(threshold)
+        for threshold in threshold_highs
+        if np.isfinite(float(threshold))
+    ]
+    if not finite_highs:
+        return float(current_low)
+    # Keep a tiny margin so scores exactly at a candidate high threshold are
+    # still filtered by the final high-threshold comparison, not by cache build.
+    return max(float(current_low), min(finite_highs) - 1e-6)
+
+
+@contextmanager
+def _temporary_tinynext_score_threshold(
+    model: torch.nn.Module,
+    *,
+    model_name: str | None,
+    threshold_low: float,
+):
+    model_family = model_zoo.get_model_family(str(model_name or ""))
+    if model_family not in {"tinynext", "unknown"}:
+        yield
+        return
+
+    if not hasattr(model, "score_thresh"):
+        yield
+        return
+
+    try:
+        original_threshold = float(getattr(model, "score_thresh"))
+        next_threshold = float(threshold_low)
+    except (TypeError, ValueError):
+        yield
+        return
+
+    if not np.isfinite(next_threshold) or next_threshold <= original_threshold:
+        yield
+        return
+
+    original_value = getattr(model, "score_thresh")
+    setattr(model, "score_thresh", next_threshold)
+    try:
+        yield
+    finally:
+        setattr(model, "score_thresh", original_value)
+
+
+def _proxy_metrics_skipped_full_proxy(metrics: Mapping[str, object] | None) -> bool:
+    if not metrics:
+        return False
+    try:
+        return int(metrics.get("full_proxy_evaluation_skipped", 0) or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
 def _model_state_fingerprint(model: torch.nn.Module) -> str:
     hasher = hashlib.sha1()
     for key, value in model.state_dict().items():
@@ -352,6 +412,43 @@ def _looks_like_fused_ultralytics_state_dict(state: object) -> bool:
     has_conv_bias = any(".conv.bias" in key for key in string_keys)
     has_batch_norm = any(".bn." in key for key in string_keys)
     return has_conv_bias and not has_batch_norm
+
+
+def _coerce_positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _infer_yolo_state_dict_num_classes(state: object) -> int | None:
+    if not isinstance(state, Mapping):
+        return None
+
+    class_counts: list[int] = []
+    head_pattern = re.compile(r"(?:^|\.)(?:one2one_)?cv3\.\d+\.2\.(?:weight|bias)$")
+    for key, value in state.items():
+        if not isinstance(key, str) or not torch.is_tensor(value):
+            continue
+        if not head_pattern.search(key) or value.ndim < 1:
+            continue
+        count = int(value.shape[0])
+        if count > 0:
+            class_counts.append(count)
+
+    unique_counts = set(class_counts)
+    if len(unique_counts) != 1:
+        return None
+    return unique_counts.pop()
+
+
+def _infer_yolo_model_num_classes(model: torch.nn.Module) -> int | None:
+    try:
+        return _infer_yolo_state_dict_num_classes(model.state_dict())
+    except Exception:
+        return None
+
 
 def _select_fixed_split_gt_sample_ids(
     manifest: Mapping[str, object],
@@ -942,11 +1039,16 @@ def _postprocess_cached_tinynext_outputs(
     ]
     image_list = ImageList(transformed_batch, transformed_sizes)
     anchors = model.anchor_generator(image_list, dummy_feature_maps)
-    detections = model.postprocess_detections(
-        head_outputs,
-        anchors,
-        transformed_sizes,
-    )
+    with _temporary_tinynext_score_threshold(
+        model,
+        model_name="tinynext",
+        threshold_low=threshold_low,
+    ):
+        detections = model.postprocess_detections(
+            head_outputs,
+            anchors,
+            transformed_sizes,
+        )
     processed = model.transform.postprocess(
         detections,
         transformed_sizes,
@@ -980,13 +1082,18 @@ def _postprocess_cached_tinynext_outputs_via_split_postprocess(
             index,
             batch_size=batch_size,
         )
-        processed = postprocess_split_runtime_output(
+        with _temporary_tinynext_score_threshold(
             model,
-            single_outputs,
-            threshold=threshold_low,
-            model_input=runtime_input,
-            orig_image=original_frame,
-        )
+            model_name="tinynext",
+            threshold_low=threshold_low,
+        ):
+            processed = postprocess_split_runtime_output(
+                model,
+                single_outputs,
+                threshold=threshold_low,
+                model_input=runtime_input,
+                orig_image=original_frame,
+            )
         single_prediction = _batched_predictions_from_model_output(
             processed,
             batch_size=1,
@@ -1665,6 +1772,7 @@ def _calibrate_tinynext_proxy_thresholds(
     splitter: UniversalModelSplitter | None = None,
     split_candidate=None,
     preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
+    proxy_cache_threshold_low: float | None = None,
 ) -> tuple[dict[str, float | int | None], float, float]:
     current_low, current_high = get_model_detection_thresholds(model, model_name)
     _, default_high = get_detection_thresholds(model_name)
@@ -1674,13 +1782,21 @@ def _calibrate_tinynext_proxy_thresholds(
         default_high=float(default_high),
         configured_candidates=candidate_thresholds,
     )
+    cache_threshold_low = (
+        float(proxy_cache_threshold_low)
+        if proxy_cache_threshold_low is not None
+        else _proxy_prediction_cache_threshold_low(
+            float(current_low),
+            [float(current_high), *candidate_highs],
+        )
+    )
 
     prediction_cache = _build_detection_proxy_prediction_cache(
         model,
         frame_dir=frame_dir,
         gt_annotations=gt_annotations,
         device=device,
-        threshold_low=float(current_low),
+        threshold_low=cache_threshold_low,
         model_name=model_name,
         frame_cache=frame_cache,
         max_samples=max_samples,
@@ -3489,14 +3605,33 @@ class CloudContinualLearner:
                         "cached wrapper weights look like a fused Ultralytics state_dict"
                     )
                 else:
+                    build_kwargs = self._detection_model_build_kwargs(
+                        model_name,
+                        runtime_input_tensor_shape=runtime_input_tensor_shape,
+                    )
+                    if model_zoo.get_model_family(str(model_name)) == "yolo":
+                        cache_num_classes = _infer_yolo_state_dict_num_classes(state)
+                        if cache_num_classes is None and candidate_weights == edge_weights:
+                            cache_metadata = self._read_edge_weights_metadata(
+                                model_name,
+                                edge_id=edge_id,
+                            )
+                            cache_num_classes = _coerce_positive_int(
+                                cache_metadata.get("yolo_head_num_classes")
+                            )
+                        if cache_num_classes is not None and cache_num_classes != 80:
+                            build_kwargs["num_classes"] = cache_num_classes
+                            logger.info(
+                                "[CL] Inferred {} YOLO class(es) from cached {} weights at {}.",
+                                cache_num_classes,
+                                model_name,
+                                candidate_weights,
+                            )
                     tmp_model = model_zoo.build_detection_model(
                         model_name,
                         pretrained=False,
                         device=self.device,
-                        **self._detection_model_build_kwargs(
-                            model_name,
-                            runtime_input_tensor_shape=runtime_input_tensor_shape,
-                        ),
+                        **build_kwargs,
                     )
                     try:
                         load_result = tmp_model.load_state_dict(state, strict=False)
@@ -5206,12 +5341,24 @@ class CloudContinualLearner:
         splitter: UniversalModelSplitter | None = None,
         split_candidate=None,
         preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
+        proxy_cache_threshold_low: float | None = None,
     ) -> dict[str, float | int | None]:
+        threshold_low = None
+        threshold_high = None
+        if proxy_cache_threshold_low is not None:
+            current_low, current_high = get_model_detection_thresholds(model, model_name)
+            threshold_low = _proxy_prediction_cache_threshold_low(
+                float(current_low),
+                [float(proxy_cache_threshold_low), float(current_high)],
+            )
+            threshold_high = float(current_high)
         return _evaluate_detection_proxy_map(
             model,
             frame_dir=frame_dir,
             gt_annotations=gt_annotations,
             device=self.device,
+            threshold_low=threshold_low,
+            threshold_high=threshold_high,
             model_name=model_name,
             sample_metadata_by_id=sample_metadata_by_id,
             frame_cache=frame_cache,
@@ -5244,6 +5391,7 @@ class CloudContinualLearner:
         splitter: UniversalModelSplitter | None = None,
         split_candidate=None,
         preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
+        allow_dead_baseline_fast_path: bool = False,
     ) -> dict[str, float | int | None]:
         full_proxy_sample_count = len(
             _normalize_proxy_sample_ids(
@@ -5260,7 +5408,7 @@ class CloudContinualLearner:
             and calibration_max_samples < full_proxy_sample_count
         )
         if use_subset_calibration:
-            _, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+            subset_metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
                 model,
                 frame_dir=frame_dir,
                 gt_annotations=gt_annotations,
@@ -5288,6 +5436,24 @@ class CloudContinualLearner:
                     calibration_max_samples,
                     stage_label,
                 )
+            if (
+                allow_dead_baseline_fast_path
+                and _proxy_metrics_indicate_dead_detector(subset_metrics)
+            ):
+                metrics = dict(subset_metrics)
+                metrics["full_proxy_evaluation_skipped"] = 1
+                metrics["full_proxy_sample_count"] = int(full_proxy_sample_count)
+                metrics["subset_proxy_sample_count"] = int(
+                    metrics.get("evaluated_samples", 0) or 0
+                )
+                logger.info(
+                    "[FixedSplitCL] Skipping full TinyNeXt baseline proxy evaluation during {}: "
+                    "{}-sample subset produced no detections; full_proxy_samples={}.",
+                    stage_label,
+                    int(metrics["subset_proxy_sample_count"]),
+                    int(full_proxy_sample_count),
+                )
+                return metrics
             return self._evaluate_fixed_split_proxy_map(
                 model,
                 frame_dir=frame_dir,
@@ -5301,6 +5467,7 @@ class CloudContinualLearner:
                 splitter=splitter,
                 split_candidate=split_candidate,
                 preloaded_records=preloaded_records,
+                proxy_cache_threshold_low=calibrated_high,
             )
 
         metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
@@ -6296,6 +6463,10 @@ class CloudContinualLearner:
                     "source_base_model_version": bundle_model_version,
                     "updated_at_ms": int(time.time() * 1000),
                 }
+                if model_zoo.get_model_family(str(current_model_name)) == "yolo":
+                    yolo_num_classes = _infer_yolo_model_num_classes(tmp_model)
+                    if yolo_num_classes is not None:
+                        weights_metadata["yolo_head_num_classes"] = int(yolo_num_classes)
                 if (
                     manifest_runtime_input_shape
                     and len(manifest_runtime_input_shape) >= 4
@@ -6518,6 +6689,7 @@ class CloudContinualLearner:
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
+                        allow_dead_baseline_fast_path=True,
                     )
                 else:
                     proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
@@ -6619,6 +6791,7 @@ class CloudContinualLearner:
                                 splitter=prepared_splitter,
                                 split_candidate=prepared_candidate,
                                 preloaded_records=preloaded_records,
+                                allow_dead_baseline_fast_path=True,
                             )
                         else:
                             proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
@@ -6660,6 +6833,14 @@ class CloudContinualLearner:
                     proxy_metrics_before,
                     proxy_metrics_after,
                 )
+                if _proxy_metrics_skipped_full_proxy(proxy_metrics_before):
+                    logger.info(
+                        "[FixedSplitCL] Initial TinyNeXt baseline proxy_mAP@0.5 used "
+                        "{}-sample dead-baseline subset fast path; final candidate was "
+                        "evaluated on {} sample(s).",
+                        int(proxy_metrics_before.get("subset_proxy_sample_count", 0) or 0),
+                        int(proxy_metrics_after.get("evaluated_samples", 0) or 0),
+                    )
                 if proxy_summary is not None:
                     logger.info("[FixedSplitCL] {}", proxy_summary)
                 else:
@@ -6671,6 +6852,40 @@ class CloudContinualLearner:
                         int(proxy_metrics_after.get("skipped_empty_gt", 0)),
                         int(proxy_metrics_after.get("skipped_missing_frame", 0)),
                     )
+
+                if _proxy_metrics_skipped_full_proxy(proxy_metrics_before):
+                    logger.info(
+                        "[FixedSplitCL] Rechecking full TinyNeXt baseline proxy before final "
+                        "candidate decision because the initial baseline used the subset fast path."
+                    )
+                    candidate_state = _snapshot_model_state(tmp_model)
+                    tmp_model.load_state_dict(baseline_state)
+                    _set_detection_model_eval_mode(tmp_model)
+                    full_baseline_metrics = self._evaluate_tinynext_proxy_map(
+                        tmp_model,
+                        frame_dir=frame_dir,
+                        gt_annotations=gt_annotations,
+                        model_name=current_model_name,
+                        sample_metadata_by_id=sample_metadata_by_id,
+                        frame_cache=proxy_eval_frame_cache,
+                        max_samples=self.proxy_eval_max_samples,
+                        candidate_thresholds=self.proxy_eval_threshold_candidates,
+                        inference_batch_size=effective_batch_size,
+                        stage_label="full baseline proxy recheck",
+                        split_cache_path=working_cache,
+                        splitter=prepared_splitter,
+                        split_candidate=prepared_candidate,
+                        preloaded_records=preloaded_records,
+                    )
+                    tmp_model.load_state_dict(candidate_state)
+                    _set_detection_model_eval_mode(tmp_model)
+                    proxy_metrics_before = full_baseline_metrics
+                    proxy_summary = _format_proxy_map_summary(
+                        proxy_metrics_before,
+                        proxy_metrics_after,
+                    )
+                    if proxy_summary is not None:
+                        logger.info("[FixedSplitCL] {}", proxy_summary)
 
                 rejection_reason = _fixed_split_proxy_rejection_reason(
                     proxy_metrics_before,

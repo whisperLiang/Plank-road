@@ -1459,6 +1459,57 @@ def test_delta_payload_applies_to_matching_model(tmp_path):
         assert torch.equal(edge_model.state_dict()[key], value)
 
 
+def test_yolo_edge_cache_loader_infers_custom_head_classes(tmp_path, monkeypatch):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="yolo26n",
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path / "workspace"),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    learner.weight_folder = str(tmp_path / "models")
+    os.makedirs(learner.weight_folder, exist_ok=True)
+    torch.save(
+        OrderedDict(
+            {
+                "model.23.cv3.0.2.weight": torch.ones(8, 64, 1, 1),
+                "model.23.cv3.0.2.bias": torch.ones(8),
+                "model.23.one2one_cv3.0.2.weight": torch.ones(8, 64, 1, 1),
+                "model.23.one2one_cv3.0.2.bias": torch.ones(8),
+            }
+        ),
+        learner._edge_weights_path("yolo26n", edge_id=1),
+    )
+    build_calls = []
+
+    class DummyModel(torch.nn.Module):
+        def load_state_dict(self, state_dict, strict=True):
+            self.loaded_state_dict = state_dict
+            return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+    def fake_build_detection_model(name, **kwargs):
+        build_calls.append((name, kwargs))
+        return DummyModel()
+
+    monkeypatch.setattr(cloud_server.model_zoo, "build_detection_model", fake_build_detection_model)
+    monkeypatch.setattr(cloud_server, "get_split_runtime_model", lambda model: model)
+
+    learner._load_edge_training_model(
+        model_name="yolo26n",
+        edge_id=1,
+        cache_policy="edge_only",
+    )
+
+    assert build_calls[0][0] == "yolo26n"
+    assert build_calls[0][1]["pretrained"] is False
+    assert build_calls[0][1]["num_classes"] == 8
+
+
 def test_old_full_state_dict_payload_is_rejected():
     full_state = torch.nn.Linear(1, 1).state_dict()
 
@@ -2040,6 +2091,154 @@ def test_cached_tinynext_fallback_postprocess_uses_original_image_metadata(monke
     assert captured["orig_image_shape"] == (720, 1280, 3)
     assert predictions[0]["boxes"] == [[100.0, 50.0, 120.0, 70.0]]
     assert predictions[0]["labels"] == [3]
+
+
+def test_tinynext_proxy_postprocess_temporarily_raises_score_threshold():
+    from cloud_server import _temporary_tinynext_score_threshold
+
+    model = SimpleNamespace(score_thresh=0.02)
+
+    with _temporary_tinynext_score_threshold(
+        model,
+        model_name="tinynext_s",
+        threshold_low=0.149999,
+    ):
+        assert model.score_thresh == pytest.approx(0.149999)
+
+    assert model.score_thresh == pytest.approx(0.02)
+
+
+def test_tinynext_dead_baseline_fast_path_skips_full_proxy_eval(tmp_path, monkeypatch):
+    from cloud_server import CloudContinualLearner
+
+    learner = object.__new__(CloudContinualLearner)
+    learner.device = torch.device("cpu")
+    learner.batch_size = 32
+    learner.proxy_eval_max_samples = None
+    eval_calls = []
+
+    def fake_calibrate(*args, **kwargs):
+        eval_calls.append(("subset", kwargs.get("max_samples")))
+        assert kwargs.get("max_samples") == 24
+        return (
+            {
+                "map": 0.0,
+                "evaluated_samples": 24,
+                "nonempty_predictions": 0,
+                "total_prediction_boxes": 0,
+            },
+            0.15,
+            0.15,
+        )
+
+    def fail_full_eval(*args, **kwargs):
+        pytest.fail("dead baseline fast path should skip the full proxy evaluation")
+
+    monkeypatch.setattr(
+        "cloud_server._calibrate_tinynext_proxy_thresholds",
+        fake_calibrate,
+    )
+    monkeypatch.setattr(
+        learner,
+        "_evaluate_fixed_split_proxy_map",
+        fail_full_eval,
+    )
+
+    gt_annotations = {
+        f"s{index}": {"boxes": [[0, 0, 1, 1]], "labels": [1]}
+        for index in range(40)
+    }
+    metrics = learner._evaluate_tinynext_proxy_map(
+        torch.nn.Identity(),
+        frame_dir=str(tmp_path),
+        gt_annotations=gt_annotations,
+        model_name="tinynext_s",
+        stage_label="proxy evaluation before retrain",
+        allow_dead_baseline_fast_path=True,
+    )
+
+    assert eval_calls == [("subset", 24)]
+    assert metrics["full_proxy_evaluation_skipped"] == 1
+    assert metrics["full_proxy_sample_count"] == 40
+    assert metrics["subset_proxy_sample_count"] == 24
+
+
+def test_tinynext_subset_proxy_selection_does_not_pass_baseline_fast_path_kwarg(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="tinynext_s",
+            continual_learning=SimpleNamespace(
+                batch_size=32,
+                proxy_eval_interval_rounds=5,
+                proxy_eval_patience=0,
+                proxy_eval_min_delta=0.0005,
+            ),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    model = torch.nn.Linear(1, 1)
+    selection_eval_count = 0
+
+    def fake_universal_split_retrain(**kwargs):
+        with torch.no_grad():
+            kwargs["model"].weight.add_(1.0)
+        return [0.1]
+
+    def fake_selection_proxy_eval(*args, **kwargs):
+        nonlocal selection_eval_count
+        assert "allow_dead_baseline_fast_path" not in kwargs
+        selection_eval_count += 1
+        return {
+            "map": 0.2 + (selection_eval_count * 0.1),
+            "evaluated_samples": int(kwargs.get("max_samples") or 0),
+            "nonempty_predictions": 24,
+            "total_prediction_boxes": 24,
+        }
+
+    def fake_full_tinynext_eval(*args, **kwargs):
+        return {
+            "map": 0.8,
+            "evaluated_samples": 40,
+            "nonempty_predictions": 40,
+            "total_prediction_boxes": 40,
+        }
+
+    monkeypatch.setattr(cloud_server, "universal_split_retrain", fake_universal_split_retrain)
+    monkeypatch.setattr(learner, "_evaluate_fixed_split_proxy_map", fake_selection_proxy_eval)
+    monkeypatch.setattr(learner, "_evaluate_tinynext_proxy_map", fake_full_tinynext_eval)
+
+    gt_annotations = {
+        f"s{index}": {"boxes": [[0, 0, 1, 1]], "labels": [1]}
+        for index in range(40)
+    }
+    proxy_metrics_after, _baseline_state = learner._run_fixed_split_retrain(
+        model,
+        current_model_name="tinynext_s",
+        bundle_info={"all_sample_ids": list(gt_annotations)},
+        manifest={"samples": [{"sample_id": sample_id} for sample_id in gt_annotations]},
+        bundle_cache_path=str(tmp_path / "bundle"),
+        working_cache=str(tmp_path / "working"),
+        frame_dir=str(tmp_path / "frames"),
+        gt_annotations=gt_annotations,
+        num_epoch=5,
+        proxy_metrics_before={"map": 0.1, "evaluated_samples": 40},
+        prepared_trace_sample_input=None,
+        prepared_splitter=_fake_suffix_splitter_for_model(model),
+        prepared_candidate=object(),
+        effective_batch_size=32,
+        sample_metadata_by_id={},
+    )
+
+    assert selection_eval_count >= 1
+    assert proxy_metrics_after["map"] == pytest.approx(0.8)
 
 
 def test_high_quality_sync_stages_pending_without_creating_contract(tmp_path, monkeypatch):

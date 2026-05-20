@@ -149,6 +149,30 @@ class YOLODetectionModel(nn.Module):
             )
         from ultralytics import YOLO
         self.yolo = YOLO(model_name)
+        internal_num_classes = max(int(num_classes), 1)
+        if internal_num_classes == 91:
+            internal_num_classes = 80
+        model_source = str(model_name)
+        if Path(model_source).suffix.lower() in {".yaml", ".yml"}:
+            model_yaml = getattr(getattr(self.yolo, "model", None), "yaml", {}) or {}
+            try:
+                current_num_classes = int(model_yaml.get("nc"))
+            except (TypeError, ValueError):
+                current_num_classes = None
+            if current_num_classes is not None and current_num_classes != internal_num_classes:
+                from ultralytics.cfg import DEFAULT_CFG_DICT
+                from ultralytics.nn.tasks import DetectionModel
+
+                self.yolo.model = DetectionModel(
+                    model_source,
+                    nc=internal_num_classes,
+                    verbose=False,
+                )
+                self.yolo.model.args = {
+                    **DEFAULT_CFG_DICT,
+                    **getattr(self.yolo, "overrides", {}),
+                }
+                self.yolo.model.task = getattr(self.yolo, "task", "detect")
         self.yolo.to(device)
         if isinstance(getattr(self.yolo, "model", None), torch.nn.Module):
             self.yolo.model.eval()
