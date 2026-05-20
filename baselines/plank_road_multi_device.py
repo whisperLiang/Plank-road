@@ -5,10 +5,16 @@ from __future__ import annotations
 import time
 from collections import defaultdict, deque
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from baselines.base_method import BaseMethod, InferenceResult, UpdatePlan
-from baselines.trigger_utils import SlidingWindowStats
+from edge.resource_aware_trigger import (
+    CloudResourceState,
+    PendingTrainingStats,
+    ResourceAwareCLTrigger,
+    TrainingDecision,
+)
 
 
 class PlankRoadMultiDevice(BaseMethod):
@@ -32,18 +38,24 @@ class PlankRoadMultiDevice(BaseMethod):
         self._collect_num = int(getattr(cfg, "collect_num", 20))
         self._metric_trigger_threshold = float(getattr(cfg, "f1_trigger_threshold", 0.55))
 
-        self._windows: dict[int, SlidingWindowStats] = {}
         self._sample_counts: dict[int, int] = defaultdict(int)
         self._drift_counts: dict[int, int] = defaultdict(int)
+        self._pending_sample_ids: dict[int, list[int]] = defaultdict(list)
+        self._latest_results: dict[int, list[InferenceResult]] = defaultdict(list)
+        self._pending_decisions: dict[int, TrainingDecision] = {}
+        self._pending_stats: dict[int, PendingTrainingStats] = {}
+        self._resource_triggers: dict[int, ResourceAwareCLTrigger] = {}
         self._triggered: dict[int, bool] = defaultdict(bool)
         self._model_versions: dict[int, int] = defaultdict(int)
         self._update_queue: deque[UpdatePlan] = deque()
         self._server_available_at = 0.0
 
-    def _get_window(self, device_id: int) -> SlidingWindowStats:
-        if device_id not in self._windows:
-            self._windows[device_id] = SlidingWindowStats(window_size=32)
-        return self._windows[device_id]
+    def _get_resource_trigger(self, device_id: int) -> ResourceAwareCLTrigger:
+        if device_id not in self._resource_triggers:
+            self._resource_triggers[device_id] = ResourceAwareCLTrigger(
+                min_training_samples=max(1, self._collect_num)
+            )
+        return self._resource_triggers[device_id]
 
     def on_inference_result(self, result: InferenceResult) -> None:
         dev = self.metrics.get_device(result.device_id)
@@ -54,37 +66,78 @@ class PlankRoadMultiDevice(BaseMethod):
             metric_f1=result.metric_f1,
             metric_map50=result.metric_map50,
         )
-        window = self._get_window(result.device_id)
-        window.update(result.confidence, result.in_drift_window)
         self._sample_counts[result.device_id] += 1
+        self._latest_results[result.device_id].append(result)
+        if self.context is not None:
+            samples = self.context.sample_store.get_recent_samples(result.device_id, 1)
+            if samples:
+                self._pending_sample_ids[result.device_id].append(samples[-1].sample_id)
         if result.in_drift_window:
             self._drift_counts[result.device_id] += 1
 
     def should_trigger(self, device_id: int) -> bool:
         if self._triggered[device_id]:
             return False
-        if self.enable_resource_aware_trigger and self._drift_counts[device_id] > 0:
+        if device_id in self._pending_decisions:
             return True
-        return self._sample_counts[device_id] >= self._collect_num
+        stats = self._build_pending_stats(device_id)
+        if stats.total_samples <= 0:
+            return False
+        if self.enable_resource_aware_trigger:
+            decision = self._get_resource_trigger(device_id).decide(
+                drift_detected=stats.drift_detected,
+                cloud_state=self._cloud_resource_state(),
+                bandwidth_mbps=self._bandwidth_mbps(),
+                sample_stats=stats,
+            )
+        else:
+            should_train = stats.low_quality_count >= max(1, self._collect_num) or stats.drift_detected
+            decision = TrainingDecision(
+                train_now=bool(should_train),
+                send_low_conf_features=False,
+                urgency=1.0 if should_train else 0.0,
+                compute_pressure=0.0,
+                bandwidth_pressure=0.0,
+                bandwidth_mbps=self._bandwidth_mbps(),
+                reason="Fallback trigger using low-quality sample count and drift flag.",
+            )
+        if not decision.train_now:
+            return False
+        self._pending_decisions[device_id] = decision
+        self._pending_stats[device_id] = stats
+        return True
 
     def build_update_plan(self, device_id: int) -> UpdatePlan:
         context = self._require_context()
-        window = self._get_window(device_id)
-        samples = context.sample_store.get_recent_samples(device_id, self._sample_counts[device_id])
+        sample_ids = list(self._pending_sample_ids.get(device_id, []))
+        samples = (
+            context.sample_store.get_selected_samples(sample_ids)
+            if sample_ids
+            else context.sample_store.get_recent_samples(device_id, self._sample_counts[device_id])
+        )
         if not samples:
             raise RuntimeError(f"No real samples available for Plank-road device {device_id}")
+        decision = self._pending_decisions.get(device_id)
+        if decision is None:
+            decision = TrainingDecision(
+                train_now=True,
+                send_low_conf_features=False,
+                urgency=0.0,
+                compute_pressure=0.0,
+                bandwidth_pressure=0.0,
+                bandwidth_mbps=self._bandwidth_mbps(),
+                reason="Manual Plank-road update plan without cached decision.",
+            )
+        stats = self._pending_stats.get(device_id, self._build_pending_stats(device_id))
         feature_ready = all(sample.feature_tensor_path for sample in samples)
-        upload_mode = self.upload_mode_default
         if (
             self.enable_feature_upload
             and self.allow_feature_upload
             and self.enable_feature_cache
             and feature_ready
+            and decision.send_low_conf_features
         ):
-            if self.enable_resource_aware_trigger and window.confidence_drop <= 0.2:
-                upload_mode = "feature_only"
-            else:
-                upload_mode = "feature_only"
+            upload_mode = "raw+feature"
         else:
             upload_mode = "raw_only"
         upload = context.measure_upload(
@@ -92,14 +145,26 @@ class PlankRoadMultiDevice(BaseMethod):
             upload_mode=upload_mode,
             method_name=self.method_name,
             device_id=device_id,
-            metadata={"selected_by": "resource_aware_trigger"},
+            metadata={
+                "selected_by": "resource_aware_trigger",
+                "trigger_decision": {
+                    "send_low_conf_features": decision.send_low_conf_features,
+                    "urgency": decision.urgency,
+                    "compute_pressure": decision.compute_pressure,
+                    "bandwidth_pressure": decision.bandwidth_pressure,
+                    "bandwidth_mbps": decision.bandwidth_mbps,
+                    "reason": decision.reason,
+                    "action_scores": decision.action_scores,
+                },
+            },
         )
-        if self.enable_resource_aware_trigger and self._drift_counts[device_id] > 0:
-            reason = "drift_detected"
-        elif self.enable_resource_aware_trigger:
-            reason = "resource_aware_trigger"
-        else:
-            reason = "fixed_collect_window"
+        reason = (
+            "resource_aware_raw_plus_feature"
+            if decision.send_low_conf_features
+            else "resource_aware_raw_only"
+        )
+        if stats.drift_detected:
+            reason = f"{reason}+drift"
         context.sample_store.mark_selected(
             [sample.sample_id for sample in samples],
             upload_mode=upload_mode,
@@ -126,6 +191,14 @@ class PlankRoadMultiDevice(BaseMethod):
                 "upload_serialization_time_sec": upload.serialization_time_sec,
                 **upload.to_event_fields(),
                 "bundle_path": upload.bundle_path,
+                "trigger_decision_reason": decision.reason,
+                "trigger_urgency": decision.urgency,
+                "trigger_compute_pressure": decision.compute_pressure,
+                "trigger_bandwidth_pressure": decision.bandwidth_pressure,
+                "send_low_conf_features": decision.send_low_conf_features,
+                "pending_low_quality_count": stats.low_quality_count,
+                "pending_low_quality_rate": stats.low_quality_rate,
+                "pending_uncovered_evidence_rate": stats.uncovered_evidence_rate,
             },
         )
 
@@ -236,8 +309,134 @@ class PlankRoadMultiDevice(BaseMethod):
 
         self._sample_counts[plan.device_id] = 0
         self._drift_counts[plan.device_id] = 0
+        self._pending_sample_ids[plan.device_id].clear()
+        self._latest_results[plan.device_id].clear()
+        self._pending_decisions.pop(plan.device_id, None)
+        self._pending_stats.pop(plan.device_id, None)
         self._triggered[plan.device_id] = False
         self._model_versions[plan.device_id] += 1
-        self._get_window(plan.device_id).reset()
         if self._update_queue:
             self._update_queue.popleft()
+
+    def _build_pending_stats(self, device_id: int) -> PendingTrainingStats:
+        context = self.context
+        sample_ids = list(self._pending_sample_ids.get(device_id, []))
+        samples = []
+        if context is not None and sample_ids:
+            samples = context.sample_store.get_selected_samples(sample_ids)
+        if samples:
+            total = len(samples)
+            low_quality = [sample for sample in samples if self._is_low_quality_sample(sample)]
+            high_quality_count = total - len(low_quality)
+            low_quality_rate = len(low_quality) / float(total)
+            uncovered = [self._sample_uncovered_evidence(sample) for sample in samples]
+            high_quality_feature_bytes = sum(
+                self._file_size(sample.feature_tensor_path)
+                for sample in samples
+                if not self._is_low_quality_sample(sample)
+            )
+            low_quality_feature_bytes = sum(
+                self._file_size(sample.feature_tensor_path)
+                for sample in low_quality
+            )
+            low_quality_raw_bytes = sum(self._file_size(sample.frame_path) for sample in low_quality)
+            return PendingTrainingStats(
+                total_samples=total,
+                high_quality_count=high_quality_count,
+                low_quality_count=len(low_quality),
+                low_quality_rate=low_quality_rate,
+                uncovered_evidence_rate=sum(uncovered) / float(total),
+                drift_detected=any(sample.in_drift_window for sample in samples),
+                high_quality_feature_bytes=high_quality_feature_bytes,
+                low_quality_feature_bytes=low_quality_feature_bytes,
+                low_quality_raw_bytes=low_quality_raw_bytes,
+            )
+
+        results = list(self._latest_results.get(device_id, []))
+        total = len(results)
+        if total <= 0:
+            return PendingTrainingStats(
+                total_samples=0,
+                high_quality_count=0,
+                low_quality_count=0,
+                low_quality_rate=0.0,
+                uncovered_evidence_rate=0.0,
+                drift_detected=False,
+                high_quality_feature_bytes=0,
+                low_quality_feature_bytes=0,
+                low_quality_raw_bytes=0,
+            )
+        low_quality_count = sum(1 for result in results if self._is_low_quality_result(result))
+        uncovered = [self._result_uncovered_evidence(result) for result in results]
+        return PendingTrainingStats(
+            total_samples=total,
+            high_quality_count=total - low_quality_count,
+            low_quality_count=low_quality_count,
+            low_quality_rate=low_quality_count / float(total),
+            uncovered_evidence_rate=sum(uncovered) / float(total),
+            drift_detected=any(result.in_drift_window for result in results),
+            high_quality_feature_bytes=0,
+            low_quality_feature_bytes=0,
+            low_quality_raw_bytes=0,
+        )
+
+    def _cloud_resource_state(self) -> CloudResourceState:
+        context = self.context
+        queue_size = len(self._update_queue)
+        max_queue = max(1, self.num_devices)
+        if context is not None:
+            max_queue = max(1, int(getattr(context, "max_concurrent_train_jobs", 1)))
+        return CloudResourceState(
+            cpu_utilization=0.0,
+            gpu_utilization=0.0,
+            memory_utilization=0.0,
+            train_queue_size=queue_size,
+            max_queue_size=max_queue,
+        )
+
+    def _bandwidth_mbps(self) -> float:
+        context = self.context
+        if context is not None and context.bandwidth_mbps not in (None, ""):
+            return float(context.bandwidth_mbps)
+        return float(getattr(self.experiment_config, "bandwidth_mbps", 0.0) or 0.0)
+
+    def _is_low_quality_sample(self, sample: Any) -> bool:
+        if bool(getattr(sample, "in_drift_window", False)):
+            return True
+        if sample.metric_f1 is not None:
+            return float(sample.metric_f1) < self._metric_trigger_threshold
+        if sample.metric_map50 is not None:
+            return float(sample.metric_map50) < self._metric_trigger_threshold
+        return float(sample.confidence) < self._metric_trigger_threshold
+
+    def _is_low_quality_result(self, result: InferenceResult) -> bool:
+        if result.in_drift_window:
+            return True
+        if result.metric_f1 is not None:
+            return float(result.metric_f1) < self._metric_trigger_threshold
+        if result.metric_map50 is not None:
+            return float(result.metric_map50) < self._metric_trigger_threshold
+        return float(result.confidence) < self._metric_trigger_threshold
+
+    def _sample_uncovered_evidence(self, sample: Any) -> float:
+        metric = sample.metric_f1 if sample.metric_f1 is not None else sample.metric_map50
+        if metric is None:
+            metric = sample.confidence
+        return self._metric_gap(float(metric))
+
+    def _result_uncovered_evidence(self, result: InferenceResult) -> float:
+        metric = result.metric_f1 if result.metric_f1 is not None else result.metric_map50
+        if metric is None:
+            metric = result.confidence
+        return self._metric_gap(float(metric))
+
+    def _metric_gap(self, value: float) -> float:
+        threshold = max(1e-6, self._metric_trigger_threshold)
+        return max(0.0, min(1.0, (threshold - float(value)) / threshold))
+
+    @staticmethod
+    def _file_size(path_like: str | Path | None) -> int:
+        if not path_like:
+            return 0
+        path = Path(path_like)
+        return path.stat().st_size if path.exists() and path.is_file() else 0

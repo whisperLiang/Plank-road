@@ -171,7 +171,7 @@ class RealTrainer:
             gt_annotations=annotations,
             device=self.device,
             num_epoch=self._resolve_epochs(epochs),
-            learning_rate=0.001,
+            learning_rate=self._resolve_split_tail_learning_rate(),
             loss_fn=self._build_loss_fn(),
             splitter=splitter,
             batch_size=self.batch_size,
@@ -433,6 +433,18 @@ class RealTrainer:
         if "tinynext" in name or "ssd" in name or "anchor" in name:
             return "tinynext"
         return None
+
+    def _resolve_split_tail_learning_rate(self) -> float:
+        """Match the tail-training motivation experiment learning-rate defaults."""
+        name = f"{self._split_model_name()} {type(self.model).__name__}".lower()
+        family = self._split_model_family()
+        if family == "tinynext" or "tinynext" in name:
+            return 1e-3
+        if family == "rfdetr" or "rfdetr" in name:
+            return 1e-4
+        if family == "yolo" or "yolo" in name:
+            return 3e-5
+        return 1e-3
 
     def _mean_f1(self, samples: list[SampleRecord]) -> float:
         values = [sample.metric_f1 for sample in samples if sample.metric_f1 is not None]

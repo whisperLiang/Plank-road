@@ -59,4 +59,37 @@ def test_plank_road_low_metric_does_not_bypass_collect_num():
             is_real=True,
         )
     )
+    assert not method.should_trigger(0)
+
+    method.on_inference_result(
+        InferenceResult(
+            device_id=0,
+            frame_index=2,
+            confidence=0.2,
+            metric_f1=0.0,
+            in_drift_window=False,
+            is_real=True,
+        )
+    )
     assert method.should_trigger(0)
+
+
+def test_plank_road_does_not_trigger_just_because_collect_count_is_reached():
+    config = make_config("plank_road_multi_device", total_frames=3)
+    config.plank_road_multi_device.collect_num = 3
+    method = PlankRoadMultiDevice(config, num_devices=1)
+
+    for index in range(3):
+        method.on_inference_result(
+            InferenceResult(
+                device_id=0,
+                frame_index=index,
+                confidence=0.95,
+                metric_f1=0.95,
+                metric_map50=0.95,
+                in_drift_window=False,
+                is_real=True,
+            )
+        )
+
+    assert not method.should_trigger(0)
