@@ -1,16 +1,17 @@
-"""Freeze vs rebuilt vs cached Ariadne split tail-training motivation experiment.
+"""Raw freeze vs Ariadne split tail-training motivation experiment.
 
-All three modes (``freeze``, ``split_rebuild`` and ``split_cached``) implement
-fixed-prefix tail training:
+All modes implement fixed-prefix tail training:
 
 * the prefix segment is a frozen feature extractor (parameters frozen,
   ``BatchNorm`` running stats frozen, dropout off, ``eval`` state, forward under
-  ``torch.no_grad``);
+  ``torch.no_grad`` when the mode uses an explicit prefix pass);
 * the suffix segment is the only trainable part, with trainable parameters
   resolved from the Ariadne runtime (``runtime.candidate.suffix_nodes``);
+* ``raw_freeze`` runs the original unsplit model forward/backward with the
+  prefix parameters frozen and the same suffix parameters trainable;
 * ``freeze``, ``split_rebuild`` and ``split_cached`` train **the same** set of
-  suffix parameters, with the same optimizer configuration, using the same
-  ``Ariadne`` ``run_prefix``/``train_suffix`` code paths;
+  suffix parameters, with the same optimizer configuration, using Ariadne
+  ``run_prefix``/``train_suffix`` code paths;
 * ``split_rebuild`` rebuilds the boundary feature cache **exactly once** before
   training and then reuses it for every epoch;
 * ``split_cached`` reuses the cache built before the repeat loop, so it must
@@ -69,7 +70,7 @@ from model_management.universal_model_split import (
 )
 
 
-DEFAULT_MODES = ("freeze", "split_rebuild", "split_cached")
+DEFAULT_MODES = ("raw_freeze", "freeze", "split_rebuild", "split_cached")
 DEFAULT_SAMPLE_COUNT = 512
 DEFAULT_EPOCHS = 10
 DEFAULT_REPEAT = 5
@@ -162,7 +163,10 @@ class _PreparedBatch:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare freeze, rebuilt Ariadne split, and cached Ariadne split training.",
+        description=(
+            "Compare raw frozen-prefix training, Ariadne freeze, rebuilt Ariadne "
+            "split, and cached Ariadne split training."
+        ),
     )
     parser.add_argument("--yaml-path", default="./config/config.yaml")
     parser.add_argument("--video-path", default="./video_data/road.mp4")
@@ -730,7 +734,7 @@ def _ordered_epoch_batches(
     """Chunk ``sample_ids`` into fixed-order batches of ``batch_size``.
 
     The tail-training motivation experiment uses the same sample order for all
-    three modes, so a deterministic chunking is all we need; there is no
+    enabled modes, so a deterministic chunking is all we need; there is no
     per-epoch reshuffle that could desynchronise freeze vs split.
     """
     ids = list(sample_ids)
@@ -989,7 +993,7 @@ def _train_suffix_loop(
 ) -> dict[str, Any]:
     """Train the Ariadne suffix over a fixed list of precomputed batches.
 
-    All three modes funnel into this single loop so the only difference
+    All Ariadne suffix modes funnel into this single loop so the only difference
     between them is *how* ``prepared_batches[i].boundary`` was produced.
     """
     epoch_times: list[float] = []
@@ -1494,10 +1498,12 @@ def plot_split_time_accuracy_subplots(
 ) -> None:
     """Two-subplot figure. Top: training-time boxplots. Bottom: mAP boxplots.
 
-    Both panels share the split-position x-axis. Each panel groups the three
+    Both panels share the split-position x-axis. Each panel groups the enabled
     modes side by side. The displayed training time follows the experiment's
     definition:
 
+    * ``raw_freeze``    -> ``suffix_train_time_sec`` (raw full-model forward,
+      backward, and optimizer step with prefix parameters frozen);
     * ``freeze``        -> ``suffix_train_time_sec`` (raw-input fixed-prefix
       forward + suffix train, measured inside the training loop);
     * ``split_rebuild`` -> ``feature_rebuild_time_sec + suffix_train_time_sec``;
@@ -1531,11 +1537,13 @@ def plot_split_time_accuracy_subplots(
     mode_offsets = {mode: float(offsets[i]) for i, mode in enumerate(modes)}
 
     mode_faces = {
+        "raw_freeze": "#d4845f",
         "freeze": "#6aa6d8",
         "split_rebuild": "#f2c94c",
         "split_cached": "#65b96a",
     }
     mode_edges = {
+        "raw_freeze": "#7f3f25",
         "freeze": "#24567a",
         "split_rebuild": "#8f6b00",
         "split_cached": "#266b32",
@@ -1706,6 +1714,65 @@ def plot_split_time_accuracy_subplots(
 # ---------------------------------------------------------------------------
 # Per-mode runners
 # ---------------------------------------------------------------------------
+
+
+def _run_raw_freeze_mode(
+    *,
+    split_model: torch.nn.Module,
+    edge_model: torch.nn.Module,
+    frames_by_id: Mapping[int, np.ndarray],
+    sample_ids: list[int],
+    annotations: Mapping[str, Mapping[str, Any]],
+    batch_size: int,
+    epochs: int,
+    device: torch.device,
+    loss_fn: Callable[[Any, Any], torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, Any]:
+    """Raw full-model training with the prefix frozen and suffix trainable."""
+    resize_mode = get_split_runtime_input_resize_mode(edge_model)
+    epoch_times: list[float] = []
+    batch_times: list[float] = []
+    losses: list[float] = []
+    _synchronize(device)
+    training_started = time.perf_counter()
+    for _epoch in range(int(epochs)):
+        epoch_started = time.perf_counter()
+        for batch_ids in _ordered_epoch_batches(
+            sample_ids,
+            batch_size=max(2, int(batch_size)),
+        ):
+            _synchronize(device)
+            batch_started = time.perf_counter()
+            inputs, targets = _prepare_raw_batch(
+                model=edge_model,
+                frame_ids=batch_ids,
+                frames_by_id=frames_by_id,
+                annotations=annotations,
+                device=device,
+                resize_mode=resize_mode,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            outputs = split_model(inputs)
+            loss = loss_fn(outputs, copy.deepcopy(targets))
+            if not isinstance(loss, torch.Tensor):
+                raise RuntimeError(f"Raw freeze loss_fn returned {type(loss)!r}, not a tensor.")
+            if not loss.requires_grad:
+                raise RuntimeError("Raw freeze loss does not require gradients.")
+            loss.backward()
+            optimizer.step()
+            _synchronize(device)
+            batch_times.append(time.perf_counter() - batch_started)
+            losses.append(float(loss.detach().cpu().item()))
+        epoch_times.append(time.perf_counter() - epoch_started)
+    _synchronize(device)
+    return {
+        "suffix_train_time_sec": float(time.perf_counter() - training_started),
+        "feature_rebuild_time_sec": 0.0,
+        "epoch_time_mean_sec": float(np.mean(epoch_times)) if epoch_times else None,
+        "batch_time_mean_sec": float(np.mean(batch_times)) if batch_times else None,
+        "final_loss": float(losses[-1]) if losses else None,
+    }
 
 
 def _run_freeze_mode(
@@ -1954,7 +2021,7 @@ def _run_one_experiment(
             cached_split.split_id,
             cached_split.cached_sample_count,
         )
-    elif mode not in {"freeze", "split_rebuild"}:
+    elif mode not in {"raw_freeze", "freeze", "split_rebuild"}:
         raise RuntimeError(f"Unsupported mode: {mode}")
 
     metadata = get_split_runtime_metadata(runtime)
@@ -1977,7 +2044,7 @@ def _run_one_experiment(
 
     # Freeze the prefix, mark only suffix parameters trainable. This MUST
     # happen before the optimizer is constructed so the optimizer only sees
-    # suffix parameters for all three modes.
+    # suffix parameters for all modes.
     suffix_param_names, _suffix_params = _configure_fixed_prefix_training(
         split_model, runtime
     )
@@ -2023,8 +2090,22 @@ def _run_one_experiment(
         device=device,
         batch_size=batch_size,
     )
+    _configure_fixed_prefix_training(split_model, runtime)
 
-    if mode == "freeze":
+    if mode == "raw_freeze":
+        train_metrics = _run_raw_freeze_mode(
+            split_model=split_model,
+            edge_model=edge_model,
+            frames_by_id=frames_by_id,
+            sample_ids=sampled_frame_indices,
+            annotations=annotations,
+            batch_size=batch_size,
+            epochs=epochs,
+            device=device,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+        )
+    elif mode == "freeze":
         train_metrics = _run_freeze_mode(
             runtime=runtime,
             edge_model=edge_model,
@@ -2093,8 +2174,8 @@ def _run_one_experiment(
     row["suffix_train_time_sec"] = suffix_train
     row["feature_rebuild_time_sec"] = feature_rebuild
     # "train_time_sec" matches the value used for the plot's training-time
-    # boxplot (freeze: suffix_train; split_rebuild: rebuild + suffix_train;
-    # split_cached: suffix_train).
+    # boxplot (raw_freeze/freeze/split_cached: suffix_train;
+    # split_rebuild: rebuild + suffix_train).
     if mode == "split_rebuild":
         row["train_time_sec"] = suffix_train + feature_rebuild
     else:
@@ -2196,7 +2277,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_build_time_by_boundary: dict[str, float] = {}
 
     # Build exactly one Ariadne runtime per boundary and reuse it for all
-    # three modes. Ariadne variant enumeration is not strictly deterministic
+    # enabled modes. Ariadne variant enumeration is not strictly deterministic
     # across separate build_split_runtime calls, so rebuilding per-mode would
     # cause the suffix parameter sets to drift between modes.
     for choice in choices:

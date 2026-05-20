@@ -28,7 +28,7 @@ def test_parse_args_uses_requested_defaults():
     assert args.batch_size == 32
     assert args.repeat == 5
     assert args.split_boundaries == ["percent:25", "percent:50", "percent:75"]
-    assert args.modes == ["freeze", "split_rebuild", "split_cached"]
+    assert args.modes == ["raw_freeze", "freeze", "split_rebuild", "split_cached"]
 
 
 def test_seeded_frame_selection_is_deterministic():
@@ -172,6 +172,7 @@ def test_split_time_accuracy_subplots_write_pdf_and_png(tmp_path):
             ("Late75%", "percent:75"),
         ]:
             for mode, suffix_base, rebuild_base, acc_base in [
+                ("raw_freeze", 13.0, 0.0, 0.54),
                 ("freeze", 12.0, 0.0, 0.55),
                 ("split_rebuild", 6.0, 1.5, 0.58),
                 ("split_cached", 5.0, 0.0, 0.60),
@@ -209,6 +210,15 @@ def test_plot_uses_two_stacked_subplots(tmp_path):
     import matplotlib.pyplot as plt
 
     rows = [
+        {
+            "mode": "raw_freeze",
+            "split_bucket": "Early25%",
+            "split_boundary": "percent:25",
+            "repeat_id": 0,
+            "suffix_train_time_sec": 1.1,
+            "feature_rebuild_time_sec": 0.0,
+            "metric_after": 0.29,
+        },
         {
             "mode": "freeze",
             "split_bucket": "Early25%",
@@ -539,6 +549,52 @@ def test_configure_fixed_prefix_training_is_not_overridden_by_model_train():
     assert model[1].training is True
 
 
+def test_raw_freeze_mode_runs_full_forward_backward_but_updates_only_suffix(monkeypatch):
+    runtime = _FakeRuntime()
+    model = runtime.root
+    experiments._configure_fixed_prefix_training(model, runtime)
+
+    prefix_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model[0].named_parameters()
+    }
+    suffix_bias_before = model[1].bias.detach().clone()
+    optimizer = torch.optim.SGD(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=0.1,
+    )
+
+    def _fake_prepare(**_kwargs):
+        return torch.ones(2, 1, 1, 1), [{"boxes": []}, {"boxes": []}]
+
+    monkeypatch.setattr(experiments, "_prepare_raw_batch", _fake_prepare)
+    monkeypatch.setattr(
+        experiments,
+        "get_split_runtime_input_resize_mode",
+        lambda _model: "direct_resize",
+    )
+
+    metrics = experiments._run_raw_freeze_mode(
+        split_model=model,
+        edge_model=model,
+        frames_by_id={},
+        sample_ids=[1, 2],
+        annotations={},
+        batch_size=2,
+        epochs=1,
+        device=torch.device("cpu"),
+        loss_fn=lambda outputs, _targets: outputs.sum(),
+        optimizer=optimizer,
+    )
+
+    for name, parameter in model[0].named_parameters():
+        assert torch.equal(parameter.detach(), prefix_before[name])
+        assert parameter.grad is None
+    assert not torch.equal(model[1].bias.detach(), suffix_bias_before)
+    assert metrics["feature_rebuild_time_sec"] == pytest.approx(0.0)
+    assert metrics["final_loss"] is not None
+
+
 # ---------------------------------------------------------------------------
 # BatchNorm running stats on the prefix
 # ---------------------------------------------------------------------------
@@ -740,6 +796,12 @@ def test_split_rebuild_and_split_cached_share_the_same_suffix_loop():
 
 def test_assert_trainable_parameter_equivalence_accepts_matching_modes():
     rows = [
+        {
+            "mode": "raw_freeze",
+            "split_boundary": "percent:25",
+            "trainable_parameter_names": ["head.weight", "head.bias"],
+            "trainable_parameter_count": 10,
+        },
         {
             "mode": "freeze",
             "split_boundary": "percent:25",
