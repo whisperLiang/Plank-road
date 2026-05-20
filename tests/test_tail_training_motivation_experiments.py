@@ -549,6 +549,34 @@ def test_configure_fixed_prefix_training_is_not_overridden_by_model_train():
     assert model[1].training is True
 
 
+def test_configure_fixed_prefix_training_trains_full_suffix_segment():
+    class _DropoutSuffixRuntime(_FakeRuntime):
+        def __init__(self):
+            super().__init__()
+            self.root = torch.nn.Sequential(
+                torch.nn.Conv2d(1, 1, kernel_size=1),
+                torch.nn.Sequential(torch.nn.Dropout(p=0.5), torch.nn.Linear(1, 1)),
+            )
+            suffix_refs = (_FakeParamRef("1.1.weight"), _FakeParamRef("1.1.bias"))
+            self.trace_plan = _FakeTracePlan(
+                (_FakeNode("suffix_node", suffix_refs),),
+                self.root,
+            )
+            self.suffix_segment = self.root[1]
+            self.prefix_segment = self.root[0]
+            self.training_prefix_segment = self.root[0]
+
+    runtime = _DropoutSuffixRuntime()
+    model = runtime.root
+
+    experiments._configure_fixed_prefix_training(model, runtime)
+
+    assert model[0].training is False
+    assert model[1].training is True
+    assert model[1][0].training is True
+    assert model[1][1].training is True
+
+
 def test_raw_freeze_mode_runs_full_forward_backward_but_updates_only_suffix(monkeypatch):
     runtime = _FakeRuntime()
     model = runtime.root

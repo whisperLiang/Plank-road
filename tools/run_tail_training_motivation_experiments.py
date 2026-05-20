@@ -930,6 +930,11 @@ def _configure_fixed_prefix_training(
       prefix ``BatchNorm`` running stats, dropout, and any other
       train-mode-only behaviour frozen.
     """
+    ariadne_runtime = (
+        runtime._ensure_runtime()
+        if callable(getattr(runtime, "_ensure_runtime", None))
+        else runtime
+    )
     suffix_names = tuple(_suffix_parameter_names(runtime))
     suffix_name_set = set(suffix_names)
 
@@ -937,6 +942,19 @@ def _configure_fixed_prefix_training(
     for parameter in split_model.parameters():
         parameter.requires_grad_(False)
         parameter.grad = None
+
+    suffix_segment = getattr(ariadne_runtime, "suffix_segment", None)
+    if isinstance(suffix_segment, torch.nn.Module):
+        suffix_segment.train()
+
+    for segment_name in ("prefix_segment", "training_prefix_segment"):
+        prefix_segment = getattr(ariadne_runtime, segment_name, None)
+        if not isinstance(prefix_segment, torch.nn.Module):
+            continue
+        prefix_segment.eval()
+        for parameter in prefix_segment.parameters(recurse=True):
+            parameter.requires_grad_(False)
+            parameter.grad = None
 
     suffix_params: list[torch.nn.Parameter] = []
     modules_with_suffix: set[str] = set()
@@ -964,18 +982,38 @@ def _configure_fixed_prefix_training(
     return suffix_names, suffix_params
 
 
-def _collect_frozen_batchnorm_stats(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+def _collect_frozen_batchnorm_stats(
+    model: torch.nn.Module,
+    runtime: Any | None = None,
+) -> dict[str, torch.Tensor]:
     snapshot: dict[str, torch.Tensor] = {}
-    for module_name, module in model.named_modules():
-        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+    ariadne_runtime = (
+        runtime._ensure_runtime()
+        if runtime is not None and callable(getattr(runtime, "_ensure_runtime", None))
+        else runtime
+    )
+    segments: list[tuple[str, torch.nn.Module]] = []
+    seen_segments: set[int] = set()
+    for segment_name in ("prefix_segment", "training_prefix_segment"):
+        segment = getattr(ariadne_runtime, segment_name, None)
+        if isinstance(segment, torch.nn.Module) and id(segment) not in seen_segments:
+            seen_segments.add(id(segment))
+            segments.append((segment_name, segment))
+    if not segments:
+        segments = [("model", model)]
+
+    for segment_name, segment in segments:
+        for module_name, module in segment.named_modules():
+            key_prefix = segment_name if not module_name else f"{segment_name}.{module_name}"
+            if not isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                continue
             running_mean = getattr(module, "running_mean", None)
             running_var = getattr(module, "running_var", None)
             if isinstance(running_mean, torch.Tensor):
-                snapshot[f"{module_name}.running_mean"] = running_mean.detach().clone()
+                snapshot[f"{key_prefix}.running_mean"] = running_mean.detach().clone()
             if isinstance(running_var, torch.Tensor):
-                snapshot[f"{module_name}.running_var"] = running_var.detach().clone()
+                snapshot[f"{key_prefix}.running_var"] = running_var.detach().clone()
     return snapshot
-
 
 # ---------------------------------------------------------------------------
 # Trainable-suffix loop (shared by freeze / split_rebuild / split_cached)
@@ -2054,7 +2092,7 @@ def _run_one_experiment(
     )
 
     # Snapshot prefix BatchNorm stats so we can assert they stayed frozen.
-    prefix_bn_snapshot = _collect_frozen_batchnorm_stats(split_model)
+    prefix_bn_snapshot = _collect_frozen_batchnorm_stats(split_model, runtime)
 
     optimizer = build_split_retrain_optimizer(
         split_model,
@@ -2151,7 +2189,7 @@ def _run_one_experiment(
     )
 
     # Verify that frozen prefix BatchNorm running stats were not updated.
-    post_bn_snapshot = _collect_frozen_batchnorm_stats(split_model)
+    post_bn_snapshot = _collect_frozen_batchnorm_stats(split_model, runtime)
     for key, before_tensor in prefix_bn_snapshot.items():
         after_tensor = post_bn_snapshot.get(key)
         if after_tensor is None:
