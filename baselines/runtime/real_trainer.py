@@ -23,6 +23,7 @@ from model_management.split_model_adapters import (
 from model_management.universal_model_split import (
     SplitRetrainProfile,
     UniversalModelSplitter,
+    build_split_retrain_optimizer,
     save_split_feature_cache,
     universal_split_retrain,
 )
@@ -94,6 +95,8 @@ class RealTrainer:
     ) -> TrainingReport:
         if not samples:
             raise ValueError("train_raw_frames requires at least one real sample")
+        if self._uses_raw_freeze_tail_training(trainable_scope):
+            return self._train_freeze_tail_raw_frames(samples, epochs=epochs)
         return self._train_detection_frames(
             samples,
             epochs=epochs,
@@ -328,6 +331,84 @@ class RealTrainer:
             map50_after_update=after_map50,
         )
 
+    def _train_freeze_tail_raw_frames(
+        self,
+        samples: list[SampleRecord],
+        *,
+        epochs: int | None = None,
+    ) -> TrainingReport:
+        selected = self._limit_samples(samples)
+        before = self._mean_f1(selected)
+        before_map50 = self._mean_map50(selected)
+        sample_input = self._prepare_split_input(selected[0])
+        core_model = get_split_runtime_model(self.model)
+        splitter = UniversalModelSplitter(device=self.device).trace(
+            core_model,
+            sample_input,
+            model_name=self._split_model_name(),
+            model_family=self._split_model_family(),
+        )
+        loss_fn = self._build_loss_fn()
+        optimizer = build_split_retrain_optimizer(
+            core_model,
+            runtime=splitter,
+            learning_rate=self._resolve_split_tail_learning_rate(),
+            optimizer_name="sgd",
+            weight_decay=0.0,
+            grad_clip_norm=None,
+        )
+        if optimizer is None:
+            raise RuntimeError("No trainable suffix parameters remain for raw freeze training")
+
+        raw_replay = 0.0
+        start = time.perf_counter()
+        steps = 0
+        for _epoch in range(self._resolve_epochs(epochs)):
+            for batch in self._batches(selected):
+                prepared = [self._prepare_detection_sample(sample) for sample in batch]
+                images = torch.cat([item[0] for item in prepared], dim=0)
+                targets = [item[1] for item in prepared]
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                prefix_start = time.perf_counter()
+                with torch.no_grad():
+                    boundary = splitter.run_prefix(images)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                raw_replay += time.perf_counter() - prefix_start
+
+                loss, _grads = splitter.train_suffix(
+                    boundary,
+                    targets,
+                    loss_fn=loss_fn,
+                    optimizer=optimizer,
+                )
+                del loss, _grads
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                steps += 1
+        training_time = time.perf_counter() - start
+        core_model.eval()
+        self.model.eval()
+        after = self._evaluate_model_f1(self.model, selected)
+        after_map50 = self._evaluate_model_map50(self.model, selected)
+        self._set_detection_trainable_scope(core_model, "full")
+        checkpoint_path, model_update_time = self._save_update_checkpoint()
+        return TrainingReport(
+            checkpoint_path=checkpoint_path,
+            training_time_sec=training_time,
+            optimizer_steps=steps,
+            raw_replay_time_sec=raw_replay,
+            full_training_time_sec=training_time,
+            model_update_time_sec=model_update_time,
+            accuracy_before_update=before,
+            accuracy_after_update=after,
+            f1_before_update=before,
+            f1_after_update=after,
+            map50_before_update=before_map50,
+            map50_after_update=after_map50,
+        )
+
     def _build_loss_fn(self):
         loss_fn = build_split_training_loss(self.model)
         if loss_fn is None:
@@ -344,6 +425,16 @@ class RealTrainer:
         if self.quick_smoke:
             return samples[: max(1, min(len(samples), self.batch_size * 2))]
         return samples
+
+    @staticmethod
+    def _uses_raw_freeze_tail_training(trainable_scope: str) -> bool:
+        return str(trainable_scope).strip().lower() in {
+            "partial",
+            "head_only",
+            "freeze",
+            "freeze_tail",
+            "frozen_prefix",
+        }
 
     def _batches(self, samples: list[SampleRecord]) -> list[list[SampleRecord]]:
         return [samples[i : i + self.batch_size] for i in range(0, len(samples), self.batch_size)]

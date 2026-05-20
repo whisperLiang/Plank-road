@@ -20,6 +20,21 @@ def test_real_trainer_optimizer_step(tmp_path: Path):
     assert Path(report.checkpoint_path).exists()
 
 
+def test_raw_partial_training_uses_motivation_freeze_path(tmp_path: Path):
+    frame_dir = make_frame_dir(tmp_path, count=4)
+    context = build_context(tmp_path, method_name="accuracy_trigger_cloud_retraining")
+    samples_results = populate_context(context, frame_dir, count=4)
+    samples = context.sample_store.get_recent_samples(0, len(samples_results))
+
+    report = context.trainer.train_raw_frames(samples, epochs=1, trainable_scope="partial")
+
+    assert report.optimizer_steps > 0
+    assert report.raw_replay_time_sec > 0
+    assert report.full_training_time_sec == pytest.approx(report.training_time_sec)
+    assert report.training_time_sec >= report.raw_replay_time_sec
+    assert report.tail_training_time_sec == 0
+
+
 class _NamedModel(torch.nn.Module):
     def __init__(self, model_name: str) -> None:
         super().__init__()
