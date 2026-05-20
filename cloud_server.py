@@ -394,6 +394,108 @@ def _is_low_quality_trigger_sample(
     return False
 
 
+def _boundary_payload_from_trigger_feature(
+    payload: object,
+    manifest: Mapping[str, object],
+    sample_id: str,
+) -> BoundaryPayload | None:
+    if isinstance(payload, BoundaryPayload):
+        return payload
+    if not isinstance(payload, Mapping):
+        return None
+    nested = payload.get("boundary_payload")
+    if isinstance(nested, BoundaryPayload):
+        return nested
+    source = payload.get("tensors") or payload
+    if not isinstance(source, Mapping):
+        return None
+    tensors = {
+        str(label): value.detach().cpu()
+        for label, value in source.items()
+        if isinstance(value, torch.Tensor)
+    }
+    if not tensors:
+        return None
+    split_plan = dict(manifest.get("split_plan", {}) or {})
+    split_id = str(
+        manifest.get("edge_split_id")
+        or manifest.get("canonical_split_key")
+        or split_plan.get("candidate_id")
+        or split_plan.get("split_label")
+        or sample_id
+    )
+    graph_signature = str(
+        split_plan.get("trace_signature")
+        or split_plan.get("graph_signature")
+        or "low-quality-trigger"
+    )
+    return boundary_payload_from_tensors(
+        tensors,
+        split_id=split_id,
+        graph_signature=graph_signature,
+    )
+
+
+def _trigger_feature_cache_record(
+    payload: object,
+    manifest: Mapping[str, object],
+    sample_id: str,
+    *,
+    input_image_size: list[int] | None = None,
+) -> dict[str, object] | None:
+    boundary = _boundary_payload_from_trigger_feature(payload, manifest, sample_id)
+    if boundary is None:
+        return None
+    split_plan = dict(manifest.get("split_plan", {}) or {})
+    boundary_labels = list(
+        manifest.get("boundary_tensor_labels")
+        or split_plan.get("boundary_tensor_labels")
+        or getattr(boundary, "boundary_tensor_labels", None)
+        or list(getattr(boundary, "tensors", {}).keys())
+    )
+    record: dict[str, object] = {
+        "intermediate": boundary,
+        "candidate_id": split_plan.get("candidate_id")
+        or getattr(boundary, "candidate_id", None)
+        or getattr(boundary, "split_id", None),
+        "boundary_tensor_labels": boundary_labels,
+        "split_index": split_plan.get("split_index"),
+        "split_label": split_plan.get("split_label") or getattr(boundary, "split_id", None),
+        "sample_id": sample_id,
+        "model_id": str(manifest.get("model_id", "") or ""),
+        "model_version": str(
+            (manifest.get("model") or {}).get("model_version", "")
+            if isinstance(manifest.get("model"), Mapping)
+            else manifest.get("model_version", "")
+        ),
+        "split_config_id": str(
+            manifest.get("split_config_id")
+            or split_plan.get("split_config_id")
+            or ""
+        ),
+        "front_version": str(
+            manifest.get("front_version")
+            or split_plan.get("front_version")
+            or "0"
+        ),
+        "input_tensor_shape": list(
+            manifest.get("input_tensor_shape")
+            or split_plan.get("input_tensor_shape", [])
+            or []
+        ),
+        "input_resize_mode": str(
+            manifest.get("input_resize_mode")
+            or split_plan.get("input_resize_mode")
+            or "direct_resize"
+        ),
+        "has_raw_sample": True,
+        "source": "low_quality_trigger_feature_shard",
+    }
+    if input_image_size is not None:
+        record["input_image_size"] = list(input_image_size)
+    return record
+
+
 def _set_detection_model_eval_mode(model: torch.nn.Module) -> None:
     invalidate_wrapper_predictor(model)
     model.eval()
@@ -2834,6 +2936,42 @@ class CloudContinualLearner:
         os.makedirs(raw_root, exist_ok=True)
         os.makedirs(feature_root, exist_ok=True)
 
+        feature_payload_by_sample: dict[str, object] = {}
+        for shard in list(trigger_manifest.get("feature_shards", []) or []):
+            if not isinstance(shard, Mapping):
+                continue
+            relpath = shard.get("file") or shard.get("path")
+            if not relpath:
+                continue
+            feature_shard_path = os.path.join(
+                bundle_cache_path,
+                str(relpath).replace("/", os.sep),
+            )
+            if not os.path.exists(feature_shard_path):
+                continue
+            try:
+                feature_payload = torch.load(
+                    feature_shard_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[ShardCL][CloudUnpack] skipped unreadable low-quality feature shard {}: {}",
+                    feature_shard_path,
+                    exc,
+                )
+                continue
+            shard_samples = (
+                feature_payload.get("samples", {})
+                if isinstance(feature_payload, Mapping)
+                else {}
+            )
+            if not isinstance(shard_samples, Mapping):
+                continue
+            for sample_id, sample_payload in shard_samples.items():
+                feature_payload_by_sample[str(sample_id)] = sample_payload
+
         samples: list[dict[str, object]] = []
         for shard in list(trigger_manifest.get("raw_shards", []) or []):
             if not isinstance(shard, Mapping):
@@ -2875,17 +3013,55 @@ class CloudContinualLearner:
                     with open(raw_path, "wb") as handle:
                         shutil.copyfileobj(source, handle)
 
+                    frame = cv2.imread(raw_path)
+                    input_image_size = (
+                        [int(frame.shape[0]), int(frame.shape[1])]
+                        if frame is not None and frame.ndim >= 2
+                        else None
+                    )
+                    feature_relpath = None
+                    feature_bytes = 0
+                    feature_payload = feature_payload_by_sample.get(sample_id)
+                    if feature_payload is not None:
+                        feature_record = _trigger_feature_cache_record(
+                            feature_payload,
+                            trigger_manifest,
+                            sample_id,
+                            input_image_size=input_image_size,
+                        )
+                        if feature_record is not None:
+                            feature_relpath = (
+                                f"low_quality_staging/features/{safe_sample_id}.pt"
+                            )
+                            feature_path = os.path.join(
+                                bundle_cache_path,
+                                feature_relpath.replace("/", os.sep),
+                            )
+                            os.makedirs(os.path.dirname(feature_path), exist_ok=True)
+                            torch.save(feature_record, feature_path)
+                            feature_bytes = os.path.getsize(feature_path)
+                        else:
+                            logger.warning(
+                                "[ShardCL][CloudUnpack] low-quality feature payload for sample {} had no tensors; raw rebuild will be used.",
+                                sample_id,
+                            )
+
                     samples.append(
                         {
                             "sample_id": sample_id,
                             "raw_relpath": raw_relpath,
                             "raw_bytes": os.path.getsize(raw_path),
                             "has_raw_sample": True,
-                            "feature_relpath": None,
-                            "feature_bytes": 0,
+                            "feature_relpath": feature_relpath,
+                            "feature_bytes": feature_bytes,
                             "model_id": trigger_manifest.get("model_id", ""),
                             "model_version": trigger_manifest.get("model_version", ""),
                             "front_version": str(trigger_manifest.get("front_version", "0") or "0"),
+                            **(
+                                {"input_image_size": input_image_size}
+                                if input_image_size is not None
+                                else {}
+                            ),
                             "input_tensor_shape": list(
                                 trigger_manifest.get("input_tensor_shape", []) or []
                             ),
@@ -4554,7 +4730,40 @@ class CloudContinualLearner:
                 "input_image_size": input_image_size,
                 "frame_path": frame_path,
             }
-            pending_rebuilds.append({**item, "raw_path": raw_path})
+            feature_relpath = sample.get("feature_relpath")
+            feature_path = (
+                os.path.join(bundle_cache_path, str(feature_relpath).replace("/", os.sep))
+                if feature_relpath
+                else None
+            )
+            if feature_path and os.path.exists(feature_path):
+                record = torch.load(feature_path, map_location="cpu", weights_only=False)
+                if not isinstance(record, dict):
+                    raise TypeError(
+                        f"Low-quality uploaded feature record must be a dict, got {type(record)!r}"
+                    )
+                if input_image_size is not None:
+                    record.setdefault("input_image_size", input_image_size)
+                record.setdefault(
+                    "input_tensor_shape",
+                    list(
+                        manifest.get("input_tensor_shape")
+                        or split_plan.get("input_tensor_shape", [])
+                        or []
+                    ),
+                )
+                record.setdefault(
+                    "input_resize_mode",
+                    str(
+                        manifest.get("input_resize_mode")
+                        or split_plan.get("input_resize_mode")
+                        or "direct_resize"
+                    ),
+                )
+                record.setdefault("has_raw_sample", True)
+                processed_items.append({**item, "record": record})
+            else:
+                pending_rebuilds.append({**item, "raw_path": raw_path})
             all_sample_ids.append(sample_id)
 
         if pending_rebuilds:
@@ -4596,51 +4805,57 @@ class CloudContinualLearner:
             sample_id = str(item["sample_id"])
             frame_path = str(item["frame_path"])
             input_image_size = item.get("input_image_size")
-            record = save_split_feature_cache(
-                cache_path=working_cache,
-                frame_index=sample_id,
-                intermediate=item["intermediate"],
-                extra_metadata={
-                    "split_plan_candidate_id": split_plan.get("candidate_id"),
-                    "split_plan_split_index": split_plan.get("split_index"),
-                    "split_plan_split_label": split_plan.get("split_label"),
-                    "split_plan_boundary_tensor_labels": list(
-                        split_plan.get("boundary_tensor_labels", []) or []
-                    ),
-                    "sample_id": sample_id,
-                    "model_id": str(model_meta.get("model_id", "") or ""),
-                    "model_version": str(model_meta.get("model_version", "") or ""),
-                    "split_config_id": str(
-                        manifest.get("split_config_id")
-                        or split_plan.get("split_config_id")
-                        or ""
-                    ),
-                    "front_version": str(
-                        manifest.get("front_version")
-                        or split_plan.get("front_version")
-                        or "0"
-                    ),
-                    "input_tensor_shape": list(
-                        manifest.get("input_tensor_shape")
-                        or split_plan.get("input_tensor_shape", [])
-                        or []
-                    ),
-                    "input_resize_mode": str(
-                        manifest.get("input_resize_mode")
-                        or split_plan.get("input_resize_mode")
-                        or "direct_resize"
-                    ),
-                    **(
-                        {"input_image_size": input_image_size}
-                        if input_image_size is not None
-                        else {}
-                    ),
-                    "has_raw_sample": True,
-                },
-            )
+            if "record" in item:
+                record = dict(item["record"])
+                feature_path = os.path.join(working_cache, "features", f"{sample_id}.pt")
+                os.makedirs(os.path.dirname(feature_path), exist_ok=True)
+                torch.save(record, feature_path)
+            else:
+                record = save_split_feature_cache(
+                    cache_path=working_cache,
+                    frame_index=sample_id,
+                    intermediate=item["intermediate"],
+                    extra_metadata={
+                        "split_plan_candidate_id": split_plan.get("candidate_id"),
+                        "split_plan_split_index": split_plan.get("split_index"),
+                        "split_plan_split_label": split_plan.get("split_label"),
+                        "split_plan_boundary_tensor_labels": list(
+                            split_plan.get("boundary_tensor_labels", []) or []
+                        ),
+                        "sample_id": sample_id,
+                        "model_id": str(model_meta.get("model_id", "") or ""),
+                        "model_version": str(model_meta.get("model_version", "") or ""),
+                        "split_config_id": str(
+                            manifest.get("split_config_id")
+                            or split_plan.get("split_config_id")
+                            or ""
+                        ),
+                        "front_version": str(
+                            manifest.get("front_version")
+                            or split_plan.get("front_version")
+                            or "0"
+                        ),
+                        "input_tensor_shape": list(
+                            manifest.get("input_tensor_shape")
+                            or split_plan.get("input_tensor_shape", [])
+                            or []
+                        ),
+                        "input_resize_mode": str(
+                            manifest.get("input_resize_mode")
+                            or split_plan.get("input_resize_mode")
+                            or "direct_resize"
+                        ),
+                        **(
+                            {"input_image_size": input_image_size}
+                            if input_image_size is not None
+                            else {}
+                        ),
+                        "has_raw_sample": True,
+                    },
+                )
+                feature_path = os.path.join(working_cache, "features", f"{sample_id}.pt")
             if preloaded_records is not None:
                 preloaded_records[sample_id] = record
-            feature_path = os.path.join(working_cache, "features", f"{sample_id}.pt")
             metadata_samples[sample_id] = {
                 "sample_id": sample_id,
                 "feature_relpath": os.path.relpath(feature_path, working_cache).replace("\\", "/"),

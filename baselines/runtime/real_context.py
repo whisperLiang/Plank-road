@@ -90,6 +90,42 @@ class RealBaselineContext:
         self.upload_event_rows.append(event)
         return upload
 
+    def measure_partitioned_upload(
+        self,
+        samples: list[SampleRecord],
+        *,
+        raw_sample_ids: list[int],
+        feature_sample_ids: list[int],
+        upload_mode: str,
+        method_name: str,
+        device_id: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> UploadRecord:
+        bundle_name = f"{method_name}_edge_{device_id}_update_{len(self.update_event_rows) + 1}"
+        upload = self.upload_meter.measure_partitioned_samples(
+            samples,
+            raw_sample_ids=raw_sample_ids,
+            feature_sample_ids=feature_sample_ids,
+            upload_mode=upload_mode,
+            bundle_name=bundle_name,
+            metadata=metadata,
+        )
+        event = {
+            **self._common_row(method_name=method_name, device_id=device_id),
+            "upload_mode": upload.upload_mode,
+            "num_samples": len(samples),
+            "raw_bytes": upload.raw_bytes,
+            "feature_bytes": upload.feature_bytes,
+            "metadata_bytes": upload.metadata_bytes,
+            "total_upload_bytes": upload.total_upload_bytes,
+            "measured_upload_bytes": upload.total_upload_bytes,
+            "upload_time_sec": upload.upload_time_sec,
+            "upload_serialization_time_sec": upload.serialization_time_sec,
+            "bundle_path": upload.bundle_path,
+        }
+        self.upload_event_rows.append(event)
+        return upload
+
     def schedule_cloud_training(
         self,
         *,

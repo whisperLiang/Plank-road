@@ -145,38 +145,90 @@ class PlankRoadMultiDevice(BaseMethod):
                 reason="Manual Plank-road update plan without cached decision.",
             )
         stats = self._pending_stats.get(device_id, self._build_pending_stats(device_id))
-        feature_ready = all(sample.feature_tensor_path for sample in samples)
-        if (
-            self.enable_feature_upload
-            and self.allow_feature_upload
+        low_quality_samples = [sample for sample in samples if self._is_low_quality_sample(sample)]
+        high_quality_samples = [
+            sample for sample in samples if not self._is_low_quality_sample(sample)
+        ]
+        high_quality_features_ready = all(
+            sample.feature_tensor_path for sample in high_quality_samples
+        )
+        use_mixed_upload = (
+            self.enable_split_tail_training
             and self.enable_feature_cache
-            and feature_ready
-            and decision.send_low_conf_features
-        ):
-            upload_mode = "raw+feature"
+            and high_quality_features_ready
+        )
+        send_low_quality_features = (
+            use_mixed_upload
+            and self.enable_feature_upload
+            and self.allow_feature_upload
+            and bool(decision.send_low_conf_features)
+        )
+        upload_mode = "raw+feature" if send_low_quality_features else "raw_only"
+        low_quality_sample_ids = [sample.sample_id for sample in low_quality_samples]
+        high_quality_sample_ids = [sample.sample_id for sample in high_quality_samples]
+        uploaded_feature_sample_ids: list[int] = []
+        if use_mixed_upload:
+            raw_sample_ids = list(low_quality_sample_ids)
+            uploaded_feature_sample_ids.extend(high_quality_sample_ids)
+            if send_low_quality_features:
+                uploaded_feature_sample_ids.extend(
+                    sample.sample_id
+                    for sample in low_quality_samples
+                    if sample.feature_tensor_path
+                )
+            upload = context.measure_partitioned_upload(
+                samples,
+                raw_sample_ids=raw_sample_ids,
+                feature_sample_ids=uploaded_feature_sample_ids,
+                upload_mode=upload_mode,
+                method_name=self.method_name,
+                device_id=device_id,
+                metadata={
+                    "selected_by": "resource_aware_trigger",
+                    "high_quality_upload_mode": "feature_only",
+                    "low_quality_upload_mode": upload_mode,
+                    "high_quality_sample_ids": high_quality_sample_ids,
+                    "low_quality_sample_ids": low_quality_sample_ids,
+                    "uploaded_feature_sample_ids": uploaded_feature_sample_ids,
+                    "trigger_decision": {
+                        "send_low_conf_features": decision.send_low_conf_features,
+                        "urgency": decision.urgency,
+                        "compute_pressure": decision.compute_pressure,
+                        "bandwidth_pressure": decision.bandwidth_pressure,
+                        "bandwidth_mbps": decision.bandwidth_mbps,
+                        "reason": decision.reason,
+                        "action_scores": decision.action_scores,
+                    },
+                },
+            )
         else:
             upload_mode = "raw_only"
-        upload = context.measure_upload(
-            samples,
-            upload_mode=upload_mode,
-            method_name=self.method_name,
-            device_id=device_id,
-            metadata={
-                "selected_by": "resource_aware_trigger",
-                "trigger_decision": {
-                    "send_low_conf_features": decision.send_low_conf_features,
-                    "urgency": decision.urgency,
-                    "compute_pressure": decision.compute_pressure,
-                    "bandwidth_pressure": decision.bandwidth_pressure,
-                    "bandwidth_mbps": decision.bandwidth_mbps,
-                    "reason": decision.reason,
-                    "action_scores": decision.action_scores,
+            upload = context.measure_upload(
+                samples,
+                upload_mode=upload_mode,
+                method_name=self.method_name,
+                device_id=device_id,
+                metadata={
+                    "selected_by": "resource_aware_trigger",
+                    "high_quality_upload_mode": "raw_only_legacy",
+                    "low_quality_upload_mode": "raw_only",
+                    "high_quality_sample_ids": high_quality_sample_ids,
+                    "low_quality_sample_ids": low_quality_sample_ids,
+                    "uploaded_feature_sample_ids": [],
+                    "trigger_decision": {
+                        "send_low_conf_features": decision.send_low_conf_features,
+                        "urgency": decision.urgency,
+                        "compute_pressure": decision.compute_pressure,
+                        "bandwidth_pressure": decision.bandwidth_pressure,
+                        "bandwidth_mbps": decision.bandwidth_mbps,
+                        "reason": decision.reason,
+                        "action_scores": decision.action_scores,
+                    },
                 },
-            },
-        )
+            )
         reason = (
             "resource_aware_raw_plus_feature"
-            if decision.send_low_conf_features
+            if send_low_quality_features
             else "resource_aware_raw_only"
         )
         if stats.drift_detected:
@@ -200,7 +252,10 @@ class PlankRoadMultiDevice(BaseMethod):
             measured_upload_bytes=upload.total_upload_bytes,
             update_config={
                 "train_mode": "split_tail" if self.enable_split_tail_training else "raw_full",
-                "use_uploaded_features": upload.feature_bytes > 0,
+                "use_uploaded_features": bool(uploaded_feature_sample_ids),
+                "uploaded_feature_sample_ids": uploaded_feature_sample_ids,
+                "low_quality_sample_ids": low_quality_sample_ids,
+                "high_quality_sample_ids": high_quality_sample_ids,
             },
             is_real=True,
             is_central=True,
@@ -213,6 +268,13 @@ class PlankRoadMultiDevice(BaseMethod):
                 "trigger_compute_pressure": decision.compute_pressure,
                 "trigger_bandwidth_pressure": decision.bandwidth_pressure,
                 "send_low_conf_features": decision.send_low_conf_features,
+                "high_quality_upload_mode": (
+                    "feature_only" if use_mixed_upload else "raw_only_legacy"
+                ),
+                "low_quality_upload_mode": upload_mode,
+                "uploaded_feature_sample_ids": uploaded_feature_sample_ids,
+                "low_quality_sample_ids": low_quality_sample_ids,
+                "high_quality_sample_ids": high_quality_sample_ids,
                 "pending_low_quality_count": stats.low_quality_count,
                 "pending_low_quality_rate": stats.low_quality_rate,
                 "pending_uncovered_evidence_rate": stats.uncovered_evidence_rate,
@@ -234,9 +296,20 @@ class PlankRoadMultiDevice(BaseMethod):
         pre_update_state = self._snapshot_device_model_state(plan.device_id)
         training_samples = samples
         try:
-            if not bool(plan.update_config.get("use_uploaded_features", False)):
-                training_samples = [replace(sample, feature_tensor_path=None) for sample in samples]
             if self.enable_split_tail_training:
+                uploaded_feature_ids = {
+                    int(sample_id)
+                    for sample_id in plan.update_config.get(
+                        "uploaded_feature_sample_ids",
+                        [],
+                    )
+                }
+                training_samples = [
+                    sample
+                    if int(sample.sample_id) in uploaded_feature_ids
+                    else replace(sample, feature_tensor_path=None)
+                    for sample in samples
+                ]
                 report = context.get_trainer(plan.device_id).train_split_tail(training_samples)
             else:
                 report = context.get_trainer(plan.device_id).train_raw_frames(

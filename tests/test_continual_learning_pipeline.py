@@ -3411,3 +3411,68 @@ def test_cloud_materialized_low_quality_trigger_keeps_edge_metadata_out_of_stagi
         assert "pseudo_labels" not in record
     finally:
         os.remove(zip_path)
+
+
+def test_cloud_uses_uploaded_low_quality_trigger_features_without_rebuild(
+    tmp_path,
+    sample_bgr_frame,
+    monkeypatch,
+):
+    from cloud_server import CloudContinualLearner
+
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    _store_low_quality_for_shard(
+        store,
+        sample_id="low-feature-uploaded",
+        frame_index=1,
+        plan=plan,
+        frame=sample_bgr_frame[:16, :16].copy(),
+    )
+    zip_path, _manifest, _stats = pack_low_quality_trigger_bundle_to_file(
+        store,
+        edge_id=1,
+        send_low_conf_features=True,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="1",
+        shard_size=64,
+        output_dir=str(tmp_path),
+    )
+    bundle_root = tmp_path / "trigger-feature"
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(bundle_root)
+        learner = CloudContinualLearner(
+            config=SimpleNamespace(
+                edge_model_name="rfdetr_nano",
+                continual_learning=SimpleNamespace(batch_size=16),
+                das=SimpleNamespace(enabled=False),
+                workspace_root=str(tmp_path),
+            ),
+            large_object_detection=SimpleNamespace(),
+        )
+        materialized = learner._materialize_low_quality_trigger_bundle(str(bundle_root))
+        sample = materialized["samples"][0]
+        assert sample["feature_relpath"] is not None
+        assert sample["feature_bytes"] > 0
+
+        def fail_rebuild_provider(*args, **kwargs):
+            raise AssertionError("uploaded low-quality features should not be rebuilt")
+
+        monkeypatch.setattr(learner, "_bundle_batch_feature_provider", fail_rebuild_provider)
+        cache_root = tmp_path / "prepared-feature"
+        learner._prepare_low_quality_trigger_training_cache(
+            torch.nn.Identity(),
+            materialized,
+            bundle_cache_path=str(bundle_root),
+            working_cache=str(cache_root),
+            splitter=None,
+            candidate=None,
+        )
+        record = load_split_feature_cache(str(cache_root), "low-feature-uploaded")
+        assert record["source"] == "low_quality_trigger_feature_shard"
+        assert record["has_raw_sample"] is True
+        assert "intermediate" in record
+    finally:
+        os.remove(zip_path)

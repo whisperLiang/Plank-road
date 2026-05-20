@@ -113,6 +113,113 @@ class UploadMeter:
             metadata=sample_metadata,
         )
 
+    def measure_partitioned_samples(
+        self,
+        samples: list[SampleRecord],
+        *,
+        raw_sample_ids: Iterable[int],
+        feature_sample_ids: Iterable[int],
+        upload_mode: str,
+        bundle_name: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> UploadRecord:
+        """Measure a mixed raw/feature payload without changing upload_mode names.
+
+        Plank-road uses this for its split-tail path: high-quality samples can
+        contribute only cached features, while low-quality samples contribute
+        raw frames and optionally features.  The caller still labels the
+        low-quality policy as ``raw_only`` or ``raw+feature`` for compatibility.
+        """
+        by_id = {int(sample.sample_id): sample for sample in samples}
+        raw_ids = [int(sample_id) for sample_id in raw_sample_ids]
+        feature_ids = [int(sample_id) for sample_id in feature_sample_ids]
+        raw_id_set = set(raw_ids)
+        feature_id_set = set(feature_ids)
+        missing_raw = [sample_id for sample_id in raw_ids if sample_id not in by_id]
+        missing_feature = [sample_id for sample_id in feature_ids if sample_id not in by_id]
+        if missing_raw or missing_feature:
+            raise KeyError(
+                "Partitioned upload sample ids are not present in samples: "
+                f"raw={missing_raw}, feature={missing_feature}"
+            )
+
+        raw_paths = [by_id[sample_id].frame_path for sample_id in raw_ids]
+        feature_paths = []
+        missing_feature_paths = []
+        for sample_id in feature_ids:
+            feature_path = by_id[sample_id].feature_tensor_path
+            if not feature_path:
+                missing_feature_paths.append(sample_id)
+                continue
+            feature_paths.append(feature_path)
+        if missing_feature_paths:
+            raise FileNotFoundError(
+                "Partitioned upload requires cached feature tensors for "
+                f"sample_ids={missing_feature_paths}"
+            )
+
+        sample_metadata = {
+            "samples": [
+                {
+                    "sample_id": sample.sample_id,
+                    "device_id": sample.device_id,
+                    "frame_index": sample.frame_index,
+                    "metric_f1": sample.metric_f1,
+                    "metric_map50": sample.metric_map50,
+                    "upload_parts": {
+                        "raw": int(sample.sample_id) in raw_id_set,
+                        "feature": int(sample.sample_id) in feature_id_set,
+                    },
+                }
+                for sample in samples
+            ],
+        }
+        if metadata:
+            sample_metadata.update(metadata)
+        return self.measure_partitioned_paths(
+            raw_paths=raw_paths,
+            feature_paths=feature_paths,
+            upload_mode=upload_mode,
+            bundle_name=bundle_name,
+            metadata=sample_metadata,
+        )
+
+    def measure_partitioned_paths(
+        self,
+        *,
+        raw_paths: Iterable[str | Path] = (),
+        feature_paths: Iterable[str | Path] = (),
+        upload_mode: str,
+        bundle_name: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> UploadRecord:
+        bundle = self.bundle_root / bundle_name
+        if bundle.exists():
+            shutil.rmtree(bundle)
+        bundle.mkdir(parents=True, exist_ok=True)
+
+        start = time.perf_counter()
+        self._copy_many(raw_paths, bundle / "raw")
+        self._copy_many(feature_paths, bundle / "features")
+        self._write_metadata(bundle, metadata)
+        elapsed = time.perf_counter() - start
+
+        raw_bytes = _directory_size(bundle / "raw") if (bundle / "raw").exists() else 0
+        feature_bytes = _directory_size(bundle / "features") if (bundle / "features").exists() else 0
+        metadata_path = bundle / "metadata.json"
+        metadata_bytes = metadata_path.stat().st_size if metadata_path.exists() else 0
+        total = _directory_size(bundle)
+        return UploadRecord(
+            upload_mode=upload_mode,
+            bytes=total,
+            serialization_time_sec=elapsed,
+            bundle_path=str(bundle),
+            raw_bytes=raw_bytes,
+            feature_bytes=feature_bytes,
+            metadata_bytes=metadata_bytes,
+            upload_time_sec=self.bandwidth_emulator.upload_time_sec(total),
+        )
+
     def measure_paths(
         self,
         *,
