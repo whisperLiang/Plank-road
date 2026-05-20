@@ -23,6 +23,17 @@ def test_plank_road_records_split_tail_metrics(tmp_path: Path):
 
     assert method.should_trigger(0)
     plan = method.build_update_plan(0)
+    method.on_inference_result(
+        InferenceResult(
+            device_id=0,
+            frame_index=2,
+            confidence=0.0,
+            metric_f1=0.0,
+            in_drift_window=True,
+            is_real=True,
+        )
+    )
+    assert not method.should_trigger(0)
     method.execute_update(plan)
     event = context.update_event_rows[-1]
 

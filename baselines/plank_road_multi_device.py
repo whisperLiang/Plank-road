@@ -170,6 +170,7 @@ class PlankRoadMultiDevice(BaseMethod):
             upload_mode=upload_mode,
             selected_by=reason,
         )
+        self._triggered[device_id] = True
         return UpdatePlan(
             device_id=device_id,
             trigger_reason=reason,
