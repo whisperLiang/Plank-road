@@ -8,6 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from baselines.base_method import BaseMethod, InferenceResult, UpdatePlan
 from edge.resource_aware_trigger import (
     CloudResourceState,
@@ -46,6 +48,9 @@ class PlankRoadMultiDevice(BaseMethod):
         self._pending_stats: dict[int, PendingTrainingStats] = {}
         self._resource_triggers: dict[int, ResourceAwareCLTrigger] = {}
         self._triggered: dict[int, bool] = defaultdict(bool)
+        self._latest_stream_time_sec: dict[int, float] = defaultdict(float)
+        self._inflight_until_sec: dict[int, float] = defaultdict(float)
+        self._deferred_checkpoints: dict[int, tuple[str, float]] = {}
         self._model_versions: dict[int, int] = defaultdict(int)
         self._update_queue: deque[UpdatePlan] = deque()
         self._server_available_at = 0.0
@@ -66,16 +71,27 @@ class PlankRoadMultiDevice(BaseMethod):
             metric_f1=result.metric_f1,
             metric_map50=result.metric_map50,
         )
+        current_sample = None
+        if self.context is not None:
+            current_sample = self._current_sample_for_result(result)
+            if current_sample is not None:
+                self.advance_stream_time(result.device_id, current_sample.timestamp)
+            else:
+                self.advance_stream_time(result.device_id, float(result.frame_index))
+        else:
+            self.advance_stream_time(result.device_id, float(result.frame_index))
+        if self._triggered[result.device_id] or self._is_device_busy(result.device_id):
+            return
         self._sample_counts[result.device_id] += 1
         self._latest_results[result.device_id].append(result)
-        if self.context is not None:
-            samples = self.context.sample_store.get_recent_samples(result.device_id, 1)
-            if samples:
-                self._pending_sample_ids[result.device_id].append(samples[-1].sample_id)
+        if current_sample is not None:
+            self._pending_sample_ids[result.device_id].append(current_sample.sample_id)
         if result.in_drift_window:
             self._drift_counts[result.device_id] += 1
 
     def should_trigger(self, device_id: int) -> bool:
+        if self._is_device_busy(device_id):
+            return False
         if self._triggered[device_id]:
             return False
         if device_id in self._pending_decisions:
@@ -215,21 +231,24 @@ class PlankRoadMultiDevice(BaseMethod):
         )
 
         arrival_time = float(plan.metadata.get("arrival_time_sec", time.perf_counter()))
+        pre_update_state = self._snapshot_device_model_state(plan.device_id)
         training_samples = samples
-        if not bool(plan.update_config.get("use_uploaded_features", False)):
-            training_samples = [replace(sample, feature_tensor_path=None) for sample in samples]
-        if self.enable_split_tail_training:
-            report = context.get_trainer(plan.device_id).train_split_tail(training_samples)
-        else:
-            report = context.get_trainer(plan.device_id).train_raw_frames(
-                training_samples,
-                trainable_scope="full",
+        try:
+            if not bool(plan.update_config.get("use_uploaded_features", False)):
+                training_samples = [replace(sample, feature_tensor_path=None) for sample in samples]
+            if self.enable_split_tail_training:
+                report = context.get_trainer(plan.device_id).train_split_tail(training_samples)
+            else:
+                report = context.get_trainer(plan.device_id).train_raw_frames(
+                    training_samples,
+                    trainable_scope="full",
+                )
+            checkpoint_load_time = self._measure_checkpoint_load_time(
+                plan.device_id,
+                report.checkpoint_path,
             )
-        checkpoint_load_time = context.load_checkpoint_for_device(
-            self.method_name,
-            plan.device_id,
-            report.checkpoint_path,
-        )
+        finally:
+            self._restore_device_model_state(plan.device_id, pre_update_state)
 
         upload_bytes = int(plan.measured_upload_bytes or 0)
         upload_time = float(plan.metadata.get("upload_time_sec", 0.0))
@@ -240,6 +259,14 @@ class PlankRoadMultiDevice(BaseMethod):
             ready_time_sec=arrival_time + upload_time + label_time,
             train_duration_sec=report.training_time_sec + report.model_update_time_sec,
         )
+        self._inflight_until_sec[plan.device_id] = (
+            queue_record.finish_time_sec + checkpoint_load_time
+        )
+        self._deferred_checkpoints[plan.device_id] = (
+            report.checkpoint_path,
+            self._inflight_until_sec[plan.device_id],
+        )
+        self._apply_deferred_checkpoint_if_ready(plan.device_id)
         queue_wait = queue_record.queue_wait_sec
         recovery_time = (
             upload_time
@@ -400,6 +427,70 @@ class PlankRoadMultiDevice(BaseMethod):
         if context is not None and context.bandwidth_mbps not in (None, ""):
             return float(context.bandwidth_mbps)
         return float(getattr(self.experiment_config, "bandwidth_mbps", 0.0) or 0.0)
+
+    def advance_stream_time(self, device_id: int, timestamp_sec: float) -> None:
+        self._latest_stream_time_sec[int(device_id)] = float(timestamp_sec)
+        self._apply_deferred_checkpoint_if_ready(int(device_id))
+
+    def _current_sample_for_result(self, result: InferenceResult) -> Any | None:
+        context = self.context
+        if context is None:
+            return None
+        device_samples = context.sample_store.get_device_samples(result.device_id)
+        for sample in reversed(device_samples):
+            if int(sample.frame_index) != int(result.frame_index):
+                continue
+            if result.frame_path and str(sample.frame_path) != str(result.frame_path):
+                continue
+            return sample
+        recent = context.sample_store.get_recent_samples(result.device_id, 1)
+        return recent[-1] if recent else None
+
+    def _is_device_busy(self, device_id: int) -> bool:
+        return (
+            float(self._latest_stream_time_sec.get(device_id, 0.0))
+            < float(self._inflight_until_sec.get(device_id, 0.0))
+        )
+
+    def _apply_deferred_checkpoint_if_ready(self, device_id: int) -> None:
+        deferred = self._deferred_checkpoints.get(int(device_id))
+        if deferred is None:
+            return
+        checkpoint_path, apply_time_sec = deferred
+        if float(self._latest_stream_time_sec.get(device_id, 0.0)) < float(apply_time_sec):
+            return
+        context = self._require_context()
+        context.load_checkpoint_for_device(
+            self.method_name,
+            int(device_id),
+            checkpoint_path,
+        )
+        self._deferred_checkpoints.pop(int(device_id), None)
+
+    def _snapshot_device_model_state(self, device_id: int) -> dict[str, torch.Tensor]:
+        context = self._require_context()
+        model = context.get_student_inferencer(device_id).model
+        return {
+            key: value.detach().clone()
+            for key, value in model.state_dict().items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    def _restore_device_model_state(
+        self,
+        device_id: int,
+        state: dict[str, torch.Tensor],
+    ) -> None:
+        context = self._require_context()
+        inferencer = context.get_student_inferencer(device_id)
+        inferencer.model.load_state_dict(state, strict=False)
+        inferencer.model.to(inferencer.device)
+        inferencer.model.eval()
+        inferencer._feature_splitter = None
+
+    def _measure_checkpoint_load_time(self, device_id: int, checkpoint_path: str) -> float:
+        context = self._require_context()
+        return context.get_student_inferencer(device_id).load_checkpoint(checkpoint_path)
 
     def _is_low_quality_sample(self, sample: Any) -> bool:
         if bool(getattr(sample, "in_drift_window", False)):

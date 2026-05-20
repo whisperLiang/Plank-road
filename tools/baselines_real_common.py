@@ -480,6 +480,9 @@ def run_one_method(
             if frame_pos >= len(frames):
                 continue
             frame = frames[frame_pos]
+            advance_stream_time = getattr(method, "advance_stream_time", None)
+            if callable(advance_stream_time):
+                advance_stream_time(frame.device_id, frame.timestamp)
             student = context.get_student_inferencer(frame.device_id).infer(
                 frame.frame_path,
                 device_id=frame.device_id,
