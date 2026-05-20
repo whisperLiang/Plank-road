@@ -68,6 +68,43 @@ def test_run_baselines_real_smoke(tmp_path: Path):
     )
 
 
+def test_run_baselines_real_ekya_smoke(tmp_path: Path):
+    frame_dir = make_frame_dir(tmp_path, count=32)
+    label_dir = make_label_dir(frame_dir)
+    results_dir = tmp_path / "ekya_results"
+    cmd = [
+        sys.executable,
+        "tools/run_baselines_real.py",
+        "--video",
+        str(frame_dir),
+        "--methods",
+        "ekya_style_centralized_scheduling",
+        "--student-model",
+        "yolo26",
+        "--teacher-model",
+        str(label_dir),
+        "--window-frames",
+        "4",
+        "--total-frames",
+        "32",
+        "--epochs",
+        "1",
+        "--batch-size",
+        "2",
+        "--device",
+        "cpu",
+        "--results-dir",
+        str(results_dir),
+        "--reuse-teacher-cache",
+        "--quick-smoke",
+    ]
+    subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True)
+
+    summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["method_name"] == "ekya_style_centralized_scheduling"
+    assert summary["total_frames"] == 32
+
+
 def test_teacher_cache_is_namespaced_by_teacher_source(tmp_path: Path):
     frame_dir = make_frame_dir(tmp_path, count=1)
     frame_path = next(frame_dir.glob("*.jpg"))

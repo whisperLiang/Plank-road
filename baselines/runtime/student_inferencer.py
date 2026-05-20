@@ -83,7 +83,10 @@ class StudentInferencer:
             raise FileNotFoundError(f"Unable to read frame image: {frame_path}")
         tensor = self._bgr_to_detection_tensor(frame)
         start = time.perf_counter()
-        with torch.inference_mode():
+        # The same model instance is later reused for training/split tracing.
+        # no_grad avoids autograd work without leaving inference-mode tensors in
+        # Ultralytics head caches that a later backward-capable forward may reuse.
+        with torch.no_grad():
             outputs = self.model([tensor])
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -138,7 +141,7 @@ class StudentInferencer:
                 f"Split feature caching for {type(self.model).__name__} requires tensor runtime input"
             )
         splitter = self._ensure_feature_splitter(sample_input)
-        with torch.inference_mode():
+        with torch.no_grad():
             boundary = splitter.run_prefix(sample_input)
         cache_root = self.feature_cache_dir / f"edge_{int(device_id)}"
         save_split_feature_cache(

@@ -560,7 +560,9 @@ class RealTrainer:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).float()
         tensor = tensor.div_(255.0).to(self.device)
-        with torch.inference_mode():
+        # Keep evaluation cheap while preserving tensors that can coexist with
+        # later autograd-enabled tracing/training on the same detector instance.
+        with torch.no_grad():
             outputs = model([tensor])
         predictions = self._detection_outputs_to_json(outputs)
         with Path(sample.label_path).open("r", encoding="utf-8") as f:
