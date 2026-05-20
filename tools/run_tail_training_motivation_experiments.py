@@ -7,8 +7,9 @@ All modes implement fixed-prefix tail training:
   ``torch.no_grad`` when the mode uses an explicit prefix pass);
 * the suffix segment is the only trainable part, with trainable parameters
   resolved from the Ariadne runtime (``runtime.candidate.suffix_nodes``);
-* ``raw_freeze`` runs the original unsplit model forward/backward with the
-  prefix parameters frozen and the same suffix parameters trainable;
+* ``raw_freeze`` runs the original unsplit model forward/backward in eval
+  module state, with the prefix parameters frozen and the same suffix
+  parameters trainable;
 * ``freeze``, ``split_rebuild`` and ``split_cached`` train **the same** set of
   suffix parameters, with the same optimizer configuration, using Ariadne
   ``run_prefix``/``train_suffix`` code paths;
@@ -993,6 +994,22 @@ def _configure_fixed_prefix_training(
     return suffix_names, suffix_params
 
 
+def _configure_raw_freeze_eval_forward_training(
+    split_model: torch.nn.Module,
+    runtime: Any,
+) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
+    """Configure raw_freeze to match Ariadne replay semantics.
+
+    The raw baseline should measure the cost of a full unsplit forward/backward,
+    not a different RF-DETR training-mode objective. We therefore keep every
+    module in ``eval`` state while leaving the exact Ariadne suffix parameters
+    trainable.
+    """
+    suffix_names, suffix_params = _configure_fixed_prefix_training(split_model, runtime)
+    split_model.eval()
+    return suffix_names, suffix_params
+
+
 def _collect_frozen_batchnorm_stats(
     model: torch.nn.Module,
     runtime: Any | None = None,
@@ -1329,14 +1346,15 @@ def _preflight_equivalence_check(
 
     # The eval-mode forward check above catches replay drift, but it does not
     # prove that raw_freeze and Ariadne freeze will apply the same suffix update.
-    # Probe one training-mode backward pass without stepping the optimizer.
+    # Probe one backward pass on the raw eval-forward path without stepping the
+    # optimizer.
     train_full_loss_value: float | None = None
     train_split_loss_value: float | None = None
     suffix_gradient_max_diff: float | None = None
     named_parameters = dict(split_model.named_parameters())
     can_probe_gradients = all(name in named_parameters for name in split_trainable_names)
     if can_probe_gradients:
-        _configure_fixed_prefix_training(split_model, runtime)
+        _configure_raw_freeze_eval_forward_training(split_model, runtime)
         rng_devices = _cuda_rng_devices(device)
         _zero_model_gradients(split_model)
         try:
@@ -1374,7 +1392,7 @@ def _preflight_equivalence_check(
         train_loss_diff = abs(train_full_loss_value - train_split_loss_value)
         if train_loss_diff > float(loss_tolerance):
             raise RuntimeError(
-                "Preflight training-mode raw vs split loss mismatch: "
+                "Preflight raw eval-forward vs split loss mismatch: "
                 f"raw={train_full_loss_value}; split={train_split_loss_value}; "
                 f"diff={train_loss_diff}; tolerance={loss_tolerance}; "
                 f"percent={choice.boundary!r}; split_id={runtime_split_id!r}."
@@ -1884,6 +1902,7 @@ def plot_split_time_accuracy_subplots(
 def _run_raw_freeze_mode(
     *,
     split_model: torch.nn.Module,
+    runtime: Any,
     edge_model: torch.nn.Module,
     frames_by_id: Mapping[int, np.ndarray],
     sample_ids: list[int],
@@ -1894,7 +1913,8 @@ def _run_raw_freeze_mode(
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
 ) -> dict[str, Any]:
-    """Raw full-model training with the prefix frozen and suffix trainable."""
+    """Raw full-model eval-forward training with only the suffix trainable."""
+    _configure_raw_freeze_eval_forward_training(split_model, runtime)
     resize_mode = get_split_runtime_input_resize_mode(edge_model)
     epoch_times: list[float] = []
     batch_times: list[float] = []
@@ -2255,11 +2275,15 @@ def _run_one_experiment(
         device=device,
         batch_size=batch_size,
     )
-    _configure_fixed_prefix_training(split_model, runtime)
+    if mode == "raw_freeze":
+        _configure_raw_freeze_eval_forward_training(split_model, runtime)
+    else:
+        _configure_fixed_prefix_training(split_model, runtime)
 
     if mode == "raw_freeze":
         train_metrics = _run_raw_freeze_mode(
             split_model=split_model,
+            runtime=runtime,
             edge_model=edge_model,
             frames_by_id=frames_by_id,
             sample_ids=sampled_frame_indices,

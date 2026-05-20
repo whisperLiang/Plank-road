@@ -577,10 +577,33 @@ def test_configure_fixed_prefix_training_trains_full_suffix_segment():
     assert model[1][1].training is True
 
 
+def test_configure_raw_freeze_eval_forward_training_keeps_suffix_eval_but_trainable():
+    runtime = _FakeRuntime()
+    model = runtime.root
+    model.train()
+    for parameter in model.parameters():
+        parameter.requires_grad_(True)
+
+    suffix_names, suffix_params = experiments._configure_raw_freeze_eval_forward_training(
+        model, runtime
+    )
+
+    assert set(suffix_names) == {"1.weight", "1.bias"}
+    assert model.training is False
+    assert model[0].training is False
+    assert model[1].training is False
+    for parameter in model[0].parameters():
+        assert parameter.requires_grad is False
+    assert suffix_params
+    for parameter in suffix_params:
+        assert parameter.requires_grad is True
+
+
 def test_raw_freeze_mode_runs_full_forward_backward_but_updates_only_suffix(monkeypatch):
     runtime = _FakeRuntime()
     model = runtime.root
     experiments._configure_fixed_prefix_training(model, runtime)
+    model.train()
 
     prefix_before = {
         name: parameter.detach().clone()
@@ -604,6 +627,7 @@ def test_raw_freeze_mode_runs_full_forward_backward_but_updates_only_suffix(monk
 
     metrics = experiments._run_raw_freeze_mode(
         split_model=model,
+        runtime=runtime,
         edge_model=model,
         frames_by_id={},
         sample_ids=[1, 2],
@@ -618,6 +642,9 @@ def test_raw_freeze_mode_runs_full_forward_backward_but_updates_only_suffix(monk
     for name, parameter in model[0].named_parameters():
         assert torch.equal(parameter.detach(), prefix_before[name])
         assert parameter.grad is None
+    assert model.training is False
+    assert model[0].training is False
+    assert model[1].training is False
     assert not torch.equal(model[1].bias.detach(), suffix_bias_before)
     assert metrics["feature_rebuild_time_sec"] == pytest.approx(0.0)
     assert metrics["final_loss"] is not None
