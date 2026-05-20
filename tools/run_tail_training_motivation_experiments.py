@@ -2235,9 +2235,9 @@ def main(argv: list[str] | None = None) -> int:
     results_path = output_root / "results.jsonl"
     summary_path = output_root / "summary.csv"
     aggregate_summary_path = output_root / "aggregate_summary.csv"
-    for path in (results_path, summary_path, aggregate_summary_path):
-        if path.exists():
-            path.unlink()
+    # for path in (results_path, summary_path, aggregate_summary_path):
+    #     if path.exists():
+    #         path.unlink()
 
     device = torch.device(str(args.device))
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -2436,6 +2436,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     rows: list[dict[str, Any]] = []
+    if results_path.exists():
+        import json
+        with results_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    rows.append(json.loads(line))
+
     for repeat_id in range(repeat):
         run_seed = int(args.seed) + repeat_id
         for choice in choices:
