@@ -151,6 +151,9 @@ class PreflightReport:
     split_loss: float
     full_output_max_diff: float
     tolerance: float
+    train_full_loss: float | None = None
+    train_split_loss: float | None = None
+    suffix_gradient_max_diff: float | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +197,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dynamic-batch-max", type=int, default=64)
     parser.add_argument("--output-root", default="./tmp/tail_training_motivation")
+    parser.add_argument(
+        "--append-results",
+        action="store_true",
+        help=(
+            "Append raw JSONL rows instead of clearing result files at startup. "
+            "Summary CSVs are still written from the current process rows."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
@@ -1171,6 +1182,53 @@ def _max_abs_output_diff(expected: Any, actual: Any) -> float:
     return float(max_diff)
 
 
+def _zero_model_gradients(model: torch.nn.Module) -> None:
+    for parameter in model.parameters():
+        parameter.grad = None
+
+
+def _cuda_rng_devices(device: torch.device) -> list[int]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return []
+    if device.index is not None:
+        return [int(device.index)]
+    return [torch.cuda.current_device()]
+
+
+def _suffix_gradients_by_name(
+    model: torch.nn.Module,
+    suffix_names: tuple[str, ...],
+) -> dict[str, torch.Tensor | None]:
+    named_parameters = dict(model.named_parameters())
+    gradients: dict[str, torch.Tensor | None] = {}
+    for name in suffix_names:
+        parameter = named_parameters.get(name)
+        gradient = None if parameter is None else parameter.grad
+        gradients[name] = None if gradient is None else gradient.detach().float().cpu().clone()
+    return gradients
+
+
+def _max_suffix_gradient_diff(
+    full_grads: Mapping[str, torch.Tensor | None],
+    split_grads: Mapping[str, torch.Tensor | None],
+) -> float:
+    max_diff = 0.0
+    for name in sorted(set(full_grads) | set(split_grads)):
+        full_grad = full_grads.get(name)
+        split_grad = split_grads.get(name)
+        if full_grad is None and split_grad is None:
+            continue
+        if full_grad is None or split_grad is None:
+            return float("inf")
+        if tuple(full_grad.shape) != tuple(split_grad.shape):
+            return float("inf")
+        if full_grad.numel() == 0:
+            continue
+        diff = (full_grad - split_grad).abs().max()
+        max_diff = max(max_diff, float(diff.item()))
+    return float(max_diff)
+
+
 def _preflight_equivalence_check(
     *,
     runtime: Any,
@@ -1190,6 +1248,7 @@ def _preflight_equivalence_check(
     runtime_graph_signature: str,
     loss_tolerance: float = 5e-2,
     output_tolerance: float = 1e-1,
+    gradient_tolerance: float = 1e-5,
 ) -> PreflightReport:
     """Fail loudly if freeze / split paths are not equivalent on one batch."""
     if freeze_trainable_names != split_trainable_names:
@@ -1268,6 +1327,71 @@ def _preflight_equivalence_check(
             f"percent={choice.boundary!r}; split_id={runtime_split_id!r}."
         )
 
+    # The eval-mode forward check above catches replay drift, but it does not
+    # prove that raw_freeze and Ariadne freeze will apply the same suffix update.
+    # Probe one training-mode backward pass without stepping the optimizer.
+    train_full_loss_value: float | None = None
+    train_split_loss_value: float | None = None
+    suffix_gradient_max_diff: float | None = None
+    named_parameters = dict(split_model.named_parameters())
+    can_probe_gradients = all(name in named_parameters for name in split_trainable_names)
+    if can_probe_gradients:
+        _configure_fixed_prefix_training(split_model, runtime)
+        rng_devices = _cuda_rng_devices(device)
+        _zero_model_gradients(split_model)
+        try:
+            with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                train_full_output = split_model(inputs)
+                train_full_loss_tensor = loss_fn(train_full_output, copy.deepcopy(targets))
+                if not isinstance(train_full_loss_tensor, torch.Tensor):
+                    raise RuntimeError(
+                        "Preflight raw full-path loss_fn returned "
+                        f"{type(train_full_loss_tensor)!r}, not a tensor."
+                    )
+                if not train_full_loss_tensor.requires_grad:
+                    raise RuntimeError("Preflight raw full-path loss does not require gradients.")
+                train_full_loss_tensor.backward()
+            full_grads = _suffix_gradients_by_name(split_model, tuple(split_trainable_names))
+
+            _zero_model_gradients(split_model)
+            _configure_fixed_prefix_training(split_model, runtime)
+            with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                with torch.no_grad():
+                    train_boundary = runtime.run_prefix(inputs)
+                train_split_loss_tensor, _split_boundary_grads = runtime.train_suffix(
+                    _contiguous_boundary_payload(train_boundary),
+                    copy.deepcopy(targets),
+                    loss_fn=loss_fn,
+                    optimizer=None,
+                )
+            split_grads = _suffix_gradients_by_name(split_model, tuple(split_trainable_names))
+        finally:
+            _zero_model_gradients(split_model)
+            _configure_fixed_prefix_training(split_model, runtime)
+
+        train_full_loss_value = float(train_full_loss_tensor.detach().cpu().item())
+        train_split_loss_value = float(train_split_loss_tensor.detach().cpu().item())
+        train_loss_diff = abs(train_full_loss_value - train_split_loss_value)
+        if train_loss_diff > float(loss_tolerance):
+            raise RuntimeError(
+                "Preflight training-mode raw vs split loss mismatch: "
+                f"raw={train_full_loss_value}; split={train_split_loss_value}; "
+                f"diff={train_loss_diff}; tolerance={loss_tolerance}; "
+                f"percent={choice.boundary!r}; split_id={runtime_split_id!r}."
+            )
+
+        suffix_gradient_max_diff = _max_suffix_gradient_diff(full_grads, split_grads)
+        if (
+            not np.isfinite(suffix_gradient_max_diff)
+            or suffix_gradient_max_diff > float(gradient_tolerance)
+        ):
+            raise RuntimeError(
+                "Preflight raw full-path vs split-path suffix gradient mismatch: "
+                f"max_abs_diff={suffix_gradient_max_diff}; "
+                f"tolerance={gradient_tolerance}; "
+                f"percent={choice.boundary!r}; split_id={runtime_split_id!r}."
+            )
+
     return PreflightReport(
         percent=choice.boundary,
         actual_split_id=runtime_split_id,
@@ -1281,6 +1405,9 @@ def _preflight_equivalence_check(
         split_loss=split_loss_value,
         full_output_max_diff=output_max_diff,
         tolerance=float(loss_tolerance),
+        train_full_loss=train_full_loss_value,
+        train_split_loss=train_split_loss_value,
+        suffix_gradient_max_diff=suffix_gradient_max_diff,
     )
 
 
@@ -2235,9 +2362,10 @@ def main(argv: list[str] | None = None) -> int:
     results_path = output_root / "results.jsonl"
     summary_path = output_root / "summary.csv"
     aggregate_summary_path = output_root / "aggregate_summary.csv"
-    # for path in (results_path, summary_path, aggregate_summary_path):
-    #     if path.exists():
-    #         path.unlink()
+    if not bool(getattr(args, "append_results", False)):
+        for path in (results_path, summary_path, aggregate_summary_path):
+            if path.exists():
+                path.unlink()
 
     device = torch.device(str(args.device))
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -2407,13 +2535,17 @@ def main(argv: list[str] | None = None) -> int:
         preflight_reports.append(report)
         logger.info(
             "Preflight OK percent={} split_id={} trainable_params={} "
-            "full_loss={:.6f} split_loss={:.6f} output_max_diff={:.3e}",
+            "full_loss={:.6f} split_loss={:.6f} output_max_diff={:.3e} "
+            "train_full_loss={:.6f} train_split_loss={:.6f} suffix_grad_max_diff={:.3e}",
             report.percent,
             report.actual_split_id,
             report.trainable_parameter_count,
             report.full_loss,
             report.split_loss,
             report.full_output_max_diff,
+            float(report.train_full_loss or 0.0),
+            float(report.train_split_loss or 0.0),
+            float(report.suffix_gradient_max_diff or 0.0),
         )
         _clear_cuda_cache()
     preflight_path = output_root / "preflight.jsonl"
@@ -2431,13 +2563,15 @@ def main(argv: list[str] | None = None) -> int:
                 "full_loss": report.full_loss,
                 "split_loss": report.split_loss,
                 "full_output_max_diff": report.full_output_max_diff,
+                "train_full_loss": report.train_full_loss,
+                "train_split_loss": report.train_split_loss,
+                "suffix_gradient_max_diff": report.suffix_gradient_max_diff,
                 "tolerance": report.tolerance,
             },
         )
 
     rows: list[dict[str, Any]] = []
-    if results_path.exists():
-        import json
+    if bool(getattr(args, "append_results", False)) and results_path.exists():
         with results_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 if line.strip():
