@@ -550,6 +550,10 @@ def build_real_baseline_context(
     inferencers: dict[int, StudentInferencer] = {}
     trainers: dict[int, RealTrainer] = {}
     initial_checkpoints: dict[int, str] = {}
+    
+    # Enforce CPU for pure-edge method
+    actual_device = "cpu" if method_name == "pure_edge_local_updating" else config.device
+
     for device_id in range(max(1, int(config.num_devices))):
         fixed_split_cache_path = (
             root_results
@@ -561,7 +565,7 @@ def build_real_baseline_context(
         )
         inferencer = StudentInferencer(
             model_name=config.student_model,
-            device=config.device,
+            device=actual_device,
             results_dir=root_results,
             method_name=method_name,
             cache_features=cache_features,

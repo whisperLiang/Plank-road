@@ -530,10 +530,17 @@ class RealTrainer:
 
     @staticmethod
     def _load_feature_record(feature_tensor_path: str | Path) -> dict[str, Any]:
+        import gzip
         path = Path(feature_tensor_path)
         if not path.exists():
             raise FileNotFoundError(f"Cached split feature path does not exist: {path}")
-        record = torch.load(path, map_location="cpu", weights_only=False)
+        
+        try:
+            with gzip.open(path, "rb") as f:
+                record = torch.load(f, map_location="cpu", weights_only=False)
+        except gzip.BadGzipFile:
+            record = torch.load(path, map_location="cpu", weights_only=False)
+            
         if not isinstance(record, dict):
             raise TypeError(f"Cached split feature record must be a dict, got {type(record)!r}")
         return record
