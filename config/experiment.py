@@ -28,6 +28,15 @@ class PlankRoadMultiDeviceConfig:
     filter_diff_threshold: float = 0.0004
     enable_feature_cache: bool = True
     enable_split_tail_training: bool = True
+    enable_fixed_split_selection: bool = True
+    fixed_split_privacy_leakage_upper_bound: float = 0.0
+    fixed_split_max_layer_freezing_ratio: float = 1.0
+    fixed_split_validate_candidates: bool = True
+    fixed_split_validate_cached_plan: bool = True
+    fixed_split_max_candidates: int = 24
+    fixed_split_max_boundary_count: int = 8
+    fixed_split_max_payload_bytes: int = 32 * 1024 * 1024
+    fixed_split_privacy_leakage_epsilon: float = 1.0e-12
     enable_resource_aware_trigger: bool = True
     enable_feature_upload: bool = True
 

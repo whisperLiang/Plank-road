@@ -39,6 +39,7 @@ from baselines.runtime.video_stream import build_streams
 from config.experiment import ExperimentConfig
 from difference.diff import DiffProcessor
 from edge.box_motion import compensate_boxes_between_frames
+from model_management.fixed_split import SplitConstraints
 
 
 PER_FRAME_FIELDNAMES = [
@@ -468,6 +469,55 @@ def _configure_method_config(
     return method_config
 
 
+def _plank_fixed_split_enabled(config: ExperimentConfig, method_name: str) -> bool:
+    if method_name != "plank_road_multi_device":
+        return False
+    cfg = config.plank_road_multi_device
+    return bool(getattr(cfg, "enable_fixed_split_selection", True)) and bool(
+        getattr(cfg, "enable_split_tail_training", True)
+    )
+
+
+def _plank_fixed_split_constraints(config: ExperimentConfig) -> SplitConstraints:
+    cfg = config.plank_road_multi_device
+    return SplitConstraints(
+        privacy_leakage_upper_bound=float(
+            getattr(cfg, "fixed_split_privacy_leakage_upper_bound", 0.0)
+        ),
+        max_layer_freezing_ratio=float(
+            getattr(cfg, "fixed_split_max_layer_freezing_ratio", 1.0)
+        ),
+        validate_candidates=bool(getattr(cfg, "fixed_split_validate_candidates", True)),
+        max_candidates=int(getattr(cfg, "fixed_split_max_candidates", 24)),
+        max_boundary_count=int(getattr(cfg, "fixed_split_max_boundary_count", 8)),
+        max_payload_bytes=int(
+            getattr(cfg, "fixed_split_max_payload_bytes", 32 * 1024 * 1024)
+        ),
+        privacy_leakage_epsilon=float(
+            getattr(cfg, "fixed_split_privacy_leakage_epsilon", 1.0e-12)
+        ),
+    )
+
+
+def _initialise_plank_fixed_split_plans(
+    config: ExperimentConfig,
+    method_name: str,
+    context: RealBaselineContext,
+    edge_frames: list[list[Any]],
+) -> None:
+    if not _plank_fixed_split_enabled(config, method_name):
+        return
+    for frames in edge_frames:
+        if not frames:
+            continue
+        device_id = int(frames[0].device_id)
+        plan = context.get_student_inferencer(device_id).ensure_fixed_split_plan(
+            frames[0].frame_path
+        )
+        if plan is not None:
+            context.get_trainer(device_id).fixed_split_plan = plan
+
+
 def build_real_baseline_context(
     *,
     config: ExperimentConfig,
@@ -486,10 +536,29 @@ def build_real_baseline_context(
         config.bandwidth_mbps,
         real_sleep_upload=config.real_sleep_upload,
     )
+    fixed_split_enabled = _plank_fixed_split_enabled(config, method_name)
+    fixed_split_constraints = (
+        _plank_fixed_split_constraints(config) if fixed_split_enabled else None
+    )
+    fixed_split_validate_cached_plan = bool(
+        getattr(
+            config.plank_road_multi_device,
+            "fixed_split_validate_cached_plan",
+            True,
+        )
+    )
     inferencers: dict[int, StudentInferencer] = {}
     trainers: dict[int, RealTrainer] = {}
     initial_checkpoints: dict[int, str] = {}
     for device_id in range(max(1, int(config.num_devices))):
+        fixed_split_cache_path = (
+            root_results
+            / "fixed_split_plans"
+            / method_name
+            / f"edge_{int(device_id)}.json"
+            if fixed_split_enabled
+            else None
+        )
         inferencer = StudentInferencer(
             model_name=config.student_model,
             device=config.device,
@@ -497,6 +566,9 @@ def build_real_baseline_context(
             method_name=method_name,
             cache_features=cache_features,
             seed=config.seed,
+            fixed_split_constraints=fixed_split_constraints,
+            fixed_split_cache_path=fixed_split_cache_path,
+            fixed_split_validate_cached_plan=fixed_split_validate_cached_plan,
         )
         initial_checkpoint = checkpoint_manager.create_initial(
             method_name,
@@ -515,6 +587,9 @@ def build_real_baseline_context(
             batch_size=config.batch_size,
             epochs=config.epochs,
             device_id=device_id,
+            fixed_split_constraints=fixed_split_constraints,
+            fixed_split_cache_path=fixed_split_cache_path,
+            fixed_split_validate_cached_plan=fixed_split_validate_cached_plan,
         )
         inferencers[device_id] = inferencer
         trainers[device_id] = trainer
@@ -594,6 +669,7 @@ def run_one_method(
     max_frames = max((len(frames) for frames in edge_frames), default=0)
     if max_frames == 0:
         raise RuntimeError("No frames were produced by the real video stream")
+    _initialise_plank_fixed_split_plans(method_config, method_name, context, edge_frames)
 
     plank_filter_states: dict[int, _PlankRoadFrameFilterState] = {}
 

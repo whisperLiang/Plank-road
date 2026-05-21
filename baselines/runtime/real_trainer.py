@@ -20,6 +20,12 @@ from model_management.split_model_adapters import (
     get_split_runtime_model,
     prepare_split_runtime_input,
 )
+from model_management.fixed_split import (
+    SplitConstraints,
+    SplitPlan,
+    apply_split_plan,
+    load_or_compute_fixed_split_plan,
+)
 from model_management.universal_model_split import (
     SplitRetrainProfile,
     UniversalModelSplitter,
@@ -74,6 +80,9 @@ class RealTrainer:
         batch_size: int = 2,
         epochs: int = 1,
         device_id: int | None = None,
+        fixed_split_constraints: SplitConstraints | None = None,
+        fixed_split_cache_path: str | Path | None = None,
+        fixed_split_validate_cached_plan: bool = True,
     ) -> None:
         self.model = model
         self.device = device
@@ -85,6 +94,12 @@ class RealTrainer:
         self.batch_size = max(1, int(batch_size))
         self.epochs = max(1, int(epochs))
         self.device_id = device_id
+        self.fixed_split_constraints = fixed_split_constraints
+        self.fixed_split_cache_path = (
+            Path(fixed_split_cache_path) if fixed_split_cache_path is not None else None
+        )
+        self.fixed_split_validate_cached_plan = bool(fixed_split_validate_cached_plan)
+        self.fixed_split_plan: SplitPlan | None = None
 
     def train_raw_frames(
         self,
@@ -119,12 +134,7 @@ class RealTrainer:
         before_map50 = self._mean_map50(selected)
         sample_input = self._prepare_split_input(selected[0])
         core_model = get_split_runtime_model(self.model)
-        splitter = UniversalModelSplitter(device=self.device).trace(
-            core_model,
-            sample_input,
-            model_name=self._split_model_name(),
-            model_family=self._split_model_family(),
-        )
+        splitter = self._trace_splitter(core_model, sample_input)
 
         cache_path = self.results_dir / "split_tail_training_cache" / self.method_name
         if self.device_id is not None:
@@ -342,12 +352,7 @@ class RealTrainer:
         before_map50 = self._mean_map50(selected)
         sample_input = self._prepare_split_input(selected[0])
         core_model = get_split_runtime_model(self.model)
-        splitter = UniversalModelSplitter(device=self.device).trace(
-            core_model,
-            sample_input,
-            model_name=self._split_model_name(),
-            model_family=self._split_model_family(),
-        )
+        splitter = self._trace_splitter(core_model, sample_input)
         loss_fn = self._build_loss_fn()
         optimizer = build_split_retrain_optimizer(
             core_model,
@@ -435,6 +440,59 @@ class RealTrainer:
             "freeze_tail",
             "frozen_prefix",
         }
+
+    def _trace_splitter(
+        self,
+        core_model: torch.nn.Module,
+        sample_input: torch.Tensor,
+    ) -> UniversalModelSplitter:
+        splitter = UniversalModelSplitter(device=self.device).trace(
+            core_model,
+            sample_input,
+            model_name=self._split_model_name(),
+            model_family=self._split_model_family(),
+        )
+        self._bind_fixed_split_plan(splitter, core_model, sample_input)
+        return splitter
+
+    def _bind_fixed_split_plan(
+        self,
+        splitter: UniversalModelSplitter,
+        core_model: torch.nn.Module,
+        sample_input: torch.Tensor,
+    ) -> SplitPlan | None:
+        if self.fixed_split_constraints is None:
+            return None
+        if self.fixed_split_plan is not None:
+            self._apply_fixed_split_plan(splitter, self.fixed_split_plan)
+            return self.fixed_split_plan
+        plan = load_or_compute_fixed_split_plan(
+            core_model,
+            self.fixed_split_constraints,
+            sample_input=sample_input,
+            device=self.device,
+            model_name=self._split_model_name(),
+            cache_path=(
+                None
+                if self.fixed_split_cache_path is None
+                else str(self.fixed_split_cache_path)
+            ),
+            splitter=splitter,
+            validate_cached_plan=self.fixed_split_validate_cached_plan,
+            input_resize_mode=get_split_runtime_input_resize_mode(self.model) or "direct_resize",
+            front_version="0",
+        )
+        self._apply_fixed_split_plan(splitter, plan)
+        self.fixed_split_plan = plan
+        return plan
+
+    @staticmethod
+    def _apply_fixed_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> None:
+        current = getattr(splitter, "current_candidate", None)
+        current_id = getattr(current, "candidate_id", None)
+        if plan.candidate_id is not None and str(current_id) == str(plan.candidate_id):
+            return
+        apply_split_plan(splitter, plan)
 
     def _batches(self, samples: list[SampleRecord]) -> list[list[SampleRecord]]:
         return [samples[i : i + self.batch_size] for i in range(0, len(samples), self.batch_size)]

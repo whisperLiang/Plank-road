@@ -40,6 +40,15 @@ baselines:
     filter_diff_threshold: 0.0004
     enable_feature_cache: true
     enable_split_tail_training: true
+    enable_fixed_split_selection: true
+    fixed_split_privacy_leakage_upper_bound: 0.0
+    fixed_split_max_layer_freezing_ratio: 1.0
+    fixed_split_validate_candidates: true
+    fixed_split_validate_cached_plan: true
+    fixed_split_max_candidates: 24
+    fixed_split_max_boundary_count: 8
+    fixed_split_max_payload_bytes: 33554432
+    fixed_split_privacy_leakage_epsilon: 1.0e-12
     enable_resource_aware_trigger: true
     enable_feature_upload: true
 

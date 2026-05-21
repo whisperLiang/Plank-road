@@ -1,9 +1,13 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+import torch
 from baselines.base_method import InferenceResult
 from baselines.plank_road_multi_device import PlankRoadMultiDevice
-from baselines.runtime.real_trainer import TrainingReport
+from baselines.runtime.real_trainer import RealTrainer, TrainingReport
+from baselines.runtime.student_inferencer import StudentInferencer
 from edge.resource_aware_trigger import TrainingDecision
+from model_management.fixed_split import SplitConstraints, SplitPlan
 from tests.baselines_real_helpers import (
     build_context,
     make_config,
@@ -11,6 +15,7 @@ from tests.baselines_real_helpers import (
     make_label_dir,
     populate_context,
 )
+from tools.baselines_real_common import _initialise_plank_fixed_split_plans
 
 
 def _build_mixed_upload_plan(
@@ -161,6 +166,171 @@ def test_plank_road_uploads_only_actual_inference_high_features(tmp_path: Path):
     assert plan.update_config["uploaded_feature_sample_ids"] == [actual_high.sample_id]
     assert plan.update_config["high_quality_sample_ids"] == [actual_high.sample_id]
     assert plan.metadata["feature_bytes"] == Path(actual_high.feature_tensor_path).stat().st_size
+
+
+def test_student_inferencer_binds_fixed_split_plan_from_planner(tmp_path: Path, monkeypatch):
+    plan = SplitPlan(
+        split_config_id="plan-1",
+        model_name="dummy",
+        candidate_id="candidate-1",
+        split_index=1,
+        split_label="boundary",
+        boundary_tensor_labels=["boundary"],
+        payload_bytes=4,
+        privacy_metric=0.0,
+        privacy_risk=0.0,
+        layer_freezing_ratio=0.5,
+    )
+    calls = {}
+
+    def fake_load_or_compute(model, constraints, **kwargs):
+        calls["model"] = model
+        calls["constraints"] = constraints
+        calls["kwargs"] = kwargs
+        return plan
+
+    monkeypatch.setattr(
+        "baselines.runtime.student_inferencer.load_or_compute_fixed_split_plan",
+        fake_load_or_compute,
+    )
+    monkeypatch.setattr(
+        "baselines.runtime.student_inferencer.get_split_runtime_model",
+        lambda model: model,
+    )
+    monkeypatch.setattr(
+        "baselines.runtime.student_inferencer.get_split_runtime_input_resize_mode",
+        lambda model: "direct_resize",
+    )
+    inferencer = StudentInferencer.__new__(StudentInferencer)
+    inferencer.model = torch.nn.Linear(1, 1)
+    inferencer.device = torch.device("cpu")
+    inferencer.model_name = "dummy"
+    inferencer.fixed_split_constraints = SplitConstraints(validate_candidates=False)
+    inferencer.fixed_split_cache_path = tmp_path / "fixed_split_plan.json"
+    inferencer.fixed_split_validate_cached_plan = False
+    inferencer.fixed_split_plan = None
+
+    class FakeSplitter:
+        current_candidate = None
+
+        def __init__(self):
+            self.candidate_ids = []
+
+        def split(self, candidate_id=None, candidate=None):
+            del candidate
+            self.candidate_ids.append(candidate_id)
+            self.current_candidate = SimpleNamespace(candidate_id=candidate_id)
+            return self.current_candidate
+
+    splitter = FakeSplitter()
+
+    selected = inferencer._bind_fixed_split_plan(splitter, torch.zeros(1, 1))
+
+    assert selected is plan
+    assert inferencer.fixed_split_plan is plan
+    assert splitter.candidate_ids == ["candidate-1"]
+    assert calls["constraints"] == inferencer.fixed_split_constraints
+    assert calls["kwargs"]["splitter"] is splitter
+    assert calls["kwargs"]["cache_path"] == str(tmp_path / "fixed_split_plan.json")
+    assert calls["kwargs"]["validate_cached_plan"] is False
+
+
+def test_plank_road_initializes_fixed_split_once_per_edge():
+    config = make_config("plank_road_multi_device", total_frames=1)
+    config.plank_road_multi_device.enable_fixed_split_selection = True
+    config.plank_road_multi_device.enable_split_tail_training = True
+    plan = SplitPlan(
+        split_config_id="plan-1",
+        model_name="dummy",
+        candidate_id="candidate-1",
+        split_index=1,
+        split_label="boundary",
+        boundary_tensor_labels=["boundary"],
+        payload_bytes=4,
+        privacy_metric=0.0,
+        privacy_risk=0.0,
+        layer_freezing_ratio=0.5,
+    )
+
+    class FakeInferencer:
+        def __init__(self):
+            self.frame_paths = []
+
+        def ensure_fixed_split_plan(self, frame_path):
+            self.frame_paths.append(frame_path)
+            return plan
+
+    inferencer = FakeInferencer()
+    trainer = SimpleNamespace(fixed_split_plan=None)
+    context = SimpleNamespace(
+        get_student_inferencer=lambda device_id: inferencer,
+        get_trainer=lambda device_id: trainer,
+    )
+    frames = [[SimpleNamespace(device_id=0, frame_path="frame-0.jpg")]]
+
+    _initialise_plank_fixed_split_plans(
+        config,
+        "plank_road_multi_device",
+        context,
+        frames,
+    )
+
+    assert inferencer.frame_paths == ["frame-0.jpg"]
+    assert trainer.fixed_split_plan is plan
+
+
+def test_real_trainer_reuses_fixed_split_plan_for_tail_training(tmp_path: Path, monkeypatch):
+    plan = SplitPlan(
+        split_config_id="plan-1",
+        model_name="dummy",
+        candidate_id="candidate-1",
+        split_index=1,
+        split_label="boundary",
+        boundary_tensor_labels=["boundary"],
+        payload_bytes=4,
+        privacy_metric=0.0,
+        privacy_risk=0.0,
+        layer_freezing_ratio=0.5,
+    )
+    applied = {}
+
+    class FakeSplitter:
+        def trace(self, core_model, sample_input, **kwargs):
+            applied["trace_kwargs"] = kwargs
+            return self
+
+        def split(self, candidate_id=None, candidate=None):
+            del candidate
+            applied["candidate_id"] = candidate_id
+            return SimpleNamespace(candidate_id=candidate_id)
+
+    fake_splitter = FakeSplitter()
+    monkeypatch.setattr(
+        "baselines.runtime.real_trainer.UniversalModelSplitter",
+        lambda device: fake_splitter,
+    )
+    monkeypatch.setattr(
+        "baselines.runtime.real_trainer.load_or_compute_fixed_split_plan",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("existing fixed split plan should be reused")
+        ),
+    )
+    trainer = RealTrainer(
+        model=torch.nn.Linear(1, 1),
+        device=torch.device("cpu"),
+        results_dir=tmp_path,
+        method_name="plank_road_multi_device",
+        checkpoint_manager=SimpleNamespace(),
+        evaluator=SimpleNamespace(),
+        fixed_split_constraints=SplitConstraints(validate_candidates=False),
+    )
+    trainer.fixed_split_plan = plan
+
+    splitter = trainer._trace_splitter(trainer.model, torch.zeros(1, 1))
+
+    assert splitter is fake_splitter
+    assert applied["candidate_id"] == "candidate-1"
+    assert applied["trace_kwargs"]["model_name"] == "Linear"
 
 
 def test_plank_road_raw_feature_upload_adds_low_features(tmp_path: Path):

@@ -26,11 +26,14 @@ from tools.run_split_tradeoff_motivation_experiment import (
     ExperimentMetadata,
     ModelExperimentResult,
     ModelSummary,
+    SplitCandidate,
+    compute_raw_input_size_bytes,
     compute_pareto_frontier,
     enumerate_candidates,
     format_candidate_limit,
     compute_model_summary,
     compute_nontrivial_score,
+    profile_candidates,
     rank_model_summaries,
     render_model_ranking_markdown,
     run_all_models_experiment,
@@ -192,6 +195,90 @@ class TestPayloadRatioCalculations:
         payload_mb = payload_bytes / (1024 * 1024)
         
         assert abs(payload_mb - 2.0) < 1e-6
+
+    def test_raw_input_size_uses_uint8_rgb_frame_bytes(self):
+        """The layer-0 baseline should be raw image bytes, not float tensors."""
+        assert compute_raw_input_size_bytes([640, 640]) == 640 * 640 * 3
+
+    def test_layer_zero_payload_displays_initial_input_size(self):
+        """Layer index 0 should show the shared raw input size."""
+        input_size_bytes = compute_raw_input_size_bytes([640, 640])
+        candidate = SplitCandidate(
+            candidate_id="layer0",
+            edge_nodes=[],
+            cloud_nodes=["conv"],
+            boundary_edges=[],
+            boundary_tensor_labels=["input"],
+            edge_input_labels=[],
+            cloud_input_labels=["input"],
+            cloud_output_labels=[],
+            estimated_edge_flops=0.0,
+            estimated_cloud_flops=1.0,
+            estimated_payload_bytes=512,
+            estimated_privacy_risk=0.0,
+            estimated_latency=0.0,
+            is_trainable_tail=True,
+            legacy_layer_index=0,
+            boundary_count=1,
+            edge_parameter_count=0,
+            total_parameter_count=100,
+            edge_parameter_ratio=0.0,
+            metadata={"boundary_shape_summary": []},
+        )
+
+        records = profile_candidates(
+            [candidate],
+            sample_input=MagicMock(),
+            runtime=SimpleNamespace(),
+            input_size_bytes=input_size_bytes,
+            initial_input_shape=[640, 640],
+        )
+
+        assert records[0].payload_bytes == input_size_bytes
+        assert records[0].payload_mb == pytest.approx(640 * 640 * 3 / 1024 / 1024)
+        assert records[0].payload_ratio_to_input == pytest.approx(1.0)
+        assert json.loads(records[0].boundary_shape_summary) == [["input", [640, 640]]]
+
+    def test_missing_layer_zero_prepends_initial_input_record(self):
+        """Candidate sets that start after layer 0 should still show raw input size."""
+        input_size_bytes = compute_raw_input_size_bytes([640, 640])
+        candidate = SplitCandidate(
+            candidate_id="layer1",
+            edge_nodes=["conv"],
+            cloud_nodes=[],
+            boundary_edges=[],
+            boundary_tensor_labels=["node_0"],
+            edge_input_labels=[],
+            cloud_input_labels=["node_0"],
+            cloud_output_labels=[],
+            estimated_edge_flops=1.0,
+            estimated_cloud_flops=1.0,
+            estimated_payload_bytes=512,
+            estimated_privacy_risk=0.0,
+            estimated_latency=0.0,
+            is_trainable_tail=True,
+            legacy_layer_index=1,
+            boundary_count=1,
+            edge_parameter_count=10,
+            total_parameter_count=100,
+            edge_parameter_ratio=0.1,
+            metadata={"boundary_shape_summary": []},
+        )
+
+        records = profile_candidates(
+            [candidate],
+            sample_input=SimpleNamespace(shape=(1, 3, 640, 640)),
+            runtime=SimpleNamespace(),
+            input_size_bytes=input_size_bytes,
+            initial_input_shape=[640, 640],
+        )
+
+        assert [record.legacy_layer_index for record in records] == [0, 1]
+        assert records[0].candidate_id == "initial_input"
+        assert records[0].payload_bytes == input_size_bytes
+        assert records[0].payload_ratio_to_input == pytest.approx(1.0)
+        assert json.loads(records[0].boundary_shape_summary) == [["input", [640, 640]]]
+        assert records[1].payload_bytes == 512
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -394,6 +481,9 @@ class TestSerialization:
                 model_name="test_model",
                 input_height=640,
                 input_width=640,
+                initial_input_height=640,
+                initial_input_width=640,
+                initial_input_bytes=640 * 640 * 3,
                 device="cpu",
                 max_candidates=128,
                 max_boundary_count=8,
@@ -476,6 +566,9 @@ class TestValidationErrorHandling:
             model_name="test_model",
             input_height=640,
             input_width=640,
+            initial_input_height=640,
+            initial_input_width=640,
+            initial_input_bytes=640 * 640 * 3,
             device="cpu",
             max_candidates=128,
             max_boundary_count=8,

@@ -13,6 +13,7 @@ Usage:
         --model tinynext \\
         --device cpu \\
         --input-size 640 640 \\
+        --initial-input-size 640 640 \\
         --max-candidates 64 \\
         --output-dir results/split_tradeoff/tinynext
 
@@ -284,6 +285,9 @@ class ExperimentMetadata:
     model_name: str
     input_height: int
     input_width: int
+    initial_input_height: int
+    initial_input_width: int
+    initial_input_bytes: int
     device: str
     max_candidates: int | None
     max_boundary_count: int
@@ -816,6 +820,7 @@ def profile_candidates(
     input_size_bytes: int,
     privacy_epsilon: float = PRIVACY_LEAKAGE_EPSILON,
     validate: bool = False,
+    initial_input_shape: Sequence[int] | None = None,
 ) -> list[CandidateRecord]:
     """Profile all candidates and create records."""
     logger.info(f"Profiling {len(candidates)} candidates...")
@@ -834,13 +839,25 @@ def profile_candidates(
                 input_size_bytes,
                 privacy_epsilon,
                 validate,
+                initial_input_shape,
             )
             records.append(record)
         except Exception as e:
             logger.warning(f"Failed to profile candidate {candidate.candidate_id}: {e}")
             # Still create a record with error information
-            record = _create_error_record(candidate, str(e))
+            record = _create_error_record(candidate, str(e), input_size_bytes)
             records.append(record)
+    
+    if records and not any(record.legacy_layer_index == 0 for record in records):
+        records.insert(
+            0,
+            _create_initial_input_record(
+                sample_input,
+                input_size_bytes,
+                records,
+                initial_input_shape=initial_input_shape,
+            ),
+        )
     
     logger.info(f"Profiled {len(records)} candidates")
     return records
@@ -854,6 +871,7 @@ def _profile_single_candidate(
     input_size_bytes: int,
     privacy_epsilon: float,
     validate: bool,
+    initial_input_shape: Sequence[int] | None = None,
 ) -> CandidateRecord:
     """Profile a single candidate."""
     
@@ -866,9 +884,10 @@ def _profile_single_candidate(
     privacy_leakage_score = max(0.0, min(1.0, privacy_leakage_score))
     
     # Compute payload metrics
-    payload_mb = candidate.estimated_payload_bytes / (1024 * 1024)
+    payload_bytes = _display_payload_bytes(candidate, input_size_bytes)
+    payload_mb = payload_bytes / (1024 * 1024)
     payload_ratio = (
-        float(candidate.estimated_payload_bytes) / float(input_size_bytes)
+        float(payload_bytes) / float(input_size_bytes)
         if input_size_bytes > 0
         else 0.0
     )
@@ -877,8 +896,11 @@ def _profile_single_candidate(
     boundary_labels_json = json.dumps(candidate.boundary_tensor_labels)
     
     # Boundary shape summary
-    boundary_shape = _get_boundary_shape_summary(candidate, runtime)
-    boundary_shape_json = json.dumps(boundary_shape)
+    if candidate.legacy_layer_index == 0 and initial_input_shape is not None:
+        boundary_shape_json = json.dumps(_initial_input_shape_summary(initial_input_shape))
+    else:
+        boundary_shape = _get_boundary_shape_summary(candidate, runtime)
+        boundary_shape_json = json.dumps(boundary_shape)
     
     # Validation
     validation_passed = True
@@ -900,7 +922,7 @@ def _profile_single_candidate(
         boundary_tensor_count=candidate.boundary_count,
         boundary_tensor_labels=boundary_labels_json,
         boundary_shape_summary=boundary_shape_json,
-        payload_bytes=candidate.estimated_payload_bytes,
+        payload_bytes=payload_bytes,
         payload_mb=payload_mb,
         input_tensor_bytes=input_size_bytes,
         payload_ratio_to_input=payload_ratio,
@@ -918,6 +940,75 @@ def _profile_single_candidate(
         replay_success_rate=1.0 if validation_passed else 0.0,
         tail_trainability=candidate.is_trainable_tail,
         validation_error=validation_error,
+    )
+
+
+def _display_payload_bytes(candidate: SplitCandidate, input_size_bytes: int) -> int:
+    """Return the payload size to show for split trade-off outputs."""
+    if candidate.legacy_layer_index == 0 and input_size_bytes > 0:
+        return int(input_size_bytes)
+    return int(candidate.estimated_payload_bytes)
+
+
+def _sample_input_shape_summary(sample_input: Any) -> list[list[Any]]:
+    """Return a compact shape summary for the initial model input."""
+    if isinstance(sample_input, list):
+        return [
+            [f"input_{idx}", list(item.shape)]
+            for idx, item in enumerate(sample_input)
+            if hasattr(item, "shape")
+        ]
+    if hasattr(sample_input, "shape"):
+        return [["input", list(sample_input.shape)]]
+    return [["input", None]]
+
+
+def _initial_input_shape_summary(initial_input_shape: Sequence[int]) -> list[list[Any]]:
+    return [["input", [int(dim) for dim in initial_input_shape]]]
+
+
+def _create_initial_input_record(
+    sample_input: Any,
+    input_size_bytes: int,
+    profiled_records: Sequence[CandidateRecord],
+    *,
+    initial_input_shape: Sequence[int] | None = None,
+) -> CandidateRecord:
+    """Create the layer-0 baseline that represents sending the raw input."""
+    total_parameter_count = max(
+        (record.total_parameter_count for record in profiled_records),
+        default=0,
+    )
+    privacy_leakage_official = safe_estimate_privacy_leakage(0)
+    payload_mb = input_size_bytes / (1024 * 1024)
+    return CandidateRecord(
+        candidate_id="initial_input",
+        legacy_layer_index=0,
+        canonical_split_key="initial_input",
+        boundary_tensor_count=1,
+        boundary_tensor_labels=json.dumps(["input"]),
+        boundary_shape_summary=json.dumps(
+            _initial_input_shape_summary(initial_input_shape)
+            if initial_input_shape is not None
+            else _sample_input_shape_summary(sample_input)
+        ),
+        payload_bytes=int(input_size_bytes),
+        payload_mb=payload_mb,
+        input_tensor_bytes=int(input_size_bytes),
+        payload_ratio_to_input=1.0 if input_size_bytes > 0 else 0.0,
+        edge_parameter_count=0,
+        total_parameter_count=total_parameter_count,
+        edge_parameter_ratio=0.0,
+        privacy_leakage_official=privacy_leakage_official,
+        privacy_leakage_log10=safe_log10(privacy_leakage_official),
+        privacy_leakage_score=1.0,
+        estimated_edge_flops=0.0,
+        estimated_cloud_flops=0.0,
+        estimated_latency=0.0,
+        is_trainable_tail=True,
+        validation_passed=True,
+        replay_success_rate=1.0,
+        tail_trainability=True,
     )
 
 
@@ -962,10 +1053,15 @@ def _validate_candidate(
         return False
 
 
-def _create_error_record(candidate: SplitCandidate, error_msg: str) -> CandidateRecord:
+def _create_error_record(
+    candidate: SplitCandidate,
+    error_msg: str,
+    input_size_bytes: int = 0,
+) -> CandidateRecord:
     """Create an error record for a failed candidate."""
     privacy_score = 1.0 - candidate.edge_parameter_ratio
     privacy_score = max(0.0, min(1.0, privacy_score))
+    payload_bytes = _display_payload_bytes(candidate, input_size_bytes)
     
     return CandidateRecord(
         candidate_id=candidate.candidate_id,
@@ -974,10 +1070,14 @@ def _create_error_record(candidate: SplitCandidate, error_msg: str) -> Candidate
         boundary_tensor_count=candidate.boundary_count,
         boundary_tensor_labels=json.dumps(candidate.boundary_tensor_labels),
         boundary_shape_summary="null",
-        payload_bytes=candidate.estimated_payload_bytes,
-        payload_mb=candidate.estimated_payload_bytes / (1024 * 1024),
-        input_tensor_bytes=0,
-        payload_ratio_to_input=0.0,
+        payload_bytes=payload_bytes,
+        payload_mb=payload_bytes / (1024 * 1024),
+        input_tensor_bytes=input_size_bytes,
+        payload_ratio_to_input=(
+            float(payload_bytes) / float(input_size_bytes)
+            if input_size_bytes > 0
+            else 0.0
+        ),
         edge_parameter_count=candidate.edge_parameter_count,
         total_parameter_count=candidate.total_parameter_count,
         edge_parameter_ratio=candidate.edge_parameter_ratio,
@@ -1326,6 +1426,14 @@ def rank_model_summaries(summaries: list[ModelSummary]) -> list[ModelSummary]:
 # ───────────────────────────────────────────────────────────────────────
 
 
+def _is_initial_input_record(record: CandidateRecord) -> bool:
+    return record.legacy_layer_index == 0 or record.candidate_id == "initial_input"
+
+
+def _initial_input_plot_label(record: CandidateRecord) -> str:
+    return f"layer 0 input\n{record.payload_mb:.2f} MB"
+
+
 def plot_payload_privacy_by_depth(
     records: list[CandidateRecord],
     output_dir: Path,
@@ -1352,15 +1460,27 @@ def plot_payload_privacy_by_depth(
     x = np.arange(len(sorted_records))
     payload_mb = [r.payload_mb for r in sorted_records]
     privacy_score = [r.privacy_leakage_score for r in sorted_records]
+    initial_indices = [
+        idx for idx, record in enumerate(sorted_records)
+        if _is_initial_input_record(record)
+    ]
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
     
     # Top plot: Payload
-    ax1.bar(x, payload_mb, color="steelblue", alpha=0.7, edgecolor="navy", linewidth=0.5)
+    bar_colors = [
+        "#c2410c" if _is_initial_input_record(record) else "steelblue"
+        for record in sorted_records
+    ]
+    bar_edges = [
+        "#7c2d12" if _is_initial_input_record(record) else "navy"
+        for record in sorted_records
+    ]
+    ax1.bar(x, payload_mb, color=bar_colors, alpha=0.7, edgecolor=bar_edges, linewidth=0.5)
     ax1.set_ylabel("Payload (MB)", fontsize=11)
     ax1.set_title("Intermediate Feature Size", fontsize=12, fontweight="bold")
     ax1.grid(axis="y", alpha=0.3, linestyle="--")
-    ax1.set_ylim([0, max(payload_mb) * 1.1 if payload_mb else 1])
+    ax1.set_ylim([0, max(payload_mb) * 1.2 if payload_mb else 1])
     
     # Bottom plot: Privacy leakage score
     ax2.plot(x, privacy_score, marker="o", color="darkred", linewidth=1.5, markersize=4, alpha=0.8)
@@ -1371,7 +1491,45 @@ def plot_payload_privacy_by_depth(
     ax2.set_ylim([0, 1.05])
     ax2.grid(axis="y", alpha=0.3, linestyle="--")
     
-    # Keep the payload bars unannotated; candidate labels clutter dense full-candidate plots.
+    for idx in initial_indices:
+        record = sorted_records[idx]
+        ax1.axvline(idx, color="#c2410c", linestyle=":", linewidth=1.2, alpha=0.8)
+        ax2.axvline(idx, color="#c2410c", linestyle=":", linewidth=1.2, alpha=0.8)
+        ax1.annotate(
+            _initial_input_plot_label(record),
+            (idx, payload_mb[idx]),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            fontweight="bold",
+            color="#7c2d12",
+        )
+        ax2.scatter(
+            [idx],
+            [privacy_score[idx]],
+            s=100,
+            marker="*",
+            c="#c2410c",
+            edgecolors="black",
+            linewidth=0.6,
+            zorder=5,
+        )
+        ax2.annotate(
+            "0",
+            (idx, privacy_score[idx]),
+            xytext=(6, -14),
+            textcoords="offset points",
+            fontsize=8,
+            fontweight="bold",
+            color="#7c2d12",
+        )
+    if initial_indices:
+        ax2.set_xticks(initial_indices)
+        ax2.set_xticklabels(["0\ninput" for _idx in initial_indices], fontsize=9)
+    
+    # Keep other candidate labels off the dense full-candidate plots.
     _ = top_k_labels
     
     plt.tight_layout()
@@ -1411,6 +1569,7 @@ def plot_pareto_tradeoff(
     privacy_score = np.array([r.privacy_leakage_score for r in records])
     edge_param_ratio = np.array([r.edge_parameter_ratio for r in records])
     is_trainable = np.array([r.is_trainable_tail for r in records])
+    is_initial = np.array([_is_initial_input_record(r) for r in records])
     
     # Compute Pareto frontier
     frontier_indices = compute_pareto_frontier(records)
@@ -1418,8 +1577,8 @@ def plot_pareto_tradeoff(
     fig, ax = plt.subplots(figsize=(10, 7))
     
     # Plot trainable vs untrainable
-    trainable_mask = is_trainable
-    untrainable_mask = ~trainable_mask
+    trainable_mask = is_trainable & ~is_initial
+    untrainable_mask = (~is_trainable) & ~is_initial
     
     scatter1 = ax.scatter(
         payload_mb[trainable_mask],
@@ -1445,6 +1604,30 @@ def plot_pareto_tradeoff(
         linewidth=1.5,
         label="Non-trainable tail",
     )
+    
+    if is_initial.any():
+        ax.scatter(
+            payload_mb[is_initial],
+            privacy_score[is_initial],
+            c="#c2410c",
+            s=180,
+            marker="*",
+            edgecolors="black",
+            linewidth=0.8,
+            label="Initial input (layer 0)",
+            zorder=6,
+        )
+        for idx in np.where(is_initial)[0]:
+            ax.annotate(
+                _initial_input_plot_label(records[int(idx)]),
+                (payload_mb[idx], privacy_score[idx]),
+                xytext=(8, -28),
+                textcoords="offset points",
+                fontsize=8,
+                fontweight="bold",
+                color="#7c2d12",
+                arrowprops={"arrowstyle": "->", "color": "#7c2d12", "lw": 0.8},
+            )
     
     # Highlight Pareto frontier
     if frontier_indices:
@@ -1473,6 +1656,8 @@ def plot_pareto_tradeoff(
     # Add top-k labels
     if top_k_labels > 0 and frontier_indices:
         for idx in frontier_indices[:top_k_labels]:
+            if _is_initial_input_record(records[idx]):
+                continue
             # Use the candidate's legacy layer index if available, otherwise use record index
             label = f"{records[idx].legacy_layer_index}" if records[idx].legacy_layer_index is not None else f"#{idx}"
             ax.annotate(
@@ -1520,6 +1705,7 @@ def plot_constraint_feasibility(
     # Extract data
     payload_mb = np.array([r.payload_mb for r in records])
     privacy_score = np.array([r.privacy_leakage_score for r in records])
+    is_initial = np.array([_is_initial_input_record(r) for r in records])
     is_valid = np.array([
         r.validation_passed and r.is_trainable_tail
         for r in records
@@ -1528,8 +1714,8 @@ def plot_constraint_feasibility(
     fig, ax = plt.subplots(figsize=(10, 7))
     
     # Plot valid vs invalid
-    valid_mask = is_valid
-    invalid_mask = ~valid_mask
+    valid_mask = is_valid & ~is_initial
+    invalid_mask = (~is_valid) & ~is_initial
     
     ax.scatter(
         payload_mb[valid_mask],
@@ -1553,6 +1739,30 @@ def plot_constraint_feasibility(
         linewidth=2,
         label="Invalid",
     )
+    
+    if is_initial.any():
+        ax.scatter(
+            payload_mb[is_initial],
+            privacy_score[is_initial],
+            c="#c2410c",
+            s=180,
+            marker="*",
+            edgecolors="black",
+            linewidth=0.8,
+            label="Initial input (layer 0)",
+            zorder=6,
+        )
+        for idx in np.where(is_initial)[0]:
+            ax.annotate(
+                _initial_input_plot_label(records[int(idx)]),
+                (payload_mb[idx], privacy_score[idx]),
+                xytext=(8, -28),
+                textcoords="offset points",
+                fontsize=8,
+                fontweight="bold",
+                color="#7c2d12",
+                arrowprops={"arrowstyle": "->", "color": "#7c2d12", "lw": 0.8},
+            )
     
     # Add constraint boundaries if provided
     if privacy_bound is not None:
@@ -1828,11 +2038,21 @@ def plot_all_models_pareto_overlay(
     for idx, (model_name, records) in enumerate(records_by_model.items()):
         if not records:
             continue
-        payload_mb = [record.payload_mb for record in records]
-        privacy_score = [record.privacy_leakage_score for record in records]
+        regular_records = [
+            record for record in records
+            if not _is_initial_input_record(record)
+        ]
+        initial_records = [
+            record for record in records
+            if _is_initial_input_record(record)
+        ]
+        payload_mb = [record.payload_mb for record in regular_records]
+        privacy_score = [record.privacy_leakage_score for record in regular_records]
+        color = f"C{idx}"
         ax.scatter(
             payload_mb,
             privacy_score,
+            c=color,
             s=70,
             alpha=0.7,
             marker=markers[idx % len(markers)],
@@ -1840,6 +2060,29 @@ def plot_all_models_pareto_overlay(
             edgecolors="black",
             linewidth=0.4,
         )
+        if initial_records:
+            ax.scatter(
+                [record.payload_mb for record in initial_records],
+                [record.privacy_leakage_score for record in initial_records],
+                c=color,
+                s=170,
+                alpha=0.95,
+                marker="*",
+                label=f"{model_name} input",
+                edgecolors="black",
+                linewidth=0.8,
+                zorder=6,
+            )
+            for record in initial_records:
+                ax.annotate(
+                    "0",
+                    (record.payload_mb, record.privacy_leakage_score),
+                    xytext=(6, -12),
+                    textcoords="offset points",
+                    fontsize=8,
+                    fontweight="bold",
+                    color=color,
+                )
         plotted = True
 
     ax.set_xlabel("Intermediate Feature Size (MB)", fontsize=11)
@@ -1910,18 +2153,19 @@ def save_all_model_outputs(
 # ───────────────────────────────────────────────────────────────────────
 
 
-def compute_sample_input_size_bytes(sample_input: Any, fallback_hw: Sequence[int]) -> int:
-    """Compute input tensor bytes for a sample input."""
-    if isinstance(sample_input, list):
-        if sample_input:
-            sample_tensor = sample_input[0]
-            numel = int(sample_tensor.numel())
-        else:
-            numel = 3 * int(fallback_hw[0]) * int(fallback_hw[1])
-    else:
-        sample_tensor = sample_input
-        numel = int(sample_tensor.numel())
-    return numel * 4
+def compute_raw_input_size_bytes(
+    input_hw: Sequence[int],
+    *,
+    channels: int = 3,
+    bytes_per_channel: int = 1,
+) -> int:
+    """Compute the shared raw RGB frame size used as the layer-0 baseline."""
+    if len(input_hw) != 2:
+        raise ValueError("input_hw must contain height and width")
+    height, width = (int(input_hw[0]), int(input_hw[1]))
+    if height <= 0 or width <= 0:
+        raise ValueError("input height and width must be positive")
+    return height * width * int(channels) * int(bytes_per_channel)
 
 
 def _make_failure_result(
@@ -1971,10 +2215,6 @@ def run_single_model_experiment(
             args.input_size[1],
             device,
         )
-        input_size_bytes = compute_sample_input_size_bytes(sample_input, args.input_size)
-        logger.info(
-            f"Split runtime input size: {input_size_bytes / (1024*1024):.2f} MB"
-        )
         splitter, runtime = trace_model_with_splitter(
             trace_model,
             sample_input,
@@ -2011,9 +2251,10 @@ def run_single_model_experiment(
             candidates,
             sample_input,
             runtime,
-            input_size_bytes,
+            args.initial_input_bytes,
             privacy_epsilon=args.privacy_epsilon,
             validate=args.validate_candidates,
+            initial_input_shape=args.initial_input_shape,
         )
     except Exception as exc:
         error = str(exc)
@@ -2024,6 +2265,9 @@ def run_single_model_experiment(
         model_name=display_model_name,
         input_height=args.input_size[0],
         input_width=args.input_size[1],
+        initial_input_height=args.initial_input_shape[0],
+        initial_input_width=args.initial_input_shape[1],
+        initial_input_bytes=args.initial_input_bytes,
         device=str(device),
         max_candidates=args.max_candidates,
         max_boundary_count=args.max_boundary_count,
@@ -2068,8 +2312,16 @@ def run_all_models_experiment(args: argparse.Namespace) -> list[ModelExperimentR
     models = resolve_requested_models(args)
     output_root = Path(args.output_dir)
     multi_model_layout = bool(getattr(args, "multi_model_layout", len(models) > 1))
+    initial_input_shape = list(getattr(args, "initial_input_size", None) or args.input_size)
+    args.initial_input_shape = initial_input_shape
+    args.initial_input_bytes = compute_raw_input_size_bytes(initial_input_shape)
     logger.info(f"Models to test: {models}")
     logger.info(f"Output root: {output_root}")
+    logger.info(
+        "Shared raw input baseline: "
+        f"{initial_input_shape[0]}x{initial_input_shape[1]}x3 uint8 = "
+        f"{args.initial_input_bytes / (1024 * 1024):.2f} MB"
+    )
 
     results: list[ModelExperimentResult] = []
     for model_name in models:
@@ -2159,6 +2411,16 @@ def main() -> None:
         nargs=2,
         default=[640, 640],
         help="Input size H W (default: 640 640)",
+    )
+    parser.add_argument(
+        "--initial-input-size",
+        type=int,
+        nargs=2,
+        default=None,
+        help=(
+            "Raw input frame size H W for the shared layer-0 baseline "
+            "(default: same as --input-size)"
+        ),
     )
     
     # Candidate enumeration

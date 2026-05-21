@@ -18,6 +18,12 @@ from model_management.split_model_adapters import (
     get_split_runtime_model,
     prepare_split_runtime_input,
 )
+from model_management.fixed_split import (
+    SplitConstraints,
+    SplitPlan,
+    apply_split_plan,
+    load_or_compute_fixed_split_plan,
+)
 from model_management.universal_model_split import UniversalModelSplitter, save_split_feature_cache
 
 
@@ -52,6 +58,9 @@ class StudentInferencer:
         cache_features: bool = False,
         pretrained: bool = True,
         seed: int = 2026,
+        fixed_split_constraints: SplitConstraints | None = None,
+        fixed_split_cache_path: str | Path | None = None,
+        fixed_split_validate_cached_plan: bool = True,
     ) -> None:
         normalized = self.MODEL_ALIASES.get(model_name.lower().replace("-", "_"), model_name)
         torch.manual_seed(int(seed))
@@ -76,6 +85,12 @@ class StudentInferencer:
         self.prediction_dir = self.results_dir / "predictions" / method_name
         self.feature_cache_dir = self.results_dir / "feature_cache" / method_name
         self._feature_splitter: UniversalModelSplitter | None = None
+        self.fixed_split_constraints = fixed_split_constraints
+        self.fixed_split_cache_path = (
+            Path(fixed_split_cache_path) if fixed_split_cache_path is not None else None
+        )
+        self.fixed_split_validate_cached_plan = bool(fixed_split_validate_cached_plan)
+        self.fixed_split_plan: SplitPlan | None = None
 
     def infer(self, frame_path: str | Path, *, device_id: int, frame_index: int) -> StudentInferenceOutput:
         frame = cv2.imread(str(frame_path))
@@ -132,7 +147,60 @@ class StudentInferencer:
                 model_name=self.model_name,
                 model_family=self.model_family,
             )
+        self._bind_fixed_split_plan(self._feature_splitter, sample_input)
         return self._feature_splitter
+
+    def ensure_fixed_split_plan(self, frame_path: str | Path) -> SplitPlan | None:
+        if self.fixed_split_constraints is None:
+            return None
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            raise FileNotFoundError(f"Unable to read frame image: {frame_path}")
+        sample_input = prepare_split_runtime_input(self.model, frame, device=self.device)
+        if not isinstance(sample_input, torch.Tensor):
+            raise NotImplementedError(
+                f"Fixed split selection for {type(self.model).__name__} requires tensor runtime input"
+            )
+        self._ensure_feature_splitter(sample_input)
+        return self.fixed_split_plan
+
+    def _bind_fixed_split_plan(
+        self,
+        splitter: UniversalModelSplitter,
+        sample_input: torch.Tensor,
+    ) -> SplitPlan | None:
+        if self.fixed_split_constraints is None:
+            return None
+        if self.fixed_split_plan is not None:
+            self._apply_fixed_split_plan(splitter, self.fixed_split_plan)
+            return self.fixed_split_plan
+        plan = load_or_compute_fixed_split_plan(
+            get_split_runtime_model(self.model),
+            self.fixed_split_constraints,
+            sample_input=sample_input,
+            device=self.device,
+            model_name=self.model_name,
+            cache_path=(
+                None
+                if self.fixed_split_cache_path is None
+                else str(self.fixed_split_cache_path)
+            ),
+            splitter=splitter,
+            validate_cached_plan=self.fixed_split_validate_cached_plan,
+            input_resize_mode=get_split_runtime_input_resize_mode(self.model) or "direct_resize",
+            front_version="0",
+        )
+        self._apply_fixed_split_plan(splitter, plan)
+        self.fixed_split_plan = plan
+        return plan
+
+    @staticmethod
+    def _apply_fixed_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> None:
+        current = getattr(splitter, "current_candidate", None)
+        current_id = getattr(current, "candidate_id", None)
+        if plan.candidate_id is not None and str(current_id) == str(plan.candidate_id):
+            return
+        apply_split_plan(splitter, plan)
 
     def _cache_split_feature(self, frame: np.ndarray, *, device_id: int, frame_index: int) -> str:
         sample_input = prepare_split_runtime_input(self.model, frame, device=self.device)
