@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import os
 import time
 from collections.abc import Iterable, Mapping
@@ -893,7 +894,9 @@ def save_split_feature_cache(
         **record_fields,
         **extra_metadata,
     }
-    torch.save(record, _feature_path(cache_path, frame_index))
+    path = _feature_path(cache_path, frame_index)
+    with gzip.open(path, "wb", compresslevel=1) as f:
+        torch.save(record, f)
     return record
 
 
@@ -901,7 +904,13 @@ def load_split_feature_cache(cache_path: str, frame_index: Any) -> dict[str, Any
     path = _feature_path(cache_path, frame_index)
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-    record = torch.load(path, map_location="cpu", weights_only=False)
+    
+    try:
+        with gzip.open(path, "rb") as f:
+            record = torch.load(f, map_location="cpu", weights_only=False)
+    except gzip.BadGzipFile:
+        record = torch.load(path, map_location="cpu", weights_only=False)
+        
     if not isinstance(record, dict):
         raise TypeError(f"Unsupported split feature cache record: {type(record)!r}")
     return record
@@ -1258,12 +1267,8 @@ def _build_boundary_batch_from_records(
                     f"got {label} shape {tuple(tensor.shape)}."
                 )
             pieces.append(tensor)
-        devices = {piece.device for piece in pieces}
-        if len(devices) > 1:
-            raise RuntimeError(
-                "Split-tail training requires batched Ariadne prefix execution "
-                "records on a single device."
-            )
+        target_device = pieces[0].device
+        pieces = [piece.to(target_device) for piece in pieces]
         batched_tensors[label] = torch.cat(pieces, dim=0)
     passthrough_groups: list[Mapping[str, Any]] = []
     for record in records:
@@ -1281,7 +1286,9 @@ def _build_boundary_batch_from_records(
                 pieces = []
                 break
             pieces.append(value)
-        if pieces and len({piece.device for piece in pieces}) == 1:
+        if pieces:
+            target_device = pieces[0].device
+            pieces = [piece.to(target_device) for piece in pieces]
             batched_passthrough[str(key)] = torch.cat(pieces, dim=0)
     return boundary_payload_from_tensors(
         batched_tensors,

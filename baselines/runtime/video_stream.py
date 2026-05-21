@@ -97,7 +97,7 @@ class VideoStream:
                 ok, frame = cap.read()
                 if not ok:
                     break
-                frame_path = frame_dir / f"{emitted:08d}.jpg"
+                frame_path = frame_dir / f"{emitted:08d}.png"
                 if not cv2.imwrite(str(frame_path), frame):
                     raise RuntimeError(f"Failed to write extracted frame: {frame_path}")
                 yield FrameRecord(
