@@ -131,8 +131,18 @@ class PlankRoadMultiDevice(BaseMethod):
             if sample_ids
             else context.sample_store.get_recent_samples(device_id, self._sample_counts[device_id])
         )
+        filtered_out_sample_ids = [
+            sample.sample_id
+            for sample in samples
+            if not self._is_actual_inference_sample(sample)
+        ]
+        samples = [
+            sample for sample in samples if self._is_actual_inference_sample(sample)
+        ]
         if not samples:
-            raise RuntimeError(f"No real samples available for Plank-road device {device_id}")
+            raise RuntimeError(
+                f"No actual inference samples available for Plank-road device {device_id}"
+            )
         decision = self._pending_decisions.get(device_id)
         if decision is None:
             decision = TrainingDecision(
@@ -149,8 +159,13 @@ class PlankRoadMultiDevice(BaseMethod):
         high_quality_samples = [
             sample for sample in samples if not self._is_low_quality_sample(sample)
         ]
+        uploadable_high_quality_samples = [
+            sample
+            for sample in high_quality_samples
+            if self._is_actual_inference_sample(sample)
+        ]
         high_quality_features_ready = all(
-            sample.feature_tensor_path for sample in high_quality_samples
+            sample.feature_tensor_path for sample in uploadable_high_quality_samples
         )
         use_mixed_upload = (
             self.enable_split_tail_training
@@ -166,10 +181,13 @@ class PlankRoadMultiDevice(BaseMethod):
         upload_mode = "raw+feature" if send_low_quality_features else "raw_only"
         low_quality_sample_ids = [sample.sample_id for sample in low_quality_samples]
         high_quality_sample_ids = [sample.sample_id for sample in high_quality_samples]
+        uploadable_high_quality_sample_ids = [
+            sample.sample_id for sample in uploadable_high_quality_samples
+        ]
         uploaded_feature_sample_ids: list[int] = []
         if use_mixed_upload:
             raw_sample_ids = list(low_quality_sample_ids)
-            uploaded_feature_sample_ids.extend(high_quality_sample_ids)
+            uploaded_feature_sample_ids.extend(uploadable_high_quality_sample_ids)
             if send_low_quality_features:
                 uploaded_feature_sample_ids.extend(
                     sample.sample_id
@@ -187,7 +205,9 @@ class PlankRoadMultiDevice(BaseMethod):
                     "selected_by": "resource_aware_trigger",
                     "high_quality_upload_mode": "feature_only",
                     "low_quality_upload_mode": upload_mode,
+                    "filtered_out_sample_ids": filtered_out_sample_ids,
                     "high_quality_sample_ids": high_quality_sample_ids,
+                    "uploadable_high_quality_sample_ids": uploadable_high_quality_sample_ids,
                     "low_quality_sample_ids": low_quality_sample_ids,
                     "uploaded_feature_sample_ids": uploaded_feature_sample_ids,
                     "trigger_decision": {
@@ -212,7 +232,9 @@ class PlankRoadMultiDevice(BaseMethod):
                     "selected_by": "resource_aware_trigger",
                     "high_quality_upload_mode": "raw_only_legacy",
                     "low_quality_upload_mode": "raw_only",
+                    "filtered_out_sample_ids": filtered_out_sample_ids,
                     "high_quality_sample_ids": high_quality_sample_ids,
+                    "uploadable_high_quality_sample_ids": [],
                     "low_quality_sample_ids": low_quality_sample_ids,
                     "uploaded_feature_sample_ids": [],
                     "trigger_decision": {
@@ -256,6 +278,8 @@ class PlankRoadMultiDevice(BaseMethod):
                 "uploaded_feature_sample_ids": uploaded_feature_sample_ids,
                 "low_quality_sample_ids": low_quality_sample_ids,
                 "high_quality_sample_ids": high_quality_sample_ids,
+                "uploadable_high_quality_sample_ids": uploadable_high_quality_sample_ids,
+                "filtered_out_sample_ids": filtered_out_sample_ids,
             },
             is_real=True,
             is_central=True,
@@ -275,6 +299,8 @@ class PlankRoadMultiDevice(BaseMethod):
                 "uploaded_feature_sample_ids": uploaded_feature_sample_ids,
                 "low_quality_sample_ids": low_quality_sample_ids,
                 "high_quality_sample_ids": high_quality_sample_ids,
+                "uploadable_high_quality_sample_ids": uploadable_high_quality_sample_ids,
+                "filtered_out_sample_ids": filtered_out_sample_ids,
                 "pending_low_quality_count": stats.low_quality_count,
                 "pending_low_quality_rate": stats.low_quality_rate,
                 "pending_uncovered_evidence_rate": stats.uncovered_evidence_rate,
@@ -425,6 +451,9 @@ class PlankRoadMultiDevice(BaseMethod):
         samples = []
         if context is not None and sample_ids:
             samples = context.sample_store.get_selected_samples(sample_ids)
+            samples = [
+                sample for sample in samples if self._is_actual_inference_sample(sample)
+            ]
         if samples:
             total = len(samples)
             low_quality = [sample for sample in samples if self._is_low_quality_sample(sample)]
@@ -573,6 +602,9 @@ class PlankRoadMultiDevice(BaseMethod):
         if sample.metric_map50 is not None:
             return float(sample.metric_map50) < self._metric_trigger_threshold
         return float(sample.confidence) < self._metric_trigger_threshold
+
+    def _is_actual_inference_sample(self, sample: Any) -> bool:
+        return bool(getattr(sample, "actual_inference", True))
 
     def _is_low_quality_result(self, result: InferenceResult) -> bool:
         if result.in_drift_window:

@@ -8,6 +8,7 @@ from baselines.runtime.detection_evaluator import DetectionEvaluator
 from config.experiment import ExperimentConfig
 from tests.baselines_real_helpers import make_frame_dir, make_label_dir
 from tools.baselines_real_common import _configure_method_config, compute_capacity_summary
+from tools.baselines_real_common import compute_summary_with_sla
 
 
 def test_metrics_schema_real(tmp_path: Path):
@@ -133,6 +134,46 @@ def test_capacity_summary_aggregates_repeats_before_selecting_capacity():
     [capacity] = compute_capacity_summary(rows)
 
     assert capacity["max_supported_edges_under_sla"] == 1
+
+
+def test_summary_latency_excludes_filtered_reuse_frames(tmp_path: Path):
+    frame_dir = make_frame_dir(tmp_path, count=1)
+    label_dir = make_label_dir(frame_dir)
+    config = ExperimentConfig(
+        method="plank_road_multi_device",
+        teacher_model=str(label_dir),
+        latency_sla_ms=10.0,
+    )
+
+    summary = compute_summary_with_sla(
+        config=config,
+        method_name="plank_road_multi_device",
+        frame_rows=[
+            {
+                "device_id": 0,
+                "frame_index": 0,
+                "timestamp": 0.0,
+                "metric_f1": 1.0,
+                "metric_map50": 1.0,
+                "inference_latency_ms": 25.0,
+                "actual_inference": True,
+            },
+            {
+                "device_id": 0,
+                "frame_index": 1,
+                "timestamp": 1.0,
+                "metric_f1": 1.0,
+                "metric_map50": 1.0,
+                "inference_latency_ms": 0.0,
+                "actual_inference": False,
+            },
+        ],
+        update_rows=[],
+        metrics_summary={},
+    )
+
+    assert summary["p95_inference_latency_ms"] == 25.0
+    assert summary["sla_satisfied"] is False
 
 
 def test_plank_road_variant_overrides_can_come_from_config(tmp_path: Path):

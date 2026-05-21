@@ -23,6 +23,9 @@ class PlankRoadMultiDeviceConfig:
     allow_resource_aware_feature_upload: bool = True
     collect_num: int = 20
     f1_trigger_threshold: float = 0.55
+    enable_frame_filter: bool = True
+    filter_feature: str = "edge"
+    filter_diff_threshold: float = 0.0004
     enable_feature_cache: bool = True
     enable_split_tail_training: bool = True
     enable_resource_aware_trigger: bool = True

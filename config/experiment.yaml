@@ -35,6 +35,9 @@ baselines:
     allow_resource_aware_feature_upload: true
     collect_num: 20
     f1_trigger_threshold: 0.55
+    enable_frame_filter: true
+    filter_feature: edge
+    filter_diff_threshold: 0.0004
     enable_feature_cache: true
     enable_split_tail_training: true
     enable_resource_aware_trigger: true

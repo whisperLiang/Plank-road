@@ -23,6 +23,7 @@ class SampleRecord:
     teacher_latency_sec: float = 0.0
     in_drift_window: bool = False
     feature_tensor_path: str | None = None
+    actual_inference: bool = True
     upload_mode: str = "raw_only"
     selected_by: str = ""
 
@@ -53,6 +54,7 @@ class SampleStore:
         teacher_latency_sec: float = 0.0,
         in_drift_window: bool = False,
         feature_tensor_path: str | None = None,
+        actual_inference: bool = True,
         upload_mode: str = "raw_only",
         selected_by: str = "",
     ) -> SampleRecord:
@@ -75,6 +77,7 @@ class SampleStore:
             teacher_latency_sec=float(teacher_latency_sec),
             in_drift_window=bool(in_drift_window),
             feature_tensor_path=str(feature_tensor_path) if feature_tensor_path else None,
+            actual_inference=bool(actual_inference),
             upload_mode=str(upload_mode),
             selected_by=str(selected_by),
         )

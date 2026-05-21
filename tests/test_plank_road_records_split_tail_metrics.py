@@ -111,6 +111,58 @@ def test_plank_road_raw_only_uploads_high_features_and_low_raw(tmp_path: Path):
     assert plan.update_config["high_quality_sample_ids"] == [high.sample_id]
 
 
+def test_plank_road_uploads_only_actual_inference_high_features(tmp_path: Path):
+    frame_dir = make_frame_dir(tmp_path, count=3)
+    config = make_config("plank_road_multi_device", total_frames=3)
+    config.plank_road_multi_device.collect_num = 3
+    context = build_context(
+        tmp_path,
+        method_name="plank_road_multi_device",
+        cache_features=True,
+    )
+    results = populate_context(context, frame_dir, count=3)
+    samples = context.sample_store.get_device_samples(0)
+    actual_high, filtered_high, low = samples
+
+    for sample, result in zip(samples, results):
+        sample.metric_f1 = 0.9
+        sample.metric_map50 = 0.9
+        sample.confidence = 0.9
+        result.metric_f1 = 0.9
+        result.metric_map50 = 0.9
+        result.confidence = 0.9
+    filtered_high.actual_inference = False
+    low.metric_f1 = 0.1
+    low.metric_map50 = 0.1
+    low.confidence = 0.1
+    results[2].metric_f1 = 0.1
+    results[2].metric_map50 = 0.1
+    results[2].confidence = 0.1
+
+    method = PlankRoadMultiDevice(config, num_devices=1)
+    method.set_context(context)
+    for result in results:
+        method.on_inference_result(result)
+    method._pending_stats[0] = method._build_pending_stats(0)
+    method._pending_decisions[0] = TrainingDecision(
+        train_now=True,
+        send_low_conf_features=False,
+        urgency=1.0,
+        compute_pressure=0.0,
+        bandwidth_pressure=0.0,
+        bandwidth_mbps=50.0,
+        reason="forced test decision",
+    )
+
+    plan = method.build_update_plan(0)
+
+    assert plan.sample_ids == [actual_high.sample_id, low.sample_id]
+    assert plan.update_config["filtered_out_sample_ids"] == [filtered_high.sample_id]
+    assert plan.update_config["uploaded_feature_sample_ids"] == [actual_high.sample_id]
+    assert plan.update_config["high_quality_sample_ids"] == [actual_high.sample_id]
+    assert plan.metadata["feature_bytes"] == Path(actual_high.feature_tensor_path).stat().st_size
+
+
 def test_plank_road_raw_feature_upload_adds_low_features(tmp_path: Path):
     _method, _context, plan, samples = _build_mixed_upload_plan(
         tmp_path,

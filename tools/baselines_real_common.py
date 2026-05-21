@@ -6,10 +6,11 @@ import csv
 import json
 import random
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
+import cv2
 import numpy as np
 import torch
 
@@ -31,11 +32,13 @@ from baselines.runtime.real_context import RealBaselineContext
 from baselines.runtime.real_trainer import RealTrainer
 from baselines.runtime.resource_meter import BandwidthEmulator, CloudTrainQueue
 from baselines.runtime.sample_store import SampleStore
-from baselines.runtime.student_inferencer import StudentInferencer
+from baselines.runtime.student_inferencer import StudentInferenceOutput, StudentInferencer
 from baselines.runtime.teacher_annotator import TeacherAnnotator
 from baselines.runtime.upload_meter import UploadMeter
 from baselines.runtime.video_stream import build_streams
 from config.experiment import ExperimentConfig
+from difference.diff import DiffProcessor
+from edge.box_motion import compensate_boxes_between_frames
 
 
 PER_FRAME_FIELDNAMES = [
@@ -58,6 +61,7 @@ PER_FRAME_FIELDNAMES = [
     "metric_map50",
     "num_detections",
     "inference_latency_ms",
+    "actual_inference",
     "teacher_label_time_sec",
     "teacher_from_cache",
     "bandwidth_mbps",
@@ -161,6 +165,115 @@ TRAINING_BREAKDOWN_FIELDNAMES = [
 ]
 
 
+@dataclass
+class _FrameFilterDecision:
+    should_infer: bool
+    frame: np.ndarray
+
+
+class _PlankRoadFrameFilterState:
+    """Mirror the edge diff gate for Plank-road baseline accounting."""
+
+    def __init__(self, *, feature: str, diff_threshold: float, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.diff_threshold = float(diff_threshold)
+        self.processor = DiffProcessor.str_to_class(str(feature))() if self.enabled else None
+        self.previous_feature: Any | None = None
+        self.accumulated_diff = 0.0
+        self.latest_output: StudentInferenceOutput | None = None
+        self.latest_frame: np.ndarray | None = None
+
+    def decide(self, frame_path: str | Path) -> _FrameFilterDecision:
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            raise FileNotFoundError(f"Unable to read frame image: {frame_path}")
+        if not self.enabled or self.processor is None:
+            return _FrameFilterDecision(should_infer=True, frame=frame)
+
+        feature = self.processor.get_frame_feature(frame)
+        if self.previous_feature is None:
+            self.previous_feature = feature
+            return _FrameFilterDecision(should_infer=True, frame=frame)
+
+        self.accumulated_diff += float(
+            self.processor.cal_frame_diff(feature, self.previous_feature)
+        )
+        self.previous_feature = feature
+        if self.accumulated_diff >= self.diff_threshold:
+            self.accumulated_diff = 0.0
+            return _FrameFilterDecision(should_infer=True, frame=frame)
+        return _FrameFilterDecision(should_infer=False, frame=frame)
+
+    def remember(self, output: StudentInferenceOutput, frame: np.ndarray) -> None:
+        self.latest_output = output
+        self.latest_frame = frame.copy()
+
+
+def _load_detection_json(path: str | Path) -> list[dict[str, Any]]:
+    with Path(path).open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return list(payload or []) if isinstance(payload, list) else []
+
+
+def _write_reused_prediction(
+    inferencer: StudentInferencer,
+    *,
+    device_id: int,
+    frame_index: int,
+    cached_output: StudentInferenceOutput,
+    cached_frame: np.ndarray | None,
+    current_frame: np.ndarray,
+) -> StudentInferenceOutput:
+    detections = _load_detection_json(cached_output.prediction_path)
+    boxes = [list(item.get("bbox") or []) for item in detections]
+    labels = [int(item.get("class_id", 0)) for item in detections]
+    scores = [float(item.get("score", 0.0)) for item in detections]
+
+    if boxes and cached_frame is not None:
+        compensated_boxes, keep_indices = compensate_boxes_between_frames(
+            boxes,
+            cached_frame,
+            current_frame,
+        )
+        kept = [
+            (box, labels[index], scores[index])
+            for box, index in zip(compensated_boxes, keep_indices)
+            if index < len(labels) and index < len(scores)
+        ]
+        boxes = [item[0] for item in kept]
+        labels = [item[1] for item in kept]
+        scores = [item[2] for item in kept]
+    elif boxes:
+        boxes = []
+        labels = []
+        scores = []
+
+    reused = [
+        {
+            "bbox": [float(value) for value in box],
+            "score": float(score),
+            "class_id": int(label),
+        }
+        for box, label, score in zip(boxes, labels, scores)
+    ]
+    pred_path = inferencer.prediction_dir / f"edge_{int(device_id)}" / f"{int(frame_index):08d}.json"
+    pred_path.parent.mkdir(parents=True, exist_ok=True)
+    with pred_path.open("w", encoding="utf-8") as f:
+        json.dump(reused, f)
+    confidence = (
+        sum(float(item["score"]) for item in reused) / len(reused)
+        if reused
+        else 0.0
+    )
+    return StudentInferenceOutput(
+        prediction_path=str(pred_path),
+        confidence=confidence,
+        latency_ms=0.0,
+        num_detections=len(reused),
+        feature_tensor_path=None,
+    )
+
+
 def set_seed(seed: int = 2026) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -216,6 +329,13 @@ def _truthy(value: Any) -> bool:
     return str(value).lower() in {"true", "1", "yes"}
 
 
+def _is_actual_inference_row(row: dict[str, Any]) -> bool:
+    value = row.get("actual_inference")
+    if value in ("", None):
+        return True
+    return _truthy(value)
+
+
 def _time_weighted(rows: list[dict[str, Any]], metric: str) -> float:
     values: list[float] = []
     weights: list[float] = []
@@ -268,6 +388,7 @@ def compute_summary_with_sla(
         float(row["inference_latency_ms"])
         for row in frame_rows
         if row.get("inference_latency_ms") not in ("", None)
+        and _is_actual_inference_row(row)
     ]
     queue_waits = [
         float(row.get("queue_wait_sec", row.get("queue_wait_time_sec", 0)) or 0)
@@ -474,6 +595,21 @@ def run_one_method(
     if max_frames == 0:
         raise RuntimeError("No frames were produced by the real video stream")
 
+    plank_filter_states: dict[int, _PlankRoadFrameFilterState] = {}
+
+    def _plank_filter_state(device_id: int) -> _PlankRoadFrameFilterState:
+        cfg = method_config.plank_road_multi_device
+        if int(device_id) not in plank_filter_states:
+            plank_filter_states[int(device_id)] = _PlankRoadFrameFilterState(
+                feature=str(getattr(cfg, "filter_feature", "edge")),
+                diff_threshold=float(getattr(cfg, "filter_diff_threshold", 0.0004)),
+                enabled=(
+                    method_name == "plank_road_multi_device"
+                    and bool(getattr(cfg, "enable_frame_filter", True))
+                ),
+            )
+        return plank_filter_states[int(device_id)]
+
     for frame_pos in range(max_frames):
         pending_plans = []
         for frames in edge_frames:
@@ -483,32 +619,64 @@ def run_one_method(
             advance_stream_time = getattr(method, "advance_stream_time", None)
             if callable(advance_stream_time):
                 advance_stream_time(frame.device_id, frame.timestamp)
-            student = context.get_student_inferencer(frame.device_id).infer(
-                frame.frame_path,
-                device_id=frame.device_id,
-                frame_index=frame.frame_index,
-            )
+            inferencer = context.get_student_inferencer(frame.device_id)
+            actual_inference = True
+            filter_decision = None
+            if method_name == "plank_road_multi_device":
+                filter_state = _plank_filter_state(frame.device_id)
+                filter_decision = filter_state.decide(frame.frame_path)
+                actual_inference = (
+                    bool(filter_decision.should_infer)
+                    or filter_state.latest_output is None
+                )
+            if actual_inference:
+                student = inferencer.infer(
+                    frame.frame_path,
+                    device_id=frame.device_id,
+                    frame_index=frame.frame_index,
+                )
+                if method_name == "plank_road_multi_device":
+                    assert filter_decision is not None
+                    _plank_filter_state(frame.device_id).remember(
+                        student,
+                        filter_decision.frame,
+                    )
+            else:
+                assert filter_decision is not None
+                filter_state = _plank_filter_state(frame.device_id)
+                assert filter_state.latest_output is not None
+                student = _write_reused_prediction(
+                    inferencer,
+                    device_id=frame.device_id,
+                    frame_index=frame.frame_index,
+                    cached_output=filter_state.latest_output,
+                    cached_frame=filter_state.latest_frame,
+                    current_frame=filter_decision.frame,
+                )
             teacher_label = context.teacher_annotator.annotate(frame.frame_path)
             metrics = context.evaluator.evaluate_files(student.prediction_path, teacher_label.label_path)
             f1_drift = method_config.f1_threshold is not None and metrics.f1 < float(method_config.f1_threshold)
             map_drift = method_config.map50_threshold is not None and metrics.map50 < float(method_config.map50_threshold)
             in_drift = bool(f1_drift or map_drift)
-            sample = context.sample_store.add_frame_record(
-                device_id=frame.device_id,
-                window_id=frame.window_id,
-                frame_index=frame.frame_index,
-                timestamp=frame.timestamp,
-                frame_path=frame.frame_path,
-                prediction_path=student.prediction_path,
-                label_path=teacher_label.label_path,
-                confidence=student.confidence,
-                metric_f1=metrics.f1,
-                metric_map50=metrics.map50,
-                latency_ms=student.latency_ms,
-                teacher_latency_sec=teacher_label.latency_sec,
-                in_drift_window=in_drift,
-                feature_tensor_path=student.feature_tensor_path,
-            )
+            sample = None
+            if actual_inference:
+                sample = context.sample_store.add_frame_record(
+                    device_id=frame.device_id,
+                    window_id=frame.window_id,
+                    frame_index=frame.frame_index,
+                    timestamp=frame.timestamp,
+                    frame_path=frame.frame_path,
+                    prediction_path=student.prediction_path,
+                    label_path=teacher_label.label_path,
+                    confidence=student.confidence,
+                    metric_f1=metrics.f1,
+                    metric_map50=metrics.map50,
+                    latency_ms=student.latency_ms,
+                    teacher_latency_sec=teacher_label.latency_sec,
+                    in_drift_window=in_drift,
+                    feature_tensor_path=student.feature_tensor_path,
+                    actual_inference=True,
+                )
             result = InferenceResult(
                 device_id=frame.device_id,
                 frame_index=frame.frame_index,
@@ -524,7 +692,8 @@ def run_one_method(
                 num_detections=student.num_detections,
                 is_real=True,
             )
-            method.on_inference_result(result)
+            if actual_inference:
+                method.on_inference_result(result)
             context.record_frame_metric(
                 {
                     "method_name": method_name,
@@ -532,7 +701,7 @@ def run_one_method(
                     "window_id": frame.window_id,
                     "frame_index": frame.frame_index,
                     "timestamp": frame.timestamp,
-                    "sample_id": sample.sample_id,
+                    "sample_id": sample.sample_id if sample is not None else "",
                     "frame_path": frame.frame_path,
                     "prediction_path": student.prediction_path,
                     "label_path": teacher_label.label_path,
@@ -541,12 +710,13 @@ def run_one_method(
                     "metric_map50": metrics.map50,
                     "num_detections": student.num_detections,
                     "inference_latency_ms": student.latency_ms,
+                    "actual_inference": actual_inference,
                     "teacher_label_time_sec": teacher_label.latency_sec,
                     "teacher_from_cache": teacher_label.from_cache,
                     "is_real": True,
                 }
             )
-            if method.should_trigger(frame.device_id):
+            if actual_inference and method.should_trigger(frame.device_id):
                 plan = method.build_update_plan(frame.device_id)
                 plan.metadata["arrival_time_sec"] = float(frame.timestamp)
                 pending_plans.append(plan)
