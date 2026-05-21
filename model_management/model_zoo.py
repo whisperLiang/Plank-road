@@ -48,6 +48,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager
 import hashlib
+import re
 import sys
 import types
 from pathlib import Path
@@ -179,7 +180,8 @@ class YOLODetectionModel(nn.Module):
         self.confidence = confidence
         self._device = device
         self.num_classes = num_classes
-        # If COCO 80-class, use the mapping; otherwise identity
+        self.label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
+        # If COCO 80-class, use the mapping; otherwise use native class IDs.
         self._map_labels = num_classes >= 91
 
     def forward(
@@ -231,7 +233,7 @@ class YOLODetectionModel(nn.Module):
                     dtype=torch.int64,
                 )
             else:
-                labels = cls_ids + 1
+                labels = cls_ids
 
             detections.append({
                 "boxes": boxes_xyxy,
@@ -410,6 +412,7 @@ class RFDETRDetectionModel(nn.Module):
         self._device = torch.device(device)
         self.num_classes = num_classes
         self.internal_num_classes = max(int(num_classes) - 1, 1)
+        self.label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
 
         kwargs = {
             "device": str(self._device),
@@ -472,6 +475,7 @@ class RFDETRDetectionModel(nn.Module):
             target_sizes=target_sizes,
             threshold=float(self.confidence),
             num_classes=self.num_classes,
+            label_schema=getattr(self, "label_schema", "coco_91"),
             num_select=getattr(self.rfdetr.model.postprocess, "num_select", predictions["pred_logits"].shape[1]),
             device=self._device,
         )
@@ -549,6 +553,7 @@ class RTDETRDetectionModel(nn.Module):
         self.confidence = confidence
         self._device = device
         self.num_classes = num_classes
+        self.label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
         self._map_labels = num_classes >= 91
 
     def forward(
@@ -589,7 +594,7 @@ class RTDETRDetectionModel(nn.Module):
                     dtype=torch.int64,
                 )
             else:
-                labels = cls_ids + 1
+                labels = cls_ids
 
             detections.append({
                 "boxes": boxes_xyxy,
@@ -711,6 +716,7 @@ _TINYNEXT_REPO_MODELS: Dict[str, str] = {
     "tinynext_s": "ssdlite_tinynext_s_coco.pth",
     "tinynext_m": "ssdlite_tinynext_m_coco.pth",
 }
+_TINYNEXT_ANCHORS_PER_LOCATION = 6
 
 _MODELS_DIR = Path(__file__).resolve().parent / "models"
 
@@ -1023,6 +1029,28 @@ def _looks_like_tinynext_internal_detector_state_dict(state_dict: dict[str, torc
     )
 
 
+def infer_tinynext_state_dict_num_classes(state_dict: object) -> int | None:
+    if not isinstance(state_dict, Mapping):
+        return None
+    class_counts: list[int] = []
+    classifier_pattern = re.compile(
+        r"(?:^bbox_head\.cls_convs\.\d+\.1|^head\.classification_head\.module_list\.\d+\.1)\.(?:weight|bias)$"
+    )
+    for key, value in state_dict.items():
+        if not isinstance(key, str) or not torch.is_tensor(value) or value.ndim < 1:
+            continue
+        if not classifier_pattern.search(key):
+            continue
+        out_channels = int(value.shape[0])
+        if out_channels > 0 and out_channels % _TINYNEXT_ANCHORS_PER_LOCATION == 0:
+            class_counts.append(out_channels // _TINYNEXT_ANCHORS_PER_LOCATION)
+
+    unique_counts = set(class_counts)
+    if len(unique_counts) != 1:
+        return None
+    return unique_counts.pop()
+
+
 def _tinynext_checkpoint_has_detector_weights(path: str | Path) -> bool:
     checkpoint = _load_tinynext_checkpoint(path, device="cpu")
     state_dict = _extract_tinynext_checkpoint_state_dict(checkpoint)
@@ -1036,14 +1064,10 @@ def _convert_tinynext_classifier_tensor(
     tensor: torch.Tensor,
     *,
     target_num_classes: int,
+    source_num_classes: int = 81,
+    label_schema: str = "coco_91",
 ) -> torch.Tensor:
-    """Map TinyNeXt MMDetection SSD logits to torchvision's 91-class layout.
-
-    The upstream checkpoint stores 80 foreground classes followed by a final
-    background channel. Torchvision SSD expects background at index 0 and COCO
-    foreground labels laid out on the original 1..90 category IDs.
-    """
-    source_num_classes = 81
+    """Map TinyNeXt MMDetection SSD logits to torchvision's SSD label layout."""
     source_background_index = source_num_classes - 1
     if tensor.shape[0] % source_num_classes != 0:
         raise RuntimeError(
@@ -1063,7 +1087,10 @@ def _convert_tinynext_classifier_tensor(
             converted[dest_start + dest_class] = background_value
         converted[dest_start] = background_value
         for source_class in range(source_background_index):
-            mapped_label = COCO_80_TO_91[source_class]
+            if str(label_schema or "coco_91").strip().lower() == "zero_based":
+                mapped_label = source_class + 1
+            else:
+                mapped_label = COCO_80_TO_91[source_class]
             if mapped_label >= target_num_classes:
                 continue
             converted[dest_start + mapped_label] = tensor[source_start + source_class]
@@ -1129,6 +1156,8 @@ def _convert_tinynext_official_detector_state_dict(
     state_dict: dict[str, torch.Tensor],
     *,
     target_num_classes: int,
+    source_num_classes: int = 81,
+    label_schema: str = "coco_91",
 ) -> dict[str, torch.Tensor]:
     converted: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
@@ -1146,31 +1175,267 @@ def _convert_tinynext_official_detector_state_dict(
                 converted_value = _convert_tinynext_classifier_tensor(
                     value,
                     target_num_classes=target_num_classes,
+                    source_num_classes=source_num_classes,
+                    label_schema=label_schema,
                 )
         if new_key is not None:
             converted[new_key] = converted_value
     return converted
 
 
+def _remap_tinynext_public_detections(model: nn.Module, detections: object) -> object:
+    if str(getattr(model, "label_schema", "coco_91")).strip().lower() != "zero_based":
+        return detections
+    if not isinstance(detections, (list, tuple)):
+        return detections
+
+    remapped: list[object] = []
+    changed = False
+    for detection in detections:
+        if not isinstance(detection, Mapping):
+            remapped.append(detection)
+            continue
+        labels = detection.get("labels")
+        if not torch.is_tensor(labels):
+            remapped.append(detection)
+            continue
+        copied = dict(detection)
+        copied["labels"] = (labels.to(dtype=torch.int64) - 1).clamp_min(0)
+        remapped.append(copied)
+        changed = True
+    if not changed:
+        return detections
+    return tuple(remapped) if isinstance(detections, tuple) else remapped
+
+
+def _tinynext_forward_label_hook(module: nn.Module, _inputs: object, output: object) -> object:
+    return _remap_tinynext_public_detections(module, output)
+
+
+def _configure_tinynext_label_schema(model: nn.Module, *, num_classes: int) -> None:
+    setattr(model, "num_classes", int(num_classes))
+    setattr(model, "label_schema", "coco_91" if int(num_classes) >= 91 else "zero_based")
+    if hasattr(model, "register_forward_hook") and not bool(getattr(model, "_plank_public_label_hook_registered", False)):
+        model.register_forward_hook(_tinynext_forward_label_hook)
+        setattr(model, "_plank_public_label_hook_registered", True)
+
+
 def _load_rfdetr_checkpoint(artifact_path: Path, *, device: str | torch.device = "cpu") -> object:
     return torch.load(artifact_path, map_location=device, weights_only=False)
 
 
+def _load_ultralytics_checkpoint(artifact_path: Path, *, device: str | torch.device = "cpu") -> object:
+    return torch.load(artifact_path, map_location=device, weights_only=False)
+
+
+def _extract_ultralytics_checkpoint_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
+    if isinstance(checkpoint, Mapping):
+        for key in ("model", "ema", "state_dict"):
+            nested = checkpoint.get(key)
+            if hasattr(nested, "state_dict"):
+                return {
+                    str(state_key): value
+                    for state_key, value in nested.state_dict().items()
+                    if isinstance(state_key, str) and torch.is_tensor(value)
+                }
+            if isinstance(nested, Mapping):
+                return {
+                    str(state_key): value
+                    for state_key, value in nested.items()
+                    if isinstance(state_key, str) and torch.is_tensor(value)
+                }
+        if any(torch.is_tensor(value) for value in checkpoint.values()):
+            return {
+                str(state_key): value
+                for state_key, value in checkpoint.items()
+                if isinstance(state_key, str) and torch.is_tensor(value)
+            }
+    return {}
+
+
+def infer_ultralytics_state_dict_num_classes(state_dict: object) -> int | None:
+    if not isinstance(state_dict, Mapping):
+        return None
+
+    class_counts: list[int] = []
+    yolo_head_pattern = re.compile(r"(?:^|\.)(?:one2one_)?cv3\.\d+\.2\.(?:weight|bias)$")
+    rtdetr_head_pattern = re.compile(
+        r"(?:^|\.)(?:denoising_class_embed|enc_score_head|dec_score_head\.\d+)\.(?:weight|bias)$"
+    )
+    for key, value in state_dict.items():
+        if not isinstance(key, str) or not torch.is_tensor(value) or value.ndim < 1:
+            continue
+        if yolo_head_pattern.search(key) or rtdetr_head_pattern.search(key):
+            count = int(value.shape[0])
+            if count > 0:
+                class_counts.append(count)
+
+    unique_counts = set(class_counts)
+    if len(unique_counts) != 1:
+        return None
+    return unique_counts.pop()
+
+
+def _infer_ultralytics_checkpoint_num_classes(checkpoint: object) -> int | None:
+    if isinstance(checkpoint, Mapping):
+        for key in ("model", "ema"):
+            model_obj = checkpoint.get(key)
+            if model_obj is None:
+                continue
+            try:
+                model_nc = int(getattr(model_obj, "nc"))
+            except (AttributeError, TypeError, ValueError):
+                model_nc = 0
+            if model_nc > 0:
+                return model_nc
+
+            names = getattr(model_obj, "names", None)
+            if isinstance(names, Mapping) and len(names) > 0:
+                return len(names)
+            if isinstance(names, (list, tuple)) and names:
+                return len(names)
+
+    state_count = infer_ultralytics_state_dict_num_classes(
+        _extract_ultralytics_checkpoint_state_dict(checkpoint)
+    )
+    if state_count is not None:
+        return state_count
+    return None
+
+
+def _maybe_infer_ultralytics_num_classes(
+    artifact_path: Path | None,
+    *,
+    device: str | torch.device,
+    model_label: str,
+    current_num_classes: int,
+) -> int:
+    if artifact_path is None or not artifact_path.is_file():
+        return int(current_num_classes)
+    try:
+        inferred_class_count = _infer_ultralytics_checkpoint_num_classes(
+            _load_ultralytics_checkpoint(artifact_path, device=device)
+        )
+    except Exception as exc:
+        logger.warning(
+            "[ModelZoo] Failed to inspect {} weights at {}: {}",
+            model_label,
+            artifact_path,
+            exc,
+        )
+        return int(current_num_classes)
+    if inferred_class_count is None or inferred_class_count == 80:
+        return int(current_num_classes)
+    logger.info(
+        "[ModelZoo] Inferred {} {} class(es) from weights at {}; using native zero-based labels.",
+        inferred_class_count,
+        model_label,
+        artifact_path,
+    )
+    return int(inferred_class_count)
+
+
+def _normalise_rfdetr_state_dict_keys(
+    state_dict: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    if not isinstance(state_dict, Mapping):
+        return {}
+    tensor_items = {
+        str(key): value
+        for key, value in state_dict.items()
+        if isinstance(key, str) and torch.is_tensor(value)
+    }
+    if not tensor_items:
+        return {}
+
+    model_prefix = "model."
+    prefixed_count = sum(1 for key in tensor_items if key.startswith(model_prefix))
+    if prefixed_count and prefixed_count == len(tensor_items):
+        return {
+            key[len(model_prefix):]: value
+            for key, value in tensor_items.items()
+        }
+    return dict(tensor_items)
+
+
 def _extract_rfdetr_checkpoint_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
     if isinstance(checkpoint, dict):
-        nested_state = checkpoint.get("state_dict")
-        if isinstance(nested_state, dict):
-            return nested_state
-
         nested_model = checkpoint.get("model")
         if isinstance(nested_model, dict):
-            return nested_model
+            model_state = _normalise_rfdetr_state_dict_keys(nested_model)
+            if model_state:
+                return model_state
+
+        nested_state = checkpoint.get("state_dict")
+        if isinstance(nested_state, dict):
+            state = _normalise_rfdetr_state_dict_keys(nested_state)
+            if state:
+                return state
 
         if checkpoint and all(isinstance(key, str) for key in checkpoint.keys()):
-            if any(torch.is_tensor(value) for value in checkpoint.values()):
-                return checkpoint
+            state = _normalise_rfdetr_state_dict_keys(checkpoint)
+            if state:
+                return state
 
     raise ValueError("RF-DETR checkpoint does not contain a readable model state_dict.")
+
+
+def _rfdetr_checkpoint_class_count(state_dict: Mapping[str, torch.Tensor]) -> int | None:
+    for key in ("class_embed.bias", "class_embed.weight"):
+        value = state_dict.get(key)
+        if torch.is_tensor(value) and value.ndim >= 1:
+            return int(value.shape[0])
+    return None
+
+
+def infer_rfdetr_state_dict_num_classes(state_dict: object) -> int | None:
+    if not isinstance(state_dict, Mapping):
+        return None
+    return _rfdetr_checkpoint_class_count(_normalise_rfdetr_state_dict_keys(state_dict))
+
+
+def _validate_rfdetr_artifact_checkpoint(
+    artifact_path: Path,
+    checkpoint: object,
+    *,
+    expected_class_count: int = 91,
+) -> dict[str, torch.Tensor]:
+    state = _extract_rfdetr_checkpoint_state_dict(checkpoint)
+    class_count = _rfdetr_checkpoint_class_count(state)
+    if class_count is not None and class_count != int(expected_class_count):
+        raise ValueError(
+            "RF-DETR checkpoint class head has "
+            f"{class_count} logits, expected {expected_class_count} for {artifact_path.name}"
+        )
+    return state
+
+
+def _validate_rfdetr_state_dict_matches_model(
+    model: nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    artifact_path: Path,
+) -> None:
+    rfdetr = getattr(model, "rfdetr", None)
+    model_context = getattr(rfdetr, "model", None)
+    inner_model = getattr(model_context, "model", None)
+    if inner_model is None or not hasattr(inner_model, "state_dict"):
+        return
+
+    wrapper_keys = {
+        _DETECTION_THRESHOLD_LOW_BUFFER,
+        _DETECTION_THRESHOLD_HIGH_BUFFER,
+        _RFDETR_CACHE_VERSION_BUFFER,
+    }
+    incoming_keys = set(state_dict) - wrapper_keys
+    model_keys = set(inner_model.state_dict().keys())
+    if incoming_keys and not (incoming_keys & model_keys):
+        raise RuntimeError(
+            "RF-DETR weights did not match the model architecture: "
+            f"{artifact_path} has {len(incoming_keys)} tensor key(s), "
+            "but none match the inner RF-DETR model. "
+            "The checkpoint may use an unsupported key prefix or belong to a different model."
+        )
 
 
 def _ensure_rfdetr_artifact(name: str) -> Path:
@@ -1192,7 +1457,10 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
         if _matches_md5(artifact_path, asset.md5_hash):
             return artifact_path
         try:
-            _extract_rfdetr_checkpoint_state_dict(_load_rfdetr_checkpoint(artifact_path))
+            _validate_rfdetr_artifact_checkpoint(
+                artifact_path,
+                _load_rfdetr_checkpoint(artifact_path),
+            )
             logger.info(
                 "Reusing readable RF-DETR weights at {} despite MD5 mismatch.",
                 artifact_path,
@@ -1270,7 +1538,8 @@ def build_detection_model(
         torchvision detection output format.
     """
     name_lower = _normalise_model_name(name)
-    artifact_path = Path(weights_path) if weights_path is not None else None
+    explicit_weights_path = weights_path is not None
+    artifact_path = Path(weights_path) if explicit_weights_path else None
     if artifact_path is not None and not artifact_path.exists():
         raise FileNotFoundError(f"Weights path does not exist: {artifact_path}")
 
@@ -1305,6 +1574,12 @@ def build_detection_model(
     if name_lower in _YOLO_MODELS:
         if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
+        num_classes = _maybe_infer_ultralytics_num_classes(
+            artifact_path,
+            device=device,
+            model_label="YOLO",
+            current_num_classes=num_classes,
+        )
         model_source = str(artifact_path) if artifact_path is not None else f"{name_lower}.yaml"
         model = YOLODetectionModel(
             model_name=model_source,
@@ -1336,6 +1611,26 @@ def build_detection_model(
         if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
         should_load_local_weights = artifact_path is not None and artifact_path.is_file()
+        rfdetr_checkpoint = None
+        rfdetr_state = None
+        if should_load_local_weights:
+            rfdetr_checkpoint = _load_rfdetr_checkpoint(artifact_path, device=device)
+            rfdetr_state = _extract_rfdetr_checkpoint_state_dict(rfdetr_checkpoint)
+            inferred_class_count = _rfdetr_checkpoint_class_count(rfdetr_state)
+            if (
+                explicit_weights_path
+                and inferred_class_count is not None
+                and inferred_class_count != int(num_classes)
+            ):
+                logger.info(
+                    "[ModelZoo] Inferred {} RF-DETR logits from custom weights at {}; "
+                    "building {} with {} foreground class(es).",
+                    inferred_class_count,
+                    artifact_path,
+                    name,
+                    max(1, inferred_class_count - 1),
+                )
+                num_classes = inferred_class_count
         model = RFDETRDetectionModel(
             model_name=name_lower,
             confidence=confidence,
@@ -1345,8 +1640,17 @@ def build_detection_model(
             **kwargs,
         )
         if should_load_local_weights:
-            state = _extract_rfdetr_checkpoint_state_dict(
-                _load_rfdetr_checkpoint(artifact_path, device=device)
+            state = rfdetr_state
+            if state is None:
+                state = _extract_rfdetr_checkpoint_state_dict(
+                    rfdetr_checkpoint
+                    if rfdetr_checkpoint is not None
+                    else _load_rfdetr_checkpoint(artifact_path, device=device)
+                )
+            _validate_rfdetr_state_dict_matches_model(
+                model,
+                state,
+                artifact_path=artifact_path,
             )
             model.load_state_dict(state, strict=False)
             logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
@@ -1356,6 +1660,8 @@ def build_detection_model(
     if name_lower in _TINYNEXT_MODELS:
         checkpoint_state_dict: dict[str, torch.Tensor] | None = None
         backbone_weights_path = None
+        tinynext_source_num_classes = 81
+        tinynext_label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
         tinynext_input_size = int(
             kwargs.pop("tinynext_input_size", kwargs.pop("image_size", 320))
         )
@@ -1364,10 +1670,31 @@ def build_detection_model(
         if artifact_path is not None and artifact_path.is_file():
             checkpoint = _load_tinynext_checkpoint(artifact_path, device="cpu")
             checkpoint_state_dict = _extract_tinynext_checkpoint_state_dict(checkpoint)
-            if not (
-                _looks_like_tinynext_official_detector_state_dict(checkpoint_state_dict)
-                or _looks_like_tinynext_internal_detector_state_dict(checkpoint_state_dict)
-            ):
+            is_official_tinynext = _looks_like_tinynext_official_detector_state_dict(checkpoint_state_dict)
+            is_internal_tinynext = _looks_like_tinynext_internal_detector_state_dict(checkpoint_state_dict)
+            inferred_class_count = infer_tinynext_state_dict_num_classes(checkpoint_state_dict)
+            if is_official_tinynext:
+                if inferred_class_count is not None and inferred_class_count != 81:
+                    num_classes = inferred_class_count
+                    tinynext_source_num_classes = inferred_class_count
+                    tinynext_label_schema = "zero_based"
+                    logger.info(
+                        "[ModelZoo] Inferred {} TinyNeXt MMDetection class logits from custom weights at {}; "
+                        "building native zero-based TinyNeXt detector.",
+                        inferred_class_count,
+                        artifact_path,
+                    )
+            elif is_internal_tinynext:
+                if inferred_class_count is not None and inferred_class_count != int(num_classes):
+                    num_classes = inferred_class_count
+                    logger.info(
+                        "[ModelZoo] Inferred {} TinyNeXt SSD class logits from weights at {}; "
+                        "building matching detector head.",
+                        inferred_class_count,
+                        artifact_path,
+                    )
+                tinynext_label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
+            else:
                 backbone_weights_path = str(artifact_path)
         model = build_tinynext_detector(
             name_lower,
@@ -1376,12 +1703,15 @@ def build_detection_model(
             backbone_weights_path=backbone_weights_path,
             image_size=tinynext_input_size,
         )
+        _configure_tinynext_label_schema(model, num_classes=num_classes)
         ensure_detection_threshold_state(model, name_lower)
         if checkpoint_state_dict is not None and backbone_weights_path is None:
             if _looks_like_tinynext_official_detector_state_dict(checkpoint_state_dict):
                 checkpoint_state_dict = _convert_tinynext_official_detector_state_dict(
                     checkpoint_state_dict,
                     target_num_classes=num_classes,
+                    source_num_classes=tinynext_source_num_classes,
+                    label_schema=tinynext_label_schema,
                 )
             model.load_state_dict(checkpoint_state_dict, strict=False)
             logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
@@ -1392,7 +1722,13 @@ def build_detection_model(
     if name_lower in _RTDETR_MODELS:
         if artifact_path is None:
             artifact_path = ensure_local_model_artifact(name_lower)
-        pt_name = str(artifact_path)
+        num_classes = _maybe_infer_ultralytics_num_classes(
+            artifact_path,
+            device=device,
+            model_label="RT-DETR",
+            current_num_classes=num_classes,
+        )
+        pt_name = str(artifact_path) if artifact_path is not None else _RTDETR_MODELS[name_lower]
         model = RTDETRDetectionModel(
             model_name=pt_name,
             confidence=confidence,
@@ -1592,16 +1928,10 @@ def _postprocess_rfdetr_predictions(
     threshold: float,
     num_classes: int,
     num_select: int,
+    label_schema: str = "coco_91",
     device: torch.device,
 ) -> list[dict[str, torch.Tensor]]:
-    """Decode RF-DETR outputs into one label per query plus light NMS.
-
-    RF-DETR uses DETR's ``max_obj_id + 1`` label layout: channel ``0`` is an
-    unused background/dummy slot and real object labels live on channels
-    ``1..max_obj_id``. We therefore collapse each query to its best
-    non-background class and then apply a conservative per-class NMS pass to
-    keep split-runtime replay stable.
-    """
+    """Decode RF-DETR outputs into one label per query plus light NMS."""
     pred_logits = predictions["pred_logits"]
     pred_boxes = predictions["pred_boxes"]
     if pred_logits.ndim != 3 or pred_boxes.ndim != 3:
@@ -1609,7 +1939,10 @@ def _postprocess_rfdetr_predictions(
 
     probabilities = pred_logits.sigmoid()
     label_offset = 0
-    if probabilities.shape[-1] > 1:
+    label_schema = str(label_schema or "coco_91").strip().lower()
+    if label_schema == "zero_based" and probabilities.shape[-1] > 1:
+        probabilities = probabilities[..., : max(1, probabilities.shape[-1] - 1)]
+    elif probabilities.shape[-1] > 1:
         probabilities = probabilities[..., 1:]
         label_offset = 1
 

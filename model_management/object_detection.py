@@ -85,7 +85,11 @@ class Object_Detection:
         self.load_model()
 
     def load_model(self):
-        explicit_weights_path = getattr(self.config, "weights_path", None)
+        explicit_weights_path = (
+            getattr(self.config, "weights_path", None)
+            if self.type == 'small inference'
+            else None
+        )
         build_kwargs = {}
         if get_model_family(self.model_name) == "tinynext":
             configured_input_size = getattr(self.config, "tinynext_input_size", None)

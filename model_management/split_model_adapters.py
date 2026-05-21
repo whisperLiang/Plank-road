@@ -24,6 +24,7 @@ from model_management.model_zoo import (
     RFDETRDetectionModel,
     RTDETRDetectionModel,
     YOLODetectionModel,
+    _remap_tinynext_public_detections,
     _postprocess_rfdetr_predictions,
 )
 from model_management.detection_box_projection import (
@@ -401,7 +402,12 @@ def build_split_training_loss(model: torch.nn.Module):
 
         def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
             device = _first_tensor_device(outputs, fallback=next(core_model.parameters()).device)
-            batch = _build_ultralytics_training_batch(targets, device=device)
+            batch = _build_ultralytics_training_batch(
+                targets,
+                device=device,
+                num_classes=int(getattr(model, "num_classes", 80)),
+                label_schema=getattr(model, "label_schema", "coco_91"),
+            )
             loss = core_model.loss(batch, outputs)
             total = loss[0] if isinstance(loss, tuple) else loss
             return total.sum() if isinstance(total, torch.Tensor) and total.ndim > 0 else total
@@ -414,7 +420,12 @@ def build_split_training_loss(model: torch.nn.Module):
 
         def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
             device = _first_tensor_device(outputs, fallback=next(core_model.parameters()).device)
-            batch = _build_ultralytics_training_batch(targets, device=device)
+            batch = _build_ultralytics_training_batch(
+                targets,
+                device=device,
+                num_classes=int(getattr(model, "num_classes", 80)),
+                label_schema=getattr(model, "label_schema", "coco_91"),
+            )
             target_pack = {
                 "cls": batch["cls"].to(device=device, dtype=torch.long).view(-1),
                 "bboxes": batch["bboxes"].to(device=device),
@@ -495,12 +506,14 @@ def build_split_training_loss(model: torch.nn.Module):
                         target_item,
                         device=device,
                         num_classes=int(getattr(model, "num_classes", 0)),
+                        label_schema=getattr(model, "label_schema", "coco_91"),
                     ))
             else:
                 labels = _build_rfdetr_training_labels(
                     targets,
                     device=device,
                     num_classes=int(getattr(model, "num_classes", 0)),
+                    label_schema=getattr(model, "label_schema", "coco_91"),
                 )
                 
             loss_dict = criterion(predictions, labels)
@@ -875,6 +888,7 @@ def _build_transformed_targets_for_anchor_loss(
                 model_input_size=sample_model_input_size,
                 resize_mode=resize_mode,
                 num_classes=num_classes,
+                label_schema=getattr(model, "label_schema", "coco_91"),
             )
         )
 
@@ -948,6 +962,8 @@ def _map_wrapper_labels(model: torch.nn.Module, cls_ids: torch.Tensor) -> torch.
         value = int(cls_id)
         if getattr(model, "_map_labels", False):
             mapped.append(COCO_80_TO_91[value] if 0 <= value < len(COCO_80_TO_91) else value + 1)
+        elif str(getattr(model, "label_schema", "")).strip().lower() == "zero_based":
+            mapped.append(value)
         else:
             mapped.append(value + 1)
     return torch.as_tensor(mapped, dtype=torch.int64, device=cls_ids.device)
@@ -1057,6 +1073,7 @@ def _postprocess_rfdetr_output(
         target_sizes=target_sizes,
         threshold=float(threshold),
         num_classes=getattr(model, "num_classes", 91),
+        label_schema=getattr(model, "label_schema", "coco_91"),
         num_select=getattr(model.rfdetr.model.postprocess, "num_select", predictions["pred_logits"].shape[1]),
         device=model._device,
     )[0]
@@ -1144,11 +1161,12 @@ def _postprocess_anchor_detector_output(
             anchors,
             transformed_images.image_sizes,
         )
-    return model.transform.postprocess(
+    detections = model.transform.postprocess(
         detections,
         transformed_images.image_sizes,
         original_image_sizes,
     )
+    return _remap_tinynext_public_detections(model, detections)
 
 
 def _iter_payload_tensors(
@@ -1663,6 +1681,7 @@ def _build_anchor_training_target(
     model_input_size: tuple[int, int],
     resize_mode: str = "letterbox",
     num_classes: int | None = None,
+    label_schema: str = "coco_91",
 ) -> dict[str, torch.Tensor]:
     _assert_original_xyxy_targets(targets)
     boxes = _clamp_xyxy_boxes(
@@ -1683,9 +1702,15 @@ def _build_anchor_training_target(
         boxes = boxes[:count]
         labels = labels[:count]
     if labels.numel():
-        valid_labels = labels > 0
-        if num_classes is not None:
-            valid_labels = valid_labels & (labels < int(num_classes))
+        is_zero_based = str(label_schema or "coco_91").strip().lower() == "zero_based"
+        if is_zero_based:
+            upper_bound = max(1, int(num_classes or 1) - 1)
+            valid_labels = (labels >= 0) & (labels < upper_bound)
+            labels = labels + 1
+        else:
+            valid_labels = labels > 0
+            if num_classes is not None:
+                valid_labels = valid_labels & (labels < int(num_classes))
         boxes = boxes[valid_labels]
         labels = labels[valid_labels]
     if boxes.numel():
@@ -1784,6 +1809,8 @@ def _prepare_coco80_targets(
     targets: dict[str, Any],
     *,
     device: torch.device,
+    num_classes: int = 80,
+    label_schema: str = "coco_91",
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
     original_image_size, model_input_size = _infer_ultralytics_image_sizes(targets)
     resize_mode = _infer_split_resize_mode(targets)
@@ -1800,9 +1827,15 @@ def _prepare_coco80_targets(
 
     mapped_labels: list[int] = []
     keep_indices: list[int] = []
+    is_zero_based = str(label_schema).strip().lower() == "zero_based"
+    max_label = max(int(num_classes), 0)
     for index, label in enumerate(labels.detach().cpu().tolist()):
         value = int(label)
-        if value in COCO_91_TO_80:
+        if is_zero_based:
+            if 0 <= value < max_label:
+                mapped_labels.append(value)
+                keep_indices.append(index)
+        elif value in COCO_91_TO_80:
             mapped_labels.append(COCO_91_TO_80[value])
             keep_indices.append(index)
         elif 0 <= value < 80:
@@ -1833,9 +1866,16 @@ def _build_ultralytics_training_batch(
     targets: Any,
     *,
     device: torch.device,
+    num_classes: int = 80,
+    label_schema: str = "coco_91",
 ) -> dict[str, torch.Tensor]:
     if isinstance(targets, dict):
-        boxes, labels, image_size = _prepare_coco80_targets(targets, device=device)
+        boxes, labels, image_size = _prepare_coco80_targets(
+            targets,
+            device=device,
+            num_classes=num_classes,
+            label_schema=label_schema,
+        )
         normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=image_size)
         height, width = image_size
         return {
@@ -1851,7 +1891,12 @@ def _build_ultralytics_training_batch(
         batch_idx_pieces: list[torch.Tensor] = []
         image_size: tuple[int, int] | None = None
         for batch_index, sample_targets in enumerate(targets):
-            boxes, labels, sample_image_size = _prepare_coco80_targets(sample_targets, device=device)
+            boxes, labels, sample_image_size = _prepare_coco80_targets(
+                sample_targets,
+                device=device,
+                num_classes=num_classes,
+                label_schema=label_schema,
+            )
             if image_size is None:
                 image_size = sample_image_size
             elif image_size != sample_image_size:
@@ -1933,6 +1978,7 @@ def _build_rfdetr_training_labels(
     *,
     device: torch.device,
     num_classes: int,
+    label_schema: str = "coco_91",
 ) -> list[dict[str, torch.Tensor]]:
     original_image_size, image_size = _infer_original_and_model_input_image_sizes(targets)
     resize_mode = _infer_split_resize_mode(targets)
@@ -1955,9 +2001,12 @@ def _build_rfdetr_training_labels(
         boxes = boxes[:count]
         labels = labels[:count]
 
-    # RF-DETR keeps the public 1-based label IDs and reserves 0 as the
-    # background/dummy slot.
-    valid = (labels > 0) & (labels < int(num_classes))
+    if str(label_schema or "coco_91").strip().lower() == "zero_based":
+        valid = (labels >= 0) & (labels < max(1, int(num_classes) - 1))
+    else:
+        # COCO-style RF-DETR keeps public 1-based label IDs and reserves 0 as
+        # the background/dummy slot.
+        valid = (labels > 0) & (labels < int(num_classes))
     if boxes.numel():
         valid = valid & (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
     boxes = boxes[valid]

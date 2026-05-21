@@ -44,17 +44,21 @@ from model_management.model_zoo import (
     get_model_artifact_path,
     get_models_dir,
     has_compatible_rfdetr_cache_state,
+    infer_rfdetr_state_dict_num_classes,
+    infer_tinynext_state_dict_num_classes,
+    infer_ultralytics_state_dict_num_classes,
     list_available_models,
     get_model_family,
     is_wrapper_model,
     model_has_roi_heads,
     set_model_detection_thresholds,
 )
-from model_management.object_detection import bgr_image_to_tensor
+from model_management.object_detection import Object_Detection, bgr_image_to_tensor
 from model_management.split_model_adapters import (
     _build_anchor_training_target,
     _build_rfdetr_training_labels,
     _build_ultralytics_training_batch,
+    _map_wrapper_labels,
     RFDETRReplay,
     build_split_runtime_sample_input,
     get_split_runtime_model,
@@ -76,6 +80,74 @@ def test_bgr_image_to_tensor_matches_pil_to_tensor_path():
     assert actual.dtype == torch.float32
     assert actual.shape == (3, 2, 2)
     assert torch.equal(actual, expected)
+
+
+def test_large_inference_ignores_edge_weights_path(monkeypatch):
+    import model_management.object_detection as object_detection_module
+
+    captured: dict[str, object] = {}
+
+    class DummyModel:
+        def to(self, _device):
+            return self
+
+        def eval(self):
+            return self
+
+    def fake_build_detection_model(name, **kwargs):
+        captured["name"] = name
+        captured["kwargs"] = kwargs
+        return DummyModel()
+
+    monkeypatch.setattr(object_detection_module, "build_detection_model", fake_build_detection_model)
+    monkeypatch.setattr(object_detection_module, "get_split_runtime_model", lambda model: model)
+    monkeypatch.setattr(object_detection_module, "get_model_detection_thresholds", lambda *_args: (0.2, 0.6))
+
+    Object_Detection(
+        SimpleNamespace(
+            golden="rtdetr_x",
+            lightweight="rfdetr_nano",
+            weights_path="./model_management/models/rf-detr-nano.pth",
+        ),
+        type="large inference",
+    )
+
+    assert captured["name"] == "rtdetr_x"
+    assert captured["kwargs"]["weights_path"] is None
+
+
+def test_small_inference_uses_configured_weights_path(monkeypatch):
+    import model_management.object_detection as object_detection_module
+
+    captured: dict[str, object] = {}
+
+    class DummyModel:
+        def to(self, _device):
+            return self
+
+        def eval(self):
+            return self
+
+    def fake_build_detection_model(name, **kwargs):
+        captured["name"] = name
+        captured["kwargs"] = kwargs
+        return DummyModel()
+
+    monkeypatch.setattr(object_detection_module, "build_detection_model", fake_build_detection_model)
+    monkeypatch.setattr(object_detection_module, "get_split_runtime_model", lambda model: model)
+    monkeypatch.setattr(object_detection_module, "get_model_detection_thresholds", lambda *_args: (0.2, 0.6))
+
+    Object_Detection(
+        SimpleNamespace(
+            golden="rtdetr_x",
+            lightweight="rfdetr_nano",
+            weights_path="./model_management/models/rf-detr-nano.pth",
+        ),
+        type="small inference",
+    )
+
+    assert captured["name"] == "rfdetr_nano"
+    assert captured["kwargs"]["weights_path"] == "./model_management/models/rf-detr-nano.pth"
 
 
 # =====================================================================
@@ -471,7 +543,7 @@ class TestModelZoo:
             )
         ]
 
-    def test_ensure_local_model_artifact_reuses_readable_rfdetr_weights_despite_md5_mismatch(self, monkeypatch, tmp_path):
+    def test_ensure_local_model_artifact_reuses_compatible_rfdetr_weights_despite_md5_mismatch(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
 
         fake_models_dir = tmp_path / "models"
@@ -481,7 +553,10 @@ class TestModelZoo:
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
-                "model": {"linear.weight": torch.arange(3)},
+                "model": {
+                    "linear.weight": torch.arange(3),
+                    "class_embed.bias": torch.zeros(91),
+                },
                 "args": {"num_classes": 90},
                 "optimizer": {"state": {"step": 42}},
                 "lr_scheduler": {"last_epoch": 5},
@@ -507,6 +582,61 @@ class TestModelZoo:
         assert checkpoint["optimizer"] == {"state": {"step": 42}}
         assert checkpoint["lr_scheduler"] == {"last_epoch": 5}
         assert calls == []
+
+    def test_ensure_local_model_artifact_redownloads_incompatible_rfdetr_weights(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        fake_models_dir = tmp_path / "models"
+        monkeypatch.setattr(model_zoo_module, "_MODELS_DIR", fake_models_dir)
+
+        artifact_path = fake_models_dir / "rf-detr-nano.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model": {
+                    "class_embed.bias": torch.zeros(9),
+                    "class_embed.weight": torch.zeros(9, 256),
+                },
+                "args": {"class_names": ["one", "two"]},
+            },
+            artifact_path,
+        )
+
+        calls = []
+
+        def fake_download_http_file_with_resume(url: str, destination: Path, *, expected_md5: str | None = None) -> Path:
+            calls.append((url, destination.name, expected_md5))
+            torch.save(
+                {
+                    "model": {
+                        "class_embed.bias": torch.zeros(91),
+                        "class_embed.weight": torch.zeros(91, 256),
+                    },
+                    "args": {"num_classes": 90},
+                },
+                destination,
+            )
+            return destination
+
+        monkeypatch.setattr(model_zoo_module, "_matches_md5", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(
+            model_zoo_module,
+            "_download_http_file_with_resume",
+            fake_download_http_file_with_resume,
+        )
+
+        resolved_path = ensure_local_model_artifact("rfdetr_nano")
+        checkpoint = torch.load(resolved_path, map_location="cpu", weights_only=False)
+
+        assert resolved_path == artifact_path
+        assert checkpoint["model"]["class_embed.bias"].shape == (91,)
+        assert calls == [
+            (
+                "https://storage.googleapis.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+                "rf-detr-nano.pth",
+                "fb6504cce7fbdc783f7a46991f07639f",
+            )
+        ]
 
     def test_build_rfdetr_detector_passes_local_artifact_to_wrapper(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
@@ -536,6 +666,131 @@ class TestModelZoo:
         assert "pretrain_weights" not in captured["init_kwargs"]
         assert captured["strict"] is False
         assert captured["loaded_state_dict"] == {"weight": torch.tensor([1.0])}
+
+    def test_build_rfdetr_detector_strips_lightning_model_prefix(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "rf-detr-nano.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"state_dict": {"model.weight": torch.tensor([2.0])}}, artifact_path)
+        monkeypatch.setattr(model_zoo_module, "ensure_local_model_artifact", lambda name: artifact_path)
+
+        captured = {}
+
+        class DummyRFDETRDetectionModel:
+            def __init__(self, **kwargs):
+                captured["init_kwargs"] = kwargs
+
+            def load_state_dict(self, state_dict, strict=True):
+                captured["loaded_state_dict"] = state_dict
+                captured["strict"] = strict
+                return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+        monkeypatch.setattr(model_zoo_module, "RFDETRDetectionModel", DummyRFDETRDetectionModel)
+
+        build_detection_model("rfdetr_nano", pretrained=True, device="cpu")
+
+        assert captured["strict"] is False
+        assert captured["loaded_state_dict"] == {"weight": torch.tensor([2.0])}
+
+    def test_build_rfdetr_detector_infers_custom_class_count(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "custom-rfdetr-nano.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model": {
+                    "class_embed.bias": torch.zeros(9),
+                    "class_embed.weight": torch.zeros(9, 256),
+                },
+            },
+            artifact_path,
+        )
+
+        captured = {}
+
+        class DummyRFDETRDetectionModel:
+            def __init__(self, **kwargs):
+                captured["init_kwargs"] = kwargs
+
+            def load_state_dict(self, state_dict, strict=True):
+                captured["loaded_state_dict"] = state_dict
+                captured["strict"] = strict
+                return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+        monkeypatch.setattr(model_zoo_module, "RFDETRDetectionModel", DummyRFDETRDetectionModel)
+
+        build_detection_model(
+            "rfdetr_nano",
+            pretrained=True,
+            device="cpu",
+            weights_path=str(artifact_path),
+        )
+
+        assert captured["init_kwargs"]["num_classes"] == 9
+        assert captured["init_kwargs"]["pretrained"] is False
+        assert infer_rfdetr_state_dict_num_classes(captured["loaded_state_dict"]) == 9
+
+    def test_build_yolo_detector_infers_custom_class_count(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "custom-yolo26n.pt"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "model.23.cv3.0.2.weight": torch.zeros(8, 64, 1, 1),
+            "model.23.cv3.0.2.bias": torch.zeros(8),
+        }
+        torch.save({"model": state}, artifact_path)
+
+        captured = {}
+
+        class DummyYOLODetectionModel:
+            def __init__(self, **kwargs):
+                captured["init_kwargs"] = kwargs
+
+        monkeypatch.setattr(model_zoo_module, "YOLODetectionModel", DummyYOLODetectionModel)
+
+        build_detection_model(
+            "yolo26n",
+            pretrained=True,
+            device="cpu",
+            weights_path=str(artifact_path),
+        )
+
+        assert captured["init_kwargs"]["num_classes"] == 8
+        assert infer_ultralytics_state_dict_num_classes(state) == 8
+
+    def test_build_rtdetr_detector_infers_custom_class_count(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "custom-rtdetr-l.pt"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "model.28.enc_score_head.weight": torch.zeros(8, 256),
+            "model.28.enc_score_head.bias": torch.zeros(8),
+            "model.28.dec_score_head.0.weight": torch.zeros(8, 256),
+            "model.28.dec_score_head.0.bias": torch.zeros(8),
+        }
+        torch.save({"model": state}, artifact_path)
+
+        captured = {}
+
+        class DummyRTDETRDetectionModel:
+            def __init__(self, **kwargs):
+                captured["init_kwargs"] = kwargs
+
+        monkeypatch.setattr(model_zoo_module, "RTDETRDetectionModel", DummyRTDETRDetectionModel)
+
+        build_detection_model(
+            "rtdetr_l",
+            pretrained=True,
+            device="cpu",
+            weights_path=str(artifact_path),
+        )
+
+        assert captured["init_kwargs"]["num_classes"] == 8
+        assert infer_ultralytics_state_dict_num_classes(state) == 8
 
     def test_rfdetr_detection_thresholds_roundtrip_through_state_dict(self):
         model = build_detection_model("rfdetr_nano", pretrained=False, device="cpu")
@@ -645,6 +900,34 @@ class TestModelZoo:
 
         assert output["labels"].tolist() == [90]
 
+    def test_rfdetr_custom_forward_uses_zero_based_labels(self):
+        import model_management.model_zoo as model_zoo_module
+
+        model = model_zoo_module.RFDETRDetectionModel.__new__(model_zoo_module.RFDETRDetectionModel)
+        nn.Module.__init__(model)
+        model.confidence = 0.01
+        model.num_classes = 9
+        model.label_schema = "zero_based"
+        model._device = torch.device("cpu")
+        model._prepare_batch = lambda images: (torch.zeros((1, 3, 8, 8)), [(8, 8)])
+        logits = torch.full((1, 1, 9), -10.0, dtype=torch.float32)
+        logits[0, 0, 0] = 5.0
+        logits[0, 0, 8] = 7.0
+        model.rfdetr = SimpleNamespace(
+            model=SimpleNamespace(
+                model=lambda batch: {
+                    "pred_logits": logits,
+                    "pred_boxes": torch.tensor([[[0.25, 0.375, 0.25, 0.25]]], dtype=torch.float32),
+                },
+                postprocess=SimpleNamespace(num_select=300),
+            )
+        )
+
+        output = model.forward([torch.rand(3, 8, 8)])[0]
+
+        assert output["labels"].tolist() == [0]
+        assert output["scores"][0].item() == pytest.approx(torch.sigmoid(torch.tensor(5.0)).item())
+
     def test_rfdetr_forward_collapses_duplicate_query_labels_and_applies_nms(self):
         import model_management.model_zoo as model_zoo_module
 
@@ -747,6 +1030,45 @@ class TestModelZoo:
         assert captured["strict"] is False
         assert captured["loaded_state_dict"] == {"head.weight": torch.tensor([1.23])}
 
+    def test_build_tinynext_detector_infers_internal_custom_class_count(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "custom-tinynext-s.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "head.classification_head.module_list.0.1.weight": torch.zeros(54, 1, 1, 1),
+            "head.classification_head.module_list.0.1.bias": torch.zeros(54),
+        }
+        torch.save({"model": state}, artifact_path)
+
+        captured: dict[str, object] = {}
+
+        class DummyTinyNeXtDetector:
+            def eval(self):
+                return self
+
+            def load_state_dict(self, state_dict, strict=True):
+                captured["loaded_state_dict"] = state_dict
+                captured["strict"] = strict
+                return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+        def fake_build_tinynext_detector(*args, **kwargs):
+            captured["build_kwargs"] = kwargs
+            return DummyTinyNeXtDetector()
+
+        monkeypatch.setattr(model_zoo_module, "build_tinynext_detector", fake_build_tinynext_detector)
+
+        build_detection_model(
+            "tinynext_s",
+            pretrained=True,
+            device="cpu",
+            weights_path=str(artifact_path),
+        )
+
+        assert captured["build_kwargs"]["num_classes"] == 9
+        assert infer_tinynext_state_dict_num_classes(state) == 9
+        assert captured["strict"] is False
+
     def test_build_tinynext_detector_converts_official_detector_checkpoint(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
 
@@ -811,6 +1133,78 @@ class TestModelZoo:
         assert cls_bias[12].item() == pytest.approx(80.0)
         assert cls_bias[COCO_80_TO_91[11]].item() == pytest.approx(11.0)
 
+    def test_build_tinynext_detector_converts_custom_official_checkpoint(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        artifact_path = tmp_path / "models" / "custom-tinynext-s.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(b"tinynext")
+
+        official_state = {
+            "backbone.embeds.0.0.0.weight": torch.tensor([1.0]),
+            "neck.extra_layers.0.0.conv.weight": torch.tensor([2.0]),
+            "bbox_head.cls_convs.0.1.weight": torch.arange(54.0).view(54, 1, 1, 1),
+            "bbox_head.cls_convs.0.1.bias": torch.arange(54.0),
+        }
+
+        captured: dict[str, object] = {}
+
+        class DummyTinyNeXtDetector:
+            def eval(self):
+                return self
+
+            def load_state_dict(self, state_dict, strict=True):
+                captured["loaded_state_dict"] = state_dict
+                captured["strict"] = strict
+                return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+        def fake_build_tinynext_detector(*args, **kwargs):
+            captured["build_kwargs"] = kwargs
+            return DummyTinyNeXtDetector()
+
+        monkeypatch.setattr(
+            model_zoo_module,
+            "_load_tinynext_checkpoint",
+            lambda *args, **kwargs: {"state_dict": official_state},
+        )
+        monkeypatch.setattr(model_zoo_module, "build_tinynext_detector", fake_build_tinynext_detector)
+
+        build_detection_model(
+            "tinynext_s",
+            pretrained=True,
+            device="cpu",
+            weights_path=str(artifact_path),
+        )
+
+        loaded_state = captured["loaded_state_dict"]
+        cls_weight = loaded_state["head.classification_head.module_list.0.1.weight"]
+        cls_bias = loaded_state["head.classification_head.module_list.0.1.bias"]
+        assert captured["build_kwargs"]["num_classes"] == 9
+        assert tuple(cls_weight.shape) == (54, 1, 1, 1)
+        assert tuple(cls_bias.shape) == (54,)
+        assert cls_weight[0].item() == pytest.approx(8.0)
+        assert cls_weight[1].item() == pytest.approx(0.0)
+        assert cls_bias[0].item() == pytest.approx(8.0)
+        assert cls_bias[1].item() == pytest.approx(0.0)
+
+    def test_tinynext_custom_forward_remaps_public_labels(self):
+        import model_management.model_zoo as model_zoo_module
+
+        class DummyTinyNeXtDetector(nn.Module):
+            def forward(self, _images):
+                return [{
+                    "boxes": torch.zeros((2, 4), dtype=torch.float32),
+                    "labels": torch.tensor([1, 8], dtype=torch.int64),
+                    "scores": torch.ones((2,), dtype=torch.float32),
+                }]
+
+        model = DummyTinyNeXtDetector()
+        model_zoo_module._configure_tinynext_label_schema(model, num_classes=9)
+
+        output = model([torch.rand(3, 8, 8)])[0]
+
+        assert output["labels"].tolist() == [0, 7]
+
     def test_tinynext_detection_thresholds_roundtrip_through_state_dict(self):
         model = build_detection_model("tinynext_s", pretrained=False, device="cpu")
         set_model_detection_thresholds(
@@ -842,6 +1236,68 @@ class TestModelZoo:
         )
 
         assert labels[0]["labels"].tolist() == [13, 90]
+
+    def test_rfdetr_training_labels_support_custom_zero_based_ids(self):
+        labels = _build_rfdetr_training_labels(
+            {
+                "boxes": [[1.0, 2.0, 6.0, 7.0], [1.0, 2.0, 5.0, 6.0], [2.0, 2.0, 6.0, 6.0]],
+                "labels": [0, 7, 8],
+                "label_coordinate_space": "original_xyxy",
+                "_split_meta": {
+                    "input_image_size": [8, 8],
+                    "input_tensor_shape": [1, 3, 8, 8],
+                    "input_resize_mode": "direct_resize",
+                },
+            },
+            device=torch.device("cpu"),
+            num_classes=9,
+            label_schema="zero_based",
+        )
+
+        assert labels[0]["labels"].tolist() == [0, 7]
+
+    def test_ultralytics_training_labels_support_custom_zero_based_ids(self):
+        batch = _build_ultralytics_training_batch(
+            {
+                "boxes": [[1.0, 2.0, 6.0, 7.0], [1.0, 2.0, 5.0, 6.0], [2.0, 2.0, 6.0, 6.0]],
+                "labels": [0, 7, 8],
+                "label_coordinate_space": "original_xyxy",
+                "_split_meta": {
+                    "input_image_size": [8, 8],
+                    "input_tensor_shape": [1, 3, 8, 8],
+                    "input_resize_mode": "direct_resize",
+                },
+            },
+            device=torch.device("cpu"),
+            num_classes=8,
+            label_schema="zero_based",
+        )
+
+        assert batch["cls"].view(-1).tolist() == [0.0, 7.0]
+
+    def test_tinynext_training_labels_support_custom_zero_based_ids(self):
+        target = _build_anchor_training_target(
+            {
+                "boxes": [[1.0, 2.0, 6.0, 7.0], [1.0, 2.0, 5.0, 6.0], [2.0, 2.0, 6.0, 6.0]],
+                "labels": [0, 7, 8],
+                "label_coordinate_space": "original_xyxy",
+            },
+            device=torch.device("cpu"),
+            original_image_size=(8, 8),
+            model_input_size=(8, 8),
+            resize_mode="direct_resize",
+            num_classes=9,
+            label_schema="zero_based",
+        )
+
+        assert target["labels"].tolist() == [1, 8]
+
+    def test_wrapper_label_mapper_supports_custom_zero_based_ids(self):
+        model = SimpleNamespace(_map_labels=False, label_schema="zero_based")
+
+        labels = _map_wrapper_labels(model, torch.tensor([0, 7]))
+
+        assert labels.tolist() == [0, 7]
 
     def test_rfdetr_training_targets_use_expected_normalized_format(self):
         labels = _build_rfdetr_training_labels(

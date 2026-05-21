@@ -166,6 +166,7 @@ class ClientConfig(ConfigSection):
     wait_thresh: int = 100
     frame_cache_maxsize: int = 100
     lightweight: str = "yolo26n"
+    weights_path: str | None = None
     final_detection_threshold: float = 0.5
     tinynext_input_size: int = 320
     server_ip: str = "192.168.66.205:50051"
@@ -186,6 +187,7 @@ class ServerConfig(ConfigSection):
     server_id: int = 0
     golden: str = "rtdetr_x"
     edge_model_name: str = "yolo26n"
+    weights_path: str | None = None
     tinynext_input_size: int = 320
     local_queue_maxsize: int = 10
     wait_thresh: int = 10

@@ -3435,6 +3435,9 @@ class CloudContinualLearner:
         return bundle_model_id or self.edge_model_name
 
     def _native_training_source_label(self, model_name: str) -> str:
+        configured_weights = str(getattr(self.config, "weights_path", "") or "").strip()
+        if configured_weights:
+            return "configured"
         return "pretrained" if model_name in model_lib else "randomly initialised"
 
     def _detection_model_build_kwargs(
@@ -3470,6 +3473,7 @@ class CloudContinualLearner:
         runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
     ) -> torch.nn.Module:
         source_label = self._native_training_source_label(model_name)
+        configured_weights = str(getattr(self.config, "weights_path", "") or "").strip()
         build_kwargs = {
             "pretrained": source_label == "pretrained",
             "device": self.device,
@@ -3480,7 +3484,9 @@ class CloudContinualLearner:
                 runtime_input_tensor_shape=runtime_input_tensor_shape,
             )
         )
-        if source_label == "pretrained":
+        if configured_weights:
+            build_kwargs["weights_path"] = configured_weights
+        elif source_label == "pretrained":
             try:
                 artifact_path = model_zoo.ensure_local_model_artifact(model_name)
             except Exception as exc:
@@ -3609,20 +3615,45 @@ class CloudContinualLearner:
                         model_name,
                         runtime_input_tensor_shape=runtime_input_tensor_shape,
                     )
-                    if model_zoo.get_model_family(str(model_name)) == "yolo":
-                        cache_num_classes = _infer_yolo_state_dict_num_classes(state)
+                    model_family = model_zoo.get_model_family(str(model_name))
+                    if model_family in {"yolo", "rtdetr"}:
+                        cache_num_classes = model_zoo.infer_ultralytics_state_dict_num_classes(state)
                         if cache_num_classes is None and candidate_weights == edge_weights:
                             cache_metadata = self._read_edge_weights_metadata(
                                 model_name,
                                 edge_id=edge_id,
                             )
                             cache_num_classes = _coerce_positive_int(
-                                cache_metadata.get("yolo_head_num_classes")
+                                cache_metadata.get("ultralytics_head_num_classes")
                             )
+                            if cache_num_classes is None and model_family == "yolo":
+                                cache_num_classes = _coerce_positive_int(
+                                    cache_metadata.get("yolo_head_num_classes")
+                                )
                         if cache_num_classes is not None and cache_num_classes != 80:
                             build_kwargs["num_classes"] = cache_num_classes
                             logger.info(
-                                "[CL] Inferred {} YOLO class(es) from cached {} weights at {}.",
+                                "[CL] Inferred {} {} class(es) from cached weights at {}.",
+                                cache_num_classes,
+                                model_name,
+                                candidate_weights,
+                            )
+                    elif model_family == "rfdetr":
+                        cache_num_classes = model_zoo.infer_rfdetr_state_dict_num_classes(state)
+                        if cache_num_classes is not None and cache_num_classes != 91:
+                            build_kwargs["num_classes"] = cache_num_classes
+                            logger.info(
+                                "[CL] Inferred {} RF-DETR logits from cached {} weights at {}.",
+                                cache_num_classes,
+                                model_name,
+                                candidate_weights,
+                            )
+                    elif model_family == "tinynext":
+                        cache_num_classes = model_zoo.infer_tinynext_state_dict_num_classes(state)
+                        if cache_num_classes is not None and cache_num_classes != 91:
+                            build_kwargs["num_classes"] = cache_num_classes
+                            logger.info(
+                                "[CL] Inferred {} TinyNeXt SSD class logits from cached {} weights at {}.",
                                 cache_num_classes,
                                 model_name,
                                 candidate_weights,
@@ -6463,18 +6494,30 @@ class CloudContinualLearner:
                     "source_base_model_version": bundle_model_version,
                     "updated_at_ms": int(time.time() * 1000),
                 }
-                if model_zoo.get_model_family(str(current_model_name)) == "yolo":
+                current_model_family = model_zoo.get_model_family(str(current_model_name))
+                if current_model_family in {"yolo", "rtdetr"}:
                     yolo_num_classes = _infer_yolo_model_num_classes(tmp_model)
+                    if yolo_num_classes is None:
+                        yolo_num_classes = model_zoo.infer_ultralytics_state_dict_num_classes(
+                            tmp_model.state_dict()
+                        )
                     if yolo_num_classes is not None:
-                        weights_metadata["yolo_head_num_classes"] = int(yolo_num_classes)
+                        weights_metadata["ultralytics_head_num_classes"] = int(yolo_num_classes)
+                        if current_model_family == "yolo":
+                            weights_metadata["yolo_head_num_classes"] = int(yolo_num_classes)
                 if (
                     manifest_runtime_input_shape
                     and len(manifest_runtime_input_shape) >= 4
-                    and model_zoo.get_model_family(str(current_model_name)) == "tinynext"
+                    and current_model_family == "tinynext"
                 ):
                     weights_metadata["tinynext_input_size"] = int(
                         manifest_runtime_input_shape[-1]
                     )
+                    tinynext_num_classes = model_zoo.infer_tinynext_state_dict_num_classes(
+                        tmp_model.state_dict()
+                    )
+                    if tinynext_num_classes is not None:
+                        weights_metadata["tinynext_head_num_classes"] = int(tinynext_num_classes)
                 working_cache = self._fixed_split_working_cache_path(
                     edge_id=edge_id,
                     model_name=current_model_name,
