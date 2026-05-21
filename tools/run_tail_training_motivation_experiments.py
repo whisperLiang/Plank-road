@@ -202,8 +202,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--append-results",
         action="store_true",
         help=(
-            "Append raw JSONL rows instead of clearing result files at startup. "
-            "Summary CSVs are still written from the current process rows."
+            "Append raw JSONL rows instead of clearing result files at startup, "
+            "skipping rows that already exist for the same repeat/boundary/mode "
+            "configuration."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -321,6 +322,18 @@ def _aggregate_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
 
 def _write_aggregate_summary_csv(path: Path, rows: list[Mapping[str, Any]]) -> None:
     _write_summary_csv(path, _aggregate_rows(rows))
+
+
+def _result_resume_key(row: Mapping[str, Any]) -> tuple[int, str, str, int, int, int, int]:
+    return (
+        int(row.get("repeat_id")),
+        str(row.get("split_boundary")),
+        str(row.get("mode")),
+        int(row.get("seed")),
+        int(row.get("sample_count")),
+        int(row.get("epochs")),
+        int(row.get("batch_size")),
+    )
 
 
 def _set_random_seed(seed: int) -> None:
@@ -2600,6 +2613,7 @@ def main(argv: list[str] | None = None) -> int:
             for line in handle:
                 if line.strip():
                     rows.append(json.loads(line))
+    completed_result_keys = {_result_resume_key(row) for row in rows}
 
     for repeat_id in range(repeat):
         run_seed = int(args.seed) + repeat_id
@@ -2608,6 +2622,23 @@ def main(argv: list[str] | None = None) -> int:
             shared_runtime = runtime_by_boundary[choice.boundary]
             shared_runtime_build_time = runtime_build_time_by_boundary[choice.boundary]
             for mode in modes:
+                expected_key = (
+                    int(repeat_id),
+                    str(choice.boundary),
+                    str(mode),
+                    int(run_seed),
+                    int(sample_count),
+                    int(epochs),
+                    int(args.batch_size),
+                )
+                if bool(getattr(args, "append_results", False)) and expected_key in completed_result_keys:
+                    logger.info(
+                        "Skipping completed result repeat={} boundary={} mode={}",
+                        repeat_id,
+                        choice.boundary,
+                        mode,
+                    )
+                    continue
                 row = _run_one_experiment(
                     mode=str(mode),
                     choice=choice,
@@ -2636,6 +2667,7 @@ def main(argv: list[str] | None = None) -> int:
                     device=device,
                 )
                 rows.append(row)
+                completed_result_keys.add(_result_resume_key(row))
                 _append_jsonl(results_path, row)
                 _restore_model_state(edge_detector.model, initial_state)
                 _clear_cuda_cache()
