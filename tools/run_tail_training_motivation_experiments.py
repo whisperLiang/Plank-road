@@ -1265,7 +1265,7 @@ def _preflight_equivalence_check(
     runtime_graph_signature: str,
     loss_tolerance: float = 5e-2,
     output_tolerance: float = 1e-1,
-    gradient_tolerance: float = 1e-5,
+    gradient_tolerance: float = 5e-5,
 ) -> PreflightReport:
     """Fail loudly if freeze / split paths are not equivalent on one batch."""
     if freeze_trainable_names != split_trainable_names:
