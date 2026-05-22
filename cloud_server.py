@@ -6676,6 +6676,16 @@ class CloudContinualLearner:
                     if rfdetr_num_classes is not None:
                         weights_metadata["rfdetr_head_num_classes"] = int(rfdetr_num_classes)
                         weights_metadata["num_classes"] = int(rfdetr_num_classes)
+                        logger.info(
+                            "[FixedSplitCL] Serializing RF-DETR model with {} classes for edge {}.",
+                            rfdetr_num_classes,
+                            edge_id,
+                        )
+                    else:
+                        logger.warning(
+                            "[FixedSplitCL] Could not infer RF-DETR num_classes from model for edge {}!",
+                            edge_id,
+                        )
                 if (
                     manifest_runtime_input_shape
                     and len(manifest_runtime_input_shape) >= 4
