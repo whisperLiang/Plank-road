@@ -221,6 +221,7 @@ def pack_low_quality_trigger_bundle(
     split_plan: SplitPlan,
     model_id: str,
     model_version: str,
+    model_metadata: Mapping[str, object] | None = None,
     bundle_cap_bytes: int | None = None,
     shard_size: int | None = None,
 ) -> tuple[bytes, dict]:
@@ -231,6 +232,7 @@ def pack_low_quality_trigger_bundle(
         split_plan=split_plan,
         model_id=model_id,
         model_version=model_version,
+        model_metadata=model_metadata,
         bundle_cap_bytes=bundle_cap_bytes,
         shard_size=shard_size,
     )
@@ -252,6 +254,7 @@ def pack_low_quality_trigger_bundle_to_file(
     split_plan: SplitPlan,
     model_id: str,
     model_version: str,
+    model_metadata: Mapping[str, object] | None = None,
     bundle_cap_bytes: int | None = None,
     shard_size: int | None = None,
     output_dir: str | None = None,
@@ -273,6 +276,15 @@ def pack_low_quality_trigger_bundle_to_file(
         bundle_cap_bytes=bundle_cap_bytes,
     )
     resolved_shard_size = max(1, int(shard_size or 64))
+    model_meta = {
+        "model_id": str(model_id),
+        "model_version": str(model_version),
+    }
+    for key, value in dict(model_metadata or {}).items():
+        if value is None:
+            continue
+        model_meta[str(key)] = value
+
     manifest = {
         "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
         "edge_id": int(edge_id),
@@ -290,10 +302,7 @@ def pack_low_quality_trigger_bundle_to_file(
         "boundary_tensor_labels": [str(label) for label in split_plan.boundary_tensor_labels],
         "upload_mode": "raw+feature" if send_low_conf_features else "raw-only",
         "created_at": _utc_now(),
-        "model": {
-            "model_id": str(model_id),
-            "model_version": str(model_version),
-        },
+        "model": model_meta,
         "split_plan": split_plan.to_dict(),
         "training_mode": {
             "send_low_conf_features": bool(send_low_conf_features),
@@ -722,6 +731,7 @@ def submit_continual_learning_job(
     split_plan: SplitPlan,
     model_id: str,
     model_version: str,
+    model_metadata: Mapping[str, object] | None = None,
     send_low_conf_features: bool,
     bundle_cap_bytes: int | None = None,
     trigger_shard_size: int | None = None,
@@ -751,6 +761,7 @@ def submit_continual_learning_job(
             split_plan=split_plan,
             model_id=model_id,
             model_version=model_version,
+            model_metadata=model_metadata,
             bundle_cap_bytes=bundle_cap_bytes,
             shard_size=trigger_shard_size,
         )

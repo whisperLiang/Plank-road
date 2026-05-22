@@ -154,6 +154,78 @@ def _write_json_file(path: str, payload: Mapping[str, object]) -> None:
         json.dump(dict(payload), handle, indent=2, sort_keys=True)
 
 
+def _manifest_model_metadata(manifest: Mapping[str, object]) -> dict[str, object]:
+    model_meta = manifest.get("model")
+    metadata = dict(model_meta) if isinstance(model_meta, Mapping) else {}
+    for manifest_key, metadata_key in (
+        ("model_id", "model_id"),
+        ("model_version", "model_version"),
+        ("model_num_classes", "num_classes"),
+        ("model_label_schema", "label_schema"),
+    ):
+        value = manifest.get(manifest_key)
+        if value is not None and metadata_key not in metadata:
+            metadata[metadata_key] = value
+    return metadata
+
+
+def _rfdetr_num_classes_from_metadata(
+    metadata: Mapping[str, object] | None,
+) -> int | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    for key in (
+        "rfdetr_head_num_classes",
+        "num_classes",
+        "class_logits",
+        "head_num_classes",
+    ):
+        value = _coerce_positive_int(metadata.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _infer_rfdetr_checkpoint_num_classes(checkpoint: object) -> int | None:
+    inferred = model_zoo.infer_rfdetr_state_dict_num_classes(checkpoint)
+    if inferred is not None:
+        return inferred
+    if not isinstance(checkpoint, Mapping):
+        return None
+    for key in ("model", "state_dict"):
+        nested = checkpoint.get(key)
+        inferred = model_zoo.infer_rfdetr_state_dict_num_classes(nested)
+        if inferred is not None:
+            return inferred
+    return None
+
+
+def _validate_rfdetr_weights_match_metadata(
+    *,
+    model_name: str,
+    weights_path: str,
+    model_metadata: Mapping[str, object] | None,
+    device: torch.device | str,
+) -> None:
+    expected = _rfdetr_num_classes_from_metadata(model_metadata)
+    if expected is None or model_zoo.get_model_family(str(model_name)) != "rfdetr":
+        return
+    if not weights_path or not os.path.exists(weights_path):
+        return
+
+    checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+    actual = _infer_rfdetr_checkpoint_num_classes(checkpoint)
+    if actual is None or actual == expected:
+        return
+
+    raise RuntimeError(
+        "[FixedSplitCL] RF-DETR weights class head mismatch for "
+        f"{model_name}: edge manifest expects {expected} logits, but weights "
+        f"at {weights_path} contain {actual}. Configure server.weights_path to "
+        "the same custom checkpoint as client.weights_path."
+    )
+
+
 def _build_fixed_split_cache_identity(
     manifest: Mapping[str, object],
 ) -> dict[str, object]:
@@ -3445,9 +3517,23 @@ class CloudContinualLearner:
         model_name: str,
         *,
         runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
+        model_metadata: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        if model_zoo.get_model_family(str(model_name)) != "tinynext":
-            return {}
+        model_family = model_zoo.get_model_family(str(model_name))
+        build_kwargs: dict[str, object] = {}
+
+        if model_family == "rfdetr":
+            manifest_num_classes = _rfdetr_num_classes_from_metadata(model_metadata)
+            if manifest_num_classes is not None:
+                build_kwargs["num_classes"] = manifest_num_classes
+                logger.info(
+                    "[CL] Using {} RF-DETR logits from edge model metadata for {}.",
+                    manifest_num_classes,
+                    model_name,
+                )
+
+        if model_family != "tinynext":
+            return build_kwargs
 
         input_size = int(getattr(self.config, "tinynext_input_size", 320))
         shape = list(runtime_input_tensor_shape or [])
@@ -3464,13 +3550,15 @@ class CloudContinualLearner:
                     f"got {runtime_input_tensor_shape!r}."
                 )
             input_size = height
-        return {"tinynext_input_size": input_size}
+        build_kwargs["tinynext_input_size"] = input_size
+        return build_kwargs
 
     def _build_native_training_model(
         self,
         model_name: str,
         *,
         runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
+        model_metadata: Mapping[str, object] | None = None,
     ) -> torch.nn.Module:
         source_label = self._native_training_source_label(model_name)
         configured_weights = str(getattr(self.config, "weights_path", "") or "").strip()
@@ -3482,9 +3570,16 @@ class CloudContinualLearner:
             self._detection_model_build_kwargs(
                 model_name,
                 runtime_input_tensor_shape=runtime_input_tensor_shape,
+                model_metadata=model_metadata,
             )
         )
         if configured_weights:
+            _validate_rfdetr_weights_match_metadata(
+                model_name=model_name,
+                weights_path=configured_weights,
+                model_metadata=model_metadata,
+                device=self.device,
+            )
             build_kwargs["weights_path"] = configured_weights
         elif source_label == "pretrained":
             try:
@@ -3497,6 +3592,12 @@ class CloudContinualLearner:
                 )
             else:
                 if artifact_path.exists():
+                    _validate_rfdetr_weights_match_metadata(
+                        model_name=model_name,
+                        weights_path=str(artifact_path),
+                        model_metadata=model_metadata,
+                        device=self.device,
+                    )
                     build_kwargs["weights_path"] = str(artifact_path)
         return model_zoo.build_detection_model(model_name, **build_kwargs)
 
@@ -3556,6 +3657,7 @@ class CloudContinualLearner:
         edge_id: int | str | None = None,
         cache_policy: str = "auto",
         runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
+        model_metadata: Mapping[str, object] | None = None,
     ) -> torch.nn.Module:
         model_name = str(model_name or self.edge_model_name)
         cache_policy = str(cache_policy or "auto").strip().lower()
@@ -3574,6 +3676,7 @@ class CloudContinualLearner:
             tmp_model = self._build_native_training_model(
                 model_name,
                 runtime_input_tensor_shape=runtime_input_tensor_shape,
+                model_metadata=model_metadata,
             )
             tmp_model.to(self.device)
             get_split_runtime_model(tmp_model).eval()
@@ -3614,6 +3717,7 @@ class CloudContinualLearner:
                     build_kwargs = self._detection_model_build_kwargs(
                         model_name,
                         runtime_input_tensor_shape=runtime_input_tensor_shape,
+                        model_metadata=model_metadata,
                     )
                     model_family = model_zoo.get_model_family(str(model_name))
                     if model_family in {"yolo", "rtdetr"}:
@@ -3640,6 +3744,14 @@ class CloudContinualLearner:
                             )
                     elif model_family == "rfdetr":
                         cache_num_classes = model_zoo.infer_rfdetr_state_dict_num_classes(state)
+                        if cache_num_classes is None and candidate_weights == edge_weights:
+                            cache_metadata = self._read_edge_weights_metadata(
+                                model_name,
+                                edge_id=edge_id,
+                            )
+                            cache_num_classes = _rfdetr_num_classes_from_metadata(
+                                cache_metadata
+                            )
                         if cache_num_classes is not None and cache_num_classes != 91:
                             build_kwargs["num_classes"] = cache_num_classes
                             logger.info(
@@ -3700,6 +3812,7 @@ class CloudContinualLearner:
                 tmp_model = self._build_native_training_model(
                     model_name,
                     runtime_input_tensor_shape=runtime_input_tensor_shape,
+                    model_metadata=model_metadata,
                 )
                 torch.save(tmp_model.state_dict(), edge_weights)
                 logger.info(
@@ -3722,6 +3835,7 @@ class CloudContinualLearner:
             tmp_model = self._build_native_training_model(
                 model_name,
                 runtime_input_tensor_shape=runtime_input_tensor_shape,
+                model_metadata=model_metadata,
             )
         tmp_model.to(self.device)
         get_split_runtime_model(tmp_model).eval()
@@ -3764,6 +3878,8 @@ class CloudContinualLearner:
             base_model_version=base_model_version,
             result_model_version=result_model_version,
         )
+        if weights_metadata is not None:
+            payload["weights_metadata"] = dict(weights_metadata)
         buf = io.BytesIO()
         torch.save(payload, buf)
         if torch.cuda.is_available():
@@ -6412,6 +6528,7 @@ class CloudContinualLearner:
                         f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
                     )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
+                manifest_model_metadata = _manifest_model_metadata(manifest)
                 manifest_runtime_input_shape = _runtime_input_tensor_shape_from_metadata(
                     manifest
                 )
@@ -6467,6 +6584,7 @@ class CloudContinualLearner:
                         edge_id=edge_id,
                         cache_policy="native_only",
                         runtime_input_tensor_shape=manifest_runtime_input_shape,
+                        model_metadata=manifest_model_metadata,
                     )
                 else:
                     metadata = self._require_matching_edge_weights_metadata(
@@ -6486,6 +6604,7 @@ class CloudContinualLearner:
                         edge_id=edge_id,
                         cache_policy="edge_only",
                         runtime_input_tensor_shape=manifest_runtime_input_shape,
+                        model_metadata=manifest_model_metadata,
                     )
                 weights_metadata = {
                     "edge_id": int(edge_id),
@@ -6505,6 +6624,17 @@ class CloudContinualLearner:
                         weights_metadata["ultralytics_head_num_classes"] = int(yolo_num_classes)
                         if current_model_family == "yolo":
                             weights_metadata["yolo_head_num_classes"] = int(yolo_num_classes)
+                if current_model_family == "rfdetr":
+                    rfdetr_num_classes = model_zoo.infer_rfdetr_state_dict_num_classes(
+                        tmp_model.state_dict()
+                    )
+                    if rfdetr_num_classes is None:
+                        rfdetr_num_classes = _coerce_positive_int(
+                            getattr(tmp_model, "num_classes", None)
+                        )
+                    if rfdetr_num_classes is not None:
+                        weights_metadata["rfdetr_head_num_classes"] = int(rfdetr_num_classes)
+                        weights_metadata["num_classes"] = int(rfdetr_num_classes)
                 if (
                     manifest_runtime_input_shape
                     and len(manifest_runtime_input_shape) >= 4
@@ -6789,6 +6919,7 @@ class CloudContinualLearner:
                         tmp_model = self._build_native_training_model(
                             current_model_name,
                             runtime_input_tensor_shape=manifest_runtime_input_shape,
+                            model_metadata=manifest_model_metadata,
                         )
                         baseline_source = "native pretrained"
                         tmp_model.to(self.device)

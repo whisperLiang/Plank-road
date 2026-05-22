@@ -1459,6 +1459,127 @@ def test_delta_payload_applies_to_matching_model(tmp_path):
         assert torch.equal(edge_model.state_dict()[key], value)
 
 
+def test_rfdetr_native_training_model_uses_edge_model_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    build_calls = []
+
+    class DummyModel(torch.nn.Module):
+        def eval(self):
+            return self
+
+    def fake_build_detection_model(name, **kwargs):
+        build_calls.append((name, kwargs))
+        return DummyModel()
+
+    monkeypatch.setattr(
+        cloud_server.model_zoo,
+        "ensure_local_model_artifact",
+        lambda _name: tmp_path / "missing-rfdetr.pth",
+    )
+    monkeypatch.setattr(
+        cloud_server.model_zoo,
+        "build_detection_model",
+        fake_build_detection_model,
+    )
+
+    learner._build_native_training_model(
+        "rfdetr_nano",
+        model_metadata={"num_classes": 9, "label_schema": "zero_based"},
+    )
+
+    assert build_calls[0][0] == "rfdetr_nano"
+    assert build_calls[0][1]["num_classes"] == 9
+
+
+def test_rfdetr_native_training_model_rejects_mismatched_configured_weights(
+    tmp_path,
+):
+    from cloud_server import CloudContinualLearner
+
+    weights_path = tmp_path / "rfdetr-coco.pth"
+    torch.save(
+        {
+            "model": {
+                "class_embed.weight": torch.zeros(91, 256),
+                "class_embed.bias": torch.zeros(91),
+            }
+        },
+        weights_path,
+    )
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            weights_path=str(weights_path),
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="expects 9 logits.*contain 91"):
+        learner._build_native_training_model(
+            "rfdetr_nano",
+            model_metadata={"num_classes": 9, "label_schema": "zero_based"},
+        )
+
+
+def test_cloud_serializes_rfdetr_head_metadata(tmp_path):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    model = torch.nn.Module()
+    model.class_embed = torch.nn.Linear(256, 9)
+    weights_metadata = {
+        "edge_id": 1,
+        "model_name": "rfdetr_nano",
+        "checkpoint_model_version": "1",
+        "source_base_model_version": "0",
+        "rfdetr_head_num_classes": 9,
+        "num_classes": 9,
+    }
+
+    payload = require_state_dict_delta_payload(
+        torch.load(
+            io.BytesIO(
+                learner._serialise_model_bytes(
+                    model,
+                    model_name="rfdetr_nano",
+                    edge_id=1,
+                    weights_metadata=weights_metadata,
+                )
+            ),
+            map_location="cpu",
+            weights_only=False,
+        )
+    )
+
+    assert payload["weights_metadata"]["rfdetr_head_num_classes"] == 9
+    assert payload["weights_metadata"]["num_classes"] == 9
+
+
 def test_yolo_edge_cache_loader_infers_custom_head_classes(tmp_path, monkeypatch):
     import cloud_server
     from cloud_server import CloudContinualLearner
@@ -3482,6 +3603,46 @@ def test_low_quality_raw_only_trigger_uses_partial_raw_shards_without_edge_label
                 first_entry = json.loads(raw_manifest[0])
                 assert set(first_entry) == {"sample_id", "raw_file"}
                 assert "raw_path" not in first_entry
+    finally:
+        os.remove(zip_path)
+
+
+def test_low_quality_trigger_manifest_includes_model_metadata(
+    tmp_path,
+    sample_bgr_frame,
+):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    _store_low_quality_for_shard(
+        store,
+        sample_id="low-rfdetr-meta",
+        frame_index=1,
+        plan=plan,
+        frame=sample_bgr_frame[:16, :16].copy(),
+    )
+
+    zip_path, manifest, _stats = pack_low_quality_trigger_bundle_to_file(
+        store,
+        edge_id=1,
+        send_low_conf_features=False,
+        split_plan=plan,
+        model_id="model-a",
+        model_version="1",
+        model_metadata={
+            "num_classes": 9,
+            "rfdetr_head_num_classes": 9,
+            "label_schema": "zero_based",
+        },
+        output_dir=str(tmp_path),
+    )
+    try:
+        assert manifest["model"] == {
+            "model_id": "model-a",
+            "model_version": "1",
+            "num_classes": 9,
+            "rfdetr_head_num_classes": 9,
+            "label_schema": "zero_based",
+        }
     finally:
         os.remove(zip_path)
 

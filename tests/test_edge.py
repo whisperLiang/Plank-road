@@ -468,6 +468,33 @@ class TestEdgeWorkerRouting:
         assert track_resets == [True]
         assert threshold_refreshes == [True]
 
+    def test_cloud_update_validation_rejects_rfdetr_head_mismatch(self):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.model_id = "rfdetr_nano"
+
+        class DummyRFDETR(torch.nn.Module):
+            num_classes = 9
+            label_schema = "zero_based"
+
+            def __init__(self):
+                super().__init__()
+                self.class_embed = torch.nn.Linear(256, 9)
+
+        worker.small_object_detection = SimpleNamespace(model=DummyRFDETR())
+        update_payload = {
+            "weights_metadata": {
+                "rfdetr_head_num_classes": 91,
+                "num_classes": 91,
+            }
+        }
+        state_dict = {
+            "class_embed.weight": torch.zeros(91, 256),
+            "class_embed.bias": torch.zeros(91),
+        }
+
+        with pytest.raises(RuntimeError, match="cloud head has 91 logits"):
+            worker._validate_cloud_update_state_compatible(update_payload, state_dict)
+
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
         quality = QualityAssessment(

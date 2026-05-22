@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import grpc
 import torch
@@ -49,6 +49,16 @@ from model_management.universal_model_split import UniversalModelSplitter
 from tools.grpc_options import grpc_message_options
 
 _QUEUE_STOP = object()
+
+
+def _coerce_positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 @dataclass(frozen=True)
@@ -562,6 +572,74 @@ class EdgeWorker:
                 getattr(record, "sample_id", None),
                 exc,
             )
+
+    def _current_model_metadata(self) -> dict[str, object]:
+        detection = getattr(self, "small_object_detection", None)
+        model = getattr(detection, "model", None)
+        metadata: dict[str, object] = {}
+        num_classes = _coerce_positive_int(getattr(model, "num_classes", None))
+        if num_classes is not None:
+            metadata["num_classes"] = num_classes
+            if str(getattr(self, "model_id", "")).lower().startswith("rfdetr_"):
+                metadata["rfdetr_head_num_classes"] = num_classes
+        label_schema = str(getattr(model, "label_schema", "") or "").strip()
+        if label_schema:
+            metadata["label_schema"] = label_schema
+        return metadata
+
+    def _validate_cloud_update_state_compatible(
+        self,
+        update_payload: Mapping[str, object],
+        state_dict: Mapping[str, object],
+    ) -> None:
+        model = getattr(self.small_object_detection, "model", None)
+        if model is None or not hasattr(model, "state_dict"):
+            return
+        current_state = model.state_dict()
+        mismatches: list[str] = []
+        for name, value in state_dict.items():
+            current_value = current_state.get(name)
+            if (
+                current_value is None
+                or not torch.is_tensor(value)
+                or not torch.is_tensor(current_value)
+                or tuple(value.shape) == tuple(current_value.shape)
+            ):
+                continue
+            mismatches.append(
+                f"{name}: cloud={tuple(value.shape)} edge={tuple(current_value.shape)}"
+            )
+
+        if not mismatches:
+            return
+
+        raw_metadata = update_payload.get("weights_metadata", {})
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        cloud_head = _coerce_positive_int(
+            metadata.get("rfdetr_head_num_classes")
+            or metadata.get("num_classes")
+        )
+        edge_head = _coerce_positive_int(getattr(model, "num_classes", None))
+        if (
+            str(getattr(self, "model_id", "")).lower().startswith("rfdetr_")
+            and cloud_head is not None
+            and edge_head is not None
+            and cloud_head != edge_head
+        ):
+            raise RuntimeError(
+                "Cloud RF-DETR update is incompatible with the edge model: "
+                f"cloud head has {cloud_head} logits but edge expects {edge_head}. "
+                "Check that server.weights_path points to the same custom RF-DETR "
+                "checkpoint as client.weights_path."
+            )
+
+        preview = "; ".join(mismatches[:4])
+        if len(mismatches) > 4:
+            preview += f"; ... (+{len(mismatches) - 4} more)"
+        raise RuntimeError(
+            "Cloud model update contains tensors with incompatible shapes: "
+            f"{preview}"
+        )
 
     def _sample_sync_context(self) -> dict[str, object]:
         split_plan = getattr(self, "fixed_split_plan", None)
@@ -1173,6 +1251,7 @@ class EdgeWorker:
                     split_plan=self.fixed_split_plan,
                     model_id=self.model_id,
                     model_version=self.model_version,
+                    model_metadata=self._current_model_metadata(),
                     send_low_conf_features=decision.send_low_conf_features,
                     bundle_cap_bytes=decision.bundle_cap_bytes,
                     trigger_shard_size=self._sample_pool_shard_size(),
@@ -1317,6 +1396,10 @@ class EdgeWorker:
                             job_id,
                         )
                     with self.small_object_detection.model_lock:
+                        self._validate_cloud_update_state_compatible(
+                            update_payload,
+                            state_dict,
+                        )
                         load_result = self.small_object_detection.model.load_state_dict(
                             state_dict,
                             strict=False,
