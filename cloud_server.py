@@ -2004,6 +2004,34 @@ class CloudContinualLearner:
         os.makedirs(self.weight_folder, exist_ok=True)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Resolve and validate configured weights_path if provided
+        configured_weights = str(getattr(config, "weights_path", "") or "").strip()
+        if configured_weights:
+            # Convert relative path to absolute path
+            if not os.path.isabs(configured_weights):
+                configured_weights = os.path.abspath(configured_weights)
+            
+            if os.path.exists(configured_weights):
+                logger.info(
+                    "[CloudCL] Using configured weights_path for {}: {}",
+                    self.edge_model_name,
+                    configured_weights,
+                )
+                # Update config with resolved absolute path
+                config.weights_path = configured_weights
+            else:
+                logger.error(
+                    "[CloudCL] Configured weights_path does not exist: {}. "
+                    "This will cause model incompatibility issues!",
+                    configured_weights,
+                )
+        else:
+            logger.warning(
+                "[CloudCL] No weights_path configured for edge model {}. "
+                "Will use default pretrained weights which may be incompatible with edge model.",
+                self.edge_model_name,
+            )
+
         # Default training hyper-parameters (overridable from config)
         cl_cfg = getattr(config, "continual_learning", None)
         self.default_num_epoch = int(getattr(cl_cfg, "num_epoch", 2)) if cl_cfg else 2
@@ -3574,13 +3602,26 @@ class CloudContinualLearner:
             )
         )
         if configured_weights:
-            _validate_rfdetr_weights_match_metadata(
-                model_name=model_name,
-                weights_path=configured_weights,
-                model_metadata=model_metadata,
-                device=self.device,
-            )
-            build_kwargs["weights_path"] = configured_weights
+            # Validate and use configured weights path
+            if not os.path.exists(configured_weights):
+                logger.error(
+                    "[CL] Configured weights_path does not exist: {}. "
+                    "This may cause model incompatibility issues.",
+                    configured_weights,
+                )
+            else:
+                _validate_rfdetr_weights_match_metadata(
+                    model_name=model_name,
+                    weights_path=configured_weights,
+                    model_metadata=model_metadata,
+                    device=self.device,
+                )
+                build_kwargs["weights_path"] = configured_weights
+                logger.info(
+                    "[CL] Building model {} with configured weights: {}",
+                    model_name,
+                    configured_weights,
+                )
         elif source_label == "pretrained":
             try:
                 artifact_path = model_zoo.ensure_local_model_artifact(model_name)
