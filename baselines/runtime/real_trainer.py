@@ -132,7 +132,7 @@ class RealTrainer:
         selected = self._limit_samples(samples)
         before = self._mean_f1(selected)
         before_map50 = self._mean_map50(selected)
-        sample_input = self._prepare_split_input(selected[0])
+        sample_input = self._prepare_runtime_trace_input(selected)
         core_model = get_split_runtime_model(self.model)
         splitter = self._trace_splitter(core_model, sample_input)
 
@@ -350,7 +350,7 @@ class RealTrainer:
         selected = self._limit_samples(samples)
         before = self._mean_f1(selected)
         before_map50 = self._mean_map50(selected)
-        sample_input = self._prepare_split_input(selected[0])
+        sample_input = self._prepare_runtime_trace_input(selected)
         core_model = get_split_runtime_model(self.model)
         splitter = self._trace_splitter(core_model, sample_input)
         loss_fn = self._build_loss_fn()
@@ -519,6 +519,15 @@ class RealTrainer:
     def _prepare_split_input(self, sample: SampleRecord) -> torch.Tensor:
         _frame, tensor = self._read_frame_and_split_input(sample)
         return tensor
+
+    def _prepare_runtime_trace_input(self, samples: list[SampleRecord]) -> torch.Tensor:
+        if not samples:
+            raise ValueError("runtime tracing requires at least one sample")
+        trace_count = 1 if self.batch_size <= 1 else min(len(samples), 2)
+        return torch.cat(
+            [self._prepare_split_input(sample) for sample in samples[:trace_count]],
+            dim=0,
+        )
 
     def _read_frame_and_split_input(self, sample: SampleRecord) -> tuple[np.ndarray, torch.Tensor]:
         frame = cv2.imread(str(sample.frame_path))
