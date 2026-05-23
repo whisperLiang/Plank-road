@@ -24,6 +24,7 @@ from model_management.model_info import model_lib, COCO_INSTANCE_CATEGORY_NAMES,
 from model_management.utils import (
     _clip_box_to_image,
     _resolve_annotation_line_width,
+    _resolve_label_text,
     cal_iou,
     get_offloading_region,
     get_offloading_image,
@@ -307,6 +308,22 @@ class TestDrawDetection:
         blank = np.zeros_like(sample_bgr_frame)
         result = draw_detection(blank, [[30, 30, 120, 120]], ["car"], [0.95])
         assert result[24:40, 30:110].sum() > 0
+
+    def test_zero_based_labels_do_not_render_as_coco_names(self):
+        assert _resolve_label_text(1, label_schema="zero_based") == "class_1"
+
+    def test_custom_class_names_override_zero_based_display_labels(self):
+        assert (
+            _resolve_label_text(
+                1,
+                class_names=["pothole", "crack"],
+                label_schema="zero_based",
+            )
+            == "crack"
+        )
+
+    def test_coco_labels_keep_existing_display_names(self):
+        assert _resolve_label_text(3) == "car"
 
     def test_draw_detection_uses_compact_annotation_line_width(self, sample_bgr_frame, monkeypatch):
         captured = {}

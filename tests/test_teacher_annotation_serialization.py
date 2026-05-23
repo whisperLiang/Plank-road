@@ -193,6 +193,53 @@ def test_collect_teacher_annotations_clips_teacher_boxes_to_frame_bounds(tmp_pat
     assert annotations["0"]["scores"] == pytest.approx([0.95])
 
 
+def test_collect_teacher_annotations_maps_coco_teacher_to_zero_based_target_names(
+    tmp_path,
+    monkeypatch,
+):
+    learner = _build_learner(tmp_path / "mapped", teacher_batch_size=1)
+    frame_dir = tmp_path / "mapped-frames"
+    _write_frames(frame_dir, ["0"])
+
+    monkeypatch.setattr(learner, "_teacher_inference_batch", lambda _frames: [_prediction(3)])
+
+    annotations = learner._collect_teacher_annotations(
+        str(frame_dir),
+        ["0"],
+        target_model_metadata={
+            "label_schema": "zero_based",
+            "num_classes": 3,
+            "class_names": ["person", "car"],
+        },
+    )
+
+    assert annotations["0"]["labels"] == [1]
+
+
+def test_collect_teacher_annotations_filters_labels_outside_zero_based_target_names(
+    tmp_path,
+    monkeypatch,
+):
+    learner = _build_learner(tmp_path / "filtered", teacher_batch_size=1)
+    frame_dir = tmp_path / "filtered-frames"
+    _write_frames(frame_dir, ["0"])
+
+    monkeypatch.setattr(learner, "_teacher_inference_batch", lambda _frames: [_prediction(1)])
+
+    annotations = learner._collect_teacher_annotations(
+        str(frame_dir),
+        ["0"],
+        include_empty=True,
+        target_model_metadata={
+            "label_schema": "zero_based",
+            "num_classes": 2,
+            "class_names": ["car"],
+        },
+    )
+
+    assert annotations["0"] == {"boxes": [], "labels": []}
+
+
 def test_collect_teacher_annotations_rejects_invalid_batch_without_per_image_retry(
     tmp_path,
     monkeypatch,

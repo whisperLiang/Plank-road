@@ -60,6 +60,7 @@ server:
     assert config.client.resource_aware_trigger.probe_timeout_sec == pytest.approx(3.0)
     assert config.client.resource_aware_trigger.bandwidth_probe_size_bytes == 65536
     assert config.client.final_detection_threshold == 0.5
+    assert config.client.class_names == []
     assert config.client.tinynext_input_size == 320
     assert config.server.golden == "yolo26x"
     assert config.server.tinynext_input_size == 320
@@ -211,6 +212,26 @@ server:
     config = load_runtime_config(config_path)
 
     assert config.client.final_detection_threshold == 0.65
+
+
+def test_load_runtime_config_reads_client_class_names(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  class_names:
+    - pothole
+    - crack
+  server_ip: 10.0.0.1:50051
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(config_path)
+
+    assert config.client.class_names == ["pothole", "crack"]
 
 
 def test_load_runtime_config_reads_tinynext_input_size(tmp_path):

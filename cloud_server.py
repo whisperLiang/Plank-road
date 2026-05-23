@@ -43,7 +43,7 @@ from model_management.detection_box_projection import (
     infer_original_image_size,
     project_original_xyxy_to_model_input_xyxy,
 )
-from model_management.model_info import model_lib
+from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES, model_lib
 from model_management.model_delta_payload import build_state_dict_delta_payload
 from model_management.model_zoo import (
     get_detection_thresholds,
@@ -492,6 +492,64 @@ def _coerce_positive_int(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _normalise_label_schema(value: object, default: str = "coco_91") -> str:
+    schema = str(value or default).strip().lower()
+    return schema or default
+
+
+def _normalise_class_name(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value).strip().lower().replace("_", " "))
+
+
+def _class_names_from_metadata(metadata: Mapping[str, object] | None) -> list[str]:
+    if not isinstance(metadata, Mapping):
+        return []
+    value = metadata.get("class_names")
+    if isinstance(value, Mapping):
+        ordered = sorted(
+            (
+                (int(key), item)
+                for key, item in value.items()
+                if str(key).lstrip("-").isdigit()
+            ),
+            key=lambda item: item[0],
+        )
+        return [str(item) for _key, item in ordered]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return []
+
+
+def _label_name_from_schema(
+    label: object,
+    *,
+    label_schema: str,
+    class_names: list[str] | tuple[str, ...] | None = None,
+) -> str | None:
+    try:
+        label_index = int(label)
+    except (TypeError, ValueError):
+        return None
+
+    names = list(class_names or [])
+    if names:
+        if _normalise_label_schema(label_schema) == "zero_based":
+            if 0 <= label_index < len(names):
+                return str(names[label_index])
+        else:
+            if 1 <= label_index <= len(names):
+                return str(names[label_index - 1])
+            if 0 <= label_index < len(names):
+                return str(names[label_index])
+
+    if _normalise_label_schema(label_schema) != "zero_based":
+        if 0 <= label_index < len(COCO_INSTANCE_CATEGORY_NAMES):
+            name = COCO_INSTANCE_CATEGORY_NAMES[label_index]
+            if name not in {"__background__", "N/A"}:
+                return str(name)
+    return None
 
 
 def _infer_yolo_state_dict_num_classes(state: object) -> int | None:
@@ -3939,13 +3997,69 @@ class CloudContinualLearner:
         logger.info("[FixedSplitCL] {} took {:.3f}s.", stage, duration)
         return duration
 
-    @staticmethod
+    def _teacher_label_schema(self) -> str:
+        teacher_model = getattr(getattr(self, "large_od", None), "model", None)
+        return _normalise_label_schema(getattr(teacher_model, "label_schema", "coco_91"))
+
+    def _teacher_class_names(self) -> list[str]:
+        teacher_model = getattr(getattr(self, "large_od", None), "model", None)
+        class_names = getattr(teacher_model, "class_names", None)
+        if isinstance(class_names, Mapping):
+            return _class_names_from_metadata({"class_names": class_names})
+        if isinstance(class_names, (list, tuple)):
+            return [str(item) for item in class_names]
+        return []
+
+    def _map_teacher_label_for_target(
+        self,
+        label: object,
+        *,
+        target_model_metadata: Mapping[str, object] | None = None,
+    ) -> int | None:
+        try:
+            label_index = int(label)
+        except (TypeError, ValueError):
+            return None
+
+        if not isinstance(target_model_metadata, Mapping):
+            return label_index
+
+        target_schema = _normalise_label_schema(
+            target_model_metadata.get("label_schema"),
+        )
+        teacher_schema = self._teacher_label_schema()
+        if target_schema != "zero_based":
+            return label_index
+
+        if teacher_schema == "zero_based":
+            return label_index
+
+        target_class_names = _class_names_from_metadata(target_model_metadata)
+        if not target_class_names:
+            return None
+
+        teacher_name = _label_name_from_schema(
+            label_index,
+            label_schema=teacher_schema,
+            class_names=self._teacher_class_names(),
+        )
+        if teacher_name is None:
+            return None
+
+        target_lookup = {
+            _normalise_class_name(name): index
+            for index, name in enumerate(target_class_names)
+        }
+        return target_lookup.get(_normalise_class_name(teacher_name))
+
     def _build_teacher_targets_from_prediction(
+        self,
         pred_boxes,
         pred_class,
         pred_score=None,
         *,
         image_size: tuple[int, int] | list[int] | None = None,
+        target_model_metadata: Mapping[str, object] | None = None,
     ) -> dict[str, object] | None:
         if pred_boxes is None or pred_class is None:
             return None
@@ -3986,8 +4100,14 @@ class CloudContinualLearner:
                 values[3] = max(0.0, min(float(image_height), values[3]))
             if values[2] <= values[0] or values[3] <= values[1]:
                 continue
+            target_label = self._map_teacher_label_for_target(
+                labels[index],
+                target_model_metadata=target_model_metadata,
+            )
+            if target_label is None:
+                continue
             target_boxes.append(values)
-            target_labels.append(int(labels[index]))
+            target_labels.append(int(target_label))
             if scores is not None and index < len(scores):
                 target_scores.append(float(scores[index]))
 
@@ -4046,13 +4166,19 @@ class CloudContinualLearner:
         except TypeError:
             return batch_inference(frames)
 
-    def _build_teacher_targets(self, frame) -> dict[str, object] | None:
+    def _build_teacher_targets(
+        self,
+        frame,
+        *,
+        target_model_metadata: Mapping[str, object] | None = None,
+    ) -> dict[str, object] | None:
         pred_boxes, pred_class, pred_score = self._teacher_inference(frame)
         return self._build_teacher_targets_from_prediction(
             pred_boxes,
             pred_class,
             pred_score,
             image_size=tuple(int(value) for value in frame.shape[:2]),
+            target_model_metadata=target_model_metadata,
         )
 
     def _proxy_eval_frame_cache(self) -> dict[str, np.ndarray | None] | None:
@@ -5414,10 +5540,23 @@ class CloudContinualLearner:
         missing_raw_message: str | None = None,
         key_transform=None,
         include_empty: bool = False,
+        target_model_metadata: Mapping[str, object] | None = None,
     ) -> dict:
         transform = key_transform or (lambda sample_id: sample_id)
         annotations = {}
         logger.info("[CL] Cloud model is annotating samples.")
+        if (
+            isinstance(target_model_metadata, Mapping)
+            and _normalise_label_schema(target_model_metadata.get("label_schema")) == "zero_based"
+            and self._teacher_label_schema() != "zero_based"
+            and not _class_names_from_metadata(target_model_metadata)
+        ):
+            logger.warning(
+                "[CL] Teacher uses {} labels but target model uses zero_based labels "
+                "without class_names metadata; teacher annotations will be skipped "
+                "because label ids cannot be mapped safely.",
+                self._teacher_label_schema(),
+            )
         pending_samples: list[tuple[object, np.ndarray]] = []
         for sample_id in sample_ids:
             img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
@@ -5468,6 +5607,7 @@ class CloudContinualLearner:
                         pred_class,
                         pred_score,
                         image_size=tuple(int(value) for value in frame.shape[:2]),
+                        target_model_metadata=target_model_metadata,
                     )
                     if teacher_targets is None:
                         if include_empty:
@@ -6751,6 +6891,7 @@ class CloudContinualLearner:
                     missing_raw_message="[FixedSplitCL] GT sample {} missing raw frame.",
                     key_transform=str,
                     include_empty=True,
+                    target_model_metadata=manifest_model_metadata,
                 )
                 self._log_stage_duration("teacher annotation", stage_started)
                 stage_started = time.perf_counter()

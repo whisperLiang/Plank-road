@@ -585,6 +585,9 @@ class EdgeWorker:
         label_schema = str(getattr(model, "label_schema", "") or "").strip()
         if label_schema:
             metadata["label_schema"] = label_schema
+        class_names = getattr(self.config, "class_names", None)
+        if class_names:
+            metadata["class_names"] = [str(name) for name in list(class_names)]
         return metadata
 
     def _validate_cloud_update_state_compatible(

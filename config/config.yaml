@@ -34,6 +34,9 @@ client:
  # Explicit custom RF-DETR checkpoint. Keep model name as the architecture
  # (rfdetr_nano) and point weights_path at your trained checkpoint.
  weights_path: ./model_management/models/rf-detr-nano.pth
+ # Optional display names for custom zero-based checkpoints. Leave empty for
+ # COCO models, or fill in the exact training-class order, e.g. ["car", "bus"].
+ class_names: ["unidentified", "others", "pedestrian", "micromobility", "car", "bus", "small truck", "truck"]
  tinynext_input_size: 640
  # edge-side final display threshold; boxes below this score are not returned
  final_detection_threshold: 0.6

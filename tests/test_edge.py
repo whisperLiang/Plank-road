@@ -495,6 +495,21 @@ class TestEdgeWorkerRouting:
         with pytest.raises(RuntimeError, match="cloud head has 91 logits"):
             worker._validate_cloud_update_state_compatible(update_payload, state_dict)
 
+    def test_current_model_metadata_includes_configured_class_names(self):
+        worker = EdgeWorker.__new__(EdgeWorker)
+        worker.model_id = "rfdetr_nano"
+        worker.config = SimpleNamespace(class_names=["person", "car"])
+        worker.small_object_detection = SimpleNamespace(
+            model=SimpleNamespace(num_classes=3, label_schema="zero_based")
+        )
+
+        metadata = worker._current_model_metadata()
+
+        assert metadata["num_classes"] == 3
+        assert metadata["rfdetr_head_num_classes"] == 3
+        assert metadata["label_schema"] == "zero_based"
+        assert metadata["class_names"] == ["person", "car"]
+
     def test_collect_data_sets_retrain_event_when_training_is_triggered(self, sample_bgr_frame):
         worker = EdgeWorker.__new__(EdgeWorker)
         quality = QualityAssessment(

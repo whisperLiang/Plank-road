@@ -43,6 +43,16 @@ def _write_task_result(handle, task: Task) -> None:
     handle.flush()
 
 
+def _resolve_display_label_config(config, edge: EdgeWorker):
+    class_names = getattr(config, "class_names", None) or None
+    label_schema = getattr(config, "label_schema", None) or None
+    detector = getattr(edge, "small_object_detection", None)
+    model = getattr(detector, "model", None)
+    if label_schema is None:
+        label_schema = getattr(model, "label_schema", None)
+    return class_names, label_schema
+
+
 def _overlay_lines(frame, lines: list[str]) -> None:
     y = 28
     for line in lines:
@@ -73,11 +83,20 @@ def _build_display_frame(
     latest_result_frame: int | None = None,
     show_boxes: bool = True,
     detection_count: int | None = None,
+    class_names=None,
+    label_schema: str | None = None,
 ):
     display_boxes = detection_boxes if show_boxes else []
     display_class = detection_class if show_boxes else []
     display_score = detection_score if show_boxes else []
-    rendered = draw_detection(frame, display_boxes, display_class, display_score)
+    rendered = draw_detection(
+        frame,
+        display_boxes,
+        display_class,
+        display_score,
+        class_names=class_names,
+        label_schema=label_schema,
+    )
     lines = [
         f"Frame: {frame_index}",
         f"Detections: {detection_count if detection_count is not None else len(display_boxes)}",
@@ -103,6 +122,17 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
 
     window_name = f"Edge {config.edge_id} Inference"
     window_created = False
+    display_class_names, display_label_schema = _resolve_display_label_config(config, edge)
+    if display_class_names:
+        logger.info(
+            "Using {} configured detection class name(s) for display.",
+            len(display_class_names),
+        )
+    elif str(display_label_schema or "").strip().lower() == "zero_based":
+        logger.info(
+            "Model uses zero-based labels; display will show class_<id>. "
+            "Set client.class_names in config.yaml to show custom names."
+        )
 
     last_visual = {
         "boxes": [],
@@ -203,6 +233,8 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
                         latest_result_frame=last_visual["frame_index"],
                         show_boxes=show_boxes,
                         detection_count=len(last_visual["boxes"]),
+                        class_names=display_class_names,
+                        label_schema=display_label_schema,
                     )
                 else:
                     display_boxes = last_visual["boxes"]
@@ -239,6 +271,8 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
                         latest_result_frame=last_visual["frame_index"],
                         show_boxes=bool(display_boxes),
                         detection_count=len(display_boxes),
+                        class_names=display_class_names,
+                        label_schema=display_label_schema,
                     )
 
                 if not headless:

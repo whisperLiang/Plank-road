@@ -167,6 +167,7 @@ class ClientConfig(ConfigSection):
     frame_cache_maxsize: int = 100
     lightweight: str = "yolo26n"
     weights_path: str | None = None
+    class_names: list[str] = field(default_factory=list)
     final_detection_threshold: float = 0.5
     tinynext_input_size: int = 320
     server_ip: str = "192.168.66.205:50051"

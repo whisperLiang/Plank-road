@@ -1,3 +1,5 @@
+from collections.abc import Mapping, Sequence
+
 import cv2
 import numpy as np
 from loguru import logger
@@ -110,9 +112,40 @@ def _clip_box_to_image(box, image_shape):
     return x1, y1, x2, y2
 
 
-def _resolve_label_text(label):
+def _is_zero_based_label_schema(label_schema) -> bool:
+    return str(label_schema or "").strip().lower() == "zero_based"
+
+
+def _resolve_class_name(label_index: int, class_names, label_schema=None):
+    if not class_names:
+        return None
+
+    if isinstance(class_names, Mapping):
+        value = class_names.get(label_index, class_names.get(str(label_index)))
+        return None if value is None else str(value)
+
+    if isinstance(class_names, Sequence) and not isinstance(class_names, (str, bytes)):
+        if _is_zero_based_label_schema(label_schema):
+            if 0 <= label_index < len(class_names):
+                return str(class_names[label_index])
+            return None
+
+        if 1 <= label_index <= len(class_names):
+            return str(class_names[label_index - 1])
+        if 0 <= label_index < len(class_names):
+            return str(class_names[label_index])
+
+    return None
+
+
+def _resolve_label_text(label, class_names=None, label_schema=None):
     if isinstance(label, (int, np.integer)):
         label_index = int(label)
+        class_name = _resolve_class_name(label_index, class_names, label_schema)
+        if class_name is not None:
+            return class_name
+        if _is_zero_based_label_schema(label_schema):
+            return f"class_{label_index}"
         return (
             COCO_INSTANCE_CATEGORY_NAMES[label_index]
             if 0 <= label_index < len(COCO_INSTANCE_CATEGORY_NAMES)
@@ -136,7 +169,7 @@ def _resolve_annotation_line_width(image_shape):
     return max(1, min(2, int(round(min_dim / 1400.0))))
 
 
-def draw_detection(img, pred_boxes, pred_cls, pred_score):
+def draw_detection(img, pred_boxes, pred_cls, pred_score, class_names=None, label_schema=None):
     cached_img = np.ascontiguousarray(img.copy())
     if pred_boxes is None or pred_cls is None:
         return cached_img
@@ -153,7 +186,11 @@ def draw_detection(img, pred_boxes, pred_cls, pred_score):
         if clipped_box is None:
             continue
         label = pred_cls[i]
-        label_text = _resolve_label_text(label)
+        label_text = _resolve_label_text(
+            label,
+            class_names=class_names,
+            label_schema=label_schema,
+        )
 
         score_text = ""
         if pred_score is not None and i < len(pred_score):
