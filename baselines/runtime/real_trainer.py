@@ -495,7 +495,10 @@ class RealTrainer:
         apply_split_plan(splitter, plan)
 
     def _batches(self, samples: list[SampleRecord]) -> list[list[SampleRecord]]:
-        return [samples[i : i + self.batch_size] for i in range(0, len(samples), self.batch_size)]
+        batches = [samples[i : i + self.batch_size] for i in range(0, len(samples), self.batch_size)]
+        if self._requires_non_singleton_train_batches():
+            return [batch + batch if len(batch) == 1 else batch for batch in batches]
+        return batches
 
     def _prepare_detection_sample(self, sample: SampleRecord) -> tuple[torch.Tensor, dict[str, object]]:
         frame = cv2.imread(str(sample.frame_path))
@@ -577,7 +580,7 @@ class RealTrainer:
         return str(getattr(self.model, "model_name", "") or type(self.model).__name__)
 
     def _split_model_family(self) -> str | None:
-        name = type(self.model).__name__.lower()
+        name = f"{self._split_model_name()} {type(self.model).__name__}".lower()
         if "yolo" in name:
             return "yolo"
         if "rfdetr" in name:
@@ -601,6 +604,9 @@ class RealTrainer:
         if family == "yolo" or "yolo" in name:
             return 3e-5
         return 1e-3
+
+    def _requires_non_singleton_train_batches(self) -> bool:
+        return self._split_model_family() == "tinynext"
 
     def _mean_f1(self, samples: list[SampleRecord]) -> float:
         values = [sample.metric_f1 for sample in samples if sample.metric_f1 is not None]

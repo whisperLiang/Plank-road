@@ -398,16 +398,30 @@ def _normalise_after_key(value: object) -> str:
     return text if text.startswith("after:") else f"after:{text}"
 
 
-def canonical_split_key_for_candidate(candidate: SplitCandidate) -> str:
+def _candidate_split_key(candidate: SplitCandidate) -> str:
     metadata = dict(getattr(candidate, "metadata", {}) or {})
     raw_key = (
         metadata.get("canonical_split_key")
         or metadata.get("ariadne_boundary_after")
         or getattr(candidate, "candidate_id", None)
     )
-    key = _normalise_after_key(raw_key)
-    unstable_prefixes = ("after:node_", "after:__node_", "after:fx_")
-    if any(key.startswith(prefix) for prefix in unstable_prefixes):
+    return _normalise_after_key(raw_key)
+
+
+_UNSTABLE_SPLIT_KEY_PREFIXES = ("after:node_", "after:__node_", "after:fx_")
+
+
+def _is_stable_module_boundary_candidate(candidate: SplitCandidate) -> bool:
+    try:
+        key = _candidate_split_key(candidate)
+    except RuntimeError:
+        return False
+    return not any(key.startswith(prefix) for prefix in _UNSTABLE_SPLIT_KEY_PREFIXES)
+
+
+def canonical_split_key_for_candidate(candidate: SplitCandidate) -> str:
+    key = _candidate_split_key(candidate)
+    if any(key.startswith(prefix) for prefix in _UNSTABLE_SPLIT_KEY_PREFIXES):
         raise RuntimeError(
             "This split point is not stable across batch sizes. "
             "Please choose a module-boundary split."
@@ -464,6 +478,8 @@ def _enumerate_feasible_candidates(
 
     eligible: list[EligibleCandidate] = []
     for candidate in candidates:
+        if not _is_stable_module_boundary_candidate(candidate):
+            continue
         if not candidate.is_trainable_tail:
             continue
         privacy_leakage = _privacy_leakage(candidate, constraints)
@@ -512,7 +528,12 @@ def _validate_payload_group(
         group,
         key=lambda item: _candidate_runtime_key(item[0]),
     ):
-        report = runtime.validate_candidate(candidate)
+        try:
+            report = runtime.validate_candidate(candidate)
+        except Exception as exc:
+            replay_validation_failures += 1
+            validation_error_counts[str(exc) or type(exc).__name__] += 1
+            continue
         if not bool(report.get("success", False)):
             replay_validation_failures += 1
             error_text = str(report.get("error") or "unknown")

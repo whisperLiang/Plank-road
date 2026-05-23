@@ -241,6 +241,8 @@ def test_fixed_split_validates_only_lowest_payload_group_until_success():
 
         def validate_candidate(self, candidate):
             self.validation_calls.append(candidate.candidate_id)
+            if candidate.candidate_id == "candidate-low-invalid":
+                raise ValueError("mismatch")
             return dict(reports[candidate.candidate_id])
 
     runtime = DummyRuntime()
@@ -257,6 +259,91 @@ def test_fixed_split_validates_only_lowest_payload_group_until_success():
         "candidate-low-invalid",
         "candidate-low-valid",
     ]
+
+
+def test_fixed_split_skips_unstable_node_candidates():
+    constraints = SplitConstraints()
+
+    def _candidate(
+        candidate_id: str,
+        *,
+        edge_nodes: list[str],
+        payload_bytes: int,
+        layer_index: int,
+        canonical_split_key: str | None = None,
+    ) -> SplitCandidate:
+        return SplitCandidate(
+            candidate_id=candidate_id,
+            edge_nodes=edge_nodes,
+            cloud_nodes=[label for label in ["n1", "n2", "n3"] if label not in edge_nodes],
+            boundary_edges=[],
+            boundary_tensor_labels=[edge_nodes[-1]],
+            edge_input_labels=[],
+            cloud_input_labels=[],
+            cloud_output_labels=["n3"],
+            estimated_edge_flops=1.0,
+            estimated_cloud_flops=1.0,
+            estimated_payload_bytes=payload_bytes,
+            estimated_privacy_risk=1.0,
+            estimated_latency=float(layer_index),
+            is_trainable_tail=True,
+            legacy_layer_index=layer_index,
+            boundary_count=1,
+            metadata=(
+                {}
+                if canonical_split_key is None
+                else {"canonical_split_key": canonical_split_key}
+            ),
+        )
+
+    candidates = [
+        _candidate("node_1", edge_nodes=["n1"], payload_bytes=1, layer_index=1),
+        _candidate(
+            "candidate-stable",
+            edge_nodes=["n1", "n2"],
+            payload_bytes=20,
+            layer_index=2,
+            canonical_split_key="backbone.stage2",
+        ),
+    ]
+
+    class DummyRuntime:
+        def __init__(self):
+            self.graph = "sig"
+            self.runtime = object()
+            self.model = object()
+            self.candidates = candidates
+            self._candidate_enumeration_config = (
+                constraints.max_candidates,
+                constraints.max_boundary_count,
+                constraints.max_payload_bytes,
+            )
+            self.validation_calls: list[str] = []
+
+        def validate_candidate(self, candidate):
+            self.validation_calls.append(candidate.candidate_id)
+            return {
+                "success": True,
+                "edge_latency": 0.1,
+                "cloud_latency": 0.1,
+                "end_to_end_latency": 0.2,
+                "tail_trainability": True,
+                "stability_score": 1.0,
+                "error": None,
+            }
+
+    runtime = DummyRuntime()
+    plan = compute_fixed_split_for_model(
+        torch.nn.Linear(1, 1),
+        constraints,
+        sample_input=[torch.rand(1)],
+        splitter=runtime,
+        model_name="dummy-model",
+    )
+
+    assert plan.candidate_id == "candidate-stable"
+    assert plan.canonical_split_key == "after:backbone.stage2"
+    assert runtime.validation_calls == ["candidate-stable"]
 
 
 def test_fixed_split_failure_reports_untrainable_replay_candidates():

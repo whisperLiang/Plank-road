@@ -65,3 +65,18 @@ def test_split_tail_learning_rate_matches_motivation_defaults(
     )
 
     assert trainer._resolve_split_tail_learning_rate() == pytest.approx(expected_lr)
+
+
+def test_tinynext_training_batches_duplicate_singletons(tmp_path: Path):
+    trainer = RealTrainer(
+        model=_NamedModel("tinynext_s"),
+        device=torch.device("cpu"),
+        results_dir=tmp_path,
+        method_name="ekya_style_centralized_scheduling",
+        checkpoint_manager=None,
+        evaluator=None,
+        batch_size=2,
+    )
+    sample = object()
+
+    assert trainer._batches([sample]) == [[sample, sample]]
