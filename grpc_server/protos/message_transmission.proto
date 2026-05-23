@@ -4,10 +4,6 @@ service MessageTransmission {
   // Cloud-side continual learning: edge sends collected frame indices,
   // cloud retrains the lightweight model and returns updated weights.
   rpc train_model_request (TrainRequest) returns (TrainReply) {}
-  // Split-learning continual learning: edge sends intermediate features
-  // (cached on shared filesystem), cloud annotates drift frames only,
-  // then trains server-side model (rpn + roi_heads) on all features.
-  rpc split_train_request (SplitTrainRequest) returns (SplitTrainReply) {}
   // Versioned continual-learning bundle upload for the fixed-split pipeline.
   rpc continual_learning_request (ContinualLearningRequest) returns (ContinualLearningReply) {}
   // Sharded sample pool exchange without creating a training job.
@@ -29,7 +25,7 @@ service MessageTransmission {
 enum TrainingJobType {
   TRAINING_JOB_TYPE_UNSPECIFIED = 0;
   TRAINING_JOB_TYPE_FULL_FRAME = 1;
-  TRAINING_JOB_TYPE_SPLIT = 2;
+  reserved 2;
   TRAINING_JOB_TYPE_CONTINUAL_LEARNING = 3;
 }
 
@@ -46,24 +42,6 @@ message TrainRequest {
 message TrainReply {
   bool success = 1;
   // Base-64 encoded PyTorch state-dict bytes of the retrained lightweight model
-  string model_data = 2;
-  string message = 3;
-}
-
-// Split-learning continual learning messages 
-message SplitTrainRequest {
-  int64 edge_id = 1;
-  repeated int64 all_frame_indices = 2;
-  repeated int64 drift_frame_indices = 3;
-  // Cloud-owned working directory hint; server resolves it inside workspace_root.
-  string cache_path = 4;
-  reserved 5;
-  bytes payload_zip = 6;
-}
-
-message SplitTrainReply {
-  bool success = 1;
-  // Base-64 encoded PyTorch state-dict bytes of the retrained model
   string model_data = 2;
   string message = 3;
 }
@@ -109,8 +87,7 @@ message SubmitTrainingJobRequest {
   reserved 6;
   bool send_low_conf_features = 7;
   repeated int64 frame_indices = 8;
-  repeated int64 all_frame_indices = 9;
-  repeated int64 drift_frame_indices = 10;
+  reserved 9, 10;
   bytes payload_zip = 11;
   // Model version at the time of submission (for stale detection)
   string base_model_version = 12;

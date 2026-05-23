@@ -408,28 +408,13 @@ def pack_low_quality_trigger_bundle_to_file(
         raise
 
 
-def pack_training_payload(cache_path, all_frame_indices, drift_frame_indices=None):
+def pack_training_payload(cache_path, frame_indices):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        if drift_frame_indices is not None:
-            # Split learning mode
-            meta_path = os.path.join(cache_path, "features", "split_meta.json")
-            if os.path.exists(meta_path):
-                zf.write(meta_path, arcname="features/split_meta.json")
-            for idx in all_frame_indices:
-                feat_path = os.path.join(cache_path, "features", f"{idx}.pt")
-                if os.path.exists(feat_path):
-                    zf.write(feat_path, arcname=f"features/{idx}.pt")
-            for idx in drift_frame_indices:
-                frame_path = os.path.join(cache_path, "frames", f"{idx}.jpg")
-                if os.path.exists(frame_path):
-                    zf.write(frame_path, arcname=f"frames/{idx}.jpg")
-        else:
-            # Full frame train mode
-            for idx in all_frame_indices:
-                frame_path = os.path.join(cache_path, "frames", f"{idx}.jpg")
-                if os.path.exists(frame_path):
-                    zf.write(frame_path, arcname=f"frames/{idx}.jpg")
+        for idx in frame_indices:
+            frame_path = os.path.join(cache_path, "frames", f"{idx}.jpg")
+            if os.path.exists(frame_path):
+                zf.write(frame_path, arcname=f"frames/{idx}.jpg")
     return buf.getvalue()
 
 
@@ -481,54 +466,6 @@ def request_cloud_training(server_ip, edge_id, frame_indices, cache_path):
         return False, "", str(exc)
 
 
-def request_cloud_split_training(
-    server_ip, edge_id, all_frame_indices, drift_frame_indices,
-    cache_path,
-):
-    """Send frame indices and drift info to cloud for **split-learning**
-    continual learning.
-
-    The cloud will:
-      1. Annotate **only** drift frames with the large model.
-      2. Train the server-side model (rpn + roi_heads) on **all** cached
-         backbone features (using pseudo-labels for non-drift frames).
-      3. Return the updated edge-model state-dict.
-
-    Parameters
-    ----------
-    server_ip : str
-        gRPC server address.
-    edge_id : int
-    all_frame_indices : list[int]
-        Every frame index that has cached backbone features.
-    drift_frame_indices : list[int]
-        Subset of *all_frame_indices* where drift was detected.
-    cache_path : str
-        Shared cache directory containing ``features/`` and ``frames/`` dirs.
-        Training epochs; 0 → cloud default.
-
-    Returns
-    -------
-    tuple[bool, str, str]
-        ``(success, base64_model_state_dict, message)``
-    """
-    try:
-        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
-        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
-        req = message_transmission_pb2.SplitTrainRequest(
-            edge_id=int(edge_id),
-            all_frame_indices=[int(index) for index in all_frame_indices],
-            drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
-            cache_path=_server_workspace_hint(edge_id, "split_train"),
-            payload_zip=pack_training_payload(cache_path, all_frame_indices, drift_frame_indices),
-        )
-        reply = stub.split_train_request(req)
-        return reply.success, reply.model_data, reply.message
-    except Exception as exc:
-        logger.exception("request_cloud_split_training failed: {}", exc)
-        return False, "", str(exc)
-
-
 def submit_training_job(
     server_ip: str,
     *,
@@ -539,8 +476,6 @@ def submit_training_job(
     protocol_version: str = "",
     send_low_conf_features: bool = False,
     frame_indices: list[int] | None = None,
-    all_frame_indices: list[int] | None = None,
-    drift_frame_indices: list[int] | None = None,
     payload_zip: bytes = b"",
     channel=None,
 ):
@@ -568,8 +503,6 @@ def submit_training_job(
             cache_path=str(cache_path or ""),
             send_low_conf_features=bool(send_low_conf_features),
             frame_indices=[int(index) for index in (frame_indices or [])],
-            all_frame_indices=[int(index) for index in (all_frame_indices or [])],
-            drift_frame_indices=[int(index) for index in (drift_frame_indices or [])],
             payload_zip=payload_zip,
         )
         reply = stub.submit_training_job(req)

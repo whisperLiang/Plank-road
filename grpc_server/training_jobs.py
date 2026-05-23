@@ -48,8 +48,6 @@ class TrainingJob:
     payload_zip: bytes = b""
     send_low_conf_features: bool = False
     frame_indices: tuple[int, ...] = ()
-    all_frame_indices: tuple[int, ...] = ()
-    drift_frame_indices: tuple[int, ...] = ()
     status: str = JOB_STATUS_QUEUED
     message: str = ""
     model_data: str = ""
@@ -120,8 +118,6 @@ class TrainingJobManager:
         payload_zip: bytes = b"",
         send_low_conf_features: bool = False,
         frame_indices: list[int] | tuple[int, ...] | None = None,
-        all_frame_indices: list[int] | tuple[int, ...] | None = None,
-        drift_frame_indices: list[int] | tuple[int, ...] | None = None,
         base_model_version: str = "0",
     ) -> tuple[TrainingJob, bool]:
         normalized_request_id = str(request_id or "").strip()
@@ -145,10 +141,6 @@ class TrainingJobManager:
                 payload_zip=bytes(payload_zip or b""),
                 send_low_conf_features=bool(send_low_conf_features),
                 frame_indices=tuple(int(value) for value in (frame_indices or [])),
-                all_frame_indices=tuple(int(value) for value in (all_frame_indices or [])),
-                drift_frame_indices=tuple(
-                    int(value) for value in (drift_frame_indices or [])
-                ),
                 base_model_version=str(base_model_version or "0"),
             )
             self._jobs[job_id] = job
@@ -295,8 +287,6 @@ class TrainingJobManager:
             request_kind = job.request_kind
             payload_zip = job.payload_zip
             frame_indices = list(job.frame_indices)
-            all_frame_indices = list(job.all_frame_indices)
-            drift_frame_indices = list(job.drift_frame_indices)
             send_low_conf_features = job.send_low_conf_features
         logger.info(
             "Async training job {} started: edge_id={} job_type={} workspace={}",
@@ -325,8 +315,6 @@ class TrainingJobManager:
                 job_type=job_type,
                 workspace=workspace,
                 frame_indices=frame_indices,
-                all_frame_indices=all_frame_indices,
-                drift_frame_indices=drift_frame_indices,
                 send_low_conf_features=send_low_conf_features,
             )
         except Exception as exc:
@@ -401,21 +389,12 @@ class TrainingJobManager:
         job_type: int,
         workspace: str,
         frame_indices: list[int],
-        all_frame_indices: list[int],
-        drift_frame_indices: list[int],
         send_low_conf_features: bool,
     ) -> tuple[bool, str, str]:
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
             return self.continual_learner.get_ground_truth_and_retrain(
                 edge_id,
                 frame_indices,
-                workspace,
-            )
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_SPLIT:
-            return self.continual_learner.get_ground_truth_and_split_retrain(
-                edge_id,
-                all_frame_indices,
-                drift_frame_indices,
                 workspace,
             )
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
@@ -429,8 +408,6 @@ class TrainingJobManager:
     def _request_kind_for_job_type(job_type: int) -> str:
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
             return "train_model"
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_SPLIT:
-            return "split_train"
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
             return "continual_learning"
         raise ValueError(f"Unsupported training job type: {job_type!r}")

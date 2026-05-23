@@ -93,8 +93,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
     def _request_kind_for_job_type(job_type: int) -> str:
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
             return "train_model"
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_SPLIT:
-            return "split_train"
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
             return "continual_learning"
         raise ValueError(f"Unsupported training job type: {job_type!r}")
@@ -132,45 +130,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             success, model_data, message = False, "", str(exc)
 
         return message_transmission_pb2.TrainReply(
-            success=success, model_data=model_data, message=message
-        )
-
-    def split_train_request(self, request, context):
-        """Split-learning continual learning : annotate only drift
-        frames with the large model, then train server-side model on all cached
-        backbone features and return the updated state-dict."""
-        cache_path = _normalize_cache_path(request.cache_path)
-        if cache_path and cache_path != request.cache_path:
-            logger.info("Normalized split-train cache_path from {} to {}", request.cache_path, cache_path)
-        logger.info(
-            "split_train_request from edge_id={} client_cache_path={}",
-            request.edge_id, cache_path or "<uploaded-bundle>",
-        )
-        if self.continual_learner is None:
-            logger.error("split_train_request: continual_learner not configured")
-            return message_transmission_pb2.SplitTrainReply(
-                success=False, model_data="", message="continual_learner not configured"
-            )
-        try:
-            workspace = prepare_request_workspace(
-                self.workspace_root,
-                edge_id=request.edge_id,
-                request_kind="split_train",
-                payload_zip=getattr(request, "payload_zip", b""),
-                client_cache_path=request.cache_path,
-            )
-            success, model_data, message = \
-                self.continual_learner.get_ground_truth_and_split_retrain(
-                    request.edge_id,
-                    [int(index) for index in request.all_frame_indices],
-                    [int(index) for index in request.drift_frame_indices],
-                    str(workspace),
-                )
-        except Exception as exc:
-            logger.exception("split_train_request error: {}", exc)
-            success, model_data, message = False, "", str(exc)
-
-        return message_transmission_pb2.SplitTrainReply(
             success=success, model_data=model_data, message=message
         )
 
@@ -349,8 +308,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             payload_zip=payload_zip,
             send_low_conf_features=bool(request.send_low_conf_features),
             frame_indices=[int(index) for index in request.frame_indices],
-            all_frame_indices=[int(index) for index in request.all_frame_indices],
-            drift_frame_indices=[int(index) for index in request.drift_frame_indices],
             base_model_version=base_model_version,
         )
 

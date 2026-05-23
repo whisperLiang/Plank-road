@@ -11,11 +11,9 @@ class TrainingJobType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     TRAINING_JOB_TYPE_UNSPECIFIED: _ClassVar[TrainingJobType]
     TRAINING_JOB_TYPE_FULL_FRAME: _ClassVar[TrainingJobType]
-    TRAINING_JOB_TYPE_SPLIT: _ClassVar[TrainingJobType]
     TRAINING_JOB_TYPE_CONTINUAL_LEARNING: _ClassVar[TrainingJobType]
 TRAINING_JOB_TYPE_UNSPECIFIED: TrainingJobType
 TRAINING_JOB_TYPE_FULL_FRAME: TrainingJobType
-TRAINING_JOB_TYPE_SPLIT: TrainingJobType
 TRAINING_JOB_TYPE_CONTINUAL_LEARNING: TrainingJobType
 
 class TrainRequest(_message.Message):
@@ -31,30 +29,6 @@ class TrainRequest(_message.Message):
     def __init__(self, edge_id: _Optional[int] = ..., frame_indices: _Optional[_Iterable[int]] = ..., cache_path: _Optional[str] = ..., payload_zip: _Optional[bytes] = ...) -> None: ...
 
 class TrainReply(_message.Message):
-    __slots__ = ("success", "model_data", "message")
-    SUCCESS_FIELD_NUMBER: _ClassVar[int]
-    MODEL_DATA_FIELD_NUMBER: _ClassVar[int]
-    MESSAGE_FIELD_NUMBER: _ClassVar[int]
-    success: bool
-    model_data: str
-    message: str
-    def __init__(self, success: bool = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ...) -> None: ...
-
-class SplitTrainRequest(_message.Message):
-    __slots__ = ("edge_id", "all_frame_indices", "drift_frame_indices", "cache_path", "payload_zip")
-    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
-    ALL_FRAME_INDICES_FIELD_NUMBER: _ClassVar[int]
-    DRIFT_FRAME_INDICES_FIELD_NUMBER: _ClassVar[int]
-    CACHE_PATH_FIELD_NUMBER: _ClassVar[int]
-    PAYLOAD_ZIP_FIELD_NUMBER: _ClassVar[int]
-    edge_id: int
-    all_frame_indices: _containers.RepeatedScalarFieldContainer[int]
-    drift_frame_indices: _containers.RepeatedScalarFieldContainer[int]
-    cache_path: str
-    payload_zip: bytes
-    def __init__(self, edge_id: _Optional[int] = ..., all_frame_indices: _Optional[_Iterable[int]] = ..., drift_frame_indices: _Optional[_Iterable[int]] = ..., cache_path: _Optional[str] = ..., payload_zip: _Optional[bytes] = ...) -> None: ...
-
-class SplitTrainReply(_message.Message):
     __slots__ = ("success", "model_data", "message")
     SUCCESS_FIELD_NUMBER: _ClassVar[int]
     MODEL_DATA_FIELD_NUMBER: _ClassVar[int]
@@ -119,7 +93,7 @@ class SampleSyncReply(_message.Message):
     def __init__(self, success: bool = ..., message: _Optional[str] = ..., committed_samples: _Optional[int] = ...) -> None: ...
 
 class SubmitTrainingJobRequest(_message.Message):
-    __slots__ = ("protocol_version", "edge_id", "request_id", "job_type", "cache_path", "send_low_conf_features", "frame_indices", "all_frame_indices", "drift_frame_indices", "payload_zip", "base_model_version")
+    __slots__ = ("protocol_version", "edge_id", "request_id", "job_type", "cache_path", "send_low_conf_features", "frame_indices", "payload_zip", "base_model_version")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
@@ -127,8 +101,6 @@ class SubmitTrainingJobRequest(_message.Message):
     CACHE_PATH_FIELD_NUMBER: _ClassVar[int]
     SEND_LOW_CONF_FEATURES_FIELD_NUMBER: _ClassVar[int]
     FRAME_INDICES_FIELD_NUMBER: _ClassVar[int]
-    ALL_FRAME_INDICES_FIELD_NUMBER: _ClassVar[int]
-    DRIFT_FRAME_INDICES_FIELD_NUMBER: _ClassVar[int]
     PAYLOAD_ZIP_FIELD_NUMBER: _ClassVar[int]
     BASE_MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
     protocol_version: str
@@ -138,11 +110,9 @@ class SubmitTrainingJobRequest(_message.Message):
     cache_path: str
     send_low_conf_features: bool
     frame_indices: _containers.RepeatedScalarFieldContainer[int]
-    all_frame_indices: _containers.RepeatedScalarFieldContainer[int]
-    drift_frame_indices: _containers.RepeatedScalarFieldContainer[int]
     payload_zip: bytes
     base_model_version: str
-    def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., cache_path: _Optional[str] = ..., send_low_conf_features: bool = ..., frame_indices: _Optional[_Iterable[int]] = ..., all_frame_indices: _Optional[_Iterable[int]] = ..., drift_frame_indices: _Optional[_Iterable[int]] = ..., payload_zip: _Optional[bytes] = ..., base_model_version: _Optional[str] = ...) -> None: ...
+    def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., cache_path: _Optional[str] = ..., send_low_conf_features: bool = ..., frame_indices: _Optional[_Iterable[int]] = ..., payload_zip: _Optional[bytes] = ..., base_model_version: _Optional[str] = ...) -> None: ...
 
 class SubmitTrainingJobReply(_message.Message):
     __slots__ = ("accepted", "job_id", "status", "queue_position", "message")

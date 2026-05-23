@@ -254,33 +254,37 @@ class TestMessageTransmissionServicer:
         assert "unsafe" in reply.message.lower()
         mock_learner.get_ground_truth_and_retrain.assert_not_called()
 
-    def test_split_train_request_uses_structured_indices(self, tmp_path):
+    def test_legacy_split_train_rpc_is_not_exposed(self):
+        assert not hasattr(message_transmission_pb2, "SplitTrainRequest")
+        assert not hasattr(message_transmission_pb2, "SplitTrainReply")
+        assert not hasattr(message_transmission_pb2, "TRAINING_JOB_TYPE_SPLIT")
+
+    def test_legacy_split_training_job_type_is_rejected(self, tmp_path):
         mock_learner = MagicMock()
-        mock_learner.get_ground_truth_and_split_retrain.return_value = (
-            True,
-            "model_data",
-            "ok",
+        manager = TrainingJobManager(
+            continual_learner=mock_learner,
+            max_concurrent_jobs=1,
         )
-        svc = self._make_servicer(tmp_path, continual_learner=mock_learner)
-        payload_zip = _zip_bytes({"features/4.pt": b"feature"})
-        request = message_transmission_pb2.SplitTrainRequest(
-            edge_id=5,
-            cache_path="edge_5/split_train",
-            all_frame_indices=[4, 5, 6],
-            drift_frame_indices=[5],
-            payload_zip=payload_zip,
-        )
+        try:
+            svc = self._make_servicer(
+                tmp_path,
+                continual_learner=mock_learner,
+                training_job_manager=manager,
+            )
+            request = message_transmission_pb2.SubmitTrainingJobRequest(
+                edge_id=5,
+                request_id="legacy-split",
+                job_type=2,
+                cache_path="edge_5/split_train",
+            )
 
-        reply = svc.split_train_request(request, MagicMock())
+            reply = svc.submit_training_job(request, MagicMock())
 
-        assert reply.success is True
-        mock_learner.get_ground_truth_and_split_retrain.assert_called_once()
-        _, all_indices, drift_indices, workspace = (
-            mock_learner.get_ground_truth_and_split_retrain.call_args.args
-        )
-        assert all_indices == [4, 5, 6]
-        assert drift_indices == [5]
-        assert Path(workspace).is_relative_to((tmp_path / "workspace").resolve())
+            assert reply.accepted is False
+            assert "Unsupported training job type" in reply.message
+            mock_learner.get_ground_truth_and_fixed_split_retrain.assert_not_called()
+        finally:
+            manager.close(timeout=1.0)
 
     def test_continual_learning_request_uses_uploaded_bundle_workspace(self, tmp_path):
         mock_learner = MagicMock()
