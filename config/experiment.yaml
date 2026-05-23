@@ -7,6 +7,19 @@ experiment:
   results_dir: results/baselines_real_smoke
   video_path: ./video_data/road.mp4
   student_model: yolo26
+  # Class names in the student model's zero-based training order.
+  class_names:
+    - unidentified
+    - others
+    - pedestrian
+    - micromobility
+    - car
+    - bus
+    - small truck
+    - truck
+  # Use "coco_91" when teacher JSON labels are COCO category ids, or "target"
+  # when teacher JSON labels already use the student model's id space.
+  teacher_label_schema: coco_91
   teacher_model: ./cache/teacher_labels/road
   initial_checkpoint:
   seed: 2026

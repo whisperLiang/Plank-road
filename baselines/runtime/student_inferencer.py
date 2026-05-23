@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,7 @@ class StudentInferencer:
         cache_features: bool = False,
         pretrained: bool = True,
         weights_path: str | Path | None = None,
+        class_names: Sequence[str] | None = None,
         seed: int = 2026,
         fixed_split_constraints: SplitConstraints | None = None,
         fixed_split_cache_path: str | Path | None = None,
@@ -84,6 +86,11 @@ class StudentInferencer:
                 f"Student model {model_name!r} could not be initialized by the real "
                 "detection adapter. Provide a supported model artifact."
             ) from exc
+        self.class_names = [str(item) for item in (class_names or [])]
+        if not self.class_names:
+            self.class_names = self._extract_model_class_names(self.model)
+        if self.class_names:
+            setattr(self.model, "class_names", list(self.class_names))
         self.model_family = get_model_family(self.model_name)
         self.model.eval()
         self.results_dir = Path(results_dir)
@@ -99,6 +106,45 @@ class StudentInferencer:
         )
         self.fixed_split_validate_cached_plan = bool(fixed_split_validate_cached_plan)
         self.fixed_split_plan: SplitPlan | None = None
+
+    @staticmethod
+    def _extract_model_class_names(model: torch.nn.Module) -> list[str]:
+        candidates: list[object] = [
+            getattr(model, "class_names", None),
+            getattr(model, "names", None),
+        ]
+        yolo_model = getattr(model, "yolo", None)
+        if yolo_model is not None:
+            candidates.extend(
+                [
+                    getattr(yolo_model, "names", None),
+                    getattr(getattr(yolo_model, "model", None), "names", None),
+                ]
+            )
+
+        for names in candidates:
+            if isinstance(names, Mapping):
+                ordered: list[str] = []
+                for key in sorted(names, key=StudentInferencer._class_name_sort_key):
+                    value = names.get(key)
+                    if value is None:
+                        ordered = []
+                        break
+                    ordered.append(str(value))
+                if ordered:
+                    return ordered
+            elif isinstance(names, Sequence) and not isinstance(names, (str, bytes)):
+                ordered = [str(item) for item in names]
+                if ordered:
+                    return ordered
+        return []
+
+    @staticmethod
+    def _class_name_sort_key(value: object) -> tuple[int, int | str]:
+        try:
+            return (0, int(value))
+        except (TypeError, ValueError):
+            return (1, str(value))
 
     def infer(self, frame_path: str | Path, *, device_id: int, frame_index: int) -> StudentInferenceOutput:
         frame = cv2.imread(str(frame_path))

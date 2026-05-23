@@ -570,12 +570,21 @@ def build_real_baseline_context(
             method_name=method_name,
             cache_features=cache_features,
             weights_path=config.student_weights_path,
+            class_names=config.class_names,
             seed=config.seed,
             fixed_split_constraints=fixed_split_constraints,
             fixed_split_cache_path=fixed_split_cache_path,
             fixed_split_validate_cached_plan=fixed_split_validate_cached_plan,
             feature_trace_batch_size=config.batch_size,
         )
+        if device_id == 0:
+            teacher.configure_target(
+                label_schema=getattr(inferencer.model, "label_schema", "coco_91"),
+                class_names=(
+                    config.class_names
+                    or getattr(inferencer.model, "class_names", [])
+                ),
+            )
         initial_checkpoint = checkpoint_manager.create_initial(
             method_name,
             base_checkpoint,
@@ -649,6 +658,7 @@ def run_one_method(
         teacher_model=method_config.teacher_model,
         results_dir=root_results / "teacher_caches" / method_name / method_config.method_variant,
         reuse_cache=method_config.reuse_teacher_cache,
+        teacher_label_schema=method_config.teacher_label_schema,
     )
     context = build_real_baseline_context(
         config=method_config,
@@ -841,6 +851,7 @@ def _build_base_checkpoint(config: ExperimentConfig, root_results: Path) -> str:
         method_name="_initial",
         cache_features=False,
         weights_path=config.student_weights_path,
+        class_names=config.class_names,
         seed=config.seed,
     )
     return seed_inferencer.save_checkpoint(root_results / "checkpoints" / "initial_student.pt")

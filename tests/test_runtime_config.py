@@ -21,6 +21,8 @@ experiment:
   teacher_model: {teacher_dir.as_posix()}
   student_model: rfdetr_nano
   student_weights_path: {weights_path.as_posix()}
+  class_names: pedestrian,micromobility,car
+  teacher_label_schema: target
 """.strip(),
         encoding="utf-8",
     )
@@ -28,6 +30,8 @@ experiment:
     config = load_experiment_config(config_path)
 
     assert config.student_weights_path == str(weights_path)
+    assert config.class_names == ["pedestrian", "micromobility", "car"]
+    assert config.teacher_label_schema == "target"
 
 
 def test_load_runtime_config_builds_typed_sections(tmp_path):

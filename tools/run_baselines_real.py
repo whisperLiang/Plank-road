@@ -22,6 +22,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", default=",".join(VALID_METHODS))
     parser.add_argument("--student-model", default="yolo26")
     parser.add_argument("--student-weights", help="Optional local student weights path.")
+    parser.add_argument(
+        "--class-names",
+        default="",
+        help="Comma-separated student model class names in zero-based order.",
+    )
+    parser.add_argument(
+        "--teacher-label-schema",
+        default="coco_91",
+        help="Teacher JSON label schema, e.g. coco_91 or target.",
+    )
     parser.add_argument("--teacher-model", required=True, help="Existing directory of teacher label JSON files.")
     parser.add_argument("--initial-checkpoint")
     parser.add_argument("--window-seconds", type=float, default=10.0)
@@ -48,6 +58,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _parse_class_names(raw: str) -> list[str]:
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
 def main() -> None:
     args = parse_args()
     root_results = Path(args.results_dir)
@@ -69,6 +83,8 @@ def main() -> None:
         video_path=args.video,
         student_model=args.student_model,
         student_weights_path=args.student_weights,
+        class_names=_parse_class_names(args.class_names),
+        teacher_label_schema=args.teacher_label_schema,
         teacher_model=args.teacher_model,
         initial_checkpoint=args.initial_checkpoint,
         seed=args.seed,

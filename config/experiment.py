@@ -84,6 +84,8 @@ class ExperimentConfig:
     video_path: str = "./video_data/road.mp4"
     student_model: str = "yolo26"
     student_weights_path: str | None = None
+    class_names: list[str] = field(default_factory=list)
+    teacher_label_schema: str = "coco_91"
     teacher_model: str | None = None
     initial_checkpoint: str | None = None
     seed: int = 2026
@@ -124,6 +126,15 @@ class ExperimentConfig:
             raise ValueError(
                 f"max_concurrent_train_jobs must be >= 1, got {self.max_concurrent_train_jobs}"
             )
+        if isinstance(self.class_names, str):
+            self.class_names = [
+                item.strip()
+                for item in self.class_names.split(",")
+                if item.strip()
+            ]
+        else:
+            self.class_names = [str(item) for item in (self.class_names or [])]
+        self.teacher_label_schema = str(self.teacher_label_schema or "coco_91").strip()
         teacher_model = str(self.teacher_model or "").strip()
         if not teacher_model:
             raise ValueError("teacher_model must be an existing teacher label directory")
@@ -168,6 +179,8 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         "video_path",
         "student_model",
         "student_weights_path",
+        "class_names",
+        "teacher_label_schema",
         "teacher_model",
         "initial_checkpoint",
         "seed",
