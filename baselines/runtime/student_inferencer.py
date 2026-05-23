@@ -57,6 +57,7 @@ class StudentInferencer:
         method_name: str,
         cache_features: bool = False,
         pretrained: bool = True,
+        weights_path: str | Path | None = None,
         seed: int = 2026,
         fixed_split_constraints: SplitConstraints | None = None,
         fixed_split_cache_path: str | Path | None = None,
@@ -71,6 +72,7 @@ class StudentInferencer:
                 self.model_name,
                 pretrained=bool(pretrained),
                 device=self.device,
+                weights_path=None if weights_path is None else str(weights_path),
             )
         except Exception as exc:
             raise NotImplementedError(

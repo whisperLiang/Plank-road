@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", required=True, help="Video file or image directory. Repeat with comma-separated paths.")
     parser.add_argument("--methods", default=",".join(VALID_METHODS))
     parser.add_argument("--student-model", default="yolo26")
+    parser.add_argument("--student-weights", help="Optional local student weights path.")
     parser.add_argument("--teacher-model", required=True, help="Existing directory of teacher label JSON files.")
     parser.add_argument("--initial-checkpoint")
     parser.add_argument("--window-seconds", type=float, default=10.0)
@@ -67,6 +68,7 @@ def main() -> None:
         results_dir=str(root_results),
         video_path=args.video,
         student_model=args.student_model,
+        student_weights_path=args.student_weights,
         teacher_model=args.teacher_model,
         initial_checkpoint=args.initial_checkpoint,
         seed=args.seed,

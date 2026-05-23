@@ -83,6 +83,7 @@ class ExperimentConfig:
     results_dir: str = "results/baselines_real"
     video_path: str = "./video_data/road.mp4"
     student_model: str = "yolo26"
+    student_weights_path: str | None = None
     teacher_model: str | None = None
     initial_checkpoint: str | None = None
     seed: int = 2026
@@ -132,6 +133,14 @@ class ExperimentConfig:
                 f"teacher_model must be an existing teacher label directory: {teacher_path}"
             )
         self.teacher_model = str(teacher_path)
+        weights_path = str(self.student_weights_path or "").strip()
+        if weights_path:
+            resolved_weights = Path(weights_path)
+            if not resolved_weights.exists() or not resolved_weights.is_file():
+                raise FileNotFoundError(
+                    f"student_weights_path must be an existing weights file: {resolved_weights}"
+                )
+            self.student_weights_path = str(resolved_weights)
         if self.method != "plank_road_multi_device" and self.method_variant != "default":
             raise ValueError("method_variant values other than 'default' are only valid for plank_road_multi_device")
 
@@ -158,6 +167,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         "results_dir",
         "video_path",
         "student_model",
+        "student_weights_path",
         "teacher_model",
         "initial_checkpoint",
         "seed",

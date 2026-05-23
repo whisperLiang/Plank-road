@@ -1398,11 +1398,15 @@ def _validate_rfdetr_artifact_checkpoint(
     artifact_path: Path,
     checkpoint: object,
     *,
-    expected_class_count: int = 91,
+    expected_class_count: int | None = None,
 ) -> dict[str, torch.Tensor]:
     state = _extract_rfdetr_checkpoint_state_dict(checkpoint)
     class_count = _rfdetr_checkpoint_class_count(state)
-    if class_count is not None and class_count != int(expected_class_count):
+    if (
+        expected_class_count is not None
+        and class_count is not None
+        and class_count != int(expected_class_count)
+    ):
         raise ValueError(
             "RF-DETR checkpoint class head has "
             f"{class_count} logits, expected {expected_class_count} for {artifact_path.name}"
@@ -1457,13 +1461,20 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
         if _matches_md5(artifact_path, asset.md5_hash):
             return artifact_path
         try:
-            _validate_rfdetr_artifact_checkpoint(
+            state = _validate_rfdetr_artifact_checkpoint(
                 artifact_path,
                 _load_rfdetr_checkpoint(artifact_path),
             )
+            class_count = _rfdetr_checkpoint_class_count(state)
             logger.info(
-                "Reusing readable RF-DETR weights at {} despite MD5 mismatch.",
+                "Reusing readable RF-DETR weights at {} despite MD5 mismatch"
+                "{}.",
                 artifact_path,
+                (
+                    f" (class head logits={class_count})"
+                    if class_count is not None
+                    else ""
+                ),
             )
             return artifact_path
         except Exception as exc:
@@ -1618,12 +1629,11 @@ def build_detection_model(
             rfdetr_state = _extract_rfdetr_checkpoint_state_dict(rfdetr_checkpoint)
             inferred_class_count = _rfdetr_checkpoint_class_count(rfdetr_state)
             if (
-                explicit_weights_path
-                and inferred_class_count is not None
+                inferred_class_count is not None
                 and inferred_class_count != int(num_classes)
             ):
                 logger.info(
-                    "[ModelZoo] Inferred {} RF-DETR logits from custom weights at {}; "
+                    "[ModelZoo] Inferred {} RF-DETR logits from weights at {}; "
                     "building {} with {} foreground class(es).",
                     inferred_class_count,
                     artifact_path,

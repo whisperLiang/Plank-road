@@ -569,6 +569,7 @@ def build_real_baseline_context(
             results_dir=root_results,
             method_name=method_name,
             cache_features=cache_features,
+            weights_path=config.student_weights_path,
             seed=config.seed,
             fixed_split_constraints=fixed_split_constraints,
             fixed_split_cache_path=fixed_split_cache_path,
@@ -838,6 +839,7 @@ def _build_base_checkpoint(config: ExperimentConfig, root_results: Path) -> str:
         results_dir=root_results,
         method_name="_initial",
         cache_features=False,
+        weights_path=config.student_weights_path,
         seed=config.seed,
     )
     return seed_inferencer.save_checkpoint(root_results / "checkpoints" / "initial_student.pt")

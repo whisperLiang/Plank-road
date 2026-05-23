@@ -583,7 +583,7 @@ class TestModelZoo:
         assert checkpoint["lr_scheduler"] == {"last_epoch": 5}
         assert calls == []
 
-    def test_ensure_local_model_artifact_redownloads_incompatible_rfdetr_weights(self, monkeypatch, tmp_path):
+    def test_ensure_local_model_artifact_reuses_custom_rfdetr_weights_with_class_head_mismatch(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
 
         fake_models_dir = tmp_path / "models"
@@ -601,6 +601,32 @@ class TestModelZoo:
             },
             artifact_path,
         )
+
+        calls = []
+
+        monkeypatch.setattr(model_zoo_module, "_matches_md5", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(
+            model_zoo_module,
+            "_download_http_file_with_resume",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+
+        resolved_path = ensure_local_model_artifact("rfdetr_nano")
+        checkpoint = torch.load(resolved_path, map_location="cpu", weights_only=False)
+
+        assert resolved_path == artifact_path
+        assert checkpoint["model"]["class_embed.bias"].shape == (9,)
+        assert calls == []
+
+    def test_ensure_local_model_artifact_redownloads_unreadable_rfdetr_weights(self, monkeypatch, tmp_path):
+        import model_management.model_zoo as model_zoo_module
+
+        fake_models_dir = tmp_path / "models"
+        monkeypatch.setattr(model_zoo_module, "_MODELS_DIR", fake_models_dir)
+
+        artifact_path = fake_models_dir / "rf-detr-nano.pth"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": "not-a-state-dict"}, artifact_path)
 
         calls = []
 
@@ -643,7 +669,16 @@ class TestModelZoo:
 
         artifact_path = tmp_path / "models" / "rf-detr-nano.pth"
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"model": {"weight": torch.tensor([1.0])}}, artifact_path)
+        torch.save(
+            {
+                "model": {
+                    "weight": torch.tensor([1.0]),
+                    "class_embed.bias": torch.zeros(9),
+                    "class_embed.weight": torch.zeros(9, 256),
+                }
+            },
+            artifact_path,
+        )
         monkeypatch.setattr(model_zoo_module, "ensure_local_model_artifact", lambda name: artifact_path)
 
         captured = {}
@@ -662,10 +697,12 @@ class TestModelZoo:
         build_detection_model("rfdetr_nano", pretrained=True, device="cpu")
 
         assert captured["init_kwargs"]["model_name"] == "rfdetr_nano"
+        assert captured["init_kwargs"]["num_classes"] == 9
         assert captured["init_kwargs"]["pretrained"] is False
         assert "pretrain_weights" not in captured["init_kwargs"]
         assert captured["strict"] is False
-        assert captured["loaded_state_dict"] == {"weight": torch.tensor([1.0])}
+        assert torch.equal(captured["loaded_state_dict"]["weight"], torch.tensor([1.0]))
+        assert infer_rfdetr_state_dict_num_classes(captured["loaded_state_dict"]) == 9
 
     def test_build_rfdetr_detector_strips_lightning_model_prefix(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module

@@ -107,6 +107,7 @@ def _build_config(
         results_dir=str(run_dir),
         video_path=_video_paths(raw),
         student_model=str(model.get("student_model", "yolo26")),
+        student_weights_path=model.get("student_weights_path") or model.get("weights_path"),
         teacher_model=_teacher_label_dir(raw),
         initial_checkpoint=model.get("initial_checkpoint"),
         seed=int(exp.get("seed", 2026)),

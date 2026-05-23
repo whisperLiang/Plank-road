@@ -4,7 +4,30 @@ import pytest
 import copy
 
 from config import load_runtime_config
+from config.experiment import load_experiment_config
 from model_management.fixed_split import SplitConstraints
+
+
+def test_load_experiment_config_reads_student_weights_path(tmp_path):
+    teacher_dir = tmp_path / "labels"
+    teacher_dir.mkdir()
+    weights_path = tmp_path / "student.pth"
+    weights_path.write_bytes(b"weights")
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(
+        f"""
+experiment:
+  method: pure_edge_local_updating
+  teacher_model: {teacher_dir.as_posix()}
+  student_model: rfdetr_nano
+  student_weights_path: {weights_path.as_posix()}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_experiment_config(config_path)
+
+    assert config.student_weights_path == str(weights_path)
 
 
 def test_load_runtime_config_builds_typed_sections(tmp_path):
