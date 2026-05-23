@@ -1173,6 +1173,133 @@ def _cached_boundary_batch_size(record: Mapping[str, Any]) -> int | None:
     return batch_size if batch_size > 1 else None
 
 
+def _boundary_payload_tensor_batch_dim(
+    payload: BoundaryPayload | None,
+    label: str,
+    tensor: torch.Tensor,
+) -> int:
+    schema = getattr(payload, "schema", None) if payload is not None else None
+    spec = dict(schema or {}).get(str(label)) if isinstance(schema, Mapping) else None
+    symbolic_shape = getattr(spec, "symbolic_shape", None)
+    if symbolic_shape is not None:
+        for dim_index, dim in enumerate(tuple(symbolic_shape)):
+            if str(dim) == "B":
+                return dim_index
+    batch_size = int(getattr(payload, "batch_size", 0) or 0) if payload is not None else 0
+    if batch_size > 0:
+        matching_dims = [
+            dim_index
+            for dim_index, dim_size in enumerate(tuple(tensor.shape))
+            if int(dim_size) == batch_size
+        ]
+        if len(matching_dims) == 1:
+            return matching_dims[0]
+    return 0
+
+
+def _cached_boundary_tensor_batch_dim(
+    record: Mapping[str, Any],
+    label: str,
+    tensor: torch.Tensor,
+) -> int:
+    return _boundary_payload_tensor_batch_dim(
+        _cached_boundary_payload(record),
+        label,
+        tensor,
+    )
+
+
+def _slice_boundary_passthrough_value(
+    value: Any,
+    *,
+    payload_batch_size: int,
+    start: int,
+    length: int,
+) -> Any:
+    if isinstance(value, torch.Tensor):
+        if (
+            value.ndim > 0
+            and payload_batch_size > 0
+            and int(value.shape[0]) == int(payload_batch_size)
+        ):
+            return value.narrow(0, start, length)
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key: _slice_boundary_passthrough_value(
+                item,
+                payload_batch_size=payload_batch_size,
+                start=start,
+                length=length,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(
+            _slice_boundary_passthrough_value(
+                item,
+                payload_batch_size=payload_batch_size,
+                start=start,
+                length=length,
+            )
+            for item in value
+        )
+    if isinstance(value, list):
+        return [
+            _slice_boundary_passthrough_value(
+                item,
+                payload_batch_size=payload_batch_size,
+                start=start,
+                length=length,
+            )
+            for item in value
+        ]
+    return value
+
+
+def slice_boundary_payload_batch(
+    payload: BoundaryPayload,
+    *,
+    start: int = 0,
+    length: int = 1,
+) -> BoundaryPayload:
+    start = max(0, int(start))
+    length = max(1, int(length))
+    payload_batch_size = int(getattr(payload, "batch_size", 0) or 0)
+    sliced_tensors: dict[str, torch.Tensor] = {}
+    for label, tensor in dict(payload.tensors or {}).items():
+        if tensor.ndim == 0:
+            sliced_tensors[str(label)] = tensor
+            continue
+        batch_dim = _boundary_payload_tensor_batch_dim(payload, str(label), tensor)
+        if batch_dim >= tensor.ndim:
+            raise RuntimeError(
+                f"Cannot slice boundary tensor {label!r} with shape {tuple(tensor.shape)}."
+            )
+        if start + length > int(tensor.shape[batch_dim]):
+            raise RuntimeError(
+                f"Cannot slice boundary tensor {label!r} at batch range "
+                f"[{start}, {start + length}) from shape {tuple(tensor.shape)}."
+            )
+        sliced_tensors[str(label)] = tensor.narrow(batch_dim, start, length)
+    passthrough_inputs = _slice_boundary_passthrough_value(
+        dict(getattr(payload, "passthrough_inputs", {}) or {}),
+        payload_batch_size=payload_batch_size,
+        start=start,
+        length=length,
+    )
+    return boundary_payload_from_tensors(
+        sliced_tensors,
+        split_id=str(payload.split_id),
+        graph_signature=str(payload.graph_signature),
+        batch_size=length,
+        schema=getattr(payload, "schema", None),
+        requires_grad=getattr(payload, "requires_grad", None),
+        weight_version=getattr(payload, "weight_version", None),
+        passthrough_inputs=passthrough_inputs,
+    )
+
+
 def _record_runtime_signature(record: Mapping[str, Any]) -> tuple[tuple[int, ...], str]:
     input_tensor_shape = tuple(
         int(dim) for dim in list(record.get("input_tensor_shape") or [])
@@ -1257,11 +1384,12 @@ def _build_boundary_batch_from_records(
     batched_tensors: dict[str, torch.Tensor] = {}
     for label in labels:
         pieces = []
+        batch_dim = _cached_boundary_tensor_batch_dim(records[0], label, tensor_groups[0][label])
         for tensors in tensor_groups:
             tensor = tensors[label]
-            if tensor.ndim == 0:
+            if tensor.ndim == 0 or batch_dim >= tensor.ndim:
                 raise RuntimeError("Split-tail feature tensors must include a batch dimension.")
-            if int(tensor.shape[0]) != 1:
+            if int(tensor.shape[batch_dim]) != 1:
                 raise RuntimeError(
                     "Split-tail feature records must be single-sample tensors; "
                     f"got {label} shape {tuple(tensor.shape)}."
@@ -1269,7 +1397,7 @@ def _build_boundary_batch_from_records(
             pieces.append(tensor)
         target_device = pieces[0].device
         pieces = [piece.to(target_device) for piece in pieces]
-        batched_tensors[label] = torch.cat(pieces, dim=0)
+        batched_tensors[label] = torch.cat(pieces, dim=batch_dim)
     passthrough_groups: list[Mapping[str, Any]] = []
     for record in records:
         payload = _cached_boundary_payload(record)
@@ -1295,6 +1423,9 @@ def _build_boundary_batch_from_records(
         split_id=_runtime_split_id(runtime),
         graph_signature=_runtime_graph_signature(runtime),
         batch_size=len(records),
+        schema=getattr(first_payload, "schema", None),
+        requires_grad=getattr(first_payload, "requires_grad", None),
+        weight_version=getattr(first_payload, "weight_version", None),
         passthrough_inputs=batched_passthrough,
     )
 
@@ -1814,5 +1945,6 @@ __all__ = [
     "reconstruct_candidate_from_descriptor",
     "save_split_feature_cache",
     "serialize_boundary_payload",
+    "slice_boundary_payload_batch",
     "universal_split_retrain",
 ]

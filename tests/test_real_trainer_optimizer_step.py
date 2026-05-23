@@ -82,6 +82,25 @@ def test_tinynext_training_batches_duplicate_singletons(tmp_path: Path):
     assert trainer._batches([sample]) == [[sample, sample]]
 
 
+def test_runtime_batches_pad_singletons_to_dynamic_trace_min(tmp_path: Path):
+    trainer = RealTrainer(
+        model=_NamedModel("generic_detector"),
+        device=torch.device("cpu"),
+        results_dir=tmp_path,
+        method_name="accuracy_trigger_cloud_retraining",
+        checkpoint_manager=None,
+        evaluator=None,
+        batch_size=4,
+    )
+    samples = [object() for _ in range(5)]
+
+    batches = trainer._runtime_batches(samples, min_batch_size=2)
+
+    assert [len(batch) for batch in batches] == [4, 2]
+    assert batches[-1][0] is samples[-1]
+    assert batches[-1][1] is samples[-1]
+
+
 def test_runtime_trace_input_uses_dynamic_batch_trace(tmp_path: Path, monkeypatch):
     trainer = RealTrainer(
         model=_NamedModel("generic_detector"),

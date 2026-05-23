@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from ariadne.runtime.boundary import BoundaryPayload, BoundaryTensorSpec
 
 from model_management.model_zoo import build_detection_model
 from model_management.object_detection import Object_Detection
@@ -13,10 +14,12 @@ from model_management.split_model_adapters import (
 )
 from model_management.universal_model_split import (
     UniversalModelSplitter,
+    _build_boundary_batch_from_records,
     build_split_retrain_optimizer,
     collect_suffix_trainable_parameters,
     load_split_feature_cache,
     save_split_feature_cache,
+    slice_boundary_payload_batch,
     universal_split_retrain,
 )
 from tests.test_split_runtime_edge_cloud_pipeline import (
@@ -47,6 +50,102 @@ def test_rfdetr_cross_batch_split_train():
 
 def test_tinynext_cross_batch_split_train():
     _assert_cross_batch_train("tinynext")
+
+
+def test_cached_boundary_batching_respects_schema_batch_dim():
+    class Runtime:
+        split_id = "after:model.class_embed"
+        graph_signature = "graph"
+
+    def payload(value: float) -> BoundaryPayload:
+        tensors = {
+            "decoder_logits": torch.full((2, 1, 3, 4), value),
+            "queries": torch.full((1, 3, 5), value),
+        }
+        schema = {
+            "decoder_logits": BoundaryTensorSpec(
+                label="decoder_logits",
+                symbolic_shape=(2, "B", 3, 4),
+                dtype=str(tensors["decoder_logits"].dtype),
+                requires_grad=False,
+                device_type="cpu",
+            ),
+            "queries": BoundaryTensorSpec(
+                label="queries",
+                symbolic_shape=("B", 3, 5),
+                dtype=str(tensors["queries"].dtype),
+                requires_grad=False,
+                device_type="cpu",
+            ),
+        }
+        return BoundaryPayload(
+            split_id=Runtime.split_id,
+            graph_signature=Runtime.graph_signature,
+            batch_size=1,
+            tensors=tensors,
+            schema=schema,
+            requires_grad={label: False for label in tensors},
+            weight_version=None,
+            passthrough_inputs={},
+        )
+
+    boundary = _build_boundary_batch_from_records(
+        [{"intermediate": payload(1.0)}, {"intermediate": payload(2.0)}],
+        runtime=Runtime(),
+    )
+
+    assert boundary.batch_size == 2
+    assert boundary.tensors["decoder_logits"].shape == (2, 2, 3, 4)
+    assert boundary.tensors["queries"].shape == (2, 3, 5)
+    assert torch.all(boundary.tensors["decoder_logits"][:, 0] == 1.0)
+    assert torch.all(boundary.tensors["decoder_logits"][:, 1] == 2.0)
+    assert tuple(boundary.schema["decoder_logits"].symbolic_shape) == (2, "B", 3, 4)
+
+
+def test_boundary_payload_slice_respects_schema_batch_dim():
+    tensors = {
+        "decoder_logits": torch.stack(
+            [torch.full((2, 3, 4), 1.0), torch.full((2, 3, 4), 2.0)],
+            dim=1,
+        ),
+        "queries": torch.stack(
+            [torch.full((3, 5), 1.0), torch.full((3, 5), 2.0)],
+            dim=0,
+        ),
+    }
+    payload = BoundaryPayload(
+        split_id="after:model.class_embed",
+        graph_signature="graph",
+        batch_size=2,
+        tensors=tensors,
+        schema={
+            "decoder_logits": BoundaryTensorSpec(
+                label="decoder_logits",
+                symbolic_shape=(2, "B", 3, 4),
+                dtype=str(tensors["decoder_logits"].dtype),
+                requires_grad=False,
+                device_type="cpu",
+            ),
+            "queries": BoundaryTensorSpec(
+                label="queries",
+                symbolic_shape=("B", 3, 5),
+                dtype=str(tensors["queries"].dtype),
+                requires_grad=False,
+                device_type="cpu",
+            ),
+        },
+        requires_grad={label: False for label in tensors},
+        weight_version=None,
+        passthrough_inputs={},
+    )
+
+    sliced = slice_boundary_payload_batch(payload, start=0, length=1)
+
+    assert sliced.batch_size == 1
+    assert sliced.tensors["decoder_logits"].shape == (2, 1, 3, 4)
+    assert sliced.tensors["queries"].shape == (1, 3, 5)
+    assert torch.all(sliced.tensors["decoder_logits"] == 1.0)
+    assert torch.all(sliced.tensors["queries"] == 1.0)
 
 
 def _tinynext_split_context():

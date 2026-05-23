@@ -574,6 +574,7 @@ def build_real_baseline_context(
             fixed_split_constraints=fixed_split_constraints,
             fixed_split_cache_path=fixed_split_cache_path,
             fixed_split_validate_cached_plan=fixed_split_validate_cached_plan,
+            feature_trace_batch_size=config.batch_size,
         )
         initial_checkpoint = checkpoint_manager.create_initial(
             method_name,

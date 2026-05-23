@@ -31,6 +31,7 @@ from model_management.universal_model_split import (
     UniversalModelSplitter,
     build_split_retrain_optimizer,
     save_split_feature_cache,
+    slice_boundary_payload_batch,
     universal_split_retrain,
 )
 
@@ -148,6 +149,7 @@ class RealTrainer:
         cached_count = 0
         reconstructed_count = 0
         reconstruction_time = 0.0
+        min_runtime_batch_size = int(sample_input.shape[0])
         for sample in selected:
             cache_key = f"sample_{sample.sample_id}"
             all_indices.append(cache_key)
@@ -160,7 +162,17 @@ class RealTrainer:
 
             reconstruct_start = time.perf_counter()
             frame, tensor = self._read_frame_and_split_input(sample)
-            boundary = splitter.run_prefix(tensor)
+            runtime_tensor = self._pad_tensor_batch(
+                tensor,
+                min_batch_size=min_runtime_batch_size,
+            )
+            boundary = splitter.run_prefix(runtime_tensor)
+            if int(runtime_tensor.shape[0]) != int(tensor.shape[0]):
+                boundary = slice_boundary_payload_batch(
+                    boundary,
+                    start=0,
+                    length=int(tensor.shape[0]),
+                )
             record = save_split_feature_cache(
                 str(cache_path),
                 cache_key,
@@ -368,8 +380,9 @@ class RealTrainer:
         raw_replay = 0.0
         start = time.perf_counter()
         steps = 0
+        min_runtime_batch_size = int(sample_input.shape[0])
         for _epoch in range(self._resolve_epochs(epochs)):
-            for batch in self._batches(selected):
+            for batch in self._runtime_batches(selected, min_batch_size=min_runtime_batch_size):
                 prepared = [self._prepare_detection_sample(sample) for sample in batch]
                 images = torch.cat([item[0] for item in prepared], dim=0)
                 targets = [item[1] for item in prepared]
@@ -499,6 +512,35 @@ class RealTrainer:
         if self._requires_non_singleton_train_batches():
             return [batch + batch if len(batch) == 1 else batch for batch in batches]
         return batches
+
+    def _runtime_batches(
+        self,
+        samples: list[SampleRecord],
+        *,
+        min_batch_size: int = 1,
+    ) -> list[list[SampleRecord]]:
+        batches = self._batches(samples)
+        min_batch_size = max(1, int(min_batch_size))
+        if min_batch_size <= 1:
+            return batches
+        padded: list[list[SampleRecord]] = []
+        for batch in batches:
+            if len(batch) >= min_batch_size:
+                padded.append(batch)
+                continue
+            padded.append(batch + [batch[-1]] * (min_batch_size - len(batch)))
+        return padded
+
+    @staticmethod
+    def _pad_tensor_batch(tensor: torch.Tensor, *, min_batch_size: int) -> torch.Tensor:
+        min_batch_size = max(1, int(min_batch_size))
+        batch_size = int(tensor.shape[0]) if tensor.ndim > 0 else 0
+        if batch_size >= min_batch_size:
+            return tensor
+        if batch_size <= 0:
+            raise RuntimeError("Split runtime tensor input must include a batch dimension.")
+        padding = [tensor[-1:]] * (min_batch_size - batch_size)
+        return torch.cat([tensor, *padding], dim=0)
 
     def _prepare_detection_sample(self, sample: SampleRecord) -> tuple[torch.Tensor, dict[str, object]]:
         frame = cv2.imread(str(sample.frame_path))

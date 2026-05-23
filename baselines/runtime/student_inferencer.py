@@ -24,7 +24,11 @@ from model_management.fixed_split import (
     apply_split_plan,
     load_or_compute_fixed_split_plan,
 )
-from model_management.universal_model_split import UniversalModelSplitter, save_split_feature_cache
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
+    save_split_feature_cache,
+    slice_boundary_payload_batch,
+)
 
 
 def resolve_torch_device(device: str) -> torch.device:
@@ -62,6 +66,7 @@ class StudentInferencer:
         fixed_split_constraints: SplitConstraints | None = None,
         fixed_split_cache_path: str | Path | None = None,
         fixed_split_validate_cached_plan: bool = True,
+        feature_trace_batch_size: int = 1,
     ) -> None:
         normalized = self.MODEL_ALIASES.get(model_name.lower().replace("-", "_"), model_name)
         torch.manual_seed(int(seed))
@@ -84,6 +89,7 @@ class StudentInferencer:
         self.results_dir = Path(results_dir)
         self.method_name = method_name
         self.cache_features = bool(cache_features)
+        self.feature_trace_batch_size = 1 if int(feature_trace_batch_size) <= 1 else 2
         self.prediction_dir = self.results_dir / "predictions" / method_name
         self.feature_cache_dir = self.results_dir / "feature_cache" / method_name
         self._feature_splitter: UniversalModelSplitter | None = None
@@ -142,15 +148,22 @@ class StudentInferencer:
         return tensor.div_(255.0).to(self.device)
 
     def _ensure_feature_splitter(self, sample_input: torch.Tensor) -> UniversalModelSplitter:
+        trace_input = self._prepare_feature_trace_input(sample_input)
         if self._feature_splitter is None:
             self._feature_splitter = UniversalModelSplitter(device=self.device).trace(
                 get_split_runtime_model(self.model),
-                sample_input,
+                trace_input,
                 model_name=self.model_name,
                 model_family=self.model_family,
             )
-        self._bind_fixed_split_plan(self._feature_splitter, sample_input)
+        self._bind_fixed_split_plan(self._feature_splitter, trace_input)
         return self._feature_splitter
+
+    def _prepare_feature_trace_input(self, sample_input: torch.Tensor) -> torch.Tensor:
+        return self._pad_tensor_batch(
+            sample_input,
+            min_batch_size=self.feature_trace_batch_size,
+        )
 
     def ensure_fixed_split_plan(self, frame_path: str | Path) -> SplitPlan | None:
         if self.fixed_split_constraints is None:
@@ -211,8 +224,15 @@ class StudentInferencer:
                 f"Split feature caching for {type(self.model).__name__} requires tensor runtime input"
             )
         splitter = self._ensure_feature_splitter(sample_input)
+        runtime_input = self._prepare_feature_trace_input(sample_input)
         with torch.no_grad():
-            boundary = splitter.run_prefix(sample_input)
+            boundary = splitter.run_prefix(runtime_input)
+        if int(runtime_input.shape[0]) != int(sample_input.shape[0]):
+            boundary = slice_boundary_payload_batch(
+                boundary,
+                start=0,
+                length=int(sample_input.shape[0]),
+            )
         cache_root = self.feature_cache_dir / f"edge_{int(device_id)}"
         save_split_feature_cache(
             str(cache_root),
@@ -223,6 +243,17 @@ class StudentInferencer:
             input_resize_mode=get_split_runtime_input_resize_mode(self.model),
         )
         return str(cache_root / "features" / f"{int(frame_index)}.pt")
+
+    @staticmethod
+    def _pad_tensor_batch(tensor: torch.Tensor, *, min_batch_size: int) -> torch.Tensor:
+        min_batch_size = max(1, int(min_batch_size))
+        batch_size = int(tensor.shape[0]) if tensor.ndim > 0 else 0
+        if batch_size >= min_batch_size:
+            return tensor
+        if batch_size <= 0:
+            raise RuntimeError("Split runtime tensor input must include a batch dimension.")
+        padding = [tensor[-1:]] * (min_batch_size - batch_size)
+        return torch.cat([tensor, *padding], dim=0)
 
     @staticmethod
     def _outputs_to_detections(outputs: Any) -> list[dict[str, Any]]:
