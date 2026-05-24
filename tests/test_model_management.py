@@ -1087,6 +1087,21 @@ class TestModelZoo:
         assert isinstance(extracted["aux_outputs"], list)
         assert tuple(extracted["aux_outputs"][0]["pred_logits"].shape) == (3, 2, 9)
 
+    def test_extract_rfdetr_outputs_preserves_raw_dict_aux_outputs(self):
+        outputs = {
+            "pred_logits": torch.zeros((3, 2, 9), dtype=torch.float32),
+            "pred_boxes": torch.zeros((3, 2, 4), dtype=torch.float32),
+            "aux_outputs": {
+                "pred_logits": torch.ones((3, 2, 9), dtype=torch.float32),
+                "pred_boxes": torch.ones((3, 2, 4), dtype=torch.float32),
+            },
+        }
+
+        extracted = _extract_rfdetr_outputs(outputs)
+
+        assert isinstance(extracted["aux_outputs"], dict)
+        assert tuple(extracted["aux_outputs"]["pred_logits"].shape) == (3, 2, 9)
+
     def test_build_tinynext_detector_unwraps_nested_full_detector_checkpoint(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module
 

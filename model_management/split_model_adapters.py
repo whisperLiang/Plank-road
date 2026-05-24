@@ -47,6 +47,7 @@ except Exception:
 
 
 COCO_91_TO_80 = {label: idx for idx, label in enumerate(COCO_80_TO_91)}
+_RFDETR_PACKED_AUX_OUTPUTS_MARKER = "__plank_rfdetr_packed_aux_outputs__"
 
 
 class TorchvisionAnchorDetectorReplay(torch.nn.Module):
@@ -1604,7 +1605,7 @@ def _pack_rfdetr_aux_outputs(value: Any) -> Any:
     if not isinstance(value, (list, tuple)):
         return _contiguous_tensor_tree(value)
     if not value:
-        return {}
+        return {_RFDETR_PACKED_AUX_OUTPUTS_MARKER: True}
     if not all(isinstance(item, Mapping) for item in value):
         return _contiguous_tensor_tree(value)
     keys = sorted(
@@ -1630,7 +1631,12 @@ def _pack_rfdetr_aux_outputs(value: Any) -> Any:
             ],
             dim=0,
         )
-    return packed if packed else _contiguous_tensor_tree(value)
+    if not packed:
+        return _contiguous_tensor_tree(value)
+    return {
+        _RFDETR_PACKED_AUX_OUTPUTS_MARKER: True,
+        **packed,
+    }
 
 
 def _unpack_rfdetr_aux_outputs(value: Any) -> Any:
@@ -1638,13 +1644,17 @@ def _unpack_rfdetr_aux_outputs(value: Any) -> Any:
         return _contiguous_tensor_tree(list(value))
     if not isinstance(value, dict):
         return _contiguous_tensor_tree(value)
+    if value.get(_RFDETR_PACKED_AUX_OUTPUTS_MARKER) is not True:
+        return _contiguous_tensor_tree(value)
     tensor_items = {
         str(key): tensor
         for key, tensor in value.items()
-        if isinstance(tensor, torch.Tensor)
+        if key != _RFDETR_PACKED_AUX_OUTPUTS_MARKER
+        and isinstance(tensor, torch.Tensor)
+        and tensor.ndim > 0
     }
     if not tensor_items:
-        return _contiguous_tensor_tree(value)
+        return []
     layer_count = min(int(tensor.shape[0]) for tensor in tensor_items.values())
     if layer_count <= 0:
         return []
