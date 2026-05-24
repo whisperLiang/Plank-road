@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 import subprocess
@@ -8,6 +9,7 @@ import pytest
 
 from baselines.runtime.teacher_annotator import TeacherAnnotator
 from tests.baselines_real_helpers import make_frame_dir, make_label_dir
+from tools.run_baselines_real import _resolve_class_names
 
 
 def test_run_baselines_real_smoke(tmp_path: Path):
@@ -152,6 +154,50 @@ def test_teacher_annotator_missing_frame_label_raises(tmp_path: Path):
     )
     with pytest.raises(FileNotFoundError):
         annotator.annotate(next(frame_dir.glob("*.jpg")))
+
+
+def test_run_baselines_real_reads_class_names_from_runtime_config(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 127.0.0.1:50051
+  class_names:
+    - pedestrian
+    - micromobility
+    - car
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        class_names="",
+        runtime_config=str(config_path),
+    )
+
+    assert _resolve_class_names(args) == ["pedestrian", "micromobility", "car"]
+
+
+def test_run_baselines_real_class_names_cli_overrides_runtime_config(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+client:
+  server_ip: 127.0.0.1:50051
+  class_names:
+    - ignored
+server:
+  listen_address: "[::]:50051"
+""".strip(),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        class_names="person,car",
+        runtime_config=str(config_path),
+    )
+
+    assert _resolve_class_names(args) == ["person", "car"]
 
 
 def test_run_baselines_real_requires_teacher_model(tmp_path: Path):

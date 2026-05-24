@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from baselines.experiment_utils import display_name_for_method
 from baselines.runtime.student_inferencer import resolve_torch_device
 from config.experiment import ExperimentConfig, VALID_METHODS
+from config.runtime import load_runtime_config
 from tools.baselines_real_common import run_one_experiment_case
 
 
@@ -22,6 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", default=",".join(VALID_METHODS))
     parser.add_argument("--student-model", default="yolo26")
     parser.add_argument("--student-weights", help="Optional local student weights path.")
+    parser.add_argument(
+        "--runtime-config",
+        default="config/config.yaml",
+        help="Runtime config used as a fallback source for client.class_names.",
+    )
     parser.add_argument(
         "--class-names",
         default="",
@@ -62,6 +68,29 @@ def _parse_class_names(raw: str) -> list[str]:
     return [item.strip() for item in str(raw or "").split(",") if item.strip()]
 
 
+def _runtime_config_class_names(path: str | Path | None) -> list[str]:
+    if not path:
+        return []
+    config_path = Path(path)
+    if not config_path.exists():
+        return []
+    try:
+        return [str(item) for item in load_runtime_config(config_path).client.class_names]
+    except Exception as exc:
+        print(
+            f"[run_baselines_real] Could not read client.class_names from {config_path}: {exc}",
+            file=sys.stderr,
+        )
+        return []
+
+
+def _resolve_class_names(args: argparse.Namespace) -> list[str]:
+    explicit = _parse_class_names(args.class_names)
+    if explicit:
+        return explicit
+    return _runtime_config_class_names(args.runtime_config)
+
+
 def main() -> None:
     args = parse_args()
     root_results = Path(args.results_dir)
@@ -83,7 +112,7 @@ def main() -> None:
         video_path=args.video,
         student_model=args.student_model,
         student_weights_path=args.student_weights,
-        class_names=_parse_class_names(args.class_names),
+        class_names=_resolve_class_names(args),
         teacher_label_schema=args.teacher_label_schema,
         teacher_model=args.teacher_model,
         initial_checkpoint=args.initial_checkpoint,
