@@ -140,7 +140,7 @@ client:
  split_learning:
   enabled: True
   fixed_split:
-   privacy_leakage_upper_bound: 4.0e-6
+   privacy_leakage_upper_bound: 1.0e-6
    max_layer_freezing_ratio: 0.75
    validate_candidates: True
    max_boundary_count: 8
