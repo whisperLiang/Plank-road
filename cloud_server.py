@@ -67,6 +67,7 @@ from model_management.universal_model_split import (
     log_split_retrain_profile,
     universal_split_retrain,
     load_split_feature_cache,
+    prepare_exact_split_runtime,
     save_split_feature_cache,
 )
 from model_management.fixed_split_runtime_template import (
@@ -77,9 +78,8 @@ from model_management.fixed_split_runtime_template import (
     fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
 )
-from model_management.split_runtime import compare_outputs, make_split_spec, prepare_split_runtime
+from model_management.split_runtime import compare_outputs, make_split_spec
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
-from model_management.fixed_split import canonical_split_key_for_candidate
 from model_management.split_contract import (
     SplitRuntimeContract,
     contract_path,
@@ -255,10 +255,12 @@ def _build_fixed_split_cache_identity(
 
 
 def _fixed_split_boundary_from_plan(split_plan: Mapping[str, object]) -> str:
+    descriptor = dict(split_plan.get("candidate_descriptor", {}) or {})
     boundary = (
-        split_plan.get("canonical_split_key")
+        split_plan.get("candidate_id")
         or split_plan.get("edge_split_id")
-        or split_plan.get("candidate_id")
+        or split_plan.get("canonical_split_key")
+        or descriptor.get("candidate_id")
         or split_plan.get("split_label")
         or (
             list(split_plan.get("boundary_tensor_labels") or [])[-1]
@@ -270,6 +272,38 @@ def _fixed_split_boundary_from_plan(split_plan: Mapping[str, object]) -> str:
     if boundary != "auto" and not boundary.startswith("after:"):
         boundary = f"after:{boundary}"
     return boundary
+
+
+def _fixed_split_dynamic_batch_from_plan(
+    split_plan: Mapping[str, object],
+    default: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    raw = split_plan.get("dynamic_batch")
+    if raw is None:
+        return default
+    try:
+        lower, upper = list(raw)[:2]
+    except (TypeError, ValueError):
+        return default
+    lower_int = max(1, int(lower))
+    upper_int = max(lower_int, int(upper))
+    return lower_int, upper_int
+
+
+def _fixed_split_trace_batch_mode_from_plan(split_plan: Mapping[str, object]) -> str:
+    mode = str(split_plan.get("trace_batch_mode") or "").strip()
+    return mode if mode in {"batch_1", "batch_gt1"} else "batch_gt1"
+
+
+def _fixed_split_trace_batch_size_from_plan(
+    split_plan: Mapping[str, object],
+    default: int,
+) -> int:
+    raw = split_plan.get("trace_batch_size")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return max(1, int(default))
 
 
 def _working_cache_manifest_path(working_cache: str) -> str:
@@ -2748,11 +2782,22 @@ class CloudContinualLearner:
                 f"model_version={bundle_model_version}."
             )
 
-        canonical_split_key = str(context.get("canonical_split_key") or "").strip()
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        canonical_split_key = str(
+            context.get("canonical_split_key")
+            or context.get("edge_split_id")
+            or split_plan.get("candidate_id")
+            or _fixed_split_boundary_from_plan(split_plan)
+        ).strip()
+        if (
+            canonical_split_key
+            and canonical_split_key != "auto"
+            and not canonical_split_key.startswith("after:")
+        ):
+            canonical_split_key = f"after:{canonical_split_key}"
         if not canonical_split_key:
             raise RuntimeError(
-                "This split point is not stable across batch sizes. "
-                "Please choose a module-boundary split."
+                "SplitRuntimeContract creation requires an exact split id."
             )
         if feature_tensors is None:
             raise RuntimeError(
@@ -2764,31 +2809,17 @@ class CloudContinualLearner:
                 "already-bound cloud batch runtime."
             )
 
-        candidates_by_key: dict[str, object] = {}
-        for batch_candidate in splitter.enumerate_candidates():
-            try:
-                key = canonical_split_key_for_candidate(batch_candidate)
-            except RuntimeError:
-                continue
-            candidates_by_key[key] = batch_candidate
-        batch_candidate = None
-        try:
-            if canonical_split_key_for_candidate(candidate) == canonical_split_key:
-                batch_candidate = candidate
-        except RuntimeError:
-            batch_candidate = None
-        if batch_candidate is None:
-            batch_candidate = candidates_by_key.get(canonical_split_key)
-        if batch_candidate is None:
-            raise RuntimeError(
-                "This split point is not stable across batch sizes. "
-                "Please choose a module-boundary split."
-            )
+        batch_candidate = candidate
         cloud_batch_split_id = self._candidate_cloud_batch_split_id(
             splitter=splitter,
             candidate=batch_candidate,
             canonical_split_key=canonical_split_key,
         )
+        if cloud_batch_split_id != canonical_split_key:
+            raise RuntimeError(
+                "SplitRuntimeContract runtime split does not match the exact plan split "
+                f"(expected={canonical_split_key!r}, actual={cloud_batch_split_id!r})."
+            )
         layout_tensors = self._contract_layout_tensors_from_runtime(
             splitter=splitter,
             candidate=batch_candidate,
@@ -4551,14 +4582,25 @@ class CloudContinualLearner:
         image_size = trace_image_size or (640, 640)
         boundary = _fixed_split_boundary_from_plan(split_plan)
         model_family = model_zoo.get_model_family(str(model_name))
+        dynamic_batch = _fixed_split_dynamic_batch_from_plan(
+            split_plan,
+            _FIXED_SPLIT_DYNAMIC_BATCH,
+        )
+        trace_batch_mode = _fixed_split_trace_batch_mode_from_plan(split_plan)
+        trace_batch_size = _fixed_split_trace_batch_size_from_plan(
+            split_plan,
+            self.trace_batch_size,
+        )
         split_spec = make_split_spec(
             boundary,
-            dynamic_batch=_FIXED_SPLIT_DYNAMIC_BATCH,
+            dynamic_batch=dynamic_batch,
             trainable=True,
-            trace_batch_mode="batch_gt1",
+            trace_batch_mode=trace_batch_mode,
             model_family=model_family,
         )
-        symbolic_example = torch.empty((2, 3, int(image_size[0]), int(image_size[1])))
+        symbolic_example = torch.empty(
+            (trace_batch_size, 3, int(image_size[0]), int(image_size[1]))
+        )
         return fixed_split_runtime_template_key(
             model_name=str(model_name),
             model_family=model_family,
@@ -4566,7 +4608,7 @@ class CloudContinualLearner:
             example_inputs=symbolic_example,
             graph_signature=str(split_plan.get("trace_signature") or "") or None,
             split_plan_hash=_json_fingerprint(split_plan),
-            trace_batch_size=max(1, int(self.trace_batch_size)),
+            trace_batch_size=trace_batch_size,
             mode=self._preferred_fixed_split_runtime_mode(model_family),
         )
 
@@ -4682,7 +4724,7 @@ class CloudContinualLearner:
 
         errors: dict[str, str | None] = {}
         for index, mode in enumerate(modes):
-            runtime = prepare_split_runtime(
+            runtime = prepare_exact_split_runtime(
                 model,
                 sample_input,
                 split_spec,
@@ -4731,20 +4773,29 @@ class CloudContinualLearner:
         split_model = get_split_runtime_model(model)
         sample_input = trace_sample_input
         if sample_input is None:
+            trace_batch_size = _fixed_split_trace_batch_size_from_plan(
+                split_plan_payload,
+                self.trace_batch_size,
+            )
             sample_input = self._build_bundle_batch_trace_sample_input(
                 model,
                 bundle_root,
                 manifest,
-                runtime_batch_size=max(1, int(self.trace_batch_size)),
+                runtime_batch_size=trace_batch_size,
             )
         boundary = _fixed_split_boundary_from_plan(split_plan_payload)
         model_name = self._resolve_fixed_split_model_name(manifest)
         model_family = model_zoo.get_model_family(model_name)
+        dynamic_batch = _fixed_split_dynamic_batch_from_plan(
+            split_plan_payload,
+            _FIXED_SPLIT_DYNAMIC_BATCH,
+        )
+        trace_batch_mode = _fixed_split_trace_batch_mode_from_plan(split_plan_payload)
         split_spec = make_split_spec(
             boundary,
-            dynamic_batch=_FIXED_SPLIT_DYNAMIC_BATCH,
+            dynamic_batch=dynamic_batch,
             trainable=True,
-            trace_batch_mode="batch_gt1",
+            trace_batch_mode=trace_batch_mode,
             model_family=model_family,
         )
         trace_started = time.perf_counter()
@@ -4762,21 +4813,14 @@ class CloudContinualLearner:
             model=split_model,
             split_spec=split_spec,
         )
-        canonical_key = str(
-            split_plan_payload.get("canonical_split_key")
-            or boundary
+        current_candidate_id = str(
+            getattr(getattr(verifier, "current_candidate", None), "candidate_id", "")
             or ""
         )
-        candidate_by_key = {}
-        for batch_candidate in verifier.enumerate_candidates():
-            try:
-                candidate_by_key[canonical_split_key_for_candidate(batch_candidate)] = batch_candidate
-            except RuntimeError:
-                continue
-        if canonical_key and canonical_key not in candidate_by_key:
+        if boundary != "auto" and current_candidate_id and current_candidate_id != boundary:
             raise RuntimeError(
-                "This split point is not stable across batch sizes. "
-                "Please choose a module-boundary split."
+                "Ariadne fixed split runtime resolved a different split candidate "
+                f"(requested={boundary!r}, actual={current_candidate_id!r})."
             )
         logger.info(
             "[FixedSplitCL] runtime template prepared Ariadne split (model_name={}, model_family={}, split_id={}, trace_signature={}, mode={}, key={}).",

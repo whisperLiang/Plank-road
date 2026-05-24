@@ -14,10 +14,13 @@ import torch
 from loguru import logger
 
 from model_management.split_candidate import CandidateProfile, SplitCandidate
-from model_management.universal_model_split import UniversalModelSplitter
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
+    build_candidate_descriptor,
+)
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v4"
+FIXED_SPLIT_PLAN_VERSION = "fixed-split.v5"
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
 
@@ -199,7 +202,12 @@ class SplitPlan:
     total_parameter_count: int = 0
     validation: dict[str, Any] = field(default_factory=dict)
     constraints: dict[str, Any] = field(default_factory=dict)
+    candidate_descriptor: dict[str, Any] = field(default_factory=dict)
+    split_granularity: str = "operation"
     trace_signature: str | None = None
+    trace_batch_mode: str = ""
+    dynamic_batch: list[int] | None = None
+    trace_batch_size: int | None = None
     canonical_split_key: str = ""
     edge_split_id: str = ""
     input_tensor_shape: list[int] = field(default_factory=list)
@@ -213,6 +221,14 @@ class SplitPlan:
             self.canonical_split_key = _normalise_after_key(raw)
         if not self.edge_split_id:
             self.edge_split_id = str(self.candidate_id or self.canonical_split_key)
+        self.split_granularity = str(self.split_granularity or "operation")
+        if self.dynamic_batch is not None:
+            self.dynamic_batch = [int(dim) for dim in list(self.dynamic_batch)[:2]]
+            if len(self.dynamic_batch) != 2:
+                self.dynamic_batch = None
+        if self.trace_batch_size is not None:
+            self.trace_batch_size = int(self.trace_batch_size)
+        self.trace_batch_mode = str(self.trace_batch_mode or "")
         self.input_tensor_shape = [int(dim) for dim in list(self.input_tensor_shape or [])]
         self.input_resize_mode = str(self.input_resize_mode or "direct_resize")
         self.front_version = str(self.front_version or "0")
@@ -229,6 +245,7 @@ class SplitPlan:
         return (
             f"canonical_split_key={self.canonical_split_key}, "
             f"candidate_id={self.candidate_id}, "
+            f"split_granularity={self.split_granularity}, "
             f"boundary_count={self.boundary_count}, "
             f"boundary_tensor_labels={boundary_labels}, "
             f"split_index={self.split_index}, "
@@ -282,8 +299,21 @@ class SplitPlan:
             total_parameter_count=int(payload.get("total_parameter_count", 0)),
             validation=dict(payload.get("validation", {})),
             constraints=dict(payload.get("constraints", {})),
+            candidate_descriptor=dict(payload.get("candidate_descriptor", {})),
+            split_granularity=str(payload.get("split_granularity") or "operation"),
             trace_signature=payload.get("trace_signature"),
-            plan_version=str(payload.get("plan_version", FIXED_SPLIT_PLAN_VERSION)),
+            trace_batch_mode=str(payload.get("trace_batch_mode") or ""),
+            dynamic_batch=(
+                [int(dim) for dim in list(payload.get("dynamic_batch") or [])[:2]]
+                if payload.get("dynamic_batch") is not None
+                else None
+            ),
+            trace_batch_size=(
+                int(payload["trace_batch_size"])
+                if payload.get("trace_batch_size") is not None
+                else None
+            ),
+            plan_version=str(payload.get("plan_version") or ""),
         )
 
     def matches(
@@ -393,7 +423,7 @@ def _normalise_after_key(value: object) -> str:
     text = str(value or "").strip()
     if not text:
         raise RuntimeError(
-            "Fixed split candidates must expose a stable module-boundary split key."
+            "Fixed split candidates must expose an exact split key."
         )
     return text if text.startswith("after:") else f"after:{text}"
 
@@ -402,31 +432,11 @@ def _candidate_split_key(candidate: SplitCandidate) -> str:
     metadata = dict(getattr(candidate, "metadata", {}) or {})
     raw_key = (
         metadata.get("canonical_split_key")
-        or metadata.get("ariadne_boundary_after")
         or getattr(candidate, "candidate_id", None)
+        or metadata.get("ariadne_operation_split_id")
+        or metadata.get("ariadne_boundary_after")
     )
     return _normalise_after_key(raw_key)
-
-
-_UNSTABLE_SPLIT_KEY_PREFIXES = ("after:node_", "after:__node_", "after:fx_")
-
-
-def _is_stable_module_boundary_candidate(candidate: SplitCandidate) -> bool:
-    try:
-        key = _candidate_split_key(candidate)
-    except RuntimeError:
-        return False
-    return not any(key.startswith(prefix) for prefix in _UNSTABLE_SPLIT_KEY_PREFIXES)
-
-
-def canonical_split_key_for_candidate(candidate: SplitCandidate) -> str:
-    key = _candidate_split_key(candidate)
-    if any(key.startswith(prefix) for prefix in _UNSTABLE_SPLIT_KEY_PREFIXES):
-        raise RuntimeError(
-            "This split point is not stable across batch sizes. "
-            "Please choose a module-boundary split."
-        )
-    return key
 
 
 def _input_tensor_shape_from_sample(sample_input: Any) -> list[int]:
@@ -437,6 +447,47 @@ def _input_tensor_shape_from_sample(sample_input: Any) -> list[int]:
             if isinstance(value, torch.Tensor):
                 return [int(dim) for dim in value.shape]
     return []
+
+
+def _first_tensor_batch_size(value: Any) -> int | None:
+    if isinstance(value, torch.Tensor) and value.ndim > 0:
+        return int(value.shape[0])
+    if isinstance(value, Mapping):
+        for item in value.values():
+            found = _first_tensor_batch_size(item)
+            if found is not None:
+                return found
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_tensor_batch_size(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _split_spec_payload_value(splitter: UniversalModelSplitter, name: str) -> Any:
+    for source in (
+        getattr(splitter, "split_spec", None),
+        getattr(getattr(splitter, "runtime", None), "split_spec", None),
+    ):
+        if source is not None and getattr(source, name, None) is not None:
+            return getattr(source, name)
+    return None
+
+
+def _splitter_dynamic_batch(splitter: UniversalModelSplitter) -> list[int] | None:
+    dynamic_batch = _split_spec_payload_value(splitter, "dynamic_batch")
+    if dynamic_batch is None:
+        return None
+    try:
+        lower, upper = list(dynamic_batch)[:2]
+    except (TypeError, ValueError):
+        return None
+    return [int(lower), int(upper)]
+
+
+def _splitter_trace_batch_mode(splitter: UniversalModelSplitter) -> str:
+    return str(_split_spec_payload_value(splitter, "trace_batch_mode") or "")
 
 
 def _fallback_candidate_pool(
@@ -478,8 +529,6 @@ def _enumerate_feasible_candidates(
 
     eligible: list[EligibleCandidate] = []
     for candidate in candidates:
-        if not _is_stable_module_boundary_candidate(candidate):
-            continue
         if not candidate.is_trainable_tail:
             continue
         privacy_leakage = _privacy_leakage(candidate, constraints)
@@ -680,12 +729,13 @@ def _profile_from_report(
 
 
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
-    if plan.candidate_id is None:
+    raw_candidate_id = plan.candidate_id or plan.edge_split_id or plan.canonical_split_key
+    if raw_candidate_id is None:
         raise RuntimeError(
             "Ariadne fixed split plans must include candidate_id "
             f"(split_config_id={plan.split_config_id!r})."
         )
-    return splitter.split(candidate_id=plan.candidate_id)
+    return splitter.split(candidate_id=_normalise_after_key(raw_candidate_id))
 
 
 def validate_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> dict[str, Any]:
@@ -759,7 +809,11 @@ def compute_fixed_split_for_model(
             "refusing to use the runtime auto/current candidate as a fixed plan."
         )
 
-    canonical_split_key = canonical_split_key_for_candidate(chosen)
+    canonical_split_key = _candidate_split_key(chosen)
+    candidate_descriptor = build_candidate_descriptor(chosen)
+    split_granularity = str(
+        (chosen.metadata or {}).get("split_granularity") or "operation"
+    )
     return SplitPlan(
         split_config_id=_make_plan_id(
             model_name=model_name or model.__class__.__name__,
@@ -767,13 +821,11 @@ def compute_fixed_split_for_model(
             constraints=constraints,
         ),
         canonical_split_key=canonical_split_key,
-        edge_split_id=str(chosen.candidate_id),
+        edge_split_id=canonical_split_key,
         model_name=model_name or model.__class__.__name__,
         candidate_id=chosen.candidate_id,
         split_index=chosen.legacy_layer_index,
-        split_label=chosen.boundary_tensor_labels[-1]
-        if chosen.boundary_tensor_labels
-        else None,
+        split_label=chosen.candidate_id,
         boundary_tensor_labels=list(chosen.boundary_tensor_labels),
         input_tensor_shape=_input_tensor_shape_from_sample(sample_input),
         input_resize_mode=str(input_resize_mode or "direct_resize"),
@@ -787,7 +839,12 @@ def compute_fixed_split_for_model(
         total_parameter_count=int(getattr(chosen, "total_parameter_count", 0)),
         validation=validation,
         constraints=_constraints_payload(constraints),
+        candidate_descriptor=candidate_descriptor,
+        split_granularity=split_granularity,
         trace_signature=_trace_signature(runtime),
+        trace_batch_mode=_splitter_trace_batch_mode(runtime),
+        dynamic_batch=_splitter_dynamic_batch(runtime),
+        trace_batch_size=_first_tensor_batch_size(sample_input),
     )
 
 

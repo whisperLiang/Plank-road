@@ -181,5 +181,3 @@ class SplitCandidateSelector:
     def cache_profile(self, profile: CandidateProfile) -> None:
         self.profiles[profile.candidate_id] = profile
 
-
-SplitPointSelector = SplitCandidateSelector

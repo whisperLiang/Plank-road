@@ -413,7 +413,7 @@ class EdgeWorker:
                 split_model,
                 sample_input,
                 model_name=self.model_id,
-                enable_dynamic_batch=False,
+                enable_dynamic_batch=True,
             )
             logger.info(
                 "Fixed split startup prepared Ariadne runtime (trace_time={:.3f}s)",

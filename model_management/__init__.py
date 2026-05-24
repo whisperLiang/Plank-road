@@ -7,12 +7,8 @@ from model_management.universal_model_split import (  # noqa: F401
     save_split_feature_cache,
     load_split_feature_cache,
     universal_split_retrain,
-    LayerInfo,
-    LayerProfile,
     SplitCandidate,
     CandidateProfile,
-    SplitCandidateSelector,
-    SplitPointSelector,
 )
 from model_management.payload import BoundaryPayload  # noqa: F401
 

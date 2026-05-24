@@ -261,7 +261,7 @@ def test_fixed_split_validates_only_lowest_payload_group_until_success():
     ]
 
 
-def test_fixed_split_skips_unstable_node_candidates():
+def test_fixed_split_selects_operation_node_candidates():
     constraints = SplitConstraints()
 
     def _candidate(
@@ -297,7 +297,7 @@ def test_fixed_split_skips_unstable_node_candidates():
         )
 
     candidates = [
-        _candidate("node_1", edge_nodes=["n1"], payload_bytes=1, layer_index=1),
+        _candidate("after:node_1", edge_nodes=["n1"], payload_bytes=1, layer_index=1),
         _candidate(
             "candidate-stable",
             edge_nodes=["n1", "n2"],
@@ -341,9 +341,12 @@ def test_fixed_split_skips_unstable_node_candidates():
         model_name="dummy-model",
     )
 
-    assert plan.candidate_id == "candidate-stable"
-    assert plan.canonical_split_key == "after:backbone.stage2"
-    assert runtime.validation_calls == ["candidate-stable"]
+    assert plan.plan_version == "fixed-split.v5"
+    assert plan.candidate_id == "after:node_1"
+    assert plan.canonical_split_key == "after:node_1"
+    assert plan.edge_split_id == "after:node_1"
+    assert plan.split_granularity == "operation"
+    assert runtime.validation_calls == ["after:node_1"]
 
 
 def test_fixed_split_failure_reports_untrainable_replay_candidates():
@@ -611,7 +614,7 @@ def test_apply_split_plan_uses_ariadne_candidate_id_only():
     plan = SplitPlan(
         split_config_id="plan-1",
         model_name="dummy-model",
-        candidate_id="candidate-2",
+        candidate_id="after:node_2",
         split_index=7,
         split_label="layer7",
         boundary_tensor_labels=["missing-boundary"],
@@ -623,7 +626,7 @@ def test_apply_split_plan_uses_ariadne_candidate_id_only():
         trace_signature="sig",
     )
     chosen = SplitCandidate(
-        candidate_id="candidate-2",
+        candidate_id="after:node_2",
         edge_nodes=["layer7"],
         cloud_nodes=["tail"],
         boundary_edges=[("layer7", "tail")],
@@ -650,13 +653,13 @@ def test_apply_split_plan_uses_ariadne_candidate_id_only():
 
         def split(self, *, candidate_id=None, **kwargs):
             self.calls.append({"candidate_id": candidate_id, **kwargs})
-            if candidate_id == "candidate-2":
+            if candidate_id == "after:node_2":
                 return chosen
             raise KeyError(candidate_id)
 
     runtime = AriadneRuntime()
     assert apply_split_plan(runtime, plan) is chosen
-    assert runtime.calls == [{"candidate_id": "candidate-2"}]
+    assert runtime.calls == [{"candidate_id": "after:node_2"}]
 
 
 def test_high_quality_sample_saves_feature_and_result_without_raw(tmp_path):
@@ -2665,12 +2668,6 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         "_prepare_replayable_split_runtime",
         fake_prepare_replayable_split_runtime,
     )
-    monkeypatch.setattr(
-        cloud_server,
-        "canonical_split_key_for_candidate",
-        lambda _candidate: "after:node_1",
-    )
-
     class FakeVerifier:
         def __init__(self, *args, **kwargs):
             pass
@@ -2702,6 +2699,53 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     assert captured["model_name"] == "rfdetr_nano"
     assert captured["preferred_mode"] == "debug_interpreter"
     assert template.mode == "debug_interpreter"
+
+
+def test_cloud_prepare_replayable_split_runtime_resolves_exact_operation_id(tmp_path):
+    from cloud_server import CloudContinualLearner
+    from model_management.split_runtime import compare_outputs, make_split_spec
+
+    class MultiOpBlock(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return torch.relu(torch.sigmoid(x)) * 2.0
+
+    class ToyNet(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = MultiOpBlock()
+            self.head = torch.nn.Linear(4, 2)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.head(self.block(x))
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="toy",
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    model = ToyNet().eval()
+    split_spec = make_split_spec(
+        "after:node_0",
+        dynamic_batch=(2, 64),
+        trace_batch_mode="batch_gt1",
+    )
+
+    runtime, _mode = learner._prepare_replayable_split_runtime(
+        model,
+        torch.randn(2, 4),
+        split_spec,
+        model_name="toy",
+    )
+
+    assert runtime.split_id == "after:node_0"
+    inputs = torch.randn(3, 4)
+    replayed = runtime.run_suffix(runtime.run_prefix(inputs))
+    ok, max_diff = compare_outputs(model(inputs), replayed)
+    assert ok, max_diff
 
 
 def test_cloud_fixed_split_working_cache_rebuild_with_template_hit_skips_trace_input(

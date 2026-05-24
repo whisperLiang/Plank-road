@@ -5,11 +5,12 @@ import gzip
 import os
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
+from ariadne.codegen.segment_builder import build_segments
 from ariadne.planner.frontier import enumerate_frontier_splits
 from loguru import logger
 
@@ -243,6 +244,69 @@ def _candidate_legacy_index(plan: Any, candidate: Any) -> int | None:
     return max(indexes) if indexes else None
 
 
+def _normalise_after_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text if text.startswith("after:") else f"after:{text}"
+
+
+def _ariadne_candidate_operation_node(candidate: Any) -> str:
+    prefix_nodes = list(getattr(candidate, "prefix_nodes", ()) or ())
+    if prefix_nodes:
+        return str(prefix_nodes[-1])
+    boundary_after = str(getattr(candidate, "boundary_after", "") or "").strip()
+    return boundary_after.removeprefix("after:")
+
+
+def _ariadne_candidate_operation_split_id(candidate: Any) -> str:
+    operation_node = _ariadne_candidate_operation_node(candidate)
+    return _normalise_after_id(operation_node) or str(
+        getattr(candidate, "split_id", "after:auto")
+    )
+
+
+def _exact_ariadne_candidate(candidate: Any) -> Any:
+    operation_node = _ariadne_candidate_operation_node(candidate)
+    operation_split_id = _ariadne_candidate_operation_split_id(candidate)
+    try:
+        return replace(
+            candidate,
+            split_id=operation_split_id,
+            boundary_after=operation_node or getattr(candidate, "boundary_after", ""),
+        )
+    except TypeError:
+        return candidate
+
+
+def _node_metadata_for_candidate(plan: Any, candidate: Any) -> dict[str, Any]:
+    operation_node = _ariadne_candidate_operation_node(candidate)
+    try:
+        node = plan.get_node(operation_node)
+    except (AttributeError, KeyError):
+        node = None
+    return {
+        "ariadne_boundary_node": operation_node or None,
+        "ariadne_module_path": getattr(node, "module_path", None),
+        "ariadne_op": getattr(node, "op", None),
+        "ariadne_target": getattr(node, "target", None),
+    }
+
+
+def _boundary_schema_summary(candidate: Any) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for label, spec in (getattr(candidate, "boundary_schema", {}) or {}).items():
+        summary[str(label)] = {
+            "symbolic_shape": [
+                str(dim) for dim in getattr(spec, "symbolic_shape", ()) or ()
+            ],
+            "dtype": str(getattr(spec, "dtype", "") or ""),
+            "device_type": str(getattr(spec, "device_type", "") or ""),
+            "requires_grad": bool(getattr(spec, "requires_grad", False)),
+        }
+    return summary
+
+
 def _candidate_from_ariadne_candidate(
     runtime: SplitRuntime,
     split_spec: SplitSpec,
@@ -269,8 +333,10 @@ def _candidate_from_ariadne_candidate(
         else float("inf")
     )
     cost = getattr(candidate, "cost", None)
+    operation_split_id = _ariadne_candidate_operation_split_id(candidate)
+    node_metadata = _node_metadata_for_candidate(plan, candidate)
     return SplitCandidate(
-        candidate_id=str(getattr(candidate, "split_id", split_spec.boundary)),
+        candidate_id=operation_split_id,
         edge_nodes=prefix_nodes,
         cloud_nodes=suffix_nodes,
         boundary_edges=_candidate_boundary_edges(plan, candidate),
@@ -300,11 +366,17 @@ def _candidate_from_ariadne_candidate(
         metadata={
             "runtime": "ariadne",
             "graph_signature": getattr(runtime, "graph_signature", None),
+            "canonical_split_key": operation_split_id,
+            "split_granularity": "operation",
+            "ariadne_operation_split_id": operation_split_id,
+            "ariadne_split_id": getattr(candidate, "split_id", None),
             "ariadne_boundary_after": getattr(candidate, "boundary_after", None),
             "ariadne_trainable_suffix": bool(getattr(candidate, "trainable_suffix", True)),
             "ariadne_prefix_node_count": int(getattr(cost, "prefix_node_count", 0) or 0),
             "ariadne_suffix_node_count": int(getattr(cost, "suffix_node_count", 0) or 0),
             "boundary_shape_summary": _boundary_shape_summary(candidate),
+            "boundary_schema": _boundary_schema_summary(candidate),
+            **node_metadata,
             "split_spec": {
                 "boundary": split_spec.boundary,
                 "dynamic_batch": split_spec.dynamic_batch,
@@ -312,35 +384,6 @@ def _candidate_from_ariadne_candidate(
             },
         },
     )
-
-
-@dataclass
-class LayerInfo:
-    index: int
-    name: str
-    module_type: str
-    output_shape: tuple[int, ...] | None = None
-    trainable_params: int = 0
-
-
-@dataclass
-class LayerProfile:
-    layer: LayerInfo
-    estimated_flops: float = 0.0
-    estimated_bytes: int = 0
-
-
-@dataclass
-class SplitPointSelector:
-    candidates: list[SplitCandidate] = field(default_factory=list)
-
-    def best(self) -> SplitCandidate | None:
-        return self.candidates[0] if self.candidates else None
-
-
-@dataclass
-class SplitCandidateSelector(SplitPointSelector):
-    pass
 
 
 def _candidate_from_runtime(runtime: SplitRuntime, split_spec: SplitSpec) -> SplitCandidate:
@@ -374,6 +417,9 @@ def _candidate_from_runtime(runtime: SplitRuntime, split_spec: SplitSpec) -> Spl
         metadata={
             "runtime": "ariadne",
             "graph_signature": getattr(runtime, "graph_signature", None),
+            "canonical_split_key": split_id,
+            "split_granularity": "runtime",
+            "ariadne_split_id": split_id,
             "ariadne_boundary_after": getattr(ariadne_candidate, "boundary_after", None),
             "ariadne_trainable_suffix": is_trainable_tail,
             "split_spec": {
@@ -390,6 +436,7 @@ def build_candidate_descriptor(candidate: SplitCandidate) -> dict[str, Any]:
         "candidate_id": candidate.candidate_id,
         "boundary_tensor_labels": list(candidate.boundary_tensor_labels),
         "legacy_layer_index": candidate.legacy_layer_index,
+        "split_granularity": (candidate.metadata or {}).get("split_granularity"),
         "metadata": dict(candidate.metadata),
     }
 
@@ -425,6 +472,55 @@ def reconstruct_candidate_from_descriptor(
         boundary_count=len(labels),
         metadata={**dict(descriptor.get("metadata", {})), "source": source or "descriptor"},
     )
+
+
+def _runtime_from_exact_ariadne_candidate(
+    runtime: SplitRuntime,
+    split_spec: SplitSpec,
+    candidate: Any,
+    *,
+    variants: tuple[SplitRuntime, ...] = (),
+) -> SplitRuntime:
+    trace_plan = getattr(runtime, "trace_plan", None)
+    if trace_plan is None:
+        raise RuntimeError("Ariadne runtime does not expose a trace plan.")
+    exact_candidate = _exact_ariadne_candidate(candidate)
+    return SplitRuntime(
+        trace_plan=trace_plan,
+        split_spec=split_spec,
+        candidate=exact_candidate,
+        segments=build_segments(trace_plan, exact_candidate),
+        mode=getattr(runtime, "mode", "generated_eager"),
+        variants=variants,
+        batch_range=getattr(runtime, "batch_range", None),
+    )
+
+
+def prepare_exact_split_runtime(
+    model: torch.nn.Module,
+    sample_input: Any,
+    split_spec: SplitSpec,
+    *,
+    mode: str = "generated_eager",
+) -> SplitRuntime:
+    boundary = str(getattr(split_spec, "boundary", "auto") or "auto")
+    if boundary == "auto":
+        return prepare_split_runtime(model, sample_input, split_spec, mode=mode)
+
+    auto_split_spec = replace(split_spec, boundary="auto")
+    runtime = prepare_split_runtime(
+        model,
+        sample_input,
+        auto_split_spec,
+        mode=mode,
+    )
+    splitter = UniversalModelSplitter().bind_runtime(
+        runtime,
+        model=model,
+        split_spec=auto_split_spec,
+    )
+    splitter.split(candidate_id=boundary)
+    return splitter._ensure_runtime()
 
 
 class UniversalModelSplitter:
@@ -463,6 +559,8 @@ class UniversalModelSplitter:
         model_name: str | None = None,
         model_family: str | None = None,
         enable_dynamic_batch: bool = True,
+        dynamic_batch_min: int | None = None,
+        dynamic_batch_max: int = 64,
         **_: Any,
     ) -> "UniversalModelSplitter":
         if sample_kwargs:
@@ -473,7 +571,14 @@ class UniversalModelSplitter:
         trace_batch_size = _first_tensor_batch_size(sample_input) or 1
         trace_batch_mode = "batch_gt1" if trace_batch_size > 1 else "batch_1"
         if enable_dynamic_batch:
-            dynamic_batch = (2, 64) if trace_batch_size > 1 else (1, 64)
+            lower = (
+                int(dynamic_batch_min)
+                if dynamic_batch_min is not None
+                else (2 if trace_batch_size > 1 else 1)
+            )
+            lower = max(1, lower)
+            upper = max(lower, int(dynamic_batch_max))
+            dynamic_batch = (lower, upper)
         else:
             dynamic_batch = None
         self.split_spec = split_spec or make_split_spec(
@@ -542,18 +647,33 @@ class UniversalModelSplitter:
         if plan is None:
             raise KeyError("Ariadne runtime does not expose a trace plan.")
 
-        expected_ids = {
-            str(value)
+        metadata = dict(getattr(candidate, "metadata", {}) or {}) if candidate is not None else {}
+        expected_exact_ids = {
+            _normalise_after_id(value)
             for value in (
                 candidate_id,
                 getattr(candidate, "candidate_id", None),
                 layer_label,
-                (candidate.metadata or {}).get("ariadne_boundary_after")
-                if candidate is not None
-                else None,
+                metadata.get("ariadne_operation_split_id"),
+                metadata.get("canonical_split_key"),
+                metadata.get("ariadne_boundary_node"),
             )
             if value is not None
         }
+        expected_exact_ids.discard("")
+        expected_legacy_ids = {
+            _normalise_after_id(value)
+            for value in (
+                candidate_id,
+                getattr(candidate, "candidate_id", None),
+                layer_label,
+                metadata.get("ariadne_split_id"),
+                metadata.get("ariadne_boundary_after"),
+                metadata.get("ariadne_module_path"),
+            )
+            if value is not None
+        }
+        expected_legacy_ids.discard("")
         expected_boundaries = list(
             boundary_tensor_labels
             or (getattr(candidate, "boundary_tensor_labels", None) if candidate else None)
@@ -561,13 +681,23 @@ class UniversalModelSplitter:
         )
         expected_boundary_set = set(expected_boundaries)
 
-        for item in enumerate_frontier_splits(plan):
-            aliases = {
-                str(getattr(item, "split_id", "")),
-                str(getattr(item, "boundary_after", "")),
-                f"after:{getattr(item, 'boundary_after', '')}",
+        frontier = tuple(enumerate_frontier_splits(plan))
+        for item in frontier:
+            operation_id = _ariadne_candidate_operation_split_id(item)
+            operation_node = _ariadne_candidate_operation_node(item)
+            exact_aliases = {
+                operation_id,
+                _normalise_after_id(operation_node),
             }
-            if expected_ids and aliases.intersection(expected_ids):
+            if expected_exact_ids and exact_aliases.intersection(expected_exact_ids):
+                return item
+
+        for item in frontier:
+            legacy_aliases = {
+                _normalise_after_id(getattr(item, "split_id", "")),
+                _normalise_after_id(getattr(item, "boundary_after", "")),
+            }
+            if expected_legacy_ids and legacy_aliases.intersection(expected_legacy_ids):
                 return item
             item_boundaries = list(getattr(item, "boundary_nodes", ()) or ())
             if expected_boundaries and (
@@ -616,19 +746,34 @@ class UniversalModelSplitter:
         )
         split_spec = replace(
             base_split_spec,
-            boundary=str(getattr(ariadne_candidate, "split_id", base_split_spec.boundary)),
+            boundary=_ariadne_candidate_operation_split_id(ariadne_candidate),
         )
-        if self.model is None or self._trace_sample_input is None:
-            raise RuntimeError(
-                "Switching Ariadne split candidates requires the original example input; "
-                "prepare a runtime for the desired boundary directly."
+        variant_runtimes: list[SplitRuntime] = []
+        for variant in tuple(getattr(runtime, "variants", ()) or ()):
+            try:
+                variant_candidate = self._find_ariadne_candidate_in_plan(
+                    getattr(variant, "trace_plan", None),
+                    candidate_id=split_spec.boundary,
+                    boundary_tensor_labels=list(
+                        getattr(ariadne_candidate, "boundary_nodes", ()) or ()
+                    ),
+                )
+            except KeyError:
+                continue
+            variant_runtimes.append(
+                _runtime_from_exact_ariadne_candidate(
+                    variant,
+                    split_spec,
+                    variant_candidate,
+                )
             )
-        self.runtime = prepare_split_runtime(
-            self.model,
-            self._trace_sample_input,
+        self.runtime = _runtime_from_exact_ariadne_candidate(
+            runtime,
             split_spec,
-            mode=str(getattr(runtime, "mode", "generated_eager")),
+            ariadne_candidate,
+            variants=tuple(variant_runtimes),
         )
+        self.split_spec = split_spec
         self.graph = str(getattr(self.runtime, "graph_signature", ""))
         self.current_candidate = _candidate_from_runtime(self.runtime, split_spec)
         return self.current_candidate
@@ -654,7 +799,10 @@ class UniversalModelSplitter:
             runtime = self._ensure_runtime()
             chosen = _candidate_from_runtime(runtime, self.split_spec or SplitSpec(boundary="auto"))
             self.current_candidate = chosen
-        if candidate_id is not None and chosen.candidate_id != candidate_id:
+        if candidate_id is not None and (
+            chosen.candidate_id != candidate_id
+            or str(getattr(self.split_spec, "boundary", "")) != str(candidate_id)
+        ):
             return self._bind_ariadne_candidate(candidate_id=candidate_id)
         if layer_label is not None or boundary_tensor_labels:
             return self._bind_ariadne_candidate(
@@ -671,6 +819,7 @@ class UniversalModelSplitter:
 
         max_boundary_count = kwargs.get("max_boundary_count")
         max_payload_bytes = kwargs.get("max_payload_bytes")
+        max_candidates = kwargs.get("max_candidates")
         split_spec = self.split_spec or getattr(runtime, "split_spec", None) or SplitSpec(
             boundary="auto"
         )
@@ -698,6 +847,8 @@ class UniversalModelSplitter:
                 item.candidate_id,
             )
         )
+        if max_candidates is not None:
+            candidates = candidates[: max(0, int(max_candidates))]
         self.candidates = list(candidates)
         return list(candidates)
 
@@ -1396,7 +1547,13 @@ def _build_boundary_batch_from_records(
                 )
             pieces.append(tensor)
         target_device = pieces[0].device
-        pieces = [piece.to(target_device) for piece in pieces]
+        try:
+            pieces = [piece.to(target_device) for piece in pieces]
+        except Exception as exc:  # noqa: BLE001 - convert device errors into cache guidance.
+            raise RuntimeError(
+                "Cached split-tail boundaries must come from batched Ariadne prefix "
+                "execution when per-sample tensors cannot be assembled on one device."
+            ) from exc
         batched_tensors[label] = torch.cat(pieces, dim=batch_dim)
     passthrough_groups: list[Mapping[str, Any]] = []
     for record in records:
@@ -1416,7 +1573,13 @@ def _build_boundary_batch_from_records(
             pieces.append(value)
         if pieces:
             target_device = pieces[0].device
-            pieces = [piece.to(target_device) for piece in pieces]
+            try:
+                pieces = [piece.to(target_device) for piece in pieces]
+            except Exception as exc:  # noqa: BLE001 - convert device errors into cache guidance.
+                raise RuntimeError(
+                    "Cached split-tail boundaries must come from batched Ariadne prefix "
+                    "execution when per-sample tensors cannot be assembled on one device."
+                ) from exc
             batched_passthrough[str(key)] = torch.cat(pieces, dim=0)
     return boundary_payload_from_tensors(
         batched_tensors,
@@ -1925,11 +2088,7 @@ def universal_split_retrain(
 __all__ = [
     "BoundaryPayload",
     "CandidateProfile",
-    "LayerInfo",
-    "LayerProfile",
     "SplitCandidate",
-    "SplitCandidateSelector",
-    "SplitPointSelector",
     "SplitRetrainProfile",
     "SplitRuntime",
     "SplitSpec",
@@ -1942,6 +2101,7 @@ __all__ = [
     "extract_split_features",
     "load_split_feature_cache",
     "log_split_retrain_profile",
+    "prepare_exact_split_runtime",
     "reconstruct_candidate_from_descriptor",
     "save_split_feature_cache",
     "serialize_boundary_payload",

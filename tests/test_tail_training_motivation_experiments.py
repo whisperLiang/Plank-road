@@ -72,19 +72,33 @@ def test_split_choices_reject_non_experiment_boundary():
         experiments._split_choices(["auto"])
 
 
-def test_stable_split_boundary_filter_promotes_internal_ops_to_module_boundaries():
-    assert not experiments._is_stable_split_id(
-        "after:model.backbone.0.encoder.encoder.encoder.layer.6.mlp.fc2"
+def test_split_choice_resolution_keeps_exact_ariadne_split_id(monkeypatch):
+    seen_boundaries: list[str] = []
+
+    def fake_build_runtime_for_boundary(**kwargs):
+        boundary = kwargs["boundary"]
+        seen_boundaries.append(boundary)
+        return SimpleNamespace(split_id=f"after:node_{len(seen_boundaries)}"), 0.0
+
+    monkeypatch.setattr(
+        experiments,
+        "_build_runtime_for_boundary",
+        fake_build_runtime_for_boundary,
     )
-    assert (
-        experiments._module_level_boundary_for_split_id(
-            "after:model.backbone.0.encoder.encoder.encoder.layer.6.mlp.fc2"
-        )
-        == "after:model.backbone.0.encoder.encoder.encoder.layer.6"
+    monkeypatch.setattr(experiments, "_clear_cuda_cache", lambda: None)
+
+    choices = experiments._resolve_exact_split_choices(
+        split_model=torch.nn.Identity(),
+        example_batch=torch.zeros(2, 1),
+        choices=experiments._split_choices(["percent:25", "percent:50"]),
+        args=SimpleNamespace(),
     )
-    assert experiments._is_stable_split_id(
-        "after:model.backbone.0.encoder.encoder.encoder.layer.6"
-    )
+
+    assert seen_boundaries == ["percent:25", "percent:50"]
+    assert [(choice.boundary, choice.resolved_boundary) for choice in choices] == [
+        ("percent:25", "after:node_1"),
+        ("percent:50", "after:node_2"),
+    ]
 
 
 def test_ordered_epoch_batches_are_deterministic_and_chunked():

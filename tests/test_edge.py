@@ -170,7 +170,7 @@ class TestEdgeWorkerRouting:
         worker.model_id = "dummy-model"
 
         trace_calls = {}
-        sample_input = object()
+        sample_input = torch.ones(1, 1)
         split_model = torch.nn.Linear(1, 1)
 
         class DummyDetection:
@@ -197,6 +197,7 @@ class TestEdgeWorkerRouting:
                 trace_calls["trace_input"] = runtime_input
                 trace_calls["model_name"] = kwargs.get("model_name")
                 trace_calls["enable_dynamic_batch"] = kwargs.get("enable_dynamic_batch")
+                trace_calls["dynamic_batch_min"] = kwargs.get("dynamic_batch_min")
 
         worker.small_object_detection = DummyDetection()
 
@@ -216,9 +217,11 @@ class TestEdgeWorkerRouting:
         worker._init_fixed_split_runtime(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
 
         assert trace_calls["frame"] is sample_bgr_frame
-        assert trace_calls["trace_input"] is sample_input
+        assert tuple(trace_calls["trace_input"].shape) == (1, 1)
+        assert trace_calls["trace_input"][0].item() == pytest.approx(1.0)
         assert trace_calls["model_name"] == "dummy-model"
-        assert trace_calls["enable_dynamic_batch"] is False
+        assert trace_calls["enable_dynamic_batch"] is True
+        assert trace_calls["dynamic_batch_min"] is None
         assert "synthetic_image_size" not in trace_calls
 
     def test_init_fixed_split_runtime_uses_ariadne_trace_without_graph_artifact_cache(
@@ -238,7 +241,7 @@ class TestEdgeWorkerRouting:
         worker.split_trace_image_size = None
         worker.model_id = "dummy-model"
 
-        sample_input = object()
+        sample_input = torch.ones(1, 1)
         split_model = torch.nn.Linear(1, 1)
         trace_calls = {}
         plan_calls = {}
@@ -265,6 +268,7 @@ class TestEdgeWorkerRouting:
                 trace_calls["input"] = runtime_input
                 trace_calls["model_name"] = kwargs.get("model_name")
                 trace_calls["enable_dynamic_batch"] = kwargs.get("enable_dynamic_batch")
+                trace_calls["dynamic_batch_min"] = kwargs.get("dynamic_batch_min")
                 return self
 
         worker.small_object_detection = DummyDetection()
@@ -291,14 +295,13 @@ class TestEdgeWorkerRouting:
 
         worker._init_fixed_split_runtime(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
 
-        assert trace_calls == {
-            "model": split_model,
-            "input": sample_input,
-            "model_name": "dummy-model",
-            "enable_dynamic_batch": False,
-        }
+        assert trace_calls["model"] is split_model
+        assert trace_calls["model_name"] == "dummy-model"
+        assert trace_calls["enable_dynamic_batch"] is True
+        assert trace_calls["dynamic_batch_min"] is None
+        assert tuple(trace_calls["input"].shape) == (1, 1)
         assert plan_calls["splitter"] is worker.universal_splitter
-        assert plan_calls["sample_input"] is sample_input
+        assert plan_calls["sample_input"] is trace_calls["input"]
         assert plan_calls["validate_cached_plan"] is False
 
     def test_resolve_active_splitter_disables_runtime_when_frame_size_changes(self, sample_bgr_frame):

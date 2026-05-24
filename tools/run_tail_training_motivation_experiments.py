@@ -27,7 +27,6 @@ import csv
 import hashlib
 import json
 import random
-import re
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -62,12 +61,14 @@ from model_management.split_runtime import (
     SplitRuntimeConfig,
     build_split_runtime,
     get_split_runtime_metadata,
+    make_split_spec,
     maybe_warmup_runtime,
 )
 from model_management.universal_model_split import (
     _suffix_parameter_names,
     build_split_retrain_optimizer,
     collect_suffix_trainable_parameters,
+    prepare_exact_split_runtime,
 )
 
 
@@ -82,23 +83,6 @@ SPLIT_BUCKET_BY_BOUNDARY = {
     "percent:75": "Late75%",
 }
 BUCKET_LABELS = tuple(SPLIT_BUCKET_BY_BOUNDARY[boundary] for boundary in DEFAULT_SPLIT_BOUNDARIES)
-UNSTABLE_SPLIT_ID_FRAGMENTS = (
-    ".self_attn",
-    ".multihead_attn",
-    ".mlp.",
-    ".fc1",
-    ".fc2",
-    ".q_proj",
-    ".k_proj",
-    ".v_proj",
-    ".out_proj",
-    ".bn",
-    ".norm",
-    ".dropout",
-    ".activation",
-    ".cv1",
-    ".cv2",
-)
 
 
 @dataclass(frozen=True)
@@ -725,26 +709,6 @@ def _split_choices(boundaries: list[str]) -> list[SplitChoice]:
             )
         choices.append(SplitChoice(bucket=SPLIT_BUCKET_BY_BOUNDARY[boundary], boundary=boundary))
     return choices
-
-
-def _is_stable_split_id(split_id: str) -> bool:
-    return not any(fragment in str(split_id) for fragment in UNSTABLE_SPLIT_ID_FRAGMENTS)
-
-
-def _module_level_boundary_for_split_id(split_id: str) -> str | None:
-    text = str(split_id)
-    for pattern in (
-        r"^(after:.*?\.encoder\.layer\.\d+)(?:\.|$)",
-        r"^(after:.*?\.decoder\.layers\.\d+)(?:\.|$)",
-        r"^(after:.*?\.projector\.stages\.\d+)(?:\.|$)",
-        r"^(after:.*?\.layer\.\d+)(?:\.|$)",
-        r"^(after:.*?\.layers\.\d+)(?:\.|$)",
-        r"^(after:.*?\.stages\.\d+)(?:\.|$)",
-    ):
-        match = re.match(pattern, text)
-        if match:
-            return match.group(1)
-    return text if _is_stable_split_id(text) else None
 
 
 def _runtime_boundary_for_choice(choice: SplitChoice) -> str:
@@ -1464,7 +1428,20 @@ def _build_runtime_for_boundary(
     )
     _log_cuda_sdp_flags("CUDA SDPA backend flags before Ariadne runtime construction")
     started = time.perf_counter()
-    runtime = build_split_runtime(split_model, example_batch, config)
+    if str(boundary).startswith("after:"):
+        runtime = prepare_exact_split_runtime(
+            split_model,
+            example_batch,
+            make_split_spec(
+                config.boundary,
+                dynamic_batch=config.dynamic_batch,
+                trainable=config.trainable,
+                trace_batch_mode="batch_gt1",
+            ),
+            mode=config.mode,
+        )
+    else:
+        runtime = build_split_runtime(split_model, example_batch, config)
     if warmup:
         maybe_warmup_runtime(runtime, example_batch)
     return runtime, float(time.perf_counter() - started)
@@ -1487,17 +1464,15 @@ def _build_runtime_for_choice(
     )
     split_id = _require_runtime_split_id(runtime)
     logger.info(
-        "Selected percent boundary {} -> runtime boundary {} -> exact Ariadne "
-        "split_id {} stable_boundary_passed={}",
+        "Selected percent boundary {} -> runtime boundary {} -> Ariadne split_id {}",
         choice.boundary,
         runtime_boundary,
         split_id,
-        _is_stable_split_id(split_id),
     )
     return runtime, elapsed
 
 
-def _resolve_stable_split_choices(
+def _resolve_exact_split_choices(
     *,
     split_model: torch.nn.Module,
     example_batch: torch.Tensor,
@@ -1516,54 +1491,16 @@ def _resolve_stable_split_choices(
         probe_split_id = _require_runtime_split_id(probe_runtime)
         del probe_runtime
         _clear_cuda_cache()
-        stable_boundary = probe_split_id
-        stable_passed = _is_stable_split_id(probe_split_id)
-        if not stable_passed:
-            stable_boundary = _module_level_boundary_for_split_id(probe_split_id)
-            if stable_boundary is None:
-                raise RuntimeError(
-                    "Ariadne percent boundary resolved to an unstable training split "
-                    f"with no module-level fallback: percent={choice.boundary!r}, "
-                    f"split_id={probe_split_id!r}."
-                )
-            logger.info(
-                "Percent boundary {} initially resolved to unstable split_id {}; "
-                "trying stable module-level boundary {}.",
-                choice.boundary,
-                probe_split_id,
-                stable_boundary,
-            )
-            stable_runtime, _stable_elapsed = _build_runtime_for_boundary(
-                split_model=split_model,
-                example_batch=example_batch,
-                boundary=stable_boundary,
-                args=args,
-                warmup=False,
-            )
-            stable_split_id = _require_runtime_split_id(stable_runtime)
-            del stable_runtime
-            _clear_cuda_cache()
-            stable_passed = _is_stable_split_id(stable_split_id)
-            if not stable_passed:
-                raise RuntimeError(
-                    "Ariadne stable boundary fallback still resolved to an unstable "
-                    "training split: "
-                    f"percent={choice.boundary!r}, requested={stable_boundary!r}, "
-                    f"split_id={stable_split_id!r}."
-                )
-            stable_boundary = stable_split_id
         logger.info(
-            "Selected percent boundary {} -> exact Ariadne split_id {} "
-            "stable_boundary_passed={}",
+            "Selected percent boundary {} -> exact Ariadne split_id {}",
             choice.boundary,
-            stable_boundary,
-            stable_passed,
+            probe_split_id,
         )
         resolved.append(
             SplitChoice(
                 bucket=choice.bucket,
                 boundary=choice.boundary,
-                resolved_boundary=stable_boundary,
+                resolved_boundary=probe_split_id,
             )
         )
     return resolved
@@ -2465,7 +2402,7 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         trace_batch_size=2,
     )
-    choices = _resolve_stable_split_choices(
+    choices = _resolve_exact_split_choices(
         split_model=split_model,
         example_batch=example_batch,
         choices=choices,

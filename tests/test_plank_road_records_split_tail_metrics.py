@@ -172,7 +172,7 @@ def test_student_inferencer_binds_fixed_split_plan_from_planner(tmp_path: Path, 
     plan = SplitPlan(
         split_config_id="plan-1",
         model_name="dummy",
-        candidate_id="candidate-1",
+        candidate_id="after:node_1",
         split_index=1,
         split_label="boundary",
         boundary_tensor_labels=["boundary"],
@@ -228,7 +228,7 @@ def test_student_inferencer_binds_fixed_split_plan_from_planner(tmp_path: Path, 
 
     assert selected is plan
     assert inferencer.fixed_split_plan is plan
-    assert splitter.candidate_ids == ["candidate-1"]
+    assert splitter.candidate_ids == ["after:node_1"]
     assert calls["constraints"] == inferencer.fixed_split_constraints
     assert calls["kwargs"]["splitter"] is splitter
     assert calls["kwargs"]["cache_path"] == str(tmp_path / "fixed_split_plan.json")
@@ -242,7 +242,7 @@ def test_plank_road_initializes_fixed_split_once_per_edge():
     plan = SplitPlan(
         split_config_id="plan-1",
         model_name="dummy",
-        candidate_id="candidate-1",
+        candidate_id="after:node_1",
         split_index=1,
         split_label="boundary",
         boundary_tensor_labels=["boundary"],
@@ -283,7 +283,7 @@ def test_real_trainer_reuses_fixed_split_plan_for_tail_training(tmp_path: Path, 
     plan = SplitPlan(
         split_config_id="plan-1",
         model_name="dummy",
-        candidate_id="candidate-1",
+        candidate_id="after:node_1",
         split_index=1,
         split_label="boundary",
         boundary_tensor_labels=["boundary"],
@@ -329,7 +329,7 @@ def test_real_trainer_reuses_fixed_split_plan_for_tail_training(tmp_path: Path, 
     splitter = trainer._trace_splitter(trainer.model, torch.zeros(1, 1))
 
     assert splitter is fake_splitter
-    assert applied["candidate_id"] == "candidate-1"
+    assert applied["candidate_id"] == "after:node_1"
     assert applied["trace_kwargs"]["model_name"] == "Linear"
 
 
