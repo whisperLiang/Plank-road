@@ -495,7 +495,6 @@ def _fallback_candidate_pool(
     constraints: SplitConstraints,
 ) -> list[SplitCandidate]:
     expected = (
-        int(constraints.max_candidates),
         int(constraints.max_boundary_count),
         int(constraints.max_payload_bytes),
     )
@@ -507,7 +506,6 @@ def _fallback_candidate_pool(
     ) and hasattr(runtime, "enumerate_candidates"):
         enumerated = list(
             runtime.enumerate_candidates(
-                max_candidates=constraints.max_candidates,
                 max_boundary_count=constraints.max_boundary_count,
                 max_payload_bytes=constraints.max_payload_bytes,
             )

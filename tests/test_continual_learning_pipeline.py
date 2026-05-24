@@ -166,7 +166,7 @@ def test_fixed_split_is_computed_once_and_reused(tmp_path, monkeypatch):
 
 
 def test_fixed_split_validates_only_lowest_payload_group_until_success():
-    constraints = SplitConstraints()
+    constraints = SplitConstraints(max_candidates=1)
 
     def _candidate(
         candidate_id: str, *, edge_nodes: list[str], payload_bytes: int, layer_index: int
@@ -233,7 +233,6 @@ def test_fixed_split_validates_only_lowest_payload_group_until_success():
             self.model = object()
             self.candidates = candidates
             self._candidate_enumeration_config = (
-                constraints.max_candidates,
                 constraints.max_boundary_count,
                 constraints.max_payload_bytes,
             )
@@ -314,7 +313,6 @@ def test_fixed_split_selects_operation_node_candidates():
             self.model = object()
             self.candidates = candidates
             self._candidate_enumeration_config = (
-                constraints.max_candidates,
                 constraints.max_boundary_count,
                 constraints.max_payload_bytes,
             )
@@ -347,6 +345,99 @@ def test_fixed_split_selects_operation_node_candidates():
     assert plan.edge_split_id == "after:node_1"
     assert plan.split_granularity == "operation"
     assert runtime.validation_calls == ["after:node_1"]
+
+
+def test_fixed_split_filters_all_candidates_before_selection():
+    constraints = SplitConstraints(
+        privacy_leakage_upper_bound=0.15,
+        max_layer_freezing_ratio=0.75,
+        validate_candidates=False,
+        max_candidates=1,
+    )
+
+    def _candidate(
+        candidate_id: str,
+        *,
+        payload_bytes: int,
+        edge_parameter_count: int,
+        edge_parameter_ratio: float,
+    ) -> SplitCandidate:
+        return SplitCandidate(
+            candidate_id=candidate_id,
+            edge_nodes=["n1"],
+            cloud_nodes=["n2"],
+            boundary_edges=[],
+            boundary_tensor_labels=["n1"],
+            edge_input_labels=[],
+            cloud_input_labels=[],
+            cloud_output_labels=["n2"],
+            estimated_edge_flops=1.0,
+            estimated_cloud_flops=1.0,
+            estimated_payload_bytes=payload_bytes,
+            estimated_privacy_risk=0.0,
+            estimated_latency=float(payload_bytes),
+            is_trainable_tail=True,
+            legacy_layer_index=payload_bytes,
+            boundary_count=1,
+            edge_parameter_count=edge_parameter_count,
+            total_parameter_count=100,
+            edge_parameter_ratio=edge_parameter_ratio,
+        )
+
+    candidates = [
+        _candidate(
+            "after:node_0",
+            payload_bytes=1,
+            edge_parameter_count=0,
+            edge_parameter_ratio=0.0,
+        ),
+        _candidate(
+            "after:node_1",
+            payload_bytes=2,
+            edge_parameter_count=80,
+            edge_parameter_ratio=0.8,
+        ),
+        _candidate(
+            "after:node_2",
+            payload_bytes=3,
+            edge_parameter_count=50,
+            edge_parameter_ratio=0.5,
+        ),
+    ]
+
+    class DummyRuntime:
+        def __init__(self):
+            self.graph = "sig"
+            self.runtime = object()
+            self.model = object()
+            self.candidates = []
+            self.enumerate_kwargs = None
+            self.selected = None
+
+        def enumerate_candidates(self, **kwargs):
+            self.enumerate_kwargs = kwargs
+            return candidates
+
+        def split(self, *, candidate=None, **kwargs):
+            assert not kwargs
+            self.selected = candidate
+            return candidate
+
+    runtime = DummyRuntime()
+    plan = compute_fixed_split_for_model(
+        torch.nn.Linear(1, 1),
+        constraints,
+        sample_input=[torch.rand(1)],
+        splitter=runtime,
+        model_name="dummy-model",
+    )
+
+    assert runtime.enumerate_kwargs == {
+        "max_boundary_count": constraints.max_boundary_count,
+        "max_payload_bytes": constraints.max_payload_bytes,
+    }
+    assert plan.candidate_id == "after:node_2"
+    assert runtime.selected is candidates[2]
 
 
 def test_fixed_split_failure_reports_untrainable_replay_candidates():
@@ -386,7 +477,6 @@ def test_fixed_split_failure_reports_untrainable_replay_candidates():
             self.model = object()
             self.candidates = candidates
             self._candidate_enumeration_config = (
-                constraints.max_candidates,
                 constraints.max_boundary_count,
                 constraints.max_payload_bytes,
             )
@@ -585,7 +675,6 @@ def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_availabl
             self.model = object()
             self.candidates = candidates
             self._candidate_enumeration_config = (
-                constraints.max_candidates,
                 constraints.max_boundary_count,
                 constraints.max_payload_bytes,
             )
