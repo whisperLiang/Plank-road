@@ -969,6 +969,51 @@ def test_split_retrain_uses_cached_boundary_batch_size_as_execution_unit(tmp_pat
     assert splitter.seen == [(2, [1, 2]), (2, [3, 3])]
 
 
+def test_split_retrain_surfaces_dynamic_suffix_template_failures(tmp_path):
+    cache_path = str(tmp_path / "cache")
+    for index in range(4):
+        payload = boundary_payload_from_tensors(
+            {"node_1": torch.tensor([[float(index + 1)]])},
+            split_id="after:node_1",
+            graph_signature="graph-sig",
+        )
+        save_split_feature_cache(cache_path, f"s{index}", payload)
+
+    class DummySplitter:
+        def __init__(self):
+            self.batch_range = (2, 64)
+            self.calls = []
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
+            del optimizer
+            self.calls.append((int(boundary.batch_size), [target["label"] for target in targets]))
+            if int(boundary.batch_size) > 2:
+                raise ValueError("zip() argument 2 is shorter than argument 1")
+            outputs = boundary.tensors["node_1"] * self.weight
+            loss = loss_fn(outputs, targets)
+            loss.backward()
+            return loss.detach(), {}
+
+    splitter = DummySplitter()
+    optimizer = torch.optim.SGD([splitter.weight], lr=0.1)
+    with pytest.raises(ValueError, match="zip\\(\\) argument 2 is shorter"):
+        universal_split_retrain(
+            model=torch.nn.Linear(1, 1),
+            sample_input=torch.ones(1, 1),
+            cache_path=cache_path,
+            all_indices=[f"s{index}" for index in range(4)],
+            gt_annotations={f"s{index}": {"label": index} for index in range(4)},
+            loss_fn=lambda outputs, targets: outputs.mean(),
+            splitter=splitter,
+            batch_size=4,
+            optimizer=optimizer,
+        )
+
+    assert splitter.calls == [(4, [0, 1, 2, 3])]
+    assert splitter.weight.item() == pytest.approx(1.0)
+
+
 def test_cached_boundary_can_be_moved_to_runtime_device_contract():
     from ariadne.runtime.boundary import BoundaryTensorSpec
     from model_management import universal_model_split as split_module
@@ -1000,6 +1045,33 @@ def test_cached_boundary_can_be_moved_to_runtime_device_contract():
     assert moved.tensors["node_1"].device.type == "meta"
     assert moved.passthrough_inputs["input"].device.type == "meta"
     assert payload.tensors["node_1"].device.type == "cpu"
+
+
+def test_cached_boundary_is_made_contiguous_before_suffix_replay():
+    from model_management import universal_model_split as split_module
+
+    feature = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4).transpose(1, 2)
+    passthrough = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
+    assert not feature.is_contiguous()
+    assert not passthrough.is_contiguous()
+    payload = boundary_payload_from_tensors(
+        {"node_1": feature},
+        split_id="after:node_1",
+        graph_signature="graph-sig",
+        passthrough_inputs={"input": passthrough},
+    )
+    runtime = SimpleNamespace(
+        suffix_segment=torch.nn.Linear(1, 1),
+        variants=(),
+    )
+
+    moved = split_module._move_boundary_to_runtime_device(runtime, payload)
+
+    assert moved is not payload
+    assert moved.tensors["node_1"].is_contiguous()
+    assert moved.passthrough_inputs["input"].is_contiguous()
+    assert moved.tensors["node_1"].tolist() == feature.tolist()
+    assert moved.passthrough_inputs["input"].tolist() == passthrough.tolist()
 
 
 def test_split_retrain_uses_preloaded_sixteen_record_suffix_batch(
@@ -2689,6 +2761,9 @@ def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
         "split_plan": {
             "split_label": "after:model.backbone.0.encoder.encoder.embeddings.patch_embeddings.projection",
             "trace_signature": "edge-trace",
+            "trace_batch_mode": "batch_1",
+            "trace_batch_size": 1,
+            "dynamic_batch": [1, 64],
         },
         "input_tensor_shape": [1, 3, 384, 384],
         "input_resize_mode": "direct_resize",
@@ -2702,6 +2777,38 @@ def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
     )
 
     assert key.mode == "debug_interpreter"
+    assert key.trace_batch_size == 2
+    assert key.validated_batch_max == 16
+    assert key.runtime_batch_validation_signature
+    assert key.dynamic_batch == (2, 64)
+
+
+def test_rfdetr_fixed_split_runtime_batch_size_uses_target_steps(tmp_path):
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            continual_learning=SimpleNamespace(
+                batch_size=32,
+                trace_batch_size=2,
+                rfdetr_fixed_split_target_steps_per_round=4,
+                yolo_fixed_split_target_steps_per_round=4,
+            ),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+
+    assert learner._resolve_fixed_split_runtime_batch_size(
+        "rfdetr_nano",
+        num_train_samples=80,
+    ) == 20
+    assert learner._resolve_fixed_split_runtime_batch_size(
+        "yolov8n",
+        num_train_samples=80,
+    ) == 20
 
 
 def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batch(
@@ -2723,7 +2830,12 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     captured = {"trace_batch_sizes": []}
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "0"},
-        "split_plan": {"split_label": "after:node_1"},
+        "split_plan": {
+            "split_label": "after:node_1",
+            "trace_batch_mode": "batch_1",
+            "trace_batch_size": 1,
+            "dynamic_batch": [1, 64],
+        },
         "input_tensor_shape": [1, 3, 4, 4],
         "input_resize_mode": "direct_resize",
         "samples": [{"sample_id": "s1", "input_tensor_shape": [1, 3, 4, 4]}],
@@ -2743,6 +2855,8 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     ):
         captured["trace_sample_shape"] = tuple(sample_input.shape)
         captured["split_boundary"] = split_spec.boundary
+        captured["trace_batch_mode"] = split_spec.trace_batch_mode
+        captured["dynamic_batch"] = tuple(split_spec.dynamic_batch)
         captured["model_name"] = model_name
         captured["preferred_mode"] = preferred_mode
         return SimpleNamespace(graph_signature="runtime-sig", split_id=split_spec.boundary), preferred_mode
@@ -2756,6 +2870,11 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         learner,
         "_prepare_replayable_split_runtime",
         fake_prepare_replayable_split_runtime,
+    )
+    monkeypatch.setattr(
+        learner,
+        "_validate_dynamic_batch_trainability",
+        lambda *args, **kwargs: [2, 4, 16],
     )
     class FakeVerifier:
         def __init__(self, *args, **kwargs):
@@ -2785,6 +2904,8 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     assert captured["trace_batch_sizes"] == [2]
     assert captured["trace_sample_shape"][0] == 2
     assert captured["split_boundary"] == "after:node_1"
+    assert captured["trace_batch_mode"] == "batch_gt1"
+    assert captured["dynamic_batch"] == (2, 64)
     assert captured["model_name"] == "rfdetr_nano"
     assert captured["preferred_mode"] == "debug_interpreter"
     assert template.mode == "debug_interpreter"

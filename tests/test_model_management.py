@@ -59,6 +59,7 @@ from model_management.split_model_adapters import (
     _build_anchor_training_target,
     _build_rfdetr_training_labels,
     _build_ultralytics_training_batch,
+    _extract_rfdetr_outputs,
     _map_wrapper_labels,
     RFDETRReplay,
     build_split_runtime_sample_input,
@@ -1049,6 +1050,42 @@ class TestModelZoo:
         assert tuple(samples.mask.shape) == (15, 384, 384)
         assert bool(samples.mask.any()) is False
         assert tuple(outputs["pred_logits"].shape) == (15, 2, 91)
+
+    def test_rfdetr_replay_packs_aux_outputs_as_tensor_tree(self):
+        class FakeCoreModel:
+            def __call__(self, samples):
+                batch = int(samples.tensors.shape[0])
+                return {
+                    "pred_logits": torch.zeros((batch, 2, 9), dtype=torch.float32),
+                    "pred_boxes": torch.zeros((batch, 2, 4), dtype=torch.float32),
+                    "aux_outputs": [
+                        {
+                            "pred_logits": torch.ones((batch, 2, 9), dtype=torch.float32),
+                            "pred_boxes": torch.ones((batch, 2, 4), dtype=torch.float32),
+                        },
+                        {
+                            "pred_logits": torch.full((batch, 2, 9), 2.0),
+                            "pred_boxes": torch.full((batch, 2, 4), 2.0),
+                        },
+                    ],
+                }
+
+        detector = SimpleNamespace(
+            rfdetr=SimpleNamespace(
+                model=SimpleNamespace(
+                    model=FakeCoreModel(),
+                )
+            )
+        )
+
+        replay = RFDETRReplay(detector)
+        outputs = replay(torch.randn(3, 3, 384, 384))
+
+        assert isinstance(outputs["aux_outputs"], dict)
+        assert tuple(outputs["aux_outputs"]["pred_logits"].shape) == (2, 3, 2, 9)
+        extracted = _extract_rfdetr_outputs(outputs)
+        assert isinstance(extracted["aux_outputs"], list)
+        assert tuple(extracted["aux_outputs"][0]["pred_logits"].shape) == (3, 2, 9)
 
     def test_build_tinynext_detector_unwraps_nested_full_detector_checkpoint(self, monkeypatch, tmp_path):
         import model_management.model_zoo as model_zoo_module

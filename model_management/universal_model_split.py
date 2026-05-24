@@ -51,7 +51,8 @@ def _runtime_args(sample_input: Any) -> tuple[Any, ...]:
 
 def _move_boundary_value_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, torch.Tensor):
-        return value.to(device)
+        moved = value.to(device)
+        return moved if moved.is_contiguous() else moved.contiguous()
     if isinstance(value, Mapping):
         return {
             key: _move_boundary_value_to_device(item, device)
@@ -66,7 +67,7 @@ def _move_boundary_value_to_device(value: Any, device: torch.device) -> Any:
 
 def _boundary_values_on_device(value: Any, device: torch.device) -> bool:
     if isinstance(value, torch.Tensor):
-        return value.device == device
+        return value.device == device and value.is_contiguous()
     if isinstance(value, Mapping):
         return all(_boundary_values_on_device(item, device) for item in value.values())
     if isinstance(value, (list, tuple)):

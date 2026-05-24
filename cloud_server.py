@@ -306,6 +306,93 @@ def _fixed_split_trace_batch_size_from_plan(
         return max(1, int(default))
 
 
+def _cloud_fixed_split_dynamic_batch(
+    split_plan: Mapping[str, object],
+    *,
+    model_family: str | None,
+) -> tuple[int, int] | None:
+    dynamic_batch = _fixed_split_dynamic_batch_from_plan(
+        split_plan,
+        _FIXED_SPLIT_DYNAMIC_BATCH,
+    )
+    if str(model_family or "").lower() != "rfdetr" or dynamic_batch is None:
+        return dynamic_batch
+    lower, upper = dynamic_batch
+    lower = max(_FIXED_SPLIT_DYNAMIC_BATCH_MIN, int(lower))
+    return lower, max(lower, int(upper))
+
+
+def _cloud_fixed_split_trace_batch_mode(
+    split_plan: Mapping[str, object],
+    *,
+    model_family: str | None,
+) -> str:
+    if str(model_family or "").lower() == "rfdetr":
+        return "batch_gt1"
+    return _fixed_split_trace_batch_mode_from_plan(split_plan)
+
+
+def _cloud_fixed_split_trace_batch_size(
+    split_plan: Mapping[str, object],
+    *,
+    model_family: str | None,
+    default: int,
+) -> int:
+    if str(model_family or "").lower() == "rfdetr":
+        return max(_FIXED_SPLIT_DYNAMIC_BATCH_MIN, int(default))
+    return _fixed_split_trace_batch_size_from_plan(split_plan, default)
+
+
+def _fixed_split_validation_batches(
+    *,
+    model_family: str | None,
+    trace_batch_size: int,
+    runtime_batch_size: int | None,
+    dynamic_batch: tuple[int, int] | None,
+) -> list[int]:
+    if str(model_family or "").lower() != "rfdetr":
+        return []
+    lower, upper = dynamic_batch or _FIXED_SPLIT_DYNAMIC_BATCH
+    max_batch = min(
+        int(upper),
+        max(int(trace_batch_size), 4, int(runtime_batch_size or trace_batch_size)),
+    )
+    candidates = [int(trace_batch_size), 4, max_batch]
+    if int(lower) <= 1:
+        candidates.insert(0, 1)
+    return sorted({batch for batch in candidates if int(lower) <= batch <= int(upper)})
+
+
+def _fixed_split_runtime_validation_signature(
+    *,
+    model_family: str | None,
+    batch_sizes: list[int],
+) -> str | None:
+    if not batch_sizes:
+        return None
+    return _json_fingerprint(
+        {
+            "kind": "fixed-split-train-smoke",
+            "version": 1,
+            "model_family": str(model_family or ""),
+            "batch_sizes": [int(batch_size) for batch_size in batch_sizes],
+        }
+    )
+
+
+def _iter_tensors(value: object):
+    if isinstance(value, torch.Tensor):
+        yield value
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_tensors(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_tensors(item)
+
+
 def _working_cache_manifest_path(working_cache: str) -> str:
     return os.path.join(working_cache, "cache_manifest.json")
 
@@ -4582,14 +4669,24 @@ class CloudContinualLearner:
         image_size = trace_image_size or (640, 640)
         boundary = _fixed_split_boundary_from_plan(split_plan)
         model_family = model_zoo.get_model_family(str(model_name))
-        dynamic_batch = _fixed_split_dynamic_batch_from_plan(
+        dynamic_batch = _cloud_fixed_split_dynamic_batch(
             split_plan,
-            _FIXED_SPLIT_DYNAMIC_BATCH,
+            model_family=model_family,
         )
-        trace_batch_mode = _fixed_split_trace_batch_mode_from_plan(split_plan)
-        trace_batch_size = _fixed_split_trace_batch_size_from_plan(
+        trace_batch_mode = _cloud_fixed_split_trace_batch_mode(
             split_plan,
-            self.trace_batch_size,
+            model_family=model_family,
+        )
+        trace_batch_size = _cloud_fixed_split_trace_batch_size(
+            split_plan,
+            model_family=model_family,
+            default=self.trace_batch_size,
+        )
+        validation_batches = _fixed_split_validation_batches(
+            model_family=model_family,
+            trace_batch_size=trace_batch_size,
+            runtime_batch_size=runtime_batch_size,
+            dynamic_batch=dynamic_batch,
         )
         split_spec = make_split_spec(
             boundary,
@@ -4609,6 +4706,11 @@ class CloudContinualLearner:
             graph_signature=str(split_plan.get("trace_signature") or "") or None,
             split_plan_hash=_json_fingerprint(split_plan),
             trace_batch_size=trace_batch_size,
+            validated_batch_max=max(validation_batches) if validation_batches else None,
+            runtime_batch_validation_signature=_fixed_split_runtime_validation_signature(
+                model_family=model_family,
+                batch_sizes=validation_batches,
+            ),
             mode=self._preferred_fixed_split_runtime_mode(model_family),
         )
 
@@ -4759,6 +4861,84 @@ class CloudContinualLearner:
             f"({error_summary})."
         )
 
+    @staticmethod
+    def _batch_polymorphic_smoke_loss(outputs: object, _targets: object) -> torch.Tensor:
+        terms: list[torch.Tensor] = []
+        for tensor in _iter_tensors(outputs):
+            if (
+                isinstance(tensor, torch.Tensor)
+                and tensor.is_floating_point()
+                and tensor.requires_grad
+                and tensor.numel() > 0
+            ):
+                terms.append(tensor.reshape(-1).mean())
+        if not terms:
+            raise RuntimeError(
+                "Batch-polymorphic split validation could not find a differentiable "
+                "floating output tensor."
+            )
+        total = terms[0]
+        for term in terms[1:]:
+            total = total + term
+        return total
+
+    def _validate_dynamic_batch_trainability(
+        self,
+        runtime,
+        model: torch.nn.Module,
+        manifest: dict[str, object],
+        *,
+        bundle_root: str,
+        model_family: str | None,
+        trace_batch_size: int,
+        runtime_batch_size: int | None,
+        dynamic_batch: tuple[int, int] | None,
+    ) -> list[int]:
+        batch_sizes = _fixed_split_validation_batches(
+            model_family=model_family,
+            trace_batch_size=trace_batch_size,
+            runtime_batch_size=runtime_batch_size,
+            dynamic_batch=dynamic_batch,
+        )
+        if not batch_sizes:
+            return []
+        suffix_segment = getattr(runtime, "suffix_segment", None)
+        if isinstance(suffix_segment, torch.nn.Module):
+            suffix_segment.train()
+
+        for batch_size in batch_sizes:
+            sample_input = self._build_bundle_batch_trace_sample_input(
+                model,
+                bundle_root,
+                manifest,
+                runtime_batch_size=batch_size,
+            )
+            try:
+                boundary_payload = runtime.run_prefix(
+                    *self._runtime_example_args(sample_input)
+                )
+                runtime.train_suffix(
+                    boundary_payload,
+                    None,
+                    loss_fn=self._batch_polymorphic_smoke_loss,
+                    optimizer=None,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Ariadne fixed split runtime failed dynamic-batch trainability "
+                    f"validation (model_family={model_family}, split_id={getattr(runtime, 'split_id', None)}, "
+                    f"batch_size={batch_size}, trace_batch_size={trace_batch_size}): {exc}"
+                ) from exc
+            if isinstance(suffix_segment, torch.nn.Module):
+                suffix_segment.zero_grad(set_to_none=True)
+        logger.info(
+            "[FixedSplitCL] dynamic-batch trainability validation passed "
+            "(split_id={}, batches={}).",
+            getattr(runtime, "split_id", None),
+            batch_sizes,
+        )
+        return batch_sizes
+
     def _build_fixed_split_runtime_template(
         self,
         model: torch.nn.Module,
@@ -4772,10 +4952,13 @@ class CloudContinualLearner:
         split_plan_payload = dict(manifest.get("split_plan", {}))
         split_model = get_split_runtime_model(model)
         sample_input = trace_sample_input
+        model_name = self._resolve_fixed_split_model_name(manifest)
+        model_family = model_zoo.get_model_family(model_name)
         if sample_input is None:
-            trace_batch_size = _fixed_split_trace_batch_size_from_plan(
+            trace_batch_size = _cloud_fixed_split_trace_batch_size(
                 split_plan_payload,
-                self.trace_batch_size,
+                model_family=model_family,
+                default=self.trace_batch_size,
             )
             sample_input = self._build_bundle_batch_trace_sample_input(
                 model,
@@ -4783,14 +4966,21 @@ class CloudContinualLearner:
                 manifest,
                 runtime_batch_size=trace_batch_size,
             )
+        else:
+            trace_batch_size = _cloud_fixed_split_trace_batch_size(
+                split_plan_payload,
+                model_family=model_family,
+                default=self.trace_batch_size,
+            )
         boundary = _fixed_split_boundary_from_plan(split_plan_payload)
-        model_name = self._resolve_fixed_split_model_name(manifest)
-        model_family = model_zoo.get_model_family(model_name)
-        dynamic_batch = _fixed_split_dynamic_batch_from_plan(
+        dynamic_batch = _cloud_fixed_split_dynamic_batch(
             split_plan_payload,
-            _FIXED_SPLIT_DYNAMIC_BATCH,
+            model_family=model_family,
         )
-        trace_batch_mode = _fixed_split_trace_batch_mode_from_plan(split_plan_payload)
+        trace_batch_mode = _cloud_fixed_split_trace_batch_mode(
+            split_plan_payload,
+            model_family=model_family,
+        )
         split_spec = make_split_spec(
             boundary,
             dynamic_batch=dynamic_batch,
@@ -4805,6 +4995,16 @@ class CloudContinualLearner:
             split_spec,
             model_name=model_name,
             preferred_mode=self._preferred_fixed_split_runtime_mode(model_family),
+        )
+        self._validate_dynamic_batch_trainability(
+            runtime,
+            model,
+            manifest,
+            bundle_root=bundle_root,
+            model_family=model_family,
+            trace_batch_size=trace_batch_size,
+            runtime_batch_size=runtime_batch_size,
+            dynamic_batch=dynamic_batch,
         )
         self._log_stage_elapsed("Ariadne prepare_split", time.perf_counter() - trace_started)
         trace_signature = str(getattr(runtime, "graph_signature", "") or "")

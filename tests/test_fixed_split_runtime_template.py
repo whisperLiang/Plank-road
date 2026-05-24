@@ -87,6 +87,32 @@ def test_fixed_split_template_key_can_include_trace_batch_size():
     assert key_b4.as_dict()["trace_batch_size"] == 4
 
 
+def test_fixed_split_template_key_can_include_batch_validation_scope():
+    spec = make_split_spec("auto", model_family="rfdetr")
+    key_b16 = fixed_split_runtime_template_key(
+        model_name="toy",
+        model_family="rfdetr",
+        split_spec=spec,
+        example_inputs=torch.randn(2, 3, 8, 8),
+        trace_batch_size=2,
+        validated_batch_max=16,
+        runtime_batch_validation_signature="sig-16",
+    )
+    key_b32 = fixed_split_runtime_template_key(
+        model_name="toy",
+        model_family="rfdetr",
+        split_spec=spec,
+        example_inputs=torch.randn(2, 3, 8, 8),
+        trace_batch_size=2,
+        validated_batch_max=32,
+        runtime_batch_validation_signature="sig-32",
+    )
+
+    assert key_b16 != key_b32
+    assert key_b16.as_dict()["validated_batch_max"] == 16
+    assert key_b16.as_dict()["runtime_batch_validation_signature"] == "sig-16"
+
+
 def test_runtime_template_cache_shares_inflight_builds():
     cache = FixedSplitRuntimeTemplateCache()
     key = ("toy", "inflight")

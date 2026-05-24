@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from dataclasses import fields, is_dataclass
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any, Mapping
 
 import cv2
@@ -125,6 +125,7 @@ class RFDETRReplay(torch.nn.Module):
         super().__init__()
         self.detector = detector
         self.model = detector.rfdetr.model.model
+        _patch_rfdetr_decoder_batch_polymorphism(self.model)
 
     @staticmethod
     def _normalize_images(images: torch.Tensor | Any) -> torch.Tensor | Any:
@@ -140,20 +141,117 @@ class RFDETRReplay(torch.nn.Module):
         outputs = self.model(self._normalize_images(images))
         if isinstance(outputs, tuple):
             return {
-                "pred_logits": outputs[1],
-                "pred_boxes": outputs[0],
+                "pred_logits": _contiguous_tensor_tree(outputs[1]),
+                "pred_boxes": _contiguous_tensor_tree(outputs[0]),
             }
         replayed = {
-            "pred_logits": outputs["pred_logits"],
-            "pred_boxes": outputs["pred_boxes"],
+            "pred_logits": _contiguous_tensor_tree(outputs["pred_logits"]),
+            "pred_boxes": _contiguous_tensor_tree(outputs["pred_boxes"]),
         }
         aux_outputs = outputs.get("aux_outputs")
         enc_outputs = outputs.get("enc_outputs")
-        if isinstance(aux_outputs, list):
-            replayed["aux_outputs"] = aux_outputs
+        if isinstance(aux_outputs, (list, tuple, dict)):
+            replayed["aux_outputs"] = _pack_rfdetr_aux_outputs(aux_outputs)
         if isinstance(enc_outputs, dict):
-            replayed["enc_outputs"] = enc_outputs
+            replayed["enc_outputs"] = _contiguous_tensor_tree(enc_outputs)
         return replayed
+
+
+def _patch_rfdetr_decoder_batch_polymorphism(model: torch.nn.Module) -> None:
+    """Replace RF-DETR's training-only split(bs) path with tensor reshapes.
+
+    The upstream decoder rebuilds grouped queries via ``tgt2.split(bs, dim=0)``.
+    Ariadne traces that list length from the canonical batch and then rejects
+    larger batches. The equivalent reshape keeps the same tensor math while
+    avoiding a Python list whose length depends on batch size.
+    """
+
+    if not isinstance(model, torch.nn.Module):
+        return
+    for module in model.modules():
+        if getattr(module, "_plank_batch_polymorphic_rfdetr", False):
+            continue
+        if not _looks_like_rfdetr_decoder_layer(module):
+            continue
+        module.forward_post = MethodType(_rfdetr_decoder_forward_post_polymorphic, module)
+        module._plank_batch_polymorphic_rfdetr = True
+
+
+def _looks_like_rfdetr_decoder_layer(module: torch.nn.Module) -> bool:
+    return (
+        hasattr(module, "self_attn")
+        and hasattr(module, "cross_attn")
+        and hasattr(module, "linear1")
+        and hasattr(module, "linear2")
+        and hasattr(module, "norm1")
+        and hasattr(module, "norm2")
+        and hasattr(module, "norm3")
+        and int(getattr(module, "group_detr", 1) or 1) > 1
+    )
+
+
+def _rfdetr_decoder_forward_post_polymorphic(
+    self,
+    tgt,
+    memory,
+    tgt_mask=None,
+    memory_mask=None,
+    tgt_key_padding_mask=None,
+    memory_key_padding_mask=None,
+    pos=None,
+    query_pos=None,
+    query_sine_embed=None,
+    is_first=False,
+    reference_points=None,
+    spatial_shapes=None,
+    level_start_index=None,
+    spatial_shapes_hw=None,
+):
+    del memory_mask, query_sine_embed, is_first
+    _batch_size, num_queries, _ = tgt.shape
+
+    q = k = tgt + query_pos
+    v = tgt
+    group_queries = num_queries // int(self.group_detr)
+    if self.training:
+        q = torch.cat(q.split(group_queries, dim=1), dim=0)
+        k = torch.cat(k.split(group_queries, dim=1), dim=0)
+        v = torch.cat(v.split(group_queries, dim=1), dim=0)
+
+    tgt2 = self.self_attn(
+        q,
+        k,
+        v,
+        attn_mask=tgt_mask,
+        key_padding_mask=tgt_key_padding_mask,
+        need_weights=False,
+    )[0]
+
+    if self.training:
+        feature_dim = tgt2.shape[-1]
+        tgt2 = (
+            tgt2.reshape(int(self.group_detr), -1, group_queries, feature_dim)
+            .transpose(0, 1)
+            .reshape(-1, num_queries, feature_dim)
+        )
+
+    tgt = tgt + self.dropout1(tgt2)
+    tgt = self.norm1(tgt)
+    tgt2 = self.cross_attn(
+        self.with_pos_embed(tgt, query_pos),
+        reference_points,
+        memory,
+        spatial_shapes,
+        level_start_index,
+        memory_key_padding_mask,
+        input_spatial_shapes_hw=spatial_shapes_hw,
+    )
+    tgt = tgt + self.dropout2(tgt2)
+    tgt = self.norm2(tgt)
+    tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+    tgt = tgt + self.dropout3(tgt2)
+    tgt = self.norm3(tgt)
+    return tgt
 
 
 def _is_anchor_detector(model: torch.nn.Module) -> bool:
@@ -1483,19 +1581,80 @@ def _extract_rfdetr_outputs(outputs: Any) -> dict[str, Any]:
         pred_boxes = outputs.get("pred_boxes")
         if isinstance(logits, torch.Tensor) and isinstance(pred_boxes, torch.Tensor):
             extracted = {
-                "pred_logits": logits,
-                "pred_boxes": pred_boxes,
+                "pred_logits": _contiguous_tensor_tree(logits),
+                "pred_boxes": _contiguous_tensor_tree(pred_boxes),
             }
-            if isinstance(outputs.get("aux_outputs"), list):
-                extracted["aux_outputs"] = outputs["aux_outputs"]
+            if isinstance(outputs.get("aux_outputs"), (list, tuple, dict)):
+                extracted["aux_outputs"] = _unpack_rfdetr_aux_outputs(
+                    outputs["aux_outputs"]
+                )
             if isinstance(outputs.get("enc_outputs"), dict):
-                extracted["enc_outputs"] = outputs["enc_outputs"]
+                extracted["enc_outputs"] = _contiguous_tensor_tree(outputs["enc_outputs"])
             return extracted
     logits, pred_boxes = _extract_detr_outputs(outputs)
     return {
-        "pred_logits": logits,
-        "pred_boxes": pred_boxes,
+        "pred_logits": _contiguous_tensor_tree(logits),
+        "pred_boxes": _contiguous_tensor_tree(pred_boxes),
     }
+
+
+def _pack_rfdetr_aux_outputs(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _contiguous_tensor_tree(value)
+    if not isinstance(value, (list, tuple)):
+        return _contiguous_tensor_tree(value)
+    if not value:
+        return {}
+    if not all(isinstance(item, Mapping) for item in value):
+        return _contiguous_tensor_tree(value)
+    keys = sorted(
+        set.intersection(
+            *[
+                {str(key) for key, item in dict(layer).items() if isinstance(item, torch.Tensor)}
+                for layer in value
+            ]
+        )
+    )
+    packed: dict[str, torch.Tensor] = {}
+    for key in keys:
+        tensors = [dict(layer)[key] for layer in value]
+        if not all(
+            isinstance(tensor, torch.Tensor) and tuple(tensor.shape) == tuple(tensors[0].shape)
+            for tensor in tensors
+        ):
+            continue
+        packed[key] = torch.stack(
+            [
+                tensor if tensor.is_contiguous() else tensor.contiguous()
+                for tensor in tensors
+            ],
+            dim=0,
+        )
+    return packed if packed else _contiguous_tensor_tree(value)
+
+
+def _unpack_rfdetr_aux_outputs(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return _contiguous_tensor_tree(list(value))
+    if not isinstance(value, dict):
+        return _contiguous_tensor_tree(value)
+    tensor_items = {
+        str(key): tensor
+        for key, tensor in value.items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    if not tensor_items:
+        return _contiguous_tensor_tree(value)
+    layer_count = min(int(tensor.shape[0]) for tensor in tensor_items.values())
+    if layer_count <= 0:
+        return []
+    return [
+        {
+            key: _contiguous_tensor_tree(tensor[layer_index])
+            for key, tensor in tensor_items.items()
+        }
+        for layer_index in range(layer_count)
+    ]
 
 
 def _extract_anchor_detector_outputs(outputs: Any) -> dict[str, torch.Tensor]:
@@ -1555,6 +1714,21 @@ def _iter_tensors(value: Any):
     if is_dataclass(value) and not isinstance(value, type):
         for field_info in fields(value):
             yield from _iter_tensors(getattr(value, field_info.name))
+
+
+def _contiguous_tensor_tree(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value if value.is_contiguous() else value.contiguous()
+    if isinstance(value, dict):
+        return {
+            key: _contiguous_tensor_tree(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_contiguous_tensor_tree(item) for item in value)
+    if isinstance(value, list):
+        return [_contiguous_tensor_tree(item) for item in value]
+    return value
 
 
 def _first_tensor_device(value: Any, *, fallback: torch.device) -> torch.device:

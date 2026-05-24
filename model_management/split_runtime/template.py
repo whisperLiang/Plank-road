@@ -12,19 +12,27 @@ from loguru import logger
 from .ariadne_runtime import SplitRuntime, SplitSpec
 from .runtime_cache import RuntimeCacheKey, make_runtime_cache_key
 
-FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 2
+FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 3
 
 
 @dataclass(frozen=True)
 class FixedSplitRuntimeTemplateKey(RuntimeCacheKey):
     version: int = FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION
     trace_batch_size: int | None = None
+    validated_batch_max: int | None = None
+    runtime_batch_validation_signature: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         payload = super().as_dict()
         payload["version"] = int(self.version)
         if self.trace_batch_size is not None:
             payload["trace_batch_size"] = int(self.trace_batch_size)
+        if self.validated_batch_max is not None:
+            payload["validated_batch_max"] = int(self.validated_batch_max)
+        if self.runtime_batch_validation_signature:
+            payload["runtime_batch_validation_signature"] = (
+                self.runtime_batch_validation_signature
+            )
         return payload
 
 
@@ -37,6 +45,8 @@ def fixed_split_runtime_template_key(
     graph_signature: str | None = None,
     split_plan_hash: str | None = None,
     trace_batch_size: int | None = None,
+    validated_batch_max: int | None = None,
+    runtime_batch_validation_signature: str | None = None,
     mode: str = "generated_eager",
 ) -> FixedSplitRuntimeTemplateKey:
     key = make_runtime_cache_key(
@@ -51,6 +61,10 @@ def fixed_split_runtime_template_key(
     return FixedSplitRuntimeTemplateKey(
         **key.__dict__,
         trace_batch_size=None if trace_batch_size is None else int(trace_batch_size),
+        validated_batch_max=(
+            None if validated_batch_max is None else int(validated_batch_max)
+        ),
+        runtime_batch_validation_signature=runtime_batch_validation_signature,
     )
 
 
