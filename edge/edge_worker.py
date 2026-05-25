@@ -419,6 +419,8 @@ class EdgeWorker:
                 "Fixed split startup prepared Ariadne runtime (trace_time={:.3f}s)",
                 time.perf_counter() - trace_started,
             )
+            plan_started = time.perf_counter()
+            logger.info("Loading or computing fixed split plan.")
             self.fixed_split_plan = load_or_compute_fixed_split_plan(
                 split_model,
                 constraints,
@@ -434,8 +436,13 @@ class EdgeWorker:
                 ),
                 front_version=str(getattr(self, "front_version", "0") or "0"),
             )
+            logger.info(
+                "Fixed split plan load/compute completed (elapsed={:.3f}s).",
+                time.perf_counter() - plan_started,
+            )
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
+            logger.info("Warming up fixed split runtime.")
             self._warmup_fixed_split_runtime(sample_input)
             logger.info(
                 "Fixed split plan ready (split_config_id={}, {}, image_size={})",

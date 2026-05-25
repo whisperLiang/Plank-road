@@ -591,17 +591,41 @@ class UniversalModelSplitter:
             trace_batch_mode=trace_batch_mode,
             model_family=model_family,
         )
+        prepare_started = time.perf_counter()
+        logger.info(
+            "[FixedSplit] Preparing Ariadne split runtime "
+            "(model_name={}, batch_size={}, dynamic_batch={}, mode={}).",
+            model_name or type(model).__name__,
+            trace_batch_size,
+            dynamic_batch,
+            mode,
+        )
         self.runtime = prepare_split_runtime(
             model,
             sample_input,
             self.split_spec,
             mode=mode,
         )
+        logger.info(
+            "[FixedSplit] Ariadne prepare_split_runtime completed in {:.3f}s "
+            "(split_id={}).",
+            time.perf_counter() - prepare_started,
+            getattr(self.runtime, "split_id", None),
+        )
+        replay_started = time.perf_counter()
+        logger.info("[FixedSplit] Validating Ariadne split replay.")
         self._last_replay_validation = _runtime_replay_report(
             self.runtime,
             model,
             sample_input,
             require_trainable=bool(self.split_spec.trainable),
+        )
+        logger.info(
+            "[FixedSplit] Ariadne split replay validation completed in {:.3f}s "
+            "(success={}, error={}).",
+            time.perf_counter() - replay_started,
+            self._last_replay_validation.get("success"),
+            self._last_replay_validation.get("error"),
         )
         self.graph = str(getattr(self.runtime, "graph_signature", ""))
         self.current_candidate = _candidate_from_runtime(self.runtime, self.split_spec)
