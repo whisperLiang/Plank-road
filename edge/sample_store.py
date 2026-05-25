@@ -102,6 +102,14 @@ def _detach_boundary_payload(payload: BoundaryPayload) -> BoundaryPayload:
         requires_grad=dict(getattr(payload, "requires_grad", {}) or {}),
         weight_version=getattr(payload, "weight_version", None),
         passthrough_inputs=passthrough_inputs,
+        supports_prefix_backward=bool(getattr(payload, "supports_prefix_backward", False)),
+        prefix_backward_owner_id=getattr(payload, "prefix_backward_owner_id", None),
+        protocol_version=getattr(payload, "protocol_version", 2),
+        values=tuple(
+            _detach_cpu_value(value)
+            for value in tuple(getattr(payload, "values", ()) or ())
+        ),
+        value_schema=tuple(getattr(payload, "value_schema", ()) or ()),
     )
 
 

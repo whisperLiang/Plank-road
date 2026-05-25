@@ -89,16 +89,16 @@ wheels = [
 
 [[package]]
 name = "ariadne-split"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "torch" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8b/8a/b3386cf1629ea9ff176ccdbc952e40f0a9914e417dc6cce55fdc9818c7f7/ariadne_split-0.1.1.tar.gz", hash = "sha256:76e957687268dee1b1f67ca693418d67eb6f097aabfe13d30f7e99e4165dd6a2", size = 247763, upload-time = "2026-05-09T14:04:42.693Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/77/88/66b2ad2b50db386b3168e2fd3a1176b7da3a51e9608e604975e75d6757bb/ariadne_split-0.1.2.tar.gz", hash = "sha256:fc89855020d012c281ebbd408a5e9c3f4b60b9948377a350602679628b8c5d04", size = 264562, upload-time = "2026-05-25T13:03:02.77Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/a6/9401899665612c86eb3425120444de2dd62f80079a2eb63a24bd1912851c/ariadne_split-0.1.1-py3-none-any.whl", hash = "sha256:3b04386b9d720d3eccef8b7c84bfe096439355fc31b2fdfde1f0ed31a3b1af92", size = 60545, upload-time = "2026-05-09T14:04:41.04Z" },
+    { url = "https://files.pythonhosted.org/packages/55/4a/d36499de1e087cca0b972f20f170f71c7af5e158d398877214990e03ca37/ariadne_split-0.1.2-py3-none-any.whl", hash = "sha256:a552dc0792c35c14d249b2e9dee7227dc3e10472fdc375284f9c1871954f2c47", size = 73300, upload-time = "2026-05-25T13:03:00.139Z" },
 ]
 
 [[package]]
@@ -1870,7 +1870,7 @@ integration = [
 [package.metadata]
 requires-dist = [
     { name = "apscheduler" },
-    { name = "ariadne-split", specifier = "==0.1.1" },
+    { name = "ariadne-split", specifier = "==0.1.2" },
     { name = "grpcio", specifier = "==1.78.1" },
     { name = "grpcio-tools", specifier = "==1.78.1" },
     { name = "huggingface-hub", specifier = "==1.5.0" },

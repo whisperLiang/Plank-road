@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
   "APScheduler",
-  "ariadne-split==0.1.1",
+  "ariadne-split==0.1.2",
   "grpcio-tools==1.78.1",
   "grpcio==1.78.1",
   "huggingface_hub==1.5.0",

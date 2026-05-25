@@ -21,6 +21,8 @@ from model_management.payload import (
 )
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_runtime import (
+    BOUNDARY_CACHE_PROTOCOL,
+    BoundaryPayloadCacheCodec,
     compare_outputs,
     make_split_spec,
     prepare_split_runtime,
@@ -1029,9 +1031,15 @@ def save_split_feature_cache(
     intermediate: BoundaryPayload,
     **record_fields: Any,
 ) -> dict[str, Any]:
+    if not isinstance(intermediate, BoundaryPayload):
+        raise TypeError(
+            "New split feature cache writes require an Ariadne BoundaryPayload; "
+            f"got {type(intermediate).__name__}."
+        )
     os.makedirs(os.path.join(cache_path, "features"), exist_ok=True)
     extra_metadata = dict(record_fields.pop("extra_metadata", {}) or {})
     record = {
+        "cache_protocol": BOUNDARY_CACHE_PROTOCOL,
         "intermediate": intermediate,
         "candidate_id": getattr(intermediate, "candidate_id", None)
         or getattr(intermediate, "split_id", None),
@@ -1063,8 +1071,21 @@ def load_split_feature_cache(cache_path: str, frame_index: Any) -> dict[str, Any
     except gzip.BadGzipFile:
         record = torch.load(path, map_location="cpu", weights_only=False)
         
+    if isinstance(record, BoundaryPayload):
+        return {
+            "cache_protocol": BOUNDARY_CACHE_PROTOCOL,
+            "intermediate": record,
+            "candidate_id": getattr(record, "split_id", None),
+            "boundary_tensor_labels": list(getattr(record, "tensors", {}) or {}),
+            "split_label": getattr(record, "split_id", None),
+        }
     if not isinstance(record, dict):
         raise TypeError(f"Unsupported split feature cache record: {type(record)!r}")
+    if record.get("cache_protocol") == BOUNDARY_CACHE_PROTOCOL and not isinstance(
+        record.get("intermediate"),
+        BoundaryPayload,
+    ):
+        raise TypeError("Ariadne boundary v2 cache record is missing a BoundaryPayload.")
     return record
 
 
@@ -1417,39 +1438,12 @@ def slice_boundary_payload_batch(
 ) -> BoundaryPayload:
     start = max(0, int(start))
     length = max(1, int(length))
-    payload_batch_size = int(getattr(payload, "batch_size", 0) or 0)
-    sliced_tensors: dict[str, torch.Tensor] = {}
-    for label, tensor in dict(payload.tensors or {}).items():
-        if tensor.ndim == 0:
-            sliced_tensors[str(label)] = tensor
-            continue
-        batch_dim = _boundary_payload_tensor_batch_dim(payload, str(label), tensor)
-        if batch_dim >= tensor.ndim:
-            raise RuntimeError(
-                f"Cannot slice boundary tensor {label!r} with shape {tuple(tensor.shape)}."
-            )
-        if start + length > int(tensor.shape[batch_dim]):
-            raise RuntimeError(
-                f"Cannot slice boundary tensor {label!r} at batch range "
-                f"[{start}, {start + length}) from shape {tuple(tensor.shape)}."
-            )
-        sliced_tensors[str(label)] = tensor.narrow(batch_dim, start, length)
-    passthrough_inputs = _slice_boundary_passthrough_value(
-        dict(getattr(payload, "passthrough_inputs", {}) or {}),
-        payload_batch_size=payload_batch_size,
-        start=start,
-        length=length,
-    )
-    return boundary_payload_from_tensors(
-        sliced_tensors,
-        split_id=str(payload.split_id),
-        graph_signature=str(payload.graph_signature),
-        batch_size=length,
-        schema=getattr(payload, "schema", None),
-        requires_grad=getattr(payload, "requires_grad", None),
-        weight_version=getattr(payload, "weight_version", None),
-        passthrough_inputs=passthrough_inputs,
-    )
+    codec = BoundaryPayloadCacheCodec(None)
+    samples = codec.split_batch(payload, actual_batch_size=start + length)
+    selected = samples[start : start + length]
+    if len(selected) == 1:
+        return selected[0]
+    return codec.collate(selected)
 
 
 def _record_runtime_signature(record: Mapping[str, Any]) -> tuple[tuple[int, ...], str]:
@@ -1518,7 +1512,9 @@ def _build_boundary_batch_from_records(
         raise RuntimeError("Cannot build an empty split-tail feature batch.")
     first_payload = _cached_boundary_payload(records[0])
     first_payload_batch_size = _cached_boundary_batch_size(records[0])
+    codec = BoundaryPayloadCacheCodec(runtime)
     if len(records) == 1 and first_payload is not None and first_payload_batch_size is None:
+        codec.validate(first_payload)
         return first_payload
     if first_payload is not None and first_payload_batch_size is not None:
         if len(records) > first_payload_batch_size:
@@ -1526,7 +1522,12 @@ def _build_boundary_batch_from_records(
                 "Cached split-tail boundary batch has fewer rows than requested targets."
             )
         if all(_same_cached_boundary_payload(records[0], record) for record in records[1:]):
+            codec.validate(first_payload)
             return first_payload
+
+    payloads = [_cached_boundary_payload(record) for record in records]
+    if all(payload is not None for payload in payloads):
+        return codec.collate([payload for payload in payloads if payload is not None])
 
     tensor_groups = [_feature_tensors_from_record(record) for record in records]
     labels = list(tensor_groups[0].keys())
@@ -1565,10 +1566,7 @@ def _build_boundary_batch_from_records(
         pieces = []
         for passthrough in passthrough_groups:
             value = passthrough.get(key)
-            if not isinstance(value, torch.Tensor):
-                pieces = []
-                break
-            if value.ndim == 0 or int(value.shape[0]) != 1:
+            if not isinstance(value, torch.Tensor) or value.ndim == 0:
                 pieces = []
                 break
             pieces.append(value)

@@ -4,6 +4,7 @@ import gzip
 import io
 from collections import OrderedDict
 from collections.abc import Mapping
+from dataclasses import fields
 from typing import Any
 
 import torch
@@ -11,7 +12,23 @@ from ariadne import BoundaryPayload
 from ariadne.runtime.boundary import BoundaryTensorSpec
 
 
+def _boundary_payload_field_names() -> set[str]:
+    try:
+        return {field.name for field in fields(BoundaryPayload)}
+    except TypeError:
+        return set(getattr(BoundaryPayload, "__annotations__", {}) or {})
+
+
+def _make_boundary_payload(**kwargs: Any) -> BoundaryPayload:
+    fields = _boundary_payload_field_names()
+    if fields:
+        kwargs = {key: value for key, value in kwargs.items() if key in fields}
+    return BoundaryPayload(**kwargs)
+
+
 def _schema_for_tensors(tensors: Mapping[str, torch.Tensor]) -> dict[str, BoundaryTensorSpec]:
+    """Legacy-only schema inference for pre-Ariadne-v2 tensor caches."""
+
     schema: dict[str, BoundaryTensorSpec] = {}
     for label, tensor in tensors.items():
         symbolic_shape: tuple[Any, ...]
@@ -39,7 +56,20 @@ def boundary_payload_from_tensors(
     requires_grad: Mapping[str, bool] | None = None,
     weight_version: int | None = None,
     passthrough_inputs: Mapping[str, Any] | None = None,
+    supports_prefix_backward: bool = False,
+    prefix_backward_owner_id: str | None = None,
+    protocol_version: int | None = 2,
+    values: tuple[Any, ...] | None = None,
+    value_schema: tuple[Any, ...] | None = None,
+    legacy_schema_inference: bool = True,
 ) -> BoundaryPayload:
+    """Build a BoundaryPayload from tensors.
+
+    ``legacy_schema_inference`` exists only for old tensor-only caches and tests.
+    Fixed-split Ariadne paths must provide the runtime schema instead of letting
+    this helper infer ``("B", *shape[1:])`` from concrete tensor shapes.
+    """
+
     ordered = {str(label): tensor for label, tensor in tensors.items()}
     if batch_size is None:
         batch_size = 1
@@ -47,7 +77,12 @@ def boundary_payload_from_tensors(
             if tensor.ndim > 0:
                 batch_size = int(tensor.shape[0])
                 break
-    return BoundaryPayload(
+    if schema is None and not legacy_schema_inference:
+        raise RuntimeError(
+            "BoundaryPayload schema is required for Ariadne fixed-split cache paths; "
+            "shape-based schema inference is legacy-only."
+        )
+    return _make_boundary_payload(
         split_id=str(split_id),
         graph_signature=str(graph_signature),
         batch_size=int(batch_size),
@@ -60,6 +95,11 @@ def boundary_payload_from_tensors(
         ),
         weight_version=weight_version,
         passthrough_inputs=dict(passthrough_inputs or {}),
+        supports_prefix_backward=bool(supports_prefix_backward),
+        prefix_backward_owner_id=prefix_backward_owner_id,
+        protocol_version=2 if protocol_version is None else int(protocol_version),
+        values=tuple(values or ()),
+        value_schema=tuple(value_schema or ()),
     )
 
 
@@ -75,6 +115,11 @@ def serialize_boundary_payload(payload: BoundaryPayload, *, compress: bool = Fal
             "requires_grad": payload.requires_grad,
             "weight_version": payload.weight_version,
             "passthrough_inputs": payload.passthrough_inputs,
+            "supports_prefix_backward": getattr(payload, "supports_prefix_backward", False),
+            "prefix_backward_owner_id": getattr(payload, "prefix_backward_owner_id", None),
+            "protocol_version": getattr(payload, "protocol_version", 2),
+            "values": tuple(getattr(payload, "values", ()) or ()),
+            "value_schema": tuple(getattr(payload, "value_schema", ()) or ()),
         },
         buffer,
     )
@@ -90,7 +135,7 @@ def deserialize_boundary_payload(data: bytes, *, compressed: bool = False) -> Bo
     if not isinstance(payload, Mapping):
         raise TypeError(f"Unsupported boundary payload transport type: {type(payload)!r}")
     if "schema" in payload and "requires_grad" in payload:
-        return BoundaryPayload(
+        return _make_boundary_payload(
             split_id=str(payload["split_id"]),
             graph_signature=str(payload["graph_signature"]),
             batch_size=int(payload["batch_size"]),
@@ -99,6 +144,11 @@ def deserialize_boundary_payload(data: bytes, *, compressed: bool = False) -> Bo
             requires_grad=dict(payload["requires_grad"]),
             weight_version=payload.get("weight_version"),
             passthrough_inputs=dict(payload.get("passthrough_inputs", {})),
+            supports_prefix_backward=bool(payload.get("supports_prefix_backward", False)),
+            prefix_backward_owner_id=payload.get("prefix_backward_owner_id"),
+            protocol_version=int(payload.get("protocol_version", 2)),
+            values=tuple(payload.get("values", ()) or ()),
+            value_schema=tuple(payload.get("value_schema", ()) or ()),
         )
     return SplitPayload(
         tensors=OrderedDict(payload.get("tensors", OrderedDict())),
@@ -131,6 +181,9 @@ class SplitPayload(BoundaryPayload):
         requires_grad: Mapping[str, bool] | None = None,
         weight_version: int | None = None,
         passthrough_inputs: Mapping[str, Any] | None = None,
+        protocol_version: int | None = 2,
+        values: tuple[Any, ...] | None = None,
+        value_schema: tuple[Any, ...] | None = None,
     ) -> None:
         ordered = OrderedDict((str(label), tensor) for label, tensor in dict(tensors or {}).items())
         labels = list(boundary_tensor_labels or ordered.keys())
@@ -159,17 +212,11 @@ class SplitPayload(BoundaryPayload):
             requires_grad=requires_grad,
             weight_version=weight_version,
             passthrough_inputs=passthrough,
+            protocol_version=protocol_version,
+            values=values,
+            value_schema=value_schema,
         )
-        for field_name in (
-            "split_id",
-            "graph_signature",
-            "batch_size",
-            "tensors",
-            "schema",
-            "requires_grad",
-            "weight_version",
-            "passthrough_inputs",
-        ):
+        for field_name in _boundary_payload_field_names():
             object.__setattr__(self, field_name, getattr(payload, field_name))
 
     @property
@@ -221,8 +268,13 @@ class SplitPayload(BoundaryPayload):
             split_id=self.split_id,
             graph_signature=self.graph_signature,
             batch_size=self.batch_size,
+            schema=getattr(self, "schema", None),
+            requires_grad=getattr(self, "requires_grad", None),
             weight_version=self.weight_version,
             passthrough_inputs=self.passthrough_inputs,
+            protocol_version=getattr(self, "protocol_version", 2),
+            values=tuple(getattr(self, "values", ()) or ()),
+            value_schema=tuple(getattr(self, "value_schema", ()) or ()),
         )
 
     def cpu(self) -> "SplitPayload":
@@ -246,8 +298,13 @@ class SplitPayload(BoundaryPayload):
             split_id=self.split_id,
             graph_signature=self.graph_signature,
             batch_size=self.batch_size,
+            schema=getattr(self, "schema", None),
+            requires_grad=getattr(self, "requires_grad", None),
             weight_version=self.weight_version,
             passthrough_inputs=self.passthrough_inputs,
+            protocol_version=getattr(self, "protocol_version", 2),
+            values=tuple(getattr(self, "values", ()) or ()),
+            value_schema=tuple(getattr(self, "value_schema", ()) or ()),
         )
 
     def serialize(self, *, compress: bool = False) -> bytes:

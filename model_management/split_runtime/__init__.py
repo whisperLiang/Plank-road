@@ -20,6 +20,7 @@ from .ariadne_runtime import (
     prepare_split_replay_runtime,
     prepare_split_runtime,
 )
+from .boundary_cache import BOUNDARY_CACHE_PROTOCOL, BoundaryPayloadCacheCodec
 from .detection_adapters import (
     DetectionSplitAdapter,
     PlankDetectionSplitAdapter,
@@ -111,7 +112,9 @@ __all__ = [
     "ARIADNE_RUNTIME_ADAPTER_VERSION",
     "BatchPrefixError",
     "BatchSuffixReplayError",
+    "BOUNDARY_CACHE_PROTOCOL",
     "BoundaryPayload",
+    "BoundaryPayloadCacheCodec",
     "DetectionSplitAdapter",
     "FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION",
     "FixedSplitRuntimeTemplate",

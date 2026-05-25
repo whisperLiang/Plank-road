@@ -183,6 +183,14 @@ def _detach_boundary_payload(payload: BoundaryPayload) -> BoundaryPayload:
         requires_grad=dict(getattr(payload, "requires_grad", {}) or {}),
         weight_version=getattr(payload, "weight_version", None),
         passthrough_inputs=passthrough_inputs,
+        supports_prefix_backward=bool(getattr(payload, "supports_prefix_backward", False)),
+        prefix_backward_owner_id=getattr(payload, "prefix_backward_owner_id", None),
+        protocol_version=getattr(payload, "protocol_version", 2),
+        values=tuple(
+            _detach_cpu_value(value)
+            for value in tuple(getattr(payload, "values", ()) or ())
+        ),
+        value_schema=tuple(getattr(payload, "value_schema", ()) or ()),
     )
 
 
@@ -214,10 +222,11 @@ def _single_sample_feature_tensors(value: object) -> dict[str, torch.Tensor]:
     else:
         tensors = normalise_feature_tensors(value)
     clean: dict[str, torch.Tensor] = {}
+    schema = dict(getattr(boundary_payload, "schema", {}) or {}) if boundary_payload else {}
     for label, tensor in sorted(tensors.items()):
         if not isinstance(tensor, torch.Tensor):
             continue
-        if tensor.ndim == 0 or int(tensor.shape[0]) != 1:
+        if not schema and (tensor.ndim == 0 or int(tensor.shape[0]) != 1):
             raise ValueError(
                 "Canonical sample features must be single-sample tensors with "
                 f"shape [1, ...]; got {label} shape {tuple(tensor.shape)}."
@@ -374,6 +383,11 @@ def _normalise_boundary_payload_for_contract(
         requires_grad=requires_grad or None,
         weight_version=getattr(payload, "weight_version", None),
         passthrough_inputs=dict(getattr(payload, "passthrough_inputs", {}) or {}),
+        supports_prefix_backward=bool(getattr(payload, "supports_prefix_backward", False)),
+        prefix_backward_owner_id=getattr(payload, "prefix_backward_owner_id", None),
+        protocol_version=getattr(payload, "protocol_version", 2),
+        values=tuple(getattr(payload, "values", ()) or ()),
+        value_schema=tuple(getattr(payload, "value_schema", ()) or ()),
     )
 
 

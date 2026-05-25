@@ -78,7 +78,11 @@ from model_management.fixed_split_runtime_template import (
     fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
 )
-from model_management.split_runtime import compare_outputs, make_split_spec
+from model_management.split_runtime import (
+    BoundaryPayloadCacheCodec,
+    compare_outputs,
+    make_split_spec,
+)
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_contract import (
     SplitRuntimeContract,
@@ -1528,17 +1532,25 @@ def _proxy_boundary_batch(
     *,
     splitter: UniversalModelSplitter,
 ) -> BoundaryPayload:
+    if not records:
+        raise RuntimeError("Cannot build an empty cached split proxy batch.")
+    payloads = [
+        record.get("intermediate")
+        for record in records
+        if isinstance(record.get("intermediate"), BoundaryPayload)
+    ]
+    if len(payloads) == len(records):
+        return BoundaryPayloadCacheCodec(splitter).collate(
+            [payload for payload in payloads if isinstance(payload, BoundaryPayload)]
+        )
+
     tensor_groups = [_proxy_feature_tensors_from_record(record) for record in records]
     labels = list(tensor_groups[0].keys())
     batched_tensors: dict[str, torch.Tensor] = {}
     for label in labels:
-        pieces = []
+        pieces: list[torch.Tensor] = []
         for tensors in tensor_groups:
             tensor = tensors[label]
-            if tensor.ndim == 0 or int(tensor.shape[0]) != 1:
-                raise RuntimeError(
-                    "Cached split proxy evaluation expects single-sample feature tensors."
-                )
             pieces.append(tensor)
         batched_tensors[label] = torch.cat(pieces, dim=0)
     passthrough_groups: list[Mapping[str, object]] = []
@@ -1553,10 +1565,7 @@ def _proxy_boundary_batch(
         pieces = []
         for passthrough in passthrough_groups:
             value = passthrough.get(key)
-            if not isinstance(value, torch.Tensor):
-                pieces = []
-                break
-            if value.ndim == 0 or int(value.shape[0]) != 1:
+            if not isinstance(value, torch.Tensor) or value.ndim == 0:
                 pieces = []
                 break
             pieces.append(value)
@@ -1569,6 +1578,7 @@ def _proxy_boundary_batch(
         graph_signature=str(getattr(runtime, "graph_signature", "") or "split-runtime"),
         batch_size=len(records),
         passthrough_inputs=batched_passthrough,
+        legacy_schema_inference=True,
     )
 
 
@@ -2620,11 +2630,15 @@ class CloudContinualLearner:
             return None
         if not isinstance(payload, BoundaryPayload):
             return None
-        tensors = {}
-        for label, tensor in dict(payload.tensors or {}).items():
-            if isinstance(tensor, torch.Tensor):
-                tensors[str(label)] = tensor[:1].detach().cpu()
-        return tensors or None
+        sample_payload = BoundaryPayloadCacheCodec(splitter).split_batch(
+            payload,
+            actual_batch_size=1,
+        )[0]
+        return {
+            str(label): tensor.detach().cpu()
+            for label, tensor in dict(sample_payload.tensors or {}).items()
+            if isinstance(tensor, torch.Tensor)
+        } or None
 
     def _load_split_runtime_contract(
         self,
@@ -3086,11 +3100,20 @@ class CloudContinualLearner:
                 )
             )
             try:
-                tensors = self._feature_tensors_from_record(dict(record))
+                boundary_payload = record.get("intermediate")
+                if isinstance(boundary_payload, BoundaryPayload):
+                    tensors = {
+                        str(label): tensor
+                        for label, tensor in dict(boundary_payload.tensors or {}).items()
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                else:
+                    boundary_payload = None
+                    tensors = self._feature_tensors_from_record(dict(record))
                 single_tensors = {
-                    label: tensor[:1].detach().cpu()
+                    label: tensor.detach().cpu()
                     for label, tensor in tensors.items()
-                    if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1
+                    if isinstance(tensor, torch.Tensor)
                 }
                 if not single_tensors:
                     raise ValueError("low-quality record has no feature tensors")
@@ -3106,6 +3129,11 @@ class CloudContinualLearner:
                 {
                     "sample_id": sample_id,
                     "feature": single_tensors,
+                    **(
+                        {"intermediate": boundary_payload}
+                        if isinstance(boundary_payload, BoundaryPayload)
+                        else {}
+                    ),
                     "labels": self._pool_annotations_from_labels(trainable_labels),
                     "sample_source": "low_quality",
                     "label_source": "teacher",
@@ -4568,30 +4596,47 @@ class CloudContinualLearner:
                     "Cloud batch reconstruction expects one sample metadata record per raw path."
                 )
 
-            def _slice_payload_value(value: object, sample_offset: int, batch_size: int):
+            def _detach_payload_value(value: object):
                 if isinstance(value, torch.Tensor):
-                    sliced = value
-                    if value.ndim > 0 and int(value.shape[0]) == batch_size:
-                        sliced = value[sample_offset : sample_offset + 1]
-                    return sliced.detach().cpu()
+                    return value.detach().cpu()
                 if isinstance(value, Mapping):
                     return {
-                        key: _slice_payload_value(item, sample_offset, batch_size)
+                        key: _detach_payload_value(item)
                         for key, item in value.items()
                     }
                 if isinstance(value, tuple):
                     return tuple(
-                        _slice_payload_value(item, sample_offset, batch_size)
+                        _detach_payload_value(item)
                         for item in value
                     )
                 if isinstance(value, list):
                     return [
-                        _slice_payload_value(item, sample_offset, batch_size)
+                        _detach_payload_value(item)
                         for item in value
                     ]
                 return value
 
+            def _detach_payload(payload: BoundaryPayload) -> BoundaryPayload:
+                changes = {
+                    "tensors": {
+                        str(label): tensor.detach().cpu()
+                        for label, tensor in dict(payload.tensors or {}).items()
+                        if isinstance(tensor, torch.Tensor)
+                    },
+                    "passthrough_inputs": {
+                        str(label): _detach_payload_value(value)
+                        for label, value in dict(payload.passthrough_inputs or {}).items()
+                    },
+                }
+                if hasattr(payload, "values"):
+                    changes["values"] = tuple(
+                        _detach_payload_value(value)
+                        for value in tuple(getattr(payload, "values", ()) or ())
+                    )
+                return replace(payload, **changes)
+
             payloads: list[BoundaryPayload] = []
+            codec = BoundaryPayloadCacheCodec(splitter)
             chunk_size = max(
                 1,
                 int(self.batch_size if runtime_batch_size is None else runtime_batch_size),
@@ -4631,28 +4676,13 @@ class CloudContinualLearner:
                         f"batch size (payload_batch={getattr(batch_payload, 'batch_size', None)}, "
                         f"expected={execution_batch_size})."
                     )
-                for sample_offset in range(actual_chunk_size):
-                    sample_tensors = {
-                        str(label): tensor[sample_offset : sample_offset + 1].detach().cpu()
-                        for label, tensor in dict(batch_payload.tensors or {}).items()
-                        if isinstance(tensor, torch.Tensor)
-                    }
-                    sample_passthrough = {
-                        str(label): _slice_payload_value(
-                            value,
-                            sample_offset,
-                            execution_batch_size,
-                        )
-                        for label, value in dict(batch_payload.passthrough_inputs or {}).items()
-                    }
-                    payloads.append(
-                        replace(
-                            batch_payload,
-                            batch_size=1,
-                            tensors=sample_tensors,
-                            passthrough_inputs=sample_passthrough,
-                        )
+                payloads.extend(
+                    _detach_payload(sample_payload)
+                    for sample_payload in codec.split_batch(
+                        batch_payload,
+                        actual_batch_size=actual_chunk_size,
                     )
+                )
             return payloads
 
         return _batch_provider
@@ -6760,13 +6790,14 @@ class CloudContinualLearner:
                             dict(boundary_payload.tensors or {})
                         )
                     else:
+                        boundary_payload = None
                         tensors = normalise_feature_tensors(
                             dict(feature_value.get("tensors") or {})
                         )
                     single_tensors = {
-                        label: tensor[:1].detach().cpu()
+                        label: tensor.detach().cpu()
                         for label, tensor in tensors.items()
-                        if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1
+                        if isinstance(tensor, torch.Tensor)
                     }
                     if not single_tensors:
                         raise ValueError("shard sample contained no tensor features")
