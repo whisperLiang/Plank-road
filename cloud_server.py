@@ -315,15 +315,17 @@ def _cloud_fixed_split_dynamic_batch(
     *,
     model_family: str | None,
 ) -> tuple[int, int] | None:
+    family = str(model_family or "").lower()
+    default = (
+        (1, _FIXED_SPLIT_DYNAMIC_BATCH_MAX)
+        if family == "rfdetr"
+        else _FIXED_SPLIT_DYNAMIC_BATCH
+    )
     dynamic_batch = _fixed_split_dynamic_batch_from_plan(
         split_plan,
-        _FIXED_SPLIT_DYNAMIC_BATCH,
+        default,
     )
-    if str(model_family or "").lower() != "rfdetr" or dynamic_batch is None:
-        return dynamic_batch
-    lower, upper = dynamic_batch
-    lower = max(_FIXED_SPLIT_DYNAMIC_BATCH_MIN, int(lower))
-    return lower, max(lower, int(upper))
+    return dynamic_batch
 
 
 def _cloud_fixed_split_trace_batch_mode(

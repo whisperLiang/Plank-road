@@ -1544,7 +1544,7 @@ def test_split_retrain_rejects_per_sample_cached_boundaries(
         "device-sample": {"intermediate": device_payload},
     }
 
-    with pytest.raises(RuntimeError, match="batched Ariadne prefix execution"):
+    with pytest.raises(RuntimeError, match="different schema"):
         universal_split_retrain(
             model=torch.nn.Module(),
             sample_input=torch.ones(1, 1),
@@ -2812,7 +2812,7 @@ def test_working_cache_manifest_fingerprint_matches_current_bundle():
 
 
 def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
-    from cloud_server import CloudContinualLearner
+    from cloud_server import CloudContinualLearner, _cloud_fixed_split_dynamic_batch
 
     learner = CloudContinualLearner(
         config=SimpleNamespace(
@@ -2847,7 +2847,14 @@ def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
     assert key.trace_batch_size == 2
     assert key.validated_batch_max == 16
     assert key.runtime_batch_validation_signature
-    assert key.dynamic_batch == (2, 64)
+    assert key.dynamic_batch == (1, 64)
+    assert (
+        _cloud_fixed_split_dynamic_batch(
+            manifest["split_plan"],
+            model_family="rfdetr",
+        )
+        == (1, 64)
+    )
 
 
 def test_rfdetr_fixed_split_runtime_batch_size_uses_target_steps(tmp_path):
@@ -2972,7 +2979,7 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     assert captured["trace_sample_shape"][0] == 2
     assert captured["split_boundary"] == "after:node_1"
     assert captured["trace_batch_mode"] == "batch_gt1"
-    assert captured["dynamic_batch"] == (2, 64)
+    assert captured["dynamic_batch"] == (1, 64)
     assert captured["model_name"] == "rfdetr_nano"
     assert captured["preferred_mode"] == "debug_interpreter"
     assert template.mode == "debug_interpreter"
@@ -3061,7 +3068,7 @@ def test_cloud_fixed_split_working_cache_rebuild_with_template_hit_skips_trace_i
     )
     split_spec = make_split_spec(
         "after:node_1",
-        dynamic_batch=(2, 64),
+        dynamic_batch=(1, 64),
         trainable=True,
         trace_batch_mode="batch_gt1",
         model_family="rfdetr",
