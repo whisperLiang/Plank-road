@@ -490,6 +490,22 @@ def _feature_metadata_from_candidate(candidate: Mapping[str, Any]) -> dict[str, 
     }
 
 
+def _has_stale_contract_metadata(
+    candidate: Mapping[str, Any],
+    split_contract: SplitRuntimeContract,
+) -> bool:
+    expected = {
+        "contract_id": split_contract.contract_id,
+        "split_config_id": split_contract.split_config_id,
+        "front_version": split_contract.front_version,
+    }
+    return any(
+        candidate.get(field_name) not in (None, "")
+        and str(candidate[field_name]) != str(expected_value)
+        for field_name, expected_value in expected.items()
+    )
+
+
 @dataclass
 class CanonicalSampleRecord:
     sample_id: str
@@ -925,33 +941,50 @@ class CloudSamplePool:
         )
         return entries
 
-    def load_active_samples_for_rebuild(self) -> list[dict[str, Any]]:
+    def load_active_samples_for_rebuild(
+        self,
+        *,
+        split_contract: SplitRuntimeContract | None = None,
+    ) -> list[dict[str, Any]]:
         samples: list[dict[str, Any]] = []
         for entry in self.list_active_samples():
+            sample = {
+                "sample_id": str(entry.get("sample_id") or ""),
+                "contract_id": entry.get("contract_id"),
+                "split_config_id": entry.get("split_config_id"),
+                "front_version": entry.get("front_version"),
+                "feature_layout_id": entry.get("feature_layout_id"),
+                "sample_source": entry.get("sample_source"),
+                "label_source": entry.get("label_source"),
+                "input_image_size": entry.get("input_image_size"),
+                "input_tensor_shape": entry.get("input_tensor_shape"),
+                "input_resize_mode": entry.get("input_resize_mode"),
+                "created_at": entry.get("created_at"),
+                "quality_score": entry.get("quality_score"),
+                "risk_score": entry.get("risk_score"),
+                "object_count": entry.get("object_count"),
+                "class_counts": entry.get("class_counts"),
+                "in_drift_window": entry.get("in_drift_window"),
+                "window_id": entry.get("window_id"),
+                "__canonical_active": True,
+                "__source_feature_path": self.reader._resolve_entry_path(entry, "feature_shard"),
+                "__source_label_path": self.reader._resolve_entry_path(entry, "label_shard"),
+            }
+            if split_contract is not None and _has_stale_contract_metadata(entry, split_contract):
+                samples.append(sample)
+                continue
             record = self.reader.read(entry)
             feature_record = dict(record.feature_record)
-            samples.append(
+            sample.update(
                 {
                     "sample_id": record.sample_id,
                     "feature_record": feature_record,
                     "feature": feature_record.get("feature"),
                     "labels": record.labels,
                     "contract_id": entry.get("contract_id") or feature_record.get("contract_id"),
-                    "split_config_id": entry.get("split_config_id"),
-                    "front_version": entry.get("front_version"),
-                    "feature_layout_id": entry.get("feature_layout_id"),
-                    "sample_source": entry.get("sample_source"),
-                    "label_source": entry.get("label_source"),
-                    "input_image_size": entry.get("input_image_size"),
-                    "input_tensor_shape": entry.get("input_tensor_shape"),
-                    "input_resize_mode": entry.get("input_resize_mode"),
-                    "created_at": entry.get("created_at"),
-                    "quality_score": entry.get("quality_score"),
-                    "risk_score": entry.get("risk_score"),
-                    "in_drift_window": entry.get("in_drift_window"),
-                    "window_id": entry.get("window_id"),
                 }
             )
+            samples.append(sample)
         return samples
 
     def _candidate_to_canonical_record(
@@ -988,14 +1021,23 @@ class CloudSamplePool:
             raise ValueError("Canonical sample is missing input_tensor_shape.")
         if not input_resize_mode:
             raise ValueError("Canonical sample is missing input_resize_mode.")
-        labels = _labels_with_default_metadata(
-            candidate.get("labels") or {},
-            input_image_size=list(input_image_size),
-            input_tensor_shape=input_tensor_shape,
-            input_resize_mode=input_resize_mode,
-        )
-        class_counts = _class_counts(labels)
-        object_count = _object_count(labels)
+        is_canonical_active = bool(candidate.get("__canonical_active"))
+        if is_canonical_active:
+            labels = dict(candidate.get("labels") or {})
+            class_counts = {
+                str(label): int(count)
+                for label, count in dict(candidate.get("class_counts") or _class_counts(labels)).items()
+            }
+            object_count = int(candidate.get("object_count") or _object_count(labels))
+        else:
+            labels = _labels_with_default_metadata(
+                candidate.get("labels") or {},
+                input_image_size=list(input_image_size),
+                input_tensor_shape=input_tensor_shape,
+                input_resize_mode=input_resize_mode,
+            )
+            class_counts = _class_counts(labels)
+            object_count = _object_count(labels)
         sample_source = str(candidate.get("sample_source") or "high_quality")
         label_source = str(
             candidate.get("label_source")
@@ -1033,7 +1075,21 @@ class CloudSamplePool:
                 if candidate.get("window_id") is None
                 else str(candidate.get("window_id"))
             ),
-            boundary_payload=_boundary_payload_from_candidate(candidate),
+            boundary_payload=(
+                None
+                if is_canonical_active
+                else _boundary_payload_from_candidate(candidate)
+            ),
+            source_feature_path=(
+                str(candidate.get("__source_feature_path"))
+                if is_canonical_active and candidate.get("__source_feature_path")
+                else None
+            ),
+            source_label_path=(
+                str(candidate.get("__source_label_path"))
+                if is_canonical_active and candidate.get("__source_label_path")
+                else None
+            ),
             source_staging_path=(
                 None
                 if candidate.get("__staging_path") is None
@@ -1215,14 +1271,14 @@ class CloudSamplePool:
             stem = _sample_file_stem(record.sample_id)
             feature_relpath = _normalise_relpath(os.path.join("features", f"{stem}.pt"))
             label_relpath = _normalise_relpath(os.path.join("labels", f"{stem}.json"))
-            _atomic_torch_save(
-                record.to_feature_payload(),
-                _resolve_relpath(tmp_dir, feature_relpath),
-            )
-            _atomic_json_dump(
-                _resolve_relpath(tmp_dir, label_relpath),
-                record.to_label_payload(),
-            )
+            feature_path = _resolve_relpath(tmp_dir, feature_relpath)
+            label_path = _resolve_relpath(tmp_dir, label_relpath)
+            if record.source_feature_path and record.source_label_path:
+                shutil.copyfile(record.source_feature_path, feature_path)
+                shutil.copyfile(record.source_label_path, label_path)
+            else:
+                _atomic_torch_save(record.to_feature_payload(), feature_path)
+                _atomic_json_dump(label_path, record.to_label_payload())
             index_records.append(
                 record.to_index_record(
                     feature_relpath=feature_relpath,
@@ -1356,12 +1412,22 @@ class CloudSamplePool:
             invalid_records: list[CanonicalSampleRecord] = []
             consumed_staging_paths: list[str] = []
             all_inputs = (
-                list(existing_active_samples or [])
-                + list(pending_high_quality_samples or [])
-                + list(new_low_quality_samples or [])
+                [("existing_active", candidate) for candidate in list(existing_active_samples or [])]
+                + [
+                    ("pending_high_quality", candidate)
+                    for candidate in list(pending_high_quality_samples or [])
+                ]
+                + [("new_low_quality", candidate) for candidate in list(new_low_quality_samples or [])]
             )
-            for candidate in all_inputs:
+            for input_source, candidate in all_inputs:
                 sample_id = str(candidate.get("sample_id", "") or "")
+                if (
+                    input_source == "existing_active"
+                    and _has_stale_contract_metadata(candidate, split_contract)
+                ):
+                    validation_counts["skipped_stale_contract"] += 1
+                    validation_previews["skipped_stale_contract"].append(sample_id)
+                    continue
                 if candidate.get("__staging_path"):
                     consumed_staging_paths.append(str(candidate.get("__staging_path")))
                 try:
@@ -1369,7 +1435,13 @@ class CloudSamplePool:
                         candidate,
                         split_contract=split_contract,
                     )
-                except Exception:
+                except Exception as exc:
+                    if input_source == "existing_active":
+                        raise RuntimeError(
+                            "Existing active canonical sample "
+                            f"{sample_id!r} is unreadable during rebuild; refusing to "
+                            f"replace the current generation: {exc}"
+                        ) from exc
                     validation_counts["skipped_unreadable"] += 1
                     validation_previews["skipped_unreadable"].append(sample_id)
                     continue

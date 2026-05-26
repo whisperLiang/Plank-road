@@ -7136,7 +7136,9 @@ class CloudContinualLearner:
                 )
                 pending_high_quality = sample_pool.load_pending_high_quality_samples()
                 staging_low_quality = sample_pool.load_staging_low_quality_samples()
-                existing_active = sample_pool.load_active_samples_for_rebuild()
+                existing_active = sample_pool.load_active_samples_for_rebuild(
+                    split_contract=split_contract,
+                )
                 rebuild_stats, kept_records = sample_pool.rebuild_canonical_training_pool(
                     split_contract=split_contract,
                     existing_active_samples=existing_active,

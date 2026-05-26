@@ -218,10 +218,14 @@ def test_canonical_rebuild_accepts_high_quality_with_extra_boundary_tensors(tmp_
     assert set(feature_label.feature_record["feature"]) == {"node_0"}
 
 
-def test_canonical_rebuild_renames_high_quality_boundary_payload_to_contract_layout(tmp_path):
+def test_canonical_rebuild_renames_high_quality_boundary_payload_to_contract_layout(
+    tmp_path,
+    monkeypatch,
+):
     from model_management.payload import boundary_payload_from_tensors
 
-    pool_cls = _load_cloud_sample_pool()
+    sample_pool_module = importlib.import_module("cloud.sample_pool")
+    pool_cls = sample_pool_module.CloudSamplePool
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
     contract = _build_split_contract(runtime_identity={"graph_signature": "runtime-graph"})
     candidate = _high_quality_candidate("hq-renamed", created_at=1.0)
@@ -251,6 +255,33 @@ def test_canonical_rebuild_renames_high_quality_boundary_payload_to_contract_lay
     assert stored_payload.schema["node_0"].label == "node_0"
     assert stored_payload.split_id == contract.cloud_batch_split_id
     assert stored_payload.graph_signature == "runtime-graph"
+
+    original_payload_reader = sample_pool_module._boundary_payload_from_candidate
+
+    def reject_active_payload_recanonicalization(candidate):
+        if candidate.get("__canonical_active"):
+            raise AssertionError("active canonical boundary payload must be carried forward verbatim")
+        return original_payload_reader(candidate)
+
+    monkeypatch.setattr(
+        sample_pool_module,
+        "_boundary_payload_from_candidate",
+        reject_active_payload_recanonicalization,
+    )
+    pool.stage_low_quality_samples([_low_quality_candidate("lq-next", created_at=2.0)])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(),
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert stats["generation_commit"]["active"] == 2
+    assert stats["validation"]["skipped_unreadable"] == 0
+    active_by_id = {entry["sample_id"]: entry for entry in pool.list_active_samples()}
+    carried_payload = pool.reader.read(active_by_id["hq-renamed"]).feature_record["intermediate"]
+    assert carried_payload.graph_signature == "runtime-graph"
+    assert set(carried_payload.tensors) == {"node_0"}
 
 
 def test_canonical_rebuild_rejects_high_quality_missing_contract_tensor(tmp_path):
@@ -299,12 +330,76 @@ def test_canonical_rebuild_replaces_previous_generation_files(tmp_path):
     second_generation_id = pool.current_generation_id()
     assert second_generation_id is not None
     assert second_generation_id != first_generation_id
+    assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"hq-1", "lq-1"}
 
     generations_dir = str(tmp_path / "pool" / "generations")
     import os as _os
 
     generation_names = sorted(_os.listdir(generations_dir))
     assert generation_names == [second_generation_id]
+
+
+def test_canonical_rebuild_preserves_active_generation_if_existing_sample_is_unreadable(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = _build_split_contract()
+
+    pool.store_pending_high_quality_samples([_high_quality_candidate("hq-1", created_at=1.0)])
+    pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+    first_generation_id = pool.current_generation_id()
+    existing = pool.load_active_samples_for_rebuild(split_contract=contract)
+    existing[0]["feature"] = None
+
+    pool.stage_low_quality_samples([_low_quality_candidate("lq-1", created_at=2.0)])
+    with pytest.raises(RuntimeError, match="Existing active canonical sample 'hq-1' is unreadable"):
+        pool.rebuild_canonical_training_pool(
+            split_contract=contract,
+            existing_active_samples=existing,
+            pending_high_quality_samples=[],
+            new_low_quality_samples=pool.load_staging_low_quality_samples(),
+        )
+
+    assert pool.current_generation_id() == first_generation_id
+    assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"hq-1"}
+    assert {entry["sample_id"] for entry in pool.load_staging_low_quality_samples()} == {"lq-1"}
+
+
+def test_canonical_rebuild_discards_unreadable_active_from_stale_contract(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    old_contract = _build_split_contract(runtime_identity={"graph_signature": "old-runtime"})
+    new_contract = _build_split_contract(runtime_identity={"graph_signature": "new-runtime"})
+
+    pool.stage_low_quality_samples([_low_quality_candidate("old-active", created_at=1.0)])
+    pool.rebuild_canonical_training_pool(
+        split_contract=old_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    old_entry = pool.list_active_samples()[0]
+    old_feature_path = pool.reader._resolve_entry_path(old_entry, "feature_shard")
+    with open(old_feature_path, "wb") as handle:
+        handle.write(b"not-a-torch-feature-payload")
+
+    pool.stage_low_quality_samples([_low_quality_candidate("new-active", created_at=2.0)])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=new_contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(
+            split_contract=new_contract,
+        ),
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert stats["validation"]["skipped_stale_contract"] == 1
+    assert stats["validation"]["skipped_unreadable"] == 0
+    assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"new-active"}
 
 
 def test_canonical_rebuild_drops_samples_with_stale_contract(tmp_path):
@@ -344,6 +439,37 @@ def test_canonical_rebuild_enforces_max_samples(tmp_path):
     )
     assert stats["generation_commit"]["active"] == 2
     assert len(pool.list_active_samples()) == 2
+
+
+def test_canonical_rebuild_accumulates_active_samples_until_max_capacity(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=3)
+    contract = _build_split_contract()
+
+    for index in range(3):
+        sample_id = f"lq-{index}"
+        pool.stage_low_quality_samples(
+            [_low_quality_candidate(sample_id, created_at=float(index + 1))]
+        )
+        stats, _kept = pool.rebuild_canonical_training_pool(
+            split_contract=contract,
+            existing_active_samples=pool.load_active_samples_for_rebuild(),
+            pending_high_quality_samples=[],
+            new_low_quality_samples=pool.load_staging_low_quality_samples(),
+        )
+        assert stats["generation_commit"]["active"] == index + 1
+        assert stats["replacement"]["dropped"] == 0
+
+    pool.stage_low_quality_samples([_low_quality_candidate("lq-overflow", created_at=4.0)])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(),
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert stats["generation_commit"]["active"] == 3
+    assert stats["replacement"]["dropped"] == 1
 
 
 def test_canonical_rebuild_prefers_teacher_over_edge_pseudo(tmp_path):
