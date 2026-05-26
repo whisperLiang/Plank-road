@@ -7,22 +7,44 @@ import os
 import tempfile
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 import torch
+from ariadne import SplitRuntime
+from ariadne.codegen.segment_builder import build_segments
+from ariadne.planner.frontier import enumerate_frontier_splits
+from ariadne.trace.tracer import trace_model
 from loguru import logger
 
 from model_management.split_candidate import CandidateProfile, SplitCandidate
+from model_management.split_runtime import make_split_spec
 from model_management.universal_model_split import (
     UniversalModelSplitter,
+    _ariadne_candidate_operation_split_id,
+    _candidate_from_ariadne_candidate,
+    _exact_ariadne_candidate,
     build_candidate_descriptor,
 )
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
 FIXED_SPLIT_PLAN_VERSION = "fixed-split.v5"
+FIXED_SPLIT_DYNAMIC_BATCH_MAX = 64
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
+
+
+@dataclass(frozen=True)
+class _LazyAriadneCandidate:
+    candidate: Any
+    operation_split_id: str
+    payload_bytes: int
+    boundary_count: int
+    legacy_layer_index: int
+    edge_parameter_count: int
+    total_parameter_count: int
+    privacy_leakage: float
+    freezing_ratio: float
 
 
 def estimate_privacy_leakage_from_edge_params(
@@ -440,12 +462,18 @@ def _candidate_split_key(candidate: SplitCandidate) -> str:
 
 
 def _input_tensor_shape_from_sample(sample_input: Any) -> list[int]:
+    def _single_sample_shape(tensor: torch.Tensor) -> list[int]:
+        shape = [int(dim) for dim in tensor.shape]
+        if shape:
+            shape[0] = 1
+        return shape
+
     if isinstance(sample_input, torch.Tensor):
-        return [int(dim) for dim in sample_input.shape]
+        return _single_sample_shape(sample_input)
     if isinstance(sample_input, (list, tuple)):
         for value in sample_input:
             if isinstance(value, torch.Tensor):
-                return [int(dim) for dim in value.shape]
+                return _single_sample_shape(value)
     return []
 
 
@@ -463,6 +491,135 @@ def _first_tensor_batch_size(value: Any) -> int | None:
             if found is not None:
                 return found
     return None
+
+
+def _runtime_args(sample_input: Any) -> tuple[Any, ...]:
+    if isinstance(sample_input, tuple):
+        return sample_input
+    if isinstance(sample_input, list):
+        return tuple(sample_input)
+    return (sample_input,)
+
+
+def _shape_numel(shape: Sequence[int] | Any) -> int:
+    total = 1
+    for dim in shape or ():
+        total *= int(dim)
+    return int(total)
+
+
+def _node_by_name(plan: Any) -> dict[str, Any]:
+    return {str(node.name): node for node in getattr(plan, "nodes", ()) or ()}
+
+
+def _parameter_count_from_nodes(
+    node_lookup: Mapping[str, Any],
+    node_names: Sequence[str] | tuple[str, ...],
+) -> int:
+    seen: set[str] = set()
+    total = 0
+    for node_name in node_names:
+        node = node_lookup.get(str(node_name))
+        if node is None:
+            continue
+        for ref in getattr(node, "param_refs", ()) or ():
+            ref_name = str(getattr(ref, "name", ""))
+            if not ref_name or ref_name in seen:
+                continue
+            seen.add(ref_name)
+            total += _shape_numel(getattr(ref, "shape", ()) or ())
+    return int(total)
+
+
+def _candidate_legacy_index_from_plan(plan: Any, candidate: Any) -> int:
+    indexes: list[int] = []
+    for label in getattr(candidate, "prefix_nodes", ()) or ():
+        try:
+            indexes.append(int(plan.index_of(label)))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+    return max(indexes) if indexes else 10**9
+
+
+def _lazy_candidate_key(item: _LazyAriadneCandidate) -> tuple[int, int, float, int, str]:
+    return (
+        int(item.payload_bytes),
+        int(item.boundary_count),
+        float(item.payload_bytes),
+        int(item.legacy_layer_index),
+        str(item.operation_split_id),
+    )
+
+
+def _lazy_ariadne_candidates(
+    plan: Any,
+    constraints: SplitConstraints,
+) -> tuple[list[_LazyAriadneCandidate], int]:
+    frontier = tuple(enumerate_frontier_splits(plan))
+    if not frontier:
+        return [], 0
+
+    node_lookup = _node_by_name(plan)
+    total_parameter_count = _parameter_count_from_nodes(
+        node_lookup,
+        tuple(str(node.name) for node in getattr(plan, "nodes", ()) or ()),
+    )
+    min_edge_parameters = _privacy_min_edge_parameter_count(constraints)
+    eligible: list[_LazyAriadneCandidate] = []
+    for ariadne_candidate in frontier:
+        if not bool(getattr(ariadne_candidate, "trainable_suffix", True)):
+            continue
+        boundary_nodes = tuple(getattr(ariadne_candidate, "boundary_nodes", ()) or ())
+        if len(boundary_nodes) > int(constraints.max_boundary_count):
+            continue
+        payload_bytes = int(
+            getattr(getattr(ariadne_candidate, "cost", None), "boundary_bytes", 0) or 0
+        )
+        if payload_bytes > int(constraints.max_payload_bytes):
+            continue
+        edge_parameter_count = _parameter_count_from_nodes(
+            node_lookup,
+            tuple(getattr(ariadne_candidate, "prefix_nodes", ()) or ()),
+        )
+        privacy_leakage = estimate_privacy_leakage_from_edge_params(
+            edge_parameter_count,
+            epsilon=constraints.privacy_leakage_epsilon,
+        )
+        if (
+            float(constraints.privacy_leakage_upper_bound) > 0.0
+            and total_parameter_count > 0
+            and edge_parameter_count < min_edge_parameters
+        ):
+            continue
+        if (
+            float(constraints.privacy_leakage_upper_bound) > 0.0
+            and total_parameter_count <= 0
+            and privacy_leakage > float(constraints.privacy_leakage_upper_bound)
+        ):
+            continue
+        freezing_ratio = (
+            float(edge_parameter_count) / float(total_parameter_count)
+            if total_parameter_count > 0
+            else 0.0
+        )
+        if freezing_ratio > float(constraints.max_layer_freezing_ratio):
+            continue
+        eligible.append(
+            _LazyAriadneCandidate(
+                candidate=ariadne_candidate,
+                operation_split_id=_ariadne_candidate_operation_split_id(ariadne_candidate),
+                payload_bytes=payload_bytes,
+                boundary_count=len(boundary_nodes),
+                legacy_layer_index=_candidate_legacy_index_from_plan(plan, ariadne_candidate),
+                edge_parameter_count=edge_parameter_count,
+                total_parameter_count=total_parameter_count,
+                privacy_leakage=privacy_leakage,
+                freezing_ratio=freezing_ratio,
+            )
+        )
+
+    eligible.sort(key=_lazy_candidate_key)
+    return eligible, len(frontier)
 
 
 def _split_spec_payload_value(splitter: UniversalModelSplitter, name: str) -> Any:
@@ -726,6 +883,214 @@ def _profile_from_report(
     )
 
 
+def _lazy_split_spec_for_sample(sample_input: Any):
+    trace_batch_size = _first_tensor_batch_size(sample_input) or 1
+    trace_batch_mode = "batch_gt1" if trace_batch_size > 1 else "batch_1"
+    return make_split_spec(
+        "auto",
+        dynamic_batch=(1, FIXED_SPLIT_DYNAMIC_BATCH_MAX),
+        trainable=True,
+        trace_batch_mode=trace_batch_mode,
+    )
+
+
+def _bind_lazy_ariadne_candidate(
+    runtime: UniversalModelSplitter,
+    *,
+    model: torch.nn.Module,
+    sample_input: Any,
+    split_spec: Any,
+    plan: Any,
+    lazy_candidate: _LazyAriadneCandidate,
+    mode: str = "generated_eager",
+) -> SplitCandidate:
+    exact_spec = replace(split_spec, boundary=lazy_candidate.operation_split_id)
+    exact_candidate = _exact_ariadne_candidate(lazy_candidate.candidate)
+    ariadne_runtime = SplitRuntime(
+        trace_plan=plan,
+        split_spec=exact_spec,
+        candidate=exact_candidate,
+        segments=build_segments(plan, exact_candidate),
+        mode=mode,
+    )
+    runtime.bind_runtime(ariadne_runtime, model=model, split_spec=exact_spec)
+    runtime._trace_sample_input = sample_input
+    candidate = _candidate_from_ariadne_candidate(
+        ariadne_runtime,
+        exact_spec,
+        exact_candidate,
+    )
+    candidate.edge_parameter_count = int(lazy_candidate.edge_parameter_count)
+    candidate.total_parameter_count = int(lazy_candidate.total_parameter_count)
+    candidate.edge_parameter_ratio = float(lazy_candidate.freezing_ratio)
+    candidate.estimated_privacy_risk = float(lazy_candidate.privacy_leakage)
+    runtime.current_candidate = candidate
+    runtime.candidates = [candidate]
+    return candidate
+
+
+def _compute_lazy_fixed_split_for_model(
+    model: torch.nn.Module,
+    constraints: SplitConstraints,
+    *,
+    sample_input: Any,
+    sample_kwargs: Mapping[str, Any] | None,
+    runtime: UniversalModelSplitter,
+    model_name: str | None,
+    input_resize_mode: str,
+    front_version: str,
+) -> SplitPlan:
+    if sample_kwargs:
+        raise RuntimeError("Ariadne fixed split planning expects positional example inputs.")
+
+    runtime.model = model
+    runtime.model_name = model_name
+    split_spec = _lazy_split_spec_for_sample(sample_input)
+    trace_batch_size = _first_tensor_batch_size(sample_input) or 1
+    trace_started = time.perf_counter()
+    logger.info(
+        "[FixedSplit] Lazy Ariadne trace started "
+        "(model_name={}, batch_size={}, dynamic_batch={}, trace_batch_mode={}).",
+        model_name or type(model).__name__,
+        trace_batch_size,
+        split_spec.dynamic_batch,
+        split_spec.trace_batch_mode,
+    )
+    plan = trace_model(
+        model,
+        example_inputs=_runtime_args(sample_input),
+        batch_symbol=split_spec.batch_symbol,
+        dynamic_batch=split_spec.dynamic_batch,
+        trace_batch_mode=split_spec.trace_batch_mode,
+    )
+    trace_elapsed = time.perf_counter() - trace_started
+    runtime.graph = str(getattr(plan, "graph_signature", "") or "")
+    runtime.split_spec = split_spec
+    runtime._trace_sample_input = sample_input
+    logger.info(
+        "[FixedSplit] Lazy Ariadne trace completed in {:.3f}s (graph_signature={}).",
+        trace_elapsed,
+        runtime.graph,
+    )
+
+    select_started = time.perf_counter()
+    eligible, candidate_pool_size = _lazy_ariadne_candidates(plan, constraints)
+    selection_elapsed = time.perf_counter() - select_started
+    if not eligible:
+        if candidate_pool_size:
+            raise RuntimeError(
+                "No split candidate satisfies the fixed split constraints. "
+                f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
+                "privacy_min_edge_parameter_count="
+                f"{_privacy_min_edge_parameter_count(constraints)}, "
+                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
+            )
+        raise RuntimeError(
+            "No Ariadne split candidates were enumerated for fixed split planning; "
+            "refusing to use the runtime auto/current candidate as a fixed plan."
+        )
+
+    attempts = 0
+    validation_error_counts: dict[str, int] = defaultdict(int)
+    max_attempts = max(1, int(constraints.max_candidates))
+    chosen: SplitCandidate | None = None
+    profile: CandidateProfile | None = None
+    chosen_lazy: _LazyAriadneCandidate | None = None
+    validation_report: Mapping[str, Any] | None = None
+    for lazy_candidate in eligible[:max_attempts]:
+        attempts += 1
+        candidate = _bind_lazy_ariadne_candidate(
+            runtime,
+            model=model,
+            sample_input=sample_input,
+            split_spec=split_spec,
+            plan=plan,
+            lazy_candidate=lazy_candidate,
+        )
+        if not constraints.validate_candidates:
+            chosen = candidate
+            chosen_lazy = lazy_candidate
+            break
+        try:
+            report = runtime.validate_candidate()
+        except Exception as exc:  # noqa: BLE001 - keep trying the next cheap candidate
+            validation_error_counts[str(exc) or type(exc).__name__] += 1
+            continue
+        if not bool(report.get("success", False)):
+            validation_error_counts[str(report.get("error") or "unknown")] += 1
+            continue
+        if not bool(report.get("tail_trainability", candidate.is_trainable_tail)):
+            validation_error_counts["selected split does not have trainable suffix parameters"] += 1
+            continue
+        chosen = candidate
+        chosen_lazy = lazy_candidate
+        validation_report = report
+        profile = _profile_from_report(runtime, candidate, report)
+        break
+
+    if chosen is None or chosen_lazy is None:
+        _raise_no_replayable_candidate(
+            constraints,
+            eligible_count=len(eligible),
+            replay_validation_failures=attempts,
+            replay_success_but_untrainable=0,
+            validation_error_counts=validation_error_counts,
+        )
+
+    validation = _build_validation_payload(chosen, profile)
+    if validation_report is not None:
+        validation.update(dict(validation_report))
+    validation.update(
+        {
+            "runtime": "ariadne",
+            "selection": "lazy_constraints",
+            "split_id": chosen.candidate_id,
+            "candidate_pool_size": candidate_pool_size,
+            "eligible_candidate_count": len(eligible),
+            "lazy_validation_attempts": attempts,
+            "lazy_trace_time_sec": float(trace_elapsed),
+            "lazy_selection_time_sec": float(selection_elapsed),
+        }
+    )
+    canonical_split_key = _candidate_split_key(chosen)
+    candidate_descriptor = build_candidate_descriptor(chosen)
+    split_granularity = str(
+        (chosen.metadata or {}).get("split_granularity") or "operation"
+    )
+    return SplitPlan(
+        split_config_id=_make_plan_id(
+            model_name=model_name or model.__class__.__name__,
+            candidate=chosen,
+            constraints=constraints,
+        ),
+        canonical_split_key=canonical_split_key,
+        edge_split_id=canonical_split_key,
+        model_name=model_name or model.__class__.__name__,
+        candidate_id=chosen.candidate_id,
+        split_index=chosen.legacy_layer_index,
+        split_label=chosen.candidate_id,
+        boundary_tensor_labels=list(chosen.boundary_tensor_labels),
+        input_tensor_shape=_input_tensor_shape_from_sample(sample_input),
+        input_resize_mode=str(input_resize_mode or "direct_resize"),
+        front_version=str(front_version or "0"),
+        payload_bytes=int(chosen.estimated_payload_bytes),
+        privacy_metric=float(chosen_lazy.privacy_leakage),
+        privacy_risk=float(chosen_lazy.privacy_leakage),
+        layer_freezing_ratio=float(chosen_lazy.freezing_ratio),
+        privacy_leakage=float(chosen_lazy.privacy_leakage),
+        edge_parameter_count=int(chosen_lazy.edge_parameter_count),
+        total_parameter_count=int(chosen_lazy.total_parameter_count),
+        validation=validation,
+        constraints=_constraints_payload(constraints),
+        candidate_descriptor=candidate_descriptor,
+        split_granularity=split_granularity,
+        trace_signature=_trace_signature(runtime),
+        trace_batch_mode=_splitter_trace_batch_mode(runtime),
+        dynamic_batch=_splitter_dynamic_batch(runtime),
+        trace_batch_size=trace_batch_size,
+    )
+
+
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
     raw_candidate_id = plan.candidate_id or plan.edge_split_id or plan.canonical_split_key
     if raw_candidate_id is None:
@@ -763,7 +1128,16 @@ def compute_fixed_split_for_model(
     del cache_path
     runtime = splitter or UniversalModelSplitter(device=device)
     if runtime.graph is None or runtime.model is None:
-        runtime.trace(model, sample_input, sample_kwargs=sample_kwargs)
+        return _compute_lazy_fixed_split_for_model(
+            model,
+            constraints,
+            sample_input=sample_input,
+            sample_kwargs=sample_kwargs,
+            runtime=runtime,
+            model_name=model_name,
+            input_resize_mode=input_resize_mode,
+            front_version=front_version,
+        )
 
     if not _is_ariadne_runtime(runtime):
         raise RuntimeError("Fixed split planning requires an Ariadne runtime.")
@@ -872,20 +1246,13 @@ def load_or_compute_fixed_split_plan(
     front_version: str = "0",
 ) -> SplitPlan:
     runtime = splitter or UniversalModelSplitter(device=device)
-    if runtime.graph is None or runtime.model is None:
-        trace_started = time.perf_counter()
-        runtime.trace(model, sample_input, sample_kwargs=sample_kwargs, model_name=model_name)
-        logger.info(
-            "Fixed split startup prepared Ariadne runtime (trace_time={:.3f}s)",
-            time.perf_counter() - trace_started,
-        )
-    trace_signature = _trace_signature(runtime)
     sample_input_shape = _input_tensor_shape_from_sample(sample_input)
     model_key = model_name or model.__class__.__name__
+    cached = load_split_plan(cache_path) if cache_path else None
 
-    if cache_path:
-        cached = load_split_plan(cache_path)
-        if cached is not None and cached.matches(
+    if runtime.graph is not None and runtime.model is not None and cached is not None:
+        trace_signature = _trace_signature(runtime)
+        if cached.matches(
             model_name=model_key,
             constraints=constraints,
             trace_signature=trace_signature,
@@ -926,7 +1293,21 @@ def load_or_compute_fixed_split_plan(
         input_resize_mode=input_resize_mode,
         front_version=front_version,
     )
-    if cache_path:
+    if cache_path and cached is None:
         persist_split_plan(cache_path, plan)
-        apply_split_plan(runtime, plan)
+    elif cache_path and cached is not None and cached.matches(
+        model_name=model_key,
+        constraints=constraints,
+        trace_signature=plan.trace_signature,
+        input_tensor_shape=sample_input_shape,
+        input_resize_mode=input_resize_mode,
+        front_version=front_version,
+    ):
+        logger.info("Fixed split plan cache already matches the current runtime.")
+    elif cache_path and cached is not None:
+        logger.info(
+            "Existing fixed split plan cache is stale for the current Ariadne trace; "
+            "using an in-memory plan without overwriting {}.",
+            cache_path,
+        )
     return plan

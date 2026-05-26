@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 
 import grpc
 import torch
+from ariadne.runtime.batching import resize_batch
 from loguru import logger
 
 from difference.diff import DiffProcessor
@@ -59,6 +60,29 @@ def _coerce_positive_int(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _first_tensor_batch_size(value: object) -> int | None:
+    if isinstance(value, torch.Tensor) and value.ndim > 0:
+        return int(value.shape[0])
+    if isinstance(value, Mapping):
+        for item in value.values():
+            found = _first_tensor_batch_size(item)
+            if found is not None:
+                return found
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_tensor_batch_size(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _fixed_split_trace_sample_input(sample_input: object, trace_batch_size: int = 2) -> object:
+    current_batch_size = _first_tensor_batch_size(sample_input)
+    if current_batch_size is None or current_batch_size >= trace_batch_size:
+        return sample_input
+    return resize_batch(sample_input, current_batch_size, trace_batch_size)
 
 
 @dataclass(frozen=True)
@@ -406,25 +430,15 @@ class EdgeWorker:
                 sample_input = self.small_object_detection.build_split_sample_input(
                     trace_image_size
                 )
+            trace_sample_input = _fixed_split_trace_sample_input(sample_input, 2)
             constraints = SplitConstraints.from_config(fixed_split_cfg)
             cache_path = os.path.join(self.config.retrain.cache_path, "fixed_split_plan.json")
-            trace_started = time.perf_counter()
-            self.universal_splitter.trace(
-                split_model,
-                sample_input,
-                model_name=self.model_id,
-                enable_dynamic_batch=True,
-            )
-            logger.info(
-                "Fixed split startup prepared Ariadne runtime (trace_time={:.3f}s)",
-                time.perf_counter() - trace_started,
-            )
             plan_started = time.perf_counter()
-            logger.info("Loading or computing fixed split plan.")
+            logger.info("Loading or computing fixed split plan with batch_gt1 lazy trace.")
             self.fixed_split_plan = load_or_compute_fixed_split_plan(
                 split_model,
                 constraints,
-                sample_input=sample_input,
+                sample_input=trace_sample_input,
                 device=next(split_model.parameters()).device,
                 model_name=self.model_id,
                 cache_path=cache_path,

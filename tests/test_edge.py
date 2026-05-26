@@ -170,6 +170,7 @@ class TestEdgeWorkerRouting:
         worker.model_id = "dummy-model"
 
         trace_calls = {}
+        plan_calls = {}
         sample_input = torch.ones(1, 1)
         split_model = torch.nn.Linear(1, 1)
 
@@ -192,36 +193,38 @@ class TestEdgeWorkerRouting:
                 self.device = device
                 self.trainability_loss_fn = None
 
-            def trace(self, model, runtime_input, **kwargs):
-                trace_calls["trace_model"] = model
-                trace_calls["trace_input"] = runtime_input
-                trace_calls["model_name"] = kwargs.get("model_name")
-                trace_calls["enable_dynamic_batch"] = kwargs.get("enable_dynamic_batch")
-                trace_calls["dynamic_batch_min"] = kwargs.get("dynamic_batch_min")
-
         worker.small_object_detection = DummyDetection()
 
         monkeypatch.setattr("edge.edge_worker.UniversalModelSplitter", DummySplitter)
         monkeypatch.setattr("edge.edge_worker.build_split_training_loss", lambda model: "loss-fn")
-        monkeypatch.setattr(
-            "edge.edge_worker.load_or_compute_fixed_split_plan",
-            lambda *args, **kwargs: SimpleNamespace(
+
+        def _fake_plan(*args, **kwargs):
+            plan_calls["model"] = args[0]
+            plan_calls["sample_input"] = kwargs.get("sample_input")
+            plan_calls["model_name"] = kwargs.get("model_name")
+            plan_calls["splitter"] = kwargs.get("splitter")
+            return SimpleNamespace(
                 split_config_id="plan-1",
                 split_index=7,
                 payload_bytes=1024,
                 candidate_id=None,
                 describe=lambda: "candidate_id=None",
-            ),
+            )
+
+        monkeypatch.setattr(
+            "edge.edge_worker.load_or_compute_fixed_split_plan",
+            _fake_plan,
         )
 
         worker._init_fixed_split_runtime(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
 
         assert trace_calls["frame"] is sample_bgr_frame
-        assert tuple(trace_calls["trace_input"].shape) == (1, 1)
-        assert trace_calls["trace_input"][0].item() == pytest.approx(1.0)
-        assert trace_calls["model_name"] == "dummy-model"
-        assert trace_calls["enable_dynamic_batch"] is True
-        assert trace_calls["dynamic_batch_min"] is None
+        assert plan_calls["model"] is split_model
+        assert tuple(plan_calls["sample_input"].shape) == (2, 1)
+        assert plan_calls["sample_input"][0].item() == pytest.approx(1.0)
+        assert plan_calls["sample_input"][1].item() == pytest.approx(1.0)
+        assert plan_calls["model_name"] == "dummy-model"
+        assert plan_calls["splitter"] is worker.universal_splitter
         assert "synthetic_image_size" not in trace_calls
 
     def test_init_fixed_split_runtime_uses_ariadne_trace_without_graph_artifact_cache(
@@ -263,14 +266,6 @@ class TestEdgeWorkerRouting:
                 self.device = device
                 self.trainability_loss_fn = None
 
-            def trace(self, model, runtime_input, **kwargs):
-                trace_calls["model"] = model
-                trace_calls["input"] = runtime_input
-                trace_calls["model_name"] = kwargs.get("model_name")
-                trace_calls["enable_dynamic_batch"] = kwargs.get("enable_dynamic_batch")
-                trace_calls["dynamic_batch_min"] = kwargs.get("dynamic_batch_min")
-                return self
-
         worker.small_object_detection = DummyDetection()
 
         monkeypatch.setattr("edge.edge_worker.UniversalModelSplitter", DummySplitter)
@@ -295,13 +290,8 @@ class TestEdgeWorkerRouting:
 
         worker._init_fixed_split_runtime(sample_bgr_frame, tuple(sample_bgr_frame.shape[:2]))
 
-        assert trace_calls["model"] is split_model
-        assert trace_calls["model_name"] == "dummy-model"
-        assert trace_calls["enable_dynamic_batch"] is True
-        assert trace_calls["dynamic_batch_min"] is None
-        assert tuple(trace_calls["input"].shape) == (1, 1)
         assert plan_calls["splitter"] is worker.universal_splitter
-        assert plan_calls["sample_input"] is trace_calls["input"]
+        assert tuple(plan_calls["sample_input"].shape) == (2, 1)
         assert plan_calls["validate_cached_plan"] is False
 
     def test_resolve_active_splitter_disables_runtime_when_frame_size_changes(self, sample_bgr_frame):

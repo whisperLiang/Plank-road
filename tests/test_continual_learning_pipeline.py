@@ -616,6 +616,73 @@ def test_ariadne_fixed_split_solves_candidate_from_constraints_instead_of_auto()
     assert plan.validation["selection"] == "constraints"
 
 
+def test_fixed_split_unprepared_splitter_uses_batch_gt1_lazy_planner():
+    class PrivacyToy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc1 = torch.nn.Linear(4, 8)
+            self.fc2 = torch.nn.Linear(8, 2)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.fc2(torch.relu(self.fc1(x)))
+
+    model = PrivacyToy().eval()
+    splitter = UniversalModelSplitter()
+    constraints = SplitConstraints(
+        privacy_leakage_upper_bound=0.0,
+        max_layer_freezing_ratio=1.0,
+        validate_candidates=True,
+        max_boundary_count=8,
+        max_payload_bytes=32 * 1024 * 1024,
+    )
+
+    plan = compute_fixed_split_for_model(
+        model,
+        constraints,
+        sample_input=torch.randn(2, 4),
+        splitter=splitter,
+        model_name="privacy-toy",
+    )
+
+    assert plan.validation["selection"] == "lazy_constraints"
+    assert plan.input_tensor_shape == [1, 4]
+    assert plan.trace_batch_mode == "batch_gt1"
+    assert plan.dynamic_batch == [1, 64]
+    assert plan.trace_batch_size == 2
+    assert splitter.runtime is not None
+    assert splitter.runtime.run_prefix(torch.randn(1, 4)).batch_size == 1
+
+
+def test_fixed_split_lazy_planner_does_not_overwrite_stale_cache(tmp_path):
+    class PrivacyToy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc1 = torch.nn.Linear(4, 8)
+            self.fc2 = torch.nn.Linear(8, 2)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.fc2(torch.relu(self.fc1(x)))
+
+    cache_path = tmp_path / "fixed_split_plan.json"
+    stale = _dummy_plan()
+    stale.trace_signature = "old-ariadne-signature"
+    persist_split_plan(str(cache_path), stale)
+
+    plan = load_or_compute_fixed_split_plan(
+        PrivacyToy().eval(),
+        SplitConstraints(privacy_leakage_upper_bound=0.0),
+        sample_input=torch.randn(2, 4),
+        splitter=UniversalModelSplitter(),
+        cache_path=str(cache_path),
+        model_name="dummy-model",
+    )
+
+    with cache_path.open("r", encoding="utf-8") as handle:
+        persisted = json.load(handle)
+    assert persisted["trace_signature"] == "old-ariadne-signature"
+    assert plan.validation["selection"] == "lazy_constraints"
+
+
 def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_available():
     constraints = SplitConstraints(
         privacy_leakage_upper_bound=1.0 / 40.0,
