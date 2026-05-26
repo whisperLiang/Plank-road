@@ -284,6 +284,63 @@ def test_canonical_rebuild_renames_high_quality_boundary_payload_to_contract_lay
     assert set(carried_payload.tensors) == {"node_0"}
 
 
+def test_canonical_rebuild_carries_schema_payload_with_non_unit_physical_first_axis(tmp_path):
+    from model_management.payload import boundary_payload_from_tensors
+
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = SplitRuntimeContract.create(
+        edge_id=1,
+        model_id="model-a",
+        split_config_id="after:model.backbone",
+        canonical_split_key="after:model.backbone",
+        edge_split_id="after:model.backbone",
+        cloud_batch_split_id="after:model.backbone",
+        input_tensor_shape=[1, 3, 64, 64],
+        input_resize_mode="direct_resize",
+        boundary_tensor_labels=["node_0"],
+        front_version="0",
+        feature_tensors={"node_0": torch.ones(4, 145, 384)},
+        runtime_identity={"graph_signature": "runtime-graph"},
+    )
+
+    def schema_candidate(sample_id: str, created_at: float) -> dict:
+        candidate = _high_quality_candidate(sample_id, created_at=created_at)
+        candidate.pop("feature")
+        candidate["intermediate"] = boundary_payload_from_tensors(
+            {"node_0": torch.ones(4, 145, 384)},
+            split_id=contract.cloud_batch_split_id,
+            graph_signature="runtime-graph",
+            batch_size=1,
+        )
+        return candidate
+
+    pool.store_pending_high_quality_samples([schema_candidate("schema-1", 1.0)])
+    pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+
+    pool.store_pending_high_quality_samples([schema_candidate("schema-2", 2.0)])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(
+            split_contract=contract,
+        ),
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+
+    assert stats["validation"]["skipped_unreadable"] == 0
+    assert stats["generation_commit"]["active"] == 2
+    assert {entry["sample_id"] for entry in pool.list_active_samples()} == {
+        "schema-1",
+        "schema-2",
+    }
+
+
 def test_canonical_rebuild_rejects_high_quality_missing_contract_tensor(tmp_path):
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)

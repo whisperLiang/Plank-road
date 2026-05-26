@@ -975,6 +975,7 @@ class CloudSamplePool:
                 continue
             record = self.reader.read(entry)
             feature_record = dict(record.feature_record)
+            boundary_payload = _boundary_payload_from_value(feature_record)
             sample.update(
                 {
                     "sample_id": record.sample_id,
@@ -982,6 +983,11 @@ class CloudSamplePool:
                     "feature": feature_record.get("feature"),
                     "labels": record.labels,
                     "contract_id": entry.get("contract_id") or feature_record.get("contract_id"),
+                    **(
+                        {"intermediate": boundary_payload}
+                        if boundary_payload is not None
+                        else {}
+                    ),
                 }
             )
             samples.append(sample)
