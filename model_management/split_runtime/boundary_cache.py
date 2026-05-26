@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 from ariadne import BoundaryPayload
+from ariadne.pattern.boundary_value import BoundaryTensorRef
 
 
 BOUNDARY_CACHE_PROTOCOL = "ariadne-boundary-v2"
@@ -97,12 +98,150 @@ def _runtime_variant_for_payload(runtime: Any, payload: BoundaryPayload) -> Any:
     return runtime
 
 
+def _runtime_payload_schema(
+    runtime: Any,
+    payload: BoundaryPayload,
+) -> dict[str, Any] | None:
+    if runtime is None:
+        return None
+    resolved_runtime = _runtime_variant_for_payload(runtime, payload)
+    for schema in (
+        getattr(getattr(resolved_runtime, "candidate", None), "boundary_schema", None),
+        getattr(resolved_runtime, "schema", None),
+    ):
+        if not isinstance(schema, Mapping):
+            continue
+        runtime_schema = {str(label): spec for label, spec in dict(schema).items()}
+        tensor_labels = {str(label) for label in dict(getattr(payload, "tensors", {}) or {})}
+        if tensor_labels and tensor_labels != set(runtime_schema):
+            continue
+        return runtime_schema
+    return None
+
+
+def _runtime_payload_value_schema(
+    runtime: Any,
+    payload: BoundaryPayload,
+) -> tuple[Any, ...] | None:
+    if runtime is None:
+        return None
+    resolved_runtime = _runtime_variant_for_payload(runtime, payload)
+    boundary_value_schema = getattr(resolved_runtime, "_boundary_value_schema", None)
+    if callable(boundary_value_schema):
+        try:
+            return tuple(boundary_value_schema())
+        except (AttributeError, KeyError, TypeError):
+            pass
+
+    candidate = getattr(resolved_runtime, "candidate", None)
+    value_schema_by_label = getattr(candidate, "boundary_value_schema", None)
+    boundary_order = getattr(getattr(resolved_runtime, "segments", None), "boundary_order", None)
+    if isinstance(value_schema_by_label, Mapping) and boundary_order is not None:
+        try:
+            return tuple(value_schema_by_label[label] for label in boundary_order)
+        except (KeyError, TypeError):
+            pass
+
+    value_schema = getattr(resolved_runtime, "value_schema", None)
+    if value_schema is not None:
+        try:
+            return tuple(value_schema)
+        except TypeError:
+            return None
+    return None
+
+
+def _runtime_requires_grad(
+    schema: Mapping[str, Any],
+    payload: BoundaryPayload,
+) -> dict[str, bool]:
+    payload_requires_grad = dict(getattr(payload, "requires_grad", {}) or {})
+    payload_tensors = dict(getattr(payload, "tensors", {}) or {})
+    requires_grad: dict[str, bool] = {}
+    for label, spec in dict(schema).items():
+        tensor = payload_tensors.get(label)
+        fallback = bool(getattr(tensor, "requires_grad", False))
+        requires_grad[str(label)] = bool(
+            getattr(spec, "requires_grad", payload_requires_grad.get(label, fallback))
+        )
+    return requires_grad
+
+
+def _sequence_element_spec(spec: Any, index: int) -> Any:
+    element_spec = getattr(spec, "element_spec", None)
+    if type(element_spec).__name__ == "BoundaryTensorValueSpec":
+        try:
+            return replace(element_spec, label=f"{getattr(spec, 'label')}.{index}")
+        except TypeError:
+            return element_spec
+    return element_spec
+
+
+def _runtime_payload_value(value: Any, spec: Any) -> Any:
+    spec_type = type(spec).__name__
+    if spec_type == "BoundaryTensorValueSpec":
+        label = str(getattr(spec, "label", "") or "")
+        return BoundaryTensorRef(label) if label else value
+    if spec_type == "BoundaryTupleValueSpec":
+        source = tuple(value) if isinstance(value, (tuple, list)) else ()
+        items = tuple(getattr(spec, "items", ()) or ())
+        return tuple(
+            _runtime_payload_value(source[index] if index < len(source) else None, item_spec)
+            for index, item_spec in enumerate(items)
+        )
+    if spec_type == "BoundaryListValueSpec":
+        source = list(value) if isinstance(value, (tuple, list)) else []
+        items = tuple(getattr(spec, "items", ()) or ())
+        return [
+            _runtime_payload_value(source[index] if index < len(source) else None, item_spec)
+            for index, item_spec in enumerate(items)
+        ]
+    if spec_type == "BoundaryDictValueSpec":
+        source = dict(value) if isinstance(value, Mapping) else {}
+        return {
+            key: _runtime_payload_value(source.get(key), item_spec)
+            for key, item_spec in tuple(getattr(spec, "items", ()) or ())
+        }
+    if spec_type == "BoundarySliceValueSpec":
+        return slice(
+            _runtime_payload_value(getattr(value, "start", None), getattr(spec, "start", None)),
+            _runtime_payload_value(getattr(value, "stop", None), getattr(spec, "stop", None)),
+            _runtime_payload_value(getattr(value, "step", None), getattr(spec, "step", None)),
+        )
+    if spec_type == "BoundarySequenceValueSpec":
+        if isinstance(value, tuple):
+            source = value
+        elif isinstance(value, list):
+            source = tuple(value)
+        else:
+            source = ()
+        rebuilt = [
+            _runtime_payload_value(item, _sequence_element_spec(spec, index))
+            for index, item in enumerate(source)
+        ]
+        return tuple(rebuilt) if getattr(spec, "container_type", None) == "tuple" else rebuilt
+    return value
+
+
+def _runtime_payload_values(
+    payload: BoundaryPayload,
+    value_schema: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    if not value_schema:
+        return ()
+    values = tuple(getattr(payload, "values", ()) or ())
+    return tuple(
+        _runtime_payload_value(values[index] if index < len(values) else None, spec)
+        for index, spec in enumerate(value_schema)
+    )
+
+
 def _runtime_payload_device(runtime: Any, payload: BoundaryPayload) -> torch.device | None:
     if runtime is None:
         return None
     resolved_runtime = _runtime_variant_for_payload(runtime, payload)
-    schema = getattr(getattr(resolved_runtime, "candidate", None), "boundary_schema", None)
-    if not isinstance(schema, Mapping):
+    schema = _runtime_payload_schema(resolved_runtime, payload)
+    if schema is None:
         schema = getattr(payload, "schema", None)
 
     schema_device_type: str | None = None
@@ -171,22 +310,64 @@ class BoundaryPayloadCacheCodec:
         if not isinstance(payload, BoundaryPayload):
             raise TypeError(f"Expected BoundaryPayload, got {type(payload).__name__}.")
         device = _runtime_payload_device(self.runtime, payload)
+        runtime_schema = _runtime_payload_schema(self.runtime, payload)
+        runtime_value_schema = _runtime_payload_value_schema(self.runtime, payload)
+        schema = dict(getattr(payload, "schema", {}) or {})
+        requires_grad = dict(getattr(payload, "requires_grad", {}) or {})
+        value_schema = tuple(getattr(payload, "value_schema", ()) or ())
+        values = tuple(getattr(payload, "values", ()) or ())
+        if runtime_schema is not None:
+            schema = runtime_schema
+            requires_grad = _runtime_requires_grad(runtime_schema, payload)
+        if runtime_value_schema is not None:
+            value_schema = runtime_value_schema
+            values = _runtime_payload_values(payload, value_schema)
         if device is None:
-            return payload
+            if (
+                schema == dict(getattr(payload, "schema", {}) or {})
+                and requires_grad == dict(getattr(payload, "requires_grad", {}) or {})
+                and value_schema == tuple(getattr(payload, "value_schema", ()) or ())
+                and values == tuple(getattr(payload, "values", ()) or ())
+            ):
+                return payload
+            return replace(
+                payload,
+                schema=schema,
+                requires_grad=requires_grad,
+                value_schema=value_schema,
+                values=values,
+            )
         tensors = dict(getattr(payload, "tensors", {}) or {})
         passthrough = dict(getattr(payload, "passthrough_inputs", {}) or {})
-        values = tuple(getattr(payload, "values", ()) or ())
+        tensors_on_device = _payload_values_on_device(tensors, device)
+        passthrough_on_device = _payload_values_on_device(passthrough, device)
+        values_on_device = _payload_values_on_device(values, device)
         if (
-            _payload_values_on_device(tensors, device)
-            and _payload_values_on_device(passthrough, device)
-            and _payload_values_on_device(values, device)
+            tensors_on_device
+            and passthrough_on_device
+            and values_on_device
+            and schema == dict(getattr(payload, "schema", {}) or {})
+            and requires_grad == dict(getattr(payload, "requires_grad", {}) or {})
+            and value_schema == tuple(getattr(payload, "value_schema", ()) or ())
+            and values == tuple(getattr(payload, "values", ()) or ())
         ):
             return payload
         return replace(
             payload,
-            tensors=_move_payload_value_to_device(tensors, device),
-            passthrough_inputs=_move_payload_value_to_device(passthrough, device),
-            values=_move_payload_value_to_device(values, device),
+            tensors=(
+                tensors
+                if tensors_on_device
+                else _move_payload_value_to_device(tensors, device)
+            ),
+            passthrough_inputs=(
+                passthrough
+                if passthrough_on_device
+                else _move_payload_value_to_device(passthrough, device)
+            ),
+            values=values if values_on_device else _move_payload_value_to_device(values, device),
+            schema=schema,
+            requires_grad=requires_grad,
+            value_schema=value_schema,
         )
 
     def split_batch(
@@ -355,7 +536,7 @@ class BoundaryPayloadCacheCodec:
         payload: BoundaryPayload,
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.validate(self.to_runtime_device(payload))
+        payload = self.validate(self.to_runtime_device(payload))
         record = dict(metadata or {})
         record.update(
             {

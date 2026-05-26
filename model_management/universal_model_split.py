@@ -1572,6 +1572,7 @@ def _build_boundary_batch_from_records(
     first_payload_batch_size = _cached_boundary_batch_size(records[0])
     codec = BoundaryPayloadCacheCodec(runtime)
     if len(records) == 1 and first_payload is not None and first_payload_batch_size is None:
+        first_payload = codec.to_runtime_device(first_payload)
         codec.validate(first_payload)
         return first_payload
     if first_payload is not None and first_payload_batch_size is not None:
@@ -1580,6 +1581,7 @@ def _build_boundary_batch_from_records(
                 "Cached split-tail boundary batch has fewer rows than requested targets."
             )
         if all(_same_cached_boundary_payload(records[0], record) for record in records[1:]):
+            first_payload = codec.to_runtime_device(first_payload)
             codec.validate(first_payload)
             return first_payload
 

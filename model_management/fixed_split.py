@@ -508,36 +508,60 @@ def _shape_numel(shape: Sequence[int] | Any) -> int:
     return int(total)
 
 
-def _node_by_name(plan: Any) -> dict[str, Any]:
-    return {str(node.name): node for node in getattr(plan, "nodes", ()) or ()}
+def _node_index_by_name(plan: Any) -> dict[str, int]:
+    return {
+        str(node.name): index
+        for index, node in enumerate(getattr(plan, "nodes", ()) or ())
+    }
 
 
-def _parameter_count_from_nodes(
-    node_lookup: Mapping[str, Any],
-    node_names: Sequence[str] | tuple[str, ...],
-) -> int:
-    seen: set[str] = set()
-    total = 0
-    for node_name in node_names:
-        node = node_lookup.get(str(node_name))
-        if node is None:
-            continue
+def _param_refs_by_node(plan: Any) -> dict[str, tuple[tuple[str, int], ...]]:
+    refs_by_node: dict[str, tuple[tuple[str, int], ...]] = {}
+    for node in getattr(plan, "nodes", ()) or ():
+        refs: list[tuple[str, int]] = []
         for ref in getattr(node, "param_refs", ()) or ():
             ref_name = str(getattr(ref, "name", ""))
-            if not ref_name or ref_name in seen:
+            if not ref_name:
+                continue
+            refs.append((ref_name, _shape_numel(getattr(ref, "shape", ()) or ())))
+        if refs:
+            refs_by_node[str(node.name)] = tuple(refs)
+    return refs_by_node
+
+
+def _parameter_count_from_ref_lookup(
+    refs_by_node: Mapping[str, tuple[tuple[str, int], ...]],
+    node_names: Sequence[str] | tuple[str, ...],
+) -> int:
+    if not refs_by_node or not node_names:
+        return 0
+    node_set = {str(node_name) for node_name in node_names}
+    if len(refs_by_node) < len(node_set):
+        nodes_to_scan = [
+            node_name for node_name in refs_by_node.keys() if node_name in node_set
+        ]
+    else:
+        nodes_to_scan = list(node_set)
+    seen: set[str] = set()
+    total = 0
+    for node_name in nodes_to_scan:
+        for ref_name, ref_numel in refs_by_node.get(str(node_name), ()):
+            if ref_name in seen:
                 continue
             seen.add(ref_name)
-            total += _shape_numel(getattr(ref, "shape", ()) or ())
+            total += int(ref_numel)
     return int(total)
 
 
-def _candidate_legacy_index_from_plan(plan: Any, candidate: Any) -> int:
-    indexes: list[int] = []
-    for label in getattr(candidate, "prefix_nodes", ()) or ():
-        try:
-            indexes.append(int(plan.index_of(label)))
-        except (AttributeError, KeyError, TypeError, ValueError):
-            continue
+def _candidate_legacy_index_from_lookup(
+    node_indexes: Mapping[str, int],
+    prefix_nodes: Sequence[str] | tuple[str, ...],
+) -> int:
+    indexes = [
+        int(node_indexes[str(label)])
+        for label in prefix_nodes
+        if str(label) in node_indexes
+    ]
     return max(indexes) if indexes else 10**9
 
 
@@ -559,10 +583,11 @@ def _lazy_ariadne_candidates(
     if not frontier:
         return [], 0
 
-    node_lookup = _node_by_name(plan)
-    total_parameter_count = _parameter_count_from_nodes(
-        node_lookup,
-        tuple(str(node.name) for node in getattr(plan, "nodes", ()) or ()),
+    refs_by_node = _param_refs_by_node(plan)
+    node_indexes = _node_index_by_name(plan)
+    total_parameter_count = _parameter_count_from_ref_lookup(
+        refs_by_node,
+        tuple(refs_by_node.keys()),
     )
     min_edge_parameters = _privacy_min_edge_parameter_count(constraints)
     eligible: list[_LazyAriadneCandidate] = []
@@ -577,9 +602,13 @@ def _lazy_ariadne_candidates(
         )
         if payload_bytes > int(constraints.max_payload_bytes):
             continue
-        edge_parameter_count = _parameter_count_from_nodes(
-            node_lookup,
-            tuple(getattr(ariadne_candidate, "prefix_nodes", ()) or ()),
+        prefix_nodes = tuple(
+            str(label)
+            for label in getattr(ariadne_candidate, "prefix_nodes", ()) or ()
+        )
+        edge_parameter_count = _parameter_count_from_ref_lookup(
+            refs_by_node,
+            prefix_nodes,
         )
         privacy_leakage = estimate_privacy_leakage_from_edge_params(
             edge_parameter_count,
@@ -610,7 +639,10 @@ def _lazy_ariadne_candidates(
                 operation_split_id=_ariadne_candidate_operation_split_id(ariadne_candidate),
                 payload_bytes=payload_bytes,
                 boundary_count=len(boundary_nodes),
-                legacy_layer_index=_candidate_legacy_index_from_plan(plan, ariadne_candidate),
+                legacy_layer_index=_candidate_legacy_index_from_lookup(
+                    node_indexes,
+                    prefix_nodes,
+                ),
                 edge_parameter_count=edge_parameter_count,
                 total_parameter_count=total_parameter_count,
                 privacy_leakage=privacy_leakage,

@@ -3974,6 +3974,43 @@ def test_high_quality_syncer_groups_retryable_samples_by_record_context(tmp_path
     } == {("1", plan.split_config_id), ("2", "other-split")}
 
 
+def test_high_quality_syncer_retries_windows_ledger_replace_error(tmp_path, monkeypatch):
+    import edge.sample_sync as sample_sync
+
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    record = _store_high_quality_for_shard(
+        store,
+        sample_id="high-ledger-retry",
+        frame_index=1,
+        plan=plan,
+    )
+    syncer = HighQualitySampleSyncer(
+        store,
+        server_ip="127.0.0.1:50051",
+        edge_id=1,
+        shard_size=64,
+        enabled=True,
+    )
+    original_replace = os.replace
+    calls = {"count": 0}
+
+    def flaky_replace(src, dst):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            exc = PermissionError(5, "Access is denied", dst)
+            exc.winerror = 5
+            raise exc
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(sample_sync.os, "replace", flaky_replace)
+
+    syncer.notify_sample(record)
+
+    assert calls["count"] == 2
+    assert syncer._sample_state(record.sample_id) == "pending"
+
+
 def test_low_quality_raw_only_trigger_uses_partial_raw_shards_without_edge_labels(
     tmp_path,
     sample_bgr_frame,

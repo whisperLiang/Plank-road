@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -28,6 +29,8 @@ UPLOAD_UPLOADED = "uploaded"
 UPLOAD_COMMITTED = "committed"
 UPLOAD_FAILED = "failed"
 _RETRYABLE_STATES = {UPLOAD_PENDING, UPLOAD_UPLOADED, UPLOAD_FAILED}
+_ATOMIC_WRITE_RETRIES = 8
+_ATOMIC_WRITE_RETRY_DELAY_SEC = 0.02
 
 
 def _utc_now() -> str:
@@ -43,11 +46,43 @@ def _first_nonempty(*values: object) -> str:
 
 
 def _atomic_json_dump(path: str, payload: Mapping[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp-{threading.get_ident()}"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(dict(payload), handle, indent=2, sort_keys=True)
-    os.replace(tmp_path, path)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = os.path.join(
+        directory,
+        f".{os.path.basename(path)}.tmp-{threading.get_ident()}-{uuid.uuid4().hex}",
+    )
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(dict(payload), handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(_ATOMIC_WRITE_RETRIES):
+            try:
+                os.replace(tmp_path, path)
+                return
+            except OSError as exc:
+                if (
+                    not _is_retryable_atomic_replace_error(exc)
+                    or attempt + 1 >= _ATOMIC_WRITE_RETRIES
+                ):
+                    raise
+                time.sleep(_ATOMIC_WRITE_RETRY_DELAY_SEC * (attempt + 1))
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _is_retryable_atomic_replace_error(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    return (
+        isinstance(exc, PermissionError)
+        or exc.errno in {errno.EACCES, errno.EPERM}
+        or winerror in {5, 32}
+    )
 
 
 def _chunks(items: Sequence[StoredSampleRecord], size: int) -> list[list[StoredSampleRecord]]:

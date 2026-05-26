@@ -125,33 +125,55 @@ def test_boundary_payload_cache_collate_restores_runtime_schema_device(tmp_path)
             device_type="meta",
         )
     }
-    runtime = FakeBoundaryRuntime(schema)
+    cached_schema = {
+        "node_0": BoundaryTensorSpec(
+            label="node_0",
+            symbolic_shape=("B", 2),
+            dtype="torch.float32",
+            requires_grad=True,
+            device_type="cpu",
+        )
+    }
+    value_schema = (BoundaryTensorValueSpec(label="node_0", tensor_spec=schema["node_0"]),)
+    cached_value_schema = (
+        BoundaryTensorValueSpec(label="edge_node", tensor_spec=cached_schema["node_0"]),
+    )
+    runtime = FakeBoundaryRuntime(schema, value_schema)
     payloads = [
         BoundaryPayload(
             split_id=runtime.split_id,
             graph_signature=runtime.graph_signature,
             batch_size=1,
             tensors={"node_0": torch.ones(1, 2)},
-            schema=schema,
-            requires_grad={"node_0": False},
+            schema=cached_schema,
+            requires_grad={"node_0": True},
             passthrough_inputs={"input": torch.ones(1, 3)},
             protocol_version=2,
-            values=(),
-            value_schema=(),
+            values=(BoundaryTensorRef("edge_node"),),
+            value_schema=cached_value_schema,
         )
         for _ in range(2)
     ]
 
     codec = BoundaryPayloadCacheCodec(runtime)
     path = tmp_path / "sample.pt"
-    codec.save(path, payloads[0])
+    saved = codec.save(path, payloads[0])
     loaded = codec.load(path)
     collated = codec.collate([loaded, payloads[1]])
 
+    assert saved["intermediate"].values == (BoundaryTensorRef("node_0"),)
     assert loaded.tensors["node_0"].device.type == "meta"
+    assert loaded.schema == schema
+    assert loaded.requires_grad == {"node_0": False}
+    assert loaded.value_schema == value_schema
+    assert loaded.values == (BoundaryTensorRef("node_0"),)
     assert collated.batch_size == 2
     assert collated.tensors["node_0"].device.type == "meta"
     assert collated.passthrough_inputs["input"].device.type == "meta"
+    assert collated.schema == schema
+    assert collated.requires_grad == {"node_0": False}
+    assert collated.value_schema == value_schema
+    assert collated.values == (BoundaryTensorRef("node_0"),)
     runtime.validate_boundary(collated)
 
 
