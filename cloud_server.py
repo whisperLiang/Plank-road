@@ -2774,6 +2774,7 @@ class CloudContinualLearner:
                 or getattr(runtime, "version", None)
                 or type(runtime).__name__
             ),
+            "graph_signature": str(getattr(runtime, "graph_signature", "") or ""),
             "adapter_version": str(getattr(runtime, "adapter_version", "") or ""),
             "split_plan_hash": _json_fingerprint(split_plan),
             "symbolic_input_schema_hash": _json_fingerprint(symbolic_schema or {}),

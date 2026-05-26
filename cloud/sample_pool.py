@@ -349,6 +349,7 @@ def _normalise_boundary_payload_for_contract(
     *,
     tensors: Mapping[str, torch.Tensor],
     source_to_target: Mapping[str, str],
+    split_contract: SplitRuntimeContract,
 ) -> BoundaryPayload | None:
     if payload is None:
         return None
@@ -376,8 +377,11 @@ def _normalise_boundary_payload_for_contract(
         )
     return boundary_payload_from_tensors(
         {str(label): tensor for label, tensor in dict(tensors).items()},
-        split_id=str(payload.split_id),
-        graph_signature=str(payload.graph_signature),
+        split_id=str(split_contract.cloud_batch_split_id or payload.split_id),
+        graph_signature=str(
+            dict(split_contract.runtime_identity or {}).get("graph_signature")
+            or payload.graph_signature
+        ),
         batch_size=1,
         schema=schema or None,
         requires_grad=requires_grad or None,
@@ -1069,6 +1073,7 @@ class CloudSamplePool:
             record.boundary_payload,
             tensors=record.feature,
             source_to_target=source_to_target,
+            split_contract=split_contract,
         )
         if [int(dim) for dim in record.input_tensor_shape] != [
             int(dim) for dim in split_contract.input_tensor_shape

@@ -34,6 +34,7 @@ def _build_split_contract(
     model_id: str = "model-a",
     split_config_id: str = "after:model.backbone",
     front_version: str = "0",
+    runtime_identity: dict | None = None,
 ) -> SplitRuntimeContract:
     return SplitRuntimeContract.create(
         edge_id=edge_id,
@@ -47,6 +48,7 @@ def _build_split_contract(
         boundary_tensor_labels=["node_0"],
         front_version=front_version,
         feature_tensors={"node_0": torch.ones(1, 4)},
+        runtime_identity=runtime_identity,
     )
 
 
@@ -221,7 +223,7 @@ def test_canonical_rebuild_renames_high_quality_boundary_payload_to_contract_lay
 
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
-    contract = _build_split_contract()
+    contract = _build_split_contract(runtime_identity={"graph_signature": "runtime-graph"})
     candidate = _high_quality_candidate("hq-renamed", created_at=1.0)
     candidate.pop("feature")
     candidate["intermediate"] = boundary_payload_from_tensors(
@@ -247,6 +249,8 @@ def test_canonical_rebuild_renames_high_quality_boundary_payload_to_contract_lay
     stored_payload = feature_label.feature_record["intermediate"]
     assert set(stored_payload.tensors) == {"node_0"}
     assert stored_payload.schema["node_0"].label == "node_0"
+    assert stored_payload.split_id == contract.cloud_batch_split_id
+    assert stored_payload.graph_signature == "runtime-graph"
 
 
 def test_canonical_rebuild_rejects_high_quality_missing_contract_tensor(tmp_path):
