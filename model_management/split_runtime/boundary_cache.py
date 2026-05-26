@@ -3,7 +3,7 @@ from __future__ import annotations
 import gzip
 import os
 from collections.abc import Mapping
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any
 
 import torch
@@ -77,6 +77,83 @@ def _same_value(left: Any, right: Any) -> bool:
     return left == right
 
 
+def _first_module_device(module: Any) -> torch.device | None:
+    if not isinstance(module, torch.nn.Module):
+        return None
+    for parameter in module.parameters(recurse=True):
+        return parameter.device
+    for buffer in module.buffers(recurse=True):
+        return buffer.device
+    return None
+
+
+def _runtime_variant_for_payload(runtime: Any, payload: BoundaryPayload) -> Any:
+    for variant in tuple(getattr(runtime, "variants", ()) or ()):
+        if (
+            getattr(variant, "graph_signature", None) == payload.graph_signature
+            and getattr(variant, "split_id", None) == payload.split_id
+        ):
+            return variant
+    return runtime
+
+
+def _runtime_payload_device(runtime: Any, payload: BoundaryPayload) -> torch.device | None:
+    if runtime is None:
+        return None
+    resolved_runtime = _runtime_variant_for_payload(runtime, payload)
+    schema = getattr(getattr(resolved_runtime, "candidate", None), "boundary_schema", None)
+    if not isinstance(schema, Mapping):
+        schema = getattr(payload, "schema", None)
+
+    schema_device_type: str | None = None
+    if isinstance(schema, Mapping):
+        for label in dict(getattr(payload, "tensors", {}) or {}):
+            spec = schema.get(str(label))
+            device_type = getattr(spec, "device_type", None)
+            if device_type:
+                schema_device_type = str(device_type)
+                break
+
+    for module_name in ("suffix_segment", "prefix_segment", "training_prefix_segment"):
+        module_device = _first_module_device(getattr(resolved_runtime, module_name, None))
+        if module_device is None:
+            continue
+        if schema_device_type is None or module_device.type == schema_device_type:
+            return module_device
+
+    if schema_device_type:
+        return torch.device(schema_device_type)
+    return None
+
+
+def _payload_values_on_device(value: Any, device: torch.device) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.device == device and value.is_contiguous()
+    if isinstance(value, Mapping):
+        return all(_payload_values_on_device(item, device) for item in value.values())
+    if isinstance(value, tuple):
+        return all(_payload_values_on_device(item, device) for item in value)
+    if isinstance(value, list):
+        return all(_payload_values_on_device(item, device) for item in value)
+    return True
+
+
+def _move_payload_value_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        moved = value.to(device)
+        return moved if moved.is_contiguous() else moved.contiguous()
+    if isinstance(value, Mapping):
+        return {
+            key: _move_payload_value_to_device(item, device)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_move_payload_value_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_payload_value_to_device(item, device) for item in value]
+    return value
+
+
 class BoundaryPayloadCacheCodec:
     def __init__(self, runtime: Any) -> None:
         self.runtime = _runtime_from(runtime)
@@ -89,6 +166,28 @@ class BoundaryPayloadCacheCodec:
         if callable(validate_boundary):
             validate_boundary(payload)
         return payload
+
+    def to_runtime_device(self, payload: BoundaryPayload) -> BoundaryPayload:
+        if not isinstance(payload, BoundaryPayload):
+            raise TypeError(f"Expected BoundaryPayload, got {type(payload).__name__}.")
+        device = _runtime_payload_device(self.runtime, payload)
+        if device is None:
+            return payload
+        tensors = dict(getattr(payload, "tensors", {}) or {})
+        passthrough = dict(getattr(payload, "passthrough_inputs", {}) or {})
+        values = tuple(getattr(payload, "values", ()) or ())
+        if (
+            _payload_values_on_device(tensors, device)
+            and _payload_values_on_device(passthrough, device)
+            and _payload_values_on_device(values, device)
+        ):
+            return payload
+        return replace(
+            payload,
+            tensors=_move_payload_value_to_device(tensors, device),
+            passthrough_inputs=_move_payload_value_to_device(passthrough, device),
+            values=_move_payload_value_to_device(values, device),
+        )
 
     def split_batch(
         self,
@@ -156,6 +255,7 @@ class BoundaryPayloadCacheCodec:
     def collate(self, payloads: list[BoundaryPayload]) -> BoundaryPayload:
         if not payloads:
             raise RuntimeError("Cannot collate an empty BoundaryPayload cache batch.")
+        payloads = [self.to_runtime_device(payload) for payload in payloads]
         for payload in payloads:
             self.validate(payload)
 
@@ -255,7 +355,7 @@ class BoundaryPayloadCacheCodec:
         payload: BoundaryPayload,
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.validate(payload)
+        self.validate(self.to_runtime_device(payload))
         record = dict(metadata or {})
         record.update(
             {
@@ -275,12 +375,14 @@ class BoundaryPayloadCacheCodec:
         except gzip.BadGzipFile:
             record = torch.load(path, map_location="cpu", weights_only=False)
         if isinstance(record, BoundaryPayload):
+            record = self.to_runtime_device(record)
             return self.validate(record)
         if not isinstance(record, Mapping):
             raise TypeError(f"Unsupported boundary cache record: {type(record).__name__}.")
         payload = record.get("intermediate") or record.get("boundary_payload")
         if not isinstance(payload, BoundaryPayload):
             raise TypeError("Boundary cache record did not contain a BoundaryPayload.")
+        payload = self.to_runtime_device(payload)
         return self.validate(payload)
 
     def _dimension_multiplier(self, value: Any) -> int | None:

@@ -115,6 +115,46 @@ def test_boundary_payload_cache_splits_and_collates_b_and_4b(tmp_path):
     runtime.validate_boundary(collated)
 
 
+def test_boundary_payload_cache_collate_restores_runtime_schema_device(tmp_path):
+    schema = {
+        "node_0": BoundaryTensorSpec(
+            label="node_0",
+            symbolic_shape=("B", 2),
+            dtype="torch.float32",
+            requires_grad=False,
+            device_type="meta",
+        )
+    }
+    runtime = FakeBoundaryRuntime(schema)
+    payloads = [
+        BoundaryPayload(
+            split_id=runtime.split_id,
+            graph_signature=runtime.graph_signature,
+            batch_size=1,
+            tensors={"node_0": torch.ones(1, 2)},
+            schema=schema,
+            requires_grad={"node_0": False},
+            passthrough_inputs={"input": torch.ones(1, 3)},
+            protocol_version=2,
+            values=(),
+            value_schema=(),
+        )
+        for _ in range(2)
+    ]
+
+    codec = BoundaryPayloadCacheCodec(runtime)
+    path = tmp_path / "sample.pt"
+    codec.save(path, payloads[0])
+    loaded = codec.load(path)
+    collated = codec.collate([loaded, payloads[1]])
+
+    assert loaded.tensors["node_0"].device.type == "meta"
+    assert collated.batch_size == 2
+    assert collated.tensors["node_0"].device.type == "meta"
+    assert collated.passthrough_inputs["input"].device.type == "meta"
+    runtime.validate_boundary(collated)
+
+
 def test_boundary_payload_cache_rejects_affine_offset():
     payload, _runtime = _rfdetr_payload(batch_size=2)
     bad_schema = dict(payload.schema)
