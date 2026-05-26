@@ -10,8 +10,11 @@ from typing import Any
 
 import torch
 from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
+from ariadne.compiler.torch_compile import maybe_compile_segments
 from ariadne.codegen.segment_builder import build_segments
 from ariadne.planner.frontier import enumerate_frontier_splits
+from ariadne.planner.selector import select_split
+from ariadne.trace.tracer import trace_model
 from loguru import logger
 
 from model_management.payload import (
@@ -510,20 +513,51 @@ def prepare_exact_split_runtime(
     if boundary == "auto":
         return prepare_split_runtime(model, sample_input, split_spec, mode=mode)
 
-    auto_split_spec = replace(split_spec, boundary="auto")
-    runtime = prepare_split_runtime(
+    plan = trace_model(
         model,
-        sample_input,
-        auto_split_spec,
+        example_inputs=_runtime_args(sample_input),
+        batch_symbol=split_spec.batch_symbol,
+        dynamic_batch=split_spec.dynamic_batch,
+        trace_batch_mode=split_spec.trace_batch_mode,
+    )
+    candidates = tuple(enumerate_frontier_splits(plan))
+    requested_operation_id = _normalise_after_id(boundary)
+    ariadne_candidate = next(
+        (
+            candidate
+            for candidate in candidates
+            if requested_operation_id
+            and requested_operation_id
+            in {
+                _ariadne_candidate_operation_split_id(candidate),
+                _normalise_after_id(_ariadne_candidate_operation_node(candidate)),
+            }
+        ),
+        None,
+    )
+    if ariadne_candidate is None:
+        ariadne_candidate = select_split(
+            plan,
+            split=split_spec,
+            candidates=candidates,
+        )
+    exact_candidate = _exact_ariadne_candidate(ariadne_candidate)
+    exact_split_spec = replace(
+        split_spec,
+        boundary=_ariadne_candidate_operation_split_id(exact_candidate),
+    )
+    segments = maybe_compile_segments(
+        build_segments(plan, exact_candidate),
+        mode=mode,
+        compile_options=None,
+    )
+    return SplitRuntime(
+        trace_plan=plan,
+        split_spec=exact_split_spec,
+        candidate=exact_candidate,
+        segments=segments,
         mode=mode,
     )
-    splitter = UniversalModelSplitter().bind_runtime(
-        runtime,
-        model=model,
-        split_spec=auto_split_spec,
-    )
-    splitter.split(candidate_id=boundary)
-    return splitter._ensure_runtime()
 
 
 class UniversalModelSplitter:
