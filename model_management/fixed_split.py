@@ -1281,6 +1281,7 @@ def load_or_compute_fixed_split_plan(
     sample_input_shape = _input_tensor_shape_from_sample(sample_input)
     model_key = model_name or model.__class__.__name__
     cached = load_split_plan(cache_path) if cache_path else None
+    cached_invalidated = False
 
     if runtime.graph is not None and runtime.model is not None and cached is not None:
         trace_signature = _trace_signature(runtime)
@@ -1310,7 +1311,8 @@ def load_or_compute_fixed_split_plan(
                         "cached_validation_time_sec": float(validation_elapsed),
                     }
                 return cached
-            except (KeyError, RuntimeError) as exc:
+            except (KeyError, RuntimeError, ValueError) as exc:
+                cached_invalidated = True
                 logger.info("Cached fixed split plan invalidated; recomputing. {}", exc)
 
     plan = compute_fixed_split_for_model(
@@ -1325,7 +1327,7 @@ def load_or_compute_fixed_split_plan(
         input_resize_mode=input_resize_mode,
         front_version=front_version,
     )
-    if cache_path and cached is None:
+    if cache_path and (cached is None or cached_invalidated):
         persist_split_plan(cache_path, plan)
     elif cache_path and cached is not None and cached.matches(
         model_name=model_key,

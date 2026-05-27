@@ -151,9 +151,9 @@ server:
  server_id: 0
  golden: rtdetr_x
  # lightweight model used to generate fine-tuned weights for the edge
- edge_model_name: rfdetr_nano
+ edge_model_name: yolo26n
  # Cloud-side starting point for retraining the edge model; golden uses server.golden.
- weights_path: ./model_management/models/rf-detr-nano.pth
+ weights_path: ./model_management/models/yolo26n.pt
  tinynext_input_size: 640
  # gRPC listen address for the cloud server
  listen_address: "[::]:50051"

@@ -683,6 +683,58 @@ def test_fixed_split_lazy_planner_does_not_overwrite_stale_cache(tmp_path):
     assert plan.validation["selection"] == "lazy_constraints"
 
 
+def test_fixed_split_recomputes_and_overwrites_unreplayable_matching_cache(
+    tmp_path,
+    monkeypatch,
+):
+    import model_management.fixed_split as fixed_split
+
+    cache_path = tmp_path / "fixed_split_plan.json"
+    stale = _dummy_plan()
+    stale.candidate_id = "after:node_247"
+    stale.canonical_split_key = "after:node_247"
+    stale.edge_split_id = "after:node_247"
+    stale.trace_signature = "same-runtime"
+    stale.input_tensor_shape = [1, 4]
+    persist_split_plan(str(cache_path), stale)
+
+    fresh = _dummy_plan()
+    fresh.candidate_id = "after:model.22"
+    fresh.canonical_split_key = "after:model.22"
+    fresh.edge_split_id = "after:model.22"
+    fresh.trace_signature = "same-runtime"
+    fresh.input_tensor_shape = [1, 4]
+
+    class Runtime:
+        graph = "same-runtime"
+        model = object()
+
+        def split(self, *, candidate_id=None, **_kwargs):
+            if candidate_id == "after:node_247":
+                raise ValueError("No split matches 'after:node_247'.")
+            raise AssertionError(f"unexpected candidate_id={candidate_id!r}")
+
+    def fake_compute(*_args, **_kwargs):
+        return fresh
+
+    monkeypatch.setattr(fixed_split, "compute_fixed_split_for_model", fake_compute)
+
+    plan = load_or_compute_fixed_split_plan(
+        torch.nn.Linear(4, 2),
+        SplitConstraints(privacy_leakage_upper_bound=0.0),
+        sample_input=torch.randn(2, 4),
+        splitter=Runtime(),
+        cache_path=str(cache_path),
+        model_name=stale.model_name,
+    )
+
+    assert plan.canonical_split_key == "after:model.22"
+    with cache_path.open("r", encoding="utf-8") as handle:
+        persisted = json.load(handle)
+    assert persisted["canonical_split_key"] == "after:model.22"
+    assert persisted["candidate_id"] == "after:model.22"
+
+
 def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_available():
     constraints = SplitConstraints(
         privacy_leakage_upper_bound=1.0 / 40.0,

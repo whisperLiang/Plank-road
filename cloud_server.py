@@ -5234,13 +5234,25 @@ class CloudContinualLearner:
             model_family=model_family,
         )
         trace_started = time.perf_counter()
-        runtime, runtime_mode = self._prepare_replayable_split_runtime(
-            split_model,
-            sample_input,
-            split_spec,
-            model_name=model_name,
-            preferred_mode=self._preferred_fixed_split_runtime_mode(model_family),
-        )
+        try:
+            runtime, runtime_mode = self._prepare_replayable_split_runtime(
+                split_model,
+                sample_input,
+                split_spec,
+                model_name=model_name,
+                preferred_mode=self._preferred_fixed_split_runtime_mode(model_family),
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "No split matches" in message:
+                raise RuntimeError(
+                    "Fixed split plan is not replayable for the current cloud runtime "
+                    f"(requested={boundary!r}, model_name={model_name!r}). "
+                    "The edge likely reused a stale fixed_split_plan.json; restart the "
+                    "edge with this fix or clear the edge retrain cache so it recomputes "
+                    "a model-qualified Ariadne split plan."
+                ) from exc
+            raise
         self._validate_dynamic_batch_trainability(
             runtime,
             model,
