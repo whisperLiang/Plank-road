@@ -3765,6 +3765,46 @@ def test_cloud_sample_pool_training_records_get_runtime_shape_metadata(tmp_path)
     assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"pool-1", "pool-meta"}
 
 
+def test_pending_high_quality_layout_alignment_detects_rename_compatible(monkeypatch):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = object.__new__(CloudContinualLearner)
+    logged: list[str] = []
+
+    def capture_info(message, *args, **_kwargs):
+        logged.append(str(message).format(*args))
+
+    monkeypatch.setattr(cloud_server.logger, "info", capture_info)
+    pending = [
+        {
+            "sample_id": "hq-renamed",
+            "feature": {"edge_node": torch.ones(1, 4)},
+            "intermediate": boundary_payload_from_tensors(
+                {"edge_node": torch.ones(1, 4)},
+                split_id="after:edge_node",
+                graph_signature="edge-graph",
+            ),
+            "feature_layout_id": "edge-layout",
+            "source_feature_split_id": "after:edge_node",
+            "source_feature_graph_signature": "edge-graph",
+        }
+    ]
+
+    learner._log_pending_high_quality_layout_alignment(
+        pending_high_quality=pending,
+        expected_tensors={"node_0": torch.ones(1, 4)},
+        expected_source="runtime",
+        low_quality_tensors={"node_0": torch.ones(1, 4)},
+    )
+
+    messages = "\n".join(logged)
+    assert "pending high-quality layout alignment" in messages
+    assert "compatible=1" in messages
+    assert "rename_compatible=1" in messages
+    assert "mismatched=0" in messages
+
+
 def test_low_quality_staging_uses_runtime_resize_mode_over_stale_manifest():
     from cloud_server import CloudContinualLearner
 
@@ -3947,9 +3987,18 @@ def test_boundary_payload_passthrough_survives_sample_store_roundtrip(tmp_path):
         assert isinstance(candidates[0]["intermediate"], BoundaryPayload)
         assert candidates[0]["intermediate"].schema["node_0"].symbolic_shape == ("B", "features")
         assert candidates[0]["intermediate"].requires_grad["node_0"] is True
+        assert candidates[0]["feature_layout_id"]
+        assert candidates[0]["source_feature_layout_id"] == candidates[0]["feature_layout_id"]
+        assert candidates[0]["source_feature_schema_hash"]
+        assert candidates[0]["source_feature_value_schema_hash"] == ""
+        assert candidates[0]["source_feature_split_id"] == "after:node_0"
+        assert candidates[0]["source_feature_graph_signature"] == "graph-sig"
 
         pool = CloudSamplePool(root_dir=str(tmp_path / "pool"), max_active_samples=8)
         pool.store_pending_high_quality_samples(candidates)
+        pending = pool.load_pending_high_quality_samples()
+        assert pending[0]["source_feature_schema_hash"] == candidates[0]["source_feature_schema_hash"]
+        assert pending[0]["source_feature_split_id"] == "after:node_0"
         contract = SplitRuntimeContract.create(
             edge_id=1,
             model_id="model-a",

@@ -341,7 +341,7 @@ def test_canonical_rebuild_carries_schema_payload_with_non_unit_physical_first_a
     }
 
 
-def test_canonical_rebuild_rejects_high_quality_missing_contract_tensor(tmp_path):
+def test_canonical_rebuild_defers_pending_high_quality_missing_contract_tensor(tmp_path):
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
     contract = _build_split_contract()
@@ -349,17 +349,29 @@ def test_canonical_rebuild_rejects_high_quality_missing_contract_tensor(tmp_path
     candidate["feature"] = {"edge_only_tensor": torch.ones(1, 4)}
 
     pool.store_pending_high_quality_samples([candidate])
+    pool.stage_low_quality_samples([_low_quality_candidate("lq-1", created_at=2.0)])
     stats, _kept = pool.rebuild_canonical_training_pool(
         split_contract=contract,
         existing_active_samples=[],
         pending_high_quality_samples=pool.load_pending_high_quality_samples(),
-        new_low_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
     )
 
     validation = stats["validation"]
     assert validation["accepted_high_quality"] == 0
-    assert validation["skipped_feature_layout"] == 1
-    assert pool.list_active_samples() == []
+    assert validation["accepted_low_quality"] == 1
+    assert validation["deferred_feature_layout"] == 1
+    assert "hq-missing" in validation["deferred_feature_layout_preview"][0]
+    assert "edge_only_tensor" in validation["deferred_feature_layout_preview"][0]
+    assert validation["skipped_feature_layout"] == 0
+    assert validation["invalid_high_quality"] == 0
+    assert stats["replacement"]["dropped_high_quality"] == 0
+    assert stats["replacement"]["dropped_invalid"] == 0
+    assert stats["replacement"]["deferred_feature_layout"] == 1
+    assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"lq-1"}
+    assert {entry["sample_id"] for entry in pool.load_pending_high_quality_samples()} == {
+        "hq-missing"
+    }
 
 
 def test_canonical_rebuild_replaces_previous_generation_files(tmp_path):
@@ -598,6 +610,7 @@ def test_canonical_rebuild_drops_samples_with_stale_contract(tmp_path):
     assert validation["accepted_high_quality"] == 0
     assert validation["skipped_stale_contract"] == 1
     assert pool.list_active_samples() == []
+    assert pool.load_pending_high_quality_samples() == []
 
 
 def test_canonical_rebuild_enforces_max_samples(tmp_path):

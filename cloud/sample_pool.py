@@ -490,6 +490,37 @@ def _feature_metadata_from_candidate(candidate: Mapping[str, Any]) -> dict[str, 
     }
 
 
+def _feature_layout_source_metadata(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: candidate[key]
+        for key in (
+            "source_feature_layout_id",
+            "source_feature_schema_hash",
+            "source_feature_value_schema_hash",
+            "source_feature_split_id",
+            "source_feature_graph_signature",
+        )
+        if candidate.get(key) is not None
+    }
+
+
+def _feature_layout_debug_summary(
+    *,
+    sample_id: str,
+    expected_layout: Mapping[str, Any] | None,
+    actual_layout: Mapping[str, Any] | None,
+    source_metadata: Mapping[str, Any] | None = None,
+) -> str:
+    payload = {
+        "sample_id": sample_id,
+        "expected_layout": expected_layout,
+        "actual_layout": actual_layout,
+    }
+    if source_metadata:
+        payload["source_metadata"] = dict(source_metadata)
+    return _stable_json(payload)
+
+
 def _has_stale_contract_metadata(
     candidate: Mapping[str, Any],
     split_contract: SplitRuntimeContract,
@@ -847,6 +878,7 @@ class CloudSamplePool:
             "risk_score": _to_float(metadata.get("risk_score", sample.get("risk_score", 0.0))),
             "in_drift_window": sample.get("in_drift_window"),
             "window_id": None if sample.get("window_id") is None else str(sample.get("window_id")),
+            **_feature_layout_source_metadata(sample),
         }
 
     def _write_stage_records(
@@ -1475,18 +1507,21 @@ class CloudSamplePool:
                 "carried_forward_compatible": 0,
                 "skipped_stale_contract": 0,
                 "skipped_feature_layout": 0,
+                "deferred_feature_layout": 0,
                 "skipped_label_bounds": 0,
                 "skipped_label_metadata": 0,
                 "skipped_unreadable": 0,
+                "invalid_high_quality": 0,
+                "invalid_low_quality": 0,
             }
             validation_previews: dict[str, list[str]] = {
                 key: []
                 for key in validation_counts
-                if key.startswith("skipped_")
+                if key.startswith("skipped_") or key.startswith("deferred_")
             }
             accepted: list[CanonicalSampleRecord] = []
             invalid_records: list[CanonicalSampleRecord] = []
-            consumed_staging_paths: list[str] = []
+            unreadable_staging_paths: list[str] = []
             all_inputs = (
                 [("existing_active", candidate) for candidate in list(existing_active_samples or [])]
                 + [
@@ -1509,8 +1544,6 @@ class CloudSamplePool:
                     validation_counts["skipped_stale_contract"] += 1
                     validation_previews["skipped_stale_contract"].append(sample_id)
                     continue
-                if candidate.get("__staging_path"):
-                    consumed_staging_paths.append(str(candidate.get("__staging_path")))
                 try:
                     record = self._candidate_to_canonical_record(
                         candidate,
@@ -1525,14 +1558,34 @@ class CloudSamplePool:
                         ) from exc
                     validation_counts["skipped_unreadable"] += 1
                     validation_previews["skipped_unreadable"].append(sample_id)
+                    if candidate.get("__staging_path"):
+                        unreadable_staging_paths.append(str(candidate.get("__staging_path")))
                     continue
                 skip_reason = self._validate_canonical_record(
                     record,
                     split_contract=split_contract,
                 )
                 if skip_reason is not None:
+                    if (
+                        input_source == "pending_high_quality"
+                        and skip_reason == "skipped_feature_layout"
+                    ):
+                        validation_counts["deferred_feature_layout"] += 1
+                        validation_previews["deferred_feature_layout"].append(
+                            _feature_layout_debug_summary(
+                                sample_id=record.sample_id,
+                                expected_layout=split_contract.feature_layout,
+                                actual_layout=feature_layout_from_tensors(record.feature),
+                                source_metadata=_feature_layout_source_metadata(candidate),
+                            )
+                        )
+                        continue
                     validation_counts[skip_reason] += 1
                     validation_previews[skip_reason].append(record.sample_id)
+                    if record.sample_source == "low_quality":
+                        validation_counts["invalid_low_quality"] += 1
+                    else:
+                        validation_counts["invalid_high_quality"] += 1
                     invalid_records.append(record)
                     continue
                 if contract_id_mismatch:
@@ -1562,10 +1615,12 @@ class CloudSamplePool:
                 "dropped": len(dropped) + len(invalid_records),
                 "dropped_high_quality": sum(
                     1 for record in dropped if record.sample_source == "high_quality"
-                ),
+                )
+                + validation_counts["invalid_high_quality"],
                 "dropped_low_quality": sum(
                     1 for record in dropped if record.sample_source == "low_quality"
-                ),
+                )
+                + validation_counts["invalid_low_quality"],
                 "dropped_stale": validation_counts["skipped_stale_contract"],
                 "dropped_invalid": sum(
                     int(validation_counts[key])
@@ -1580,6 +1635,7 @@ class CloudSamplePool:
                 "carried_forward_compatible": validation_counts[
                     "carried_forward_compatible"
                 ],
+                "deferred_feature_layout": validation_counts["deferred_feature_layout"],
             }
             stats = {
                 "validation": {
@@ -1597,7 +1653,7 @@ class CloudSamplePool:
                 stats=stats,
             )
             processed_count = self._delete_staging_records(kept + dropped + invalid_records)
-            processed_count += self._delete_staging_paths(consumed_staging_paths)
+            processed_count += self._delete_staging_paths(unreadable_staging_paths)
             stats["generation_commit"] = {
                 **commit_stats,
                 "deleted_processed_staging_files": processed_count,

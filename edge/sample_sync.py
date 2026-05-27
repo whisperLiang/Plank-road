@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import io
+import hashlib
 import json
 import os
 import tempfile
@@ -21,6 +22,7 @@ from edge.quality_assessor import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
 from model_management.detection_box_projection import ORIGINAL_XYXY
 from model_management.payload import BoundaryPayload
+from model_management.split_contract import feature_layout_from_tensors
 HIGH_QUALITY_SYNC_PROTOCOL_VERSION = "high-quality-feature-label-shard.v2"
 UPLOAD_LEDGER_VERSION = "edge-sample-upload-ledger.v1"
 UPLOAD_LEDGER_FILENAME = "upload_ledger.json"
@@ -43,6 +45,14 @@ def _first_nonempty(*values: object) -> str:
         if text:
             return text
     return ""
+
+
+def _stable_json(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+
+
+def _hash_payload(payload: object) -> str:
+    return hashlib.sha1(_stable_json(payload).encode("utf-8")).hexdigest()
 
 
 def _atomic_json_dump(path: str, payload: Mapping[str, Any]) -> None:
@@ -126,6 +136,54 @@ def _training_labels(result: Mapping[str, Any], record: StoredSampleRecord) -> d
     if getattr(record, "input_resize_mode", None):
         labels["label_resize_mode"] = str(record.input_resize_mode)
     return labels
+
+
+def _feature_layout_metadata(intermediate: Any) -> dict[str, Any]:
+    if not isinstance(intermediate, BoundaryPayload):
+        return {}
+    tensors = {
+        str(label): tensor.detach().cpu()
+        for label, tensor in dict(intermediate.tensors or {}).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    layout = feature_layout_from_tensors(tensors) if tensors else {}
+    schema_payload = {}
+    for label, spec in dict(getattr(intermediate, "schema", {}) or {}).items():
+        schema_payload[str(label)] = {
+            "label": str(getattr(spec, "label", label)),
+            "symbolic_shape": [str(dim) for dim in list(getattr(spec, "symbolic_shape", ()) or ())],
+            "dtype": str(getattr(spec, "dtype", "")),
+            "requires_grad": bool(getattr(spec, "requires_grad", False)),
+            "device_type": str(getattr(spec, "device_type", "")),
+        }
+    value_schema_payload = [
+        {
+            "label": str(getattr(spec, "label", "")),
+            "tensor_spec": {
+                "label": str(getattr(getattr(spec, "tensor_spec", None), "label", "")),
+                "symbolic_shape": [
+                    str(dim)
+                    for dim in list(
+                        getattr(getattr(spec, "tensor_spec", None), "symbolic_shape", ()) or ()
+                    )
+                ],
+                "dtype": str(getattr(getattr(spec, "tensor_spec", None), "dtype", "")),
+                "requires_grad": bool(
+                    getattr(getattr(spec, "tensor_spec", None), "requires_grad", False)
+                ),
+                "device_type": str(getattr(getattr(spec, "tensor_spec", None), "device_type", "")),
+            },
+        }
+        for spec in tuple(getattr(intermediate, "value_schema", ()) or ())
+    ]
+    return {
+        "feature_layout_id": _hash_payload(layout) if layout else "",
+        "feature_layout": layout,
+        "feature_schema_hash": _hash_payload(schema_payload) if schema_payload else "",
+        "feature_value_schema_hash": _hash_payload(value_schema_payload) if value_schema_payload else "",
+        "feature_split_id": str(getattr(intermediate, "split_id", "") or ""),
+        "feature_graph_signature": str(getattr(intermediate, "graph_signature", "") or ""),
+    }
 
 
 def pack_high_quality_sync_bundle(
@@ -243,6 +301,7 @@ def pack_high_quality_sync_bundle_to_file(
                     intermediate = sample_store.load_intermediate(record)
                     result = sample_store.load_inference_result(record)
                     feature_sample = _feature_sample_payload(intermediate)
+                    feature_sample.update(_feature_layout_metadata(intermediate))
                     if record.input_image_size is not None:
                         feature_sample["input_image_size"] = list(record.input_image_size)
                     if record.input_tensor_shape is not None:

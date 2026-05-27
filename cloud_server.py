@@ -2626,6 +2626,129 @@ class CloudContinualLearner:
                     return tensors
         return None
 
+    @staticmethod
+    def _feature_layout_summary_from_candidate(
+        candidate: Mapping[str, object],
+    ) -> dict[str, object]:
+        tensors = CloudContinualLearner._feature_tensors_from_record(candidate)
+        layout = feature_layout_from_tensors(tensors)
+        return {
+            "sample_id": str(candidate.get("sample_id") or ""),
+            "feature_layout_id": str(
+                candidate.get("feature_layout_id") or make_feature_layout_id(layout)
+            ),
+            "feature_layout": layout,
+            "source_feature_layout_id": str(candidate.get("source_feature_layout_id") or ""),
+            "source_feature_schema_hash": str(candidate.get("source_feature_schema_hash") or ""),
+            "source_feature_value_schema_hash": str(
+                candidate.get("source_feature_value_schema_hash") or ""
+            ),
+            "source_feature_split_id": str(candidate.get("source_feature_split_id") or ""),
+            "source_feature_graph_signature": str(
+                candidate.get("source_feature_graph_signature") or ""
+            ),
+        }
+
+    @staticmethod
+    def _layout_specs_match_ignoring_labels(
+        actual: Mapping[str, Mapping[str, object]],
+        expected: Mapping[str, Mapping[str, object]],
+    ) -> bool:
+        def normalised_specs(layout: Mapping[str, Mapping[str, object]]) -> list[dict[str, object]]:
+            specs: list[dict[str, object]] = []
+            for spec in dict(layout or {}).values():
+                if not isinstance(spec, Mapping):
+                    continue
+                specs.append(
+                    {
+                        "dtype": str(spec.get("dtype") or ""),
+                        "shape_without_batch": [
+                            int(dim) for dim in list(spec.get("shape_without_batch") or [])
+                        ],
+                    }
+                )
+            return sorted(specs, key=lambda item: _stable_json_dumps(item))
+
+        return normalised_specs(actual) == normalised_specs(expected)
+
+    def _log_pending_high_quality_layout_alignment(
+        self,
+        *,
+        pending_high_quality: list[Mapping[str, object]],
+        expected_tensors: Mapping[str, torch.Tensor] | None,
+        expected_source: str,
+        low_quality_tensors: Mapping[str, torch.Tensor] | None,
+    ) -> None:
+        if not pending_high_quality:
+            return
+        if expected_tensors is None:
+            logger.warning(
+                "[SamplePool] pending high-quality layout alignment skipped: no {} layout is available (pending={}).",
+                expected_source,
+                len(pending_high_quality),
+            )
+            return
+        expected_layout = feature_layout_from_tensors(expected_tensors)
+        expected_layout_id = make_feature_layout_id(expected_layout)
+        low_quality_layout = (
+            feature_layout_from_tensors(low_quality_tensors)
+            if low_quality_tensors is not None
+            else None
+        )
+        compatible = 0
+        renamed_compatible = 0
+        mismatches: list[dict[str, object]] = []
+        for candidate in pending_high_quality:
+            try:
+                summary = self._feature_layout_summary_from_candidate(candidate)
+            except Exception as exc:
+                mismatches.append(
+                    {
+                        "sample_id": str(candidate.get("sample_id") or ""),
+                        "reason": f"unreadable:{type(exc).__name__}",
+                    }
+                )
+                continue
+            actual_layout = dict(summary.get("feature_layout") or {})
+            if summary.get("feature_layout_id") == expected_layout_id:
+                compatible += 1
+                continue
+            can_rename_with_schema = isinstance(
+                candidate.get("intermediate") or candidate.get("boundary_payload"),
+                BoundaryPayload,
+            )
+            if (
+                can_rename_with_schema
+                and self._layout_specs_match_ignoring_labels(actual_layout, expected_layout)
+            ):
+                compatible += 1
+                renamed_compatible += 1
+                continue
+            if len(mismatches) < 5:
+                mismatches.append(
+                    {
+                        **summary,
+                        "expected_feature_layout_id": expected_layout_id,
+                        "expected_feature_layout": expected_layout,
+                        "expected_source": expected_source,
+                    }
+                )
+        logger.info(
+            "[SamplePool] pending high-quality layout alignment: pending={} compatible={} rename_compatible={} mismatched={} expected_source={} expected_feature_layout_id={} low_quality_feature_layout_id={}.",
+            len(pending_high_quality),
+            compatible,
+            renamed_compatible,
+            len(pending_high_quality) - compatible,
+            expected_source,
+            expected_layout_id,
+            make_feature_layout_id(low_quality_layout) if low_quality_layout else "",
+        )
+        if mismatches:
+            logger.warning(
+                "[SamplePool] pending high-quality layout mismatch preview={}",
+                mismatches,
+            )
+
     def _contract_layout_tensors_from_runtime(
         self,
         *,
@@ -2810,6 +2933,7 @@ class CloudContinualLearner:
         edge_id: int | str,
         manifest: Mapping[str, object],
         feature_tensors: Mapping[str, torch.Tensor] | None = None,
+        contract_layout_tensors: Mapping[str, torch.Tensor] | None = None,
         model: torch.nn.Module | None = None,
         splitter: UniversalModelSplitter | None = None,
         candidate: object | None = None,
@@ -2849,13 +2973,20 @@ class CloudContinualLearner:
                 )
                 if runtime_split_id != existing.cloud_batch_split_id:
                     stale_reason = "cloud_batch_split_id"
-                layout_tensors_for_existing = self._contract_layout_tensors_from_runtime(
-                    splitter=splitter,
-                    candidate=candidate,
-                    input_tensor_shape=[
-                        int(dim)
-                        for dim in list(context.get("input_tensor_shape", []) or [])
-                    ],
+                layout_tensors_for_existing = (
+                    {
+                        str(label): tensor
+                        for label, tensor in dict(contract_layout_tensors or {}).items()
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                    or self._contract_layout_tensors_from_runtime(
+                        splitter=splitter,
+                        candidate=candidate,
+                        input_tensor_shape=[
+                            int(dim)
+                            for dim in list(context.get("input_tensor_shape", []) or [])
+                        ],
+                    )
                 )
                 if (
                     stale_reason is None
@@ -2940,10 +3071,19 @@ class CloudContinualLearner:
                 "SplitRuntimeContract runtime split does not match the exact plan split "
                 f"(expected={canonical_split_key!r}, actual={cloud_batch_split_id!r})."
             )
-        layout_tensors = self._contract_layout_tensors_from_runtime(
-            splitter=splitter,
-            candidate=batch_candidate,
-            input_tensor_shape=[int(dim) for dim in list(context.get("input_tensor_shape", []) or [])],
+        layout_tensors = (
+            {
+                str(label): tensor
+                for label, tensor in dict(contract_layout_tensors or {}).items()
+                if isinstance(tensor, torch.Tensor)
+            }
+            or self._contract_layout_tensors_from_runtime(
+                splitter=splitter,
+                candidate=batch_candidate,
+                input_tensor_shape=[
+                    int(dim) for dim in list(context.get("input_tensor_shape", []) or [])
+                ],
+            )
         )
         contract_feature_tensors = layout_tensors or feature_tensors
         if contract_feature_tensors is None:
@@ -3136,6 +3276,7 @@ class CloudContinualLearner:
                 }
                 if not single_tensors:
                     raise ValueError("low-quality record has no feature tensors")
+                feature_layout = feature_layout_from_tensors(single_tensors)
             except Exception as exc:
                 logger.warning(
                     "[FixedSplitCL] Skipping low-quality sample {} with unreadable feature tensors: {}",
@@ -3171,6 +3312,16 @@ class CloudContinualLearner:
                     "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape)],
                     "input_resize_mode": resolved_resize_mode,
                     "created_at": time.time(),
+                    "feature_layout_id": make_feature_layout_id(feature_layout),
+                    "source_feature_layout_id": make_feature_layout_id(feature_layout),
+                    "source_feature_schema_hash": "",
+                    "source_feature_value_schema_hash": "",
+                    "source_feature_split_id": str(
+                        getattr(boundary_payload, "split_id", "") if isinstance(boundary_payload, BoundaryPayload) else ""
+                    ),
+                    "source_feature_graph_signature": str(
+                        getattr(boundary_payload, "graph_signature", "") if isinstance(boundary_payload, BoundaryPayload) else ""
+                    ),
                 }
             )
         return processed_samples
@@ -6926,6 +7077,37 @@ class CloudContinualLearner:
                         "model_id": manifest_model_id,
                         "split_config_id": manifest_split_config_id,
                         "front_version": manifest_front_version,
+                        "feature_layout_id": str(
+                            feature_value.get("feature_layout_id")
+                            or make_feature_layout_id(feature_layout_from_tensors(single_tensors))
+                        ),
+                        "source_feature_layout_id": str(
+                            feature_value.get("source_feature_layout_id")
+                            or feature_value.get("feature_layout_id")
+                            or make_feature_layout_id(feature_layout_from_tensors(single_tensors))
+                        ),
+                        "source_feature_schema_hash": str(
+                            feature_value.get("source_feature_schema_hash")
+                            or feature_value.get("feature_schema_hash")
+                            or ""
+                        ),
+                        "source_feature_value_schema_hash": str(
+                            feature_value.get("source_feature_value_schema_hash")
+                            or feature_value.get("feature_value_schema_hash")
+                            or ""
+                        ),
+                        "source_feature_split_id": str(
+                            feature_value.get("source_feature_split_id")
+                            or feature_value.get("feature_split_id")
+                            or getattr(boundary_payload, "split_id", "")
+                            or ""
+                        ),
+                        "source_feature_graph_signature": str(
+                            feature_value.get("source_feature_graph_signature")
+                            or feature_value.get("feature_graph_signature")
+                            or getattr(boundary_payload, "graph_signature", "")
+                            or ""
+                        ),
                         "input_image_size": (
                             [int(dim) for dim in list(sample_input_image_size)]
                             if sample_input_image_size is not None
@@ -7174,18 +7356,47 @@ class CloudContinualLearner:
                     model_input_size=pool_model_input_size,
                     resize_mode=pool_input_resize_mode,
                 )
-                representative_features = self._first_candidate_feature_tensors(
+                pending_high_quality = sample_pool.load_pending_high_quality_samples()
+                low_quality_representative_features = self._first_candidate_feature_tensors(
                     low_quality_staging_candidates
+                )
+                contract_layout_tensors = self._contract_layout_tensors_from_runtime(
+                    splitter=prepared_splitter,
+                    candidate=prepared_candidate,
+                    input_tensor_shape=[
+                        int(dim)
+                        for dim in list(
+                            self._sample_pool_manifest_context(manifest).get(
+                                "input_tensor_shape",
+                                [],
+                            )
+                            or []
+                        )
+                    ],
+                )
+                representative_features = (
+                    contract_layout_tensors or low_quality_representative_features
                 )
                 if representative_features is None:
                     raise RuntimeError(
                         "No rebuilt low-quality feature sample was available to create "
                         "the SplitRuntimeContract."
                     )
+                self._log_pending_high_quality_layout_alignment(
+                    pending_high_quality=pending_high_quality,
+                    expected_tensors=representative_features,
+                    expected_source=(
+                        "runtime"
+                        if contract_layout_tensors is not None
+                        else "low_quality_rebuild"
+                    ),
+                    low_quality_tensors=low_quality_representative_features,
+                )
                 split_contract = self._get_or_create_split_runtime_contract(
                     edge_id=edge_id,
                     manifest=manifest,
                     feature_tensors=representative_features,
+                    contract_layout_tensors=contract_layout_tensors,
                     model=tmp_model,
                     splitter=prepared_splitter,
                     candidate=prepared_candidate,
@@ -7195,7 +7406,6 @@ class CloudContinualLearner:
                 staging_stats = sample_pool.stage_low_quality_samples(
                     low_quality_staging_candidates
                 )
-                pending_high_quality = sample_pool.load_pending_high_quality_samples()
                 staging_low_quality = sample_pool.load_staging_low_quality_samples()
                 existing_active = sample_pool.load_active_samples_for_rebuild(
                     split_contract=split_contract,
@@ -7224,23 +7434,33 @@ class CloudContinualLearner:
                     "[SamplePool] canonical validation: "
                     "accepted_high_quality={} accepted_low_quality={} "
                     "migrated_contract_id={} carried_forward_compatible={} "
-                    "skipped_stale_contract={} skipped_feature_layout={} "
+                    "invalid_high_quality={} invalid_low_quality={} "
+                    "deferred_feature_layout={} skipped_stale_contract={} skipped_feature_layout={} "
                     "skipped_label_bounds={} skipped_label_metadata={} "
                     "skipped_unreadable={}.",
                     validation_stats.get("accepted_high_quality", 0),
                     validation_stats.get("accepted_low_quality", 0),
                     validation_stats.get("migrated_contract_id", 0),
                     validation_stats.get("carried_forward_compatible", 0),
+                    validation_stats.get("invalid_high_quality", 0),
+                    validation_stats.get("invalid_low_quality", 0),
+                    validation_stats.get("deferred_feature_layout", 0),
                     validation_stats.get("skipped_stale_contract", 0),
                     validation_stats.get("skipped_feature_layout", 0),
                     validation_stats.get("skipped_label_bounds", 0),
                     validation_stats.get("skipped_label_metadata", 0),
                     validation_stats.get("skipped_unreadable", 0),
                 )
+                deferred_preview = validation_stats.get("deferred_feature_layout_preview")
+                if deferred_preview:
+                    logger.warning(
+                        "[SamplePool] deferred pending high-quality feature-layout mismatch preview={}",
+                        deferred_preview,
+                    )
                 logger.info(
                     "[SamplePool] replacement: before={} incoming={} kept={} "
                     "dropped={} dropped_high_quality={} dropped_low_quality={} "
-                    "dropped_stale={} dropped_invalid={} "
+                    "dropped_stale={} dropped_invalid={} deferred_feature_layout={} "
                     "migrated_contract_id={} carried_forward_compatible={}.",
                     replacement_stats.get("before", 0),
                     replacement_stats.get("incoming", 0),
@@ -7250,6 +7470,7 @@ class CloudContinualLearner:
                     replacement_stats.get("dropped_low_quality", 0),
                     replacement_stats.get("dropped_stale", 0),
                     replacement_stats.get("dropped_invalid", 0),
+                    replacement_stats.get("deferred_feature_layout", 0),
                     replacement_stats.get("migrated_contract_id", 0),
                     replacement_stats.get("carried_forward_compatible", 0),
                 )
