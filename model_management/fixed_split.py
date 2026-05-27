@@ -11,8 +11,6 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 import torch
-from ariadne import SplitRuntime
-from ariadne.codegen.segment_builder import build_segments
 from ariadne.planner.frontier import enumerate_frontier_splits
 from ariadne.trace.tracer import trace_model
 from loguru import logger
@@ -25,10 +23,11 @@ from model_management.universal_model_split import (
     _candidate_from_ariadne_candidate,
     _exact_ariadne_candidate,
     build_candidate_descriptor,
+    prepare_exact_split_runtime,
 )
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v5"
+FIXED_SPLIT_PLAN_VERSION = "fixed-split.v6"
 FIXED_SPLIT_DYNAMIC_BATCH_MAX = 64
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
@@ -936,20 +935,31 @@ def _bind_lazy_ariadne_candidate(
     lazy_candidate: _LazyAriadneCandidate,
     mode: str = "generated_eager",
 ) -> SplitCandidate:
-    exact_spec = replace(split_spec, boundary=lazy_candidate.operation_split_id)
-    exact_candidate = _exact_ariadne_candidate(lazy_candidate.candidate)
-    ariadne_runtime = SplitRuntime(
-        trace_plan=plan,
-        split_spec=exact_spec,
-        candidate=exact_candidate,
-        segments=build_segments(plan, exact_candidate),
+    del plan
+    exact_spec = replace(
+        split_spec,
+        boundary=lazy_candidate.operation_split_id,
+    )
+    ariadne_runtime = prepare_exact_split_runtime(
+        model,
+        sample_input,
+        exact_spec,
         mode=mode,
     )
     runtime.bind_runtime(ariadne_runtime, model=model, split_spec=exact_spec)
     runtime._trace_sample_input = sample_input
+    exact_candidate = getattr(ariadne_runtime, "candidate", None)
+    if exact_candidate is None:
+        exact_candidate = _exact_ariadne_candidate(lazy_candidate.candidate)
+    actual_split_id = _ariadne_candidate_operation_split_id(exact_candidate)
+    if actual_split_id != lazy_candidate.operation_split_id:
+        raise ValueError(
+            "Exact Ariadne split runtime resolved a different split candidate "
+            f"(requested={lazy_candidate.operation_split_id!r}, actual={actual_split_id!r})."
+        )
     candidate = _candidate_from_ariadne_candidate(
         ariadne_runtime,
-        exact_spec,
+        getattr(ariadne_runtime, "split_spec", exact_spec),
         exact_candidate,
     )
     candidate.edge_parameter_count = int(lazy_candidate.edge_parameter_count)
@@ -1031,14 +1041,18 @@ def _compute_lazy_fixed_split_for_model(
     validation_report: Mapping[str, Any] | None = None
     for lazy_candidate in eligible[:max_attempts]:
         attempts += 1
-        candidate = _bind_lazy_ariadne_candidate(
-            runtime,
-            model=model,
-            sample_input=sample_input,
-            split_spec=split_spec,
-            plan=plan,
-            lazy_candidate=lazy_candidate,
-        )
+        try:
+            candidate = _bind_lazy_ariadne_candidate(
+                runtime,
+                model=model,
+                sample_input=sample_input,
+                split_spec=split_spec,
+                plan=plan,
+                lazy_candidate=lazy_candidate,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep trying the next exact split candidate
+            validation_error_counts[str(exc) or type(exc).__name__] += 1
+            continue
         if not constraints.validate_candidates:
             chosen = candidate
             chosen_lazy = lazy_candidate
@@ -1282,8 +1296,20 @@ def load_or_compute_fixed_split_plan(
     model_key = model_name or model.__class__.__name__
     cached = load_split_plan(cache_path) if cache_path else None
     cached_invalidated = False
+    if cached is not None and cached.plan_version != FIXED_SPLIT_PLAN_VERSION:
+        cached_invalidated = True
+        logger.info(
+            "Cached fixed split plan version {} is stale; recomputing with {}.",
+            cached.plan_version,
+            FIXED_SPLIT_PLAN_VERSION,
+        )
 
-    if runtime.graph is not None and runtime.model is not None and cached is not None:
+    if (
+        runtime.graph is not None
+        and runtime.model is not None
+        and cached is not None
+        and not cached_invalidated
+    ):
         trace_signature = _trace_signature(runtime)
         if cached.matches(
             model_name=model_key,

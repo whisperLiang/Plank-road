@@ -339,7 +339,7 @@ def test_fixed_split_selects_operation_node_candidates():
         model_name="dummy-model",
     )
 
-    assert plan.plan_version == "fixed-split.v5"
+    assert plan.plan_version == "fixed-split.v6"
     assert plan.candidate_id == "after:node_1"
     assert plan.canonical_split_key == "after:node_1"
     assert plan.edge_split_id == "after:node_1"
@@ -733,6 +733,87 @@ def test_fixed_split_recomputes_and_overwrites_unreplayable_matching_cache(
         persisted = json.load(handle)
     assert persisted["canonical_split_key"] == "after:model.22"
     assert persisted["candidate_id"] == "after:model.22"
+
+
+def test_fixed_split_recomputes_and_overwrites_old_plan_version(
+    tmp_path,
+    monkeypatch,
+):
+    import model_management.fixed_split as fixed_split
+
+    cache_path = tmp_path / "fixed_split_plan.json"
+    stale = _dummy_plan()
+    stale.plan_version = "fixed-split.v5"
+    persist_split_plan(str(cache_path), stale)
+
+    fresh = _dummy_plan()
+    fresh.plan_version = "fixed-split.v6"
+    fresh.candidate_id = "after:node_1"
+    fresh.canonical_split_key = "after:node_1"
+    fresh.edge_split_id = "after:node_1"
+
+    monkeypatch.setattr(
+        fixed_split,
+        "compute_fixed_split_for_model",
+        lambda *_args, **_kwargs: fresh,
+    )
+
+    plan = load_or_compute_fixed_split_plan(
+        torch.nn.Linear(4, 2),
+        SplitConstraints(privacy_leakage_upper_bound=0.0),
+        sample_input=torch.randn(2, 4),
+        splitter=UniversalModelSplitter(),
+        cache_path=str(cache_path),
+        model_name=stale.model_name,
+    )
+
+    assert plan.plan_version == "fixed-split.v6"
+    with cache_path.open("r", encoding="utf-8") as handle:
+        persisted = json.load(handle)
+    assert persisted["plan_version"] == "fixed-split.v6"
+    assert persisted["canonical_split_key"] == "after:node_1"
+
+
+def test_fixed_split_rejects_exact_runtime_split_mismatch(monkeypatch):
+    import model_management.fixed_split as fixed_split
+
+    requested = SimpleNamespace(
+        prefix_nodes=("node_1",),
+        boundary_after="node_1",
+        split_id="after:node_1",
+    )
+    actual = SimpleNamespace(
+        prefix_nodes=("node_2",),
+        boundary_after="node_2",
+        split_id="after:node_2",
+    )
+    lazy_candidate = fixed_split._LazyAriadneCandidate(
+        candidate=requested,
+        operation_split_id="after:node_1",
+        payload_bytes=128,
+        boundary_count=1,
+        legacy_layer_index=1,
+        edge_parameter_count=10,
+        total_parameter_count=20,
+        privacy_leakage=0.1,
+        freezing_ratio=0.5,
+    )
+
+    monkeypatch.setattr(
+        fixed_split,
+        "prepare_exact_split_runtime",
+        lambda *_args, **_kwargs: SimpleNamespace(candidate=actual),
+    )
+
+    with pytest.raises(ValueError, match="resolved a different split candidate"):
+        fixed_split._bind_lazy_ariadne_candidate(
+            UniversalModelSplitter(),
+            model=torch.nn.Linear(4, 2),
+            sample_input=torch.randn(2, 4),
+            split_spec=fixed_split.make_split_spec("after:node_1"),
+            plan=SimpleNamespace(),
+            lazy_candidate=lazy_candidate,
+        )
 
 
 def test_fixed_split_uses_privacy_leakage_and_freezing_constraints_when_available():
