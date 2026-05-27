@@ -1823,6 +1823,64 @@ def test_rfdetr_native_training_model_uses_edge_model_metadata(
     assert build_calls[0][1]["num_classes"] == 9
 
 
+def test_rfdetr_native_training_model_ignores_known_other_model_weights_path(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    wrong_weights_path = tmp_path / "tinynext_s.pth"
+    wrong_weights_path.write_bytes(b"not-rfdetr")
+    native_weights_path = tmp_path / "rf-detr-nano.pth"
+    torch.save(
+        {
+            "model": {
+                "class_embed.weight": torch.zeros(9, 256),
+                "class_embed.bias": torch.zeros(9),
+            }
+        },
+        native_weights_path,
+    )
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="rfdetr_nano",
+            weights_path=str(wrong_weights_path),
+            continual_learning=SimpleNamespace(batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    build_calls = []
+
+    class DummyModel(torch.nn.Module):
+        pass
+
+    def fake_build_detection_model(name, **kwargs):
+        build_calls.append((name, kwargs))
+        return DummyModel()
+
+    monkeypatch.setattr(
+        cloud_server.model_zoo,
+        "ensure_local_model_artifact",
+        lambda _name: native_weights_path,
+    )
+    monkeypatch.setattr(
+        cloud_server.model_zoo,
+        "build_detection_model",
+        fake_build_detection_model,
+    )
+
+    learner._build_native_training_model(
+        "rfdetr_nano",
+        model_metadata={"num_classes": 9, "label_schema": "zero_based"},
+    )
+
+    assert build_calls[0][0] == "rfdetr_nano"
+    assert build_calls[0][1]["weights_path"] == str(native_weights_path)
+
+
 def test_rfdetr_native_training_model_rejects_mismatched_configured_weights(
     tmp_path,
 ):

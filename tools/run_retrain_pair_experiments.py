@@ -340,7 +340,7 @@ def _run_pair_experiment(
     client_cfg.weights_path = _resolve_local_weights_path(edge_model, refresh=refresh_weights)
     server_cfg.edge_model_name = edge_model
     server_cfg.golden = golden_model
-    server_cfg.weights_path = _resolve_local_weights_path(golden_model, refresh=refresh_weights)
+    server_cfg.weights_path = _resolve_local_weights_path(edge_model, refresh=refresh_weights)
     server_cfg.continual_learning.num_epoch = int(epochs)
     if teacher_threshold is not None:
         server_cfg.continual_learning.teacher_annotation_threshold = float(teacher_threshold)

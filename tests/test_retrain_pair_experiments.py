@@ -31,8 +31,13 @@ def test_run_pair_experiment_returns_failure_when_split_plan_fails(tmp_path, mon
     frames = [np.zeros((8, 8, 3), dtype=np.uint8)]
     frame_indices = [300]
 
-    monkeypatch.setattr(experiments, "_resolve_local_weights_path", lambda *args, **kwargs: "dummy-weights")
+    monkeypatch.setattr(
+        experiments,
+        "_resolve_local_weights_path",
+        lambda model_name, **_kwargs: f"{model_name}-weights",
+    )
     monkeypatch.setattr(experiments, "_sample_video_frames", lambda *args, **kwargs: (frame_indices, frames))
+    learner_configs = []
 
     class DummyObjectDetection:
         def __init__(self, config, type):
@@ -44,6 +49,7 @@ def test_run_pair_experiment_returns_failure_when_split_plan_fails(tmp_path, mon
             self.config = config
             self.large_object_detection = large_object_detection
             self.weight_folder = ""
+            learner_configs.append(config)
 
     monkeypatch.setattr(experiments, "Object_Detection", DummyObjectDetection)
     monkeypatch.setattr(experiments, "CloudContinualLearner", DummyLearner)
@@ -77,3 +83,4 @@ def test_run_pair_experiment_returns_failure_when_split_plan_fails(tmp_path, mon
     assert result.sample_stats == {}
     assert "raw_fallback" not in result.sample_stats
     assert "No split candidate satisfies the fixed split constraints." in result.message
+    assert learner_configs[0].weights_path == "tinynext_s-weights"

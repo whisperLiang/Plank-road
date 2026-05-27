@@ -31,6 +31,36 @@ def test_parse_args_uses_requested_defaults():
     assert args.modes == ["raw_freeze", "freeze", "split_rebuild", "split_cached"]
 
 
+def test_prepare_configs_uses_edge_weights_for_cloud_retraining(monkeypatch):
+    base_config = SimpleNamespace(
+        client=SimpleNamespace(),
+        server=SimpleNamespace(
+            continual_learning=SimpleNamespace(),
+            das=SimpleNamespace(enabled=True),
+        ),
+    )
+    monkeypatch.setattr(experiments, "load_runtime_config", lambda _path: base_config)
+    monkeypatch.setattr(
+        experiments,
+        "_resolve_local_weights_path",
+        lambda model_name: f"{model_name}-weights",
+    )
+
+    client_cfg, server_cfg = experiments._prepare_configs(
+        SimpleNamespace(
+            yaml_path="./config/config.yaml",
+            edge_model="rfdetr_nano",
+            golden_model="tinynext_s",
+            epochs=3,
+            batch_size=4,
+        )
+    )
+
+    assert client_cfg.weights_path == "rfdetr_nano-weights"
+    assert server_cfg.golden == "tinynext_s"
+    assert server_cfg.weights_path == "rfdetr_nano-weights"
+
+
 def test_seeded_frame_selection_is_deterministic():
     first = experiments._select_sample_frame_ids(20, 7, seed=11)
     second = experiments._select_sample_frame_ids(20, 7, seed=11)

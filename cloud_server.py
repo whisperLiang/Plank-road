@@ -2201,13 +2201,29 @@ class CloudContinualLearner:
             # Convert relative path to absolute path
             if not os.path.isabs(configured_weights):
                 configured_weights = os.path.abspath(configured_weights)
-            
+
             if os.path.exists(configured_weights):
-                logger.info(
-                    "[CloudCL] Using configured weights_path for {}: {}",
-                    self.edge_model_name,
-                    configured_weights,
+                configured_model = self._known_model_name_for_weights_path(
+                    configured_weights
                 )
+                if (
+                    configured_model is not None
+                    and configured_model
+                    != self._normalize_model_name_for_lookup(self.edge_model_name)
+                ):
+                    logger.warning(
+                        "[CloudCL] server.weights_path {} is the known artifact for {}, "
+                        "not edge_model_name {}; it will be ignored for edge retraining.",
+                        configured_weights,
+                        configured_model,
+                        self.edge_model_name,
+                    )
+                else:
+                    logger.info(
+                        "[CloudCL] Using configured weights_path for {}: {}",
+                        self.edge_model_name,
+                        configured_weights,
+                    )
                 # Update config with resolved absolute path
                 config.weights_path = configured_weights
             else:
@@ -3715,6 +3731,48 @@ class CloudContinualLearner:
             f"tmp_edge_model_{safe_name}_edge_{safe_edge}.pth",
         )
 
+    @staticmethod
+    def _normalize_model_name_for_lookup(model_name: str) -> str:
+        return str(model_name).strip().lower().replace("-", "_")
+
+    @classmethod
+    def _known_model_name_for_weights_path(cls, weights_path: str) -> str | None:
+        artifact_name = os.path.basename(str(weights_path)).strip().lower()
+        if not artifact_name:
+            return None
+        for model_name, model_info in model_lib.items():
+            known_artifact = os.path.basename(
+                str(model_info.get("model_path", ""))
+            ).strip().lower()
+            if artifact_name == known_artifact:
+                return cls._normalize_model_name_for_lookup(model_name)
+        return None
+
+    def _configured_weights_path_for_model(
+        self,
+        model_name: str,
+        *,
+        warn: bool = True,
+    ) -> str:
+        configured_weights = str(getattr(self.config, "weights_path", "") or "").strip()
+        if not configured_weights:
+            return ""
+
+        configured_model = self._known_model_name_for_weights_path(configured_weights)
+        requested_model = self._normalize_model_name_for_lookup(model_name)
+        if configured_model is not None and configured_model != requested_model:
+            if warn:
+                logger.warning(
+                    "[CL] Ignoring server.weights_path {} because it is the known artifact "
+                    "for {}, not requested edge model {}. Falling back to native {} weights.",
+                    configured_weights,
+                    configured_model,
+                    requested_model,
+                    requested_model,
+                )
+            return ""
+        return configured_weights
+
     def _edge_weights_metadata_path(
         self,
         model_name: str,
@@ -3742,7 +3800,10 @@ class CloudContinualLearner:
         return bundle_model_id or self.edge_model_name
 
     def _native_training_source_label(self, model_name: str) -> str:
-        configured_weights = str(getattr(self.config, "weights_path", "") or "").strip()
+        configured_weights = self._configured_weights_path_for_model(
+            model_name,
+            warn=False,
+        )
         if configured_weights:
             return "configured"
         return "pretrained" if model_name in model_lib else "randomly initialised"
@@ -3796,7 +3857,7 @@ class CloudContinualLearner:
         model_metadata: Mapping[str, object] | None = None,
     ) -> torch.nn.Module:
         source_label = self._native_training_source_label(model_name)
-        configured_weights = str(getattr(self.config, "weights_path", "") or "").strip()
+        configured_weights = self._configured_weights_path_for_model(model_name)
         build_kwargs = {
             "pretrained": source_label == "pretrained",
             "device": self.device,
