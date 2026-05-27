@@ -494,16 +494,62 @@ def _has_stale_contract_metadata(
     candidate: Mapping[str, Any],
     split_contract: SplitRuntimeContract,
 ) -> bool:
-    expected = {
-        "contract_id": split_contract.contract_id,
+    return (
+        _has_contract_id_metadata_mismatch(candidate, split_contract)
+        or _hard_contract_metadata_mismatch_reason(candidate, split_contract) is not None
+    )
+
+
+def _metadata_present(value: Any) -> bool:
+    return value not in (None, "", [])
+
+
+def _has_contract_id_metadata_mismatch(
+    candidate: Mapping[str, Any],
+    split_contract: SplitRuntimeContract,
+) -> bool:
+    value = candidate.get("contract_id")
+    return _metadata_present(value) and str(value) != str(split_contract.contract_id)
+
+
+def _hard_contract_metadata_mismatch_reason(
+    candidate: Mapping[str, Any],
+    split_contract: SplitRuntimeContract,
+) -> str | None:
+    expected_text = {
         "split_config_id": split_contract.split_config_id,
         "front_version": split_contract.front_version,
     }
-    return any(
-        candidate.get(field_name) not in (None, "")
-        and str(candidate[field_name]) != str(expected_value)
-        for field_name, expected_value in expected.items()
-    )
+    for field_name, expected_value in expected_text.items():
+        value = candidate.get(field_name)
+        if _metadata_present(value) and str(value) != str(expected_value):
+            return field_name
+
+    input_tensor_shape = candidate.get("input_tensor_shape")
+    if _metadata_present(input_tensor_shape):
+        try:
+            actual_shape = [int(dim) for dim in list(input_tensor_shape)]
+        except Exception:
+            return "input_tensor_shape"
+        if actual_shape != [int(dim) for dim in split_contract.input_tensor_shape]:
+            return "input_tensor_shape"
+
+    input_resize_mode = candidate.get("input_resize_mode")
+    if (
+        _metadata_present(input_resize_mode)
+        and str(input_resize_mode).strip().lower()
+        != str(split_contract.input_resize_mode).strip().lower()
+    ):
+        return "input_resize_mode"
+
+    feature_layout_id = candidate.get("feature_layout_id")
+    if (
+        _metadata_present(feature_layout_id)
+        and str(feature_layout_id) != str(split_contract.feature_layout_id)
+    ):
+        return "feature_layout_id"
+
+    return None
 
 
 @dataclass
@@ -970,10 +1016,28 @@ class CloudSamplePool:
                 "__source_feature_path": self.reader._resolve_entry_path(entry, "feature_shard"),
                 "__source_label_path": self.reader._resolve_entry_path(entry, "label_shard"),
             }
-            if split_contract is not None and _has_stale_contract_metadata(entry, split_contract):
+            contract_id_mismatch = (
+                split_contract is not None
+                and _has_contract_id_metadata_mismatch(entry, split_contract)
+            )
+            hard_mismatch_reason = (
+                _hard_contract_metadata_mismatch_reason(entry, split_contract)
+                if split_contract is not None
+                else None
+            )
+            if hard_mismatch_reason is not None:
+                sample["__hard_contract_mismatch_reason"] = hard_mismatch_reason
                 samples.append(sample)
                 continue
-            record = self.reader.read(entry)
+            try:
+                record = self.reader.read(entry)
+            except Exception:
+                if contract_id_mismatch:
+                    sample["__contract_id_mismatch"] = True
+                    sample["__unreadable_contract_migration_candidate"] = True
+                    samples.append(sample)
+                    continue
+                raise
             feature_record = dict(record.feature_record)
             boundary_payload = _boundary_payload_from_value(feature_record)
             sample.update(
@@ -1050,9 +1114,15 @@ class CloudSamplePool:
             or ("teacher" if sample_source == "low_quality" else "edge_pseudo")
         )
         feature_layout = feature_layout_from_tensors(feature)
+        contract_id = str(candidate.get("contract_id") or split_contract.contract_id)
+        active_contract_id_mismatch = (
+            is_canonical_active
+            and bool(contract_id)
+            and contract_id != split_contract.contract_id
+        )
         return CanonicalSampleRecord(
             sample_id=sample_id,
-            contract_id=str(candidate.get("contract_id") or split_contract.contract_id),
+            contract_id=contract_id,
             split_config_id=str(candidate.get("split_config_id") or split_contract.split_config_id),
             front_version=str(candidate.get("front_version") or split_contract.front_version),
             feature_layout_id=str(
@@ -1083,7 +1153,7 @@ class CloudSamplePool:
             ),
             boundary_payload=(
                 None
-                if is_canonical_active
+                if is_canonical_active and not active_contract_id_mismatch
                 else _boundary_payload_from_candidate(candidate)
             ),
             source_feature_path=(
@@ -1109,8 +1179,6 @@ class CloudSamplePool:
         *,
         split_contract: SplitRuntimeContract,
     ) -> str | None:
-        if record.contract_id != split_contract.contract_id:
-            return "skipped_stale_contract"
         if record.split_config_id != split_contract.split_config_id:
             return "skipped_stale_contract"
         if record.front_version != split_contract.front_version:
@@ -1403,6 +1471,8 @@ class CloudSamplePool:
             validation_counts = {
                 "accepted_high_quality": 0,
                 "accepted_low_quality": 0,
+                "migrated_contract_id": 0,
+                "carried_forward_compatible": 0,
                 "skipped_stale_contract": 0,
                 "skipped_feature_layout": 0,
                 "skipped_label_bounds": 0,
@@ -1427,10 +1497,15 @@ class CloudSamplePool:
             )
             for input_source, candidate in all_inputs:
                 sample_id = str(candidate.get("sample_id", "") or "")
-                if (
-                    input_source == "existing_active"
-                    and _has_stale_contract_metadata(candidate, split_contract)
-                ):
+                contract_id_mismatch = _has_contract_id_metadata_mismatch(
+                    candidate,
+                    split_contract,
+                )
+                hard_mismatch_reason = _hard_contract_metadata_mismatch_reason(
+                    candidate,
+                    split_contract,
+                )
+                if input_source == "existing_active" and hard_mismatch_reason is not None:
                     validation_counts["skipped_stale_contract"] += 1
                     validation_previews["skipped_stale_contract"].append(sample_id)
                     continue
@@ -1442,7 +1517,7 @@ class CloudSamplePool:
                         split_contract=split_contract,
                     )
                 except Exception as exc:
-                    if input_source == "existing_active":
+                    if input_source == "existing_active" and not contract_id_mismatch:
                         raise RuntimeError(
                             "Existing active canonical sample "
                             f"{sample_id!r} is unreadable during rebuild; refusing to "
@@ -1460,6 +1535,15 @@ class CloudSamplePool:
                     validation_previews[skip_reason].append(record.sample_id)
                     invalid_records.append(record)
                     continue
+                if contract_id_mismatch:
+                    validation_counts["migrated_contract_id"] += 1
+                    if input_source == "existing_active":
+                        validation_counts["carried_forward_compatible"] += 1
+                    record.contract_id = split_contract.contract_id
+                    record.split_config_id = split_contract.split_config_id
+                    record.front_version = split_contract.front_version
+                    record.source_feature_path = None
+                    record.source_label_path = None
                 if record.sample_source == "low_quality":
                     validation_counts["accepted_low_quality"] += 1
                 else:
@@ -1492,6 +1576,10 @@ class CloudSamplePool:
                         "skipped_unreadable",
                     )
                 ),
+                "migrated_contract_id": validation_counts["migrated_contract_id"],
+                "carried_forward_compatible": validation_counts[
+                    "carried_forward_compatible"
+                ],
             }
             stats = {
                 "validation": {

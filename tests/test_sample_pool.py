@@ -426,7 +426,79 @@ def test_canonical_rebuild_preserves_active_generation_if_existing_sample_is_unr
     assert {entry["sample_id"] for entry in pool.load_staging_low_quality_samples()} == {"lq-1"}
 
 
-def test_canonical_rebuild_discards_unreadable_active_from_stale_contract(tmp_path):
+def test_canonical_rebuild_migrates_compatible_contract_id_drift_until_capacity(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    old_contract = _build_split_contract(runtime_identity={"graph_signature": "old-runtime"})
+    new_contract = _build_split_contract(runtime_identity={"graph_signature": "new-runtime"})
+
+    pool.stage_low_quality_samples([_low_quality_candidate("old-active", created_at=1.0)])
+    pool.rebuild_canonical_training_pool(
+        split_contract=old_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    pool.stage_low_quality_samples([_low_quality_candidate("new-active", created_at=2.0)])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=new_contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(
+            split_contract=new_contract,
+        ),
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert stats["validation"]["migrated_contract_id"] == 1
+    assert stats["validation"]["carried_forward_compatible"] == 1
+    assert stats["validation"]["skipped_stale_contract"] == 0
+    assert stats["replacement"]["dropped"] == 0
+    active = pool.list_active_samples()
+    assert {entry["sample_id"] for entry in active} == {"old-active", "new-active"}
+    assert {entry["contract_id"] for entry in active} == {new_contract.contract_id}
+    active_by_id = {entry["sample_id"]: entry for entry in active}
+    migrated_feature = pool.reader.read(active_by_id["old-active"]).feature_record
+    assert migrated_feature["contract_id"] == new_contract.contract_id
+
+
+def test_canonical_rebuild_migrates_compatible_contract_id_drift_with_capacity_limit(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=2)
+    old_contract = _build_split_contract(runtime_identity={"graph_signature": "old-runtime"})
+    new_contract = _build_split_contract(runtime_identity={"graph_signature": "new-runtime"})
+
+    pool.stage_low_quality_samples(
+        [
+            _low_quality_candidate("old-active-1", created_at=1.0),
+            _low_quality_candidate("old-active-2", created_at=2.0),
+        ]
+    )
+    pool.rebuild_canonical_training_pool(
+        split_contract=old_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    pool.stage_low_quality_samples([_low_quality_candidate("new-active", created_at=3.0)])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=new_contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(
+            split_contract=new_contract,
+        ),
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert stats["validation"]["migrated_contract_id"] == 2
+    assert stats["validation"]["carried_forward_compatible"] == 2
+    assert stats["generation_commit"]["active"] == 2
+    assert stats["replacement"]["dropped"] == 1
+    assert len(pool.list_active_samples()) == 2
+
+
+def test_canonical_rebuild_skips_unreadable_contract_id_drift_without_blocking(tmp_path):
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
     old_contract = _build_split_contract(runtime_identity={"graph_signature": "old-runtime"})
@@ -445,6 +517,54 @@ def test_canonical_rebuild_discards_unreadable_active_from_stale_contract(tmp_pa
         handle.write(b"not-a-torch-feature-payload")
 
     pool.stage_low_quality_samples([_low_quality_candidate("new-active", created_at=2.0)])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=new_contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(
+            split_contract=new_contract,
+        ),
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert stats["validation"]["skipped_stale_contract"] == 0
+    assert stats["validation"]["skipped_unreadable"] == 1
+    assert {entry["sample_id"] for entry in pool.list_active_samples()} == {"new-active"}
+
+
+def test_canonical_rebuild_skips_hard_stale_active_without_reading_payload(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    old_contract = _build_split_contract(runtime_identity={"graph_signature": "old-runtime"})
+    new_contract = SplitRuntimeContract.create(
+        edge_id=1,
+        model_id="model-a",
+        split_config_id="after:model.backbone",
+        canonical_split_key="after:model.backbone",
+        edge_split_id="after:model.backbone",
+        cloud_batch_split_id="after:model.backbone",
+        input_tensor_shape=[1, 3, 64, 64],
+        input_resize_mode="direct_resize",
+        boundary_tensor_labels=["node_0"],
+        front_version="0",
+        feature_tensors={"node_0": torch.ones(1, 5)},
+        runtime_identity={"graph_signature": "new-runtime"},
+    )
+
+    pool.stage_low_quality_samples([_low_quality_candidate("old-active", created_at=1.0)])
+    pool.rebuild_canonical_training_pool(
+        split_contract=old_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    old_entry = pool.list_active_samples()[0]
+    old_feature_path = pool.reader._resolve_entry_path(old_entry, "feature_shard")
+    with open(old_feature_path, "wb") as handle:
+        handle.write(b"not-a-torch-feature-payload")
+
+    new_candidate = _low_quality_candidate("new-active", created_at=2.0)
+    new_candidate["feature"] = {"node_0": torch.ones(1, 5)}
+    pool.stage_low_quality_samples([new_candidate])
     stats, _kept = pool.rebuild_canonical_training_pool(
         split_contract=new_contract,
         existing_active_samples=pool.load_active_samples_for_rebuild(

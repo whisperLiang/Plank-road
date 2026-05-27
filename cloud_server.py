@@ -7223,11 +7223,14 @@ class CloudContinualLearner:
                 logger.info(
                     "[SamplePool] canonical validation: "
                     "accepted_high_quality={} accepted_low_quality={} "
+                    "migrated_contract_id={} carried_forward_compatible={} "
                     "skipped_stale_contract={} skipped_feature_layout={} "
                     "skipped_label_bounds={} skipped_label_metadata={} "
                     "skipped_unreadable={}.",
                     validation_stats.get("accepted_high_quality", 0),
                     validation_stats.get("accepted_low_quality", 0),
+                    validation_stats.get("migrated_contract_id", 0),
+                    validation_stats.get("carried_forward_compatible", 0),
                     validation_stats.get("skipped_stale_contract", 0),
                     validation_stats.get("skipped_feature_layout", 0),
                     validation_stats.get("skipped_label_bounds", 0),
@@ -7237,7 +7240,8 @@ class CloudContinualLearner:
                 logger.info(
                     "[SamplePool] replacement: before={} incoming={} kept={} "
                     "dropped={} dropped_high_quality={} dropped_low_quality={} "
-                    "dropped_stale={} dropped_invalid={}.",
+                    "dropped_stale={} dropped_invalid={} "
+                    "migrated_contract_id={} carried_forward_compatible={}.",
                     replacement_stats.get("before", 0),
                     replacement_stats.get("incoming", 0),
                     replacement_stats.get("kept", 0),
@@ -7246,6 +7250,8 @@ class CloudContinualLearner:
                     replacement_stats.get("dropped_low_quality", 0),
                     replacement_stats.get("dropped_stale", 0),
                     replacement_stats.get("dropped_invalid", 0),
+                    replacement_stats.get("migrated_contract_id", 0),
+                    replacement_stats.get("carried_forward_compatible", 0),
                 )
                 logger.info(
                     "[SamplePool] generation commit: generation={} active={} "
