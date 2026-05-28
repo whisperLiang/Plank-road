@@ -4214,6 +4214,49 @@ def test_high_quality_syncer_groups_retryable_samples_by_record_context(tmp_path
     } == {("1", plan.split_config_id), ("2", "other-split")}
 
 
+def test_high_quality_syncer_marks_stale_split_records_non_retryable(tmp_path):
+    store = EdgeSampleStore(str(tmp_path / "store"))
+    plan = _dummy_plan()
+    stale = _store_high_quality_for_shard(
+        store,
+        sample_id="high-stale-split",
+        frame_index=1,
+        plan=plan,
+    )
+    current = store.store_sample(
+        sample_id="high-current-split",
+        frame_index=2,
+        confidence=0.96,
+        split_config_id="active-split",
+        model_id="model-a",
+        model_version="2",
+        quality_bucket=HIGH_QUALITY,
+        inference_result={"boxes": [[1, 2, 3, 4]], "labels": [1], "scores": [0.9]},
+        intermediate=_planned_payload(plan),
+    )
+    syncer = HighQualitySampleSyncer(
+        store,
+        server_ip="127.0.0.1:50051",
+        edge_id=1,
+        shard_size=64,
+        enabled=True,
+        context_provider=lambda: {
+            "model_id": "model-a",
+            "model_version": "2",
+            "split_config_id": "active-split",
+        },
+    )
+    syncer._mark_samples([stale.sample_id, current.sample_id], "pending")
+
+    groups = syncer._select_retryable_record_groups(include_partial=True)
+
+    assert [[record.sample_id for record in group] for group in groups] == [
+        ["high-current-split"]
+    ]
+    assert syncer._sample_state(stale.sample_id) == "stale_split"
+    assert syncer._sample_state(current.sample_id) == "pending"
+
+
 def test_high_quality_syncer_retries_windows_ledger_replace_error(tmp_path, monkeypatch):
     import edge.sample_sync as sample_sync
 

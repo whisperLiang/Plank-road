@@ -374,6 +374,32 @@ def test_canonical_rebuild_defers_pending_high_quality_missing_contract_tensor(t
     }
 
 
+def test_canonical_rebuild_quarantines_tagged_incompatible_high_quality(tmp_path):
+    pool_cls = _load_cloud_sample_pool()
+    pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
+    contract = _build_split_contract()
+    candidate = _high_quality_candidate("hq-old-layout", created_at=1.0)
+    candidate["feature"] = {"edge_only_tensor": torch.ones(1, 4)}
+    candidate["feature_layout_id"] = "old-edge-layout"
+    candidate["source_feature_layout_id"] = "old-edge-layout"
+
+    pool.store_pending_high_quality_samples([candidate])
+    stats, _kept = pool.rebuild_canonical_training_pool(
+        split_contract=contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+
+    assert stats["validation"]["deferred_feature_layout"] == 1
+    assert stats["generation_commit"]["quarantined_incompatible_feature_layout_files"] == 1
+    assert pool.load_pending_high_quality_samples() == []
+    assert {
+        entry["sample_id"]
+        for entry in pool.load_incompatible_feature_layout_samples()
+    } == {"hq-old-layout"}
+
+
 def test_canonical_rebuild_replaces_previous_generation_files(tmp_path):
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)

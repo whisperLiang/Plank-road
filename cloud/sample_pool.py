@@ -796,12 +796,17 @@ class CloudSamplePool:
         self.staging_root = os.path.abspath(staging_root)
         self.pending_high_quality_dir = os.path.join(self.staging_root, "pending_high_quality")
         self.staging_low_quality_dir = os.path.join(self.staging_root, "staging_low_quality")
+        self.incompatible_feature_layout_dir = os.path.join(
+            self.staging_root,
+            "incompatible_feature_layout",
+        )
         self.stale_dir = os.path.join(self.staging_root, "stale")
         self.processed_dir = os.path.join(self.staging_root, "processed")
         for directory in (
             self.generations_dir,
             self.pending_high_quality_dir,
             self.staging_low_quality_dir,
+            self.incompatible_feature_layout_dir,
             self.stale_dir,
             self.processed_dir,
         ):
@@ -974,6 +979,9 @@ class CloudSamplePool:
 
     def load_pending_high_quality_samples(self) -> list[dict[str, Any]]:
         return self._load_stage_directory(self.pending_high_quality_dir)
+
+    def load_incompatible_feature_layout_samples(self) -> list[dict[str, Any]]:
+        return self._load_stage_directory(self.incompatible_feature_layout_dir)
 
     def load_staging_low_quality_samples(self) -> list[dict[str, Any]]:
         return self._load_stage_directory(self.staging_low_quality_dir)
@@ -1490,6 +1498,21 @@ class CloudSamplePool:
                 pass
         return deleted
 
+    @staticmethod
+    def _move_staging_paths(paths: list[str], directory: str) -> int:
+        moved = 0
+        os.makedirs(directory, exist_ok=True)
+        for path in sorted({str(path) for path in paths if str(path)}):
+            if not os.path.exists(path):
+                continue
+            destination = os.path.join(directory, os.path.basename(path))
+            try:
+                shutil.move(path, destination)
+                moved += 1
+            except OSError:
+                pass
+        return moved
+
     def rebuild_canonical_training_pool(
         self,
         *,
@@ -1521,6 +1544,7 @@ class CloudSamplePool:
             }
             accepted: list[CanonicalSampleRecord] = []
             invalid_records: list[CanonicalSampleRecord] = []
+            incompatible_feature_layout_paths: list[str] = []
             unreadable_staging_paths: list[str] = []
             all_inputs = (
                 [("existing_active", candidate) for candidate in list(existing_active_samples or [])]
@@ -1579,6 +1603,16 @@ class CloudSamplePool:
                                 source_metadata=_feature_layout_source_metadata(candidate),
                             )
                         )
+                        if (
+                            candidate.get("__staging_path")
+                            and (
+                                candidate.get("feature_layout_id")
+                                or candidate.get("source_feature_layout_id")
+                            )
+                        ):
+                            incompatible_feature_layout_paths.append(
+                                str(candidate.get("__staging_path"))
+                            )
                         continue
                     validation_counts[skip_reason] += 1
                     validation_previews[skip_reason].append(record.sample_id)
@@ -1654,9 +1688,14 @@ class CloudSamplePool:
             )
             processed_count = self._delete_staging_records(kept + dropped + invalid_records)
             processed_count += self._delete_staging_paths(unreadable_staging_paths)
+            quarantined_count = self._move_staging_paths(
+                incompatible_feature_layout_paths,
+                self.incompatible_feature_layout_dir,
+            )
             stats["generation_commit"] = {
                 **commit_stats,
                 "deleted_processed_staging_files": processed_count,
+                "quarantined_incompatible_feature_layout_files": quarantined_count,
             }
             return stats, kept
 

@@ -30,6 +30,7 @@ UPLOAD_PENDING = "pending"
 UPLOAD_UPLOADED = "uploaded"
 UPLOAD_COMMITTED = "committed"
 UPLOAD_FAILED = "failed"
+UPLOAD_STALE_SPLIT = "stale_split"
 _RETRYABLE_STATES = {UPLOAD_PENDING, UPLOAD_UPLOADED, UPLOAD_FAILED}
 _ATOMIC_WRITE_RETRIES = 8
 _ATOMIC_WRITE_RETRY_DELAY_SEC = 0.02
@@ -761,15 +762,37 @@ class HighQualitySampleSyncer:
         )
 
     def _retryable_records_by_context(self) -> dict[tuple[str, str, str], list[StoredSampleRecord]]:
+        provider_split = ""
+        if callable(self._context_provider):
+            try:
+                provider_split = str(
+                    dict(self._context_provider() or {}).get("split_config_id") or ""
+                ).strip()
+            except Exception as exc:
+                logger.warning("High-quality sync context provider failed: {}", exc)
         with self._ledger_lock:
             samples = dict(self._load_ledger_unlocked().get("samples", {}))
         groups: dict[tuple[str, str, str], list[StoredSampleRecord]] = {}
+        stale_sample_ids: list[str] = []
         for record in self.sample_store.list_records(quality_bucket=HIGH_QUALITY):
             entry = samples.get(str(record.sample_id)) or {}
             state = str(entry.get("sync_state") or entry.get("state") or "")
             if state not in _RETRYABLE_STATES:
                 continue
+            record_split = str(getattr(record, "split_config_id", "") or "").strip()
+            if provider_split and record_split and record_split != provider_split:
+                stale_sample_ids.append(str(record.sample_id))
+                continue
             groups.setdefault(self._record_context_key(record), []).append(record)
+        if stale_sample_ids:
+            self._mark_samples(
+                stale_sample_ids,
+                UPLOAD_STALE_SPLIT,
+                error=(
+                    "sample feature split_config_id no longer matches the active "
+                    f"fixed split plan {provider_split!r}"
+                ),
+            )
         return groups
 
     def _retryable_full_group_count(self) -> int:

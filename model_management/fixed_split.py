@@ -429,6 +429,7 @@ def _make_plan_id(
     raw = json.dumps(
         {
             "model_name": model_name,
+            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "candidate_id": candidate.candidate_id,
             "split_index": candidate.legacy_layer_index,
             "boundary_tensor_labels": list(candidate.boundary_tensor_labels),
