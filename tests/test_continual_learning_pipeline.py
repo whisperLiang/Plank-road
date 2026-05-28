@@ -19,6 +19,7 @@ from edge.transmit import (
     pack_low_quality_trigger_bundle_to_file,
 )
 from model_management.fixed_split import (
+    FIXED_SPLIT_PLAN_VERSION,
     SplitConstraints,
     SplitPlan,
     apply_split_plan,
@@ -401,7 +402,7 @@ def test_fixed_split_selects_operation_node_candidates():
         model_name="dummy-model",
     )
 
-    assert plan.plan_version == "fixed-split.v8"
+    assert plan.plan_version == FIXED_SPLIT_PLAN_VERSION
     assert plan.candidate_id == "after:node_1"
     assert plan.canonical_split_key == "after:node_1"
     assert plan.edge_split_id == "after:node_1"
@@ -809,7 +810,7 @@ def test_fixed_split_recomputes_and_overwrites_old_plan_version(
     persist_split_plan(str(cache_path), stale)
 
     fresh = _dummy_plan()
-    fresh.plan_version = "fixed-split.v8"
+    fresh.plan_version = FIXED_SPLIT_PLAN_VERSION
     fresh.candidate_id = "after:node_1"
     fresh.canonical_split_key = "after:node_1"
     fresh.edge_split_id = "after:node_1"
@@ -829,10 +830,10 @@ def test_fixed_split_recomputes_and_overwrites_old_plan_version(
         model_name=stale.model_name,
     )
 
-    assert plan.plan_version == "fixed-split.v8"
+    assert plan.plan_version == FIXED_SPLIT_PLAN_VERSION
     with cache_path.open("r", encoding="utf-8") as handle:
         persisted = json.load(handle)
-    assert persisted["plan_version"] == "fixed-split.v8"
+    assert persisted["plan_version"] == FIXED_SPLIT_PLAN_VERSION
     assert persisted["canonical_split_key"] == "after:node_1"
 
 
@@ -3103,7 +3104,7 @@ def test_working_cache_manifest_fingerprint_matches_current_bundle():
     assert (
         CloudContinualLearner._working_cache_manifest_matches(changed_identity, identity) is False
     )
-    with pytest.raises(RuntimeError, match="fixed-split.v8"):
+    with pytest.raises(RuntimeError, match=FIXED_SPLIT_PLAN_VERSION):
         _fixed_split_boundary_from_plan(
             {
                 "candidate_id": "after:model.backbone.stem",
@@ -3128,7 +3129,7 @@ def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "0"},
         "split_plan": {
-            "plan_version": "fixed-split.v8",
+            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "runtime_contract": _runtime_contract(
                 "after:model.backbone.0.encoder.encoder.embeddings.patch_embeddings.projection",
                 ["node_0"],
@@ -3214,7 +3215,7 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "0"},
         "split_plan": {
-            "plan_version": "fixed-split.v8",
+            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "runtime_contract": _runtime_contract(
                 "after:node_1",
                 ["edge_node_a", "edge_node_b"],
@@ -3339,7 +3340,7 @@ def test_cloud_fixed_split_template_rebuilds_raw_trigger_on_boundary_label_misma
         "input_tensor_shape": [1, 3, 4, 4],
         "model": {"model_id": "yolo26n", "model_version": "0"},
         "split_plan": {
-            "plan_version": "fixed-split.v8",
+            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "runtime_contract": _runtime_contract(
                 "after:node_247",
                 ["edge_a", "edge_b"],
@@ -3452,7 +3453,7 @@ def test_cloud_fixed_split_template_layout_mismatch_without_raw_fails(
         "input_tensor_shape": [1, 3, 4, 4],
         "model": {"model_id": "yolo26n", "model_version": "0"},
         "split_plan": {
-            "plan_version": "fixed-split.v8",
+            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "runtime_contract": edge_contract,
             "trace_batch_mode": "batch_gt1",
             "trace_batch_size": 2,
@@ -3550,7 +3551,7 @@ def test_cloud_raw_rebuild_boundary_mismatch_ignores_uploaded_feature_record(
         "protocol_version": cloud_server.LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
         "model": {"model_id": "yolo26n", "model_version": "0"},
         "split_plan": {
-            "plan_version": "fixed-split.v8",
+            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "runtime_contract": _runtime_contract("after:node_247", ["edge_a"]),
         },
         "samples": [
@@ -3669,7 +3670,7 @@ def test_cloud_fixed_split_working_cache_rebuild_with_template_hit_skips_trace_i
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "1"},
         "split_plan": {
-            "plan_version": "fixed-split.v8",
+            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "runtime_contract": _runtime_contract(
                 "after:node_1",
                 ["node_1"],

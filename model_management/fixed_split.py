@@ -28,7 +28,7 @@ from model_management.universal_model_split import (
 )
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v8"
+FIXED_SPLIT_PLAN_VERSION = "fixed-split.v9"
 FIXED_SPLIT_DYNAMIC_BATCH_MAX = 64
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]

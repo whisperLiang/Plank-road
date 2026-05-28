@@ -78,6 +78,7 @@ from model_management.fixed_split_runtime_template import (
     fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
 )
+from model_management.fixed_split import FIXED_SPLIT_PLAN_VERSION
 from model_management.split_runtime import (
     BoundaryPayloadCacheCodec,
     compare_outputs,
@@ -272,10 +273,10 @@ def _fixed_split_boundary_from_plan(split_plan: Mapping[str, object]) -> str:
 def _fixed_split_plan_runtime_contract(
     split_plan: Mapping[str, object],
 ) -> dict[str, object]:
-    if str(split_plan.get("plan_version") or "") != "fixed-split.v8":
+    if str(split_plan.get("plan_version") or "") != FIXED_SPLIT_PLAN_VERSION:
         raise RuntimeError(
             "Unsupported fixed split plan version "
-            f"{split_plan.get('plan_version')!r}; fixed-split.v8 runtime_contract "
+            f"{split_plan.get('plan_version')!r}; {FIXED_SPLIT_PLAN_VERSION} runtime_contract "
             "payloads are required."
         )
     runtime_contract = split_plan.get("runtime_contract")
