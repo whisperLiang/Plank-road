@@ -185,8 +185,11 @@ def _write_low_quality_raw_tar(
 def _write_low_quality_feature_shard(
     sample_store: EdgeSampleStore,
     records: Sequence,
+    *,
+    runtime_contract: Mapping[str, object] | None = None,
 ) -> tuple[bytes | None, list[str]]:
     feature_payload = {"schema_version": 1, "samples": {}}
+    contract_payload = dict(runtime_contract or {})
     sample_ids: list[str] = []
     for record in records:
         sample_id = str(record.sample_id)
@@ -194,9 +197,14 @@ def _write_low_quality_feature_shard(
         if feature_path is None or not os.path.exists(feature_path):
             continue
         try:
-            feature_payload["samples"][sample_id] = _feature_sample_payload(
-                sample_store.load_intermediate(record)
-            )
+            feature_sample = _feature_sample_payload(sample_store.load_intermediate(record))
+            if contract_payload:
+                feature_sample["runtime_contract"] = contract_payload
+                if contract_payload.get("feature_layout_id"):
+                    feature_sample["feature_layout_id"] = str(
+                        contract_payload.get("feature_layout_id")
+                    )
+            feature_payload["samples"][sample_id] = feature_sample
         except Exception as exc:
             logger.warning(
                 "Skipping optional low-quality feature for sample {}: {}",
@@ -340,6 +348,7 @@ def pack_low_quality_trigger_bundle_to_file(
                 feature_payload, feature_sample_ids = _write_low_quality_feature_shard(
                     sample_store,
                     shard_records,
+                    runtime_contract=dict(getattr(split_plan, "runtime_contract", {}) or {}),
                 )
                 if feature_payload is not None and feature_sample_ids:
                     feature_shard_payloads.append(

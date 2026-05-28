@@ -358,15 +358,20 @@ class SplitPlan:
         input_tensor_shape: Sequence[int] | None = None,
         input_resize_mode: str = "direct_resize",
         front_version: str = "0",
+        model_version: str = "0",
     ) -> bool:
         expected_shape = (
             [int(dim) for dim in list(input_tensor_shape)]
             if input_tensor_shape is not None
             else None
         )
+        cached_model_version = str(
+            dict(self.runtime_contract or {}).get("model_version") or "0"
+        )
         return (
             self.plan_version == FIXED_SPLIT_PLAN_VERSION
             and self.model_name == model_name
+            and cached_model_version == str(model_version or "0")
             and self.constraints == _constraints_payload(constraints)
             and self.trace_signature == trace_signature
             and (expected_shape is None or self.input_tensor_shape == expected_shape)
@@ -1418,14 +1423,16 @@ def load_or_compute_fixed_split_plan(
         and not cached_invalidated
     ):
         trace_signature = _trace_signature(runtime)
-        if cached.matches(
+        cache_matches = cached.matches(
             model_name=model_key,
             constraints=constraints,
             trace_signature=trace_signature,
             input_tensor_shape=sample_input_shape,
             input_resize_mode=input_resize_mode,
             front_version=front_version,
-        ):
+            model_version=model_version,
+        )
+        if cache_matches:
             try:
                 cached_candidate = apply_split_plan(runtime, cached)
                 if validate_cached_plan:
@@ -1447,6 +1454,9 @@ def load_or_compute_fixed_split_plan(
             except (KeyError, RuntimeError, ValueError) as exc:
                 cached_invalidated = True
                 logger.info("Cached fixed split plan invalidated; recomputing. {}", exc)
+        else:
+            cached_invalidated = True
+            logger.info("Cached fixed split plan metadata is stale; recomputing.")
 
     plan = compute_fixed_split_for_model(
         model,
@@ -1470,6 +1480,7 @@ def load_or_compute_fixed_split_plan(
         input_tensor_shape=sample_input_shape,
         input_resize_mode=input_resize_mode,
         front_version=front_version,
+        model_version=model_version,
     ):
         logger.info("Fixed split plan cache already matches the current runtime.")
     elif cache_path and cached is not None:

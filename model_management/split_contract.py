@@ -392,7 +392,35 @@ class SplitRuntimeContract:
         runtime_identity: Mapping[str, Any] | None = None,
     ) -> "SplitRuntimeContract":
         layout = feature_layout_from_tensors(feature_tensors)
-        layout_id = feature_layout_id(layout)
+        runtime_contract = dict(
+            dict(runtime_identity or {}).get("runtime_contract") or {}
+        )
+        boundary_schema = (
+            runtime_contract.get("boundary_schema")
+            if isinstance(runtime_contract.get("boundary_schema"), Mapping)
+            else {}
+        )
+        layout_id = str(runtime_contract.get("feature_layout_id") or "")
+        if not layout_id:
+            layout_id = compute_feature_layout_id(
+                model_id=str(model_id),
+                model_version=str(
+                    dict(runtime_identity or {}).get("model_version")
+                    or tail_version
+                    or ""
+                ),
+                logical_split_id=str(cloud_batch_split_id or canonical_split_key),
+                trace_signature=str(
+                    dict(runtime_identity or {}).get("graph_signature") or ""
+                ),
+                input_tensor_shape=[int(dim) for dim in input_tensor_shape],
+                input_resize_mode=str(input_resize_mode or "direct_resize"),
+                boundary_tensor_labels=[
+                    str(label) for label in list(boundary_tensor_labels or [])
+                ],
+                boundary_schema=boundary_schema,
+                feature_layout=layout,
+            )
         identity = _runtime_identity_payload(
             model_id=str(model_id),
             front_version=str(front_version or "0"),

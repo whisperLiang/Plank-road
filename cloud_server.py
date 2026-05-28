@@ -3150,7 +3150,10 @@ class CloudContinualLearner:
                 "SplitRuntimeContract creation requires a representative feature tensor."
             )
         contract_layout = feature_layout_from_tensors(contract_feature_tensors)
-        contract_layout_id = make_feature_layout_id(contract_layout)
+        contract_layout_id = str(
+            cloud_runtime_contract.get("feature_layout_id")
+            or make_feature_layout_id(contract_layout)
+        )
         runtime_identity = self._runtime_identity_for_contract(
             manifest=manifest,
             splitter=splitter,
@@ -5806,6 +5809,12 @@ class CloudContinualLearner:
                     )
                 if input_image_size is not None:
                     record.setdefault("input_image_size", input_image_size)
+                record.setdefault("runtime_contract", runtime_contract)
+                if runtime_contract.get("feature_layout_id"):
+                    record.setdefault(
+                        "feature_layout_id",
+                        str(runtime_contract.get("feature_layout_id")),
+                    )
                 record.setdefault(
                     "input_tensor_shape",
                     list(
@@ -5879,6 +5888,9 @@ class CloudContinualLearner:
                     intermediate=item["intermediate"],
                     extra_metadata={
                         "runtime_contract": runtime_contract,
+                        "feature_layout_id": str(
+                            runtime_contract.get("feature_layout_id") or ""
+                        ),
                         "sample_id": sample_id,
                         "model_id": str(model_meta.get("model_id", "") or ""),
                         "model_version": str(model_meta.get("model_version", "") or ""),
@@ -7045,6 +7057,14 @@ class CloudContinualLearner:
         manifest_model_id = str(manifest.get("model_id", "") or "")
         manifest_split_config_id = str(manifest.get("split_config_id", "") or "")
         manifest_front_version = str(manifest.get("front_version", "0") or "0")
+        manifest_runtime_contract = dict(
+            manifest.get("runtime_contract")
+            if isinstance(manifest.get("runtime_contract"), Mapping)
+            else {}
+        )
+        manifest_feature_layout_id = str(
+            manifest_runtime_contract.get("feature_layout_id") or ""
+        )
         label_coordinate_space = str(
             manifest.get("label_coordinate_space") or POOL_LABEL_COORDINATE_SPACE
         )
@@ -7114,6 +7134,9 @@ class CloudContinualLearner:
                     }
                     if not single_tensors:
                         raise ValueError("shard sample contained no tensor features")
+                    tensor_layout_id = make_feature_layout_id(
+                        feature_layout_from_tensors(single_tensors)
+                    )
                 except Exception:
                     unreadable_ids.append(sample_key)
                     continue
@@ -7175,14 +7198,15 @@ class CloudContinualLearner:
                         "model_id": manifest_model_id,
                         "split_config_id": manifest_split_config_id,
                         "front_version": manifest_front_version,
+                        "runtime_contract": manifest_runtime_contract,
                         "feature_layout_id": str(
-                            feature_value.get("feature_layout_id")
-                            or make_feature_layout_id(feature_layout_from_tensors(single_tensors))
+                            manifest_feature_layout_id
+                            or feature_value.get("feature_layout_id")
+                            or tensor_layout_id
                         ),
                         "source_feature_layout_id": str(
                             feature_value.get("source_feature_layout_id")
-                            or feature_value.get("feature_layout_id")
-                            or make_feature_layout_id(feature_layout_from_tensors(single_tensors))
+                            or tensor_layout_id
                         ),
                         "source_feature_schema_hash": str(
                             feature_value.get("source_feature_schema_hash")

@@ -300,6 +300,18 @@ def pack_high_quality_sync_bundle_to_file(
                     result = sample_store.load_inference_result(record)
                     feature_sample = _feature_sample_payload(intermediate)
                     feature_sample.update(_feature_layout_metadata(intermediate))
+                    if runtime_contract:
+                        tensor_layout_id = str(feature_sample.get("feature_layout_id") or "")
+                        if tensor_layout_id:
+                            feature_sample.setdefault(
+                                "source_feature_layout_id",
+                                tensor_layout_id,
+                            )
+                        feature_sample["runtime_contract"] = runtime_contract
+                        if runtime_contract.get("feature_layout_id"):
+                            feature_sample["feature_layout_id"] = str(
+                                runtime_contract.get("feature_layout_id")
+                            )
                     if record.input_image_size is not None:
                         feature_sample["input_image_size"] = list(record.input_image_size)
                     if record.input_tensor_shape is not None:

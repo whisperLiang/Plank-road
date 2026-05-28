@@ -836,6 +836,54 @@ def test_fixed_split_recomputes_and_overwrites_old_plan_version(
     assert persisted["canonical_split_key"] == "after:node_1"
 
 
+def test_fixed_split_recomputes_and_overwrites_model_version_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    import model_management.fixed_split as fixed_split
+
+    cache_path = tmp_path / "fixed_split_plan.json"
+    stale = _dummy_plan()
+    stale.trace_signature = "same-runtime"
+    stale.input_tensor_shape = [1, 4]
+    stale.runtime_contract["model_version"] = "0"
+    persist_split_plan(str(cache_path), stale)
+
+    fresh = _dummy_plan()
+    fresh.trace_signature = "same-runtime"
+    fresh.input_tensor_shape = [1, 4]
+    fresh.runtime_contract["model_version"] = "1"
+    fresh.canonical_split_key = "after:node_1"
+
+    class Runtime:
+        graph = "same-runtime"
+        model = object()
+
+        def split(self, **_kwargs):
+            raise AssertionError("stale cache should not be applied")
+
+    monkeypatch.setattr(
+        fixed_split,
+        "compute_fixed_split_for_model",
+        lambda *_args, **_kwargs: fresh,
+    )
+
+    plan = load_or_compute_fixed_split_plan(
+        torch.nn.Linear(4, 2),
+        SplitConstraints(privacy_leakage_upper_bound=0.0),
+        sample_input=torch.randn(2, 4),
+        splitter=Runtime(),
+        cache_path=str(cache_path),
+        model_name=stale.model_name,
+        model_version="1",
+    )
+
+    assert plan.runtime_contract["model_version"] == "1"
+    with cache_path.open("r", encoding="utf-8") as handle:
+        persisted = json.load(handle)
+    assert persisted["runtime_contract"]["model_version"] == "1"
+
+
 def test_fixed_split_rejects_exact_runtime_split_mismatch(monkeypatch):
     import model_management.fixed_split as fixed_split
 

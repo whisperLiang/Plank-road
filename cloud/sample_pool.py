@@ -21,7 +21,6 @@ from model_management.detection_box_projection import (
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_contract import (
     SplitRuntimeContract,
-    feature_layout_id as make_feature_layout_id,
     feature_layout_from_tensors,
     normalise_feature_tensors,
 )
@@ -535,6 +534,25 @@ def _metadata_present(value: Any) -> bool:
     return value not in (None, "", [])
 
 
+def _runtime_contract_feature_layout_id(candidate: Mapping[str, Any]) -> str:
+    runtime_contract = candidate.get("runtime_contract")
+    if not isinstance(runtime_contract, Mapping):
+        return ""
+    return str(runtime_contract.get("feature_layout_id") or "")
+
+
+def _candidate_feature_layout_id(
+    candidate: Mapping[str, Any],
+    *,
+    split_contract: SplitRuntimeContract,
+) -> str:
+    return (
+        _runtime_contract_feature_layout_id(candidate)
+        or str(candidate.get("feature_layout_id") or "")
+        or str(split_contract.feature_layout_id)
+    )
+
+
 def _has_contract_id_metadata_mismatch(
     candidate: Mapping[str, Any],
     split_contract: SplitRuntimeContract,
@@ -573,7 +591,10 @@ def _hard_contract_metadata_mismatch_reason(
     ):
         return "input_resize_mode"
 
-    feature_layout_id = candidate.get("feature_layout_id")
+    feature_layout_id = (
+        _runtime_contract_feature_layout_id(candidate)
+        or candidate.get("feature_layout_id")
+    )
     if (
         _metadata_present(feature_layout_id)
         and str(feature_layout_id) != str(split_contract.feature_layout_id)
@@ -1166,8 +1187,7 @@ class CloudSamplePool:
             split_config_id=str(candidate.get("split_config_id") or split_contract.split_config_id),
             front_version=str(candidate.get("front_version") or split_contract.front_version),
             feature_layout_id=str(
-                candidate.get("feature_layout_id")
-                or hashlib.sha1(_stable_json(feature_layout).encode("utf-8")).hexdigest()
+                _candidate_feature_layout_id(candidate, split_contract=split_contract)
             ),
             sample_source=sample_source,
             label_source=label_source,
@@ -1234,11 +1254,7 @@ class CloudSamplePool:
         except Exception:
             return "skipped_feature_layout"
         record.feature, source_to_target = normalised
-        record.feature_layout_id = make_feature_layout_id(
-            feature_layout_from_tensors(record.feature)
-        )
-        if record.feature_layout_id != split_contract.feature_layout_id:
-            return "skipped_feature_layout"
+        record.feature_layout_id = split_contract.feature_layout_id
         record.boundary_payload = _normalise_boundary_payload_for_contract(
             record.boundary_payload,
             tensors=record.feature,

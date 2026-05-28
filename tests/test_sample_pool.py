@@ -52,6 +52,19 @@ def _build_split_contract(
     )
 
 
+def test_split_contract_feature_layout_id_includes_runtime_contract_identity():
+    first = _build_split_contract(runtime_identity={"graph_signature": "trace-a"})
+    second = _build_split_contract(runtime_identity={"graph_signature": "trace-b"})
+    same_layout_new_contract = _build_split_contract(
+        runtime_identity={"graph_signature": "trace-a", "trace_batch_size": 2}
+    )
+
+    assert first.feature_layout == second.feature_layout
+    assert first.feature_layout_id != second.feature_layout_id
+    assert first.feature_layout_id == same_layout_new_contract.feature_layout_id
+    assert first.contract_id != same_layout_new_contract.contract_id
+
+
 def _high_quality_candidate(sample_id: str, *, created_at: float = 0.0) -> dict:
     return {
         "sample_id": sample_id,
@@ -467,8 +480,12 @@ def test_canonical_rebuild_preserves_active_generation_if_existing_sample_is_unr
 def test_canonical_rebuild_migrates_compatible_contract_id_drift_until_capacity(tmp_path):
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
-    old_contract = _build_split_contract(runtime_identity={"graph_signature": "old-runtime"})
-    new_contract = _build_split_contract(runtime_identity={"graph_signature": "new-runtime"})
+    old_contract = _build_split_contract(
+        runtime_identity={"graph_signature": "runtime", "trace_batch_size": 1}
+    )
+    new_contract = _build_split_contract(
+        runtime_identity={"graph_signature": "runtime", "trace_batch_size": 2}
+    )
 
     pool.stage_low_quality_samples([_low_quality_candidate("old-active", created_at=1.0)])
     pool.rebuild_canonical_training_pool(
@@ -503,8 +520,12 @@ def test_canonical_rebuild_migrates_compatible_contract_id_drift_until_capacity(
 def test_canonical_rebuild_migrates_compatible_contract_id_drift_with_capacity_limit(tmp_path):
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=2)
-    old_contract = _build_split_contract(runtime_identity={"graph_signature": "old-runtime"})
-    new_contract = _build_split_contract(runtime_identity={"graph_signature": "new-runtime"})
+    old_contract = _build_split_contract(
+        runtime_identity={"graph_signature": "runtime", "trace_batch_size": 1}
+    )
+    new_contract = _build_split_contract(
+        runtime_identity={"graph_signature": "runtime", "trace_batch_size": 2}
+    )
 
     pool.stage_low_quality_samples(
         [
@@ -539,8 +560,12 @@ def test_canonical_rebuild_migrates_compatible_contract_id_drift_with_capacity_l
 def test_canonical_rebuild_skips_unreadable_contract_id_drift_without_blocking(tmp_path):
     pool_cls = _load_cloud_sample_pool()
     pool = pool_cls(root_dir=str(tmp_path / "pool"), max_active_samples=8)
-    old_contract = _build_split_contract(runtime_identity={"graph_signature": "old-runtime"})
-    new_contract = _build_split_contract(runtime_identity={"graph_signature": "new-runtime"})
+    old_contract = _build_split_contract(
+        runtime_identity={"graph_signature": "runtime", "trace_batch_size": 1}
+    )
+    new_contract = _build_split_contract(
+        runtime_identity={"graph_signature": "runtime", "trace_batch_size": 2}
+    )
 
     pool.stage_low_quality_samples([_low_quality_candidate("old-active", created_at=1.0)])
     pool.rebuild_canonical_training_pool(
