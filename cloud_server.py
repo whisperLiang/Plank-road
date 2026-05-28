@@ -74,6 +74,7 @@ from model_management.fixed_split_runtime_template import (
     FixedSplitRuntimeTemplate,
     FixedSplitRuntimeTemplateKey,
     FixedSplitRuntimeTemplateLookup,
+    bind_request_runtime_from_template,
     bind_request_splitter_from_template,
     fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
@@ -2797,8 +2798,9 @@ class CloudContinualLearner:
             make_feature_layout_id(low_quality_layout) if low_quality_layout else "",
         )
         if mismatches:
-            logger.warning(
-                "[SamplePool] pending high-quality layout mismatch preview={}",
+            logger.info(
+                "[SamplePool] pending high-quality feature-only samples are not compatible "
+                "with the active runtime layout and will remain deferred: preview={}",
                 mismatches,
             )
 
@@ -2808,11 +2810,16 @@ class CloudContinualLearner:
         splitter: UniversalModelSplitter,
         candidate: object | None,
         input_tensor_shape: list[int],
+        device: torch.device | str | None = None,
     ) -> dict[str, torch.Tensor] | None:
         if len(input_tensor_shape) < 4:
             return None
         batch_shape = [2, *[int(dim) for dim in input_tensor_shape[1:]]]
-        example = torch.zeros(batch_shape, dtype=torch.float32, device=self.device)
+        example = torch.zeros(
+            batch_shape,
+            dtype=torch.float32,
+            device=self.device if device is None else device,
+        )
         try:
             with torch.no_grad():
                 payload = splitter.edge_forward(example, candidate=candidate)
@@ -4562,11 +4569,12 @@ class CloudContinualLearner:
         frame,
         *,
         sample_metadata: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
     ):
         return prepare_split_runtime_input(
             model,
             frame,
-            device=self.device,
+            device=self.device if device is None else device,
             input_tensor_shape=_runtime_input_tensor_shape_from_metadata(sample_metadata),
         )
 
@@ -4658,11 +4666,13 @@ class CloudContinualLearner:
         *,
         sample_metadata: Mapping[str, object] | None = None,
         context: str,
+        device: torch.device | str | None = None,
     ) -> torch.Tensor:
         runtime_input = self._prepare_split_runtime_input(
             model,
             frame,
             sample_metadata=sample_metadata,
+            device=device,
         )
         return self._normalize_bundle_runtime_tensor(
             runtime_input,
@@ -4727,6 +4737,7 @@ class CloudContinualLearner:
         manifest: dict[str, object],
         *,
         runtime_batch_size: int | None = None,
+        device: torch.device | str | None = None,
     ) -> torch.Tensor:
         batch_target = max(
             1,
@@ -4750,6 +4761,7 @@ class CloudContinualLearner:
                     frame,
                     sample_metadata=sample,
                     context="Cloud fixed-split batch tracing",
+                    device=device,
                 )
             )
             if len(prepared_inputs) >= batch_target:
@@ -4762,7 +4774,7 @@ class CloudContinualLearner:
                     build_split_runtime_sample_input(
                         model,
                         image_size=trace_image_size,
-                        device=self.device,
+                        device=self.device if device is None else device,
                     ),
                     context="Cloud fixed-split batch tracing",
                 )
@@ -5174,6 +5186,59 @@ class CloudContinualLearner:
             f"({error_summary})."
         )
 
+    def _resolve_runtime_contract_trace_device(
+        self,
+        runtime_contract: Mapping[str, object],
+    ) -> torch.device:
+        requested = str(runtime_contract.get("trace_device_type") or "").strip().lower()
+        if requested == "cuda" and torch.cuda.is_available():
+            return torch.device("cuda")
+        if requested == "cpu":
+            return torch.device("cpu")
+        return torch.device(self.device)
+
+    @staticmethod
+    def _module_device(module: torch.nn.Module) -> torch.device:
+        for parameter in module.parameters(recurse=True):
+            return parameter.device
+        for buffer in module.buffers(recurse=True):
+            return buffer.device
+        return torch.device("cpu")
+
+    def _trace_model_for_device(
+        self,
+        model: torch.nn.Module,
+        trace_device: torch.device,
+    ) -> torch.nn.Module:
+        model_device = self._module_device(model)
+        if model_device.type == trace_device.type:
+            return model
+        trace_model = copy.deepcopy(model)
+        trace_model.to(trace_device)
+        trace_model.eval()
+        return trace_model
+
+    @staticmethod
+    def _move_runtime_input_to_device(value: object, device: torch.device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, tuple):
+            return tuple(
+                CloudContinualLearner._move_runtime_input_to_device(item, device)
+                for item in value
+            )
+        if isinstance(value, list):
+            return [
+                CloudContinualLearner._move_runtime_input_to_device(item, device)
+                for item in value
+            ]
+        if isinstance(value, dict):
+            return {
+                key: CloudContinualLearner._move_runtime_input_to_device(item, device)
+                for key, item in value.items()
+            }
+        return value
+
     @staticmethod
     def _batch_polymorphic_smoke_loss(outputs: object, _targets: object) -> torch.Tensor:
         terms: list[torch.Tensor] = []
@@ -5206,6 +5271,7 @@ class CloudContinualLearner:
         trace_batch_size: int,
         runtime_batch_size: int | None,
         dynamic_batch: tuple[int, int] | None,
+        runtime_device: torch.device | str | None = None,
     ) -> list[int]:
         batch_sizes = _fixed_split_validation_batches(
             model_family=model_family,
@@ -5225,6 +5291,7 @@ class CloudContinualLearner:
                 bundle_root,
                 manifest,
                 runtime_batch_size=batch_size,
+                device=runtime_device,
             )
             try:
                 boundary_payload = runtime.run_prefix(
@@ -5267,6 +5334,9 @@ class CloudContinualLearner:
         sample_input = trace_sample_input
         model_name = self._resolve_fixed_split_model_name(manifest)
         model_family = model_zoo.get_model_family(model_name)
+        edge_runtime_contract = _fixed_split_plan_runtime_contract(split_plan_payload)
+        trace_device = self._resolve_runtime_contract_trace_device(edge_runtime_contract)
+        trace_model = self._trace_model_for_device(split_model, trace_device)
         if sample_input is None:
             trace_batch_size = _cloud_fixed_split_trace_batch_size(
                 split_plan_payload,
@@ -5278,6 +5348,7 @@ class CloudContinualLearner:
                 bundle_root,
                 manifest,
                 runtime_batch_size=trace_batch_size,
+                device=trace_device,
             )
         else:
             trace_batch_size = _cloud_fixed_split_trace_batch_size(
@@ -5285,6 +5356,7 @@ class CloudContinualLearner:
                 model_family=model_family,
                 default=self.trace_batch_size,
             )
+            sample_input = self._move_runtime_input_to_device(sample_input, trace_device)
         boundary = _fixed_split_boundary_from_plan(split_plan_payload)
         dynamic_batch = _cloud_fixed_split_dynamic_batch(
             split_plan_payload,
@@ -5301,10 +5373,9 @@ class CloudContinualLearner:
             trace_batch_mode=trace_batch_mode,
             model_family=model_family,
         )
-        edge_runtime_contract = _fixed_split_plan_runtime_contract(split_plan_payload)
         trace_started = time.perf_counter()
         runtime, runtime_mode = self._prepare_replayable_split_runtime(
-            split_model,
+            trace_model,
             sample_input,
             split_spec,
             model_name=model_name,
@@ -5343,8 +5414,8 @@ class CloudContinualLearner:
                     "Fixed split feature layout mismatch and raw rebuild is unavailable: "
                     f"{compatibility}."
                 )
-            logger.warning(
-                "[FixedSplitCL] Edge/cloud feature layout mismatch; rebuilding "
+            logger.info(
+                "[FixedSplitCL] Edge/cloud feature layout differs; rebuilding "
                 "low-quality trigger features from raw frames with the cloud runtime. "
                 "model_name={} boundary={} compatibility={}",
                 model_name,
@@ -5352,8 +5423,25 @@ class CloudContinualLearner:
                 compatibility,
             )
             manifest["_cloud_rebuild_features_for_runtime_contract_mismatch"] = True
+        template_for_training = FixedSplitRuntimeTemplate(
+            cache_key=template_key,
+            runtime=runtime,
+            split_spec=split_spec,
+            model_name=model_name,
+            model_family=model_family,
+            graph_signature=str(getattr(runtime, "graph_signature", "") or ""),
+            symbolic_input_schema_hash=template_key.symbolic_input_schema_hash,
+            split_plan_hash=str(template_key.split_plan_hash),
+            mode=runtime_mode,
+            runtime_device=str(trace_device.type),
+        )
+        training_runtime = bind_request_runtime_from_template(
+            template_for_training,
+            model=split_model,
+            device=str(self.device),
+        )
         self._validate_dynamic_batch_trainability(
-            runtime,
+            training_runtime,
             model,
             manifest,
             bundle_root=bundle_root,
@@ -5361,11 +5449,12 @@ class CloudContinualLearner:
             trace_batch_size=trace_batch_size,
             runtime_batch_size=runtime_batch_size,
             dynamic_batch=dynamic_batch,
+            runtime_device=self.device,
         )
         self._log_stage_elapsed("Ariadne prepare_split", time.perf_counter() - trace_started)
         trace_signature = str(getattr(runtime, "graph_signature", "") or "")
         verifier = UniversalModelSplitter(device=self.device).bind_runtime(
-            runtime,
+            training_runtime,
             model=split_model,
             split_spec=split_spec,
         )
@@ -5397,6 +5486,7 @@ class CloudContinualLearner:
             symbolic_input_schema_hash=template_key.symbolic_input_schema_hash,
             split_plan_hash=str(template_key.split_plan_hash),
             mode=runtime_mode,
+            runtime_device=str(trace_device.type),
         )
 
     def _get_or_create_fixed_split_runtime_template(
@@ -7576,8 +7666,9 @@ class CloudContinualLearner:
                 )
                 deferred_preview = validation_stats.get("deferred_feature_layout_preview")
                 if deferred_preview:
-                    logger.warning(
-                        "[SamplePool] deferred pending high-quality feature-layout mismatch preview={}",
+                    logger.info(
+                        "[SamplePool] deferred pending high-quality feature-only samples "
+                        "kept out of training due to runtime layout mismatch: preview={}",
                         deferred_preview,
                     )
                 logger.info(

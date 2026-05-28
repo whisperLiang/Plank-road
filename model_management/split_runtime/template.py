@@ -6,7 +6,9 @@ from collections.abc import Callable, Hashable
 from dataclasses import dataclass, replace
 from typing import Any
 
+import torch
 from ariadne.codegen.segment_builder import build_segments
+from ariadne.trace.interception import ConstantTensorArg
 from loguru import logger
 
 from .ariadne_runtime import SplitRuntime, SplitSpec
@@ -79,6 +81,7 @@ class FixedSplitRuntimeTemplate:
     symbolic_input_schema_hash: str
     split_plan_hash: str
     mode: str = "generated_eager"
+    runtime_device: str = ""
 
 
 @dataclass(frozen=True)
@@ -212,7 +215,8 @@ def bind_request_runtime_from_template(
 
 
 def _rebind_runtime_to_model(runtime: SplitRuntime, model: Any) -> SplitRuntime:
-    trace_plan = replace(runtime.trace_plan, root_module=model)
+    trace_plan = _rebind_trace_plan_to_model(runtime.trace_plan, model)
+    candidate = _rebind_candidate_device(getattr(runtime, "candidate", None), model)
     variants = tuple(
         _rebind_runtime_to_model(variant, model)
         for variant in tuple(getattr(runtime, "variants", ()) or ())
@@ -220,12 +224,117 @@ def _rebind_runtime_to_model(runtime: SplitRuntime, model: Any) -> SplitRuntime:
     return SplitRuntime(
         trace_plan=trace_plan,
         split_spec=runtime.split_spec,
-        candidate=runtime.candidate,
-        segments=build_segments(trace_plan, runtime.candidate),
+        candidate=candidate,
+        segments=build_segments(trace_plan, candidate),
         mode=runtime.mode,
         variants=variants,
         batch_range=getattr(runtime, "batch_range", None),
     )
+
+
+def _model_device(model: Any) -> Any:
+    if model is None:
+        return None
+    for parameter in getattr(model, "parameters", lambda **_: ())():
+        target_device = getattr(parameter, "device", None)
+        if target_device is not None:
+            return target_device
+    for buffer in getattr(model, "buffers", lambda **_: ())():
+        target_device = getattr(buffer, "device", None)
+        if target_device is not None:
+            return target_device
+    return None
+
+
+def _rebind_trace_plan_to_model(trace_plan: Any, model: Any) -> Any:
+    target_device = _model_device(model)
+    artifact = getattr(trace_plan, "runtime_artifact", None)
+    if target_device is not None and artifact is not None:
+        ops = tuple(
+            replace(
+                op,
+                args_template=_move_template_tensors_to_device(
+                    getattr(op, "args_template", None),
+                    target_device,
+                ),
+                kwargs_template=_move_template_tensors_to_device(
+                    getattr(op, "kwargs_template", None),
+                    target_device,
+                ),
+                output_template=_move_template_tensors_to_device(
+                    getattr(op, "output_template", None),
+                    target_device,
+                ),
+            )
+            for op in tuple(getattr(artifact, "ops", ()) or ())
+        )
+        artifact = replace(artifact, ops=ops)
+    return replace(trace_plan, root_module=model, runtime_artifact=artifact)
+
+
+def _move_template_tensors_to_device(value: Any, device: Any) -> Any:
+    if isinstance(value, ConstantTensorArg):
+        return replace(value, value=value.value.to(device))
+    if isinstance(value, torch.device):
+        return torch.device(device)
+    if hasattr(value, "device") and hasattr(value, "to"):
+        try:
+            return value.to(device)
+        except Exception:
+            return value
+    if isinstance(value, tuple):
+        return tuple(_move_template_tensors_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_template_tensors_to_device(item, device) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _move_template_tensors_to_device(item, device)
+            for key, item in value.items()
+        }
+    if isinstance(value, slice):
+        return slice(
+            _move_template_tensors_to_device(value.start, device),
+            _move_template_tensors_to_device(value.stop, device),
+            _move_template_tensors_to_device(value.step, device),
+        )
+    return value
+
+
+def _rebind_candidate_device(candidate: Any, model: Any) -> Any:
+    if candidate is None:
+        return None
+    target_device = _model_device(model)
+    if target_device is None:
+        return candidate
+
+    def _rebind_spec(spec: Any) -> Any:
+        try:
+            return replace(spec, device_type=str(target_device.type))
+        except Exception:
+            return spec
+
+    boundary_schema = getattr(candidate, "boundary_schema", None)
+    if isinstance(boundary_schema, dict):
+        boundary_schema = {
+            str(label): _rebind_spec(spec)
+            for label, spec in boundary_schema.items()
+        }
+
+    boundary_value_schema = getattr(candidate, "boundary_value_schema", None)
+    if isinstance(boundary_value_schema, dict):
+        boundary_value_schema = {
+            str(label): replace(spec, tensor_spec=_rebind_spec(getattr(spec, "tensor_spec", None)))
+            for label, spec in boundary_value_schema.items()
+        }
+
+    try:
+        return replace(
+            candidate,
+            boundary_schema=boundary_schema if boundary_schema is not None else getattr(candidate, "boundary_schema", None),
+            boundary_value_schema=boundary_value_schema if boundary_value_schema is not None else getattr(candidate, "boundary_value_schema", None),
+        )
+    except TypeError:
+        return candidate
 
 
 _PROCESS_FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE = FixedSplitRuntimeTemplateCache()

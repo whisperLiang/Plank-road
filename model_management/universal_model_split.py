@@ -117,11 +117,9 @@ def _runtime_boundary_device(runtime: Any, boundary: BoundaryPayload) -> torch.d
                 schema_device_type = str(device_type)
                 break
 
-    for module_name in ("suffix_segment", "prefix_segment", "training_prefix_segment"):
+    for module_name in ("suffix_segment", "training_prefix_segment", "prefix_segment"):
         module_device = _first_module_device(getattr(resolved_runtime, module_name, None))
-        if module_device is None:
-            continue
-        if schema_device_type is None or module_device.type == schema_device_type:
+        if module_device is not None:
             return module_device
 
     if schema_device_type:

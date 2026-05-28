@@ -375,6 +375,7 @@ class BoundaryPayloadCacheCodec:
         payload: BoundaryPayload,
         actual_batch_size: int | None = None,
     ) -> list[BoundaryPayload]:
+        payload = self.to_runtime_device(payload)
         self.validate(payload)
         payload_batch_size = int(getattr(payload, "batch_size", 0) or 0)
         if payload_batch_size <= 0:

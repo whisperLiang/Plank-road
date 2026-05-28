@@ -115,6 +115,35 @@ def test_boundary_payload_cache_splits_and_collates_b_and_4b(tmp_path):
     runtime.validate_boundary(collated)
 
 
+def test_boundary_payload_cache_split_moves_cuda_payload_to_trace_schema_device():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to exercise cross-device boundary split normalization.")
+
+    payload, runtime = _rfdetr_payload(batch_size=2)
+    cuda_payload = BoundaryPayload(
+        split_id=payload.split_id,
+        graph_signature=payload.graph_signature,
+        batch_size=payload.batch_size,
+        tensors={key: tensor.cuda() for key, tensor in payload.tensors.items()},
+        schema=payload.schema,
+        requires_grad=payload.requires_grad,
+        passthrough_inputs={
+            key: value.cuda() if isinstance(value, torch.Tensor) else value
+            for key, value in payload.passthrough_inputs.items()
+        },
+        protocol_version=payload.protocol_version,
+        values=payload.values,
+        value_schema=payload.value_schema,
+    )
+    codec = BoundaryPayloadCacheCodec(runtime)
+
+    samples = codec.split_batch(cuda_payload)
+
+    assert len(samples) == 2
+    assert samples[0].tensors["node_44"].device.type == "cpu"
+    assert samples[0].passthrough_inputs["input"].device.type == "cpu"
+
+
 def test_boundary_payload_cache_collate_restores_runtime_schema_device(tmp_path):
     schema = {
         "node_0": BoundaryTensorSpec(

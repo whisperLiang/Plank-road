@@ -3232,8 +3232,16 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         "samples": [{"sample_id": "s1", "input_tensor_shape": [1, 3, 4, 4]}],
     }
 
-    def fake_build_trace_input(model, bundle_root, manifest, *, runtime_batch_size=None):
+    def fake_build_trace_input(
+        model,
+        bundle_root,
+        manifest,
+        *,
+        runtime_batch_size=None,
+        device=None,
+    ):
         captured["trace_batch_sizes"].append(runtime_batch_size)
+        captured["trace_device"] = str(device)
         return torch.zeros(int(runtime_batch_size), 3, 4, 4)
 
     def fake_prepare_replayable_split_runtime(
@@ -3280,10 +3288,19 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         "_prepare_replayable_split_runtime",
         fake_prepare_replayable_split_runtime,
     )
+    def fake_validate_dynamic_batch_trainability(*args, **kwargs):
+        captured["training_runtime_device"] = str(kwargs.get("runtime_device"))
+        return [2, 4, 16]
+
     monkeypatch.setattr(
         learner,
         "_validate_dynamic_batch_trainability",
-        lambda *args, **kwargs: [2, 4, 16],
+        fake_validate_dynamic_batch_trainability,
+    )
+    monkeypatch.setattr(
+        cloud_server,
+        "bind_request_runtime_from_template",
+        lambda template, *, model, device: template.runtime,
     )
     class FakeVerifier:
         def __init__(self, *args, **kwargs):
@@ -3311,6 +3328,8 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     )
 
     assert captured["trace_batch_sizes"] == [2]
+    assert captured["trace_device"] == "cpu"
+    assert captured["training_runtime_device"] == str(learner.device)
     assert captured["trace_sample_shape"][0] == 2
     assert captured["split_boundary"] == "after:node_1"
     assert captured["trace_batch_mode"] == "batch_gt1"
@@ -3397,6 +3416,11 @@ def test_cloud_fixed_split_template_rebuilds_raw_trigger_on_boundary_label_misma
         learner,
         "_validate_dynamic_batch_trainability",
         lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        cloud_server,
+        "bind_request_runtime_from_template",
+        lambda template, *, model, device: template.runtime,
     )
 
     class FakeVerifier:
