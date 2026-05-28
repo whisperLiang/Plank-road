@@ -16,6 +16,7 @@ from ariadne.trace.tracer import trace_model
 from loguru import logger
 
 from model_management.split_candidate import CandidateProfile, SplitCandidate
+from model_management.split_contract import build_runtime_contract
 from model_management.split_runtime import make_split_spec
 from model_management.universal_model_split import (
     UniversalModelSplitter,
@@ -27,7 +28,7 @@ from model_management.universal_model_split import (
 )
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v6"
+FIXED_SPLIT_PLAN_VERSION = "fixed-split.v8"
 FIXED_SPLIT_DYNAMIC_BATCH_MAX = 64
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
@@ -235,6 +236,7 @@ class SplitPlan:
     input_resize_mode: str = "direct_resize"
     front_version: str = "0"
     plan_version: str = FIXED_SPLIT_PLAN_VERSION
+    runtime_contract: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.canonical_split_key:
@@ -253,6 +255,7 @@ class SplitPlan:
         self.input_tensor_shape = [int(dim) for dim in list(self.input_tensor_shape or [])]
         self.input_resize_mode = str(self.input_resize_mode or "direct_resize")
         self.front_version = str(self.front_version or "0")
+        self.runtime_contract = dict(self.runtime_contract or {})
 
     @property
     def boundary_count(self) -> int:
@@ -265,15 +268,23 @@ class SplitPlan:
         )
         return (
             f"canonical_split_key={self.canonical_split_key}, "
-            f"candidate_id={self.candidate_id}, "
+            f"logical_split_id={self.logical_split_id}, "
             f"split_granularity={self.split_granularity}, "
             f"boundary_count={self.boundary_count}, "
             f"boundary_tensor_labels={boundary_labels}, "
-            f"split_index={self.split_index}, "
+            f"feature_layout_id={self.feature_layout_id}, "
             f"payload_bytes={self.payload_bytes}, "
             f"privacy_leakage={self.privacy_leakage:.6g}, "
             f"edge_parameters={self.edge_parameter_count}/{self.total_parameter_count}"
         )
+
+    @property
+    def logical_split_id(self) -> str:
+        return str(self.runtime_contract.get("logical_split_id") or self.canonical_split_key)
+
+    @property
+    def feature_layout_id(self) -> str:
+        return str(self.runtime_contract.get("feature_layout_id") or "")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -301,6 +312,7 @@ class SplitPlan:
             split_index=payload.get("split_index"),
             split_label=payload.get("split_label"),
             boundary_tensor_labels=list(payload.get("boundary_tensor_labels", [])),
+            runtime_contract=dict(payload.get("runtime_contract") or {}),
             input_tensor_shape=[
                 int(dim) for dim in list(payload.get("input_tensor_shape", []) or [])
             ],
@@ -380,6 +392,57 @@ def _trace_signature(splitter: UniversalModelSplitter) -> str:
     return "unavailable"
 
 
+def _first_tensor_device_type(value: Any) -> str:
+    if isinstance(value, torch.Tensor):
+        return str(value.device.type)
+    if isinstance(value, Mapping):
+        for item in value.values():
+            found = _first_tensor_device_type(item)
+            if found:
+                return found
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_tensor_device_type(item)
+            if found:
+                return found
+    return ""
+
+
+def _runtime_backend(splitter: UniversalModelSplitter) -> str:
+    runtime = getattr(splitter, "runtime", None)
+    return str(getattr(runtime, "mode", "") or "")
+
+
+def _candidate_boundary_schema(candidate: SplitCandidate) -> dict[str, Any]:
+    metadata = dict(getattr(candidate, "metadata", {}) or {})
+    boundary_schema = metadata.get("boundary_schema")
+    return dict(boundary_schema) if isinstance(boundary_schema, Mapping) else {}
+
+
+def _build_plan_runtime_contract(
+    *,
+    model_name: str,
+    model_version: str,
+    candidate: SplitCandidate,
+    runtime: UniversalModelSplitter,
+    sample_input: Any,
+    input_resize_mode: str,
+) -> dict[str, Any]:
+    trace_signature = _trace_signature(runtime)
+    return build_runtime_contract(
+        logical_split_id=_candidate_split_key(candidate),
+        trace_signature=trace_signature,
+        trace_device_type=_first_tensor_device_type(sample_input),
+        runtime_backend=_runtime_backend(runtime),
+        boundary_tensor_labels=list(candidate.boundary_tensor_labels),
+        boundary_schema=_candidate_boundary_schema(candidate),
+        model_id=str(model_name),
+        model_version=str(model_version or "0"),
+        input_tensor_shape=_input_tensor_shape_from_sample(sample_input),
+        input_resize_mode=str(input_resize_mode or "direct_resize"),
+    )
+
+
 def _layer_freezing_ratio(
     splitter: UniversalModelSplitter,
     candidate: SplitCandidate,
@@ -425,14 +488,16 @@ def _make_plan_id(
     model_name: str,
     candidate: SplitCandidate,
     constraints: SplitConstraints,
+    runtime_contract: Mapping[str, Any] | None = None,
 ) -> str:
     raw = json.dumps(
         {
             "model_name": model_name,
             "plan_version": FIXED_SPLIT_PLAN_VERSION,
-            "candidate_id": candidate.candidate_id,
-            "split_index": candidate.legacy_layer_index,
-            "boundary_tensor_labels": list(candidate.boundary_tensor_labels),
+            "logical_split_id": _candidate_split_key(candidate),
+            "feature_layout_id": str(
+                dict(runtime_contract or {}).get("feature_layout_id") or ""
+            ),
             "constraints": _constraints_payload(constraints),
         },
         sort_keys=True,
@@ -999,6 +1064,7 @@ def _compute_lazy_fixed_split_for_model(
     model_name: str | None,
     input_resize_mode: str,
     front_version: str,
+    model_version: str,
 ) -> SplitPlan:
     if sample_kwargs:
         raise RuntimeError("Ariadne fixed split planning expects positional example inputs.")
@@ -1118,6 +1184,14 @@ def _compute_lazy_fixed_split_for_model(
     )
     canonical_split_key = _candidate_split_key(chosen)
     candidate_descriptor = build_candidate_descriptor(chosen)
+    runtime_contract = _build_plan_runtime_contract(
+        model_name=model_name or model.__class__.__name__,
+        model_version=model_version,
+        candidate=chosen,
+        runtime=runtime,
+        sample_input=sample_input,
+        input_resize_mode=input_resize_mode,
+    )
     split_granularity = str(
         (chosen.metadata or {}).get("split_granularity") or "operation"
     )
@@ -1126,6 +1200,7 @@ def _compute_lazy_fixed_split_for_model(
             model_name=model_name or model.__class__.__name__,
             candidate=chosen,
             constraints=constraints,
+            runtime_contract=runtime_contract,
         ),
         canonical_split_key=canonical_split_key,
         edge_split_id=canonical_split_key,
@@ -1134,6 +1209,7 @@ def _compute_lazy_fixed_split_for_model(
         split_index=chosen.legacy_layer_index,
         split_label=chosen.candidate_id,
         boundary_tensor_labels=list(chosen.boundary_tensor_labels),
+        runtime_contract=runtime_contract,
         input_tensor_shape=_input_tensor_shape_from_sample(sample_input),
         input_resize_mode=str(input_resize_mode or "direct_resize"),
         front_version=str(front_version or "0"),
@@ -1188,6 +1264,7 @@ def compute_fixed_split_for_model(
     cache_path: str | None = None,
     input_resize_mode: str = "direct_resize",
     front_version: str = "0",
+    model_version: str = "0",
 ) -> SplitPlan:
     del cache_path
     runtime = splitter or UniversalModelSplitter(device=device)
@@ -1201,6 +1278,7 @@ def compute_fixed_split_for_model(
             model_name=model_name,
             input_resize_mode=input_resize_mode,
             front_version=front_version,
+            model_version=model_version,
         )
 
     if not _is_ariadne_runtime(runtime):
@@ -1247,6 +1325,14 @@ def compute_fixed_split_for_model(
 
     canonical_split_key = _candidate_split_key(chosen)
     candidate_descriptor = build_candidate_descriptor(chosen)
+    runtime_contract = _build_plan_runtime_contract(
+        model_name=model_name or model.__class__.__name__,
+        model_version=model_version,
+        candidate=chosen,
+        runtime=runtime,
+        sample_input=sample_input,
+        input_resize_mode=input_resize_mode,
+    )
     split_granularity = str(
         (chosen.metadata or {}).get("split_granularity") or "operation"
     )
@@ -1255,6 +1341,7 @@ def compute_fixed_split_for_model(
             model_name=model_name or model.__class__.__name__,
             candidate=chosen,
             constraints=constraints,
+            runtime_contract=runtime_contract,
         ),
         canonical_split_key=canonical_split_key,
         edge_split_id=canonical_split_key,
@@ -1263,6 +1350,7 @@ def compute_fixed_split_for_model(
         split_index=chosen.legacy_layer_index,
         split_label=chosen.candidate_id,
         boundary_tensor_labels=list(chosen.boundary_tensor_labels),
+        runtime_contract=runtime_contract,
         input_tensor_shape=_input_tensor_shape_from_sample(sample_input),
         input_resize_mode=str(input_resize_mode or "direct_resize"),
         front_version=str(front_version or "0"),
@@ -1308,6 +1396,7 @@ def load_or_compute_fixed_split_plan(
     validate_cached_plan: bool = True,
     input_resize_mode: str = "direct_resize",
     front_version: str = "0",
+    model_version: str = "0",
 ) -> SplitPlan:
     runtime = splitter or UniversalModelSplitter(device=device)
     sample_input_shape = _input_tensor_shape_from_sample(sample_input)
@@ -1370,6 +1459,7 @@ def load_or_compute_fixed_split_plan(
         cache_path=cache_path,
         input_resize_mode=input_resize_mode,
         front_version=front_version,
+        model_version=model_version,
     )
     if cache_path and (cached is None or cached_invalidated):
         persist_split_plan(cache_path, plan)

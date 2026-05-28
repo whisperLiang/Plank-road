@@ -254,10 +254,7 @@ def pack_high_quality_sync_bundle_to_file(
         or getattr(first_record, "input_resize_mode", "")
         or "direct_resize"
     )
-    split_label = context.get("split_label")
-    boundary_tensor_labels = [
-        str(label) for label in list(context.get("boundary_tensor_labels", []) or [])
-    ]
+    runtime_contract = dict(context.get("runtime_contract") or {})
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
@@ -280,7 +277,7 @@ def pack_high_quality_sync_bundle_to_file(
         "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
         "input_resize_mode": input_resize_mode,
         "label_coordinate_space": ORIGINAL_XYXY,
-        "boundary_tensor_labels": boundary_tensor_labels,
+        "runtime_contract": runtime_contract,
         "request_id": resolved_request_id,
         "created_at": _utc_now(),
         "shard_size": resolved_shard_size,
@@ -687,9 +684,8 @@ class HighQualitySampleSyncer:
                 provider_context.get("input_tensor_shape", []) or []
             )
             context["input_resize_mode"] = provider_context.get("input_resize_mode")
-            context["split_label"] = provider_context.get("split_label")
-            context["boundary_tensor_labels"] = list(
-                provider_context.get("boundary_tensor_labels", []) or []
+            context["runtime_contract"] = dict(
+                provider_context.get("runtime_contract") or {}
             )
         return context
 

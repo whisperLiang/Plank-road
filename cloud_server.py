@@ -85,11 +85,14 @@ from model_management.split_runtime import (
 )
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_contract import (
+    FIXED_SPLIT_RUNTIME_CONTRACT_VERSION,
     SplitRuntimeContract,
+    classify_feature_layout_compatibility,
     contract_path,
     feature_layout_from_tensors,
     feature_layout_id as make_feature_layout_id,
     normalise_feature_tensors,
+    resolve_cloud_runtime_contract,
 )
 from torchvision.models.detection.image_list import ImageList
 
@@ -259,23 +262,40 @@ def _build_fixed_split_cache_identity(
 
 
 def _fixed_split_boundary_from_plan(split_plan: Mapping[str, object]) -> str:
-    descriptor = dict(split_plan.get("candidate_descriptor", {}) or {})
-    boundary = (
-        split_plan.get("candidate_id")
-        or split_plan.get("edge_split_id")
-        or split_plan.get("canonical_split_key")
-        or descriptor.get("candidate_id")
-        or split_plan.get("split_label")
-        or (
-            list(split_plan.get("boundary_tensor_labels") or [])[-1]
-            if split_plan.get("boundary_tensor_labels")
-            else "auto"
-        )
-    )
+    boundary = _fixed_split_plan_runtime_contract(split_plan).get("logical_split_id") or "auto"
     boundary = str(boundary)
     if boundary != "auto" and not boundary.startswith("after:"):
         boundary = f"after:{boundary}"
     return boundary
+
+
+def _fixed_split_plan_runtime_contract(
+    split_plan: Mapping[str, object],
+) -> dict[str, object]:
+    if str(split_plan.get("plan_version") or "") != "fixed-split.v8":
+        raise RuntimeError(
+            "Unsupported fixed split plan version "
+            f"{split_plan.get('plan_version')!r}; fixed-split.v8 runtime_contract "
+            "payloads are required."
+        )
+    runtime_contract = split_plan.get("runtime_contract")
+    if not isinstance(runtime_contract, Mapping):
+        raise RuntimeError(
+            "Fixed split plan is missing runtime_contract; old fixed-split "
+            "payloads are no longer supported."
+        )
+    logical_split_id = str(runtime_contract.get("logical_split_id") or "").strip()
+    if not logical_split_id:
+        raise RuntimeError("Fixed split runtime_contract is missing logical_split_id.")
+    contract_version = str(runtime_contract.get("contract_version") or "")
+    if contract_version != FIXED_SPLIT_RUNTIME_CONTRACT_VERSION:
+        raise RuntimeError(
+            "Unsupported fixed split runtime_contract version "
+            f"{contract_version!r}; {FIXED_SPLIT_RUNTIME_CONTRACT_VERSION} is required."
+        )
+    if not str(runtime_contract.get("feature_layout_id") or "").strip():
+        raise RuntimeError("Fixed split runtime_contract is missing feature_layout_id.")
+    return dict(runtime_contract)
 
 
 def _fixed_split_dynamic_batch_from_plan(
@@ -367,6 +387,19 @@ def _fixed_split_validation_batches(
     if int(lower) <= 1:
         candidates.insert(0, 1)
     return sorted({batch for batch in candidates if int(lower) <= batch <= int(upper)})
+
+
+def _fixed_split_manifest_has_rebuildable_raw_samples(
+    manifest: Mapping[str, object],
+) -> bool:
+    samples = [
+        sample
+        for sample in list(manifest.get("samples", []) or [])
+        if isinstance(sample, Mapping)
+    ]
+    if not samples:
+        return False
+    return all(sample.get("raw_relpath") is not None for sample in samples)
 
 
 def _fixed_split_runtime_validation_signature(
@@ -771,16 +804,16 @@ def _boundary_payload_from_trigger_feature(
     if not tensors:
         return None
     split_plan = dict(manifest.get("split_plan", {}) or {})
+    runtime_contract = _fixed_split_plan_runtime_contract(split_plan)
     split_id = str(
-        manifest.get("edge_split_id")
+        runtime_contract.get("logical_split_id")
+        or manifest.get("edge_split_id")
         or manifest.get("canonical_split_key")
-        or split_plan.get("candidate_id")
-        or split_plan.get("split_label")
         or sample_id
     )
     graph_signature = str(
-        split_plan.get("trace_signature")
-        or split_plan.get("graph_signature")
+        runtime_contract.get("trace_signature")
+        or split_plan.get("trace_signature")
         or "low-quality-trigger"
     )
     return boundary_payload_from_tensors(
@@ -801,20 +834,18 @@ def _trigger_feature_cache_record(
     if boundary is None:
         return None
     split_plan = dict(manifest.get("split_plan", {}) or {})
+    runtime_contract = _fixed_split_plan_runtime_contract(split_plan)
     boundary_labels = list(
-        manifest.get("boundary_tensor_labels")
-        or split_plan.get("boundary_tensor_labels")
+        runtime_contract.get("boundary_tensor_labels")
         or getattr(boundary, "boundary_tensor_labels", None)
         or list(getattr(boundary, "tensors", {}).keys())
     )
     record: dict[str, object] = {
         "intermediate": boundary,
-        "candidate_id": split_plan.get("candidate_id")
-        or getattr(boundary, "candidate_id", None)
+        "runtime_contract": runtime_contract,
+        "candidate_id": runtime_contract.get("logical_split_id")
         or getattr(boundary, "split_id", None),
         "boundary_tensor_labels": boundary_labels,
-        "split_index": split_plan.get("split_index"),
-        "split_label": split_plan.get("split_label") or getattr(boundary, "split_id", None),
         "sample_id": sample_id,
         "model_id": str(manifest.get("model_id", "") or ""),
         "model_version": str(
@@ -2483,6 +2514,13 @@ class CloudContinualLearner:
     ) -> dict[str, object]:
         model_meta = dict(manifest.get("model", {}) or {})
         split_plan = dict(manifest.get("split_plan", {}) or {})
+        runtime_contract = dict(
+            manifest.get("runtime_contract")
+            if isinstance(manifest.get("runtime_contract"), Mapping)
+            else split_plan.get("runtime_contract")
+            if isinstance(split_plan.get("runtime_contract"), Mapping)
+            else {}
+        )
         return {
             "model_id": str(manifest.get("model_id") or model_meta.get("model_id", "") or ""),
             "front_version": str(
@@ -2493,32 +2531,36 @@ class CloudContinualLearner:
             "split_config_id": str(
                 manifest.get("split_config_id") or split_plan.get("split_config_id", "") or ""
             ),
+            "feature_layout_id": str(runtime_contract.get("feature_layout_id") or ""),
             "boundary_tensor_labels": list(
-                manifest.get("boundary_tensor_labels")
-                or split_plan.get("boundary_tensor_labels", [])
+                runtime_contract.get("boundary_tensor_labels", [])
                 or []
             ),
             "canonical_split_key": str(
                 manifest.get("canonical_split_key")
                 or split_plan.get("canonical_split_key")
+                or runtime_contract.get("logical_split_id")
                 or ""
             ),
             "edge_split_id": str(
                 manifest.get("edge_split_id")
                 or split_plan.get("edge_split_id")
-                or split_plan.get("candidate_id")
+                or runtime_contract.get("logical_split_id")
                 or ""
             ),
             "input_tensor_shape": list(
-                manifest.get("input_tensor_shape")
+                runtime_contract.get("input_tensor_shape")
+                or manifest.get("input_tensor_shape")
                 or split_plan.get("input_tensor_shape", [])
                 or []
             ),
             "input_resize_mode": str(
-                manifest.get("input_resize_mode")
+                runtime_contract.get("input_resize_mode")
+                or manifest.get("input_resize_mode")
                 or split_plan.get("input_resize_mode")
                 or "direct_resize"
             ),
+            "runtime_contract": runtime_contract,
         }
 
     def _cloud_sample_pool_path(
@@ -2528,7 +2570,12 @@ class CloudContinualLearner:
         manifest: Mapping[str, object],
     ) -> str:
         context = self._sample_pool_manifest_context(manifest)
-        split_key = str(context.get("split_config_id", "") or "").strip()
+        layout_key = str(context.get("feature_layout_id", "") or "").strip()
+        split_key = (
+            f"feature_layout_{layout_key}"
+            if layout_key
+            else str(context.get("split_config_id", "") or "").strip()
+        )
         if not split_key:
             split_key = _json_fingerprint(
                 {
@@ -2553,7 +2600,12 @@ class CloudContinualLearner:
         manifest: Mapping[str, object],
     ) -> str:
         context = self._sample_pool_manifest_context(manifest)
-        split_key = str(context.get("split_config_id", "") or "").strip()
+        layout_key = str(context.get("feature_layout_id", "") or "").strip()
+        split_key = (
+            f"feature_layout_{layout_key}"
+            if layout_key
+            else str(context.get("split_config_id", "") or "").strip()
+        )
         if not split_key:
             split_key = _json_fingerprint(
                 {
@@ -2894,12 +2946,16 @@ class CloudContinualLearner:
     ) -> dict[str, object]:
         context = self._sample_pool_manifest_context(manifest)
         split_plan = dict(manifest.get("split_plan", {}) or {})
+        cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
         runtime = getattr(splitter, "runtime", splitter)
         dynamic_batch = _splitter_dynamic_batch_range(splitter)
         trace_plan = getattr(runtime, "trace_plan", None)
         symbolic_schema = getattr(runtime, "symbolic_input_schema", None)
         return {
             "model_id": str(context.get("model_id") or self.edge_model_name),
+            "model_version": str(
+                dict(manifest.get("model", {}) or {}).get("model_version", "") or "0"
+            ),
             "front_version": str(context.get("front_version") or "0"),
             "split_config_id": str(context.get("split_config_id") or ""),
             "canonical_split_key": str(context.get("canonical_split_key") or ""),
@@ -2925,6 +2981,7 @@ class CloudContinualLearner:
             "trace_batch_size": getattr(runtime, "trace_batch_size", None),
             "mode": str(getattr(runtime, "mode", "") or ""),
             "feature_layout_id": str(feature_layout_id),
+            "runtime_contract": cloud_runtime_contract,
         }
 
     def _get_or_create_split_runtime_contract(
@@ -3034,10 +3091,12 @@ class CloudContinualLearner:
             )
 
         split_plan = dict(manifest.get("split_plan", {}) or {})
+        edge_runtime_contract = _fixed_split_plan_runtime_contract(split_plan)
+        cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
         canonical_split_key = str(
             context.get("canonical_split_key")
             or context.get("edge_split_id")
-            or split_plan.get("candidate_id")
+            or edge_runtime_contract.get("logical_split_id")
             or _fixed_split_boundary_from_plan(split_plan)
         ).strip()
         if (
@@ -3101,7 +3160,8 @@ class CloudContinualLearner:
         edge_split_id = str(context.get("edge_split_id") or canonical_split_key)
         boundary_tensor_labels = list(
             getattr(batch_candidate, "boundary_tensor_labels", None)
-            or context.get("boundary_tensor_labels", [])
+            or cloud_runtime_contract.get("boundary_tensor_labels")
+            or context.get("boundary_tensor_labels")
             or []
         )
         contract = SplitRuntimeContract.create(
@@ -3662,6 +3722,8 @@ class CloudContinualLearner:
                         }
                     )
 
+        split_plan_payload = dict(trigger_manifest.get("split_plan", {}) or {})
+        runtime_contract_payload = _fixed_split_plan_runtime_contract(split_plan_payload)
         normalized_manifest = dict(trigger_manifest)
         normalized_manifest.update(
             {
@@ -3684,7 +3746,8 @@ class CloudContinualLearner:
                     "model_id": str(trigger_manifest.get("model_id", "") or ""),
                     "model_version": str(trigger_manifest.get("model_version", "") or "0"),
                 },
-                "split_plan": dict(trigger_manifest.get("split_plan", {}) or {}),
+                "runtime_contract": runtime_contract_payload,
+                "split_plan": split_plan_payload,
                 "training_mode": {
                     "send_low_conf_features": bool(trigger_manifest.get("feature_shards")),
                     "low_quality_mode": str(trigger_manifest.get("upload_mode", "raw-only")),
@@ -4908,8 +4971,9 @@ class CloudContinualLearner:
         model_name: str,
         manifest: Mapping[str, object],
         runtime_batch_size: int | None = None,
-    ) -> FixedSplitRuntimeTemplateKey:
+        ) -> FixedSplitRuntimeTemplateKey:
         split_plan = dict(manifest.get("split_plan", {}))
+        runtime_contract = _fixed_split_plan_runtime_contract(split_plan)
         trace_image_size = self._infer_bundle_trace_image_size(dict(manifest))
         image_size = trace_image_size or (640, 640)
         boundary = _fixed_split_boundary_from_plan(split_plan)
@@ -4948,7 +5012,7 @@ class CloudContinualLearner:
             model_family=model_family,
             split_spec=split_spec,
             example_inputs=symbolic_example,
-            graph_signature=str(split_plan.get("trace_signature") or "") or None,
+            graph_signature=str(runtime_contract.get("trace_signature") or "") or None,
             split_plan_hash=_json_fingerprint(split_plan),
             trace_batch_size=trace_batch_size,
             validated_batch_max=max(validation_batches) if validation_batches else None,
@@ -5062,7 +5126,6 @@ class CloudContinualLearner:
         *,
         model_name: str,
         preferred_mode: str = "generated_eager",
-        expected_boundary_tensor_labels: list[str] | tuple[str, ...] | None = None,
     ) -> tuple[object, str]:
         modes = []
         for mode in (preferred_mode, "generated_eager", "debug_interpreter"):
@@ -5077,7 +5140,6 @@ class CloudContinualLearner:
                 sample_input,
                 split_spec,
                 mode=mode,
-                expected_boundary_tensor_labels=expected_boundary_tensor_labels,
             )
             ok, error = self._validate_prepared_split_runtime(
                 runtime,
@@ -5235,31 +5297,57 @@ class CloudContinualLearner:
             trace_batch_mode=trace_batch_mode,
             model_family=model_family,
         )
-        expected_boundary_tensor_labels = [
-            str(label)
-            for label in list(split_plan_payload.get("boundary_tensor_labels", []) or [])
-        ]
+        edge_runtime_contract = _fixed_split_plan_runtime_contract(split_plan_payload)
         trace_started = time.perf_counter()
-        try:
-            runtime, runtime_mode = self._prepare_replayable_split_runtime(
-                split_model,
-                sample_input,
-                split_spec,
-                model_name=model_name,
-                preferred_mode=self._preferred_fixed_split_runtime_mode(model_family),
-                expected_boundary_tensor_labels=expected_boundary_tensor_labels,
-            )
-        except ValueError as exc:
-            message = str(exc)
-            if "No split matches" in message:
+        runtime, runtime_mode = self._prepare_replayable_split_runtime(
+            split_model,
+            sample_input,
+            split_spec,
+            model_name=model_name,
+            preferred_mode=self._preferred_fixed_split_runtime_mode(model_family),
+        )
+        model_meta = dict(manifest.get("model", {}) or {})
+        context = self._sample_pool_manifest_context(manifest)
+        cloud_runtime_contract = resolve_cloud_runtime_contract(
+            runtime,
+            getattr(runtime, "candidate", None),
+            logical_split_id=boundary,
+            model_id=str(model_meta.get("model_id") or model_name),
+            model_version=str(model_meta.get("model_version", "") or "0"),
+            input_tensor_shape=list(
+                edge_runtime_contract.get("input_tensor_shape")
+                or context.get("input_tensor_shape")
+                or []
+            ),
+            input_resize_mode=str(
+                edge_runtime_contract.get("input_resize_mode")
+                or context.get("input_resize_mode")
+                or "direct_resize"
+            ),
+            sample_input=sample_input,
+            runtime_backend=runtime_mode,
+        )
+        compatibility = classify_feature_layout_compatibility(
+            edge_runtime_contract,
+            cloud_runtime_contract,
+        )
+        manifest["_cloud_runtime_contract"] = cloud_runtime_contract
+        manifest["_feature_layout_compatibility"] = compatibility
+        if not bool(compatibility.get("compatible")):
+            if not _fixed_split_manifest_has_rebuildable_raw_samples(manifest):
                 raise RuntimeError(
-                    "Fixed split plan is not replayable for the current cloud runtime "
-                    f"(requested={boundary!r}, model_name={model_name!r}). "
-                    "The edge likely reused a stale fixed_split_plan.json; restart the "
-                    "edge with this fix or clear the edge retrain cache so it recomputes "
-                    "a model-qualified Ariadne split plan."
-                ) from exc
-            raise
+                    "Fixed split feature layout mismatch and raw rebuild is unavailable: "
+                    f"{compatibility}."
+                )
+            logger.warning(
+                "[FixedSplitCL] Edge/cloud feature layout mismatch; rebuilding "
+                "low-quality trigger features from raw frames with the cloud runtime. "
+                "model_name={} boundary={} compatibility={}",
+                model_name,
+                boundary,
+                compatibility,
+            )
+            manifest["_cloud_rebuild_features_for_runtime_contract_mismatch"] = True
         self._validate_dynamic_batch_trainability(
             runtime,
             model,
@@ -5660,9 +5748,17 @@ class CloudContinualLearner:
             preloaded_records.clear()
 
         split_plan = dict(manifest.get("split_plan", {}) or {})
+        runtime_contract = dict(
+            manifest.get("_cloud_runtime_contract")
+            or split_plan.get("runtime_contract")
+            or {}
+        )
         all_sample_ids: list[str] = []
         processed_items: list[dict[str, object]] = []
         pending_rebuilds: list[dict[str, object]] = []
+        force_rebuild_features = bool(
+            manifest.get("_cloud_rebuild_features_for_runtime_contract_mismatch")
+        )
 
         for sample in list(manifest.get("samples", []) or []):
             if not isinstance(sample, Mapping):
@@ -5702,7 +5798,7 @@ class CloudContinualLearner:
                 if feature_relpath
                 else None
             )
-            if feature_path and os.path.exists(feature_path):
+            if feature_path and os.path.exists(feature_path) and not force_rebuild_features:
                 record = torch.load(feature_path, map_location="cpu", weights_only=False)
                 if not isinstance(record, dict):
                     raise TypeError(
@@ -5782,12 +5878,7 @@ class CloudContinualLearner:
                     frame_index=sample_id,
                     intermediate=item["intermediate"],
                     extra_metadata={
-                        "split_plan_candidate_id": split_plan.get("candidate_id"),
-                        "split_plan_split_index": split_plan.get("split_index"),
-                        "split_plan_split_label": split_plan.get("split_label"),
-                        "split_plan_boundary_tensor_labels": list(
-                            split_plan.get("boundary_tensor_labels", []) or []
-                        ),
+                        "runtime_contract": runtime_contract,
                         "sample_id": sample_id,
                         "model_id": str(model_meta.get("model_id", "") or ""),
                         "model_version": str(model_meta.get("model_version", "") or ""),
@@ -5829,12 +5920,7 @@ class CloudContinualLearner:
                 "frame_relpath": os.path.relpath(frame_path, working_cache).replace("\\", "/"),
                 "frame_file_size": os.path.getsize(frame_path),
                 "has_raw_sample": True,
-                "split_plan_candidate_id": split_plan.get("candidate_id"),
-                "split_plan_split_index": split_plan.get("split_index"),
-                "split_plan_split_label": split_plan.get("split_label"),
-                "split_plan_boundary_tensor_labels": list(
-                    split_plan.get("boundary_tensor_labels", []) or []
-                ),
+                "runtime_contract": runtime_contract,
                 "source_feature_relpath": sample.get("feature_relpath"),
                 "source_feature_bytes": int(sample.get("feature_bytes") or 0),
                 "source_raw_relpath": sample.get("raw_relpath"),
@@ -5874,14 +5960,7 @@ class CloudContinualLearner:
                 "version": 1,
                 "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
                 "model": model_meta,
-                "split_plan": {
-                    "candidate_id": split_plan.get("candidate_id"),
-                    "split_index": split_plan.get("split_index"),
-                    "split_label": split_plan.get("split_label"),
-                    "boundary_tensor_labels": list(
-                        split_plan.get("boundary_tensor_labels", []) or []
-                    ),
-                },
+                "runtime_contract": runtime_contract,
                 "all_sample_ids": all_sample_ids,
                 "samples": metadata_samples,
             },

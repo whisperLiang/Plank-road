@@ -298,8 +298,7 @@ def pack_low_quality_trigger_bundle_to_file(
             int(dim) for dim in list(getattr(split_plan, "input_tensor_shape", []) or [])
         ],
         "input_resize_mode": str(getattr(split_plan, "input_resize_mode", "") or "direct_resize"),
-        "split_label": None if split_plan.split_label is None else str(split_plan.split_label),
-        "boundary_tensor_labels": [str(label) for label in split_plan.boundary_tensor_labels],
+        "runtime_contract": dict(getattr(split_plan, "runtime_contract", {}) or {}),
         "upload_mode": "raw+feature" if send_low_conf_features else "raw-only",
         "created_at": _utc_now(),
         "model": model_meta,

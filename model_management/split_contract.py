@@ -11,6 +11,7 @@ import torch
 
 
 SPLIT_RUNTIME_CONTRACT_VERSION = "split-runtime-contract.v2"
+FIXED_SPLIT_RUNTIME_CONTRACT_VERSION = "fixed-split-runtime-contract.v1"
 
 
 def _stable_json(payload: object) -> str:
@@ -101,6 +102,205 @@ def feature_layout_from_tensors(
 
 def feature_layout_id(layout: Mapping[str, Mapping[str, Any]]) -> str:
     return hashlib.sha1(_stable_json(layout).encode("utf-8")).hexdigest()
+
+
+def _normalise_boundary_schema(
+    boundary_schema: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    normalised: dict[str, dict[str, Any]] = {}
+    for label, spec in dict(boundary_schema or {}).items():
+        if isinstance(spec, Mapping):
+            symbolic_shape = spec.get("symbolic_shape") or spec.get("shape") or ()
+            dtype = spec.get("dtype")
+            device_type = spec.get("device_type")
+            requires_grad = spec.get("requires_grad", False)
+        else:
+            symbolic_shape = getattr(spec, "symbolic_shape", ()) or ()
+            dtype = getattr(spec, "dtype", "")
+            device_type = getattr(spec, "device_type", "")
+            requires_grad = getattr(spec, "requires_grad", False)
+        normalised[str(label)] = {
+            "symbolic_shape": [str(dim) for dim in list(symbolic_shape or [])],
+            "dtype": str(dtype or ""),
+            "device_type": str(device_type or ""),
+            "requires_grad": bool(requires_grad),
+        }
+    return normalised
+
+
+def compute_feature_layout_id(
+    *,
+    model_id: str = "",
+    model_version: str = "",
+    logical_split_id: str = "",
+    trace_signature: str = "",
+    input_tensor_shape: list[int] | tuple[int, ...] | None = None,
+    input_resize_mode: str = "",
+    boundary_tensor_labels: list[str] | tuple[str, ...] | None = None,
+    boundary_schema: Mapping[str, Any] | None = None,
+    feature_layout: Mapping[str, Mapping[str, Any]] | None = None,
+) -> str:
+    payload = {
+        "version": "feature-layout.v2",
+        "model_id": str(model_id or ""),
+        "model_version": str(model_version or ""),
+        "logical_split_id": str(logical_split_id or ""),
+        "trace_signature": str(trace_signature or ""),
+        "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
+        "input_resize_mode": str(input_resize_mode or ""),
+        "boundary_tensor_labels": [
+            str(label) for label in list(boundary_tensor_labels or [])
+        ],
+        "boundary_schema": _normalise_boundary_schema(boundary_schema),
+        "feature_layout": {
+            str(label): dict(spec)
+            for label, spec in dict(feature_layout or {}).items()
+            if isinstance(spec, Mapping)
+        },
+    }
+    return hashlib.sha1(_stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def build_runtime_contract(
+    *,
+    logical_split_id: str,
+    trace_signature: str,
+    trace_device_type: str,
+    runtime_backend: str,
+    boundary_tensor_labels: list[str] | tuple[str, ...],
+    boundary_schema: Mapping[str, Any] | None,
+    model_id: str,
+    model_version: str,
+    input_tensor_shape: list[int] | tuple[int, ...],
+    input_resize_mode: str,
+    feature_layout: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    labels = [str(label) for label in list(boundary_tensor_labels or [])]
+    schema = _normalise_boundary_schema(boundary_schema)
+    layout = {
+        str(label): dict(spec)
+        for label, spec in dict(feature_layout or {}).items()
+        if isinstance(spec, Mapping)
+    }
+    layout_id = compute_feature_layout_id(
+        model_id=str(model_id),
+        model_version=str(model_version),
+        logical_split_id=str(logical_split_id),
+        trace_signature=str(trace_signature),
+        input_tensor_shape=[int(dim) for dim in list(input_tensor_shape or [])],
+        input_resize_mode=str(input_resize_mode or ""),
+        boundary_tensor_labels=labels,
+        boundary_schema=schema,
+        feature_layout=layout,
+    )
+    return {
+        "contract_version": FIXED_SPLIT_RUNTIME_CONTRACT_VERSION,
+        "logical_split_id": str(logical_split_id),
+        "trace_signature": str(trace_signature or ""),
+        "trace_device_type": str(trace_device_type or ""),
+        "runtime_backend": str(runtime_backend or ""),
+        "boundary_tensor_labels": labels,
+        "boundary_schema": schema,
+        "feature_layout": layout,
+        "feature_layout_id": layout_id,
+        "model_id": str(model_id or ""),
+        "model_version": str(model_version or ""),
+        "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
+        "input_resize_mode": str(input_resize_mode or ""),
+    }
+
+
+def _contract_payload(contract: Mapping[str, Any] | None) -> dict[str, Any]:
+    return dict(contract or {})
+
+
+def classify_feature_layout_compatibility(
+    edge_contract: Mapping[str, Any] | None,
+    cloud_contract: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    edge = _contract_payload(edge_contract)
+    cloud = _contract_payload(cloud_contract)
+    edge_layout_id = str(edge.get("feature_layout_id") or "")
+    cloud_layout_id = str(cloud.get("feature_layout_id") or "")
+    compatible = bool(edge_layout_id and cloud_layout_id and edge_layout_id == cloud_layout_id)
+    reason = "compatible" if compatible else "feature_layout_id"
+    if not edge:
+        reason = "missing_edge_runtime_contract"
+    elif not cloud:
+        reason = "missing_cloud_runtime_contract"
+    return {
+        "compatible": compatible,
+        "reason": reason,
+        "edge_feature_layout_id": edge_layout_id,
+        "cloud_feature_layout_id": cloud_layout_id,
+        "edge_trace_device_type": str(edge.get("trace_device_type") or ""),
+        "cloud_trace_device_type": str(cloud.get("trace_device_type") or ""),
+        "edge_boundary_tensor_labels": [
+            str(label) for label in list(edge.get("boundary_tensor_labels") or [])
+        ],
+        "cloud_boundary_tensor_labels": [
+            str(label) for label in list(cloud.get("boundary_tensor_labels") or [])
+        ],
+    }
+
+
+def _first_tensor_device_type(value: object) -> str:
+    if isinstance(value, torch.Tensor):
+        return str(value.device.type)
+    if isinstance(value, Mapping):
+        for item in value.values():
+            found = _first_tensor_device_type(item)
+            if found:
+                return found
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_tensor_device_type(item)
+            if found:
+                return found
+    return ""
+
+
+def resolve_cloud_runtime_contract(
+    runtime: object,
+    candidate: object | None,
+    *,
+    logical_split_id: str,
+    model_id: str,
+    model_version: str,
+    input_tensor_shape: list[int] | tuple[int, ...],
+    input_resize_mode: str,
+    sample_input: object | None = None,
+    runtime_backend: str | None = None,
+    feature_layout: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    candidate_metadata = dict(getattr(candidate, "metadata", {}) or {})
+    boundary_labels = (
+        list(getattr(candidate, "boundary_tensor_labels", []) or [])
+        or list(getattr(candidate, "boundary_nodes", []) or [])
+        or list(candidate_metadata.get("boundary_tensor_labels", []) or [])
+    )
+    boundary_schema = (
+        candidate_metadata.get("boundary_schema")
+        or getattr(candidate, "boundary_schema", None)
+        or {}
+    )
+    runtime_obj = getattr(runtime, "runtime", runtime)
+    trace_device_type = _first_tensor_device_type(sample_input) or str(
+        getattr(runtime_obj, "device", "") or ""
+    )
+    return build_runtime_contract(
+        logical_split_id=str(logical_split_id),
+        trace_signature=str(getattr(runtime_obj, "graph_signature", "") or ""),
+        trace_device_type=trace_device_type,
+        runtime_backend=str(runtime_backend or getattr(runtime_obj, "mode", "") or ""),
+        boundary_tensor_labels=[str(label) for label in boundary_labels],
+        boundary_schema=boundary_schema,
+        model_id=str(model_id),
+        model_version=str(model_version),
+        input_tensor_shape=[int(dim) for dim in list(input_tensor_shape or [])],
+        input_resize_mode=str(input_resize_mode or ""),
+        feature_layout=feature_layout,
+    )
 
 
 def runtime_identity_id(identity: Mapping[str, Any]) -> str:
@@ -326,12 +526,17 @@ class SplitRuntimeContract:
 
 
 __all__ = [
+    "FIXED_SPLIT_RUNTIME_CONTRACT_VERSION",
     "SPLIT_RUNTIME_CONTRACT_VERSION",
     "SplitRuntimeContract",
+    "build_runtime_contract",
+    "classify_feature_layout_compatibility",
+    "compute_feature_layout_id",
     "contract_path",
     "feature_layout_from_tensors",
     "feature_layout_id",
     "feature_layout_matches",
     "normalise_feature_tensors",
+    "resolve_cloud_runtime_contract",
     "runtime_identity_id",
 ]

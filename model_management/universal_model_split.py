@@ -13,7 +13,6 @@ from ariadne import BoundaryPayload, SplitRuntime, SplitSpec
 from ariadne.compiler.torch_compile import maybe_compile_segments
 from ariadne.codegen.segment_builder import build_segments
 from ariadne.planner.frontier import enumerate_frontier_splits
-from ariadne.planner.selector import select_split
 from ariadne.trace.tracer import trace_model
 from loguru import logger
 
@@ -558,7 +557,7 @@ def prepare_exact_split_runtime(
                 for candidate in matching_candidates[:5]
             ]
             raise ValueError(
-                "No exact Ariadne split candidate matches the requested boundary tensors "
+                "Fixed split runtime contract mismatch for requested boundary tensors "
                 f"(boundary={boundary!r}, expected={sorted(expected_boundary_set)!r}, "
                 f"available={available!r})."
             )
@@ -570,10 +569,9 @@ def prepare_exact_split_runtime(
             None,
         )
     if ariadne_candidate is None:
-        ariadne_candidate = select_split(
-            plan,
-            split=split_spec,
-            candidates=candidates,
+        raise ValueError(
+            "Fixed split runtime contract mismatch for requested logical split "
+            f"(boundary={boundary!r}, available_count={len(candidates)})."
         )
     exact_candidate = _exact_ariadne_candidate(ariadne_candidate)
     exact_split_spec = replace(

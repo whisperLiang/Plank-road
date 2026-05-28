@@ -8,6 +8,7 @@ from collections import OrderedDict
 from types import SimpleNamespace
 
 import cv2
+import numpy as np
 import pytest
 import torch
 from loguru import logger
@@ -30,6 +31,7 @@ from model_management.model_delta_payload import (
     require_state_dict_delta_payload,
 )
 from model_management.payload import BoundaryPayload, SplitPayload, boundary_payload_from_tensors
+from model_management.split_contract import build_runtime_contract
 from model_management.split_candidate import SplitCandidate
 from model_management.universal_model_split import (
     UniversalModelSplitter,
@@ -40,6 +42,40 @@ from model_management.universal_model_split import (
 )
 
 
+def _runtime_contract(
+    logical_split_id: str,
+    labels: list[str],
+    *,
+    model_id: str = "yolo26n",
+    model_version: str = "0",
+    trace_signature: str = "runtime-sig",
+    trace_device_type: str = "cpu",
+    runtime_backend: str = "generated_eager",
+    input_tensor_shape: list[int] | None = None,
+) -> dict[str, object]:
+    schema = {
+        str(label): {
+            "symbolic_shape": ["B", "1"],
+            "dtype": "torch.float32",
+            "device_type": trace_device_type,
+            "requires_grad": False,
+        }
+        for label in labels
+    }
+    return build_runtime_contract(
+        logical_split_id=logical_split_id,
+        trace_signature=trace_signature,
+        trace_device_type=trace_device_type,
+        runtime_backend=runtime_backend,
+        boundary_tensor_labels=labels,
+        boundary_schema=schema,
+        model_id=model_id,
+        model_version=model_version,
+        input_tensor_shape=input_tensor_shape or [1, 3, 4, 4],
+        input_resize_mode="direct_resize",
+    )
+
+
 def _dummy_plan() -> SplitPlan:
     return SplitPlan(
         split_config_id="plan-1",
@@ -48,6 +84,12 @@ def _dummy_plan() -> SplitPlan:
         split_index=3,
         split_label="layer3",
         boundary_tensor_labels=["layer3"],
+        runtime_contract=_runtime_contract(
+            "candidate-1",
+            ["layer3"],
+            model_id="dummy-model",
+            trace_signature="sig",
+        ),
         payload_bytes=128,
         privacy_metric=0.4,
         privacy_risk=0.6,
@@ -68,6 +110,26 @@ def _dummy_plan() -> SplitPlan:
         trace_signature="sig",
         input_tensor_shape=[1],
     )
+
+
+def test_runtime_contract_layout_id_separates_cpu_and_cuda_boundaries():
+    cpu_contract = _runtime_contract(
+        "after:node_247",
+        ["node_201", "node_244", "node_247"],
+        trace_signature="cpu-trace",
+        trace_device_type="cpu",
+    )
+    cuda_contract = _runtime_contract(
+        "after:node_247",
+        ["node_161", "node_229", "node_237_0", "node_237_1", "node_247"],
+        trace_signature="cuda-trace",
+        trace_device_type="cuda",
+    )
+
+    assert cpu_contract["logical_split_id"] == cuda_contract["logical_split_id"]
+    assert cpu_contract["feature_layout_id"] != cuda_contract["feature_layout_id"]
+    assert cpu_contract["trace_device_type"] == "cpu"
+    assert cuda_contract["trace_device_type"] == "cuda"
 
 
 def _payload() -> SplitPayload:
@@ -339,7 +401,7 @@ def test_fixed_split_selects_operation_node_candidates():
         model_name="dummy-model",
     )
 
-    assert plan.plan_version == "fixed-split.v6"
+    assert plan.plan_version == "fixed-split.v8"
     assert plan.candidate_id == "after:node_1"
     assert plan.canonical_split_key == "after:node_1"
     assert plan.edge_split_id == "after:node_1"
@@ -747,7 +809,7 @@ def test_fixed_split_recomputes_and_overwrites_old_plan_version(
     persist_split_plan(str(cache_path), stale)
 
     fresh = _dummy_plan()
-    fresh.plan_version = "fixed-split.v6"
+    fresh.plan_version = "fixed-split.v8"
     fresh.candidate_id = "after:node_1"
     fresh.canonical_split_key = "after:node_1"
     fresh.edge_split_id = "after:node_1"
@@ -767,10 +829,10 @@ def test_fixed_split_recomputes_and_overwrites_old_plan_version(
         model_name=stale.model_name,
     )
 
-    assert plan.plan_version == "fixed-split.v6"
+    assert plan.plan_version == "fixed-split.v8"
     with cache_path.open("r", encoding="utf-8") as handle:
         persisted = json.load(handle)
-    assert persisted["plan_version"] == "fixed-split.v6"
+    assert persisted["plan_version"] == "fixed-split.v8"
     assert persisted["canonical_split_key"] == "after:node_1"
 
 
@@ -2993,13 +3055,14 @@ def test_working_cache_manifest_fingerprint_matches_current_bundle():
     assert (
         CloudContinualLearner._working_cache_manifest_matches(changed_identity, identity) is False
     )
-    assert _fixed_split_boundary_from_plan(
-        {
-            "candidate_id": "after:model.backbone.stem",
-            "split_label": "after:node_5",
-            "boundary_tensor_labels": ["node_13", "node_5"],
-        }
-    ) == "after:model.backbone.stem"
+    with pytest.raises(RuntimeError, match="fixed-split.v8"):
+        _fixed_split_boundary_from_plan(
+            {
+                "candidate_id": "after:model.backbone.stem",
+                "split_label": "after:node_5",
+                "boundary_tensor_labels": ["node_13", "node_5"],
+            }
+        )
 
 
 def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
@@ -3017,8 +3080,15 @@ def test_rfdetr_fixed_split_template_key_prefers_debug_interpreter(tmp_path):
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "0"},
         "split_plan": {
-            "split_label": "after:model.backbone.0.encoder.encoder.embeddings.patch_embeddings.projection",
-            "trace_signature": "edge-trace",
+            "plan_version": "fixed-split.v8",
+            "runtime_contract": _runtime_contract(
+                "after:model.backbone.0.encoder.encoder.embeddings.patch_embeddings.projection",
+                ["node_0"],
+                model_id="rfdetr_nano",
+                trace_signature="edge-trace",
+                runtime_backend="debug_interpreter",
+                input_tensor_shape=[1, 3, 384, 384],
+            ),
             "trace_batch_mode": "batch_1",
             "trace_batch_size": 1,
             "dynamic_batch": [1, 64],
@@ -3096,8 +3166,14 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "0"},
         "split_plan": {
-            "split_label": "after:node_1",
-            "boundary_tensor_labels": ["edge_node_a", "edge_node_b"],
+            "plan_version": "fixed-split.v8",
+            "runtime_contract": _runtime_contract(
+                "after:node_1",
+                ["edge_node_a", "edge_node_b"],
+                model_id="rfdetr_nano",
+                trace_signature="runtime-sig",
+                runtime_backend="debug_interpreter",
+            ),
             "trace_batch_mode": "batch_1",
             "trace_batch_size": 1,
             "dynamic_batch": [1, 64],
@@ -3118,7 +3194,6 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         *,
         model_name,
         preferred_mode,
-        expected_boundary_tensor_labels=None,
     ):
         captured["trace_sample_shape"] = tuple(sample_input.shape)
         captured["split_boundary"] = split_spec.boundary
@@ -3126,10 +3201,25 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         captured["dynamic_batch"] = tuple(split_spec.dynamic_batch)
         captured["model_name"] = model_name
         captured["preferred_mode"] = preferred_mode
-        captured["expected_boundary_tensor_labels"] = list(
-            expected_boundary_tensor_labels or []
+        return (
+            SimpleNamespace(
+                graph_signature="runtime-sig",
+                split_id=split_spec.boundary,
+                candidate=SimpleNamespace(
+                    boundary_nodes=["edge_node_a", "edge_node_b"],
+                    boundary_schema={
+                        label: SimpleNamespace(
+                            symbolic_shape=("B", "1"),
+                            dtype="torch.float32",
+                            device_type="cpu",
+                            requires_grad=False,
+                        )
+                        for label in ["edge_node_a", "edge_node_b"]
+                    },
+                ),
+            ),
+            preferred_mode,
         )
-        return SimpleNamespace(graph_signature="runtime-sig", split_id=split_spec.boundary), preferred_mode
 
     monkeypatch.setattr(
         learner,
@@ -3178,8 +3268,285 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     assert captured["dynamic_batch"] == (1, 64)
     assert captured["model_name"] == "rfdetr_nano"
     assert captured["preferred_mode"] == "debug_interpreter"
-    assert captured["expected_boundary_tensor_labels"] == ["edge_node_a", "edge_node_b"]
     assert template.mode == "debug_interpreter"
+
+
+def test_cloud_fixed_split_template_rebuilds_raw_trigger_on_boundary_label_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="yolo26n",
+            continual_learning=SimpleNamespace(batch_size=16, trace_batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    manifest = {
+        "input_tensor_shape": [1, 3, 4, 4],
+        "model": {"model_id": "yolo26n", "model_version": "0"},
+        "split_plan": {
+            "plan_version": "fixed-split.v8",
+            "runtime_contract": _runtime_contract(
+                "after:node_247",
+                ["edge_a", "edge_b"],
+                model_id="yolo26n",
+                trace_signature="edge-sig",
+            ),
+            "trace_batch_mode": "batch_gt1",
+            "trace_batch_size": 2,
+            "dynamic_batch": [1, 64],
+        },
+        "samples": [{"sample_id": "s1", "raw_relpath": "raw/s1.jpg"}],
+    }
+    calls = []
+
+    def fake_prepare_replayable_split_runtime(
+        model,
+        sample_input,
+        split_spec,
+        *,
+        model_name,
+        preferred_mode,
+    ):
+        calls.append(split_spec.boundary)
+        return (
+            SimpleNamespace(
+                graph_signature="cloud-sig",
+                split_id=split_spec.boundary,
+                candidate=SimpleNamespace(
+                    boundary_nodes=["cloud_a"],
+                    boundary_schema={
+                        "cloud_a": SimpleNamespace(
+                            symbolic_shape=("B", "1"),
+                            dtype="torch.float32",
+                            device_type="cpu",
+                            requires_grad=False,
+                        )
+                    },
+                ),
+            ),
+            preferred_mode,
+        )
+
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_batch_trace_sample_input",
+        lambda *_args, **_kwargs: torch.zeros(2, 3, 4, 4),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_prepare_replayable_split_runtime",
+        fake_prepare_replayable_split_runtime,
+    )
+    monkeypatch.setattr(
+        learner,
+        "_validate_dynamic_batch_trainability",
+        lambda *args, **kwargs: [],
+    )
+
+    class FakeVerifier:
+        def bind_runtime(self, *args, **kwargs):
+            return self
+
+    monkeypatch.setattr(
+        cloud_server,
+        "UniversalModelSplitter",
+        lambda *args, **kwargs: FakeVerifier(),
+    )
+
+    template_key = learner._fixed_split_runtime_template_key(
+        model_name="yolo26n",
+        manifest=manifest,
+        runtime_batch_size=16,
+    )
+    template = learner._build_fixed_split_runtime_template(
+        torch.nn.Identity(),
+        manifest,
+        bundle_root=str(tmp_path / "bundle"),
+        template_key=template_key,
+        runtime_batch_size=16,
+    )
+
+    assert calls == ["after:node_247"]
+    assert manifest["_cloud_rebuild_features_for_runtime_contract_mismatch"] is True
+    assert template.mode == "generated_eager"
+
+
+def test_cloud_fixed_split_template_layout_mismatch_without_raw_fails(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="yolo26n",
+            continual_learning=SimpleNamespace(batch_size=16, trace_batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    edge_contract = _runtime_contract(
+        "after:node_247",
+        ["edge_a"],
+        model_id="yolo26n",
+        trace_signature="edge-sig",
+    )
+    manifest = {
+        "input_tensor_shape": [1, 3, 4, 4],
+        "model": {"model_id": "yolo26n", "model_version": "0"},
+        "split_plan": {
+            "plan_version": "fixed-split.v8",
+            "runtime_contract": edge_contract,
+            "trace_batch_mode": "batch_gt1",
+            "trace_batch_size": 2,
+            "dynamic_batch": [1, 64],
+        },
+        "samples": [{"sample_id": "s1", "feature_relpath": "features/s1.pt"}],
+    }
+
+    monkeypatch.setattr(
+        learner,
+        "_build_bundle_batch_trace_sample_input",
+        lambda *_args, **_kwargs: torch.zeros(2, 3, 4, 4),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_prepare_replayable_split_runtime",
+        lambda _model, _sample_input, split_spec, *, model_name, preferred_mode: (
+            SimpleNamespace(
+                graph_signature="cloud-sig",
+                split_id=split_spec.boundary,
+                candidate=SimpleNamespace(
+                    boundary_nodes=["cloud_a"],
+                    boundary_schema={
+                        "cloud_a": SimpleNamespace(
+                            symbolic_shape=("B", "1"),
+                            dtype="torch.float32",
+                            device_type="cpu",
+                            requires_grad=False,
+                        )
+                    },
+                ),
+            ),
+            preferred_mode,
+        ),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_validate_dynamic_batch_trainability",
+        lambda *args, **kwargs: [],
+    )
+
+    class FakeVerifier:
+        def bind_runtime(self, *args, **kwargs):
+            return self
+
+    monkeypatch.setattr(
+        cloud_server,
+        "UniversalModelSplitter",
+        lambda *args, **kwargs: FakeVerifier(),
+    )
+
+    template_key = learner._fixed_split_runtime_template_key(
+        model_name="yolo26n",
+        manifest=manifest,
+        runtime_batch_size=16,
+    )
+    with pytest.raises(RuntimeError, match=edge_contract["feature_layout_id"]):
+        learner._build_fixed_split_runtime_template(
+            torch.nn.Identity(),
+            manifest,
+            bundle_root=str(tmp_path / "bundle"),
+            template_key=template_key,
+            runtime_batch_size=16,
+        )
+
+
+def test_cloud_raw_rebuild_boundary_mismatch_ignores_uploaded_feature_record(
+    tmp_path,
+    monkeypatch,
+):
+    import cloud_server
+    from cloud_server import CloudContinualLearner
+
+    bundle_root = tmp_path / "bundle"
+    raw_dir = bundle_root / "raw"
+    feature_dir = bundle_root / "features"
+    raw_dir.mkdir(parents=True)
+    feature_dir.mkdir(parents=True)
+    raw_path = raw_dir / "s1.jpg"
+    feature_path = feature_dir / "s1.pt"
+    cv2.imwrite(str(raw_path), np.zeros((4, 4, 3), dtype=np.uint8))
+    torch.save({"should_not_load": True}, feature_path)
+
+    learner = CloudContinualLearner(
+        config=SimpleNamespace(
+            edge_model_name="yolo26n",
+            continual_learning=SimpleNamespace(batch_size=16, trace_batch_size=2),
+            das=SimpleNamespace(enabled=False),
+            workspace_root=str(tmp_path),
+        ),
+        large_object_detection=SimpleNamespace(),
+    )
+    manifest = {
+        "_cloud_rebuild_features_for_runtime_contract_mismatch": True,
+        "protocol_version": cloud_server.LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
+        "model": {"model_id": "yolo26n", "model_version": "0"},
+        "split_plan": {
+            "plan_version": "fixed-split.v8",
+            "runtime_contract": _runtime_contract("after:node_247", ["edge_a"]),
+        },
+        "samples": [
+            {
+                "sample_id": "s1",
+                "raw_relpath": "raw/s1.jpg",
+                "raw_bytes": raw_path.stat().st_size,
+                "feature_relpath": "features/s1.pt",
+                "feature_bytes": feature_path.stat().st_size,
+            }
+        ],
+    }
+    provider_calls = []
+
+    def fake_provider(*_args, **_kwargs):
+        def provide(raw_paths, samples, manifest_payload):
+            provider_calls.append((list(raw_paths), list(samples), dict(manifest_payload)))
+            return [{"rebuilt": True}]
+
+        return provide
+
+    monkeypatch.setattr(learner, "_bundle_batch_feature_provider", fake_provider)
+    def fake_save_split_feature_cache(**kwargs):
+        feature_out = tmp_path / "working" / "features" / f"{kwargs['frame_index']}.pt"
+        feature_out.parent.mkdir(parents=True, exist_ok=True)
+        record = {"saved_rebuilt": True}
+        torch.save(record, feature_out)
+        return record
+
+    monkeypatch.setattr(cloud_server, "save_split_feature_cache", fake_save_split_feature_cache)
+
+    info = learner._prepare_low_quality_trigger_training_cache(
+        torch.nn.Identity(),
+        manifest,
+        bundle_cache_path=str(bundle_root),
+        working_cache=str(tmp_path / "working"),
+        splitter=None,
+        candidate=None,
+        runtime_batch_size=16,
+        preloaded_records={},
+    )
+
+    assert info["all_sample_ids"] == ["s1"]
+    assert len(provider_calls) == 1
 
 
 def test_cloud_prepare_replayable_split_runtime_resolves_exact_operation_id(tmp_path):
@@ -3253,7 +3620,17 @@ def test_cloud_fixed_split_working_cache_rebuild_with_template_hit_skips_trace_i
     learner._fixed_split_runtime_template_cache = FixedSplitRuntimeTemplateCache()
     manifest = {
         "model": {"model_id": "rfdetr_nano", "model_version": "1"},
-        "split_plan": {"split_label": "after:node_1"},
+        "split_plan": {
+            "plan_version": "fixed-split.v8",
+            "runtime_contract": _runtime_contract(
+                "after:node_1",
+                ["node_1"],
+                model_id="rfdetr_nano",
+                model_version="1",
+                trace_signature="runtime-sig",
+                runtime_backend="debug_interpreter",
+            ),
+        },
         "input_tensor_shape": [1, 3, 4, 4],
         "input_resize_mode": "direct_resize",
         "samples": [{"sample_id": "s1", "input_tensor_shape": [1, 3, 4, 4]}],

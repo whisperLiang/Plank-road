@@ -449,6 +449,7 @@ class EdgeWorker:
                     or "direct_resize"
                 ),
                 front_version=str(getattr(self, "front_version", "0") or "0"),
+                model_version=str(getattr(self, "model_version", "0") or "0"),
             )
             logger.info(
                 "Fixed split plan load/compute completed (elapsed={:.3f}s).",
@@ -667,9 +668,6 @@ class EdgeWorker:
 
     def _sample_sync_context(self) -> dict[str, object]:
         split_plan = getattr(self, "fixed_split_plan", None)
-        boundary_tensor_labels = list(
-            getattr(split_plan, "boundary_tensor_labels", []) or []
-        )
         return {
             "model_id": str(getattr(self, "model_id", "") or ""),
             "model_version": str(getattr(self, "model_version", "") or ""),
@@ -679,8 +677,7 @@ class EdgeWorker:
             "edge_split_id": getattr(split_plan, "edge_split_id", None),
             "input_tensor_shape": list(getattr(split_plan, "input_tensor_shape", []) or []),
             "input_resize_mode": getattr(split_plan, "input_resize_mode", None),
-            "split_label": getattr(split_plan, "split_label", None),
-            "boundary_tensor_labels": boundary_tensor_labels,
+            "runtime_contract": dict(getattr(split_plan, "runtime_contract", {}) or {}),
         }
 
     def _stats_for_training_trigger(self) -> dict[str, Any]:
