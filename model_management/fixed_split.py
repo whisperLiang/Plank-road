@@ -946,6 +946,10 @@ def _bind_lazy_ariadne_candidate(
         sample_input,
         exact_spec,
         mode=mode,
+        expected_boundary_tensor_labels=[
+            str(label)
+            for label in list(getattr(lazy_candidate.candidate, "boundary_nodes", ()) or [])
+        ],
     )
     runtime.bind_runtime(ariadne_runtime, model=model, split_spec=exact_spec)
     runtime._trace_sample_input = sample_input
@@ -957,6 +961,19 @@ def _bind_lazy_ariadne_candidate(
         raise ValueError(
             "Exact Ariadne split runtime resolved a different split candidate "
             f"(requested={lazy_candidate.operation_split_id!r}, actual={actual_split_id!r})."
+        )
+    expected_boundary_labels = [
+        str(label)
+        for label in list(getattr(lazy_candidate.candidate, "boundary_nodes", ()) or [])
+    ]
+    actual_boundary_labels = [
+        str(label)
+        for label in list(getattr(exact_candidate, "boundary_nodes", ()) or [])
+    ]
+    if expected_boundary_labels and actual_boundary_labels != expected_boundary_labels:
+        raise ValueError(
+            "Exact Ariadne split runtime resolved different boundary tensors "
+            f"(requested={expected_boundary_labels!r}, actual={actual_boundary_labels!r})."
         )
     candidate = _candidate_from_ariadne_candidate(
         ariadne_runtime,

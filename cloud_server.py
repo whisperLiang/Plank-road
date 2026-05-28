@@ -5062,6 +5062,7 @@ class CloudContinualLearner:
         *,
         model_name: str,
         preferred_mode: str = "generated_eager",
+        expected_boundary_tensor_labels: list[str] | tuple[str, ...] | None = None,
     ) -> tuple[object, str]:
         modes = []
         for mode in (preferred_mode, "generated_eager", "debug_interpreter"):
@@ -5076,6 +5077,7 @@ class CloudContinualLearner:
                 sample_input,
                 split_spec,
                 mode=mode,
+                expected_boundary_tensor_labels=expected_boundary_tensor_labels,
             )
             ok, error = self._validate_prepared_split_runtime(
                 runtime,
@@ -5233,6 +5235,10 @@ class CloudContinualLearner:
             trace_batch_mode=trace_batch_mode,
             model_family=model_family,
         )
+        expected_boundary_tensor_labels = [
+            str(label)
+            for label in list(split_plan_payload.get("boundary_tensor_labels", []) or [])
+        ]
         trace_started = time.perf_counter()
         try:
             runtime, runtime_mode = self._prepare_replayable_split_runtime(
@@ -5241,6 +5247,7 @@ class CloudContinualLearner:
                 split_spec,
                 model_name=model_name,
                 preferred_mode=self._preferred_fixed_split_runtime_mode(model_family),
+                expected_boundary_tensor_labels=expected_boundary_tensor_labels,
             )
         except ValueError as exc:
             message = str(exc)

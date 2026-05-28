@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from model_management.split_runtime import (
     SplitSpec,
@@ -130,6 +131,26 @@ def test_prepare_exact_split_runtime_handles_module_internal_operation_id():
     replayed = runtime.run_suffix(runtime.run_prefix(inputs))
     ok, max_diff = compare_outputs(model(inputs), replayed)
     assert ok, max_diff
+
+
+def test_prepare_exact_split_runtime_rejects_missing_expected_boundary_labels():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 8),
+        torch.nn.ReLU(),
+        torch.nn.Linear(8, 2),
+    ).eval()
+
+    with pytest.raises(ValueError, match="requested boundary tensors"):
+        prepare_exact_split_runtime(
+            model,
+            torch.randn(2, 4),
+            make_split_spec(
+                "after:not_a_real_node",
+                dynamic_batch=(2, 64),
+                trace_batch_mode="batch_gt1",
+            ),
+            expected_boundary_tensor_labels=["edge_node"],
+        )
 
 
 def test_suffix_replay_uses_boundary_payload_batch_size_for_nonbatch_first_boundary():

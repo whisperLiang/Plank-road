@@ -3097,6 +3097,7 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         "model": {"model_id": "rfdetr_nano", "model_version": "0"},
         "split_plan": {
             "split_label": "after:node_1",
+            "boundary_tensor_labels": ["edge_node_a", "edge_node_b"],
             "trace_batch_mode": "batch_1",
             "trace_batch_size": 1,
             "dynamic_batch": [1, 64],
@@ -3117,6 +3118,7 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         *,
         model_name,
         preferred_mode,
+        expected_boundary_tensor_labels=None,
     ):
         captured["trace_sample_shape"] = tuple(sample_input.shape)
         captured["split_boundary"] = split_spec.boundary
@@ -3124,6 +3126,9 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
         captured["dynamic_batch"] = tuple(split_spec.dynamic_batch)
         captured["model_name"] = model_name
         captured["preferred_mode"] = preferred_mode
+        captured["expected_boundary_tensor_labels"] = list(
+            expected_boundary_tensor_labels or []
+        )
         return SimpleNamespace(graph_signature="runtime-sig", split_id=split_spec.boundary), preferred_mode
 
     monkeypatch.setattr(
@@ -3173,6 +3178,7 @@ def test_cloud_fixed_split_template_cold_build_traces_with_configured_trace_batc
     assert captured["dynamic_batch"] == (1, 64)
     assert captured["model_name"] == "rfdetr_nano"
     assert captured["preferred_mode"] == "debug_interpreter"
+    assert captured["expected_boundary_tensor_labels"] == ["edge_node_a", "edge_node_b"]
     assert template.mode == "debug_interpreter"
 
 

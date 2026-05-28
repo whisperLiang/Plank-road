@@ -4,7 +4,7 @@ import copy
 import gzip
 import os
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -508,6 +508,7 @@ def prepare_exact_split_runtime(
     split_spec: SplitSpec,
     *,
     mode: str = "generated_eager",
+    expected_boundary_tensor_labels: Sequence[str] | None = None,
 ) -> SplitRuntime:
     boundary = str(getattr(split_spec, "boundary", "auto") or "auto")
     if boundary == "auto":
@@ -522,19 +523,52 @@ def prepare_exact_split_runtime(
     )
     candidates = tuple(enumerate_frontier_splits(plan))
     requested_operation_id = _normalise_after_id(boundary)
-    ariadne_candidate = next(
-        (
-            candidate
-            for candidate in candidates
-            if requested_operation_id
-            and requested_operation_id
-            in {
-                _ariadne_candidate_operation_split_id(candidate),
-                _normalise_after_id(_ariadne_candidate_operation_node(candidate)),
-            }
-        ),
-        None,
-    )
+    expected_boundary_set = {
+        str(label) for label in list(expected_boundary_tensor_labels or []) if str(label)
+    }
+    matching_candidates = [
+        candidate
+        for candidate in candidates
+        if requested_operation_id
+        and requested_operation_id
+        in {
+            _ariadne_candidate_operation_split_id(candidate),
+            _normalise_after_id(_ariadne_candidate_operation_node(candidate)),
+        }
+    ]
+    if expected_boundary_set:
+        ariadne_candidate = next(
+            (
+                candidate
+                for candidate in matching_candidates
+                if {
+                    str(label)
+                    for label in list(getattr(candidate, "boundary_nodes", ()) or [])
+                }
+                == expected_boundary_set
+            ),
+            None,
+        )
+        if ariadne_candidate is None:
+            available = [
+                sorted(
+                    str(label)
+                    for label in list(getattr(candidate, "boundary_nodes", ()) or [])
+                )
+                for candidate in matching_candidates[:5]
+            ]
+            raise ValueError(
+                "No exact Ariadne split candidate matches the requested boundary tensors "
+                f"(boundary={boundary!r}, expected={sorted(expected_boundary_set)!r}, "
+                f"available={available!r})."
+            )
+    else:
+        ariadne_candidate = None
+    if ariadne_candidate is None:
+        ariadne_candidate = next(
+            iter(matching_candidates),
+            None,
+        )
     if ariadne_candidate is None:
         ariadne_candidate = select_split(
             plan,
