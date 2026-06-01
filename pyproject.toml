@@ -43,6 +43,7 @@ integration = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+norecursedirs = ["tmp", ".venv", "__pycache__", ".git"]
 filterwarnings = [
   "ignore:`torch.jit.script` is deprecated.*:DeprecationWarning:torch.jit._script",
   "ignore:rfdetr\\.util\\..* is deprecated.*:DeprecationWarning",
