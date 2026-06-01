@@ -2,7 +2,6 @@ import io
 import json
 import os
 import tarfile
-import time
 import zipfile
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -3791,7 +3790,6 @@ def test_cloud_fixed_split_working_cache_hit_skips_prepare_cache(
     tmp_path,
     monkeypatch,
 ):
-    import cloud_server
     from cloud_server import CloudContinualLearner, _build_fixed_split_cache_identity
 
     learner = CloudContinualLearner(

@@ -22,10 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import load_runtime_config
-from cloud_server import (
-    CloudContinualLearner,
-    _evaluate_detection_proxy_map,
-)
+from cloud_server import CloudContinualLearner
 from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
 from edge.quality_assessor import LOW_QUALITY, QualityAssessor
 from edge.sample_store import EdgeSampleStore
@@ -551,4 +548,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

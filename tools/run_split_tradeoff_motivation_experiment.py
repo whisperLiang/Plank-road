@@ -30,9 +30,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import logging
 import math
-import os
 import sys
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -573,7 +571,7 @@ def trace_model_with_splitter(
     device: torch.device,
 ) -> tuple[UniversalModelSplitter, SplitRuntime]:
     """Trace model using UniversalModelSplitter with fallback input formats."""
-    logger.info(f"Tracing model with UniversalModelSplitter...")
+    logger.info("Tracing model with UniversalModelSplitter...")
     
     splitter = UniversalModelSplitter(device=device)
     
@@ -607,7 +605,7 @@ def trace_model_with_splitter(
         logger.warning(f"Trace failed with list format: {e}")
     
     # Both formats failed
-    logger.error(f"Trace failed with both input formats")
+    logger.error("Trace failed with both input formats")
     raise RuntimeError(
         f"Failed to trace model {model_name} with any input format. "
         f"Tried: Tensor[1,3,H,W] and list[Tensor[3,H,W]]"
@@ -1593,7 +1591,7 @@ def plot_pareto_tradeoff(
         label="Trainable tail",
     )
     
-    scatter2 = ax.scatter(
+    ax.scatter(
         payload_mb[untrainable_mask],
         privacy_score[untrainable_mask],
         c=edge_param_ratio[untrainable_mask],
@@ -1772,7 +1770,7 @@ def plot_constraint_feasibility(
     if max_freezing_ratio is not None:
         ax.axvline(x=max_freezing_ratio * (max(payload_mb) if payload_mb.size > 0 else 1), 
                   color="orange", linestyle="--", linewidth=1.5, alpha=0.7,
-                  label=f"Max freezing ratio")
+                  label="Max freezing ratio")
     
     ax.set_xlabel("Intermediate Feature Size (MB)", fontsize=11)
     ax.set_ylabel("Privacy Leakage Score", fontsize=11)

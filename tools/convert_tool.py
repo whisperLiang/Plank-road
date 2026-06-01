@@ -1,8 +1,6 @@
-import os
 import cv2
 import base64
 import numpy as np
-from sys import getsizeof
 
 
 def cv2_to_base64(frame, qp=90):

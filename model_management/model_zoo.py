@@ -48,6 +48,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager
 import hashlib
+from importlib.util import find_spec
 import re
 import sys
 import types
@@ -68,7 +69,6 @@ from torchvision.ops import batched_nms
 # ---------------------------------------------------------------------------
 # Required dependencies
 # ---------------------------------------------------------------------------
-import ultralytics
 from transformers import DetrConfig, DetrForObjectDetection, DetrImageProcessor
 from torchvision.models.detection import (
     retinanet_resnet50_fpn,
@@ -93,7 +93,7 @@ except Exception:
     RFDETRNano = RFDETRSmall = RFDETRMedium = RFDETRLarge = None
     _HAS_RFDETR = False
 
-_HAS_ULTRALYTICS = True
+_HAS_ULTRALYTICS = find_spec("ultralytics") is not None
 _HAS_HF_DETR = True
 _HAS_TV_DETECTION = True
 

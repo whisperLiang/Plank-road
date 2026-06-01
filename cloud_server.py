@@ -12,7 +12,6 @@ import shutil
 import tarfile
 import threading
 import time
-import zipfile
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -99,10 +98,6 @@ from model_management.split_contract import (
 from torchvision.models.detection.image_list import ImageList
 
 from grpc_server import message_transmission_pb2_grpc
-
-
-def _collate_fn(batch):
-    return tuple(zip(*batch))
 
 
 _FIXED_SPLIT_WORKING_CACHE_VERSION = 3
@@ -606,20 +601,6 @@ def _proxy_metrics_skipped_full_proxy(metrics: Mapping[str, object] | None) -> b
         return False
 
 
-def _model_state_fingerprint(model: torch.nn.Module) -> str:
-    hasher = hashlib.sha1()
-    for key, value in model.state_dict().items():
-        hasher.update(str(key).encode("utf-8"))
-        if torch.is_tensor(value):
-            tensor = value.detach().cpu().contiguous()
-            hasher.update(str(tensor.dtype).encode("utf-8"))
-            hasher.update(str(tuple(tensor.shape)).encode("utf-8"))
-            hasher.update(tensor.numpy().tobytes())
-        else:
-            hasher.update(_stable_json_dumps(value).encode("utf-8"))
-    return hasher.hexdigest()
-
-
 def _is_cuda_oom_error(exc: BaseException) -> bool:
     oom_error_type = getattr(torch.cuda, "OutOfMemoryError", None)
     if oom_error_type is not None and isinstance(exc, oom_error_type):
@@ -986,37 +967,6 @@ def _build_synthetic_original_frame(
         return None
     height, width = original_image_size
     return np.zeros((height, width, 3), dtype=np.uint8)
-
-
-def _flatten_tensors_for_trace_batch_size(obj: object) -> list[torch.Tensor]:
-    tensors: list[torch.Tensor] = []
-    if isinstance(obj, torch.Tensor):
-        tensors.append(obj)
-        return tensors
-    if isinstance(obj, Mapping):
-        for value in obj.values():
-            tensors.extend(_flatten_tensors_for_trace_batch_size(value))
-        return tensors
-    if isinstance(obj, (list, tuple)):
-        for value in obj:
-            tensors.extend(_flatten_tensors_for_trace_batch_size(value))
-    return tensors
-
-
-def _infer_splitter_trace_batch_size(splitter: UniversalModelSplitter | None) -> int:
-    graph = getattr(splitter, "graph", None)
-    if graph is None:
-        return 1
-    try:
-        sample_args = tuple(getattr(graph, "sample_args", ()) or ())
-        sample_kwargs = tuple((getattr(graph, "sample_kwargs", {}) or {}).values())
-        for sample in sample_args + sample_kwargs:
-            for tensor in _flatten_tensors_for_trace_batch_size(sample):
-                if tensor.ndim > 0:
-                    return max(1, int(tensor.shape[0]))
-    except Exception:
-        return 1
-    return 1
 
 
 def _trim_batched_runtime_outputs(
@@ -2447,11 +2397,6 @@ class CloudContinualLearner:
             if raw_sample_pool_max in (None, "", 0)
             else int(raw_sample_pool_max)
         )
-        self.sample_pool_reader_cache_size = (
-            int(getattr(cl_cfg, "sample_pool_reader_cache_size", 4))
-            if cl_cfg
-            else 4
-        )
         self.sample_pool_shard_size = (
             max(1, int(getattr(sample_pool_cfg, "shard_size", 64)))
             if sample_pool_cfg is not None
@@ -2643,7 +2588,6 @@ class CloudContinualLearner:
             ),
             max_active_samples=self.sample_pool_max_active_samples,
             shard_size=self.sample_pool_shard_size,
-            reader_cache_size=self.sample_pool_reader_cache_size,
         )
 
     @staticmethod
@@ -2957,7 +2901,6 @@ class CloudContinualLearner:
         cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
         runtime = getattr(splitter, "runtime", splitter)
         dynamic_batch = _splitter_dynamic_batch_range(splitter)
-        trace_plan = getattr(runtime, "trace_plan", None)
         symbolic_schema = getattr(runtime, "symbolic_input_schema", None)
         return {
             "model_id": str(context.get("model_id") or self.edge_model_name),

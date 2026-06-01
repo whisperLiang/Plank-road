@@ -8,7 +8,7 @@ training budgets. Supports concurrent drift bursts for stress testing.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from baselines.base_method import InferenceResult
@@ -219,4 +219,3 @@ class ScenarioGenerator:
             ))
 
         return results
-

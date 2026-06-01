@@ -1,9 +1,7 @@
-from typing import List, Tuple, Dict, Optional
-import torch
-import torchvision
+from typing import Dict, Optional, Tuple
+
 from torch import nn, Tensor
 from torchvision.transforms import functional as F
-from torchvision.transforms import transforms as T
 
 
 class Compose(object):
@@ -39,4 +37,3 @@ class Resize(nn.Module):
             target["boxes"][:, [0, 2]] *= scale_w
             target["boxes"][:, [1, 3]] *= scale_h
         return image, target
-

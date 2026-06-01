@@ -4,7 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import torch
 
 from tools import run_retrain_pair_experiments as experiments

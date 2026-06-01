@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from baselines.base_method import BaseMethod
-from baselines.plank_road_multi_device import PlankRoadMultiDevice
-from baselines.ekya_style_centralized_scheduling import EkyaStyleCentralizedScheduling
 from baselines.accuracy_trigger_cloud_retraining import AccuracyTriggerCloudRetraining
+from baselines.ekya_style_centralized_scheduling import EkyaStyleCentralizedScheduling
+from baselines.plank_road_multi_device import PlankRoadMultiDevice
 from baselines.pure_edge_local_updating import PureEdgeLocalUpdating
-from config.experiment import ExperimentConfig, VALID_METHODS
+from config.experiment import ExperimentConfig
 
 
 _REGISTRY: dict[str, type[BaseMethod]] = {

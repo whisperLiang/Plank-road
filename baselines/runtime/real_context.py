@@ -187,7 +187,7 @@ class RealBaselineContext:
             enriched["total_upload_bytes"] = int(enriched.get("measured_upload_bytes", 0) or 0)
         if "measured_upload_bytes" not in enriched:
             enriched["measured_upload_bytes"] = int(enriched.get("total_upload_bytes", 0) or 0)
-        for field in (
+        for metric_field in (
             "raw_bytes",
             "feature_bytes",
             "metadata_bytes",
@@ -206,7 +206,7 @@ class RealBaselineContext:
             "reconstructed_feature_ratio",
             "recovery_time_sec",
         ):
-            enriched.setdefault(field, 0)
+            enriched.setdefault(metric_field, 0)
         if "metric_f1_before" not in enriched:
             enriched["metric_f1_before"] = enriched.get("f1_before_update", enriched.get("accuracy_before_update", ""))
         if "metric_f1_after" not in enriched:

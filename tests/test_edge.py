@@ -21,7 +21,6 @@ from edge.task import Task
 from edge.info import FRAME_TYPE, TASK_STATE
 from edge.box_motion import compensate_boxes_between_frames, estimate_frame_translation
 from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY, QualityAssessment
-from edge.resample import history_sample, annotion_process
 from edge.resource_aware_trigger import (
     CloudResourceState,
     PendingTrainingStats,
@@ -29,7 +28,7 @@ from edge.resource_aware_trigger import (
     TrainingDecision,
 )
 from edge.edge_worker import AsyncSampleWriter, EdgeWorker, SampleStatsDelta, SampleWriteJob
-from edge.sample_store import EdgeSampleStore, LOW_QUALITY
+from edge.sample_store import EdgeSampleStore
 from edge.window_drift_detector import WindowDriftDetector
 from model_management.object_detection import InferenceArtifacts
 
@@ -246,7 +245,6 @@ class TestEdgeWorkerRouting:
 
         sample_input = torch.ones(1, 1)
         split_model = torch.nn.Linear(1, 1)
-        trace_calls = {}
         plan_calls = {}
 
         class DummyDetection:
@@ -1262,5 +1260,4 @@ class TestResourceAwareCLTrigger:
             sample_stats=self._stats(),
         )
         assert decision.train_now is False
-
 

@@ -43,11 +43,8 @@ from __future__ import annotations
 
 import collections
 import math
-from collections import defaultdict
-from itertools import repeat
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

@@ -8,7 +8,6 @@ Tests for model_management/ module:
   - model_zoo.py            (list_available_models, get_model_family, is_wrapper_model, model_has_roi_heads)
 """
 import os
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 

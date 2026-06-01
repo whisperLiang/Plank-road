@@ -215,29 +215,6 @@ source .venv/bin/activate
 .venv\Scripts\Activate.ps1
 ```
 
-### Verify Installation
-
-```bash
-uv run python - <<'PY'
-import cv2
-import grpc
-import torch
-import torchvision
-import PIL
-import tqdm
-import yaml
-
-print("Plank-Road environment OK")
-PY
-```
-
-If a package is missing after `uv sync`, first check that commands are running
-inside the uv environment by using `uv run ...` or activating `.venv`. When adding
-new dependencies, use `uv add <package>` or edit `pyproject.toml`, then run
-`uv lock` and `uv sync` again. Avoid `uv pip install ...` for project
-dependencies because it bypasses the lockfile and is easy to lose on the next
-sync.
-
 ### Compile gRPC Stubs
 
 Generated gRPC files are committed in [grpc_server/](./grpc_server/). Rebuild

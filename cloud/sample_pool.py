@@ -791,7 +791,6 @@ class CloudSamplePool:
         max_active_samples: int | None = None,
         max_samples: int | None = None,
         shard_size: int = 64,
-        reader_cache_size: int = 4,
         **_: Any,
     ) -> None:
         self.root_dir = os.path.abspath(root_dir)
@@ -1174,7 +1173,6 @@ class CloudSamplePool:
             candidate.get("label_source")
             or ("teacher" if sample_source == "low_quality" else "edge_pseudo")
         )
-        feature_layout = feature_layout_from_tensors(feature)
         contract_id = str(candidate.get("contract_id") or split_contract.contract_id)
         active_contract_id_mismatch = (
             is_canonical_active

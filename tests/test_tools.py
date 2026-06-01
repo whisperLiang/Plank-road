@@ -6,12 +6,8 @@ Tests for tools/ module:
   - video_processor.py (VideoProcessor)
 """
 import os
-import tempfile
-import shutil
 
-import cv2
 import numpy as np
-import pytest
 
 from tools.convert_tool import cv2_to_base64, base64_to_cv2
 from tools.file_op import creat_folder, clear_folder, sample_files

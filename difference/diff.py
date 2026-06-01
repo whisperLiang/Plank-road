@@ -1,6 +1,5 @@
 import cv2
 import imutils
-from loguru import logger
 
 
 class DiffProcessor:

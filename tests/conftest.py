@@ -6,9 +6,8 @@ import sys
 import shutil
 import tempfile
 
-import numpy as np
-import cv2
 import pytest
+import numpy as np
 
 # Ensure the project root is on sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

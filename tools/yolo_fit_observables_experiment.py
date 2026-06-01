@@ -6,7 +6,6 @@ import io
 import json
 import sys
 import tarfile
-from copy import deepcopy
 from pathlib import Path
 from typing import Any
 

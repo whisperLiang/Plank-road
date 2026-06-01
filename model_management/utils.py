@@ -1,8 +1,6 @@
 from collections.abc import Mapping, Sequence
 
-import cv2
 import numpy as np
-from loguru import logger
 from mapcalc import calculate_map
 from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES
 from ultralytics.utils.plotting import Annotator, colors
