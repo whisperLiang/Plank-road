@@ -175,25 +175,37 @@ Plank-road/
 ```
 
 ## Installation
-
 ### Recommended Environment
 
-The Ariadne split runtime has been validated with:
-- `ariadne-split==0.1.0`
+The current lockfile has been validated with:
+- `ariadne-split==0.1.2`
 - `torchlens==1.0.1`
-- `numpy==1.26.4`
+- `numpy==2.2.6`
 - `opencv-python==4.11.0.86`
 
-These versions are pinned in [requirements.txt](./requirements.txt).
+The full runtime also installs the object-detection backends used by the model
+zoo, including `torch`, `torchvision`, `ultralytics`, `rfdetr`, `timm`, and
+`transformers`.
 
-### Create A Virtual Environment
+### Install With uv
 
 ```bash
-pip install uv
-uv venv
+python -m pip install --upgrade uv
+uv sync --all-extras
 ```
 
-Activate the environment:
+`uv sync` creates `.venv` if needed and installs dependencies from
+`pyproject.toml`/`uv.lock`. `--all-extras` keeps the command safe if optional
+dependency groups gain additional packages later.
+
+Use the environment through `uv run`:
+
+```bash
+uv run python cloud_server.py
+uv run python edge_client.py
+```
+
+Or activate `.venv` manually:
 
 ```bash
 # Linux / macOS
@@ -203,18 +215,36 @@ source .venv/bin/activate
 .venv\Scripts\Activate.ps1
 ```
 
-### Install Dependencies
+### Verify Installation
 
 ```bash
-uv pip install -r requirements.txt
+uv run python - <<'PY'
+import cv2
+import grpc
+import torch
+import torchvision
+import PIL
+import tqdm
+import yaml
+
+print("Plank-Road environment OK")
+PY
 ```
+
+If a package is missing after `uv sync`, first check that commands are running
+inside the uv environment by using `uv run ...` or activating `.venv`. When adding
+new dependencies, use `uv add <package>` or edit `pyproject.toml`, then run
+`uv lock` and `uv sync` again. Avoid `uv pip install ...` for project
+dependencies because it bypasses the lockfile and is easy to lose on the next
+sync.
 
 ### Compile gRPC Stubs
 
-```bash
-uv pip install grpcio-tools
+Generated gRPC files are committed in [grpc_server/](./grpc_server/). Rebuild
+them only after changing [message_transmission.proto](./grpc_server/protos/message_transmission.proto):
 
-python -m grpc_tools.protoc \
+```bash
+uv run python -m grpc_tools.protoc \
     -I ./grpc_server/protos \
     --python_out=./grpc_server \
     --pyi_out=./grpc_server \
@@ -225,7 +255,7 @@ python -m grpc_tools.protoc \
 Windows PowerShell:
 
 ```powershell
-python -m grpc_tools.protoc `
+uv run python -m grpc_tools.protoc `
     -I ./grpc_server/protos `
     --python_out=./grpc_server `
     --pyi_out=./grpc_server `
