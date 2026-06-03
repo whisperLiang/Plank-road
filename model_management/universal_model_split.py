@@ -819,6 +819,34 @@ def _cached_boundary_payload(record: Mapping[str, Any]) -> BoundaryPayload | Non
     return intermediate if isinstance(intermediate, BoundaryPayload) else None
 
 
+_SPLIT_TARGET_METADATA_FIELDS = (
+    "input_image_size",
+    "input_tensor_shape",
+    "input_resize_mode",
+)
+
+
+def _target_with_split_meta(target: Any, record: Mapping[str, Any]) -> Any:
+    if not isinstance(target, Mapping):
+        return target
+
+    enriched = dict(target)
+    existing_meta = enriched.get("_split_meta")
+    split_meta = dict(existing_meta) if isinstance(existing_meta, Mapping) else {}
+    for field_name in _SPLIT_TARGET_METADATA_FIELDS:
+        if split_meta.get(field_name) is not None:
+            continue
+        value = record.get(field_name)
+        if value is None:
+            continue
+        if isinstance(value, tuple):
+            value = list(value)
+        split_meta[field_name] = value
+    if split_meta:
+        enriched["_split_meta"] = split_meta
+    return enriched
+
+
 def _build_boundary_batch_from_records(records: list[Mapping[str, Any]], *, runtime: Any) -> BoundaryPayload:
     if not records:
         raise RuntimeError("Cannot build an empty split-tail feature batch.")
@@ -892,7 +920,7 @@ def _load_cached_split_batches(
                     "boxes": list(record.get("pseudo_boxes") or []),
                     "labels": list(record.get("pseudo_labels") or []),
                 }
-            targets.append(target)
+            targets.append(_target_with_split_meta(target, record))
         batches.append((batch_indices, _build_boundary_batch_from_records(records, runtime=runtime), targets))
     return batches
 
