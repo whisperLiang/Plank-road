@@ -58,7 +58,7 @@ baselines:
     fixed_split_max_layer_freezing_ratio: 1.0
     fixed_split_validate_candidates: true
     fixed_split_validate_cached_plan: true
-    fixed_split_max_candidates: 24
+    fixed_split_max_candidates: 0
     fixed_split_max_boundary_count: 8
     fixed_split_max_payload_bytes: 33554432
     fixed_split_privacy_leakage_epsilon: 1.0e-12

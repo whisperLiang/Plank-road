@@ -1605,7 +1605,7 @@ def _pack_rfdetr_aux_outputs(value: Any) -> Any:
     if not isinstance(value, (list, tuple)):
         return _contiguous_tensor_tree(value)
     if not value:
-        return {_RFDETR_PACKED_AUX_OUTPUTS_MARKER: True}
+        return []
     if not all(isinstance(item, Mapping) for item in value):
         return _contiguous_tensor_tree(value)
     keys = sorted(
@@ -1633,10 +1633,26 @@ def _pack_rfdetr_aux_outputs(value: Any) -> Any:
         )
     if not packed:
         return _contiguous_tensor_tree(value)
+    marker_device = next(iter(packed.values())).device
     return {
-        _RFDETR_PACKED_AUX_OUTPUTS_MARKER: True,
+        _RFDETR_PACKED_AUX_OUTPUTS_MARKER: torch.ones(
+            (),
+            dtype=torch.bool,
+            device=marker_device,
+        ),
         **packed,
     }
+
+
+def _is_rfdetr_packed_aux_marker(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        try:
+            return bool(value.detach().bool().cpu().item())
+        except Exception:
+            return False
+    return False
 
 
 def _unpack_rfdetr_aux_outputs(value: Any) -> Any:
@@ -1644,7 +1660,7 @@ def _unpack_rfdetr_aux_outputs(value: Any) -> Any:
         return _contiguous_tensor_tree(list(value))
     if not isinstance(value, dict):
         return _contiguous_tensor_tree(value)
-    if value.get(_RFDETR_PACKED_AUX_OUTPUTS_MARKER) is not True:
+    if not _is_rfdetr_packed_aux_marker(value.get(_RFDETR_PACKED_AUX_OUTPUTS_MARKER)):
         return _contiguous_tensor_tree(value)
     tensor_items = {
         str(key): tensor

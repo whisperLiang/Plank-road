@@ -488,7 +488,7 @@ def _plank_fixed_split_constraints(config: ExperimentConfig) -> SplitConstraints
             getattr(cfg, "fixed_split_max_layer_freezing_ratio", 1.0)
         ),
         validate_candidates=bool(getattr(cfg, "fixed_split_validate_candidates", True)),
-        max_candidates=int(getattr(cfg, "fixed_split_max_candidates", 24)),
+        max_candidates=int(getattr(cfg, "fixed_split_max_candidates", 0)),
         max_boundary_count=int(getattr(cfg, "fixed_split_max_boundary_count", 8)),
         max_payload_bytes=int(
             getattr(cfg, "fixed_split_max_payload_bytes", 32 * 1024 * 1024)

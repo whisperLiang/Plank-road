@@ -80,11 +80,30 @@ def _load_json_artifact(path: str) -> dict[str, Any] | None:
 
 
 @dataclass(frozen=True)
+class CandidateEnumerationStats:
+    total_candidates: int
+    eligible_candidates: int
+    rejected_not_trainable_tail: int
+    rejected_privacy: int
+    rejected_freezing: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "total_candidates": int(self.total_candidates),
+            "eligible_candidates": int(self.eligible_candidates),
+            "rejected_not_trainable_tail": int(self.rejected_not_trainable_tail),
+            "rejected_privacy": int(self.rejected_privacy),
+            "rejected_freezing": int(self.rejected_freezing),
+        }
+
+
+@dataclass(frozen=True)
 class SplitConstraints:
     privacy_leakage_upper_bound: float = 0.0
     max_layer_freezing_ratio: float = 1.0
     validate_candidates: bool = True
-    max_candidates: int = 24
+    # Deprecated compatibility field; fixed split planning now considers all candidates.
+    max_candidates: int = 0
     max_boundary_count: int = 8
     max_payload_bytes: int = 32 * 1024 * 1024
     privacy_leakage_epsilon: float = PRIVACY_LEAKAGE_EPSILON
@@ -127,7 +146,7 @@ class SplitConstraints:
             privacy_leakage_upper_bound=float(privacy_leakage_upper_bound),
             max_layer_freezing_ratio=float(getattr(config, "max_layer_freezing_ratio", 1.0)),
             validate_candidates=bool(getattr(config, "validate_candidates", True)),
-            max_candidates=int(getattr(config, "max_candidates", 24)),
+            max_candidates=int(getattr(config, "max_candidates", 0)),
             max_boundary_count=int(getattr(config, "max_boundary_count", 8)),
             max_payload_bytes=int(getattr(config, "max_payload_bytes", 32 * 1024 * 1024)),
             privacy_leakage_epsilon=float(
@@ -150,7 +169,6 @@ def _constraints_payload(constraints: SplitConstraints) -> dict[str, Any]:
         "privacy_min_edge_parameter_count": _privacy_min_edge_parameter_count(constraints),
         "max_layer_freezing_ratio": float(constraints.max_layer_freezing_ratio),
         "validate_candidates": bool(constraints.validate_candidates),
-        "max_candidates": int(constraints.max_candidates),
         "max_boundary_count": int(constraints.max_boundary_count),
         "max_payload_bytes": int(constraints.max_payload_bytes),
     }
@@ -479,29 +497,62 @@ def _splitter_trace_batch_mode(splitter: UniversalModelSplitter) -> str:
     return str(getattr(split_spec, "trace_batch_mode", "") or "")
 
 
+def _format_candidate_enumeration_stats(
+    stats: CandidateEnumerationStats,
+    constraints: SplitConstraints,
+) -> str:
+    return (
+        f"total_candidates={stats.total_candidates}, "
+        f"eligible_candidates={stats.eligible_candidates}, "
+        f"rejected_not_trainable_tail={stats.rejected_not_trainable_tail}, "
+        f"rejected_privacy={stats.rejected_privacy}, "
+        f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
+        f"rejected_freezing={stats.rejected_freezing}, "
+        f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}, "
+        f"max_boundary_count={constraints.max_boundary_count}, "
+        f"max_payload_bytes={constraints.max_payload_bytes}"
+    )
+
+
 def _enumerate_feasible_candidates(
     runtime: UniversalModelSplitter,
     constraints: SplitConstraints,
-) -> list[EligibleCandidate]:
+) -> tuple[list[EligibleCandidate], CandidateEnumerationStats]:
     candidates = list(
         runtime.enumerate_candidates(
             max_boundary_count=constraints.max_boundary_count,
             max_payload_bytes=constraints.max_payload_bytes,
-            max_candidates=max(1, int(constraints.max_candidates) * 4),
         )
     )
     eligible: list[EligibleCandidate] = []
+    rejected_not_trainable_tail = 0
+    rejected_privacy = 0
+    rejected_freezing = 0
     for candidate in candidates:
         if not candidate.is_trainable_tail:
+            rejected_not_trainable_tail += 1
             continue
         privacy_leakage = _privacy_leakage(candidate, constraints)
         freezing_ratio = _layer_freezing_ratio(runtime, candidate)
         if not _satisfies_privacy_constraint(candidate, constraints, privacy_leakage):
+            rejected_privacy += 1
             continue
         if freezing_ratio > constraints.max_layer_freezing_ratio:
+            rejected_freezing += 1
             continue
         eligible.append((candidate, privacy_leakage, freezing_ratio))
-    return eligible
+    stats = CandidateEnumerationStats(
+        total_candidates=len(candidates),
+        eligible_candidates=len(eligible),
+        rejected_not_trainable_tail=rejected_not_trainable_tail,
+        rejected_privacy=rejected_privacy,
+        rejected_freezing=rejected_freezing,
+    )
+    logger.info(
+        "[FixedSplit] Candidate enumeration summary: {}.",
+        _format_candidate_enumeration_stats(stats, constraints),
+    )
+    return eligible, stats
 
 
 def _candidate_runtime_key(candidate: SplitCandidate) -> tuple[int, float, int, str]:
@@ -568,16 +619,23 @@ def _select_candidate(
     runtime: UniversalModelSplitter,
     eligible: list[EligibleCandidate],
     constraints: SplitConstraints,
+    stats: CandidateEnumerationStats | None = None,
 ) -> tuple[SplitCandidate, float, float, CandidateProfile | None, Mapping[str, Any] | None]:
     if not eligible:
+        stats_suffix = (
+            f", {_format_candidate_enumeration_stats(stats, constraints)}"
+            if stats is not None
+            else ""
+        )
         raise RuntimeError(
             "No split candidate satisfies the fixed split constraints. "
             f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
             f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
             f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
+            f"{stats_suffix}"
         )
     validation_errors: dict[str, int] = defaultdict(int)
-    for candidate, privacy_leakage, freezing_ratio in sorted(eligible, key=_eligible_candidate_key)[: max(1, int(constraints.max_candidates))]:
+    for candidate, privacy_leakage, freezing_ratio in sorted(eligible, key=_eligible_candidate_key):
         if not constraints.validate_candidates:
             runtime.split(candidate=candidate)
             return candidate, privacy_leakage, freezing_ratio, None, None
@@ -641,14 +699,19 @@ def compute_fixed_split_for_model(
         runtime.trace(
             model,
             sample_input,
-            boundary="50%",
+            boundary="auto",
             model_name=model_name,
             enable_dynamic_batch=True,
             dynamic_batch_min=1,
             dynamic_batch_max=FIXED_SPLIT_DYNAMIC_BATCH_MAX,
         )
-    eligible = _enumerate_feasible_candidates(runtime, constraints)
-    chosen, privacy_leakage, freezing_ratio, profile, report = _select_candidate(runtime, eligible, constraints)
+    eligible, enumeration_stats = _enumerate_feasible_candidates(runtime, constraints)
+    chosen, privacy_leakage, freezing_ratio, profile, report = _select_candidate(
+        runtime,
+        eligible,
+        constraints,
+        enumeration_stats,
+    )
     validation = _build_validation_payload(chosen, profile)
     if report is not None:
         validation.update(dict(report))
@@ -657,7 +720,13 @@ def compute_fixed_split_for_model(
             "runtime": "torchlens_native",
             "selection": "constraints",
             "split_id": chosen.candidate_id,
-            "candidate_pool_size": len(getattr(runtime, "candidates", None) or []),
+            "candidate_pool_size": enumeration_stats.total_candidates,
+            "eligible_candidate_count": enumeration_stats.eligible_candidates,
+            "candidate_rejection_counts": {
+                "not_trainable_tail": enumeration_stats.rejected_not_trainable_tail,
+                "privacy": enumeration_stats.rejected_privacy,
+                "freezing": enumeration_stats.rejected_freezing,
+            },
         }
     )
     canonical_split_key = _candidate_split_key(chosen)

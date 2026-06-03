@@ -7,12 +7,23 @@ import torch
 from torch import nn
 
 import model_management.split_runtime.template as runtime_template_module
-from model_management.fixed_split import SplitConstraints, compute_fixed_split_for_model
+from model_management.fixed_split import (
+    SplitConstraints,
+    _enumerate_feasible_candidates,
+    _select_candidate,
+    compute_fixed_split_for_model,
+)
 from model_management.fixed_split_runtime_template import (
     FixedSplitRuntimeTemplate,
     bind_request_runtime_from_template,
     bind_request_splitter_from_template,
     fixed_split_runtime_template_key,
+)
+from model_management.split_candidate import SplitCandidate
+from model_management.split_model_adapters import (
+    _RFDETR_PACKED_AUX_OUTPUTS_MARKER,
+    _pack_rfdetr_aux_outputs,
+    _unpack_rfdetr_aux_outputs,
 )
 from model_management.split_runtime import (
     BOUNDARY_CACHE_PROTOCOL,
@@ -204,7 +215,7 @@ def test_fixed_split_contract_is_torchlens_native() -> None:
     model, example, _splitter = _prepared_splitter()
     plan = compute_fixed_split_for_model(
         model,
-        SplitConstraints(validate_candidates=True, max_candidates=3, max_payload_bytes=1 << 20),
+        SplitConstraints(validate_candidates=True, max_payload_bytes=1 << 20),
         sample_input=example,
         model_name="tiny",
     )
@@ -227,6 +238,151 @@ def test_fixed_split_contract_is_torchlens_native() -> None:
     for schema in plan.runtime_contract["boundary_schema"].values():
         assert required <= set(schema)
         assert "device" not in schema
+
+
+def test_fixed_split_enumerates_full_pool_before_constraint_filtering() -> None:
+    def candidate(candidate_id: str, *, edge_parameters: int) -> SplitCandidate:
+        return SplitCandidate(
+            candidate_id=candidate_id,
+            edge_nodes=[],
+            cloud_nodes=[],
+            boundary_edges=[],
+            boundary_tensor_labels=["x"],
+            edge_input_labels=[],
+            cloud_input_labels=["x"],
+            cloud_output_labels=[],
+            estimated_edge_flops=0.0,
+            estimated_cloud_flops=0.0,
+            estimated_payload_bytes=1024,
+            estimated_privacy_risk=1.0 / max(1, edge_parameters),
+            estimated_latency=1024.0,
+            is_trainable_tail=True,
+            is_validated=True,
+            legacy_layer_index=0,
+            boundary_count=1,
+            edge_parameter_count=edge_parameters,
+            total_parameter_count=1000,
+            edge_parameter_ratio=float(edge_parameters) / 1000.0,
+        )
+
+    class FakeSplitter:
+        def __init__(self) -> None:
+            self.seen_kwargs = None
+            self._candidates = [
+                candidate("after:privacy_fail_0", edge_parameters=10),
+                candidate("after:privacy_fail_1", edge_parameters=10),
+                candidate("after:privacy_fail_2", edge_parameters=10),
+                candidate("after:privacy_fail_3", edge_parameters=10),
+                candidate("after:eligible", edge_parameters=200),
+            ]
+
+        def enumerate_candidates(self, **kwargs):
+            self.seen_kwargs = dict(kwargs)
+            candidates = list(self._candidates)
+            max_candidates = kwargs.get("max_candidates")
+            if max_candidates is not None:
+                candidates = candidates[: int(max_candidates)]
+            return candidates
+
+    splitter = FakeSplitter()
+    constraints = SplitConstraints(
+        privacy_leakage_upper_bound=0.01,
+        max_layer_freezing_ratio=0.75,
+        max_candidates=1,
+    )
+
+    eligible, stats = _enumerate_feasible_candidates(splitter, constraints)
+
+    assert splitter.seen_kwargs is not None
+    assert "max_candidates" not in splitter.seen_kwargs
+    assert [item[0].candidate_id for item in eligible] == ["after:eligible"]
+    assert stats.total_candidates == 5
+    assert stats.eligible_candidates == 1
+    assert stats.rejected_privacy == 4
+
+
+def test_fixed_split_validates_all_eligible_candidates_without_limit() -> None:
+    def candidate(candidate_id: str, *, payload_bytes: int) -> SplitCandidate:
+        return SplitCandidate(
+            candidate_id=candidate_id,
+            edge_nodes=[],
+            cloud_nodes=[],
+            boundary_edges=[],
+            boundary_tensor_labels=["x"],
+            edge_input_labels=[],
+            cloud_input_labels=["x"],
+            cloud_output_labels=[],
+            estimated_edge_flops=0.0,
+            estimated_cloud_flops=0.0,
+            estimated_payload_bytes=payload_bytes,
+            estimated_privacy_risk=0.0,
+            estimated_latency=float(payload_bytes),
+            is_trainable_tail=True,
+            is_validated=True,
+            legacy_layer_index=0,
+            boundary_count=1,
+            edge_parameter_count=1000,
+            total_parameter_count=1000,
+            edge_parameter_ratio=1.0,
+        )
+
+    class FakeSplitter:
+        def __init__(self) -> None:
+            self.validated: list[str] = []
+
+        def split(self, *, candidate):
+            return candidate
+
+        def validate_candidate(self, candidate):
+            self.validated.append(candidate.candidate_id)
+            return {
+                "success": candidate.candidate_id == "after:success",
+                "tail_trainability": True,
+                "error": None if candidate.candidate_id == "after:success" else "replay failed",
+            }
+
+    runtime = FakeSplitter()
+    constraints = SplitConstraints(validate_candidates=True, max_candidates=1)
+    eligible = [
+        (candidate("after:fail", payload_bytes=1), 0.0, 0.0),
+        (candidate("after:success", payload_bytes=2), 0.0, 0.0),
+    ]
+
+    chosen, _privacy, _freezing, _profile, report = _select_candidate(
+        runtime,
+        eligible,
+        constraints,
+    )
+
+    assert chosen.candidate_id == "after:success"
+    assert runtime.validated == ["after:fail", "after:success"]
+    assert report is not None
+    assert report["success"] is True
+
+
+def test_rfdetr_aux_outputs_pack_uses_tensor_marker_for_split_replay() -> None:
+    aux_outputs = [
+        {
+            "pred_logits": torch.randn(2, 3, 4),
+            "pred_boxes": torch.randn(2, 3, 4),
+        },
+        {
+            "pred_logits": torch.randn(2, 3, 4),
+            "pred_boxes": torch.randn(2, 3, 4),
+        },
+    ]
+
+    packed = _pack_rfdetr_aux_outputs(aux_outputs)
+
+    assert isinstance(packed, dict)
+    assert isinstance(packed[_RFDETR_PACKED_AUX_OUTPUTS_MARKER], torch.Tensor)
+    assert packed[_RFDETR_PACKED_AUX_OUTPUTS_MARKER].dtype == torch.bool
+    unpacked = _unpack_rfdetr_aux_outputs(packed)
+    assert isinstance(unpacked, list)
+    assert len(unpacked) == len(aux_outputs)
+    for expected, actual in zip(aux_outputs, unpacked, strict=True):
+        assert torch.equal(actual["pred_logits"], expected["pred_logits"])
+        assert torch.equal(actual["pred_boxes"], expected["pred_boxes"])
 
 
 def test_native_runtime_preserves_spec_mode_and_list_inputs(monkeypatch) -> None:

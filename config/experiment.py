@@ -33,7 +33,7 @@ class PlankRoadMultiDeviceConfig:
     fixed_split_max_layer_freezing_ratio: float = 1.0
     fixed_split_validate_candidates: bool = True
     fixed_split_validate_cached_plan: bool = True
-    fixed_split_max_candidates: int = 24
+    fixed_split_max_candidates: int = 0
     fixed_split_max_boundary_count: int = 8
     fixed_split_max_payload_bytes: int = 32 * 1024 * 1024
     fixed_split_privacy_leakage_epsilon: float = 1.0e-12

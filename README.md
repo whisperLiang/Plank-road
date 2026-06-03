@@ -265,7 +265,6 @@ client:
       privacy_leakage_upper_bound: 0.15
       max_layer_freezing_ratio: 0.75
       validate_candidates: True
-      max_candidates: 24
       max_boundary_count: 8
       max_payload_bytes: 33554432
       privacy_leakage_epsilon: 1.0e-12

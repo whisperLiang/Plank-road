@@ -16,7 +16,10 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUN_E2E_ENV = "PLANK_ROAD_RUN_YOLO26N_E2E"
+RUN_FULL_RETRAIN_ENV = "PLANK_ROAD_RUN_YOLO26N_E2E_FULL_RETRAIN"
 DEEP_COPY_ERROR = "Only Tensors created explicitly by the user"
+COORDINATE_METADATA_ERROR = "Missing coordinate metadata required for split retraining"
+FIXED_SPLIT_FAILURE = "fixed-split training failed"
 
 
 class _ProcessCapture:
@@ -95,6 +98,10 @@ def _wait_for_patterns(
         combined = "\n".join(process.text for process in processes)
         if DEEP_COPY_ERROR in combined:
             pytest.fail(f"TorchLens deepcopy regression appeared:\n{combined[-8000:]}")
+        if COORDINATE_METADATA_ERROR in combined:
+            pytest.fail(f"Coordinate metadata regression appeared:\n{combined[-8000:]}")
+        if FIXED_SPLIT_FAILURE in combined:
+            pytest.fail(f"Fixed-split training failed:\n{combined[-8000:]}")
         if all(pattern.search(combined) for pattern in compiled):
             return combined
         for process in processes:
@@ -117,7 +124,7 @@ def _base_env() -> dict[str, str]:
     return env
 
 
-def _write_e2e_config(tmp_path: Path, port: int) -> Path:
+def _write_e2e_config(tmp_path: Path, port: int, *, full_retrain: bool) -> Path:
     config_path = PROJECT_ROOT / "config" / "config.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     cache_root = tmp_path / "cache"
@@ -194,7 +201,7 @@ def _write_e2e_config(tmp_path: Path, port: int) -> Path:
             "proxy_eval_interval_rounds": 1,
             "proxy_eval_patience": 0,
             "max_concurrent_jobs": 1,
-            "connectivity_smoke_only": True,
+            "connectivity_smoke_only": not full_retrain,
         }
     )
 
@@ -206,7 +213,10 @@ def _write_e2e_config(tmp_path: Path, port: int) -> Path:
 @pytest.mark.integration
 def test_yolo26n_fixed_split_continual_learning_process_e2e(tmp_path: Path) -> None:
     if os.environ.get(RUN_E2E_ENV) != "1":
-        pytest.skip(f"set {RUN_E2E_ENV}=1 to run the GPU/CPU process E2E smoke")
+        pytest.skip(
+            f"set {RUN_E2E_ENV}=1 to run the GPU/CPU process E2E smoke; "
+            f"also set {RUN_FULL_RETRAIN_ENV}=1 to run full retraining"
+        )
     if not torch.cuda.is_available():
         pytest.skip("GPU cloud process requested, but CUDA is not available")
     if not (PROJECT_ROOT / "model_management" / "models" / "yolo26n.pt").exists():
@@ -215,7 +225,8 @@ def test_yolo26n_fixed_split_continual_learning_process_e2e(tmp_path: Path) -> N
         pytest.skip("road.mp4 is not available")
 
     port = _free_port()
-    config_path = _write_e2e_config(tmp_path, port)
+    full_retrain = os.environ.get(RUN_FULL_RETRAIN_ENV) == "1"
+    config_path = _write_e2e_config(tmp_path, port, full_retrain=full_retrain)
     cloud_env = _base_env()
     cloud_env["CUDA_VISIBLE_DEVICES"] = os.environ.get(
         "PLANK_ROAD_E2E_CUDA_VISIBLE_DEVICES",
@@ -243,18 +254,32 @@ def test_yolo26n_fixed_split_continual_learning_process_e2e(tmp_path: Path) -> N
             env=edge_env,
             name="edge_client",
         )
+        patterns = [
+            r"Preparing fixed split runtime",
+            r"Submitted continual learning job",
+            r"submit_training_job edge_id=1",
+            r"\[ShardCL\]\[CloudUnpack\] materialized low-quality trigger shards",
+            r"\[ShardCL\]\[FeatureRebuild\] Reconstructing",
+        ]
+        if full_retrain:
+            patterns.extend(
+                [
+                    r"fixed-split retrain will train 1 epoch\(s\)",
+                    r"epoch 1/1 avg_loss=",
+                    r"Edge model updated from cloud successfully",
+                ]
+            )
+        else:
+            patterns.extend(
+                [
+                    r"\[FixedSplitCL\]\[ConnectivitySmoke\]",
+                    r"Edge model updated from cloud successfully",
+                ]
+            )
         combined = _wait_for_patterns(
             [cloud, edge],
-            [
-                r"Preparing fixed split runtime",
-                r"Submitted continual learning job",
-                r"submit_training_job edge_id=1",
-                r"\[ShardCL\]\[CloudUnpack\] materialized low-quality trigger shards",
-                r"\[ShardCL\]\[FeatureRebuild\] Reconstructing",
-                r"\[FixedSplitCL\]\[ConnectivitySmoke\]",
-                r"Edge model updated from cloud successfully",
-            ],
-            timeout=360,
+            patterns,
+            timeout=900 if full_retrain else 360,
         )
         assert DEEP_COPY_ERROR not in combined
     finally:

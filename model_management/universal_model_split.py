@@ -29,6 +29,8 @@ from model_management.split_runtime import (
     prepare_split_runtime,
 )
 
+AUTO_TRACE_PROBE_BOUNDARY = "50%"
+
 
 def _runtime_args(sample_input: Any) -> tuple[Any, ...]:
     if isinstance(sample_input, tuple):
@@ -393,13 +395,20 @@ class UniversalModelSplitter:
         trace_batch_size = _first_tensor_batch_size(sample_input) or 1
         trace_batch_mode = "batch_gt1" if trace_batch_size > 1 else "batch_1"
         if enable_dynamic_batch:
-            lower = int(dynamic_batch_min) if dynamic_batch_min is not None else (2 if trace_batch_size > 1 else 1)
+            lower = (
+                int(dynamic_batch_min)
+                if dynamic_batch_min is not None
+                else (2 if trace_batch_size > 1 else 1)
+            )
             lower = max(1, lower)
             upper = max(lower, int(dynamic_batch_max))
             dynamic_batch = (lower, upper)
         else:
             dynamic_batch = None
-        resolved_boundary = "50%" if str(boundary) == "auto" else str(boundary)
+        requested_boundary = str(boundary)
+        resolved_boundary = (
+            AUTO_TRACE_PROBE_BOUNDARY if requested_boundary == "auto" else requested_boundary
+        )
         self.split_spec = split_spec or make_split_spec(
             resolved_boundary,
             dynamic_batch=dynamic_batch,
@@ -411,18 +420,34 @@ class UniversalModelSplitter:
         prepare_started = time.perf_counter()
         logger.info(
             "[FixedSplit] Preparing TorchLens native split runtime "
-            "(model_name={}, batch_size={}, dynamic_batch={}, mode={}).",
+            "(model_name={}, batch_size={}, dynamic_batch={}, mode={}, "
+            "requested_boundary={}, trace_probe_boundary={}).",
             model_name or type(model).__name__,
             trace_batch_size,
             dynamic_batch,
             self.split_spec.mode,
+            requested_boundary,
+            resolved_boundary,
         )
-        self.runtime = prepare_split_runtime(model, sample_input, self.split_spec, mode=self.split_spec.mode)
-        logger.info(
-            "[FixedSplit] TorchLens prepare_split_runtime completed in {:.3f}s (split_id={}).",
-            time.perf_counter() - prepare_started,
-            getattr(self.runtime, "split_id", None),
+        self.runtime = prepare_split_runtime(
+            model,
+            sample_input,
+            self.split_spec,
+            mode=self.split_spec.mode,
         )
+        if requested_boundary == "auto":
+            logger.info(
+                "[FixedSplit] TorchLens trace probe runtime completed in {:.3f}s "
+                "(trace_probe_split_id={}; final split will be selected from enumerated candidates).",
+                time.perf_counter() - prepare_started,
+                getattr(self.runtime, "split_id", None),
+            )
+        else:
+            logger.info(
+                "[FixedSplit] TorchLens prepare_split_runtime completed in {:.3f}s (split_id={}).",
+                time.perf_counter() - prepare_started,
+                getattr(self.runtime, "split_id", None),
+            )
         self.graph = _runtime_trace_signature(self.runtime)
         self.current_candidate = _candidate_from_runtime(self.runtime, self.split_spec)
         self.candidates = [self.current_candidate]
