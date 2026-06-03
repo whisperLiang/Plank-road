@@ -555,6 +555,8 @@ def _has_contract_id_metadata_mismatch(
 def _hard_contract_metadata_mismatch_reason(
     candidate: Mapping[str, Any],
     split_contract: SplitRuntimeContract,
+    *,
+    allow_feature_layout_migration: bool = False,
 ) -> str | None:
     expected_text = {
         "split_config_id": split_contract.split_config_id,
@@ -590,6 +592,8 @@ def _hard_contract_metadata_mismatch_reason(
         _metadata_present(feature_layout_id)
         and str(feature_layout_id) != str(split_contract.feature_layout_id)
     ):
+        if allow_feature_layout_migration:
+            return None
         return "feature_layout_id"
 
     return None
@@ -1072,7 +1076,11 @@ class CloudSamplePool:
                 and _has_contract_id_metadata_mismatch(entry, split_contract)
             )
             hard_mismatch_reason = (
-                _hard_contract_metadata_mismatch_reason(entry, split_contract)
+                _hard_contract_metadata_mismatch_reason(
+                    entry,
+                    split_contract,
+                    allow_feature_layout_migration=True,
+                )
                 if split_contract is not None
                 else None
             )
@@ -1568,6 +1576,7 @@ class CloudSamplePool:
                 hard_mismatch_reason = _hard_contract_metadata_mismatch_reason(
                     candidate,
                     split_contract,
+                    allow_feature_layout_migration=input_source == "existing_active",
                 )
                 if input_source == "existing_active" and hard_mismatch_reason is not None:
                     validation_counts["skipped_stale_contract"] += 1

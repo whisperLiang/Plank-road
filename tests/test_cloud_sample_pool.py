@@ -94,6 +94,78 @@ def test_sample_pool_accepts_folded_single_sample_boundary_payload(tmp_path) -> 
     assert kept_records[0].feature["dropout_1_17"].shape == (4, 145, 384)
 
 
+def test_sample_pool_migrates_existing_active_feature_layout_id_changes(tmp_path) -> None:
+    old_boundary = boundary_payload_from_tensors(
+        {"old_label": torch.randn(1, 4)},
+        split_id="after:linear",
+        graph_signature="old-runtime",
+        batch_size=1,
+        schema={
+            "old_label": {
+                "canonical_id": "old_label",
+                "torchlens_label": "old_label",
+                "module_path": "fake.old",
+                "op_type": "linear",
+                "shape": (1, 4),
+                "dtype": torch.float32,
+                "requires_grad": False,
+                "role": "primary",
+                "output_index": None,
+                "device_policy": "runtime",
+            }
+        },
+    )
+    old_tensors = dict(old_boundary.tensors)
+    new_tensors = {"new_label": torch.randn(1, 4)}
+    old_contract = _split_contract(old_tensors)
+    new_contract = _split_contract(new_tensors)
+    pool = CloudSamplePool(
+        str(tmp_path / "pool"),
+        model_id="rfdetr_nano",
+        front_version="0",
+        split_config_id="split-a",
+        edge_id=1,
+        staging_root=str(tmp_path / "staging"),
+    )
+
+    pool.stage_low_quality_samples(
+        [
+            {
+                "sample_id": "sample-1",
+                "intermediate": old_boundary,
+                "labels": {"boxes": [], "labels": []},
+                "split_config_id": "split-a",
+                "front_version": "0",
+                "input_image_size": [720, 1280],
+                "input_tensor_shape": [1, 3, 384, 384],
+                "input_resize_mode": "direct_resize",
+            }
+        ]
+    )
+    _stats, kept_records = pool.rebuild_canonical_training_pool(
+        split_contract=old_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    assert len(kept_records) == 1
+
+    existing_active = pool.load_active_samples_for_rebuild(split_contract=new_contract)
+    rebuild_stats, kept_records = pool.rebuild_canonical_training_pool(
+        split_contract=new_contract,
+        existing_active_samples=existing_active,
+        pending_high_quality_samples=[],
+        new_low_quality_samples=[],
+    )
+
+    assert rebuild_stats["validation"]["skipped_stale_contract"] == 0
+    assert rebuild_stats["validation"]["migrated_contract_id"] == 1
+    assert rebuild_stats["validation"]["carried_forward_compatible"] == 1
+    assert rebuild_stats["generation_commit"]["active"] == 1
+    assert len(kept_records) == 1
+    assert list(kept_records[0].feature) == ["new_label"]
+
+
 def test_sample_pool_rejects_unstructured_multi_sample_tensor(tmp_path) -> None:
     pool = CloudSamplePool(
         str(tmp_path / "pool"),
