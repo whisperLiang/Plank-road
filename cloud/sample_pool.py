@@ -208,6 +208,11 @@ def _boundary_payload_from_value(value: object) -> BoundaryPayload | None:
 def _single_sample_feature_tensors(value: object) -> dict[str, torch.Tensor]:
     boundary_payload = _boundary_payload_from_value(value)
     if boundary_payload is not None:
+        if boundary_payload.batch_size is not None and int(boundary_payload.batch_size) != 1:
+            raise ValueError(
+                "Canonical sample BoundaryPayload must have batch_size=1; "
+                f"got {boundary_payload.batch_size}."
+            )
         tensors = {
             str(label): tensor.detach().cpu()
             for label, tensor in dict(boundary_payload.tensors or {}).items()
@@ -216,7 +221,7 @@ def _single_sample_feature_tensors(value: object) -> dict[str, torch.Tensor]:
     else:
         tensors = normalise_feature_tensors(value)
     clean: dict[str, torch.Tensor] = {}
-    schema = dict(getattr(boundary_payload, "schema", {}) or {}) if boundary_payload else {}
+    schema = dict(getattr(boundary_payload, "spec", {}) or {}) if boundary_payload else {}
     for label, tensor in sorted(tensors.items()):
         if not isinstance(tensor, torch.Tensor):
             continue
