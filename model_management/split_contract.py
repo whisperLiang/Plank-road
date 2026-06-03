@@ -11,7 +11,7 @@ import torch
 
 
 SPLIT_RUNTIME_CONTRACT_VERSION = "split-runtime-contract.v2"
-FIXED_SPLIT_RUNTIME_CONTRACT_VERSION = "fixed-split-runtime-contract.v1"
+FIXED_SPLIT_RUNTIME_CONTRACT_VERSION = "fixed-split-runtime-contract.v2"
 
 
 def _stable_json(payload: object) -> str:
@@ -112,18 +112,40 @@ def _normalise_boundary_schema(
         if isinstance(spec, Mapping):
             symbolic_shape = spec.get("symbolic_shape") or spec.get("shape") or ()
             dtype = spec.get("dtype")
-            device_type = spec.get("device_type")
             requires_grad = spec.get("requires_grad", False)
+            canonical_id = spec.get("canonical_id") or label
+            torchlens_label = spec.get("torchlens_label") or label
+            module_path = spec.get("module_path") or ""
+            op_type = spec.get("op_type") or spec.get("op") or ""
+            role = spec.get("role") or "primary"
+            output_index = spec.get("output_index")
+            device_policy = spec.get("device_policy") or "runtime"
         else:
-            symbolic_shape = getattr(spec, "symbolic_shape", ()) or ()
+            symbolic_shape = (
+                getattr(spec, "shape", None)
+                or getattr(spec, "symbolic_shape", None)
+                or ()
+            )
             dtype = getattr(spec, "dtype", "")
-            device_type = getattr(spec, "device_type", "")
             requires_grad = getattr(spec, "requires_grad", False)
+            canonical_id = getattr(spec, "canonical_id", label)
+            torchlens_label = getattr(spec, "torchlens_label", label)
+            module_path = getattr(spec, "module_path", "")
+            op_type = getattr(spec, "op_type", "")
+            role = getattr(spec, "role", "primary")
+            output_index = getattr(spec, "output_index", None)
+            device_policy = getattr(spec, "device_policy", "runtime")
         normalised[str(label)] = {
+            "canonical_id": str(canonical_id or label),
+            "torchlens_label": str(torchlens_label or label),
+            "module_path": str(module_path or ""),
+            "op_type": str(op_type or ""),
             "symbolic_shape": [str(dim) for dim in list(symbolic_shape or [])],
             "dtype": str(dtype or ""),
-            "device_type": str(device_type or ""),
             "requires_grad": bool(requires_grad),
+            "role": str(role or "primary"),
+            "output_index": None if output_index is None else int(output_index),
+            "device_policy": str(device_policy or "runtime"),
         }
     return normalised
 
@@ -141,7 +163,7 @@ def compute_feature_layout_id(
     feature_layout: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str:
     payload = {
-        "version": "feature-layout.v2",
+        "version": "feature-layout.v3",
         "model_id": str(model_id or ""),
         "model_version": str(model_version or ""),
         "logical_split_id": str(logical_split_id or ""),
@@ -288,11 +310,21 @@ def resolve_cloud_runtime_contract(
     trace_device_type = _first_tensor_device_type(sample_input) or str(
         getattr(runtime_obj, "device", "") or ""
     )
+    resolved_backend = str(runtime_backend or "")
+    if not resolved_backend:
+        resolved_backend = (
+            "torchlens_native"
+            if getattr(runtime_obj, "trace_graph", None) is not None
+            else str(getattr(runtime_obj, "mode", "") or "")
+        )
     return build_runtime_contract(
         logical_split_id=str(logical_split_id),
-        trace_signature=str(getattr(runtime_obj, "graph_signature", "") or ""),
+        trace_signature=str(
+            getattr(getattr(runtime_obj, "trace_graph", None), "graph_shape_hash", "")
+            or ""
+        ),
         trace_device_type=trace_device_type,
-        runtime_backend=str(runtime_backend or getattr(runtime_obj, "mode", "") or ""),
+        runtime_backend=resolved_backend,
         boundary_tensor_labels=[str(label) for label in boundary_labels],
         boundary_schema=boundary_schema,
         model_id=str(model_id),

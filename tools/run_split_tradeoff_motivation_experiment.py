@@ -3,7 +3,7 @@ Split Model Tradeoff Motivation Experiment
 ===========================================
 
 Visualizes intermediate feature size and privacy leakage tradeoffs
-for arbitrary detection models under different Ariadne split candidates.
+for arbitrary detection models under different TorchLens split candidates.
 
 This script performs split candidate profiling and plotting without
 participating in training or modifying the fixed_split/split_runtime/retrain pipelines.
@@ -100,19 +100,12 @@ except ModuleNotFoundError as exc:
     torch = _MissingTorch()  # type: ignore[assignment]
 
 try:
-    from ariadne import SplitRuntime, SplitSpec
-    from ariadne.planner.frontier import enumerate_frontier_splits
+    from torchlens.split import SplitRuntime
 except Exception as exc:
-    _ARIADNE_IMPORT_ERROR = exc
+    _TORCHLENS_IMPORT_ERROR = exc
 
     class SplitRuntime:
         pass
-
-    class SplitSpec:
-        pass
-
-    def enumerate_frontier_splits(*args, **kwargs):
-        raise RuntimeError("ariadne is required to enumerate split candidates") from _ARIADNE_IMPORT_ERROR
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -582,9 +575,10 @@ def trace_model_with_splitter(
         runtime = getattr(traced, "runtime", None)
         if runtime is None:
             raise RuntimeError("UniversalModelSplitter.trace() did not produce a runtime")
+        plan = getattr(runtime, "plan", None)
         logger.info(f"Trace successful with batched tensor format. "
-                   f"Prefix nodes: {len(runtime.candidate.prefix_nodes)}, "
-                   f"Suffix nodes: {len(runtime.candidate.suffix_nodes)}")
+                   f"Prefix nodes: {len(getattr(plan, 'prefix_nodes', ()) or ())}, "
+                   f"Suffix nodes: {len(getattr(plan, 'suffix_nodes', ()) or ())}")
         return splitter, runtime
     except Exception as e:
         logger.warning(f"Trace failed with batched tensor: {e}")
@@ -597,9 +591,10 @@ def trace_model_with_splitter(
         runtime = getattr(traced, "runtime", None)
         if runtime is None:
             raise RuntimeError("UniversalModelSplitter.trace() did not produce a runtime")
+        plan = getattr(runtime, "plan", None)
         logger.info(f"Trace successful with list format. "
-                   f"Prefix nodes: {len(runtime.candidate.prefix_nodes)}, "
-                   f"Suffix nodes: {len(runtime.candidate.suffix_nodes)}")
+                   f"Prefix nodes: {len(getattr(plan, 'prefix_nodes', ()) or ())}, "
+                   f"Suffix nodes: {len(getattr(plan, 'suffix_nodes', ()) or ())}")
         return splitter, runtime
     except Exception as e:
         logger.warning(f"Trace failed with list format: {e}")
@@ -613,6 +608,7 @@ def trace_model_with_splitter(
 
 
 def enumerate_candidates(
+    splitter: UniversalModelSplitter,
     runtime: SplitRuntime,
     max_candidates: int | None = None,
     max_boundary_count: int = 8,
@@ -625,185 +621,19 @@ def enumerate_candidates(
         f"max_boundary={max_boundary_count}, "
         f"max_payload={max_payload_bytes / (1024*1024):.1f} MB)..."
     )
-    
+
     try:
-        # Ariadne versions differ here: older builds accepted runtime plus
-        # filter kwargs, while current builds accept only TracePlan. Keep
-        # filtering local so the experiment script remains version-tolerant.
-        try:
-            frontier_kwargs = {
-                "max_boundaries": max_boundary_count,
-                "max_payload_bytes": max_payload_bytes,
-            }
-            if max_candidates is not None:
-                frontier_kwargs["max_splits"] = max_candidates
-            candidates_raw = enumerate_frontier_splits(runtime, **frontier_kwargs)
-        except TypeError as exc:
-            logger.debug(f"Falling back to TracePlan-only frontier enumeration: {exc}")
-            trace_plan = getattr(runtime, "trace_plan", None)
-            if trace_plan is None:
-                raise RuntimeError("Runtime does not expose trace_plan for enumeration") from exc
-            candidates_raw = enumerate_frontier_splits(trace_plan)
-        
-        # Convert ariadne candidates to SplitCandidate objects
-        candidates: list[SplitCandidate] = []
-        for idx, ariadne_cand in enumerate(candidates_raw):
-            boundary_count = len(getattr(ariadne_cand, "boundary_nodes", []) or [])
-            if boundary_count > max_boundary_count:
-                continue
-            payload_bytes = int(
-                getattr(getattr(ariadne_cand, "cost", None), "boundary_bytes", 0)
-                or 0
-            )
-            if payload_bytes > max_payload_bytes:
-                continue
-            try:
-                # Extract candidate info from ariadne object
-                candidate = _convert_ariadne_candidate_to_split_candidate(
-                    runtime, ariadne_cand, idx
-                )
-                candidates.append(candidate)
-                if max_candidates is not None and len(candidates) >= max_candidates:
-                    break
-            except Exception as e:
-                logger.warning(f"Failed to convert candidate {idx}: {e}")
-                continue
-        
+        del runtime
+        candidates = splitter.enumerate_candidates(
+            max_candidates=max_candidates,
+            max_boundary_count=max_boundary_count,
+            max_payload_bytes=max_payload_bytes,
+        )
         logger.info(f"Enumerated {len(candidates)} valid candidates")
-        return candidates
+        return list(candidates)
     except Exception as e:
         logger.error(f"Candidate enumeration failed: {e}")
         raise RuntimeError(f"Failed to enumerate candidates: {e}") from e
-
-
-def _convert_ariadne_candidate_to_split_candidate(
-    runtime: SplitRuntime,
-    ariadne_cand: Any,
-    index: int,
-) -> SplitCandidate:
-    """Convert an ariadne candidate object to SplitCandidate."""
-    candidate_id = str(getattr(ariadne_cand, "split_id", f"candidate_{index}"))
-    
-    prefix_nodes = list(getattr(ariadne_cand, "prefix_nodes", []))
-    suffix_nodes = list(getattr(ariadne_cand, "suffix_nodes", []))
-    boundary_labels = list(getattr(ariadne_cand, "boundary_nodes", []))
-    
-    # Extract payload bytes
-    cost = getattr(ariadne_cand, "cost", None)
-    payload_bytes = int(getattr(cost, "boundary_bytes", 0) or 0)
-    
-    # Compute parameter counts
-    plan = getattr(runtime, "trace_plan", None)
-    edge_param_count = _count_parameters_for_nodes(plan, prefix_nodes)
-    total_param_count = _count_all_parameters(plan)
-    edge_param_ratio = (
-        float(edge_param_count) / float(total_param_count)
-        if total_param_count > 0
-        else 0.0
-    )
-    
-    # Extract trainability
-    trainable_tail = bool(getattr(ariadne_cand, "trainable_suffix", True))
-    
-    # Extract legacy layer index
-    legacy_index = _get_legacy_layer_index(plan, prefix_nodes)
-    
-    return SplitCandidate(
-        candidate_id=candidate_id,
-        edge_nodes=prefix_nodes,
-        cloud_nodes=suffix_nodes,
-        boundary_edges=[],  # Minimal for this experiment
-        boundary_tensor_labels=boundary_labels,
-        edge_input_labels=[],
-        cloud_input_labels=boundary_labels,
-        cloud_output_labels=[],
-        estimated_edge_flops=0.0,
-        estimated_cloud_flops=0.0,
-        estimated_payload_bytes=payload_bytes,
-        estimated_privacy_risk=0.0,
-        estimated_latency=0.0,
-        is_trainable_tail=trainable_tail,
-        legacy_layer_index=legacy_index,
-        boundary_count=len(boundary_labels),
-        edge_parameter_count=edge_param_count,
-        total_parameter_count=total_param_count,
-        edge_parameter_ratio=edge_param_ratio,
-        metadata={
-            "runtime": "ariadne",
-            "ariadne_candidate_id": candidate_id,
-        },
-    )
-
-
-def _count_parameters_for_nodes(plan: Any, node_names: list[str]) -> int:
-    """Count parameters in specified nodes."""
-    if plan is None:
-        return 0
-    
-    selected = set(node_names)
-    seen: set[str] = set()
-    total = 0
-    
-    for node in getattr(plan, "nodes", []):
-        if node.name not in selected:
-            continue
-        
-        for ref in getattr(node, "param_refs", []) or []:
-            ref_name = str(getattr(ref, "name", ""))
-            if not ref_name or ref_name in seen:
-                continue
-            seen.add(ref_name)
-            
-            # Count elements in parameter shape
-            shape = getattr(ref, "shape", []) or []
-            numel = 1
-            for dim in shape:
-                numel *= int(dim)
-            total += numel
-    
-    return int(total)
-
-
-def _count_all_parameters(plan: Any) -> int:
-    """Count all parameters in the plan."""
-    if plan is None:
-        return 0
-    
-    seen: set[str] = set()
-    total = 0
-    
-    for node in getattr(plan, "nodes", []):
-        for ref in getattr(node, "param_refs", []) or []:
-            ref_name = str(getattr(ref, "name", ""))
-            if not ref_name or ref_name in seen:
-                continue
-            seen.add(ref_name)
-            
-            shape = getattr(ref, "shape", []) or []
-            numel = 1
-            for dim in shape:
-                numel *= int(dim)
-            total += numel
-    
-    return int(total)
-
-
-def _get_legacy_layer_index(plan: Any, prefix_nodes: list[str]) -> int | None:
-    """Get the maximum layer index in prefix nodes."""
-    if plan is None or not prefix_nodes:
-        return None
-    
-    indexes = []
-    for label in prefix_nodes:
-        try:
-            # Try to get index from plan
-            idx = getattr(plan, "index_of", lambda x: None)(label)
-            if idx is not None:
-                indexes.append(int(idx))
-        except (AttributeError, KeyError, TypeError, ValueError):
-            continue
-    
-    return max(indexes) if indexes else None
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -815,6 +645,7 @@ def profile_candidates(
     candidates: list[SplitCandidate],
     sample_input: Any,
     runtime: SplitRuntime,
+    splitter: UniversalModelSplitter,
     input_size_bytes: int,
     privacy_epsilon: float = PRIVACY_LEAKAGE_EPSILON,
     validate: bool = False,
@@ -834,6 +665,7 @@ def profile_candidates(
                 idx,
                 sample_input,
                 runtime,
+                splitter,
                 input_size_bytes,
                 privacy_epsilon,
                 validate,
@@ -866,6 +698,7 @@ def _profile_single_candidate(
     index: int,
     sample_input: Any,
     runtime: SplitRuntime,
+    splitter: UniversalModelSplitter,
     input_size_bytes: int,
     privacy_epsilon: float,
     validate: bool,
@@ -905,7 +738,7 @@ def _profile_single_candidate(
     validation_error = None
     if validate:
         try:
-            validation_passed = _validate_candidate(candidate, runtime, sample_input)
+            validation_passed = _validate_candidate(candidate, splitter, sample_input)
         except Exception as e:
             validation_passed = False
             validation_error = str(e)
@@ -1017,17 +850,25 @@ def _get_boundary_shape_summary(candidate: SplitCandidate, runtime: SplitRuntime
     # Try to get from metadata first
     if "boundary_shape_summary" in candidate.metadata:
         return candidate.metadata["boundary_shape_summary"]
+    schema = candidate.metadata.get("boundary_schema")
+    if isinstance(schema, Sequence) and not isinstance(schema, (str, bytes)):
+        return [
+            [
+                str(item.get("canonical_id") or item.get("torchlens_label") or ""),
+                list(item.get("symbolic_shape") or []),
+            ]
+            for item in schema
+            if isinstance(item, Mapping)
+        ]
     
-    # Try to get from runtime graph if available
+    # Try to get from TraceGraph if available.
     try:
-        if hasattr(runtime, "graph") and hasattr(runtime.graph, "nodes"):
+        graph = getattr(runtime, "trace_graph", None)
+        if graph is not None and hasattr(graph, "nodes"):
             for label in candidate.boundary_tensor_labels:
-                if label in runtime.graph.nodes:
-                    node = runtime.graph.nodes[label]
-                    if hasattr(node, "tensor_shape"):
-                        shapes.append([label, list(node.tensor_shape)])
-                    else:
-                        shapes.append([label, None])
+                node = dict(getattr(graph, "nodes", {}) or {}).get(str(label))
+                shape = getattr(node, "shape", None) or getattr(node, "tensor_shape", None)
+                shapes.append([label, list(shape) if shape is not None else None])
     except Exception as e:
         logger.debug(f"Failed to extract boundary shape: {e}")
     
@@ -1036,15 +877,18 @@ def _get_boundary_shape_summary(candidate: SplitCandidate, runtime: SplitRuntime
 
 def _validate_candidate(
     candidate: SplitCandidate,
-    runtime: SplitRuntime,
+    splitter: UniversalModelSplitter,
     sample_input: Any,
 ) -> bool:
-    """Validate a candidate (simplified version)."""
-    if not hasattr(runtime, "validate_candidate"):
+    """Validate a candidate through the Plank-road split facade."""
+    del sample_input
+    if not hasattr(splitter, "validate_candidate"):
         return True
     
     try:
-        result = runtime.validate_candidate(candidate)
+        result = splitter.validate_candidate(candidate)
+        if isinstance(result, Mapping):
+            return bool(result.get("success", result.get("valid", False)))
         return bool(result)
     except Exception as e:
         logger.debug(f"Validation error for {candidate.candidate_id}: {e}")
@@ -2229,6 +2073,7 @@ def run_single_model_experiment(
 
     try:
         candidates = enumerate_candidates(
+            splitter,
             runtime,
             max_candidates=args.max_candidates,
             max_boundary_count=args.max_boundary_count,
@@ -2249,6 +2094,7 @@ def run_single_model_experiment(
             candidates,
             sample_input,
             runtime,
+            splitter,
             args.initial_input_bytes,
             privacy_epsilon=args.privacy_epsilon,
             validate=args.validate_candidates,
@@ -2457,7 +2303,7 @@ def main() -> None:
         "--validate-candidates",
         action="store_true",
         default=False,
-        help="Validate candidates using runtime.validate_candidate()",
+        help="Validate candidates using UniversalModelSplitter.validate_candidate()",
     )
     parser.add_argument(
         "--output-dir",

@@ -1538,31 +1538,13 @@ def _proxy_boundary_batch(
             tensor = tensors[label]
             pieces.append(tensor)
         batched_tensors[label] = torch.cat(pieces, dim=0)
-    passthrough_groups: list[Mapping[str, object]] = []
-    for record in records:
-        intermediate = record.get("intermediate")
-        if isinstance(intermediate, BoundaryPayload):
-            passthrough_groups.append(dict(intermediate.passthrough_inputs or {}))
-        else:
-            passthrough_groups.append({})
-    batched_passthrough: dict[str, object] = {}
-    for key in list(passthrough_groups[0].keys()) if passthrough_groups else []:
-        pieces = []
-        for passthrough in passthrough_groups:
-            value = passthrough.get(key)
-            if not isinstance(value, torch.Tensor) or value.ndim == 0:
-                pieces = []
-                break
-            pieces.append(value)
-        if pieces:
-            batched_passthrough[str(key)] = torch.cat(pieces, dim=0)
     runtime = getattr(splitter, "runtime", splitter)
+    trace_graph = getattr(runtime, "trace_graph", None)
     return boundary_payload_from_tensors(
         batched_tensors,
         split_id=str(getattr(runtime, "split_id", "") or "split-tail"),
-        graph_signature=str(getattr(runtime, "graph_signature", "") or "split-runtime"),
+        graph_signature=str(getattr(trace_graph, "graph_shape_hash", "") or "split-runtime"),
         batch_size=len(records),
-        passthrough_inputs=batched_passthrough,
         legacy_schema_inference=True,
     )
 
@@ -2920,7 +2902,10 @@ class CloudContinualLearner:
                 or getattr(runtime, "version", None)
                 or type(runtime).__name__
             ),
-            "graph_signature": str(getattr(runtime, "graph_signature", "") or ""),
+            "graph_signature": str(
+                getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "")
+                or ""
+            ),
             "adapter_version": str(getattr(runtime, "adapter_version", "") or ""),
             "split_plan_hash": _json_fingerprint(split_plan),
             "symbolic_input_schema_hash": _json_fingerprint(symbolic_schema or {}),
@@ -2930,7 +2915,7 @@ class CloudContinualLearner:
                 else None
             ),
             "trace_batch_size": getattr(runtime, "trace_batch_size", None),
-            "mode": str(getattr(runtime, "mode", "") or ""),
+            "mode": str(getattr(getattr(runtime, "split_spec", None), "mode", "") or getattr(runtime, "mode", "") or ""),
             "feature_layout_id": str(feature_layout_id),
             "runtime_contract": cloud_runtime_contract,
         }
@@ -3334,7 +3319,12 @@ class CloudContinualLearner:
                         getattr(boundary_payload, "split_id", "") if isinstance(boundary_payload, BoundaryPayload) else ""
                     ),
                     "source_feature_graph_signature": str(
-                        getattr(boundary_payload, "graph_signature", "") if isinstance(boundary_payload, BoundaryPayload) else ""
+                        (
+                            boundary_payload.metadata.get("graph_shape_hash")
+                            or boundary_payload.metadata.get("graph_signature")
+                            or ""
+                        )
+                        if isinstance(boundary_payload, BoundaryPayload) else ""
                     ),
                 }
             )
@@ -4860,16 +4850,11 @@ class CloudContinualLearner:
                         for label, tensor in dict(payload.tensors or {}).items()
                         if isinstance(tensor, torch.Tensor)
                     },
-                    "passthrough_inputs": {
+                    "metadata": {
                         str(label): _detach_payload_value(value)
-                        for label, value in dict(payload.passthrough_inputs or {}).items()
+                        for label, value in dict(payload.metadata or {}).items()
                     },
                 }
-                if hasattr(payload, "values"):
-                    changes["values"] = tuple(
-                        _detach_payload_value(value)
-                        for value in tuple(getattr(payload, "values", ()) or ())
-                    )
                 return replace(payload, **changes)
 
             payloads: list[BoundaryPayload] = []
@@ -4904,7 +4889,7 @@ class CloudContinualLearner:
                 batch_payload = splitter.edge_forward(inputs, candidate=candidate)
                 if not isinstance(batch_payload, BoundaryPayload):
                     raise RuntimeError(
-                        "Cloud feature reconstruction expected an Ariadne BoundaryPayload "
+                        "Cloud feature reconstruction expected a TorchLens ReplayBoundary "
                         f"from prefix execution, got {type(batch_payload).__name__}."
                     )
                 if int(getattr(batch_payload, "batch_size", 0)) != execution_batch_size:
@@ -5046,8 +5031,6 @@ class CloudContinualLearner:
 
     @staticmethod
     def _preferred_fixed_split_runtime_mode(model_family: str | None) -> str:
-        if str(model_family or "").lower() == "rfdetr":
-            return "debug_interpreter"
         return "generated_eager"
 
     def _validate_prepared_split_runtime(
@@ -5071,7 +5054,7 @@ class CloudContinualLearner:
         if not ok:
             return False, f"split replay output mismatch (max_diff={max_diff})"
         logger.info(
-            "[FixedSplitCL] Ariadne {} runtime replay validation passed (split_id={}).",
+            "[FixedSplitCL] TorchLens {} runtime replay validation passed (split_id={}).",
             mode,
             getattr(runtime, "split_id", None),
         )
@@ -5087,7 +5070,7 @@ class CloudContinualLearner:
         preferred_mode: str = "generated_eager",
     ) -> tuple[object, str]:
         modes = []
-        for mode in (preferred_mode, "generated_eager", "debug_interpreter"):
+        for mode in (preferred_mode, "generated_eager", "compiled"):
             mode = str(mode)
             if mode not in modes:
                 modes.append(mode)
@@ -5112,7 +5095,7 @@ class CloudContinualLearner:
             errors[mode] = error
             if index + 1 < len(modes):
                 logger.warning(
-                    "[FixedSplitCL] Ariadne {} runtime failed replay validation "
+                    "[FixedSplitCL] TorchLens {} runtime failed replay validation "
                     "(model_name={}, split_id={}, error={}); retrying with {}.",
                     mode,
                     model_name,
@@ -5125,7 +5108,7 @@ class CloudContinualLearner:
             f"{mode}_error={error}" for mode, error in errors.items()
         )
         raise RuntimeError(
-            "Ariadne fixed split runtime is not replayable in any supported mode "
+            "TorchLens fixed split runtime is not replayable in any supported mode "
             f"({error_summary})."
         )
 
@@ -5248,7 +5231,7 @@ class CloudContinualLearner:
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    "Ariadne fixed split runtime failed dynamic-batch trainability "
+                    "TorchLens fixed split runtime failed dynamic-batch trainability "
                     f"validation (model_family={model_family}, split_id={getattr(runtime, 'split_id', None)}, "
                     f"batch_size={batch_size}, trace_batch_size={trace_batch_size}): {exc}"
                 ) from exc
@@ -5328,7 +5311,7 @@ class CloudContinualLearner:
         context = self._sample_pool_manifest_context(manifest)
         cloud_runtime_contract = resolve_cloud_runtime_contract(
             runtime,
-            getattr(runtime, "candidate", None),
+            getattr(UniversalModelSplitter(device=self.device).bind_runtime(runtime, model=trace_model), "current_candidate", None),
             logical_split_id=boundary,
             model_id=str(model_meta.get("model_id") or model_name),
             model_version=str(model_meta.get("model_version", "") or "0"),
@@ -5372,7 +5355,10 @@ class CloudContinualLearner:
             split_spec=split_spec,
             model_name=model_name,
             model_family=model_family,
-            graph_signature=str(getattr(runtime, "graph_signature", "") or ""),
+            graph_signature=str(
+                getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "")
+                or ""
+            ),
             symbolic_input_schema_hash=template_key.symbolic_input_schema_hash,
             split_plan_hash=str(template_key.split_plan_hash),
             mode=runtime_mode,
@@ -5394,8 +5380,11 @@ class CloudContinualLearner:
             dynamic_batch=dynamic_batch,
             runtime_device=self.device,
         )
-        self._log_stage_elapsed("Ariadne prepare_split", time.perf_counter() - trace_started)
-        trace_signature = str(getattr(runtime, "graph_signature", "") or "")
+        self._log_stage_elapsed("TorchLens prepare_split", time.perf_counter() - trace_started)
+        trace_signature = str(
+            getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "")
+            or ""
+        )
         verifier = UniversalModelSplitter(device=self.device).bind_runtime(
             training_runtime,
             model=split_model,
@@ -5407,11 +5396,11 @@ class CloudContinualLearner:
         )
         if boundary != "auto" and current_candidate_id and current_candidate_id != boundary:
             raise RuntimeError(
-                "Ariadne fixed split runtime resolved a different split candidate "
+                "TorchLens fixed split runtime resolved a different split candidate "
                 f"(requested={boundary!r}, actual={current_candidate_id!r})."
             )
         logger.info(
-            "[FixedSplitCL] runtime template prepared Ariadne split (model_name={}, model_family={}, split_id={}, trace_signature={}, mode={}, key={}).",
+            "[FixedSplitCL] runtime template prepared TorchLens split (model_name={}, model_family={}, split_id={}, trace_signature={}, mode={}, key={}).",
             model_name,
             model_family,
             getattr(runtime, "split_id", None),
@@ -5477,7 +5466,7 @@ class CloudContinualLearner:
         )
         bind_elapsed = time.perf_counter() - bind_started
         logger.info(
-            "[FixedSplitCL] request-local Ariadne runtime bind took {:.3f}s (split_id={}, key={}).",
+            "[FixedSplitCL] request-local TorchLens runtime bind took {:.3f}s (split_id={}, key={}).",
             bind_elapsed,
             getattr(splitter.runtime, "split_id", None),
             template.cache_key.to_log_payload(),
@@ -7261,7 +7250,15 @@ class CloudContinualLearner:
                         "source_feature_graph_signature": str(
                             feature_value.get("source_feature_graph_signature")
                             or feature_value.get("feature_graph_signature")
-                            or getattr(boundary_payload, "graph_signature", "")
+                            or (
+                                (
+                                    boundary_payload.metadata.get("graph_shape_hash")
+                                    or boundary_payload.metadata.get("graph_signature")
+                                    or ""
+                                )
+                                if isinstance(boundary_payload, BoundaryPayload)
+                                else ""
+                            )
                             or ""
                         ),
                         "input_image_size": (

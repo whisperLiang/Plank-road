@@ -1,4 +1,4 @@
-"""Raw freeze vs Ariadne split tail-training motivation experiment.
+"""Raw freeze vs TorchLens split tail-training motivation experiment.
 
 All modes implement fixed-prefix tail training:
 
@@ -6,12 +6,12 @@ All modes implement fixed-prefix tail training:
   ``BatchNorm`` running stats frozen, dropout off, ``eval`` state, forward under
   ``torch.no_grad`` when the mode uses an explicit prefix pass);
 * the suffix segment is the only trainable part, with trainable parameters
-  resolved from the Ariadne runtime (``runtime.candidate.suffix_nodes``);
+  resolved from the TorchLens runtime plan (``runtime.plan.suffix_nodes``);
 * ``raw_freeze`` runs the original unsplit model forward/backward in eval
   module state, with the prefix parameters frozen and the same suffix
   parameters trainable;
 * ``freeze``, ``split_rebuild`` and ``split_cached`` train **the same** set of
-  suffix parameters, with the same optimizer configuration, using Ariadne
+  suffix parameters, with the same optimizer configuration, using TorchLens
   ``run_prefix``/``train_suffix`` code paths;
 * ``split_rebuild`` rebuilds the boundary feature cache **exactly once** before
   training and then reuses it for every epoch;
@@ -97,9 +97,8 @@ class CachedSplitBatch:
     """Precomputed boundary payload for a single training mini-batch.
 
     Storing the full :class:`BoundaryPayload` (not just the tensors) keeps the
-    Ariadne replay metadata needed for suffix training: ``split_id``,
-    ``graph_signature``, ``passthrough_inputs``, ``schema`` and
-    ``primary_label``.
+    TorchLens replay metadata needed for suffix training: ``split_id``,
+    ``graph_signature``, ``spec`` and ``metadata``.
     """
 
     sample_ids: tuple[int, ...]
@@ -152,8 +151,8 @@ class _PreparedBatch:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare raw frozen-prefix training, Ariadne freeze, rebuilt Ariadne "
-            "split, and cached Ariadne split training."
+            "Compare raw frozen-prefix training, TorchLens freeze, rebuilt TorchLens "
+            "split, and cached TorchLens split training."
         ),
     )
     parser.add_argument("--yaml-path", default="./config/config.yaml")
@@ -176,7 +175,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=list(DEFAULT_SPLIT_BOUNDARIES),
     )
     parser.add_argument(
-        "--ariadne-mode",
+        "--torchlens-mode",
         choices=("generated_eager", "compiled"),
         default="generated_eager",
     )
@@ -684,18 +683,18 @@ def _make_trace_batch(
     trace_batch_size: int,
 ) -> torch.Tensor:
     if int(trace_batch_size) <= 1:
-        raise ValueError("Ariadne batch_gt1 tracing requires trace_batch_size > 1.")
+        raise ValueError("TorchLens batch_gt1 tracing requires trace_batch_size > 1.")
     if len(sample_ids) < int(trace_batch_size):
-        raise ValueError("--sample-count must be at least the Ariadne trace batch size.")
+        raise ValueError("--sample-count must be at least the TorchLens trace batch size.")
     runtime_inputs = [
         prepare_split_runtime_input(model, frames_by_id[int(frame_id)], device=device)
         for frame_id in sample_ids[: int(trace_batch_size)]
     ]
     batch = _combine_runtime_inputs(runtime_inputs)
     if not isinstance(batch, torch.Tensor):
-        raise TypeError("Ariadne split experiments expect a tensor runtime input.")
+        raise TypeError("TorchLens split experiments expect a tensor runtime input.")
     if _runtime_input_batch_size(batch) <= 1:
-        raise RuntimeError("Ariadne example batch must contain at least two samples.")
+        raise RuntimeError("TorchLens example batch must contain at least two samples.")
     return batch
 
 
@@ -730,7 +729,7 @@ def _ordered_epoch_batches(
     batches = [ids[start : start + batch_size] for start in range(0, len(ids), batch_size)]
     if any(len(batch) < 2 for batch in batches):
         raise ValueError(
-            "Ariadne batch_gt1 experiments require every training batch to contain "
+            "TorchLens batch_gt1 experiments require every training batch to contain "
             "at least two samples. Adjust --sample-count or --batch-size to avoid "
             "a singleton final batch."
         )
@@ -760,7 +759,7 @@ def _optimizer_overrides(model_name: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Ariadne runtime helpers
+# TorchLens runtime helpers
 # ---------------------------------------------------------------------------
 
 
@@ -769,7 +768,7 @@ def _require_runtime_split_id(runtime: Any) -> str:
     if split_id is None:
         split_id = get_split_runtime_metadata(runtime).get("actual_split_id")
     if not split_id:
-        raise RuntimeError("Ariadne runtime did not expose an authoritative split_id.")
+        raise RuntimeError("TorchLens runtime did not expose an authoritative split_id.")
     return str(split_id)
 
 
@@ -778,21 +777,28 @@ def _require_runtime_graph_signature(runtime: Any) -> str:
     if not graph_signature:
         graph_signature = get_split_runtime_metadata(runtime).get("graph_signature")
     if not graph_signature:
-        raise RuntimeError("Ariadne runtime did not expose a graph_signature.")
+        raise RuntimeError("TorchLens runtime did not expose a graph_signature.")
     return str(graph_signature)
 
 
 def _require_boundary_split_id(boundary: Any) -> str:
     split_id = getattr(boundary, "split_id", None)
     if not split_id:
-        raise RuntimeError("Cached Ariadne boundary payload did not expose split_id.")
+        raise RuntimeError("Cached TorchLens boundary payload did not expose split_id.")
     return str(split_id)
 
 
 def _require_boundary_graph_signature(boundary: Any) -> str:
     graph_signature = getattr(boundary, "graph_signature", None)
     if not graph_signature:
-        raise RuntimeError("Cached Ariadne boundary payload did not expose graph_signature.")
+        metadata = getattr(boundary, "metadata", None)
+        if isinstance(metadata, Mapping):
+            graph_signature = (
+                metadata.get("graph_shape_hash")
+                or metadata.get("graph_signature")
+            )
+    if not graph_signature:
+        raise RuntimeError("Cached TorchLens boundary payload did not expose graph_signature.")
     return str(graph_signature)
 
 
@@ -816,19 +822,7 @@ def _contiguous_boundary_payload(boundary: Any) -> Any:
         key: _contiguous_tensor_tree(value)
         for key, value in tensors.items()
     }
-    passthrough_inputs = getattr(boundary, "passthrough_inputs", None)
-    contiguous_passthrough = (
-        _contiguous_tensor_tree(passthrough_inputs)
-        if isinstance(passthrough_inputs, Mapping)
-        else passthrough_inputs
-    )
-    if contiguous_tensors is tensors and contiguous_passthrough is passthrough_inputs:
-        return boundary
-    return replace(
-        boundary,
-        tensors=contiguous_tensors,
-        passthrough_inputs=contiguous_passthrough,
-    )
+    return replace(boundary, tensors=contiguous_tensors)
 
 
 def _raise_cached_split_id_mismatch(
@@ -839,7 +833,7 @@ def _raise_cached_split_id_mismatch(
     sample_index: int,
 ) -> None:
     raise RuntimeError(
-        "Cached Ariadne boundary split_id mismatch before split_cached training: "
+        "Cached TorchLens boundary split_id mismatch before split_cached training: "
         f"cached sample split_id={cached_sample_split_id!r}; "
         f"cached runtime split_id={cached_runtime_split_id!r}; "
         f"percent={percent!r}; "
@@ -853,7 +847,7 @@ def _validate_cached_split_runtime(cached_split: CachedSplitRuntime) -> None:
     runtime_graph_signature = _require_runtime_graph_signature(cached_split.runtime)
     if runtime_split_id != cached_split.split_id:
         raise RuntimeError(
-            "Cached Ariadne runtime split_id changed before split_cached training: "
+            "Cached TorchLens runtime split_id changed before split_cached training: "
             f"cached sample split_id={cached_split.split_id!r}; "
             f"cached runtime split_id={runtime_split_id!r}; "
             f"percent={cached_split.percent!r}; sample index=0. "
@@ -861,7 +855,7 @@ def _validate_cached_split_runtime(cached_split: CachedSplitRuntime) -> None:
         )
     if runtime_graph_signature != cached_split.graph_signature:
         raise RuntimeError(
-            "Cached Ariadne runtime graph_signature changed before split_cached training: "
+            "Cached TorchLens runtime graph_signature changed before split_cached training: "
             f"cached graph_signature={cached_split.graph_signature!r}; "
             f"cached runtime graph_signature={runtime_graph_signature!r}; "
             f"percent={cached_split.percent!r}; sample index=0."
@@ -871,7 +865,7 @@ def _validate_cached_split_runtime(cached_split: CachedSplitRuntime) -> None:
         boundary_graph_signature = _require_boundary_graph_signature(cached_batch.boundary)
         if boundary_split_id != cached_batch.boundary_split_id:
             raise RuntimeError(
-                "Cached Ariadne boundary split_id metadata mismatch: "
+                "Cached TorchLens boundary split_id metadata mismatch: "
                 f"cached sample split_id={boundary_split_id!r}; "
                 f"recorded sample split_id={cached_batch.boundary_split_id!r}; "
                 f"cached runtime split_id={cached_split.split_id!r}; "
@@ -880,7 +874,7 @@ def _validate_cached_split_runtime(cached_split: CachedSplitRuntime) -> None:
             )
         if boundary_graph_signature != cached_batch.boundary_graph_signature:
             raise RuntimeError(
-                "Cached Ariadne boundary graph_signature metadata mismatch: "
+                "Cached TorchLens boundary graph_signature metadata mismatch: "
                 f"cached sample graph_signature={boundary_graph_signature!r}; "
                 f"recorded sample graph_signature={cached_batch.boundary_graph_signature!r}; "
                 f"percent={cached_split.percent!r}; sample index={sample_index}."
@@ -894,7 +888,7 @@ def _validate_cached_split_runtime(cached_split: CachedSplitRuntime) -> None:
             )
         if boundary_graph_signature != cached_split.graph_signature:
             raise RuntimeError(
-                "Cached Ariadne boundary graph_signature does not match runtime: "
+                "Cached TorchLens boundary graph_signature does not match runtime: "
                 f"boundary graph_signature={boundary_graph_signature!r}; "
                 f"runtime graph_signature={cached_split.graph_signature!r}; "
                 f"percent={cached_split.percent!r}; sample index={sample_index}."
@@ -919,7 +913,7 @@ def _configure_fixed_prefix_training(
       prefix ``BatchNorm`` running stats, dropout, and any other
       train-mode-only behaviour frozen.
     """
-    ariadne_runtime = (
+    torchlens_runtime = (
         runtime._ensure_runtime()
         if callable(getattr(runtime, "_ensure_runtime", None))
         else runtime
@@ -932,12 +926,12 @@ def _configure_fixed_prefix_training(
         parameter.requires_grad_(False)
         parameter.grad = None
 
-    suffix_segment = getattr(ariadne_runtime, "suffix_segment", None)
+    suffix_segment = getattr(torchlens_runtime, "suffix_segment", None)
     if isinstance(suffix_segment, torch.nn.Module):
         suffix_segment.train()
 
     for segment_name in ("prefix_segment", "training_prefix_segment"):
-        prefix_segment = getattr(ariadne_runtime, segment_name, None)
+        prefix_segment = getattr(torchlens_runtime, segment_name, None)
         if not isinstance(prefix_segment, torch.nn.Module):
             continue
         prefix_segment.eval()
@@ -975,11 +969,11 @@ def _configure_raw_freeze_eval_forward_training(
     split_model: torch.nn.Module,
     runtime: Any,
 ) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
-    """Configure raw_freeze to match Ariadne replay semantics.
+    """Configure raw_freeze to match TorchLens replay semantics.
 
     The raw baseline should measure the cost of a full unsplit forward/backward,
     not a different RF-DETR training-mode objective. We therefore keep every
-    module in ``eval`` state while leaving the exact Ariadne suffix parameters
+    module in ``eval`` state while leaving the exact TorchLens suffix parameters
     trainable.
     """
     suffix_names, suffix_params = _configure_fixed_prefix_training(split_model, runtime)
@@ -992,7 +986,7 @@ def _collect_frozen_batchnorm_stats(
     runtime: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     snapshot: dict[str, torch.Tensor] = {}
-    ariadne_runtime = (
+    torchlens_runtime = (
         runtime._ensure_runtime()
         if runtime is not None and callable(getattr(runtime, "_ensure_runtime", None))
         else runtime
@@ -1000,7 +994,7 @@ def _collect_frozen_batchnorm_stats(
     segments: list[tuple[str, torch.nn.Module]] = []
     seen_segments: set[int] = set()
     for segment_name in ("prefix_segment", "training_prefix_segment"):
-        segment = getattr(ariadne_runtime, segment_name, None)
+        segment = getattr(torchlens_runtime, segment_name, None)
         if isinstance(segment, torch.nn.Module) and id(segment) not in seen_segments:
             seen_segments.add(id(segment))
             segments.append((segment_name, segment))
@@ -1034,9 +1028,9 @@ def _train_suffix_loop(
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
 ) -> dict[str, Any]:
-    """Train the Ariadne suffix over a fixed list of precomputed batches.
+    """Train the TorchLens suffix over a fixed list of precomputed batches.
 
-    All Ariadne suffix modes funnel into this single loop so the only difference
+    All TorchLens suffix modes funnel into this single loop so the only difference
     between them is *how* ``prepared_batches[i].boundary`` was produced.
     """
     epoch_times: list[float] = []
@@ -1109,7 +1103,7 @@ def _build_cached_batches(
             )
         if boundary_graph_signature != graph_signature:
             raise RuntimeError(
-                "Ariadne boundary graph_signature differs from runtime: "
+                "TorchLens boundary graph_signature differs from runtime: "
                 f"boundary={boundary_graph_signature!r}; runtime={graph_signature!r}; "
                 f"percent={percent!r}; sample index={len(batches)}."
             )
@@ -1322,7 +1316,7 @@ def _preflight_equivalence_check(
         )
 
     # The eval-mode forward check above catches replay drift, but it does not
-    # prove that raw_freeze and Ariadne freeze will apply the same suffix update.
+    # prove that raw_freeze and TorchLens freeze will apply the same suffix update.
     # Probe one backward pass on the raw eval-forward path without stepping the
     # optimizer.
     train_full_loss_value: float | None = None
@@ -1423,10 +1417,10 @@ def _build_runtime_for_boundary(
         boundary=str(boundary),
         dynamic_batch=(2, max(2, int(args.dynamic_batch_max), int(args.batch_size))),
         trace_batch_size=2,
-        mode=str(args.ariadne_mode),
+        mode=str(args.torchlens_mode),
         trainable=True,
     )
-    _log_cuda_sdp_flags("CUDA SDPA backend flags before Ariadne runtime construction")
+    _log_cuda_sdp_flags("CUDA SDPA backend flags before TorchLens runtime construction")
     started = time.perf_counter()
     if str(boundary).startswith("after:"):
         runtime = prepare_exact_split_runtime(
@@ -1464,7 +1458,7 @@ def _build_runtime_for_choice(
     )
     split_id = _require_runtime_split_id(runtime)
     logger.info(
-        "Selected percent boundary {} -> runtime boundary {} -> Ariadne split_id {}",
+        "Selected percent boundary {} -> runtime boundary {} -> TorchLens split_id {}",
         choice.boundary,
         runtime_boundary,
         split_id,
@@ -1492,7 +1486,7 @@ def _resolve_exact_split_choices(
         del probe_runtime
         _clear_cuda_cache()
         logger.info(
-            "Selected percent boundary {} -> exact Ariadne split_id {}",
+            "Selected percent boundary {} -> exact TorchLens split_id {}",
             choice.boundary,
             probe_split_id,
         )
@@ -1557,7 +1551,7 @@ def _base_result_row(
     batch_size: int,
     repeat_id: int,
     seed: int,
-    ariadne_mode: str,
+    torchlens_mode: str,
     teacher_annotation_time: float,
     sampled_frame_indices: list[int],
 ) -> dict[str, Any]:
@@ -1579,7 +1573,7 @@ def _base_result_row(
         "metric_after": None,
         "metric_delta": None,
         "batch_size": int(batch_size),
-        "ariadne_mode": ariadne_mode,
+        "torchlens_mode": torchlens_mode,
         "edge_model": edge_model,
         "golden_model": golden_model,
         "seed": int(seed),
@@ -1923,12 +1917,12 @@ def _run_freeze_mode(
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
 ) -> dict[str, Any]:
-    """Fixed-prefix freeze training via the Ariadne runtime.
+    """Fixed-prefix freeze training via the TorchLens runtime.
 
     Each batch:
 
     1. prepare raw inputs for the ordered sample ids;
-    2. run the Ariadne prefix under ``torch.no_grad`` (prefix is frozen and in
+    2. run the TorchLens prefix under ``torch.no_grad`` (prefix is frozen and in
        ``eval`` state) to produce a BoundaryPayload;
     3. call ``runtime.train_suffix`` to update suffix parameters.
 
@@ -2144,14 +2138,14 @@ def _run_one_experiment(
     runtime_build_time = float(shared_runtime_build_time)
     if mode == "split_cached":
         if cached_split is None:
-            raise RuntimeError("Missing cached Ariadne split runtime.")
+            raise RuntimeError("Missing cached TorchLens split runtime.")
         _validate_cached_split_runtime(cached_split)
         if cached_split.runtime is not runtime:
             raise RuntimeError(
                 "split_cached runtime does not match the shared per-boundary runtime."
             )
         logger.info(
-            "Using cached Ariadne runtime for {} split_id={} samples={}",
+            "Using cached TorchLens runtime for {} split_id={} samples={}",
             cached_split.percent,
             cached_split.split_id,
             cached_split.cached_sample_count,
@@ -2171,7 +2165,7 @@ def _run_one_experiment(
         batch_size=batch_size,
         repeat_id=repeat_id,
         seed=seed,
-        ariadne_mode=str(args.ariadne_mode),
+        torchlens_mode=str(args.torchlens_mode),
         teacher_annotation_time=teacher_annotation_time,
         sampled_frame_indices=sampled_frame_indices,
     )
@@ -2345,7 +2339,7 @@ def main(argv: list[str] | None = None) -> int:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device requested CUDA, but torch.cuda.is_available() is false.")
     if int(args.batch_size) < 2:
-        raise ValueError("--batch-size must be at least 2 for Ariadne batch_gt1 tracing.")
+        raise ValueError("--batch-size must be at least 2 for TorchLens batch_gt1 tracing.")
     _force_cuda_math_sdp(device)
     object_detection_module.device = device
     _set_random_seed(int(args.seed))
@@ -2416,8 +2410,8 @@ def main(argv: list[str] | None = None) -> int:
     runtime_by_boundary: dict[str, Any] = {}
     runtime_build_time_by_boundary: dict[str, float] = {}
 
-    # Build exactly one Ariadne runtime per boundary and reuse it for all
-    # enabled modes. Ariadne variant enumeration is not strictly deterministic
+    # Build exactly one TorchLens runtime per boundary and reuse it for all
+    # enabled modes. TorchLens variant enumeration is not strictly deterministic
     # across separate build_split_runtime calls, so rebuilding per-mode would
     # cause the suffix parameter sets to drift between modes.
     for choice in choices:
@@ -2441,7 +2435,7 @@ def main(argv: list[str] | None = None) -> int:
             _configure_fixed_prefix_training(split_model, runtime)
             split_model.eval()
             logger.info(
-                "Prebuilding cached Ariadne boundaries for {} using split_id {}",
+                "Prebuilding cached TorchLens boundaries for {} using split_id {}",
                 choice.boundary,
                 split_id,
             )

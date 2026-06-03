@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import importlib.metadata
+from dataclasses import dataclass, replace
+from typing import Any, Literal
+
+import torch
+from torchlens.split import (
+    ReplayBoundary,
+    SplitRuntime,
+    SplitSpec,
+    prepare_split,
+    prepare_split_replay,
+)
+
+
+TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "plank-road-torchlens-native-runtime-v1"
+DEFAULT_SPLIT_MODE = "generated_eager"
+BoundaryPayload = ReplayBoundary
+
+
+@dataclass(frozen=True)
+class SplitRuntimeConfig:
+    boundary: str
+    dynamic_batch: tuple[int, int] = (2, 64)
+    trace_batch_size: int = 2
+    mode: Literal["generated_eager", "compiled"] = DEFAULT_SPLIT_MODE
+    trainable: bool = True
+
+
+def torchlens_runtime_version() -> str:
+    try:
+        return importlib.metadata.version("torchlens")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def normalize_example_inputs(example_inputs: Any) -> tuple[Any, ...]:
+    if isinstance(example_inputs, tuple):
+        return example_inputs
+    return (example_inputs,)
+
+
+def _normalize_mode(mode: str | None) -> Literal["generated_eager", "compiled"]:
+    normalized = str(mode or DEFAULT_SPLIT_MODE).strip()
+    if normalized not in {"generated_eager", "compiled"}:
+        raise ValueError(f"Unsupported TorchLens split mode: {mode!r}.")
+    return normalized  # type: ignore[return-value]
+
+
+def make_split_spec(
+    boundary: str | SplitRuntimeConfig,
+    *,
+    batch_symbol: str = "B",
+    dynamic_batch: tuple[int, int] | None = (2, 64),
+    trainable: bool = True,
+    trace_batch_mode: str = "batch_gt1",
+    model_family: str | None = None,
+    mode: str = DEFAULT_SPLIT_MODE,
+) -> SplitSpec:
+    """Build a TorchLens native SplitSpec for Plank-road split runtimes."""
+
+    del model_family
+    if isinstance(boundary, SplitRuntimeConfig):
+        config = boundary
+        return SplitSpec(
+            boundary=str(config.boundary),
+            batch_symbol=batch_symbol,
+            dynamic_batch=config.dynamic_batch,
+            trainable=bool(config.trainable),
+            trace_batch_mode="batch_gt1",
+            device_policy="runtime",
+            mode=_normalize_mode(config.mode),
+        )
+    return SplitSpec(
+        boundary=str(boundary),
+        batch_symbol=batch_symbol,
+        dynamic_batch=dynamic_batch,
+        trainable=bool(trainable),
+        trace_batch_mode=str(trace_batch_mode or "batch_gt1"),
+        device_policy="runtime",
+        mode=_normalize_mode(mode),
+    )
+
+
+def _spec_with_mode(split_spec: SplitSpec | str, mode: str | None) -> SplitSpec:
+    spec = (
+        make_split_spec(split_spec, mode=mode or DEFAULT_SPLIT_MODE)
+        if isinstance(split_spec, str)
+        else split_spec
+    )
+    if mode is None:
+        return spec
+    normalized_mode = _normalize_mode(mode)
+    if getattr(spec, "mode", None) == normalized_mode:
+        return spec
+    return replace(spec, mode=normalized_mode)
+
+
+def prepare_split_runtime(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    split_spec: SplitSpec | str,
+    mode: str | None = None,
+) -> SplitRuntime:
+    """Prepare a split runtime using the TorchLens native split API."""
+
+    spec = _spec_with_mode(split_spec, mode)
+    return prepare_split(
+        model,
+        normalize_example_inputs(example_inputs),
+        spec,
+    )
+
+
+def prepare_split_replay_runtime(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    split_spec: SplitSpec | str,
+    mode: str | None = None,
+) -> SplitRuntime:
+    """Prepare an inference-style replay runtime using TorchLens native split."""
+
+    spec = _spec_with_mode(split_spec, mode)
+    return prepare_split_replay(
+        model,
+        normalize_example_inputs(example_inputs),
+        spec,
+    )
+
+
+def _require_batch_gt1(example_batch: torch.Tensor) -> None:
+    if int(example_batch.shape[0]) <= 1:
+        raise ValueError("TorchLens batch_gt1 tracing requires example_batch batch size > 1.")
+
+
+def build_split_runtime(
+    model: Any,
+    example_batch: torch.Tensor,
+    config: SplitRuntimeConfig,
+) -> SplitRuntime:
+    _require_batch_gt1(example_batch)
+    return prepare_split_runtime(model, example_batch, make_split_spec(config), mode=config.mode)
+
+
+def build_replay_runtime(
+    model: Any,
+    example_batch: torch.Tensor,
+    config: SplitRuntimeConfig,
+) -> SplitRuntime:
+    _require_batch_gt1(example_batch)
+    replay_config = replace(config, trainable=False)
+    return prepare_split_replay_runtime(
+        model,
+        example_batch,
+        make_split_spec(replay_config),
+        mode=config.mode,
+    )
+
+
+def maybe_warmup_runtime(runtime: Any, batch: torch.Tensor) -> None:
+    run_prefix = getattr(runtime, "run_prefix", None)
+    run_suffix = getattr(runtime, "run_suffix", None)
+    if not callable(run_prefix) or not callable(run_suffix):
+        return
+    with torch.inference_mode():
+        run_suffix(run_prefix(batch))
+
+
+def trace_signature(runtime: Any) -> str:
+    trace_graph = getattr(runtime, "trace_graph", None)
+    return str(getattr(trace_graph, "graph_shape_hash", "") or "")
+
+
+def get_split_runtime_metadata(runtime: Any) -> dict[str, Any]:
+    plan = getattr(runtime, "plan", None)
+    split_spec = getattr(runtime, "split_spec", None)
+    return {
+        "actual_split_id": getattr(runtime, "split_id", None),
+        "graph_signature": trace_signature(runtime),
+        "runtime_backend": "torchlens_native",
+        "torchlens_mode": getattr(split_spec, "mode", None),
+        "boundary_after": getattr(plan, "split_label", None),
+        "boundary_nodes": list(getattr(plan, "boundary_nodes", ()) or ()),
+        "prefix_nodes": list(getattr(plan, "prefix_nodes", ()) or ()),
+        "suffix_nodes": list(getattr(plan, "suffix_nodes", ()) or ()),
+        "boundary_bytes": 0,
+        "trainable_suffix": bool(getattr(split_spec, "trainable", True)),
+    }
+
+
+__all__ = [
+    "BoundaryPayload",
+    "DEFAULT_SPLIT_MODE",
+    "ReplayBoundary",
+    "SplitRuntime",
+    "SplitRuntimeConfig",
+    "SplitSpec",
+    "TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION",
+    "build_replay_runtime",
+    "build_split_runtime",
+    "get_split_runtime_metadata",
+    "make_split_spec",
+    "maybe_warmup_runtime",
+    "normalize_example_inputs",
+    "prepare_split_replay_runtime",
+    "prepare_split_runtime",
+    "torchlens_runtime_version",
+    "trace_signature",
+]

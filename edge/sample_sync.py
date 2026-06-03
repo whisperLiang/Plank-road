@@ -149,41 +149,31 @@ def _feature_layout_metadata(intermediate: Any) -> dict[str, Any]:
     }
     layout = feature_layout_from_tensors(tensors) if tensors else {}
     schema_payload = {}
-    for label, spec in dict(getattr(intermediate, "schema", {}) or {}).items():
+    for label, spec in dict(getattr(intermediate, "spec", {}) or {}).items():
         schema_payload[str(label)] = {
             "label": str(getattr(spec, "label", label)),
-            "symbolic_shape": [str(dim) for dim in list(getattr(spec, "symbolic_shape", ()) or ())],
+            "canonical_id": str(getattr(spec, "canonical_id", label)),
+            "torchlens_label": str(getattr(spec, "torchlens_label", label)),
+            "module_path": str(getattr(spec, "module_path", "")),
+            "op_type": str(getattr(spec, "op_type", "")),
+            "symbolic_shape": [str(dim) for dim in list(getattr(spec, "shape", ()) or ())],
             "dtype": str(getattr(spec, "dtype", "")),
             "requires_grad": bool(getattr(spec, "requires_grad", False)),
-            "device_type": str(getattr(spec, "device_type", "")),
+            "role": str(getattr(spec, "role", "")),
+            "output_index": getattr(spec, "output_index", None),
+            "device_policy": str(getattr(spec, "device_policy", "runtime")),
         }
-    value_schema_payload = [
-        {
-            "label": str(getattr(spec, "label", "")),
-            "tensor_spec": {
-                "label": str(getattr(getattr(spec, "tensor_spec", None), "label", "")),
-                "symbolic_shape": [
-                    str(dim)
-                    for dim in list(
-                        getattr(getattr(spec, "tensor_spec", None), "symbolic_shape", ()) or ()
-                    )
-                ],
-                "dtype": str(getattr(getattr(spec, "tensor_spec", None), "dtype", "")),
-                "requires_grad": bool(
-                    getattr(getattr(spec, "tensor_spec", None), "requires_grad", False)
-                ),
-                "device_type": str(getattr(getattr(spec, "tensor_spec", None), "device_type", "")),
-            },
-        }
-        for spec in tuple(getattr(intermediate, "value_schema", ()) or ())
-    ]
     return {
         "feature_layout_id": _hash_payload(layout) if layout else "",
         "feature_layout": layout,
         "feature_schema_hash": _hash_payload(schema_payload) if schema_payload else "",
-        "feature_value_schema_hash": _hash_payload(value_schema_payload) if value_schema_payload else "",
+        "feature_value_schema_hash": "",
         "feature_split_id": str(getattr(intermediate, "split_id", "") or ""),
-        "feature_graph_signature": str(getattr(intermediate, "graph_signature", "") or ""),
+        "feature_graph_signature": str(
+            intermediate.metadata.get("graph_shape_hash")
+            or intermediate.metadata.get("graph_signature")
+            or ""
+        ),
     }
 
 

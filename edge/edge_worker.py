@@ -9,7 +9,6 @@ from typing import Any, Callable, Mapping
 
 import grpc
 import torch
-from ariadne.runtime.batching import resize_batch
 from loguru import logger
 
 from difference.diff import DiffProcessor
@@ -76,6 +75,31 @@ def _first_tensor_batch_size(value: object) -> int | None:
             if found is not None:
                 return found
     return None
+
+
+def resize_batch(value: object, current_batch_size: int, target_batch_size: int) -> object:
+    current = int(current_batch_size)
+    target = int(target_batch_size)
+    if target <= current:
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.shape[0]) == current:
+            return value.narrow(0, 0, target)
+        return value
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0 or int(value.shape[0]) != current:
+            return value
+        pad_count = target - current
+        pad = value[-1:].expand(pad_count, *value.shape[1:]).clone()
+        return torch.cat([value, pad], dim=0)
+    if isinstance(value, Mapping):
+        return {
+            key: resize_batch(item, current_batch_size, target_batch_size)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(resize_batch(item, current_batch_size, target_batch_size) for item in value)
+    if isinstance(value, list):
+        return [resize_batch(item, current_batch_size, target_batch_size) for item in value]
+    return value
 
 
 def _fixed_split_trace_sample_input(sample_input: object, trace_batch_size: int = 2) -> object:

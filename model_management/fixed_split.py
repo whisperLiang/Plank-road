@@ -7,44 +7,24 @@ import os
 import tempfile
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Sequence
 
 import torch
-from ariadne.planner.frontier import enumerate_frontier_splits
-from ariadne.trace.tracer import trace_model
 from loguru import logger
 
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_contract import build_runtime_contract
-from model_management.split_runtime import make_split_spec
 from model_management.universal_model_split import (
     UniversalModelSplitter,
-    _ariadne_candidate_operation_split_id,
-    _candidate_from_ariadne_candidate,
-    _exact_ariadne_candidate,
     build_candidate_descriptor,
-    prepare_exact_split_runtime,
 )
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v9"
+FIXED_SPLIT_PLAN_VERSION = "fixed-split.v10"
 FIXED_SPLIT_DYNAMIC_BATCH_MAX = 64
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
-
-
-@dataclass(frozen=True)
-class _LazyAriadneCandidate:
-    candidate: Any
-    operation_split_id: str
-    payload_bytes: int
-    boundary_count: int
-    legacy_layer_index: int
-    edge_parameter_count: int
-    total_parameter_count: int
-    privacy_leakage: float
-    freezing_ratio: float
 
 
 def estimate_privacy_leakage_from_edge_params(
@@ -73,12 +53,7 @@ def min_edge_parameters_for_privacy(
 def _atomic_write_json(path: str, payload: Mapping[str, Any]) -> None:
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=directory,
-        delete=False,
-    )
+    handle = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False)
     try:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.flush()
@@ -102,20 +77,6 @@ def _load_json_artifact(path: str) -> dict[str, Any] | None:
     with open(path, "r", encoding="utf-8") as handle:
         loaded = json.load(handle)
     return dict(loaded) if isinstance(loaded, Mapping) else None
-
-
-def _format_boundary_labels(
-    boundary_tensor_labels: list[str],
-    *,
-    max_items: int = 4,
-) -> str:
-    labels = [str(label) for label in boundary_tensor_labels]
-    if not labels:
-        return "[]"
-    if len(labels) <= max_items:
-        return "[" + ", ".join(labels) + "]"
-    shown = ", ".join(labels[:max_items])
-    return f"[{shown}, ... (+{len(labels) - max_items} more)]"
 
 
 @dataclass(frozen=True)
@@ -148,11 +109,7 @@ class SplitConstraints:
         extras = getattr(config, "_extras", {}) or {}
         legacy_privacy_bound = getattr(config, "privacy_metric_lower_bound", None)
         privacy_leakage_upper_bound = getattr(config, "privacy_leakage_upper_bound", None)
-        default_privacy_bound = getattr(
-            type(config),
-            "privacy_leakage_upper_bound",
-            None,
-        )
+        default_privacy_bound = getattr(type(config), "privacy_leakage_upper_bound", None)
         if (
             "privacy_metric_lower_bound" in extras
             and (
@@ -165,20 +122,14 @@ class SplitConstraints:
         ):
             privacy_leakage_upper_bound = legacy_privacy_bound
         if privacy_leakage_upper_bound is None:
-            privacy_leakage_upper_bound = (
-                legacy_privacy_bound if legacy_privacy_bound is not None else 0.0
-            )
+            privacy_leakage_upper_bound = legacy_privacy_bound if legacy_privacy_bound is not None else 0.0
         return cls(
             privacy_leakage_upper_bound=float(privacy_leakage_upper_bound),
-            max_layer_freezing_ratio=float(
-                getattr(config, "max_layer_freezing_ratio", 1.0)
-            ),
+            max_layer_freezing_ratio=float(getattr(config, "max_layer_freezing_ratio", 1.0)),
             validate_candidates=bool(getattr(config, "validate_candidates", True)),
             max_candidates=int(getattr(config, "max_candidates", 24)),
             max_boundary_count=int(getattr(config, "max_boundary_count", 8)),
-            max_payload_bytes=int(
-                getattr(config, "max_payload_bytes", 32 * 1024 * 1024)
-            ),
+            max_payload_bytes=int(getattr(config, "max_payload_bytes", 32 * 1024 * 1024)),
             privacy_leakage_epsilon=float(
                 getattr(config, "privacy_leakage_epsilon", PRIVACY_LEAKAGE_EPSILON)
             ),
@@ -196,9 +147,7 @@ def _constraints_payload(constraints: SplitConstraints) -> dict[str, Any]:
     return {
         "privacy_leakage_upper_bound": float(constraints.privacy_leakage_upper_bound),
         "privacy_leakage_epsilon": float(constraints.privacy_leakage_epsilon),
-        "privacy_min_edge_parameter_count": _privacy_min_edge_parameter_count(
-            constraints
-        ),
+        "privacy_min_edge_parameter_count": _privacy_min_edge_parameter_count(constraints),
         "max_layer_freezing_ratio": float(constraints.max_layer_freezing_ratio),
         "validate_candidates": bool(constraints.validate_candidates),
         "max_candidates": int(constraints.max_candidates),
@@ -261,23 +210,6 @@ class SplitPlan:
     def boundary_count(self) -> int:
         return len(self.boundary_tensor_labels)
 
-    def describe(self, *, max_boundary_labels: int = 4) -> str:
-        boundary_labels = _format_boundary_labels(
-            self.boundary_tensor_labels,
-            max_items=max_boundary_labels,
-        )
-        return (
-            f"canonical_split_key={self.canonical_split_key}, "
-            f"logical_split_id={self.logical_split_id}, "
-            f"split_granularity={self.split_granularity}, "
-            f"boundary_count={self.boundary_count}, "
-            f"boundary_tensor_labels={boundary_labels}, "
-            f"feature_layout_id={self.feature_layout_id}, "
-            f"payload_bytes={self.payload_bytes}, "
-            f"privacy_leakage={self.privacy_leakage:.6g}, "
-            f"edge_parameters={self.edge_parameter_count}/{self.total_parameter_count}"
-        )
-
     @property
     def logical_split_id(self) -> str:
         return str(self.runtime_contract.get("logical_split_id") or self.canonical_split_key)
@@ -285,6 +217,20 @@ class SplitPlan:
     @property
     def feature_layout_id(self) -> str:
         return str(self.runtime_contract.get("feature_layout_id") or "")
+
+    def describe(self, *, max_boundary_labels: int = 4) -> str:
+        labels = [str(label) for label in self.boundary_tensor_labels]
+        if len(labels) > max_boundary_labels:
+            label_text = f"[{', '.join(labels[:max_boundary_labels])}, ... (+{len(labels)-max_boundary_labels} more)]"
+        else:
+            label_text = "[" + ", ".join(labels) + "]"
+        return (
+            f"canonical_split_key={self.canonical_split_key}, logical_split_id={self.logical_split_id}, "
+            f"split_granularity={self.split_granularity}, boundary_count={self.boundary_count}, "
+            f"boundary_tensor_labels={label_text}, feature_layout_id={self.feature_layout_id}, "
+            f"payload_bytes={self.payload_bytes}, privacy_leakage={self.privacy_leakage:.6g}, "
+            f"edge_parameters={self.edge_parameter_count}/{self.total_parameter_count}"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -298,11 +244,7 @@ class SplitPlan:
             or payload.get("split_label")
             or ""
         )
-        edge_split_id = str(
-            payload.get("edge_split_id")
-            or payload.get("candidate_id")
-            or canonical_split_key
-        )
+        edge_split_id = str(payload.get("edge_split_id") or payload.get("candidate_id") or canonical_split_key)
         return cls(
             split_config_id=str(payload["split_config_id"]),
             canonical_split_key=canonical_split_key,
@@ -313,9 +255,7 @@ class SplitPlan:
             split_label=payload.get("split_label"),
             boundary_tensor_labels=list(payload.get("boundary_tensor_labels", [])),
             runtime_contract=dict(payload.get("runtime_contract") or {}),
-            input_tensor_shape=[
-                int(dim) for dim in list(payload.get("input_tensor_shape", []) or [])
-            ],
+            input_tensor_shape=[int(dim) for dim in list(payload.get("input_tensor_shape", []) or [])],
             input_resize_mode=str(payload.get("input_resize_mode") or "direct_resize"),
             front_version=str(payload.get("front_version") or "0"),
             payload_bytes=int(payload.get("payload_bytes", 0)),
@@ -323,10 +263,7 @@ class SplitPlan:
             privacy_risk=float(payload.get("privacy_risk", 0.0)),
             layer_freezing_ratio=float(payload.get("layer_freezing_ratio", 0.0)),
             privacy_leakage=float(
-                payload.get(
-                    "privacy_leakage",
-                    payload.get("privacy_risk", payload.get("privacy_metric", 0.0)),
-                )
+                payload.get("privacy_leakage", payload.get("privacy_risk", payload.get("privacy_metric", 0.0)))
             ),
             edge_parameter_count=int(payload.get("edge_parameter_count", 0)),
             total_parameter_count=int(payload.get("total_parameter_count", 0)),
@@ -341,11 +278,7 @@ class SplitPlan:
                 if payload.get("dynamic_batch") is not None
                 else None
             ),
-            trace_batch_size=(
-                int(payload["trace_batch_size"])
-                if payload.get("trace_batch_size") is not None
-                else None
-            ),
+            trace_batch_size=(int(payload["trace_batch_size"]) if payload.get("trace_batch_size") is not None else None),
             plan_version=str(payload.get("plan_version") or ""),
         )
 
@@ -360,14 +293,8 @@ class SplitPlan:
         front_version: str = "0",
         model_version: str = "0",
     ) -> bool:
-        expected_shape = (
-            [int(dim) for dim in list(input_tensor_shape)]
-            if input_tensor_shape is not None
-            else None
-        )
-        cached_model_version = str(
-            dict(self.runtime_contract or {}).get("model_version") or "0"
-        )
+        expected_shape = [int(dim) for dim in list(input_tensor_shape)] if input_tensor_shape is not None else None
+        cached_model_version = str(dict(self.runtime_contract or {}).get("model_version") or "0")
         return (
             self.plan_version == FIXED_SPLIT_PLAN_VERSION
             and self.model_name == model_name
@@ -380,20 +307,15 @@ class SplitPlan:
         )
 
 
-def _is_ariadne_runtime(splitter: UniversalModelSplitter) -> bool:
-    return getattr(splitter, "runtime", None) is not None or isinstance(
-        getattr(splitter, "graph", None), str
-    )
-
-
 def _trace_signature(splitter: UniversalModelSplitter) -> str:
     runtime = getattr(splitter, "runtime", None)
-    graph_signature = getattr(runtime, "graph_signature", None)
+    graph = getattr(runtime, "trace_graph", None)
+    graph_signature = getattr(graph, "graph_shape_hash", None)
     if graph_signature:
         return str(graph_signature)
-    graph = getattr(splitter, "graph", None)
-    if isinstance(graph, str) and graph:
-        return graph
+    graph_value = getattr(splitter, "graph", None)
+    if isinstance(graph_value, str) and graph_value:
+        return graph_value
     return "unavailable"
 
 
@@ -413,11 +335,6 @@ def _first_tensor_device_type(value: Any) -> str:
     return ""
 
 
-def _runtime_backend(splitter: UniversalModelSplitter) -> str:
-    runtime = getattr(splitter, "runtime", None)
-    return str(getattr(runtime, "mode", "") or "")
-
-
 def _candidate_boundary_schema(candidate: SplitCandidate) -> dict[str, Any]:
     metadata = dict(getattr(candidate, "metadata", {}) or {})
     boundary_schema = metadata.get("boundary_schema")
@@ -433,12 +350,11 @@ def _build_plan_runtime_contract(
     sample_input: Any,
     input_resize_mode: str,
 ) -> dict[str, Any]:
-    trace_signature = _trace_signature(runtime)
     return build_runtime_contract(
         logical_split_id=_candidate_split_key(candidate),
-        trace_signature=trace_signature,
+        trace_signature=_trace_signature(runtime),
         trace_device_type=_first_tensor_device_type(sample_input),
-        runtime_backend=_runtime_backend(runtime),
+        runtime_backend="torchlens_native",
         boundary_tensor_labels=list(candidate.boundary_tensor_labels),
         boundary_schema=_candidate_boundary_schema(candidate),
         model_id=str(model_name),
@@ -448,20 +364,14 @@ def _build_plan_runtime_contract(
     )
 
 
-def _layer_freezing_ratio(
-    splitter: UniversalModelSplitter,
-    candidate: SplitCandidate,
-) -> float:
+def _layer_freezing_ratio(splitter: UniversalModelSplitter, candidate: SplitCandidate) -> float:
     del splitter
     if int(getattr(candidate, "total_parameter_count", 0)) > 0:
         return max(0.0, min(1.0, float(getattr(candidate, "edge_parameter_ratio", 0.0))))
     return 0.0
 
 
-def _privacy_leakage(
-    candidate: SplitCandidate,
-    constraints: SplitConstraints,
-) -> float:
+def _privacy_leakage(candidate: SplitCandidate, constraints: SplitConstraints) -> float:
     if (
         int(getattr(candidate, "total_parameter_count", 0)) > 0
         or int(getattr(candidate, "edge_parameter_count", 0)) > 0
@@ -483,9 +393,7 @@ def _satisfies_privacy_constraint(
     total_parameter_count = int(getattr(candidate, "total_parameter_count", 0))
     if total_parameter_count <= 0:
         return privacy_leakage <= float(constraints.privacy_leakage_upper_bound)
-    return int(getattr(candidate, "edge_parameter_count", 0)) >= (
-        _privacy_min_edge_parameter_count(constraints)
-    )
+    return int(getattr(candidate, "edge_parameter_count", 0)) >= _privacy_min_edge_parameter_count(constraints)
 
 
 def _make_plan_id(
@@ -500,9 +408,7 @@ def _make_plan_id(
             "model_name": model_name,
             "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "logical_split_id": _candidate_split_key(candidate),
-            "feature_layout_id": str(
-                dict(runtime_contract or {}).get("feature_layout_id") or ""
-            ),
+            "feature_layout_id": str(dict(runtime_contract or {}).get("feature_layout_id") or ""),
             "constraints": _constraints_payload(constraints),
         },
         sort_keys=True,
@@ -514,20 +420,13 @@ def _make_plan_id(
 def _normalise_after_key(value: object) -> str:
     text = str(value or "").strip()
     if not text:
-        raise RuntimeError(
-            "Fixed split candidates must expose an exact split key."
-        )
+        raise RuntimeError("Fixed split candidates must expose an exact split key.")
     return text if text.startswith("after:") else f"after:{text}"
 
 
 def _candidate_split_key(candidate: SplitCandidate) -> str:
     metadata = dict(getattr(candidate, "metadata", {}) or {})
-    raw_key = (
-        metadata.get("canonical_split_key")
-        or getattr(candidate, "candidate_id", None)
-        or metadata.get("ariadne_operation_split_id")
-        or metadata.get("ariadne_boundary_after")
-    )
+    raw_key = metadata.get("canonical_split_key") or getattr(candidate, "candidate_id", None)
     return _normalise_after_key(raw_key)
 
 
@@ -563,179 +462,9 @@ def _first_tensor_batch_size(value: Any) -> int | None:
     return None
 
 
-def _runtime_args(sample_input: Any) -> tuple[Any, ...]:
-    if isinstance(sample_input, tuple):
-        return sample_input
-    if isinstance(sample_input, list):
-        return tuple(sample_input)
-    return (sample_input,)
-
-
-def _shape_numel(shape: Sequence[int] | Any) -> int:
-    total = 1
-    for dim in shape or ():
-        total *= int(dim)
-    return int(total)
-
-
-def _node_index_by_name(plan: Any) -> dict[str, int]:
-    return {
-        str(node.name): index
-        for index, node in enumerate(getattr(plan, "nodes", ()) or ())
-    }
-
-
-def _param_refs_by_node(plan: Any) -> dict[str, tuple[tuple[str, int], ...]]:
-    refs_by_node: dict[str, tuple[tuple[str, int], ...]] = {}
-    for node in getattr(plan, "nodes", ()) or ():
-        refs: list[tuple[str, int]] = []
-        for ref in getattr(node, "param_refs", ()) or ():
-            ref_name = str(getattr(ref, "name", ""))
-            if not ref_name:
-                continue
-            refs.append((ref_name, _shape_numel(getattr(ref, "shape", ()) or ())))
-        if refs:
-            refs_by_node[str(node.name)] = tuple(refs)
-    return refs_by_node
-
-
-def _parameter_count_from_ref_lookup(
-    refs_by_node: Mapping[str, tuple[tuple[str, int], ...]],
-    node_names: Sequence[str] | tuple[str, ...],
-) -> int:
-    if not refs_by_node or not node_names:
-        return 0
-    node_set = {str(node_name) for node_name in node_names}
-    if len(refs_by_node) < len(node_set):
-        nodes_to_scan = [
-            node_name for node_name in refs_by_node.keys() if node_name in node_set
-        ]
-    else:
-        nodes_to_scan = list(node_set)
-    seen: set[str] = set()
-    total = 0
-    for node_name in nodes_to_scan:
-        for ref_name, ref_numel in refs_by_node.get(str(node_name), ()):
-            if ref_name in seen:
-                continue
-            seen.add(ref_name)
-            total += int(ref_numel)
-    return int(total)
-
-
-def _candidate_legacy_index_from_lookup(
-    node_indexes: Mapping[str, int],
-    prefix_nodes: Sequence[str] | tuple[str, ...],
-) -> int:
-    indexes = [
-        int(node_indexes[str(label)])
-        for label in prefix_nodes
-        if str(label) in node_indexes
-    ]
-    return max(indexes) if indexes else 10**9
-
-
-def _lazy_candidate_key(item: _LazyAriadneCandidate) -> tuple[int, int, float, int, str]:
-    return (
-        int(item.payload_bytes),
-        int(item.boundary_count),
-        float(item.payload_bytes),
-        int(item.legacy_layer_index),
-        str(item.operation_split_id),
-    )
-
-
-def _lazy_ariadne_candidates(
-    plan: Any,
-    constraints: SplitConstraints,
-) -> tuple[list[_LazyAriadneCandidate], int]:
-    frontier = tuple(enumerate_frontier_splits(plan))
-    if not frontier:
-        return [], 0
-
-    refs_by_node = _param_refs_by_node(plan)
-    node_indexes = _node_index_by_name(plan)
-    total_parameter_count = _parameter_count_from_ref_lookup(
-        refs_by_node,
-        tuple(refs_by_node.keys()),
-    )
-    min_edge_parameters = _privacy_min_edge_parameter_count(constraints)
-    eligible: list[_LazyAriadneCandidate] = []
-    for ariadne_candidate in frontier:
-        if not bool(getattr(ariadne_candidate, "trainable_suffix", True)):
-            continue
-        boundary_nodes = tuple(getattr(ariadne_candidate, "boundary_nodes", ()) or ())
-        if len(boundary_nodes) > int(constraints.max_boundary_count):
-            continue
-        payload_bytes = int(
-            getattr(getattr(ariadne_candidate, "cost", None), "boundary_bytes", 0) or 0
-        )
-        if payload_bytes > int(constraints.max_payload_bytes):
-            continue
-        prefix_nodes = tuple(
-            str(label)
-            for label in getattr(ariadne_candidate, "prefix_nodes", ()) or ()
-        )
-        edge_parameter_count = _parameter_count_from_ref_lookup(
-            refs_by_node,
-            prefix_nodes,
-        )
-        privacy_leakage = estimate_privacy_leakage_from_edge_params(
-            edge_parameter_count,
-            epsilon=constraints.privacy_leakage_epsilon,
-        )
-        if (
-            float(constraints.privacy_leakage_upper_bound) > 0.0
-            and total_parameter_count > 0
-            and edge_parameter_count < min_edge_parameters
-        ):
-            continue
-        if (
-            float(constraints.privacy_leakage_upper_bound) > 0.0
-            and total_parameter_count <= 0
-            and privacy_leakage > float(constraints.privacy_leakage_upper_bound)
-        ):
-            continue
-        freezing_ratio = (
-            float(edge_parameter_count) / float(total_parameter_count)
-            if total_parameter_count > 0
-            else 0.0
-        )
-        if freezing_ratio > float(constraints.max_layer_freezing_ratio):
-            continue
-        eligible.append(
-            _LazyAriadneCandidate(
-                candidate=ariadne_candidate,
-                operation_split_id=_ariadne_candidate_operation_split_id(ariadne_candidate),
-                payload_bytes=payload_bytes,
-                boundary_count=len(boundary_nodes),
-                legacy_layer_index=_candidate_legacy_index_from_lookup(
-                    node_indexes,
-                    prefix_nodes,
-                ),
-                edge_parameter_count=edge_parameter_count,
-                total_parameter_count=total_parameter_count,
-                privacy_leakage=privacy_leakage,
-                freezing_ratio=freezing_ratio,
-            )
-        )
-
-    eligible.sort(key=_lazy_candidate_key)
-    return eligible, len(frontier)
-
-
-def _split_spec_payload_value(splitter: UniversalModelSplitter, name: str) -> Any:
-    for source in (
-        getattr(splitter, "split_spec", None),
-        getattr(getattr(splitter, "runtime", None), "split_spec", None),
-    ):
-        if source is not None and getattr(source, name, None) is not None:
-            return getattr(source, name)
-    return None
-
-
 def _splitter_dynamic_batch(splitter: UniversalModelSplitter) -> list[int] | None:
-    dynamic_batch = _split_spec_payload_value(splitter, "dynamic_batch")
+    split_spec = getattr(splitter, "split_spec", None) or getattr(getattr(splitter, "runtime", None), "split_spec", None)
+    dynamic_batch = getattr(split_spec, "dynamic_batch", None)
     if dynamic_batch is None:
         return None
     try:
@@ -746,44 +475,21 @@ def _splitter_dynamic_batch(splitter: UniversalModelSplitter) -> list[int] | Non
 
 
 def _splitter_trace_batch_mode(splitter: UniversalModelSplitter) -> str:
-    return str(_split_spec_payload_value(splitter, "trace_batch_mode") or "")
-
-
-def _fallback_candidate_pool(
-    runtime: UniversalModelSplitter,
-    constraints: SplitConstraints,
-) -> list[SplitCandidate]:
-    expected = (
-        int(constraints.max_boundary_count),
-        int(constraints.max_payload_bytes),
-    )
-    current_candidates = getattr(runtime, "candidates", None)
-    current_config = getattr(runtime, "_candidate_enumeration_config", None)
-    if (
-        not current_candidates
-        or current_config != expected
-    ) and hasattr(runtime, "enumerate_candidates"):
-        enumerated = list(
-            runtime.enumerate_candidates(
-                max_boundary_count=constraints.max_boundary_count,
-                max_payload_bytes=constraints.max_payload_bytes,
-            )
-        )
-        setattr(runtime, "candidates", list(enumerated))
-        setattr(runtime, "_candidate_enumeration_config", expected)
-        current_candidates = enumerated
-    return list(current_candidates or [])
+    split_spec = getattr(splitter, "split_spec", None) or getattr(getattr(splitter, "runtime", None), "split_spec", None)
+    return str(getattr(split_spec, "trace_batch_mode", "") or "")
 
 
 def _enumerate_feasible_candidates(
     runtime: UniversalModelSplitter,
     constraints: SplitConstraints,
 ) -> list[EligibleCandidate]:
-    candidates = _fallback_candidate_pool(runtime, constraints)
-
-    if not candidates:
-        return []
-
+    candidates = list(
+        runtime.enumerate_candidates(
+            max_boundary_count=constraints.max_boundary_count,
+            max_payload_bytes=constraints.max_payload_bytes,
+            max_candidates=max(1, int(constraints.max_candidates) * 4),
+        )
+    )
     eligible: list[EligibleCandidate] = []
     for candidate in candidates:
         if not candidate.is_trainable_tail:
@@ -810,149 +516,6 @@ def _candidate_runtime_key(candidate: SplitCandidate) -> tuple[int, float, int, 
 def _eligible_candidate_key(item: EligibleCandidate) -> tuple[int, int, float, int, str]:
     candidate = item[0]
     return (int(candidate.estimated_payload_bytes), *_candidate_runtime_key(candidate))
-
-
-def _validated_candidate_key(item: ValidatedCandidate) -> tuple[float, int, str]:
-    profile, candidate, _, _ = item
-    return (
-        float(profile.measured_end_to_end_latency),
-        candidate.legacy_layer_index if candidate.legacy_layer_index is not None else 10**9,
-        candidate.candidate_id,
-    )
-
-
-def _validate_payload_group(
-    runtime: UniversalModelSplitter,
-    group: list[EligibleCandidate],
-) -> tuple[list[ValidatedCandidate], int, int, dict[str, int]]:
-    validated_group: list[ValidatedCandidate] = []
-    replay_validation_failures = 0
-    replay_success_but_untrainable = 0
-    validation_error_counts: dict[str, int] = defaultdict(int)
-
-    for candidate, privacy_leakage, freezing_ratio in sorted(
-        group,
-        key=lambda item: _candidate_runtime_key(item[0]),
-    ):
-        try:
-            report = runtime.validate_candidate(candidate)
-        except Exception as exc:
-            replay_validation_failures += 1
-            validation_error_counts[str(exc) or type(exc).__name__] += 1
-            continue
-        if not bool(report.get("success", False)):
-            replay_validation_failures += 1
-            error_text = str(report.get("error") or "unknown")
-            validation_error_counts[error_text] += 1
-            continue
-        if not bool(report.get("tail_trainability", candidate.is_trainable_tail)):
-            replay_success_but_untrainable += 1
-            continue
-        validated_group.append(
-            (
-                _profile_from_report(runtime, candidate, report),
-                candidate,
-                privacy_leakage,
-                freezing_ratio,
-            )
-        )
-
-    return (
-        validated_group,
-        replay_validation_failures,
-        replay_success_but_untrainable,
-        validation_error_counts,
-    )
-
-
-def _raise_no_replayable_candidate(
-    constraints: SplitConstraints,
-    *,
-    eligible_count: int,
-    replay_validation_failures: int,
-    replay_success_but_untrainable: int,
-    validation_error_counts: Mapping[str, int],
-) -> None:
-    diagnostics = [
-        f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}",
-        f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}",
-        f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}",
-        f"eligible_candidates={eligible_count}",
-    ]
-    if replay_success_but_untrainable:
-        diagnostics.append(
-            f"replay_success_but_untrainable={replay_success_but_untrainable}"
-        )
-    if replay_validation_failures:
-        diagnostics.append(f"replay_validation_failures={replay_validation_failures}")
-        if validation_error_counts:
-            top_errors = sorted(
-                validation_error_counts.items(),
-                key=lambda item: (-item[1], item[0]),
-            )[:3]
-            diagnostics.append(
-                "validation_errors="
-                + "; ".join(f"{error} x{count}" for error, count in top_errors)
-            )
-    raise RuntimeError(
-        "No replayable Ariadne split candidate satisfies the fixed split constraints. "
-        + ", ".join(diagnostics)
-    )
-
-
-def _select_validated_candidate(
-    runtime: UniversalModelSplitter,
-    eligible: list[EligibleCandidate],
-    constraints: SplitConstraints,
-) -> ValidatedCandidate:
-    grouped: dict[int, list[EligibleCandidate]] = defaultdict(list)
-    for item in eligible:
-        grouped[int(item[0].estimated_payload_bytes)].append(item)
-
-    replay_validation_failures = 0
-    replay_success_but_untrainable = 0
-    validation_error_counts: dict[str, int] = defaultdict(int)
-
-    for payload_bytes in sorted(grouped):
-        validated_group, failures, untrainable, error_counts = _validate_payload_group(
-            runtime,
-            grouped[payload_bytes],
-        )
-        replay_validation_failures += failures
-        replay_success_but_untrainable += untrainable
-        for error_text, count in error_counts.items():
-            validation_error_counts[error_text] += count
-        if validated_group:
-            return min(validated_group, key=_validated_candidate_key)
-
-    _raise_no_replayable_candidate(
-        constraints,
-        eligible_count=len(eligible),
-        replay_validation_failures=replay_validation_failures,
-        replay_success_but_untrainable=replay_success_but_untrainable,
-        validation_error_counts=validation_error_counts,
-    )
-
-
-def _build_validation_payload(
-    chosen: SplitCandidate,
-    profile: CandidateProfile | None,
-) -> dict[str, Any]:
-    validation = {
-        "validation_passed": bool(profile.validation_passed) if profile is not None else True,
-        "tail_trainability": bool(profile.tail_trainability)
-        if profile is not None
-        else bool(chosen.is_trainable_tail),
-        "replay_success_rate": float(profile.replay_success_rate) if profile is not None else 1.0,
-        "stability_score": float(profile.stability_score) if profile is not None else 1.0,
-    }
-    if profile is not None:
-        validation["measured_end_to_end_latency"] = float(profile.measured_end_to_end_latency)
-        validation["measured_edge_latency"] = float(profile.measured_edge_latency)
-        validation["measured_cloud_latency"] = float(profile.measured_cloud_latency)
-        if profile.metadata:
-            validation["profile_metadata"] = dict(profile.metadata)
-    return validation
 
 
 def _profile_from_report(
@@ -985,264 +548,63 @@ def _profile_from_report(
     )
 
 
-def _lazy_split_spec_for_sample(sample_input: Any):
-    trace_batch_size = _first_tensor_batch_size(sample_input) or 1
-    trace_batch_mode = "batch_gt1" if trace_batch_size > 1 else "batch_1"
-    return make_split_spec(
-        "auto",
-        dynamic_batch=(1, FIXED_SPLIT_DYNAMIC_BATCH_MAX),
-        trainable=True,
-        trace_batch_mode=trace_batch_mode,
-    )
+def _build_validation_payload(chosen: SplitCandidate, profile: CandidateProfile | None) -> dict[str, Any]:
+    validation = {
+        "validation_passed": bool(profile.validation_passed) if profile is not None else True,
+        "tail_trainability": bool(profile.tail_trainability) if profile is not None else bool(chosen.is_trainable_tail),
+        "replay_success_rate": float(profile.replay_success_rate) if profile is not None else 1.0,
+        "stability_score": float(profile.stability_score) if profile is not None else 1.0,
+    }
+    if profile is not None:
+        validation["measured_end_to_end_latency"] = float(profile.measured_end_to_end_latency)
+        validation["measured_edge_latency"] = float(profile.measured_edge_latency)
+        validation["measured_cloud_latency"] = float(profile.measured_cloud_latency)
+        if profile.metadata:
+            validation["profile_metadata"] = dict(profile.metadata)
+    return validation
 
 
-def _bind_lazy_ariadne_candidate(
+def _select_candidate(
     runtime: UniversalModelSplitter,
-    *,
-    model: torch.nn.Module,
-    sample_input: Any,
-    split_spec: Any,
-    plan: Any,
-    lazy_candidate: _LazyAriadneCandidate,
-    mode: str = "generated_eager",
-) -> SplitCandidate:
-    del plan
-    exact_spec = replace(
-        split_spec,
-        boundary=lazy_candidate.operation_split_id,
-    )
-    ariadne_runtime = prepare_exact_split_runtime(
-        model,
-        sample_input,
-        exact_spec,
-        mode=mode,
-        expected_boundary_tensor_labels=[
-            str(label)
-            for label in list(getattr(lazy_candidate.candidate, "boundary_nodes", ()) or [])
-        ],
-    )
-    runtime.bind_runtime(ariadne_runtime, model=model, split_spec=exact_spec)
-    runtime._trace_sample_input = sample_input
-    exact_candidate = getattr(ariadne_runtime, "candidate", None)
-    if exact_candidate is None:
-        exact_candidate = _exact_ariadne_candidate(lazy_candidate.candidate)
-    actual_split_id = _ariadne_candidate_operation_split_id(exact_candidate)
-    if actual_split_id != lazy_candidate.operation_split_id:
-        raise ValueError(
-            "Exact Ariadne split runtime resolved a different split candidate "
-            f"(requested={lazy_candidate.operation_split_id!r}, actual={actual_split_id!r})."
-        )
-    expected_boundary_labels = [
-        str(label)
-        for label in list(getattr(lazy_candidate.candidate, "boundary_nodes", ()) or [])
-    ]
-    actual_boundary_labels = [
-        str(label)
-        for label in list(getattr(exact_candidate, "boundary_nodes", ()) or [])
-    ]
-    if expected_boundary_labels and actual_boundary_labels != expected_boundary_labels:
-        raise ValueError(
-            "Exact Ariadne split runtime resolved different boundary tensors "
-            f"(requested={expected_boundary_labels!r}, actual={actual_boundary_labels!r})."
-        )
-    candidate = _candidate_from_ariadne_candidate(
-        ariadne_runtime,
-        getattr(ariadne_runtime, "split_spec", exact_spec),
-        exact_candidate,
-    )
-    candidate.edge_parameter_count = int(lazy_candidate.edge_parameter_count)
-    candidate.total_parameter_count = int(lazy_candidate.total_parameter_count)
-    candidate.edge_parameter_ratio = float(lazy_candidate.freezing_ratio)
-    candidate.estimated_privacy_risk = float(lazy_candidate.privacy_leakage)
-    runtime.current_candidate = candidate
-    runtime.candidates = [candidate]
-    return candidate
-
-
-def _compute_lazy_fixed_split_for_model(
-    model: torch.nn.Module,
+    eligible: list[EligibleCandidate],
     constraints: SplitConstraints,
-    *,
-    sample_input: Any,
-    sample_kwargs: Mapping[str, Any] | None,
-    runtime: UniversalModelSplitter,
-    model_name: str | None,
-    input_resize_mode: str,
-    front_version: str,
-    model_version: str,
-) -> SplitPlan:
-    if sample_kwargs:
-        raise RuntimeError("Ariadne fixed split planning expects positional example inputs.")
-
-    runtime.model = model
-    runtime.model_name = model_name
-    split_spec = _lazy_split_spec_for_sample(sample_input)
-    trace_batch_size = _first_tensor_batch_size(sample_input) or 1
-    trace_started = time.perf_counter()
-    logger.info(
-        "[FixedSplit] Lazy Ariadne trace started "
-        "(model_name={}, batch_size={}, dynamic_batch={}, trace_batch_mode={}).",
-        model_name or type(model).__name__,
-        trace_batch_size,
-        split_spec.dynamic_batch,
-        split_spec.trace_batch_mode,
-    )
-    plan = trace_model(
-        model,
-        example_inputs=_runtime_args(sample_input),
-        batch_symbol=split_spec.batch_symbol,
-        dynamic_batch=split_spec.dynamic_batch,
-        trace_batch_mode=split_spec.trace_batch_mode,
-    )
-    trace_elapsed = time.perf_counter() - trace_started
-    runtime.graph = str(getattr(plan, "graph_signature", "") or "")
-    runtime.split_spec = split_spec
-    runtime._trace_sample_input = sample_input
-    logger.info(
-        "[FixedSplit] Lazy Ariadne trace completed in {:.3f}s (graph_signature={}).",
-        trace_elapsed,
-        runtime.graph,
-    )
-
-    select_started = time.perf_counter()
-    eligible, candidate_pool_size = _lazy_ariadne_candidates(plan, constraints)
-    selection_elapsed = time.perf_counter() - select_started
+) -> tuple[SplitCandidate, float, float, CandidateProfile | None, Mapping[str, Any] | None]:
     if not eligible:
-        if candidate_pool_size:
-            raise RuntimeError(
-                "No split candidate satisfies the fixed split constraints. "
-                f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
-                "privacy_min_edge_parameter_count="
-                f"{_privacy_min_edge_parameter_count(constraints)}, "
-                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
-            )
         raise RuntimeError(
-            "No Ariadne split candidates were enumerated for fixed split planning; "
-            "refusing to use the runtime auto/current candidate as a fixed plan."
+            "No split candidate satisfies the fixed split constraints. "
+            f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
+            f"privacy_min_edge_parameter_count={_privacy_min_edge_parameter_count(constraints)}, "
+            f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
         )
-
-    attempts = 0
-    validation_error_counts: dict[str, int] = defaultdict(int)
-    max_attempts = max(1, int(constraints.max_candidates))
-    chosen: SplitCandidate | None = None
-    profile: CandidateProfile | None = None
-    chosen_lazy: _LazyAriadneCandidate | None = None
-    validation_report: Mapping[str, Any] | None = None
-    for lazy_candidate in eligible[:max_attempts]:
-        attempts += 1
-        try:
-            candidate = _bind_lazy_ariadne_candidate(
-                runtime,
-                model=model,
-                sample_input=sample_input,
-                split_spec=split_spec,
-                plan=plan,
-                lazy_candidate=lazy_candidate,
-            )
-        except Exception as exc:  # noqa: BLE001 - keep trying the next exact split candidate
-            validation_error_counts[str(exc) or type(exc).__name__] += 1
-            continue
+    validation_errors: dict[str, int] = defaultdict(int)
+    for candidate, privacy_leakage, freezing_ratio in sorted(eligible, key=_eligible_candidate_key)[: max(1, int(constraints.max_candidates))]:
         if not constraints.validate_candidates:
-            chosen = candidate
-            chosen_lazy = lazy_candidate
-            break
+            runtime.split(candidate=candidate)
+            return candidate, privacy_leakage, freezing_ratio, None, None
         try:
-            report = runtime.validate_candidate()
-        except Exception as exc:  # noqa: BLE001 - keep trying the next cheap candidate
-            validation_error_counts[str(exc) or type(exc).__name__] += 1
+            bound = runtime.split(candidate=candidate)
+            report = runtime.validate_candidate(bound)
+        except Exception as exc:
+            validation_errors[str(exc) or type(exc).__name__] += 1
             continue
         if not bool(report.get("success", False)):
-            validation_error_counts[str(report.get("error") or "unknown")] += 1
+            validation_errors[str(report.get("error") or "unknown")] += 1
             continue
-        if not bool(report.get("tail_trainability", candidate.is_trainable_tail)):
-            validation_error_counts["selected split does not have trainable suffix parameters"] += 1
+        if not bool(report.get("tail_trainability", bound.is_trainable_tail)):
+            validation_errors["selected split does not have trainable suffix parameters"] += 1
             continue
-        chosen = candidate
-        chosen_lazy = lazy_candidate
-        validation_report = report
-        profile = _profile_from_report(runtime, candidate, report)
-        break
-
-    if chosen is None or chosen_lazy is None:
-        _raise_no_replayable_candidate(
-            constraints,
-            eligible_count=len(eligible),
-            replay_validation_failures=attempts,
-            replay_success_but_untrainable=0,
-            validation_error_counts=validation_error_counts,
-        )
-
-    validation = _build_validation_payload(chosen, profile)
-    if validation_report is not None:
-        validation.update(dict(validation_report))
-    validation.update(
-        {
-            "runtime": "ariadne",
-            "selection": "lazy_constraints",
-            "split_id": chosen.candidate_id,
-            "candidate_pool_size": candidate_pool_size,
-            "eligible_candidate_count": len(eligible),
-            "lazy_validation_attempts": attempts,
-            "lazy_trace_time_sec": float(trace_elapsed),
-            "lazy_selection_time_sec": float(selection_elapsed),
-        }
-    )
-    canonical_split_key = _candidate_split_key(chosen)
-    candidate_descriptor = build_candidate_descriptor(chosen)
-    runtime_contract = _build_plan_runtime_contract(
-        model_name=model_name or model.__class__.__name__,
-        model_version=model_version,
-        candidate=chosen,
-        runtime=runtime,
-        sample_input=sample_input,
-        input_resize_mode=input_resize_mode,
-    )
-    split_granularity = str(
-        (chosen.metadata or {}).get("split_granularity") or "operation"
-    )
-    return SplitPlan(
-        split_config_id=_make_plan_id(
-            model_name=model_name or model.__class__.__name__,
-            candidate=chosen,
-            constraints=constraints,
-            runtime_contract=runtime_contract,
-        ),
-        canonical_split_key=canonical_split_key,
-        edge_split_id=canonical_split_key,
-        model_name=model_name or model.__class__.__name__,
-        candidate_id=chosen.candidate_id,
-        split_index=chosen.legacy_layer_index,
-        split_label=chosen.candidate_id,
-        boundary_tensor_labels=list(chosen.boundary_tensor_labels),
-        runtime_contract=runtime_contract,
-        input_tensor_shape=_input_tensor_shape_from_sample(sample_input),
-        input_resize_mode=str(input_resize_mode or "direct_resize"),
-        front_version=str(front_version or "0"),
-        payload_bytes=int(chosen.estimated_payload_bytes),
-        privacy_metric=float(chosen_lazy.privacy_leakage),
-        privacy_risk=float(chosen_lazy.privacy_leakage),
-        layer_freezing_ratio=float(chosen_lazy.freezing_ratio),
-        privacy_leakage=float(chosen_lazy.privacy_leakage),
-        edge_parameter_count=int(chosen_lazy.edge_parameter_count),
-        total_parameter_count=int(chosen_lazy.total_parameter_count),
-        validation=validation,
-        constraints=_constraints_payload(constraints),
-        candidate_descriptor=candidate_descriptor,
-        split_granularity=split_granularity,
-        trace_signature=_trace_signature(runtime),
-        trace_batch_mode=_splitter_trace_batch_mode(runtime),
-        dynamic_batch=_splitter_dynamic_batch(runtime),
-        trace_batch_size=trace_batch_size,
+        return bound, privacy_leakage, freezing_ratio, _profile_from_report(runtime, bound, report), report
+    top_errors = "; ".join(f"{error} x{count}" for error, count in sorted(validation_errors.items())[:3])
+    raise RuntimeError(
+        "No replayable TorchLens split candidate satisfies the fixed split constraints. "
+        f"eligible_candidates={len(eligible)}, validation_errors={top_errors}"
     )
 
 
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
     raw_candidate_id = plan.candidate_id or plan.edge_split_id or plan.canonical_split_key
     if raw_candidate_id is None:
-        raise RuntimeError(
-            "Ariadne fixed split plans must include candidate_id "
-            f"(split_config_id={plan.split_config_id!r})."
-        )
+        raise RuntimeError(f"Fixed split plans must include candidate_id (split_config_id={plan.split_config_id!r}).")
     return splitter.split(candidate_id=_normalise_after_key(raw_candidate_id))
 
 
@@ -1272,62 +634,32 @@ def compute_fixed_split_for_model(
     model_version: str = "0",
 ) -> SplitPlan:
     del cache_path
+    if sample_kwargs:
+        raise RuntimeError("TorchLens fixed split planning expects positional example inputs.")
     runtime = splitter or UniversalModelSplitter(device=device)
-    if runtime.graph is None or runtime.model is None:
-        return _compute_lazy_fixed_split_for_model(
+    if runtime.runtime is None or runtime.model is None:
+        runtime.trace(
             model,
-            constraints,
-            sample_input=sample_input,
-            sample_kwargs=sample_kwargs,
-            runtime=runtime,
+            sample_input,
+            boundary="50%",
             model_name=model_name,
-            input_resize_mode=input_resize_mode,
-            front_version=front_version,
-            model_version=model_version,
+            enable_dynamic_batch=True,
+            dynamic_batch_min=1,
+            dynamic_batch_max=FIXED_SPLIT_DYNAMIC_BATCH_MAX,
         )
-
-    if not _is_ariadne_runtime(runtime):
-        raise RuntimeError("Fixed split planning requires an Ariadne runtime.")
-
     eligible = _enumerate_feasible_candidates(runtime, constraints)
-    candidate_pool = list(getattr(runtime, "candidates", None) or [])
-    if eligible:
-        if not constraints.validate_candidates:
-            chosen, privacy_leakage, freezing_ratio = min(
-                eligible,
-                key=_eligible_candidate_key,
-            )
-            profile = None
-            runtime.split(candidate=chosen)
-        else:
-            profile, chosen, privacy_leakage, freezing_ratio = _select_validated_candidate(
-                runtime,
-                eligible,
-                constraints,
-            )
-        validation = _build_validation_payload(chosen, profile)
-        validation.update(
-            {
-                "runtime": "ariadne",
-                "selection": "constraints",
-                "split_id": chosen.candidate_id,
-                "candidate_pool_size": len(candidate_pool),
-            }
-        )
-    else:
-        if candidate_pool:
-            raise RuntimeError(
-                "No split candidate satisfies the fixed split constraints. "
-                f"privacy_leakage_upper_bound={constraints.privacy_leakage_upper_bound}, "
-                "privacy_min_edge_parameter_count="
-                f"{_privacy_min_edge_parameter_count(constraints)}, "
-                f"max_layer_freezing_ratio={constraints.max_layer_freezing_ratio}"
-            )
-        raise RuntimeError(
-            "No Ariadne split candidates were enumerated for fixed split planning; "
-            "refusing to use the runtime auto/current candidate as a fixed plan."
-        )
-
+    chosen, privacy_leakage, freezing_ratio, profile, report = _select_candidate(runtime, eligible, constraints)
+    validation = _build_validation_payload(chosen, profile)
+    if report is not None:
+        validation.update(dict(report))
+    validation.update(
+        {
+            "runtime": "torchlens_native",
+            "selection": "constraints",
+            "split_id": chosen.candidate_id,
+            "candidate_pool_size": len(getattr(runtime, "candidates", None) or []),
+        }
+    )
     canonical_split_key = _candidate_split_key(chosen)
     candidate_descriptor = build_candidate_descriptor(chosen)
     runtime_contract = _build_plan_runtime_contract(
@@ -1337,9 +669,6 @@ def compute_fixed_split_for_model(
         runtime=runtime,
         sample_input=sample_input,
         input_resize_mode=input_resize_mode,
-    )
-    split_granularity = str(
-        (chosen.metadata or {}).get("split_granularity") or "operation"
     )
     return SplitPlan(
         split_config_id=_make_plan_id(
@@ -1369,7 +698,7 @@ def compute_fixed_split_for_model(
         validation=validation,
         constraints=_constraints_payload(constraints),
         candidate_descriptor=candidate_descriptor,
-        split_granularity=split_granularity,
+        split_granularity=str((chosen.metadata or {}).get("split_granularity") or "operation"),
         trace_signature=_trace_signature(runtime),
         trace_batch_mode=_splitter_trace_batch_mode(runtime),
         dynamic_batch=_splitter_dynamic_batch(runtime),
@@ -1415,18 +744,16 @@ def load_or_compute_fixed_split_plan(
             cached.plan_version,
             FIXED_SPLIT_PLAN_VERSION,
         )
-
     if (
-        runtime.graph is not None
+        runtime.runtime is not None
         and runtime.model is not None
         and cached is not None
         and not cached_invalidated
     ):
-        trace_signature = _trace_signature(runtime)
         cache_matches = cached.matches(
             model_name=model_key,
             constraints=constraints,
-            trace_signature=trace_signature,
+            trace_signature=_trace_signature(runtime),
             input_tensor_shape=sample_input_shape,
             input_resize_mode=input_resize_mode,
             front_version=front_version,
@@ -1436,19 +763,17 @@ def load_or_compute_fixed_split_plan(
             try:
                 cached_candidate = apply_split_plan(runtime, cached)
                 if validate_cached_plan:
-                    validation_started = time.perf_counter()
+                    started = time.perf_counter()
                     report = runtime.validate_candidate(cached_candidate)
-                    validation_elapsed = time.perf_counter() - validation_started
                     if not bool(report.get("success", False)):
                         raise RuntimeError(
                             "Persisted split plan is no longer replayable. "
-                            f"candidate_id={cached_candidate.candidate_id}, "
-                            f"error={report.get('error')}"
+                            f"candidate_id={cached_candidate.candidate_id}, error={report.get('error')}"
                         )
                     cached.validation = {
                         **cached.validation,
                         **report,
-                        "cached_validation_time_sec": float(validation_elapsed),
+                        "cached_validation_time_sec": float(time.perf_counter() - started),
                     }
                 return cached
             except (KeyError, RuntimeError, ValueError) as exc:
@@ -1457,7 +782,6 @@ def load_or_compute_fixed_split_plan(
         else:
             cached_invalidated = True
             logger.info("Cached fixed split plan metadata is stale; recomputing.")
-
     plan = compute_fixed_split_for_model(
         model,
         constraints,
@@ -1473,20 +797,27 @@ def load_or_compute_fixed_split_plan(
     )
     if cache_path and (cached is None or cached_invalidated):
         persist_split_plan(cache_path, plan)
-    elif cache_path and cached is not None and cached.matches(
-        model_name=model_key,
-        constraints=constraints,
-        trace_signature=plan.trace_signature,
-        input_tensor_shape=sample_input_shape,
-        input_resize_mode=input_resize_mode,
-        front_version=front_version,
-        model_version=model_version,
-    ):
-        logger.info("Fixed split plan cache already matches the current runtime.")
     elif cache_path and cached is not None:
         logger.info(
-            "Existing fixed split plan cache is stale for the current Ariadne trace; "
+            "Existing fixed split plan cache is stale for the current TorchLens trace; "
             "using an in-memory plan without overwriting {}.",
             cache_path,
         )
     return plan
+
+
+__all__ = [
+    "FIXED_SPLIT_DYNAMIC_BATCH_MAX",
+    "FIXED_SPLIT_PLAN_VERSION",
+    "PRIVACY_LEAKAGE_EPSILON",
+    "SplitConstraints",
+    "SplitPlan",
+    "apply_split_plan",
+    "compute_fixed_split_for_model",
+    "estimate_privacy_leakage_from_edge_params",
+    "load_or_compute_fixed_split_plan",
+    "load_split_plan",
+    "min_edge_parameters_for_privacy",
+    "persist_split_plan",
+    "validate_split_plan",
+]

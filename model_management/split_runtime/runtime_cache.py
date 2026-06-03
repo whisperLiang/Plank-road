@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 import threading
 from collections.abc import Callable, Hashable, Mapping
@@ -10,7 +9,11 @@ from typing import Any
 
 import torch
 
-from .ariadne_runtime import ARIADNE_RUNTIME_ADAPTER_VERSION, SplitSpec
+from .torchlens_native_runtime import (
+    TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
+    SplitSpec,
+    torchlens_runtime_version,
+)
 
 
 def _stable_json_dumps(payload: object) -> str:
@@ -19,13 +22,6 @@ def _stable_json_dumps(payload: object) -> str:
 
 def stable_hash(payload: object) -> str:
     return hashlib.sha256(_stable_json_dumps(payload).encode("utf-8")).hexdigest()
-
-
-def ariadne_runtime_version() -> str:
-    try:
-        return importlib.metadata.version("ariadne-split")
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"
 
 
 def symbolize_shape(shape: Any, *, batch_symbol: str = "B") -> list[Any]:
@@ -143,8 +139,8 @@ def make_runtime_cache_key(
     return RuntimeCacheKey(
         model_name=str(model_name),
         model_family=str(model_family),
-        runtime_version=ariadne_runtime_version(),
-        adapter_version=ARIADNE_RUNTIME_ADAPTER_VERSION,
+        runtime_version=torchlens_runtime_version(),
+        adapter_version=TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
         graph_signature=graph_signature,
         split_plan_hash=split_plan_hash_value or split_spec_hash(split_spec),
         symbolic_input_schema_hash=schema_hash,
@@ -189,7 +185,6 @@ __all__ = [
     "RuntimeCache",
     "RuntimeCacheKey",
     "RuntimeCacheLookup",
-    "ariadne_runtime_version",
     "make_runtime_cache_key",
     "split_spec_hash",
     "stable_hash",

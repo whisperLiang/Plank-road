@@ -169,27 +169,22 @@ def _detach_boundary_payload(payload: BoundaryPayload) -> BoundaryPayload:
         for label, tensor in dict(payload.tensors or {}).items()
         if isinstance(tensor, torch.Tensor)
     }
-    passthrough_inputs = {
-        str(label): _detach_cpu_value(value)
-        for label, value in dict(payload.passthrough_inputs or {}).items()
-    }
+    metadata = {str(label): _detach_cpu_value(value) for label, value in dict(payload.metadata or {}).items()}
     return boundary_payload_from_tensors(
         tensors,
         split_id=str(payload.split_id),
-        graph_signature=str(payload.graph_signature),
-        batch_size=int(payload.batch_size),
-        schema=dict(getattr(payload, "schema", {}) or {}),
-        requires_grad=dict(getattr(payload, "requires_grad", {}) or {}),
-        weight_version=getattr(payload, "weight_version", None),
-        passthrough_inputs=passthrough_inputs,
-        supports_prefix_backward=bool(getattr(payload, "supports_prefix_backward", False)),
-        prefix_backward_owner_id=getattr(payload, "prefix_backward_owner_id", None),
-        protocol_version=getattr(payload, "protocol_version", 2),
-        values=tuple(
-            _detach_cpu_value(value)
-            for value in tuple(getattr(payload, "values", ()) or ())
+        graph_signature=str(
+            payload.metadata.get("graph_shape_hash")
+            or payload.metadata.get("graph_signature")
+            or ""
         ),
-        value_schema=tuple(getattr(payload, "value_schema", ()) or ()),
+        batch_size=int(payload.batch_size),
+        schema=dict(getattr(payload, "spec", {}) or {}),
+        weight_version=payload.metadata.get("weight_version"),
+        supports_prefix_backward=bool(payload.metadata.get("supports_prefix_backward", False)),
+        prefix_backward_owner_id=payload.metadata.get("prefix_backward_owner_id"),
+        protocol_version=payload.metadata.get("protocol_version", 2),
+        metadata=metadata,
     )
 
 
@@ -352,8 +347,7 @@ def _normalise_boundary_payload_for_contract(
 ) -> BoundaryPayload | None:
     if payload is None:
         return None
-    payload_schema = dict(payload.schema or {})
-    payload_requires_grad = dict(payload.requires_grad or {})
+    payload_schema = dict(payload.spec or {})
     schema = {}
     requires_grad = {}
     for source_label, target_label in dict(source_to_target).items():
@@ -362,35 +356,27 @@ def _normalise_boundary_payload_for_contract(
         spec = payload_schema.get(source_label) or payload_schema.get(target_label)
         if spec is not None:
             try:
-                schema[target_label] = replace(spec, label=target_label)
+                schema[target_label] = replace(spec, torchlens_label=target_label)
             except TypeError:
                 schema[target_label] = spec
-        requires_grad[target_label] = bool(
-            payload_requires_grad.get(
-                source_label,
-                payload_requires_grad.get(
-                    target_label,
-                    bool(dict(tensors)[target_label].requires_grad),
-                ),
-            )
-        )
+        requires_grad[target_label] = bool(dict(tensors)[target_label].requires_grad)
     return boundary_payload_from_tensors(
         {str(label): tensor for label, tensor in dict(tensors).items()},
         split_id=str(split_contract.cloud_batch_split_id or payload.split_id),
         graph_signature=str(
             dict(split_contract.runtime_identity or {}).get("graph_signature")
-            or payload.graph_signature
+            or payload.metadata.get("graph_shape_hash")
+            or payload.metadata.get("graph_signature")
+            or ""
         ),
         batch_size=1,
         schema=schema or None,
         requires_grad=requires_grad or None,
-        weight_version=getattr(payload, "weight_version", None),
-        passthrough_inputs=dict(getattr(payload, "passthrough_inputs", {}) or {}),
-        supports_prefix_backward=bool(getattr(payload, "supports_prefix_backward", False)),
-        prefix_backward_owner_id=getattr(payload, "prefix_backward_owner_id", None),
-        protocol_version=getattr(payload, "protocol_version", 2),
-        values=tuple(getattr(payload, "values", ()) or ()),
-        value_schema=tuple(getattr(payload, "value_schema", ()) or ()),
+        weight_version=payload.metadata.get("weight_version"),
+        supports_prefix_backward=bool(payload.metadata.get("supports_prefix_backward", False)),
+        prefix_backward_owner_id=payload.metadata.get("prefix_backward_owner_id"),
+        protocol_version=payload.metadata.get("protocol_version", 2),
+        metadata=dict(payload.metadata or {}),
     )
 
 

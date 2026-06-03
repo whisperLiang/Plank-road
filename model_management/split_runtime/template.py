@@ -1,20 +1,20 @@
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from collections.abc import Callable, Hashable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import torch
-from ariadne.codegen.segment_builder import build_segments
-from ariadne.trace.interception import ConstantTensorArg
 from loguru import logger
+from torchlens.split.codegen import build_segments
 
-from .ariadne_runtime import SplitRuntime, SplitSpec
 from .runtime_cache import RuntimeCacheKey, make_runtime_cache_key
+from .torchlens_native_runtime import SplitRuntime, SplitSpec
 
-FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 3
+FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -32,9 +32,7 @@ class FixedSplitRuntimeTemplateKey(RuntimeCacheKey):
         if self.validated_batch_max is not None:
             payload["validated_batch_max"] = int(self.validated_batch_max)
         if self.runtime_batch_validation_signature:
-            payload["runtime_batch_validation_signature"] = (
-                self.runtime_batch_validation_signature
-            )
+            payload["runtime_batch_validation_signature"] = self.runtime_batch_validation_signature
         return payload
 
 
@@ -63,9 +61,7 @@ def fixed_split_runtime_template_key(
     return FixedSplitRuntimeTemplateKey(
         **key.__dict__,
         trace_batch_size=None if trace_batch_size is None else int(trace_batch_size),
-        validated_batch_max=(
-            None if validated_batch_max is None else int(validated_batch_max)
-        ),
+        validated_batch_max=None if validated_batch_max is None else int(validated_batch_max),
         runtime_batch_validation_signature=runtime_batch_validation_signature,
     )
 
@@ -113,10 +109,7 @@ class FixedSplitRuntimeTemplateCache:
         with self._lock:
             cached = self._templates.get(cache_key)
             if cached is not None:
-                logger.info(
-                    "[FixedSplitCL] Ariadne runtime template cache hit (key={}).",
-                    cache_key,
-                )
+                logger.info("[FixedSplitCL] TorchLens runtime template cache hit (key={}).", cache_key)
                 return FixedSplitRuntimeTemplateLookup(template=cached, cache_status="hit")
 
             inflight = self._inflight.get(cache_key)
@@ -124,16 +117,10 @@ class FixedSplitRuntimeTemplateCache:
                 inflight = _InflightTemplateBuild(event=threading.Event())
                 self._inflight[cache_key] = inflight
                 build_owner = True
-                logger.info(
-                    "[FixedSplitCL] Ariadne runtime template cache miss (key={}).",
-                    cache_key,
-                )
+                logger.info("[FixedSplitCL] TorchLens runtime template cache miss (key={}).", cache_key)
             else:
                 build_owner = False
-                logger.info(
-                    "[FixedSplitCL] Waiting for Ariadne runtime template build (key={}).",
-                    cache_key,
-                )
+                logger.info("[FixedSplitCL] Waiting for TorchLens runtime template build (key={}).", cache_key)
 
         if not build_owner:
             wait_started = time.perf_counter()
@@ -142,10 +129,7 @@ class FixedSplitRuntimeTemplateCache:
             if inflight.error is not None:
                 raise inflight.error
             if inflight.template is None:
-                raise RuntimeError(
-                    "Ariadne runtime template build completed without a template "
-                    f"(key={cache_key})."
-                )
+                raise RuntimeError(f"TorchLens runtime template build completed without a template (key={cache_key}).")
             return FixedSplitRuntimeTemplateLookup(
                 template=inflight.template,
                 cache_status="wait",
@@ -169,7 +153,7 @@ class FixedSplitRuntimeTemplateCache:
             self._inflight.pop(cache_key, None)
             inflight.event.set()
         logger.info(
-            "[FixedSplitCL] Ariadne runtime template cold build completed in {:.3f}s (key={}).",
+            "[FixedSplitCL] TorchLens runtime template cold build completed in {:.3f}s (key={}).",
             elapsed,
             cache_key,
         )
@@ -198,143 +182,38 @@ def bind_request_runtime_from_template(
     model: Any | None = None,
     device: str | None = None,
 ) -> SplitRuntime:
-    """Bind a request-specific runtime from a cached template.
-    
-    Args:
-        template: The cached template to bind.
-        model: Reserved for future use (per-request model customization).
-        device: Reserved for future use (device-specific binding).
-    
-    Returns:
-        A split runtime bound to the request model.
-    """
-    _ = device  # The request model already carries the desired device.
-    if model is None:
+    del device
+    if model is None or model is getattr(template.runtime, "model", None):
         return template.runtime
     return _rebind_runtime_to_model(template.runtime, model)
 
 
 def _rebind_runtime_to_model(runtime: SplitRuntime, model: Any) -> SplitRuntime:
-    trace_plan = _rebind_trace_plan_to_model(runtime.trace_plan, model)
-    candidate = _rebind_candidate_device(getattr(runtime, "candidate", None), model)
-    variants = tuple(
-        _rebind_runtime_to_model(variant, model)
-        for variant in tuple(getattr(runtime, "variants", ()) or ())
-    )
+    graph = copy.deepcopy(runtime.trace_graph)
+    _rebind_graph_param_refs(graph, model)
+    segments = build_segments(graph, runtime.plan, mode=runtime.split_spec.mode)
     return SplitRuntime(
-        trace_plan=trace_plan,
+        model=model,
+        trace_graph=graph,
         split_spec=runtime.split_spec,
-        candidate=candidate,
-        segments=build_segments(trace_plan, candidate),
-        mode=runtime.mode,
-        variants=variants,
-        batch_range=getattr(runtime, "batch_range", None),
+        plan=runtime.plan,
+        segments=segments,
     )
 
 
-def _model_device(model: Any) -> Any:
-    if model is None:
-        return None
-    for parameter in getattr(model, "parameters", lambda **_: ())():
-        target_device = getattr(parameter, "device", None)
-        if target_device is not None:
-            return target_device
-    for buffer in getattr(model, "buffers", lambda **_: ())():
-        target_device = getattr(buffer, "device", None)
-        if target_device is not None:
-            return target_device
-    return None
-
-
-def _rebind_trace_plan_to_model(trace_plan: Any, model: Any) -> Any:
-    target_device = _model_device(model)
-    artifact = getattr(trace_plan, "runtime_artifact", None)
-    if target_device is not None and artifact is not None:
-        ops = tuple(
-            replace(
-                op,
-                args_template=_move_template_tensors_to_device(
-                    getattr(op, "args_template", None),
-                    target_device,
-                ),
-                kwargs_template=_move_template_tensors_to_device(
-                    getattr(op, "kwargs_template", None),
-                    target_device,
-                ),
-                output_template=_move_template_tensors_to_device(
-                    getattr(op, "output_template", None),
-                    target_device,
-                ),
-            )
-            for op in tuple(getattr(artifact, "ops", ()) or ())
-        )
-        artifact = replace(artifact, ops=ops)
-    return replace(trace_plan, root_module=model, runtime_artifact=artifact)
-
-
-def _move_template_tensors_to_device(value: Any, device: Any) -> Any:
-    if isinstance(value, ConstantTensorArg):
-        return replace(value, value=value.value.to(device))
-    if isinstance(value, torch.device):
-        return torch.device(device)
-    if hasattr(value, "device") and hasattr(value, "to"):
-        try:
-            return value.to(device)
-        except Exception:
-            return value
-    if isinstance(value, tuple):
-        return tuple(_move_template_tensors_to_device(item, device) for item in value)
-    if isinstance(value, list):
-        return [_move_template_tensors_to_device(item, device) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: _move_template_tensors_to_device(item, device)
-            for key, item in value.items()
-        }
-    if isinstance(value, slice):
-        return slice(
-            _move_template_tensors_to_device(value.start, device),
-            _move_template_tensors_to_device(value.stop, device),
-            _move_template_tensors_to_device(value.step, device),
-        )
-    return value
-
-
-def _rebind_candidate_device(candidate: Any, model: Any) -> Any:
-    if candidate is None:
-        return None
-    target_device = _model_device(model)
-    if target_device is None:
-        return candidate
-
-    def _rebind_spec(spec: Any) -> Any:
-        try:
-            return replace(spec, device_type=str(target_device.type))
-        except Exception:
-            return spec
-
-    boundary_schema = getattr(candidate, "boundary_schema", None)
-    if isinstance(boundary_schema, dict):
-        boundary_schema = {
-            str(label): _rebind_spec(spec)
-            for label, spec in boundary_schema.items()
-        }
-
-    boundary_value_schema = getattr(candidate, "boundary_value_schema", None)
-    if isinstance(boundary_value_schema, dict):
-        boundary_value_schema = {
-            str(label): replace(spec, tensor_spec=_rebind_spec(getattr(spec, "tensor_spec", None)))
-            for label, spec in boundary_value_schema.items()
-        }
-
-    try:
-        return replace(
-            candidate,
-            boundary_schema=boundary_schema if boundary_schema is not None else getattr(candidate, "boundary_schema", None),
-            boundary_value_schema=boundary_value_schema if boundary_value_schema is not None else getattr(candidate, "boundary_value_schema", None),
-        )
-    except TypeError:
-        return candidate
+def _rebind_graph_param_refs(graph: Any, model: Any) -> None:
+    if not isinstance(model, torch.nn.Module):
+        return
+    named_parameters = dict(model.named_parameters())
+    for node in getattr(graph, "ordered_nodes", lambda: ())():
+        layer = getattr(node, "layer", None)
+        for param_log in list(getattr(layer, "parent_param_logs", []) or []):
+            address = str(getattr(param_log, "address", "") or "")
+            if address and address in named_parameters:
+                try:
+                    setattr(param_log, "_param_ref", named_parameters[address])
+                except Exception:
+                    pass
 
 
 _PROCESS_FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE = FixedSplitRuntimeTemplateCache()

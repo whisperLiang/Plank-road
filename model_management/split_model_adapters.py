@@ -162,7 +162,7 @@ def _patch_rfdetr_decoder_batch_polymorphism(model: torch.nn.Module) -> None:
     """Replace RF-DETR's training-only split(bs) path with tensor reshapes.
 
     The upstream decoder rebuilds grouped queries via ``tgt2.split(bs, dim=0)``.
-    Ariadne traces that list length from the canonical batch and then rejects
+    Split replay traces that list length from the canonical batch can reject
     larger batches. The equivalent reshape keeps the same tensor math while
     avoiding a Python list whose length depends on batch size.
     """
@@ -1762,16 +1762,19 @@ def _has_nonempty_floating_tensors(value: Any) -> bool:
 
 
 def _tail_activation_probe_loss(runtime, candidate) -> torch.Tensor | None:
-    if runtime is None or candidate is None or getattr(runtime, "graph", None) is None:
+    trace_graph = getattr(runtime, "trace_graph", None)
+    runtime_state = getattr(runtime, "runtime_state", None)
+    state_values = getattr(runtime_state, "values", None)
+    if runtime is None or candidate is None or trace_graph is None or not isinstance(state_values, Mapping):
         return None
 
-    graph = runtime.graph
     selected_labels: list[str] = []
     for label in reversed(candidate.cloud_nodes):
-        node = graph.nodes.get(label)
-        if node is None or not node.has_trainable_params:
+        node = dict(getattr(trace_graph, "nodes", {}) or {}).get(str(label))
+        layer = getattr(node, "layer", None)
+        if node is None or not getattr(layer, "parent_param_logs", None):
             continue
-        if label not in runtime.runtime_state.values:
+        if label not in state_values:
             continue
         selected_labels.append(label)
         if len(selected_labels) >= 4:
@@ -1780,7 +1783,7 @@ def _tail_activation_probe_loss(runtime, candidate) -> torch.Tensor | None:
     total: torch.Tensor | None = None
     pieces = 0
     for label in selected_labels:
-        value = runtime.runtime_state.values.get(label)
+        value = state_values.get(label)
         for tensor in _iter_tensors(value):
             if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
                 continue

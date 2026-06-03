@@ -10,15 +10,15 @@ class SplitRuntimeError(RuntimeError):
 
 
 class BatchPrefixError(SplitRuntimeError):
-    """Raised when Ariadne prefix execution fails for a batch."""
+    """Raised when split prefix execution fails for a batch."""
 
 
 class BatchSuffixReplayError(SplitRuntimeError):
-    """Raised when Ariadne suffix replay fails for a batch."""
+    """Raised when split suffix replay fails for a batch."""
 
 
 class SplitTailTrainingError(SplitRuntimeError):
-    """Raised when Ariadne suffix training fails for a batch."""
+    """Raised when split suffix training fails for a batch."""
 
 
 class UnsupportedModelAdapterError(SplitRuntimeError):

@@ -4,19 +4,17 @@ from typing import Any
 
 import torch
 
-from .ariadne_adapter import (
+from .torchlens_native_runtime import (
+    TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
+    BoundaryPayload,
     SplitRuntimeConfig,
+    SplitRuntime,
+    SplitSpec,
     build_replay_runtime,
     build_split_runtime,
     get_split_runtime_metadata,
-    maybe_warmup_runtime,
-)
-from .ariadne_runtime import (
-    ARIADNE_RUNTIME_ADAPTER_VERSION,
-    BoundaryPayload,
-    SplitRuntime,
-    SplitSpec,
     make_split_spec,
+    maybe_warmup_runtime,
     prepare_split_replay_runtime,
     prepare_split_runtime,
 )
@@ -101,6 +99,10 @@ def compare_outputs(
         rhs_cpu = rhs.detach().cpu()
         if lhs_cpu.numel() == 0:
             continue
+        if not lhs_cpu.is_floating_point() and not rhs_cpu.is_floating_point():
+            if not torch.equal(lhs_cpu, rhs_cpu):
+                return False, float("inf")
+            continue
         diff = float((lhs_cpu - rhs_cpu).abs().max().item())
         max_diff = max(max_diff, diff)
         if not torch.allclose(lhs_cpu, rhs_cpu, atol=atol, rtol=rtol):
@@ -109,7 +111,6 @@ def compare_outputs(
 
 
 __all__ = [
-    "ARIADNE_RUNTIME_ADAPTER_VERSION",
     "BatchPrefixError",
     "BatchSuffixReplayError",
     "BOUNDARY_CACHE_PROTOCOL",
@@ -131,6 +132,7 @@ __all__ = [
     "SplitRuntimeError",
     "SplitSpec",
     "SplitTailTrainingError",
+    "TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION",
     "UnsupportedModelAdapterError",
     "bind_request_runtime_from_template",
     "build_replay_runtime",

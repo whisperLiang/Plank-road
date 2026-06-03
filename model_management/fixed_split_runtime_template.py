@@ -25,9 +25,9 @@ def describe_split_candidate(candidate: SplitCandidate) -> dict[str, Any]:
 
 
 def restore_split_candidate(graph: Any, descriptor: Mapping[str, Any] | None) -> SplitCandidate:
-    candidate = reconstruct_candidate_from_descriptor(graph, descriptor, source="ariadne_template")
+    candidate = reconstruct_candidate_from_descriptor(graph, descriptor, source="torchlens_template")
     if candidate is None:
-        raise RuntimeError("Could not restore split candidate from Ariadne runtime template.")
+        raise RuntimeError("Could not restore split candidate from TorchLens runtime template.")
     return candidate
 
 

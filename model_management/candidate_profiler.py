@@ -1,9 +1,33 @@
 from __future__ import annotations
 
 import time
-from typing import Sequence
+from collections.abc import Mapping, Sequence
 
 from model_management.split_candidate import CandidateProfile, SplitCandidate
+
+
+def _candidate_boundary_shape_summary(runtime, candidate: SplitCandidate) -> list[tuple[str, object]]:
+    schema = dict(getattr(candidate, "metadata", {}) or {}).get("boundary_schema")
+    if isinstance(schema, Sequence) and not isinstance(schema, (str, bytes)):
+        summary: list[tuple[str, object]] = []
+        for item in schema:
+            if not isinstance(item, Mapping):
+                continue
+            label = str(item.get("canonical_id") or item.get("torchlens_label") or "")
+            summary.append((label, item.get("symbolic_shape")))
+        if summary:
+            return summary
+
+    graph = getattr(runtime, "trace_graph", None)
+    if graph is None:
+        graph = getattr(getattr(runtime, "runtime", None), "trace_graph", None)
+    nodes = dict(getattr(graph, "nodes", {}) or {})
+    summary = []
+    for label in candidate.boundary_tensor_labels:
+        node = nodes.get(str(label))
+        shape = getattr(node, "shape", None) or getattr(node, "tensor_shape", None)
+        summary.append((str(label), shape))
+    return summary
 
 
 def profile_candidates(
@@ -27,7 +51,10 @@ def profile_candidates(
             trainable = True
             for _ in range(max(1, validation_runs)):
                 start = time.perf_counter()
-                report = runtime.validate_candidate(candidate)
+                if hasattr(runtime, "validate_candidate"):
+                    report = runtime.validate_candidate(candidate)
+                else:
+                    report = {"success": True, "tail_trainability": candidate.is_trainable_tail}
                 elapsed = time.perf_counter() - start
                 end_to_end_latency += elapsed
                 edge_latency += float(report.get("edge_latency", 0.0))
@@ -52,10 +79,7 @@ def profile_candidates(
             cloud_flops=candidate.estimated_cloud_flops,
             payload_bytes=candidate.estimated_payload_bytes,
             boundary_tensor_count=candidate.boundary_count,
-            boundary_shape_summary=[
-                (label, runtime.graph.nodes[label].tensor_shape)
-                for label in candidate.boundary_tensor_labels
-            ],
+            boundary_shape_summary=_candidate_boundary_shape_summary(runtime, candidate),
             estimated_privacy_leakage=candidate.estimated_privacy_risk,
             measured_edge_latency=edge_latency,
             measured_cloud_latency=cloud_latency,
