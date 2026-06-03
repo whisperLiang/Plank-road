@@ -6,7 +6,14 @@ import pytest
 import torch
 from torch import nn
 
+import model_management.split_runtime.template as runtime_template_module
 from model_management.fixed_split import SplitConstraints, compute_fixed_split_for_model
+from model_management.fixed_split_runtime_template import (
+    FixedSplitRuntimeTemplate,
+    bind_request_runtime_from_template,
+    bind_request_splitter_from_template,
+    fixed_split_runtime_template_key,
+)
 from model_management.split_runtime import (
     BOUNDARY_CACHE_PROTOCOL,
     BoundaryPayloadCacheCodec,
@@ -39,6 +46,115 @@ def _prepared_splitter() -> tuple[TinySplitModel, torch.Tensor, UniversalModelSp
     assert candidates
     splitter.split(candidate=candidates[0])
     return model, example, splitter
+
+
+def _fixed_runtime_template(
+    model: TinySplitModel,
+    example: torch.Tensor,
+    splitter: UniversalModelSplitter,
+) -> FixedSplitRuntimeTemplate:
+    del model
+    runtime = splitter.runtime
+    key = fixed_split_runtime_template_key(
+        model_name="tiny",
+        model_family="tiny",
+        split_spec=runtime.split_spec,
+        example_inputs=example,
+        graph_signature=str(
+            getattr(runtime.trace_graph, "graph_shape_hash", "") or "tiny"
+        ),
+        split_plan_hash="tiny-plan",
+        mode=getattr(runtime.split_spec, "mode", "generated_eager"),
+    )
+    return FixedSplitRuntimeTemplate(
+        cache_key=key,
+        runtime=runtime,
+        split_spec=runtime.split_spec,
+        model_name="tiny",
+        model_family="tiny",
+        graph_signature=str(
+            getattr(runtime.trace_graph, "graph_shape_hash", "") or "tiny"
+        ),
+        symbolic_input_schema_hash=key.symbolic_input_schema_hash,
+        split_plan_hash=str(key.split_plan_hash),
+        mode=getattr(runtime.split_spec, "mode", "generated_eager"),
+        runtime_device="cpu",
+    )
+
+
+def _poison_trace_graph_deepcopy(runtime) -> None:
+    node = next(iter(runtime.trace_graph.nodes.values()))
+    setattr(
+        node.layer,
+        "_plank_road_nonleaf_deepcopy_probe",
+        torch.ones(2, requires_grad=True) * 2,
+    )
+
+
+def test_template_binding_same_model_returns_template_runtime() -> None:
+    model, example, splitter = _prepared_splitter()
+    template = _fixed_runtime_template(model, example, splitter)
+
+    assert bind_request_runtime_from_template(template, model=None) is splitter.runtime
+    assert bind_request_runtime_from_template(template, model=model) is splitter.runtime
+
+
+def test_template_binding_different_model_requires_example_inputs() -> None:
+    model, example, splitter = _prepared_splitter()
+    template = _fixed_runtime_template(model, example, splitter)
+
+    with pytest.raises(RuntimeError, match="cannot be rebound by deepcopy"):
+        bind_request_runtime_from_template(template, model=TinySplitModel().eval())
+
+
+def test_template_binding_different_model_reprepares_runtime(monkeypatch) -> None:
+    model, example, splitter = _prepared_splitter()
+    _poison_trace_graph_deepcopy(splitter.runtime)
+    template = _fixed_runtime_template(model, example, splitter)
+    prepared_calls: list[tuple[nn.Module, object, object, object]] = []
+    real_prepare = runtime_template_module.prepare_split_runtime
+
+    def spy_prepare(model_arg, example_inputs_arg, split_spec_arg, mode=None):
+        prepared_calls.append((model_arg, example_inputs_arg, split_spec_arg, mode))
+        return real_prepare(model_arg, example_inputs_arg, split_spec_arg, mode=mode)
+
+    monkeypatch.setattr(runtime_template_module, "prepare_split_runtime", spy_prepare)
+
+    request_model = TinySplitModel().eval()
+    request_runtime = bind_request_runtime_from_template(
+        template,
+        model=request_model,
+        example_inputs=example,
+    )
+
+    assert prepared_calls
+    assert prepared_calls[0][0] is request_model
+    assert request_runtime is not splitter.runtime
+    with torch.no_grad():
+        replayed = request_runtime.run_suffix(request_runtime.run_prefix(example))
+        expected = request_model(example)
+    assert torch.allclose(replayed, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_template_splitter_binding_reprepares_for_different_model() -> None:
+    model, example, splitter = _prepared_splitter()
+    _poison_trace_graph_deepcopy(splitter.runtime)
+    template = _fixed_runtime_template(model, example, splitter)
+    request_model = TinySplitModel().eval()
+
+    request_splitter, candidate = bind_request_splitter_from_template(
+        request_model,
+        template,
+        example_inputs=example,
+        device="cpu",
+    )
+
+    assert candidate is not None
+    boundary = request_splitter.edge_forward(example)
+    replayed = request_splitter.cloud_forward(boundary)
+    with torch.no_grad():
+        expected = request_model(example)
+    assert torch.allclose(replayed, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_native_split_replays_and_enumerates_compute_boundaries() -> None:

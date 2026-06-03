@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import copy
 import threading
 import time
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-import torch
 from loguru import logger
-from torchlens.split.codegen import build_segments
 
 from .runtime_cache import RuntimeCacheKey, make_runtime_cache_key
-from .torchlens_native_runtime import SplitRuntime, SplitSpec
+from .torchlens_native_runtime import SplitRuntime, SplitSpec, prepare_split_runtime
 
 FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 4
 
@@ -69,6 +66,8 @@ def fixed_split_runtime_template_key(
 @dataclass(frozen=True)
 class FixedSplitRuntimeTemplate:
     cache_key: FixedSplitRuntimeTemplateKey
+    # TorchLens native executable runtimes are not rebindable across model
+    # instances. This runtime is kept only as a read-only trace/layout artifact.
     runtime: SplitRuntime
     split_spec: SplitSpec
     model_name: str
@@ -78,6 +77,10 @@ class FixedSplitRuntimeTemplate:
     split_plan_hash: str
     mode: str = "generated_eager"
     runtime_device: str = ""
+    candidate_descriptor: Mapping[str, object] | None = None
+    runtime_contract: Mapping[str, object] | None = None
+    boundary_tensor_labels: tuple[str, ...] = ()
+    boundary_schema: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -180,40 +183,24 @@ def bind_request_runtime_from_template(
     template: FixedSplitRuntimeTemplate,
     *,
     model: Any | None = None,
+    example_inputs: Any | None = None,
     device: str | None = None,
 ) -> SplitRuntime:
     del device
     if model is None or model is getattr(template.runtime, "model", None):
         return template.runtime
-    return _rebind_runtime_to_model(template.runtime, model)
-
-
-def _rebind_runtime_to_model(runtime: SplitRuntime, model: Any) -> SplitRuntime:
-    graph = copy.deepcopy(runtime.trace_graph)
-    _rebind_graph_param_refs(graph, model)
-    segments = build_segments(graph, runtime.plan, mode=runtime.split_spec.mode)
-    return SplitRuntime(
-        model=model,
-        trace_graph=graph,
-        split_spec=runtime.split_spec,
-        plan=runtime.plan,
-        segments=segments,
+    if example_inputs is None:
+        raise RuntimeError(
+            "TorchLens runtime cannot be rebound by deepcopy. Provide example_inputs "
+            "so bind_request_runtime_from_template can prepare a request-local "
+            "SplitRuntime for the supplied model."
+        )
+    return prepare_split_runtime(
+        model,
+        example_inputs,
+        template.split_spec,
+        mode=template.mode,
     )
-
-
-def _rebind_graph_param_refs(graph: Any, model: Any) -> None:
-    if not isinstance(model, torch.nn.Module):
-        return
-    named_parameters = dict(model.named_parameters())
-    for node in getattr(graph, "ordered_nodes", lambda: ())():
-        layer = getattr(node, "layer", None)
-        for param_log in list(getattr(layer, "parent_param_logs", []) or []):
-            address = str(getattr(param_log, "address", "") or "")
-            if address and address in named_parameters:
-                try:
-                    setattr(param_log, "_param_ref", named_parameters[address])
-                except Exception:
-                    pass
 
 
 _PROCESS_FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE = FixedSplitRuntimeTemplateCache()

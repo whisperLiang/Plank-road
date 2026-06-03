@@ -45,9 +45,15 @@ def bind_request_splitter_from_template(
     runtime_model,
     template: FixedSplitRuntimeTemplate,
     *,
+    example_inputs=None,
     device="cpu",
 ):
-    runtime = bind_request_runtime_from_template(template, model=runtime_model, device=device)
+    runtime = bind_request_runtime_from_template(
+        template,
+        model=runtime_model,
+        example_inputs=example_inputs,
+        device=device,
+    )
     splitter = UniversalModelSplitter(device=device).bind_runtime(
         runtime,
         model=runtime_model,

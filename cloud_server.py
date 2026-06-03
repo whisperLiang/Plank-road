@@ -73,8 +73,8 @@ from model_management.fixed_split_runtime_template import (
     FixedSplitRuntimeTemplate,
     FixedSplitRuntimeTemplateKey,
     FixedSplitRuntimeTemplateLookup,
-    bind_request_runtime_from_template,
     bind_request_splitter_from_template,
+    describe_split_candidate,
     fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
 )
@@ -2316,6 +2316,10 @@ class CloudContinualLearner:
         self.proxy_eval_frame_cache_enabled = (
             bool(getattr(cl_cfg, "proxy_eval_frame_cache_enabled", True))
             if cl_cfg else True
+        )
+        self.connectivity_smoke_only = (
+            bool(getattr(cl_cfg, "connectivity_smoke_only", False))
+            if cl_cfg else False
         )
         self.workspace_root = os.path.abspath(
             str(getattr(config, "workspace_root", "./cache/server_workspace"))
@@ -5309,9 +5313,14 @@ class CloudContinualLearner:
         )
         model_meta = dict(manifest.get("model", {}) or {})
         context = self._sample_pool_manifest_context(manifest)
+        runtime_splitter = UniversalModelSplitter(device=self.device).bind_runtime(
+            runtime,
+            model=trace_model,
+        )
+        runtime_candidate = getattr(runtime_splitter, "current_candidate", None)
         cloud_runtime_contract = resolve_cloud_runtime_contract(
             runtime,
-            getattr(UniversalModelSplitter(device=self.device).bind_runtime(runtime, model=trace_model), "current_candidate", None),
+            runtime_candidate,
             logical_split_id=boundary,
             model_id=str(model_meta.get("model_id") or model_name),
             model_version=str(model_meta.get("model_version", "") or "0"),
@@ -5349,26 +5358,31 @@ class CloudContinualLearner:
                 compatibility,
             )
             manifest["_cloud_rebuild_features_for_runtime_contract_mismatch"] = True
-        template_for_training = FixedSplitRuntimeTemplate(
-            cache_key=template_key,
-            runtime=runtime,
-            split_spec=split_spec,
-            model_name=model_name,
-            model_family=model_family,
-            graph_signature=str(
-                getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "")
-                or ""
-            ),
-            symbolic_input_schema_hash=template_key.symbolic_input_schema_hash,
-            split_plan_hash=str(template_key.split_plan_hash),
-            mode=runtime_mode,
-            runtime_device=str(trace_device.type),
-        )
-        training_runtime = bind_request_runtime_from_template(
-            template_for_training,
-            model=split_model,
-            device=str(self.device),
-        )
+        if trace_model is split_model:
+            training_runtime = runtime
+            training_runtime_mode = runtime_mode
+        else:
+            training_sample_input = self._build_bundle_batch_trace_sample_input(
+                model,
+                bundle_root,
+                manifest,
+                runtime_batch_size=trace_batch_size,
+                device=self.device,
+            )
+            training_runtime, training_runtime_mode = self._prepare_replayable_split_runtime(
+                split_model,
+                training_sample_input,
+                split_spec,
+                model_name=model_name,
+                preferred_mode=runtime_mode,
+            )
+            if training_runtime_mode != runtime_mode:
+                logger.warning(
+                    "[FixedSplitCL] request-local TorchLens runtime prepared with "
+                    "mode={} while template trace artifact used mode={}.",
+                    training_runtime_mode,
+                    runtime_mode,
+                )
         self._validate_dynamic_batch_trainability(
             training_runtime,
             model,
@@ -5400,7 +5414,9 @@ class CloudContinualLearner:
                 f"(requested={boundary!r}, actual={current_candidate_id!r})."
             )
         logger.info(
-            "[FixedSplitCL] runtime template prepared TorchLens split (model_name={}, model_family={}, split_id={}, trace_signature={}, mode={}, key={}).",
+            "[FixedSplitCL] runtime template prepared TorchLens split "
+            "(model_name={}, model_family={}, split_id={}, trace_signature={}, "
+            "mode={}, key={}).",
             model_name,
             model_family,
             getattr(runtime, "split_id", None),
@@ -5419,6 +5435,22 @@ class CloudContinualLearner:
             split_plan_hash=str(template_key.split_plan_hash),
             mode=runtime_mode,
             runtime_device=str(trace_device.type),
+            candidate_descriptor=(
+                describe_split_candidate(runtime_candidate)
+                if runtime_candidate is not None
+                else None
+            ),
+            runtime_contract=cloud_runtime_contract,
+            boundary_tensor_labels=tuple(
+                str(label)
+                for label in list(
+                    getattr(getattr(runtime, "plan", None), "boundary_nodes", ())
+                    or ()
+                )
+            ),
+            boundary_schema=dict(
+                getattr(getattr(runtime, "plan", None), "boundary_specs", {}) or {}
+            ),
         )
 
     def _get_or_create_fixed_split_runtime_template(
@@ -5456,17 +5488,48 @@ class CloudContinualLearner:
         self,
         model: torch.nn.Module,
         template: FixedSplitRuntimeTemplate,
+        *,
+        manifest: dict[str, object],
+        bundle_root: str,
+        trace_sample_input: torch.Tensor | None = None,
+        runtime_batch_size: int | None = None,
     ) -> tuple[UniversalModelSplitter, object]:
         bind_started = time.perf_counter()
         split_model = get_split_runtime_model(model)
+        split_plan_payload = dict(manifest.get("split_plan", {}) or {})
+        model_family = model_zoo.get_model_family(str(template.model_name))
+        trace_batch_size = (
+            int(template.cache_key.trace_batch_size)
+            if template.cache_key.trace_batch_size is not None
+            else _cloud_fixed_split_trace_batch_size(
+                split_plan_payload,
+                model_family=model_family,
+                default=self.trace_batch_size,
+            )
+        )
+        if trace_sample_input is not None:
+            request_sample_input = self._move_runtime_input_to_device(
+                trace_sample_input,
+                self.device,
+            )
+        else:
+            request_sample_input = self._build_bundle_batch_trace_sample_input(
+                model,
+                bundle_root,
+                manifest,
+                runtime_batch_size=trace_batch_size,
+                device=self.device,
+            )
         splitter, candidate = bind_request_splitter_from_template(
             split_model,
             template,
+            example_inputs=request_sample_input,
             device=self.device,
         )
         bind_elapsed = time.perf_counter() - bind_started
         logger.info(
-            "[FixedSplitCL] request-local TorchLens runtime bind took {:.3f}s (split_id={}, key={}).",
+            "[FixedSplitCL] request-local TorchLens runtime prepare/bind took {:.3f}s "
+            "(split_id={}, key={}).",
             bind_elapsed,
             getattr(splitter.runtime, "split_id", None),
             template.cache_key.to_log_payload(),
@@ -5491,11 +5554,19 @@ class CloudContinualLearner:
         )
         if template_lookup.cache_status in {"hit", "wait"}:
             logger.info(
-                "[FixedSplitCL] hot path skipped trace input build / graph build / candidate recovery (cache_status={}, key={}).",
+                "[FixedSplitCL] hot path skipped trace input build / graph build / "
+                "candidate recovery (cache_status={}, key={}).",
                 template_lookup.cache_status,
                 template_lookup.template.cache_key.to_log_payload(),
             )
-        return self._bind_bundle_splitter_from_template(model, template_lookup.template)
+        return self._bind_bundle_splitter_from_template(
+            model,
+            template_lookup.template,
+            manifest=manifest,
+            bundle_root=bundle_root,
+            trace_sample_input=trace_sample_input,
+            runtime_batch_size=runtime_batch_size,
+        )
 
     @staticmethod
     def _working_cache_manifest_matches(
@@ -7688,6 +7759,32 @@ class CloudContinualLearner:
                     len(bundle_info["all_sample_ids"]),
                     len(gt_annotations),
                 )
+                if self.connectivity_smoke_only:
+                    stage_started = time.perf_counter()
+                    encoded = base64.b64encode(
+                        self._serialise_model_bytes(
+                            tmp_model,
+                            model_name=current_model_name,
+                            edge_id=edge_id,
+                            weights_metadata=weights_metadata,
+                        )
+                    ).decode("utf-8")
+                    self._log_stage_duration("serialization / encoding", stage_started)
+                    self._log_stage_duration("total round time", total_round_started)
+                    logger.success(
+                        "[FixedSplitCL][ConnectivitySmoke] Connected edge inference, "
+                        "sample upload, cloud annotation, feature rebuild, contract "
+                        "creation, and tail-runtime preparation for edge {} with {} "
+                        "active sample(s) ({} GT-annotated); skipped full retraining.",
+                        edge_id,
+                        len(bundle_info["all_sample_ids"]),
+                        len(gt_annotations),
+                    )
+                    return (
+                        True,
+                        encoded,
+                        "Fixed split connectivity smoke successful; skipped full retraining",
+                    )
                 proxy_eval_frame_cache = self._proxy_eval_frame_cache()
 
                 stage_started = time.perf_counter()

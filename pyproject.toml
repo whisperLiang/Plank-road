@@ -46,6 +46,9 @@ integration = [
 testpaths = ["tests"]
 addopts = "-q"
 norecursedirs = ["tmp", ".venv", "__pycache__", ".git"]
+markers = [
+  "integration: tests that launch real processes or require heavyweight runtime dependencies",
+]
 filterwarnings = [
   "ignore:`torch.jit.script` is deprecated.*:DeprecationWarning:torch.jit._script",
   "ignore:rfdetr\\.util\\..* is deprecated.*:DeprecationWarning",

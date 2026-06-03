@@ -75,7 +75,6 @@ def _trainable_state_dict_names(
     """
     state_keys = {str(key) for key in state.keys()}
     selected: set[str] = set()
-    saw_trainable_parameter = False
 
     modules: list[object] = [model]
     for path in _WRAPPER_INNER_MODULE_PATHS:
@@ -87,12 +86,14 @@ def _trainable_state_dict_names(
         for name, parameter in _iter_named_parameters(module) or ():
             if not bool(getattr(parameter, "requires_grad", False)):
                 continue
-            saw_trainable_parameter = True
             state_key = _state_key_for_parameter_name(str(name), state_keys)
             if state_key is not None:
                 selected.add(state_key)
 
-    if saw_trainable_parameter and not selected:
+    if not selected:
+        # Some detector wrappers expose their state_dict but no usable
+        # named_parameters() surface. A non-empty floating-state fallback is
+        # preferable to producing an update payload the edge cannot apply.
         selected.update(
             str(name)
             for name, value in state.items()
