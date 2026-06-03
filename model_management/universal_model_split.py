@@ -54,6 +54,66 @@ def _first_tensor_batch_size(value: Any) -> int | None:
     return None
 
 
+def _batch_dimension_multiplier(value: Any, *, batch_symbol: str = "B") -> int | None:
+    if isinstance(value, str):
+        if value == batch_symbol:
+            return 1
+        prefix = f"{batch_symbol}*"
+        if value.startswith(prefix):
+            try:
+                multiplier = int(value[len(prefix):])
+            except ValueError:
+                return None
+            return multiplier if multiplier > 0 else None
+        return None
+    expression = getattr(value, "expression", None)
+    if expression != batch_symbol:
+        return None
+    offset = int(getattr(value, "offset", 0) or 0)
+    if offset != 0:
+        return None
+    multiplier = int(getattr(value, "multiplier", 1) or 1)
+    return multiplier if multiplier > 0 else None
+
+
+def _boundary_matches_input_batch(payload: BoundaryPayload, batch_size: int) -> bool:
+    spec = dict(getattr(payload, "spec", {}) or {})
+    for label, tensor in dict(getattr(payload, "tensors", {}) or {}).items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        tensor_spec = spec.get(str(label))
+        symbolic_shape = tuple(
+            getattr(tensor_spec, "shape", None)
+            or getattr(tensor_spec, "symbolic_shape", None)
+            or ()
+        )
+        if tensor.ndim != len(symbolic_shape):
+            continue
+        for axis, dim in enumerate(symbolic_shape):
+            multiplier = _batch_dimension_multiplier(dim)
+            if multiplier is None:
+                continue
+            if int(tensor.shape[axis]) == int(batch_size) * int(multiplier):
+                return True
+    return False
+
+
+def _normalise_boundary_batch_metadata(
+    payload: BoundaryPayload,
+    inputs: tuple[Any, ...],
+) -> BoundaryPayload:
+    input_batch_size = _first_tensor_batch_size(inputs)
+    if input_batch_size is None or input_batch_size <= 0:
+        return payload
+    if not _boundary_matches_input_batch(payload, input_batch_size):
+        return payload
+    metadata = dict(getattr(payload, "metadata", {}) or {})
+    if metadata.get("batch_size") == int(input_batch_size):
+        return payload
+    metadata["batch_size"] = int(input_batch_size)
+    return replace(payload, metadata=metadata)
+
+
 def _move_boundary_to_runtime_device(runtime: Any, boundary: BoundaryPayload) -> BoundaryPayload:
     codec = BoundaryPayloadCacheCodec(runtime)
     return codec.to_runtime_device(boundary)
@@ -584,7 +644,8 @@ class UniversalModelSplitter:
         del candidate
         if kwargs:
             raise RuntimeError("TorchLens prefix execution expects positional runtime inputs.")
-        return self._ensure_runtime().run_prefix(*args)
+        boundary = self._ensure_runtime().run_prefix(*args)
+        return _normalise_boundary_batch_metadata(boundary, args)
 
     run_prefix = edge_forward
 

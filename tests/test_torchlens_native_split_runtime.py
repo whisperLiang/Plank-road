@@ -25,6 +25,7 @@ from model_management.split_model_adapters import (
     _pack_rfdetr_aux_outputs,
     _unpack_rfdetr_aux_outputs,
 )
+from model_management.payload import boundary_payload_from_tensors
 from model_management.split_runtime import (
     BOUNDARY_CACHE_PROTOCOL,
     BoundaryPayloadCacheCodec,
@@ -202,6 +203,51 @@ def test_boundary_cache_uses_torchlens_protocol_and_rejects_old_protocol(tmp_pat
         torch.save({"cache_protocol": "old-boundary-cache", "intermediate": boundary}, handle)
     with pytest.raises(RuntimeError, match="rebuild feature cache"):
         codec.load(old_path)
+
+
+def test_splitter_corrects_folded_boundary_batch_metadata() -> None:
+    tensors = {"folded": torch.arange(8, dtype=torch.float32).reshape(8, 1)}
+    boundary = boundary_payload_from_tensors(
+        tensors,
+        split_id="after:folded",
+        graph_signature="folded-test",
+        batch_size=8,
+        schema={
+            "folded": {
+                "canonical_id": "folded",
+                "torchlens_label": "folded",
+                "module_path": "fake",
+                "op_type": "reshape",
+                "shape": ("B*4", 1),
+                "dtype": torch.float32,
+                "requires_grad": False,
+                "role": "primary",
+                "output_index": None,
+                "device_policy": "runtime",
+            }
+        },
+    )
+
+    class FoldedBoundaryRuntime:
+        boundary_spec = boundary.spec
+
+        def run_prefix(self, *inputs):
+            del inputs
+            return boundary
+
+    runtime = FoldedBoundaryRuntime()
+    splitter = UniversalModelSplitter(device="cpu")
+    splitter.runtime = runtime
+
+    corrected = splitter.edge_forward(torch.randn(2, 3, 4, 4))
+
+    assert corrected.batch_size == 2
+    parts = BoundaryPayloadCacheCodec(runtime).split_batch(corrected)
+    assert len(parts) == 2
+    assert all(part.batch_size == 1 for part in parts)
+    assert [tuple(part.tensors["folded"].shape) for part in parts] == [(4, 1), (4, 1)]
+    assert torch.equal(parts[0].tensors["folded"], tensors["folded"][:4])
+    assert torch.equal(parts[1].tensors["folded"], tensors["folded"][4:])
 
 
 def test_suffix_trainable_parameters_come_from_trace_plan() -> None:
