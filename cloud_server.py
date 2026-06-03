@@ -2418,6 +2418,8 @@ class CloudContinualLearner:
         self._active_jobs = 0
         self._training_slots = threading.BoundedSemaphore(self.max_concurrent_jobs)
         self._teacher_queue_state = _GLOBAL_TEACHER_ANNOTATION_QUEUE
+        self._initial_state_reset_lock = threading.Lock()
+        self._initial_state_reset_sessions: set[str] = set()
 
     def _edge_lock(self, edge_id: int | str) -> threading.Lock:
         edge_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(edge_id).strip()) or "unknown"
@@ -2575,6 +2577,173 @@ class CloudContinualLearner:
             max_active_samples=self.sample_pool_max_active_samples,
             shard_size=self.sample_pool_shard_size,
         )
+
+    @staticmethod
+    def _manifest_edge_session_id(manifest: Mapping[str, object]) -> str:
+        return str(
+            manifest.get("edge_session_id")
+            or manifest.get("client_session_id")
+            or manifest.get("session_id")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _manifest_model_version(
+        manifest: Mapping[str, object],
+        *,
+        fallback: object = "",
+    ) -> str:
+        model_meta = manifest.get("model")
+        model_meta = dict(model_meta) if isinstance(model_meta, Mapping) else {}
+        return str(
+            manifest.get("model_version")
+            or model_meta.get("model_version")
+            or fallback
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _remove_reset_path_if_safe(
+        *,
+        path: str,
+        root: str,
+        label: str,
+    ) -> bool:
+        abs_path = os.path.abspath(str(path or ""))
+        abs_root = os.path.abspath(str(root or ""))
+        if not abs_path or not abs_root:
+            return False
+        if abs_path == abs_root or not abs_path.startswith(abs_root + os.sep):
+            logger.warning(
+                "[FixedSplitCL][InitialReset] Skipping unsafe {} path outside {}: {}",
+                label,
+                abs_root,
+                abs_path,
+            )
+            return False
+        if not os.path.exists(abs_path):
+            return False
+        if os.path.isdir(abs_path):
+            shutil.rmtree(abs_path, ignore_errors=True)
+        else:
+            os.remove(abs_path)
+        return True
+
+    def _reset_initial_cloud_state_if_needed(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+        model_name: str,
+        sample_pool: CloudSamplePool,
+        fallback_model_version: object = "",
+        allow_without_session: bool = False,
+    ) -> CloudSamplePool:
+        model_version = self._manifest_model_version(
+            manifest,
+            fallback=fallback_model_version,
+        )
+        if not model_version:
+            return sample_pool
+        try:
+            is_initial_model = (
+                _normalize_model_version(
+                    model_version,
+                    field_name="initial reset model_version",
+                )
+                == "0"
+            )
+        except Exception:
+            is_initial_model = False
+        if not is_initial_model:
+            return sample_pool
+
+        context = self._sample_pool_manifest_context(manifest)
+        model_id = str(context.get("model_id") or model_name or self.edge_model_name)
+        split_config_id = str(context.get("split_config_id") or "").strip()
+        front_version = str(context.get("front_version") or "0")
+        edge_session_id = self._manifest_edge_session_id(manifest)
+        if not edge_session_id and not allow_without_session:
+            return sample_pool
+
+        reset_key = (
+            _stable_json_dumps(
+                {
+                    "edge_id": str(edge_id),
+                    "model_id": model_id,
+                    "front_version": front_version,
+                    "split_config_id": split_config_id,
+                    "edge_session_id": edge_session_id,
+                }
+            )
+            if edge_session_id
+            else ""
+        )
+        edge_segment = f"edge_{_sanitize_cache_segment(edge_id)}"
+        model_segment = _sanitize_cache_segment(model_id)
+        front_segment = f"front_version_{_sanitize_cache_segment(front_version)}"
+        pool_front_dir = os.path.join(
+            self.sample_pool_root,
+            edge_segment,
+            model_segment,
+            front_segment,
+        )
+        staging_model_dir = os.path.join(
+            self.sample_pool_staging_root,
+            edge_segment,
+            model_segment,
+        )
+        working_cache = self._fixed_split_working_cache_path(
+            edge_id=edge_id,
+            model_name=model_name or model_id,
+        )
+        stale_contract_dir = os.path.join(
+            self.split_contract_root,
+            "stale",
+            edge_segment,
+            model_segment,
+        )
+        deleted_labels: list[str] = []
+
+        with self._initial_state_reset_lock:
+            if reset_key and reset_key in self._initial_state_reset_sessions:
+                return sample_pool
+            reset_paths = [
+                (pool_front_dir, self.sample_pool_root, "sample_pool"),
+                (staging_model_dir, self.sample_pool_staging_root, "sample_staging"),
+                (working_cache, self.fixed_split_cache_root, "working_cache"),
+                (stale_contract_dir, self.split_contract_root, "stale_contracts"),
+            ]
+            if split_config_id:
+                reset_paths.append(
+                    (
+                        contract_path(
+                            self.split_contract_root,
+                            edge_id=edge_id,
+                            model_id=model_id,
+                            split_config_id=split_config_id,
+                        ),
+                        self.split_contract_root,
+                        "split_contract",
+                    )
+                )
+            for path, root, label in reset_paths:
+                if self._remove_reset_path_if_safe(path=path, root=root, label=label):
+                    deleted_labels.append(label)
+            if reset_key:
+                self._initial_state_reset_sessions.add(reset_key)
+
+        logger.info(
+            "[FixedSplitCL][InitialReset] edge_id={} model_id={} split_config_id={} "
+            "front_version={} session_id={} cleared={}.",
+            edge_id,
+            model_id,
+            split_config_id or "<none>",
+            front_version,
+            edge_session_id or "<legacy-no-session>",
+            deleted_labels,
+        )
+        return self._cloud_sample_pool_for_manifest(edge_id=edge_id, manifest=manifest)
 
     @staticmethod
     def _preview_ids(sample_ids: list[str], *, limit: int = 10) -> list[str]:
@@ -7094,6 +7263,8 @@ class CloudContinualLearner:
                 )
             if model_id and not manifest.get("model_id"):
                 manifest["model_id"] = str(model_id)
+            if model_version and not manifest.get("model_version"):
+                manifest["model_version"] = str(model_version)
             if split_config_id and not manifest.get("split_config_id"):
                 manifest["split_config_id"] = str(split_config_id)
             manifest.setdefault("edge_id", int(edge_id))
@@ -7108,6 +7279,14 @@ class CloudContinualLearner:
             sample_pool = self._cloud_sample_pool_for_manifest(
                 edge_id=edge_id,
                 manifest=manifest,
+            )
+            sample_pool = self._reset_initial_cloud_state_if_needed(
+                edge_id=edge_id,
+                manifest=manifest,
+                model_name=str(manifest.get("model_id") or model_id or self.edge_model_name),
+                sample_pool=sample_pool,
+                fallback_model_version=model_version,
+                allow_without_session=False,
             )
             pending_candidates, unreadable_ids = self._load_high_quality_shard_candidates(
                 manifest=manifest,
@@ -7401,6 +7580,14 @@ class CloudContinualLearner:
                 sample_pool = self._cloud_sample_pool_for_manifest(
                     edge_id=edge_id,
                     manifest=manifest,
+                )
+                sample_pool = self._reset_initial_cloud_state_if_needed(
+                    edge_id=edge_id,
+                    manifest=manifest,
+                    model_name=current_model_name,
+                    sample_pool=sample_pool,
+                    fallback_model_version=bundle_model_version,
+                    allow_without_session=True,
                 )
                 next_checkpoint_model_version = _increment_model_version(
                     bundle_model_version,

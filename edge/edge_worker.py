@@ -3,6 +3,7 @@ import io
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Mapping
@@ -356,6 +357,7 @@ class EdgeWorker:
         self.collect_flag = bool(self.config.retrain.flag)
         self.retrain_flag = False
         self.pending_training_decision: TrainingDecision | None = None
+        self.edge_session_id = uuid.uuid4().hex
         self.sample_store = EdgeSampleStore(
             os.path.join(self.config.retrain.cache_path, "sample_store")
         )
@@ -695,6 +697,7 @@ class EdgeWorker:
         return {
             "model_id": str(getattr(self, "model_id", "") or ""),
             "model_version": str(getattr(self, "model_version", "") or ""),
+            "edge_session_id": str(getattr(self, "edge_session_id", "") or ""),
             "front_version": str(getattr(self, "front_version", "0") or "0"),
             "split_config_id": str(getattr(split_plan, "split_config_id", "") or ""),
             "canonical_split_key": getattr(split_plan, "canonical_split_key", None),
@@ -1297,6 +1300,7 @@ class EdgeWorker:
                     model_id=self.model_id,
                     model_version=self.model_version,
                     model_metadata=self._current_model_metadata(),
+                    edge_session_id=str(getattr(self, "edge_session_id", "") or ""),
                     send_low_conf_features=decision.send_low_conf_features,
                     bundle_cap_bytes=decision.bundle_cap_bytes,
                     trigger_shard_size=self._sample_pool_shard_size(),

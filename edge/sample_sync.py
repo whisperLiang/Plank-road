@@ -224,6 +224,12 @@ def pack_high_quality_sync_bundle_to_file(
     context = dict(split_context or {})
     first_record = selected[0] if selected else None
     model_id = str(context.get("model_id") or getattr(first_record, "model_id", "") or "")
+    model_version = str(
+        context.get("model_version")
+        or getattr(first_record, "model_version", "")
+        or ""
+    )
+    edge_session_id = str(context.get("edge_session_id") or "").strip()
     front_version = str(
         context.get("front_version") or getattr(first_record, "front_version", "") or "0"
     )
@@ -259,7 +265,9 @@ def pack_high_quality_sync_bundle_to_file(
     manifest: dict[str, Any] = {
         "protocol_version": HIGH_QUALITY_SYNC_PROTOCOL_VERSION,
         "edge_id": int(edge_id),
+        "edge_session_id": edge_session_id,
         "model_id": model_id,
+        "model_version": model_version,
         "front_version": front_version,
         "split_config_id": split_config_id,
         "canonical_split_key": canonical_split_key,
