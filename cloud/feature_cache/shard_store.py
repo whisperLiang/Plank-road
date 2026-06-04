@@ -104,8 +104,9 @@ class FeatureShardStore:
         refs: Sequence[FeatureShardRef | Mapping[str, object]],
         *,
         device=None,
+        runtime=None,
     ):
-        return self.reader.read_batch(refs, device=device)
+        return self.reader.read_batch(refs, device=device, runtime=runtime)
 
     def validate_ref(self, ref: FeatureShardRef | Mapping[str, object]) -> FeatureShardRef:
         parsed = ref if isinstance(ref, FeatureShardRef) else FeatureShardRef.from_dict(ref)

@@ -905,7 +905,7 @@ def _load_cached_split_batches(
         if profile is not None:
             profile.add("target_construction_time", time.perf_counter() - prepare_started)
         batch_started = time.perf_counter()
-        boundary = shard_reader.read_batch(refs)
+        boundary = shard_reader.read_batch(refs, runtime=runtime)
         if profile is not None:
             profile.add("boundary_payload_batching_time", time.perf_counter() - batch_started)
             profile.add("training_batch_preparation_time", time.perf_counter() - prepare_started)

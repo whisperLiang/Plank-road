@@ -93,13 +93,19 @@ def shard_feature_layout_from_metadata(
             continue
         spec = dict(raw_spec)
         label = str(spec.get("original_label") or leaf_key)
-        sample_shape = spec.get("sample_shape")
-        if not sample_shape:
+        feature_shape = spec.get("feature_shape_without_batch")
+        if not feature_shape:
+            sample_shape = spec.get("sample_shape")
+            if not sample_shape:
+                shape = list(spec.get("shape") or [])
+                sample_shape = shape[1:] if shape else []
+            feature_shape = sample_shape
+        if not feature_shape:
             shape = list(spec.get("shape") or [])
-            sample_shape = shape[1:] if shape else []
+            feature_shape = shape[1:] if shape else []
         layout[label] = {
             "dtype": str(spec.get("dtype") or payload.get("dtype") or ""),
-            "shape_without_batch": [int(dim) for dim in list(sample_shape or [])],
+            "shape_without_batch": [int(dim) for dim in list(feature_shape or [])],
         }
     return layout
 
@@ -304,6 +310,7 @@ class ShardFeatureRefValidator:
         *,
         allow_abi_compatible_migration: bool = True,
         deep_validate_payload: bool = False,
+        runtime: object | None = None,
     ) -> ValidationResult:
         try:
             ref = (
@@ -426,7 +433,7 @@ class ShardFeatureRefValidator:
 
         if deep_validate_payload:
             try:
-                self._reader.read_batch([ref])
+                self._reader.read_batch([ref], runtime=runtime)
             except Exception as exc:
                 return ValidationResult(
                     unreadable_shard=True,

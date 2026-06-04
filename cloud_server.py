@@ -84,6 +84,7 @@ from model_management.split_model_adapters import (
 from model_management.universal_model_split import (
     SplitRetrainProfile,
     UniversalModelSplitter,
+    _load_cached_split_batches,
     collect_suffix_trainable_parameters,
     prepare_exact_split_runtime,
 )
@@ -1647,7 +1648,8 @@ def _build_detection_proxy_prediction_cache(
                 batch = pending_samples[start:stop]
                 execution_batch = _execution_batch(batch)
                 batched_payload = shard_reader.read_batch(
-                    [feature_ref for _, _, feature_ref, _ in execution_batch]
+                    [feature_ref for _, _, feature_ref, _ in execution_batch],
+                    runtime=splitter,
                 )
                 execution_batch_size = int(batched_payload.batch_size)
                 raw_outputs = splitter.cloud_forward(
@@ -5879,6 +5881,100 @@ class CloudContinualLearner:
         )
         return int(effective_batch_size)
 
+    def _validate_fixed_split_cached_runtime_batch_size(
+        self,
+        *,
+        current_model_name: str,
+        training_cache_path: str,
+        all_sample_ids: Sequence[object],
+        gt_annotations: Mapping[object, object],
+        prepared_splitter: UniversalModelSplitter | None,
+        prepared_candidate,
+        configured_batch_size: int,
+        preloaded_records: Mapping[object, Mapping[str, object]] | None,
+        manifest: Mapping[str, object],
+    ) -> int:
+        if prepared_splitter is None or not training_cache_path or not all_sample_ids:
+            return max(1, int(configured_batch_size))
+
+        model_family = model_zoo.get_model_family(str(current_model_name))
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        trace_batch_size = _cloud_fixed_split_trace_batch_size(
+            split_plan,
+            model_family=model_family,
+            default=self.trace_batch_size,
+        )
+        dynamic_batch = _splitter_dynamic_batch_range(prepared_splitter)
+        dynamic_min = int(dynamic_batch[0]) if dynamic_batch is not None else 1
+        candidates: list[int] = []
+        for value in (
+            int(configured_batch_size),
+            int(trace_batch_size),
+            int(dynamic_min),
+            1,
+        ):
+            value = max(1, int(value))
+            if value not in candidates:
+                candidates.append(value)
+
+        errors: dict[int, str] = {}
+        sample_ids = list(all_sample_ids)
+        for candidate_batch_size in candidates:
+            smoke_indices = sample_ids[: max(1, min(len(sample_ids), candidate_batch_size))]
+            try:
+                batches = _load_cached_split_batches(
+                    cache_path=training_cache_path,
+                    all_indices=smoke_indices,
+                    annotations=gt_annotations,
+                    batch_size=candidate_batch_size,
+                    runtime=prepared_splitter,
+                    preloaded_records=preloaded_records,
+                )
+                if not batches:
+                    raise RuntimeError("cached split smoke validation prepared no batches")
+                _batch_indices, boundary, _targets = batches[0]
+                with torch.no_grad():
+                    prepared_splitter.cloud_forward(
+                        boundary,
+                        candidate=prepared_candidate,
+                    )
+            except Exception as exc:  # noqa: BLE001 - try narrower batch fallback.
+                errors[candidate_batch_size] = str(exc) or type(exc).__name__
+                logger.warning(
+                    "[FixedSplitCL] cached split smoke validation failed "
+                    "(model_name={}, batch_size={}, error={}); trying fallback if available.",
+                    current_model_name,
+                    candidate_batch_size,
+                    errors[candidate_batch_size],
+                )
+                continue
+
+            if candidate_batch_size != int(configured_batch_size):
+                logger.warning(
+                    "[FixedSplitCL] Falling back fixed-split cached batch size "
+                    "{} -> {} for {} after runtime smoke validation.",
+                    int(configured_batch_size),
+                    candidate_batch_size,
+                    current_model_name,
+                )
+            else:
+                logger.info(
+                    "[FixedSplitCL] cached split smoke validation passed "
+                    "(model_name={}, batch_size={}).",
+                    current_model_name,
+                    candidate_batch_size,
+                )
+            return candidate_batch_size
+
+        error_summary = ", ".join(
+            f"batch_size={batch_size}: {error}"
+            for batch_size, error in errors.items()
+        )
+        raise RuntimeError(
+            "Fixed-split cached feature runtime smoke validation failed for all "
+            f"candidate batch sizes ({error_summary})."
+        )
+
     def _feature_cache_store(self) -> FeatureShardStore:
         return FeatureShardStore(
             self.feature_cache_store_root_dir,
@@ -7290,6 +7386,17 @@ class CloudContinualLearner:
                     num_train_samples=active_sample_count,
                 )
                 training_cache_path = str(bundle_info.get("training_view_path") or "")
+                effective_batch_size = self._validate_fixed_split_cached_runtime_batch_size(
+                    current_model_name=current_model_name,
+                    training_cache_path=training_cache_path,
+                    all_sample_ids=bundle_info["all_sample_ids"],
+                    gt_annotations=gt_annotations,
+                    prepared_splitter=prepared_splitter,
+                    prepared_candidate=prepared_candidate,
+                    configured_batch_size=effective_batch_size,
+                    preloaded_records=preloaded_records,
+                    manifest=manifest,
+                )
                 logger.info(
                     "[FixedSplitCL] Training from {} canonical-active sample(s) via TrainingCacheView(source=canonical_active) ({} label entry/entries).",
                     len(bundle_info["all_sample_ids"]),

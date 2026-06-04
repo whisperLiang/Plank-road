@@ -25,7 +25,8 @@ from cloud.feature_cache.types import (
 from model_management.payload import BoundaryPayload
 
 
-SHARD_FORMAT_VERSION = "feature-shard.v1"
+SHARD_FORMAT_VERSION = "feature-shard.v2"
+SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis_v2"
 
 
 def _sanitize_segment(value: object) -> str:
@@ -135,15 +136,105 @@ def _torch_dtype(dtype: str | None) -> torch.dtype | None:
     return getattr(torch, text, None)
 
 
-def _shape_bucket(tensors: Mapping[str, torch.Tensor], *, dtype: str) -> str:
+def _symbolic_shape(spec: Mapping[str, Any]) -> list[Any]:
+    shape = spec.get("symbolic_shape", spec.get("shape"))
+    return list(shape or [])
+
+
+def _batch_dimension_multiplier(value: Any, *, batch_symbol: str = "B") -> int | None:
+    if isinstance(value, str):
+        if value == batch_symbol:
+            return 1
+        prefix = f"{batch_symbol}*"
+        if value.startswith(prefix):
+            try:
+                multiplier = int(value[len(prefix):])
+            except ValueError:
+                return None
+            return multiplier if multiplier > 0 else None
+        return None
+    expression = getattr(value, "expression", None)
+    if expression != batch_symbol:
+        return None
+    offset = int(getattr(value, "offset", 0) or 0)
+    if offset != 0:
+        return None
+    multiplier = int(getattr(value, "multiplier", 1) or 1)
+    return multiplier if multiplier > 0 else None
+
+
+def _batch_dimension_plan(
+    tensor: torch.Tensor,
+    spec: Mapping[str, Any],
+) -> tuple[int, int] | None:
+    symbolic_shape = _symbolic_shape(spec)
+    if tensor.ndim == 0 or len(symbolic_shape) != tensor.ndim:
+        return None
+    batch_dims: list[tuple[int, int]] = []
+    for axis, dim in enumerate(symbolic_shape):
+        multiplier = _batch_dimension_multiplier(dim)
+        if multiplier is not None:
+            batch_dims.append((axis, multiplier))
+    if len(batch_dims) != 1:
+        return None
+    return batch_dims[0]
+
+
+def _feature_shape_without_batch(
+    tensor: torch.Tensor,
+    spec: Mapping[str, Any],
+) -> list[int]:
+    plan = _batch_dimension_plan(tensor, spec)
+    shape = [int(dim) for dim in tensor.shape]
+    if plan is None:
+        return shape[1:] if shape else []
+    axis, _multiplier = plan
+    return [dim for index, dim in enumerate(shape) if index != axis]
+
+
+def _leaf_layouts(
+    tensors: Mapping[str, torch.Tensor],
+    schema: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    layouts: dict[str, dict[str, Any]] = {}
+    for label, tensor in tensors.items():
+        spec = dict(schema.get(label) or {}) if isinstance(schema, Mapping) else {}
+        plan = _batch_dimension_plan(tensor, spec)
+        layouts[str(label)] = {
+            "sample_shape": [int(dim) for dim in tensor.shape],
+            "feature_shape_without_batch": _feature_shape_without_batch(tensor, spec),
+            "symbolic_shape": [str(dim) for dim in _symbolic_shape(spec)],
+            "batch_axis": None if plan is None else int(plan[0]),
+            "batch_multiplier": 1 if plan is None else int(plan[1]),
+        }
+    return layouts
+
+
+def _shape_bucket(
+    layouts: Mapping[str, Mapping[str, Any]],
+    *,
+    dtype: str,
+) -> str:
     payload = {
         "dtype": dtype,
+        "storage_layout": SAMPLE_AXIS_STORAGE_LAYOUT,
         "leaves": [
             {
                 "label": label,
-                "shape": [int(dim) for dim in tensor.shape[1:]],
+                "sample_shape": [
+                    int(dim) for dim in list(layout.get("sample_shape") or [])
+                ],
+                "feature_shape_without_batch": [
+                    int(dim)
+                    for dim in list(layout.get("feature_shape_without_batch") or [])
+                ],
+                "symbolic_shape": [
+                    str(dim) for dim in list(layout.get("symbolic_shape") or [])
+                ],
+                "batch_axis": layout.get("batch_axis"),
+                "batch_multiplier": int(layout.get("batch_multiplier") or 1),
             }
-            for label, tensor in tensors.items()
+            for label, layout in layouts.items()
         ],
     }
     return stable_digest(payload)[:16]
@@ -198,9 +289,12 @@ class FeatureShardWriter:
             target_dtype = _torch_dtype(self.shard_dtype)
             if target_dtype is not None:
                 tensors = OrderedDict((label, tensor.to(dtype=target_dtype)) for label, tensor in tensors.items())
-            bucket = _shape_bucket(tensors, dtype=dtype)
+            schema = dict(payload_meta.get("schema") or {})
+            leaf_layouts = _leaf_layouts(tensors, schema)
+            bucket = _shape_bucket(leaf_layouts, dtype=dtype)
             entry["_feature_tensors"] = tensors
             entry["_payload_meta"] = payload_meta
+            entry["_leaf_layouts"] = leaf_layouts
             entry["_dtype"] = dtype
             entry["_shape_bucket"] = bucket
             grouped.setdefault((dtype, bucket), []).append(entry)
@@ -245,7 +339,10 @@ class FeatureShardWriter:
             if str(entry["_dtype"]) != dtype or str(entry["_shape_bucket"]) != shape_bucket:
                 raise ValueError("Shard entries in one bucket have different dtype/shape bucket.")
         stacked = {
-            leaf_key: torch.cat([entry["_feature_tensors"][label] for entry in entries], dim=0).contiguous()
+            leaf_key: torch.stack(
+                [entry["_feature_tensors"][label] for entry in entries],
+                dim=0,
+            ).contiguous()
             for leaf_key, label in zip(leaf_keys, original_labels, strict=True)
         }
         shard_id = stable_digest(
@@ -268,10 +365,29 @@ class FeatureShardWriter:
         for leaf_key, label in zip(leaf_keys, original_labels, strict=True):
             source_tensor = tensors[label]
             spec = dict(schema.get(label) or {}) if isinstance(schema, Mapping) else {}
+            layout = dict(first.get("_leaf_layouts", {}).get(label) or {})
             leaf_specs[leaf_key] = {
                 "original_label": label,
                 "shape": [int(dim) for dim in source_tensor.shape],
-                "sample_shape": [int(dim) for dim in source_tensor.shape[1:]],
+                "sample_shape": [
+                    int(dim)
+                    for dim in list(layout.get("sample_shape") or source_tensor.shape)
+                ],
+                "feature_shape_without_batch": [
+                    int(dim)
+                    for dim in list(
+                        layout.get("feature_shape_without_batch")
+                        or source_tensor.shape[1:]
+                    )
+                ],
+                "storage_layout": SAMPLE_AXIS_STORAGE_LAYOUT,
+                "sample_axis": 0,
+                "storage_shape": [int(dim) for dim in stacked[leaf_key].shape],
+                "batch_axis": layout.get("batch_axis"),
+                "batch_multiplier": int(layout.get("batch_multiplier") or 1),
+                "symbolic_shape": [
+                    str(dim) for dim in list(layout.get("symbolic_shape") or [])
+                ],
                 "dtype": str(source_tensor.dtype),
                 "schema": spec,
             }
