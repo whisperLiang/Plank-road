@@ -120,6 +120,19 @@ class TeacherAnnotationConfig(ConfigSection):
 
 
 @dataclass
+class FeatureCacheConfig(ConfigSection):
+    enabled: bool = True
+    store_root_dir: str = "./cache/feature_cache/store"
+    view_root_dir: str = "./cache/feature_cache/views"
+    materialization_mode: str = "direct_ref"
+    feature_rebuild_batch_size: int = 16
+    max_live_generations: int = 3
+
+    def __post_init__(self) -> None:
+        self.materialization_mode = str(self.materialization_mode).strip().lower()
+
+
+@dataclass
 class ContinualLearningConfig(ConfigSection):
     num_epoch: int = 5
     trace_batch_size: int = 2
@@ -144,6 +157,7 @@ class ContinualLearningConfig(ConfigSection):
     teacher_annotation: TeacherAnnotationConfig = field(
         default_factory=TeacherAnnotationConfig
     )
+    feature_cache: FeatureCacheConfig = field(default_factory=FeatureCacheConfig)
 
     def __post_init__(self) -> None:
         if self.teacher_batch_size is None:
@@ -248,6 +262,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["teacher_annotation"] = _section(
             TeacherAnnotationConfig,
             known.get("teacher_annotation"),
+        )
+        known["feature_cache"] = _section(
+            FeatureCacheConfig,
+            known.get("feature_cache"),
         )
     elif section_cls is ClientConfig:
         known["sample_pool"] = _section(SamplePoolConfig, known.get("sample_pool"))
@@ -626,6 +644,36 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "server.continual_learning.teacher_annotation.cache_root_dir must be non-empty"
         )
+    feature_cache = config.server.continual_learning.feature_cache
+    if not isinstance(feature_cache.enabled, bool):
+        raise ValueError(
+            "server.continual_learning.feature_cache.enabled must be a boolean, "
+            f"got {feature_cache.enabled!r}"
+        )
+    if not str(feature_cache.store_root_dir).strip():
+        raise ValueError(
+            "server.continual_learning.feature_cache.store_root_dir must be non-empty"
+        )
+    if not str(feature_cache.view_root_dir).strip():
+        raise ValueError(
+            "server.continual_learning.feature_cache.view_root_dir must be non-empty"
+        )
+    feature_cache_mode = str(feature_cache.materialization_mode).strip().lower()
+    if feature_cache_mode not in {"direct_ref", "copy", "hardlink", "symlink"}:
+        raise ValueError(
+            "server.continual_learning.feature_cache.materialization_mode must be one of "
+            "{'direct_ref', 'copy', 'hardlink', 'symlink'}, "
+            f"got {feature_cache.materialization_mode!r}"
+        )
+    _validate_positive(
+        "server.continual_learning.feature_cache.feature_rebuild_batch_size",
+        int(feature_cache.feature_rebuild_batch_size),
+    )
+    _validate_positive(
+        "server.continual_learning.feature_cache.max_live_generations",
+        int(feature_cache.max_live_generations),
+        allow_zero=True,
+    )
     _validate_positive(
         "server.das.probe_samples",
         int(config.server.das.probe_samples),

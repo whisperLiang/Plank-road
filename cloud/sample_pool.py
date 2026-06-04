@@ -57,6 +57,7 @@ _CANONICAL_FEATURE_METADATA_FIELDS = {
     "class_counts",
     "in_drift_window",
     "window_id",
+    "feature_ref",
 }
 
 
@@ -480,6 +481,23 @@ def _feature_metadata_from_candidate(candidate: Mapping[str, Any]) -> dict[str, 
     }
 
 
+def _feature_ref_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    feature_record = candidate.get("feature_record") or candidate.get("record")
+    values = []
+    if isinstance(feature_record, Mapping):
+        values.append(feature_record.get("feature_ref"))
+    values.append(candidate.get("feature_ref"))
+    for value in values:
+        if isinstance(value, Mapping):
+            return dict(value)
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict()
+            if isinstance(payload, Mapping):
+                return dict(payload)
+    return None
+
+
 def _feature_layout_source_metadata(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: candidate[key]
@@ -621,6 +639,7 @@ class CanonicalSampleRecord:
     in_drift_window: bool | None = None
     window_id: str | None = None
     boundary_payload: BoundaryPayload | None = field(default=None, repr=False, compare=False)
+    feature_ref: dict[str, Any] | None = field(default=None, repr=False, compare=False)
     source_feature_path: str | None = field(default=None, repr=False, compare=False)
     source_label_path: str | None = field(default=None, repr=False, compare=False)
     source_staging_path: str | None = field(default=None, repr=False, compare=False)
@@ -652,6 +671,8 @@ class CanonicalSampleRecord:
         }
         if self.boundary_payload is not None:
             payload["intermediate"] = _detach_boundary_payload(self.boundary_payload)
+        if self.feature_ref is not None:
+            payload["feature_ref"] = dict(self.feature_ref)
         return payload
 
     def to_label_payload(self) -> dict[str, Any]:
@@ -703,6 +724,11 @@ class CanonicalSampleRecord:
             "in_drift_window": self.in_drift_window,
             "window_id": self.window_id,
             "input_image_size": list(self.input_image_size),
+            **(
+                {"feature_ref": dict(self.feature_ref)}
+                if self.feature_ref is not None
+                else {}
+            ),
             "input_tensor_shape": list(self.input_tensor_shape),
             "input_resize_mode": self.input_resize_mode,
             "generation_id": generation_id,
@@ -864,6 +890,7 @@ class CloudSamplePool:
         )
         metadata = _feature_metadata_from_candidate(sample)
         boundary_payload = _boundary_payload_from_candidate(sample)
+        feature_ref = _feature_ref_from_candidate(sample)
         return {
             "schema_version": _CANONICAL_RECORD_VERSION,
             "sample_id": sample_id,
@@ -898,6 +925,7 @@ class CloudSamplePool:
             "risk_score": _to_float(metadata.get("risk_score", sample.get("risk_score", 0.0))),
             "in_drift_window": sample.get("in_drift_window"),
             "window_id": None if sample.get("window_id") is None else str(sample.get("window_id")),
+            **({"feature_ref": feature_ref} if feature_ref is not None else {}),
             **_feature_layout_source_metadata(sample),
         }
 
@@ -1106,6 +1134,7 @@ class CloudSamplePool:
                     "feature": feature_record.get("feature"),
                     "labels": record.labels,
                     "contract_id": entry.get("contract_id") or feature_record.get("contract_id"),
+                    "feature_ref": entry.get("feature_ref") or feature_record.get("feature_ref"),
                     **(
                         {"intermediate": boundary_payload}
                         if boundary_payload is not None
@@ -1213,6 +1242,7 @@ class CloudSamplePool:
                 if is_canonical_active and not active_contract_id_mismatch
                 else _boundary_payload_from_candidate(candidate)
             ),
+            feature_ref=_feature_ref_from_candidate(candidate),
             source_feature_path=(
                 str(candidate.get("__source_feature_path"))
                 if is_canonical_active and candidate.get("__source_feature_path")
@@ -1645,6 +1675,7 @@ class CloudSamplePool:
                     record.front_version = split_contract.front_version
                     record.source_feature_path = None
                     record.source_label_path = None
+                    record.feature_ref = None
                 if record.sample_source == "low_quality":
                     validation_counts["accepted_low_quality"] += 1
                 else:
