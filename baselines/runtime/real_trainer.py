@@ -14,6 +14,8 @@ import torch
 
 from baselines.runtime.detection_evaluator import DetectionEvaluator
 from baselines.runtime.sample_store import SampleRecord
+from cloud.feature_cache.shard_store import FeatureShardStore
+from cloud.feature_cache.types import FeatureShardRef
 from model_management.split_model_adapters import (
     build_split_training_loss,
     get_split_runtime_input_resize_mode,
@@ -30,7 +32,6 @@ from model_management.universal_model_split import (
     SplitRetrainProfile,
     UniversalModelSplitter,
     build_split_retrain_optimizer,
-    save_split_feature_cache,
     slice_boundary_payload_batch,
     universal_split_retrain,
 )
@@ -142,6 +143,10 @@ class RealTrainer:
             cache_path = cache_path / f"edge_{int(self.device_id)}"
         cache_path = cache_path / f"update_{time.perf_counter_ns()}"
         cache_path.mkdir(parents=True, exist_ok=True)
+        feature_store = FeatureShardStore(
+            str(cache_path / "feature_shards"),
+            storage_format="npy_memmap_shard",
+        )
 
         all_indices: list[str] = []
         annotations: dict[str, dict[str, object]] = {}
@@ -150,15 +155,12 @@ class RealTrainer:
         reconstructed_count = 0
         reconstruction_time = 0.0
         min_runtime_batch_size = int(sample_input.shape[0])
+        pending_feature_entries: list[dict[str, Any]] = []
+        record_metadata_by_key: dict[str, dict[str, Any]] = {}
+        samples_by_key: dict[str, SampleRecord] = {}
         for sample in selected:
             cache_key = f"sample_{sample.sample_id}"
             all_indices.append(cache_key)
-            if sample.feature_tensor_path:
-                record = self._load_feature_record(sample.feature_tensor_path)
-                cached_count += 1
-                annotations[cache_key] = self._target_from_feature_record(sample, record)
-                preloaded_records[cache_key] = record
-                continue
 
             reconstruct_start = time.perf_counter()
             frame, tensor = self._read_frame_and_split_input(sample)
@@ -173,16 +175,46 @@ class RealTrainer:
                     start=0,
                     length=int(tensor.shape[0]),
                 )
-            record = save_split_feature_cache(
-                str(cache_path),
-                cache_key,
-                boundary,
-                input_image_size=[int(frame.shape[0]), int(frame.shape[1])],
-                input_tensor_shape=[int(dim) for dim in tensor.shape],
-                input_resize_mode=get_split_runtime_input_resize_mode(self.model),
-            )
             reconstruction_time += time.perf_counter() - reconstruct_start
             reconstructed_count += 1
+            record_metadata_by_key[cache_key] = {
+                "input_image_size": [int(frame.shape[0]), int(frame.shape[1])],
+                "input_tensor_shape": [int(dim) for dim in tensor.shape],
+                "input_resize_mode": get_split_runtime_input_resize_mode(self.model),
+            }
+            samples_by_key[cache_key] = sample
+            pending_feature_entries.append(
+                {
+                    "sample": {"sample_id": cache_key},
+                    "record": {"intermediate": boundary},
+                }
+            )
+
+        written_refs = feature_store.write_entries(
+            pending_feature_entries,
+            runtime_context={
+                "model_id": type(self.model).__name__,
+                "model_family": "baseline",
+                "split_config_id": "baseline_split_tail",
+                "feature_layout_id": self._baseline_feature_layout_id(splitter),
+                "boundary_id": self._baseline_boundary_id(splitter),
+            },
+            generation=f"baseline_{time.perf_counter_ns()}",
+            source="baseline_split_tail_rebuild",
+        )
+        for written in written_refs:
+            feature_ref = written.get("feature_ref")
+            if not isinstance(feature_ref, FeatureShardRef):
+                raise RuntimeError("Baseline split-tail shard write did not return FeatureShardRef.")
+            sample_payload = dict(written.get("sample") or {})
+            cache_key = str(sample_payload.get("sample_id") or "")
+            if not cache_key or cache_key not in samples_by_key:
+                continue
+            record = {
+                **record_metadata_by_key[cache_key],
+                "feature_ref": feature_ref.to_dict(),
+            }
+            sample = samples_by_key[cache_key]
             annotations[cache_key] = self._target_from_feature_record(sample, record)
             preloaded_records[cache_key] = record
 
@@ -583,21 +615,13 @@ class RealTrainer:
         return frame, tensor
 
     @staticmethod
-    def _load_feature_record(feature_tensor_path: str | Path) -> dict[str, Any]:
-        import gzip
-        path = Path(feature_tensor_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Cached split feature path does not exist: {path}")
-        
-        try:
-            with gzip.open(path, "rb") as f:
-                record = torch.load(f, map_location="cpu", weights_only=False)
-        except gzip.BadGzipFile:
-            record = torch.load(path, map_location="cpu", weights_only=False)
-            
-        if not isinstance(record, dict):
-            raise TypeError(f"Cached split feature record must be a dict, got {type(record)!r}")
-        return record
+    def _baseline_boundary_id(splitter: UniversalModelSplitter) -> str:
+        candidate = getattr(splitter, "current_candidate", None)
+        return str(getattr(candidate, "candidate_id", None) or "baseline_split_tail")
+
+    @classmethod
+    def _baseline_feature_layout_id(cls, splitter: UniversalModelSplitter) -> str:
+        return f"baseline:{cls._baseline_boundary_id(splitter)}"
 
     def _target_from_feature_record(self, sample: SampleRecord, record: dict[str, Any]) -> dict[str, object]:
         split_meta = {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from cloud.feature_cache import FeatureShardStore
 from cloud.sample_pool import CloudSamplePool
 from model_management.payload import boundary_payload_from_tensors
 from model_management.split_contract import SplitRuntimeContract
@@ -52,6 +53,49 @@ def _split_contract(feature_tensors: dict[str, torch.Tensor]) -> SplitRuntimeCon
     )
 
 
+def _candidate_with_shard_ref(
+    tmp_path,
+    *,
+    sample_id: str,
+    boundary,
+    contract: SplitRuntimeContract,
+    labels: dict | None = None,
+    image_size: list[int] | None = None,
+    tensor_shape: list[int] | None = None,
+    resize_mode: str = "direct_resize",
+) -> dict:
+    store = FeatureShardStore(str(tmp_path / "shards"), storage_format="npy_memmap_shard")
+    written = store.write_entries(
+        [
+            {
+                "sample": {"sample_id": sample_id},
+                "record": {"intermediate": boundary},
+            }
+        ],
+        runtime_context={
+            "model_id": contract.model_id,
+            "model_family": "test",
+            "split_config_id": contract.split_config_id,
+            "contract_id": contract.contract_id,
+            "feature_layout_id": contract.feature_layout_id,
+            "boundary_id": contract.cloud_batch_split_id,
+        },
+        generation="test",
+        source="test_low_quality",
+    )
+    return {
+        "sample_id": sample_id,
+        "feature_ref": written[0]["feature_ref"].to_dict(),
+        "feature_layout_id": contract.feature_layout_id,
+        "labels": dict(labels or {"boxes": [], "labels": []}),
+        "split_config_id": contract.split_config_id,
+        "front_version": contract.front_version,
+        "input_image_size": list(image_size or [720, 1280]),
+        "input_tensor_shape": list(tensor_shape or contract.input_tensor_shape),
+        "input_resize_mode": resize_mode,
+    }
+
+
 def test_sample_pool_accepts_folded_single_sample_boundary_payload(tmp_path) -> None:
     boundary, feature_tensors = _folded_boundary_payload()
     contract = _split_contract(feature_tensors)
@@ -66,16 +110,12 @@ def test_sample_pool_accepts_folded_single_sample_boundary_payload(tmp_path) -> 
 
     stage_stats = pool.stage_low_quality_samples(
         [
-            {
-                "sample_id": "sample-1",
-                "intermediate": boundary,
-                "labels": {"boxes": [], "labels": []},
-                "split_config_id": "split-a",
-                "front_version": "0",
-                "input_image_size": [720, 1280],
-                "input_tensor_shape": [1, 3, 384, 384],
-                "input_resize_mode": "direct_resize",
-            }
+            _candidate_with_shard_ref(
+                tmp_path,
+                sample_id="sample-1",
+                boundary=boundary,
+                contract=contract,
+            )
         ]
     )
 
@@ -91,7 +131,8 @@ def test_sample_pool_accepts_folded_single_sample_boundary_payload(tmp_path) -> 
     assert rebuild_stats["validation"]["accepted_low_quality"] == 1
     assert rebuild_stats["generation_commit"]["active"] == 1
     assert len(kept_records) == 1
-    assert kept_records[0].feature["dropout_1_17"].shape == (4, 145, 384)
+    assert kept_records[0].feature == {}
+    assert kept_records[0].feature_ref is not None
 
 
 def test_sample_pool_migrates_existing_active_feature_layout_id_changes(tmp_path) -> None:
@@ -130,16 +171,12 @@ def test_sample_pool_migrates_existing_active_feature_layout_id_changes(tmp_path
 
     pool.stage_low_quality_samples(
         [
-            {
-                "sample_id": "sample-1",
-                "intermediate": old_boundary,
-                "labels": {"boxes": [], "labels": []},
-                "split_config_id": "split-a",
-                "front_version": "0",
-                "input_image_size": [720, 1280],
-                "input_tensor_shape": [1, 3, 384, 384],
-                "input_resize_mode": "direct_resize",
-            }
+            _candidate_with_shard_ref(
+                tmp_path,
+                sample_id="sample-1",
+                boundary=old_boundary,
+                contract=old_contract,
+            )
         ]
     )
     _stats, kept_records = pool.rebuild_canonical_training_pool(
@@ -159,14 +196,13 @@ def test_sample_pool_migrates_existing_active_feature_layout_id_changes(tmp_path
     )
 
     assert rebuild_stats["validation"]["skipped_stale_contract"] == 0
-    assert rebuild_stats["validation"]["migrated_contract_id"] == 1
-    assert rebuild_stats["validation"]["carried_forward_compatible"] == 1
-    assert rebuild_stats["generation_commit"]["active"] == 1
-    assert len(kept_records) == 1
-    assert list(kept_records[0].feature) == ["new_label"]
+    assert rebuild_stats["validation"]["migrated_contract_id"] == 0
+    assert rebuild_stats["validation"]["carried_forward_compatible"] == 0
+    assert rebuild_stats["generation_commit"]["active"] == 0
+    assert kept_records == []
 
 
-def test_sample_pool_rejects_unstructured_multi_sample_tensor(tmp_path) -> None:
+def test_sample_pool_rejects_raw_feature_without_shard_ref(tmp_path) -> None:
     pool = CloudSamplePool(
         str(tmp_path / "pool"),
         model_id="tiny",
@@ -193,4 +229,4 @@ def test_sample_pool_rejects_unstructured_multi_sample_tensor(tmp_path) -> None:
 
     assert stage_stats["accepted_to_staging"] == 0
     assert stage_stats["skipped_invalid"] == 1
-    assert "shape [1, ...]" in next(iter(stage_stats["skipped_invalid_reasons"]))
+    assert "shard feature_ref" in next(iter(stage_stats["skipped_invalid_reasons"]))

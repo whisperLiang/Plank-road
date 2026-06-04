@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import grpc
-import torch
 from loguru import logger
 
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
@@ -60,28 +59,6 @@ def _safe_sample_filename(sample_id: str, suffix: str) -> str:
     return f"{safe or uuid.uuid4().hex}{suffix}"
 
 
-def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
-    if hasattr(intermediate, "tensors"):
-        source = dict(getattr(intermediate, "tensors"))
-    elif isinstance(intermediate, torch.Tensor):
-        source = {"payload": intermediate}
-    elif isinstance(intermediate, Mapping):
-        source = dict(intermediate.get("tensors") or intermediate)
-    else:
-        raise TypeError(f"Unsupported intermediate feature type: {type(intermediate)!r}")
-    tensors: dict[str, torch.Tensor] = {}
-    for label, value in source.items():
-        if isinstance(value, torch.Tensor):
-            tensors[str(label)] = value.detach().cpu()
-    if not tensors:
-        raise ValueError("Intermediate feature payload did not contain tensors.")
-    return tensors
-
-
-def _feature_sample_payload(intermediate: Any) -> dict[str, Any]:
-    return {"tensors": _tensor_only_features(intermediate)}
-
-
 def _record_abs_path(sample_store: EdgeSampleStore, relpath: str | None) -> str | None:
     if relpath is None:
         return None
@@ -94,8 +71,9 @@ def _low_quality_trigger_source_bytes(
     *,
     send_low_conf_features: bool,
 ) -> int:
+    del send_low_conf_features
     total = 0
-    for relpath in (record.raw_relpath, record.feature_relpath if send_low_conf_features else None):
+    for relpath in (record.raw_relpath,):
         path = _record_abs_path(sample_store, relpath)
         if path and os.path.exists(path):
             total += os.path.getsize(path)
@@ -133,7 +111,7 @@ def _select_low_quality_trigger_records(
         selected.append(record)
         selected_bytes += source_bytes
     return selected, {
-        "policy": "low_quality_trigger_raw_with_optional_features",
+        "policy": "low_quality_trigger_raw_only",
         "bundle_cap_bytes": 0 if cap is None else int(cap),
         "selected_sample_count": len(selected),
         "omitted_sample_count": omitted + max(0, len(records) - len(selected) - omitted),
@@ -180,45 +158,6 @@ def _write_low_quality_raw_tar(
         manifest_info.mtime = int(time.time())
         tf.addfile(manifest_info, io.BytesIO(manifest_bytes))
     return tar_buffer.getvalue(), manifest_entries
-
-
-def _write_low_quality_feature_shard(
-    sample_store: EdgeSampleStore,
-    records: Sequence,
-    *,
-    runtime_contract: Mapping[str, object] | None = None,
-) -> tuple[bytes | None, list[str]]:
-    feature_payload = {"schema_version": 1, "samples": {}}
-    contract_payload = dict(runtime_contract or {})
-    sample_ids: list[str] = []
-    for record in records:
-        sample_id = str(record.sample_id)
-        feature_path = _record_abs_path(sample_store, record.feature_relpath)
-        if feature_path is None or not os.path.exists(feature_path):
-            continue
-        try:
-            feature_sample = _feature_sample_payload(sample_store.load_intermediate(record))
-            if contract_payload:
-                feature_sample["runtime_contract"] = contract_payload
-                if contract_payload.get("feature_layout_id"):
-                    feature_sample["feature_layout_id"] = str(
-                        contract_payload.get("feature_layout_id")
-                    )
-            feature_payload["samples"][sample_id] = feature_sample
-        except Exception as exc:
-            logger.warning(
-                "Skipping optional low-quality feature for sample {}: {}",
-                sample_id,
-                exc,
-            )
-            feature_payload["samples"].pop(sample_id, None)
-            continue
-        sample_ids.append(sample_id)
-    if not sample_ids:
-        return None, []
-    buffer = io.BytesIO()
-    torch.save(feature_payload, buffer)
-    return buffer.getvalue(), sample_ids
 
 
 def pack_low_quality_trigger_bundle(
@@ -280,6 +219,8 @@ def pack_low_quality_trigger_bundle_to_file(
         == str(getattr(split_plan, "front_version", "0") or "0")
         and record.quality_bucket == LOW_QUALITY
     ]
+    send_features_requested = bool(send_low_conf_features)
+    send_low_conf_features = False
     selected, selection_policy = _select_low_quality_trigger_records(
         sample_store,
         records,
@@ -311,13 +252,14 @@ def pack_low_quality_trigger_bundle_to_file(
         ],
         "input_resize_mode": str(getattr(split_plan, "input_resize_mode", "") or "direct_resize"),
         "runtime_contract": dict(getattr(split_plan, "runtime_contract", {}) or {}),
-        "upload_mode": "raw+feature" if send_low_conf_features else "raw-only",
+        "upload_mode": "raw-only",
         "created_at": _utc_now(),
         "model": model_meta,
         "split_plan": split_plan.to_dict(),
         "training_mode": {
             "send_low_conf_features": bool(send_low_conf_features),
-            "low_quality_mode": "raw+feature" if send_low_conf_features else "raw-only",
+            "send_low_conf_features_requested": send_features_requested,
+            "low_quality_mode": "raw-only",
         },
         "selection_policy": selection_policy,
         "shard_size": resolved_shard_size,
@@ -338,7 +280,6 @@ def pack_low_quality_trigger_bundle_to_file(
     handle.close()
     try:
         raw_shard_payloads: list[tuple[str, bytes, list[str]]] = []
-        feature_shard_payloads: list[tuple[str, bytes, list[str]]] = []
         for shard_index, shard_records in enumerate(_chunks(selected, resolved_shard_size), 1):
             sample_ids = [str(record.sample_id) for record in shard_records]
             raw_shard_name = f"raw_shards/low_raw_shard_{shard_index:06d}.tar"
@@ -347,21 +288,6 @@ def pack_low_quality_trigger_bundle_to_file(
                 shard_records,
             )
             raw_shard_payloads.append((raw_shard_name, tar_bytes, sample_ids))
-            if send_low_conf_features:
-                feature_shard_name = f"feature_shards/low_feature_shard_{shard_index:06d}.pt"
-                feature_payload, feature_sample_ids = _write_low_quality_feature_shard(
-                    sample_store,
-                    shard_records,
-                    runtime_contract=dict(getattr(split_plan, "runtime_contract", {}) or {}),
-                )
-                if feature_payload is not None and feature_sample_ids:
-                    feature_shard_payloads.append(
-                        (
-                            feature_shard_name,
-                            feature_payload,
-                            feature_sample_ids,
-                        )
-                    )
         manifest["raw_shards"] = [
             {
                 "shard_id": f"edge{int(edge_id)}_low_raw_{index:06d}",
@@ -370,20 +296,11 @@ def pack_low_quality_trigger_bundle_to_file(
             }
             for index, (name, _payload, sample_ids) in enumerate(raw_shard_payloads, 1)
         ]
-        manifest["feature_shards"] = [
-            {
-                "shard_id": f"edge{int(edge_id)}_low_feature_{index:06d}",
-                "file": name,
-                "sample_count": len(sample_ids),
-            }
-            for index, (name, _payload, sample_ids) in enumerate(feature_shard_payloads, 1)
-        ]
+        manifest["feature_shards"] = []
 
         def _write_zip() -> None:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
                 for name, payload, _sample_ids in raw_shard_payloads:
-                    zf.writestr(name, payload, compress_type=zipfile.ZIP_STORED)
-                for name, payload, _sample_ids in feature_shard_payloads:
                     zf.writestr(name, payload, compress_type=zipfile.ZIP_STORED)
                 zf.writestr(
                     "trigger_manifest.json",

@@ -375,6 +375,7 @@ class EdgeWorker:
             server_ip=self.config.server_ip,
             edge_id=self.edge_id,
             sample_pool_config=getattr(self.config, "sample_pool", None),
+            feature_upload_config=getattr(self.config, "feature_upload", None),
             context_provider=self._sample_sync_context,
         )
         self.bundle_cache_path = os.path.join(self.config.retrain.cache_path, "server_bundle")

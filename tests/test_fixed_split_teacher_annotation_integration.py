@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import torch
 
+from cloud.feature_cache import FeatureShardStore
 from cloud.sample_pool import CloudSamplePool
 from cloud_server import CloudContinualLearner
 from model_management.payload import boundary_payload_from_tensors
@@ -132,6 +133,46 @@ def _boundary_and_contract():
     return boundary, contract
 
 
+def _candidate_with_shard_ref(
+    tmp_path,
+    *,
+    sample_id: str,
+    boundary,
+    contract: SplitRuntimeContract,
+    labels: dict,
+) -> dict:
+    store = FeatureShardStore(str(tmp_path / "shards"), storage_format="npy_memmap_shard")
+    written = store.write_entries(
+        [
+            {
+                "sample": {"sample_id": sample_id},
+                "record": {"intermediate": boundary},
+            }
+        ],
+        runtime_context={
+            "model_id": contract.model_id,
+            "model_family": "test",
+            "split_config_id": contract.split_config_id,
+            "contract_id": contract.contract_id,
+            "feature_layout_id": contract.feature_layout_id,
+            "boundary_id": contract.cloud_batch_split_id,
+        },
+        generation="teacher-integration",
+        source="test_low_quality",
+    )
+    return {
+        "sample_id": sample_id,
+        "feature_ref": written[0]["feature_ref"].to_dict(),
+        "feature_layout_id": contract.feature_layout_id,
+        "labels": dict(labels),
+        "split_config_id": contract.split_config_id,
+        "front_version": contract.front_version,
+        "input_image_size": [16, 16],
+        "input_tensor_shape": [1, 3, 16, 16],
+        "input_resize_mode": "direct_resize",
+    }
+
+
 def test_cache_label_format_is_accepted_by_cloud_sample_pool(tmp_path) -> None:
     boundary, contract = _boundary_and_contract()
     pool = CloudSamplePool(
@@ -145,22 +186,19 @@ def test_cache_label_format_is_accepted_by_cloud_sample_pool(tmp_path) -> None:
 
     stage_stats = pool.stage_low_quality_samples(
         [
-            {
-                "sample_id": "sample-1",
-                "intermediate": boundary,
-                "labels": {
+            _candidate_with_shard_ref(
+                tmp_path,
+                sample_id="sample-1",
+                boundary=boundary,
+                contract=contract,
+                labels={
                     "boxes": [[1, 2, 3, 4]],
                     "labels": [1],
                     "scores": [0.9],
                     "label_coordinate_space": "original_xyxy",
                     "label_runtime_version": "fixed-split-pool-labels.v1",
                 },
-                "split_config_id": "split-a",
-                "front_version": "0",
-                "input_image_size": [16, 16],
-                "input_tensor_shape": [1, 3, 16, 16],
-                "input_resize_mode": "direct_resize",
-            }
+            )
         ]
     )
     rebuild_stats, kept = pool.rebuild_canonical_training_pool(
@@ -187,16 +225,13 @@ def test_unresolved_low_quality_sample_is_not_staged(tmp_path) -> None:
     )
     resolved_labels = {"sample-1": {"boxes": [], "labels": []}}
     candidates = [
-        {
-            "sample_id": sample_id,
-            "intermediate": boundary,
-            "labels": labels,
-            "split_config_id": "split-a",
-            "front_version": "0",
-            "input_image_size": [16, 16],
-            "input_tensor_shape": [1, 3, 16, 16],
-            "input_resize_mode": "direct_resize",
-        }
+        _candidate_with_shard_ref(
+            tmp_path,
+            sample_id=sample_id,
+            boundary=boundary,
+            contract=contract,
+            labels=labels,
+        )
         for sample_id, labels in resolved_labels.items()
     ]
 

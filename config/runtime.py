@@ -88,6 +88,18 @@ class ResourceAwareTriggerConfig(ConfigSection):
 
 
 @dataclass
+class FeatureUploadConfig(ConfigSection):
+    storage_format: str = "safetensors_shard"
+    shard_max_samples: int = 64
+    shard_dtype: str = "float16"
+    include_index_json: bool = True
+    include_meta_json: bool = True
+
+    def __post_init__(self) -> None:
+        self.storage_format = str(self.storage_format).strip().lower()
+
+
+@dataclass
 class FixedSplitConfig(ConfigSection):
     privacy_leakage_upper_bound: float = 0.15
     max_layer_freezing_ratio: float = 0.75
@@ -125,6 +137,20 @@ class FeatureCacheConfig(ConfigSection):
     materialization_mode: str = "direct_ref"
     view_root_dir: str = "./cache/cloud_training_views"
     store_root_dir: str = "./cache/cloud_feature_store"
+    shard_root_dir: str = "./cache/cloud_feature_shards"
+    storage_format: str = "safetensors_shard"
+    accepted_storage_formats: list[str] = field(
+        default_factory=lambda: ["safetensors_shard", "npy_memmap_shard"]
+    )
+    shard_max_samples: int = 64
+    shard_dtype: str = "float16"
+    payload_cache_enabled: bool = True
+    payload_cache_scope: str = "active_pool"
+    payload_cache_device: str = "cpu"
+    payload_cache_max_cpu_bytes: int = 4294967296
+    payload_cache_max_gpu_bytes: int = 1073741824
+    pin_memory: bool = True
+    non_blocking_transfer: bool = True
     validate_refs: bool = True
     deep_validate_feature_payload: bool = False
     deep_validate_sample_rate: float = 0.0
@@ -135,6 +161,7 @@ class FeatureCacheConfig(ConfigSection):
     def __post_init__(self) -> None:
         self.view_source = str(self.view_source).strip().lower()
         self.materialization_mode = str(self.materialization_mode).strip().lower()
+        self.storage_format = str(self.storage_format).strip().lower()
 
 
 @dataclass
@@ -215,6 +242,7 @@ class ClientConfig(ConfigSection):
     resource_aware_trigger: ResourceAwareTriggerConfig = field(
         default_factory=ResourceAwareTriggerConfig
     )
+    feature_upload: FeatureUploadConfig = field(default_factory=FeatureUploadConfig)
     split_learning: SplitLearningConfig = field(default_factory=SplitLearningConfig)
     sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
 
@@ -287,6 +315,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["resource_aware_trigger"] = _section(
             ResourceAwareTriggerConfig,
             known.get("resource_aware_trigger"),
+        )
+        known["feature_upload"] = _section(
+            FeatureUploadConfig,
+            known.get("feature_upload"),
         )
         known["split_learning"] = _section(
             SplitLearningConfig,
@@ -431,6 +463,30 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             raise ValueError(message)
 
     _validate_sample_pool_config("sample_pool", config.sample_pool)
+    feature_upload = config.client.feature_upload
+    if str(feature_upload.storage_format).strip().lower() not in {
+        "safetensors_shard",
+        "npy_memmap_shard",
+    }:
+        raise ValueError(
+            "client.feature_upload.storage_format must be one of "
+            "safetensors_shard, npy_memmap_shard, "
+            f"got {feature_upload.storage_format!r}"
+        )
+    _validate_positive(
+        "client.feature_upload.shard_max_samples",
+        int(feature_upload.shard_max_samples),
+    )
+    if not isinstance(feature_upload.include_index_json, bool):
+        raise ValueError(
+            "client.feature_upload.include_index_json must be a boolean, "
+            f"got {feature_upload.include_index_json!r}"
+        )
+    if not isinstance(feature_upload.include_meta_json, bool):
+        raise ValueError(
+            "client.feature_upload.include_meta_json must be a boolean, "
+            f"got {feature_upload.include_meta_json!r}"
+        )
     _validate_positive("client.interval", int(config.client.interval))
     _validate_positive("client.local_queue_maxsize", int(config.client.local_queue_maxsize))
     _validate_positive("client.wait_thresh", int(config.client.wait_thresh))
@@ -660,6 +716,29 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "server.continual_learning.feature_cache.store_root_dir must be non-empty"
         )
+    if not str(feature_cache.shard_root_dir).strip():
+        raise ValueError(
+            "server.continual_learning.feature_cache.shard_root_dir must be non-empty"
+        )
+    storage_format = str(feature_cache.storage_format).strip().lower()
+    if storage_format not in {"safetensors_shard", "npy_memmap_shard"}:
+        raise ValueError(
+            "server.continual_learning.feature_cache.storage_format must be one of "
+            "safetensors_shard, npy_memmap_shard, "
+            f"got {feature_cache.storage_format!r}"
+        )
+    accepted_formats = [str(item).strip().lower() for item in list(feature_cache.accepted_storage_formats or [])]
+    if not accepted_formats or any(
+        item not in {"safetensors_shard", "npy_memmap_shard"} for item in accepted_formats
+    ):
+        raise ValueError(
+            "server.continual_learning.feature_cache.accepted_storage_formats must contain "
+            "only safetensors_shard and/or npy_memmap_shard"
+        )
+    _validate_positive(
+        "server.continual_learning.feature_cache.shard_max_samples",
+        int(feature_cache.shard_max_samples),
+    )
     if not str(feature_cache.view_root_dir).strip():
         raise ValueError(
             "server.continual_learning.feature_cache.view_root_dir must be non-empty"
@@ -693,6 +772,25 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.continual_learning.feature_cache.feature_rebuild_batch_size",
         int(feature_cache.feature_rebuild_batch_size),
     )
+    _validate_positive(
+        "server.continual_learning.feature_cache.payload_cache_max_cpu_bytes",
+        int(feature_cache.payload_cache_max_cpu_bytes),
+    )
+    if not isinstance(feature_cache.payload_cache_enabled, bool):
+        raise ValueError(
+            "server.continual_learning.feature_cache.payload_cache_enabled must be a boolean, "
+            f"got {feature_cache.payload_cache_enabled!r}"
+        )
+    if not isinstance(feature_cache.pin_memory, bool):
+        raise ValueError(
+            "server.continual_learning.feature_cache.pin_memory must be a boolean, "
+            f"got {feature_cache.pin_memory!r}"
+        )
+    if not isinstance(feature_cache.non_blocking_transfer, bool):
+        raise ValueError(
+            "server.continual_learning.feature_cache.non_blocking_transfer must be a boolean, "
+            f"got {feature_cache.non_blocking_transfer!r}"
+        )
     if not isinstance(feature_cache.gc_enabled, bool):
         raise ValueError(
             "server.continual_learning.feature_cache.gc_enabled must be a boolean, "

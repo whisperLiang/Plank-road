@@ -39,11 +39,12 @@ from cloud.annotation import (
 )
 from cloud.edge_registry import EdgeRegistry
 from cloud.feature_cache import (
-    FeatureBlobStore,
     FeatureCacheMaterializer,
     FeatureCachePlanner,
-    FeatureRef,
+    FeatureShardRef,
+    FeatureShardStore,
     LabelRef,
+    ShardFeatureBatchReader,
 )
 from cloud.sample_pool import CloudSamplePool
 from cloud.training import (
@@ -83,7 +84,6 @@ from model_management.universal_model_split import (
     SplitRetrainProfile,
     UniversalModelSplitter,
     collect_suffix_trainable_parameters,
-    load_split_feature_cache,
     prepare_exact_split_runtime,
 )
 from model_management.fixed_split_runtime_template import (
@@ -110,7 +110,6 @@ from model_management.split_contract import (
     contract_path,
     feature_layout_from_tensors,
     feature_layout_id as make_feature_layout_id,
-    normalise_feature_tensors,
     resolve_cloud_runtime_contract,
 )
 from torchvision.models.detection.image_list import ImageList
@@ -1451,54 +1450,6 @@ def _filter_prediction_by_high_threshold(
     }
 
 
-def _proxy_feature_tensors_from_record(record: Mapping[str, object]) -> dict[str, torch.Tensor]:
-    if "feature" in record:
-        return normalise_feature_tensors(record["feature"])
-    intermediate = record.get("intermediate")
-    if isinstance(intermediate, BoundaryPayload):
-        return normalise_feature_tensors(dict(intermediate.tensors))
-    if intermediate is not None:
-        return normalise_feature_tensors(intermediate)
-    return normalise_feature_tensors(record)
-
-
-def _proxy_boundary_batch(
-    records: list[Mapping[str, object]],
-    *,
-    splitter: UniversalModelSplitter,
-) -> BoundaryPayload:
-    if not records:
-        raise RuntimeError("Cannot build an empty cached split proxy batch.")
-    payloads = [
-        record.get("intermediate")
-        for record in records
-        if isinstance(record.get("intermediate"), BoundaryPayload)
-    ]
-    if len(payloads) == len(records):
-        return BoundaryPayloadCacheCodec(splitter).collate(
-            [payload for payload in payloads if isinstance(payload, BoundaryPayload)]
-        )
-
-    tensor_groups = [_proxy_feature_tensors_from_record(record) for record in records]
-    labels = list(tensor_groups[0].keys())
-    batched_tensors: dict[str, torch.Tensor] = {}
-    for label in labels:
-        pieces: list[torch.Tensor] = []
-        for tensors in tensor_groups:
-            tensor = tensors[label]
-            pieces.append(tensor)
-        batched_tensors[label] = torch.cat(pieces, dim=0)
-    runtime = getattr(splitter, "runtime", splitter)
-    trace_graph = getattr(runtime, "trace_graph", None)
-    return boundary_payload_from_tensors(
-        batched_tensors,
-        split_id=str(getattr(runtime, "split_id", "") or "split-tail"),
-        graph_signature=str(getattr(trace_graph, "graph_shape_hash", "") or "split-runtime"),
-        batch_size=len(records),
-        legacy_schema_inference=True,
-    )
-
-
 def _splitter_dynamic_batch_range(
     splitter: object | None,
 ) -> tuple[int, int] | None:
@@ -1603,13 +1554,16 @@ def _build_detection_proxy_prediction_cache(
         and split_candidate is not None
         and model_family in _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES
     ):
+        metadata_index_path = os.path.join(split_cache_path, "metadata_index.json")
+        metadata_index = (
+            _read_json_file(metadata_index_path)
+            if os.path.exists(metadata_index_path)
+            else {}
+        )
+        metadata_samples = dict(metadata_index.get("samples") or {})
+        shard_reader = ShardFeatureBatchReader()
         pending_samples: list[
-            tuple[
-                list[object],
-                list[object],
-                Mapping[str, object],
-                Mapping[str, object] | None,
-            ]
+            tuple[list[object], list[object], FeatureShardRef, Mapping[str, object] | None]
         ] = []
         for sample_id in sample_ids:
             target = gt_annotations.get(sample_id) or {}
@@ -1621,13 +1575,13 @@ def _build_detection_proxy_prediction_cache(
 
             record = _lookup_preloaded_record(preloaded_records, sample_id)
             if record is None:
-                try:
-                    record = load_split_feature_cache(split_cache_path, sample_id)
-                except FileNotFoundError:
-                    skipped_missing_frame += 1
-                    continue
+                candidate = metadata_samples.get(str(sample_id))
+                record = dict(candidate) if isinstance(candidate, Mapping) else None
+            if not isinstance(record, Mapping):
+                skipped_missing_frame += 1
+                continue
             try:
-                _proxy_feature_tensors_from_record(record)
+                feature_ref = FeatureShardRef.from_dict(dict(record.get("feature_ref") or {}))
             except Exception:
                 skipped_missing_frame += 1
                 continue
@@ -1638,7 +1592,7 @@ def _build_detection_proxy_prediction_cache(
             )
             if not isinstance(sample_metadata, Mapping):
                 sample_metadata = record if isinstance(record, Mapping) else None
-            pending_samples.append((gt_boxes, gt_labels, dict(record), sample_metadata))
+            pending_samples.append((gt_boxes, gt_labels, feature_ref, sample_metadata))
 
         prediction_rows: list[tuple[list[object], list[object], dict[str, list]]] = []
         _set_detection_model_eval_mode(model)
@@ -1652,7 +1606,7 @@ def _build_detection_proxy_prediction_cache(
                 tuple[
                     list[object],
                     list[object],
-                    Mapping[str, object],
+                    FeatureShardRef,
                     Mapping[str, object] | None,
                 ]
             ],
@@ -1660,7 +1614,7 @@ def _build_detection_proxy_prediction_cache(
             tuple[
                 list[object],
                 list[object],
-                Mapping[str, object],
+                FeatureShardRef,
                 Mapping[str, object] | None,
             ]
         ]:
@@ -1682,9 +1636,8 @@ def _build_detection_proxy_prediction_cache(
             for start, stop in spans:
                 batch = pending_samples[start:stop]
                 execution_batch = _execution_batch(batch)
-                batched_payload = _proxy_boundary_batch(
-                    [record for _, _, record, _ in execution_batch],
-                    splitter=splitter,
+                batched_payload = shard_reader.read_batch(
+                    [feature_ref for _, _, feature_ref, _ in execution_batch]
                 )
                 execution_batch_size = int(batched_payload.batch_size)
                 raw_outputs = splitter.cloud_forward(
@@ -2208,10 +2161,41 @@ class CloudContinualLearner:
             str(
                 getattr(
                     feature_cache_cfg,
-                    "store_root_dir",
-                    "./cache/cloud_feature_store",
+                    "shard_root_dir",
+                    getattr(feature_cache_cfg, "store_root_dir", "./cache/cloud_feature_shards"),
                 )
             )
+        )
+        self.feature_cache_storage_format = (
+            str(getattr(feature_cache_cfg, "storage_format", "safetensors_shard")).strip().lower()
+        )
+        self.feature_cache_accepted_storage_formats = [
+            str(item).strip().lower()
+            for item in list(
+                getattr(
+                    feature_cache_cfg,
+                    "accepted_storage_formats",
+                    ["safetensors_shard", "npy_memmap_shard"],
+                )
+                or []
+            )
+        ]
+        self.feature_cache_shard_max_samples = max(
+            1,
+            int(getattr(feature_cache_cfg, "shard_max_samples", 64)),
+        )
+        self.feature_cache_shard_dtype = str(
+            getattr(feature_cache_cfg, "shard_dtype", "float16") or ""
+        )
+        self.feature_cache_payload_cache_enabled = bool(
+            getattr(feature_cache_cfg, "payload_cache_enabled", True)
+        )
+        self.feature_cache_payload_cache_max_cpu_bytes = int(
+            getattr(feature_cache_cfg, "payload_cache_max_cpu_bytes", 4294967296)
+        )
+        self.feature_cache_pin_memory = bool(getattr(feature_cache_cfg, "pin_memory", True))
+        self.feature_cache_non_blocking_transfer = bool(
+            getattr(feature_cache_cfg, "non_blocking_transfer", True)
         )
         self.feature_cache_view_root_dir = os.path.abspath(
             str(
@@ -2831,45 +2815,18 @@ class CloudContinualLearner:
         return [str(sample_id) for sample_id in sample_ids[: max(0, int(limit))]]
 
     @staticmethod
-    def _feature_tensors_from_record(record: Mapping[str, object]) -> dict[str, torch.Tensor]:
-        if "feature" in record:
-            return normalise_feature_tensors(record["feature"])
-        if "tensors" in record:
-            return normalise_feature_tensors(record["tensors"])
-        intermediate = record.get("intermediate")
-        if isinstance(intermediate, BoundaryPayload):
-            return normalise_feature_tensors(dict(intermediate.tensors))
-        if intermediate is not None:
-            return normalise_feature_tensors(intermediate)
-        return normalise_feature_tensors(record)
-
-    @staticmethod
-    def _first_candidate_feature_tensors(
-        candidates: list[Mapping[str, object]],
-    ) -> dict[str, torch.Tensor] | None:
-        """Return the first usable feature tensor dict from canonical candidates."""
-        for candidate in candidates:
-            feature = candidate.get("feature")
-            if isinstance(feature, Mapping):
-                tensors = {
-                    str(label): tensor
-                    for label, tensor in dict(feature).items()
-                    if isinstance(tensor, torch.Tensor)
-                }
-                if tensors:
-                    return tensors
-        return None
-
-    @staticmethod
     def _feature_layout_summary_from_candidate(
         candidate: Mapping[str, object],
     ) -> dict[str, object]:
-        tensors = CloudContinualLearner._feature_tensors_from_record(candidate)
-        layout = feature_layout_from_tensors(tensors)
+        feature_ref = candidate.get("feature_ref")
+        ref_payload = dict(feature_ref) if isinstance(feature_ref, Mapping) else {}
+        layout = dict(candidate.get("feature_layout") or {})
         return {
             "sample_id": str(candidate.get("sample_id") or ""),
             "feature_layout_id": str(
-                candidate.get("feature_layout_id") or make_feature_layout_id(layout)
+                candidate.get("feature_layout_id")
+                or ref_payload.get("feature_layout_id")
+                or (make_feature_layout_id(layout) if layout else "")
             ),
             "feature_layout": layout,
             "source_feature_layout_id": str(candidate.get("source_feature_layout_id") or ""),
@@ -3426,16 +3383,12 @@ class CloudContinualLearner:
         self,
         *,
         feature_entries: Sequence[Mapping[str, object]],
-        feature_store: FeatureBlobStore,
+        feature_store: FeatureShardStore,
         model_input_size: tuple[int, int] | None = None,
         resize_mode: str | None = None,
     ) -> list[dict[str, object]]:
-        """Build canonical-pool staging candidates from low-quality trigger samples.
-
-        Each candidate contains a single-sample feature tensor, teacher labels
-        in canonical ``original_xyxy`` coordinates, and the contract reference
-        metadata required by :meth:`CloudSamplePool.rebuild_canonical_training_pool`.
-        """
+        """Build canonical-pool staging candidates from rebuilt low-quality shard refs."""
+        del feature_store
         processed_samples: list[dict[str, object]] = []
         for entry in list(feature_entries or []):
             if not isinstance(entry, Mapping):
@@ -3449,21 +3402,25 @@ class CloudContinualLearner:
                 continue
             record = dict(entry.get("record") or {})
             feature_ref = entry.get("feature_ref")
-            if not isinstance(feature_ref, FeatureRef):
+            if not isinstance(feature_ref, FeatureShardRef):
                 if isinstance(feature_ref, Mapping):
-                    feature_ref = FeatureRef.from_dict(feature_ref)
+                    feature_ref = FeatureShardRef.from_dict(feature_ref)
                 else:
                     logger.warning(
                         "[FeatureCache][Rebuild] low-quality sample_id={} has no feature_ref after readiness planning; skipping staging.",
                         sample_id,
                     )
                     continue
-            if not record:
-                record = feature_store.read(feature_ref)
             original_size = _original_image_size_from_metadata(record)
+            if original_size is None and sample.get("input_image_size") is not None:
+                original_size = tuple(int(dim) for dim in list(sample.get("input_image_size") or [])[:2])
             resolved_model_input_size = (
                 model_input_size or self._model_input_size_from_record(record)
             )
+            if resolved_model_input_size is None:
+                tensor_shape = sample.get("input_tensor_shape") or record.get("input_tensor_shape") or []
+                if len(tensor_shape) >= 4:
+                    resolved_model_input_size = (int(tensor_shape[-2]), int(tensor_shape[-1]))
             input_tensor_shape = (
                 record.get("input_tensor_shape")
                 or sample.get("input_tensor_shape")
@@ -3506,46 +3463,19 @@ class CloudContinualLearner:
                     resize_mode=resolved_resize_mode,
                 )
             )
-            try:
-                boundary_payload = record.get("intermediate")
-                if isinstance(boundary_payload, BoundaryPayload):
-                    tensors = {
-                        str(label): tensor
-                        for label, tensor in dict(boundary_payload.tensors or {}).items()
-                        if isinstance(tensor, torch.Tensor)
-                    }
-                else:
-                    boundary_payload = None
-                    tensors = self._feature_tensors_from_record(dict(record))
-                single_tensors = {
-                    label: tensor.detach().cpu()
-                    for label, tensor in tensors.items()
-                    if isinstance(tensor, torch.Tensor)
-                }
-                if not single_tensors:
-                    raise ValueError("low-quality record has no feature tensors")
-                feature_layout = feature_layout_from_tensors(single_tensors)
-            except Exception as exc:
-                logger.warning(
-                    "[FixedSplitCL] Skipping low-quality sample {} with unreadable feature tensors: {}",
-                    sample_id,
-                    exc,
-                )
-                continue
+            source_split_id = str(feature_ref.boundary_id or record.get("split_label") or "")
+            source_graph_signature = str(
+                dict(feature_ref.metadata or {}).get("graph_signature")
+                or record.get("source_feature_graph_signature")
+                or ""
+            )
             processed_samples.append(
                 {
                     "sample_id": sample_id,
-                    "feature": single_tensors,
-                    **(
-                        {"intermediate": boundary_payload}
-                        if isinstance(boundary_payload, BoundaryPayload)
-                        else {}
-                    ),
                     "labels": self._pool_annotations_from_labels(trainable_labels),
                     "sample_source": "low_quality",
                     "label_source": "teacher",
                     "feature_ref": feature_ref.to_dict(),
-                    "feature_record": record,
                     "model_id": str(sample.get("model_id") or record.get("model_id") or ""),
                     "split_config_id": str(
                         sample.get("split_config_id") or record.get("split_config_id") or ""
@@ -3557,21 +3487,12 @@ class CloudContinualLearner:
                     "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape)],
                     "input_resize_mode": resolved_resize_mode,
                     "created_at": time.time(),
-                    "feature_layout_id": make_feature_layout_id(feature_layout),
-                    "source_feature_layout_id": make_feature_layout_id(feature_layout),
+                    "feature_layout_id": feature_ref.feature_layout_id,
+                    "source_feature_layout_id": feature_ref.feature_layout_id,
                     "source_feature_schema_hash": "",
                     "source_feature_value_schema_hash": "",
-                    "source_feature_split_id": str(
-                        getattr(boundary_payload, "split_id", "") if isinstance(boundary_payload, BoundaryPayload) else ""
-                    ),
-                    "source_feature_graph_signature": str(
-                        (
-                            boundary_payload.metadata.get("graph_shape_hash")
-                            or boundary_payload.metadata.get("graph_signature")
-                            or ""
-                        )
-                        if isinstance(boundary_payload, BoundaryPayload) else ""
-                    ),
+                    "source_feature_split_id": source_split_id,
+                    "source_feature_graph_signature": source_graph_signature,
                 }
             )
         return processed_samples
@@ -3641,42 +3562,6 @@ class CloudContinualLearner:
         os.makedirs(raw_root, exist_ok=True)
         os.makedirs(feature_root, exist_ok=True)
 
-        feature_payload_by_sample: dict[str, object] = {}
-        for shard in list(trigger_manifest.get("feature_shards", []) or []):
-            if not isinstance(shard, Mapping):
-                continue
-            relpath = shard.get("file") or shard.get("path")
-            if not relpath:
-                continue
-            feature_shard_path = os.path.join(
-                bundle_cache_path,
-                str(relpath).replace("/", os.sep),
-            )
-            if not os.path.exists(feature_shard_path):
-                continue
-            try:
-                feature_payload = torch.load(
-                    feature_shard_path,
-                    map_location="cpu",
-                    weights_only=False,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[ShardCL][CloudUnpack] skipped unreadable low-quality feature shard {}: {}",
-                    feature_shard_path,
-                    exc,
-                )
-                continue
-            shard_samples = (
-                feature_payload.get("samples", {})
-                if isinstance(feature_payload, Mapping)
-                else {}
-            )
-            if not isinstance(shard_samples, Mapping):
-                continue
-            for sample_id, sample_payload in shard_samples.items():
-                feature_payload_by_sample[str(sample_id)] = sample_payload
-
         samples: list[dict[str, object]] = []
         for shard in list(trigger_manifest.get("raw_shards", []) or []):
             if not isinstance(shard, Mapping):
@@ -3724,41 +3609,12 @@ class CloudContinualLearner:
                         if frame is not None and frame.ndim >= 2
                         else None
                     )
-                    feature_relpath = None
-                    feature_bytes = 0
-                    feature_payload = feature_payload_by_sample.get(sample_id)
-                    if feature_payload is not None:
-                        feature_record = _trigger_feature_cache_record(
-                            feature_payload,
-                            trigger_manifest,
-                            sample_id,
-                            input_image_size=input_image_size,
-                        )
-                        if feature_record is not None:
-                            feature_relpath = (
-                                f"low_quality_staging/features/{safe_sample_id}.pt"
-                            )
-                            feature_path = os.path.join(
-                                bundle_cache_path,
-                                feature_relpath.replace("/", os.sep),
-                            )
-                            os.makedirs(os.path.dirname(feature_path), exist_ok=True)
-                            torch.save(feature_record, feature_path)
-                            feature_bytes = os.path.getsize(feature_path)
-                        else:
-                            logger.warning(
-                                "[ShardCL][CloudUnpack] low-quality feature payload for sample {} had no tensors; raw rebuild will be used.",
-                                sample_id,
-                            )
-
                     samples.append(
                         {
                             "sample_id": sample_id,
                             "raw_relpath": raw_relpath,
                             "raw_bytes": os.path.getsize(raw_path),
                             "has_raw_sample": True,
-                            "feature_relpath": feature_relpath,
-                            "feature_bytes": feature_bytes,
                             "model_id": trigger_manifest.get("model_id", ""),
                             "model_version": trigger_manifest.get("model_version", ""),
                             "front_version": str(trigger_manifest.get("front_version", "0") or "0"),
@@ -5982,12 +5838,22 @@ class CloudContinualLearner:
         )
         return int(effective_batch_size)
 
-    def _feature_cache_store(self) -> FeatureBlobStore:
-        return FeatureBlobStore(self.feature_cache_store_root_dir)
+    def _feature_cache_store(self) -> FeatureShardStore:
+        return FeatureShardStore(
+            self.feature_cache_store_root_dir,
+            storage_format=self.feature_cache_storage_format,
+            accepted_storage_formats=self.feature_cache_accepted_storage_formats,
+            shard_max_samples=self.feature_cache_shard_max_samples,
+            shard_dtype=self.feature_cache_shard_dtype,
+            payload_cache_enabled=self.feature_cache_payload_cache_enabled,
+            payload_cache_max_cpu_bytes=self.feature_cache_payload_cache_max_cpu_bytes,
+            pin_memory=self.feature_cache_pin_memory,
+            non_blocking_transfer=self.feature_cache_non_blocking_transfer,
+        )
 
     def _feature_cache_materializer(
         self,
-        store: FeatureBlobStore,
+        store: FeatureShardStore,
         *,
         rebuild_provider=None,
     ) -> FeatureCacheMaterializer:
@@ -6064,12 +5930,6 @@ class CloudContinualLearner:
                     if frame is not None and frame.ndim >= 2
                     else None
                 )
-            feature_relpath = sample.get("feature_relpath")
-            feature_path = (
-                os.path.join(bundle_cache_path, str(feature_relpath).replace("/", os.sep))
-                if feature_relpath
-                else None
-            )
             resolved.append(
                 {
                     **dict(sample),
@@ -6078,11 +5938,6 @@ class CloudContinualLearner:
                     "label_source": "teacher",
                     "labels": dict(labels),
                     "raw_path": raw_path,
-                    **(
-                        {"feature_path": feature_path}
-                        if feature_path and os.path.exists(feature_path)
-                        else {}
-                    ),
                     "model_id": str(model_meta.get("model_id") or manifest.get("model_id") or ""),
                     "model_version": str(model_meta.get("model_version") or ""),
                     "split_config_id": str(
@@ -6210,61 +6065,6 @@ class CloudContinualLearner:
             raise RuntimeError(
                 "Canonical active samples could not all be direct-referenced into "
                 f"the training view: dropped_preview={dropped_ids}."
-            )
-        migrated_refs: dict[str, dict[str, object]] = {}
-        for entry in plan.reuse_existing_refs:
-            if not bool(entry.get("legacy_migration")):
-                continue
-            sample = dict(entry.get("sample") or {})
-            sample_id = str(sample.get("sample_id") or "")
-            feature_ref = entry.get("feature_ref")
-            if not sample_id or not isinstance(feature_ref, FeatureRef):
-                continue
-            label_ref = entry.get("label_ref")
-            if not isinstance(label_ref, LabelRef):
-                labels = dict(sample.get("labels") or {})
-                label_source = str(
-                    sample.get("label_source")
-                    or ("teacher" if sample.get("sample_source") == "low_quality" else "edge_pseudo")
-                )
-                label_path = (
-                    str(sample.get("__source_label_path"))
-                    if sample.get("__source_label_path")
-                    else None
-                )
-                label_ref = LabelRef(
-                    sample_id=sample_id,
-                    path=label_path,
-                    codec="json" if label_path else "json_inline",
-                    label_source=label_source,
-                    teacher_labeled=label_source == "teacher",
-                    pseudo_labeled=label_source == "edge_pseudo",
-                    size_bytes=(
-                        os.path.getsize(label_path)
-                        if label_path and os.path.exists(label_path)
-                        else 0
-                    ),
-                    metadata={
-                        field_name: labels[field_name]
-                        for field_name in POOL_LABEL_METADATA_FIELDS
-                        if labels.get(field_name) is not None
-                    },
-                    labels=labels,
-                )
-                entry["label_ref"] = label_ref
-                sample["label_ref"] = label_ref.to_dict()
-                entry["sample"] = sample
-            migrated_refs[sample_id] = {
-                "feature_ref": feature_ref.to_dict(),
-                "label_ref": label_ref.to_dict(),
-            }
-        if migrated_refs:
-            persisted = sample_pool.persist_active_sample_refs(migrated_refs)
-            logger.info(
-                "[FeatureCache][LegacyMigration] generation={} migrated_refs={} persisted_refs={}",
-                generation_id,
-                len(migrated_refs),
-                persisted,
             )
         result = self._feature_cache_materializer(store).prepare(plan)
         if result.view is None:
@@ -6824,7 +6624,7 @@ class CloudContinualLearner:
         manifest: Mapping[str, object],
         bundle_cache_path: str,
     ) -> tuple[list[dict[str, object]], list[str]]:
-        """Extract the minimal pending record for each high-quality shard sample."""
+        """Register uploaded feature shards and build pending records from row refs."""
         candidates: list[dict[str, object]] = []
         unreadable_ids: list[str] = []
         manifest_input_tensor_shape = list(manifest.get("input_tensor_shape", []) or [])
@@ -6838,40 +6638,25 @@ class CloudContinualLearner:
             else {}
         )
         manifest_feature_layout_id = str(
-            manifest_runtime_contract.get("feature_layout_id") or ""
+            manifest_runtime_contract.get("feature_layout_id")
+            or manifest.get("feature_layout_id")
+            or ""
         )
         label_coordinate_space = str(
             manifest.get("label_coordinate_space") or POOL_LABEL_COORDINATE_SPACE
         )
+        labels_by_id: dict[str, dict[str, object]] = {}
         for shard in list(manifest.get("shards", []) or []):
             if not isinstance(shard, Mapping):
                 continue
-            feature_file = shard.get("feature_file") or shard.get("feature_shard")
             label_file = shard.get("label_file") or shard.get("label_shard")
-            if not feature_file or not label_file:
+            if not label_file:
                 continue
-            feature_path = os.path.join(
-                bundle_cache_path,
-                str(feature_file).replace("/", os.sep),
-            )
             label_path = os.path.join(
                 bundle_cache_path,
                 str(label_file).replace("/", os.sep),
             )
             try:
-                feature_payload = torch.load(
-                    feature_path,
-                    map_location="cpu",
-                    weights_only=False,
-                )
-                feature_samples = (
-                    feature_payload.get("samples")
-                    if isinstance(feature_payload, Mapping)
-                    else None
-                )
-                if not isinstance(feature_samples, Mapping):
-                    raise TypeError("feature shard does not contain a samples mapping")
-                labels_by_id: dict[str, dict[str, object]] = {}
                 with open(label_path, "r", encoding="utf-8") as handle:
                     for line in handle:
                         line = line.strip()
@@ -6884,147 +6669,99 @@ class CloudContinualLearner:
                         ):
                             labels_by_id[str(label_payload["sample_id"])] = dict(label_payload)
             except Exception:
-                unreadable_ids.append(str(shard.get("shard_id") or feature_file or label_file))
+                unreadable_ids.append(str(shard.get("shard_id") or label_file))
+        try:
+            registered = self._feature_cache_store().import_shard_bundle(
+                bundle_root=bundle_cache_path,
+                manifest=manifest,
+                shard_entries=[
+                    dict(shard)
+                    for shard in list(manifest.get("shards", []) or [])
+                    if isinstance(shard, Mapping)
+                ],
+            )
+        except Exception as exc:
+            logger.warning("[FeatureShard][Register] high-quality upload failed: {}", exc)
+            return [], [str(manifest.get("request_id") or "uploaded_feature_shards")]
+        for registered_entry in registered:
+            sample_key = str(registered_entry.get("sample_id") or "")
+            feature_ref = registered_entry.get("feature_ref")
+            if not sample_key or not isinstance(feature_ref, FeatureShardRef):
+                unreadable_ids.append(sample_key)
                 continue
-            for sample_id, feature_value in feature_samples.items():
-                sample_key = str(sample_id)
-                if sample_key not in labels_by_id or not isinstance(feature_value, Mapping):
-                    unreadable_ids.append(sample_key)
-                    continue
-                try:
-                    boundary_payload = feature_value.get("boundary_payload")
-                    if isinstance(boundary_payload, BoundaryPayload):
-                        tensors = normalise_feature_tensors(
-                            dict(boundary_payload.tensors or {})
-                        )
-                    else:
-                        boundary_payload = None
-                        tensors = normalise_feature_tensors(
-                            dict(feature_value.get("tensors") or {})
-                        )
-                    single_tensors = {
-                        label: tensor.detach().cpu()
-                        for label, tensor in tensors.items()
-                        if isinstance(tensor, torch.Tensor)
-                    }
-                    if not single_tensors:
-                        raise ValueError("shard sample contained no tensor features")
-                    tensor_layout_id = make_feature_layout_id(
-                        feature_layout_from_tensors(single_tensors)
-                    )
-                except Exception:
-                    unreadable_ids.append(sample_key)
-                    continue
-                label_payload = dict(labels_by_id[sample_key])
-                sample_input_image_size = (
-                    label_payload.get("input_image_size")
-                    or feature_value.get("input_image_size")
-                )
-                sample_input_tensor_shape = list(
-                    label_payload.get("input_tensor_shape")
-                    or feature_value.get("input_tensor_shape")
-                    or manifest_input_tensor_shape
-                    or []
-                )
-                sample_resize_mode = str(
-                    label_payload.get("input_resize_mode")
-                    or feature_value.get("input_resize_mode")
-                    or manifest_resize_mode
-                    or ""
-                )
-                candidates.append(
-                    {
-                        "sample_id": sample_key,
-                        "feature": single_tensors,
+            if sample_key not in labels_by_id:
+                unreadable_ids.append(sample_key)
+                continue
+            label_payload = dict(labels_by_id[sample_key])
+            sample_input_image_size = label_payload.get("input_image_size")
+            sample_input_tensor_shape = list(
+                label_payload.get("input_tensor_shape")
+                or manifest_input_tensor_shape
+                or []
+            )
+            sample_resize_mode = str(
+                label_payload.get("input_resize_mode")
+                or manifest_resize_mode
+                or ""
+            )
+            candidates.append(
+                {
+                    "sample_id": sample_key,
+                    "labels": {
+                        "boxes": list(label_payload.get("boxes") or []),
+                        "labels": list(label_payload.get("labels") or []),
                         **(
-                            {"intermediate": boundary_payload}
-                            if isinstance(boundary_payload, BoundaryPayload)
+                            {"scores": list(label_payload.get("scores") or [])}
+                            if label_payload.get("scores") is not None
                             else {}
                         ),
-                        "labels": {
-                            "boxes": list(label_payload.get("boxes") or []),
-                            "labels": list(label_payload.get("labels") or []),
-                            **(
-                                {"scores": list(label_payload.get("scores") or [])}
-                                if label_payload.get("scores") is not None
-                                else {}
-                            ),
-                            "label_coordinate_space": str(
-                                label_payload.get("label_coordinate_space")
-                                or label_coordinate_space
-                            ),
-                            **(
-                                {"label_image_size": list(label_payload.get("label_image_size") or [])}
-                                if label_payload.get("label_image_size") is not None
-                                else {}
-                            ),
-                            **(
-                                {"label_input_size": list(label_payload.get("label_input_size") or [])}
-                                if label_payload.get("label_input_size") is not None
-                                else {}
-                            ),
-                            "label_resize_mode": str(
-                                label_payload.get("label_resize_mode")
-                                or sample_resize_mode
-                            ),
-                        },
-                        "sample_source": "high_quality",
-                        "label_source": "edge_pseudo",
-                        "model_id": manifest_model_id,
-                        "split_config_id": manifest_split_config_id,
-                        "front_version": manifest_front_version,
-                        "runtime_contract": manifest_runtime_contract,
-                        "feature_layout_id": str(
-                            manifest_feature_layout_id
-                            or feature_value.get("feature_layout_id")
-                            or tensor_layout_id
+                        "label_coordinate_space": str(
+                            label_payload.get("label_coordinate_space")
+                            or label_coordinate_space
                         ),
-                        "source_feature_layout_id": str(
-                            feature_value.get("source_feature_layout_id")
-                            or tensor_layout_id
+                        **(
+                            {"label_image_size": list(label_payload.get("label_image_size") or [])}
+                            if label_payload.get("label_image_size") is not None
+                            else {}
                         ),
-                        "source_feature_schema_hash": str(
-                            feature_value.get("source_feature_schema_hash")
-                            or feature_value.get("feature_schema_hash")
-                            or ""
+                        **(
+                            {"label_input_size": list(label_payload.get("label_input_size") or [])}
+                            if label_payload.get("label_input_size") is not None
+                            else {}
                         ),
-                        "source_feature_value_schema_hash": str(
-                            feature_value.get("source_feature_value_schema_hash")
-                            or feature_value.get("feature_value_schema_hash")
-                            or ""
+                        "label_resize_mode": str(
+                            label_payload.get("label_resize_mode")
+                            or sample_resize_mode
                         ),
-                        "source_feature_split_id": str(
-                            feature_value.get("source_feature_split_id")
-                            or feature_value.get("feature_split_id")
-                            or getattr(boundary_payload, "split_id", "")
-                            or ""
-                        ),
-                        "source_feature_graph_signature": str(
-                            feature_value.get("source_feature_graph_signature")
-                            or feature_value.get("feature_graph_signature")
-                            or (
-                                (
-                                    boundary_payload.metadata.get("graph_shape_hash")
-                                    or boundary_payload.metadata.get("graph_signature")
-                                    or ""
-                                )
-                                if isinstance(boundary_payload, BoundaryPayload)
-                                else ""
-                            )
-                            or ""
-                        ),
-                        "input_image_size": (
-                            [int(dim) for dim in list(sample_input_image_size)]
-                            if sample_input_image_size is not None
-                            else None
-                        ),
-                        "input_tensor_shape": [
-                            int(dim) for dim in list(sample_input_tensor_shape)
-                        ],
-                        "input_resize_mode": sample_resize_mode,
-                        "created_at": time.time(),
-                    }
-                )
+                    },
+                    "sample_source": "high_quality",
+                    "label_source": "edge_pseudo",
+                    "feature_ref": feature_ref.to_dict(),
+                    "model_id": manifest_model_id,
+                    "split_config_id": manifest_split_config_id,
+                    "front_version": manifest_front_version,
+                    "runtime_contract": manifest_runtime_contract,
+                    "feature_layout_id": str(
+                        manifest_feature_layout_id
+                        or feature_ref.feature_layout_id
+                    ),
+                    "source_feature_layout_id": str(feature_ref.feature_layout_id),
+                    "source_feature_schema_hash": "",
+                    "source_feature_value_schema_hash": "",
+                    "source_feature_split_id": str(feature_ref.boundary_id or ""),
+                    "source_feature_graph_signature": str(
+                        dict(feature_ref.metadata or {}).get("graph_signature") or ""
+                    ),
+                    "input_image_size": (
+                        [int(dim) for dim in list(sample_input_image_size)]
+                        if sample_input_image_size is not None
+                        else None
+                    ),
+                    "input_tensor_shape": [int(dim) for dim in list(sample_input_tensor_shape)],
+                    "input_resize_mode": sample_resize_mode,
+                    "created_at": time.time(),
+                }
+            )
         return candidates, unreadable_ids
 
     def get_ground_truth_and_retrain(

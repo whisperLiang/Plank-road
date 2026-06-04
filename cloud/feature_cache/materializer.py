@@ -9,12 +9,12 @@ from typing import Any
 
 from loguru import logger
 
-from cloud.feature_cache.feature_store import FeatureBlobStore, load_feature_record_path
+from cloud.feature_cache.shard_store import FeatureShardStore
 from cloud.feature_cache.types import (
     FeatureCachePreparePlan,
     FeatureCachePrepareResult,
     FeatureCacheStats,
-    FeatureRef,
+    FeatureShardRef,
     LabelRef,
     SampleTrainingRef,
     TrainingCacheView,
@@ -66,11 +66,7 @@ def _label_ref(sample: Mapping[str, Any], *, label_path: str | None = None) -> L
         teacher_labeled=label_source == "teacher",
         pseudo_labeled=label_source == "edge_pseudo",
         size_bytes=os.path.getsize(label_path) if label_path and os.path.exists(label_path) else 0,
-        metadata={
-            key: value
-            for key, value in labels.items()
-            if str(key).startswith("label_")
-        },
+        metadata={key: value for key, value in labels.items() if str(key).startswith("label_")},
         labels=labels,
     )
 
@@ -111,21 +107,9 @@ def _record_from_payload(
             "model_id": str(runtime_context.get("model_id") or ""),
             "split_config_id": str(runtime_context.get("split_config_id") or ""),
             "front_version": str(runtime_context.get("front_version") or "0"),
-            "input_tensor_shape": list(
-                sample.get("input_tensor_shape")
-                or runtime_context.get("input_tensor_shape")
-                or []
-            ),
-            "input_resize_mode": str(
-                sample.get("input_resize_mode")
-                or runtime_context.get("input_resize_mode")
-                or "direct_resize"
-            ),
-            **(
-                {"input_image_size": list(sample.get("input_image_size") or [])}
-                if sample.get("input_image_size") is not None
-                else {}
-            ),
+            "input_tensor_shape": list(sample.get("input_tensor_shape") or runtime_context.get("input_tensor_shape") or []),
+            "input_resize_mode": str(sample.get("input_resize_mode") or runtime_context.get("input_resize_mode") or "direct_resize"),
+            **({"input_image_size": list(sample.get("input_image_size") or [])} if sample.get("input_image_size") is not None else {}),
             "has_raw_sample": bool(sample.get("has_raw_sample", True)),
         }
     return dict(payload)
@@ -153,7 +137,7 @@ def _call_rebuild_provider(
 class FeatureCacheMaterializer:
     def __init__(
         self,
-        store: FeatureBlobStore,
+        store: FeatureShardStore,
         *,
         view_root_dir: str,
         materialization_mode: str = "direct_ref",
@@ -163,28 +147,16 @@ class FeatureCacheMaterializer:
         deep_validate_feature_payload: bool = False,
         deep_validate_sample_rate: float = 0.0,
     ) -> None:
+        del deep_validate_feature_payload, deep_validate_sample_rate
         self.store = store
         self.view_root_dir = os.path.abspath(str(view_root_dir))
         self.materialization_mode = str(materialization_mode or "direct_ref").strip().lower()
         if self.materialization_mode != "direct_ref":
-            raise ValueError(
-                "FeatureCacheMaterializer only supports materialization_mode='direct_ref'."
-            )
+            raise ValueError("Feature shard views only support materialization_mode='direct_ref'.")
         self.feature_rebuild_batch_size = max(1, int(feature_rebuild_batch_size or 16))
         self.dynamic_batch_range = dynamic_batch_range
         self.rebuild_provider = rebuild_provider
-        self.deep_validate_feature_payload = bool(deep_validate_feature_payload)
-        self.deep_validate_sample_rate = max(0.0, min(1.0, float(deep_validate_sample_rate)))
         os.makedirs(self.view_root_dir, exist_ok=True)
-
-    def _should_deep_validate(self, sample_id: object) -> bool:
-        if not self.deep_validate_feature_payload or self.deep_validate_sample_rate <= 0.0:
-            return False
-        if self.deep_validate_sample_rate >= 1.0:
-            return True
-        digest = stable_digest(str(sample_id or ""))
-        bucket = int(digest[:12], 16) / float(16**12 - 1)
-        return bucket < self.deep_validate_sample_rate
 
     def _effective_batch_size(self, requested: int) -> int:
         size = max(1, int(requested))
@@ -196,8 +168,8 @@ class FeatureCacheMaterializer:
     def _rebuild_features(self, plan: FeatureCachePreparePlan, stats: FeatureCacheStats) -> list[dict[str, object]]:
         if not plan.rebuild_low_quality_from_raw:
             logger.info(
-                "[FeatureCache][Rebuild] requested=0 rebuilt=0 failures=0 rebuild_batch_size={} rebuild_batches=0 rebuild_time=0.000s cache_write_time=0.000s",
-                self.feature_rebuild_batch_size,
+                "[FeatureShard][Build] requested_samples=0 rebuilt_samples=0 storage_format={} shards_written=0 write_time=0.000s",
+                self.store.storage_format,
             )
             return []
         if self.rebuild_provider is None:
@@ -208,8 +180,8 @@ class FeatureCacheMaterializer:
             int(plan.runtime_context.get("feature_rebuild_batch_size") or self.feature_rebuild_batch_size)
         )
         stats.rebuild_batch_size = batch_size
-        offset = 0
         rebuilt_entries: list[dict[str, object]] = []
+        offset = 0
         while offset < len(pending):
             current_batch_size = min(batch_size, len(pending) - offset)
             batch = pending[offset : offset + current_batch_size]
@@ -229,7 +201,7 @@ class FeatureCacheMaterializer:
                     batch_size = max(1, current_batch_size // 2)
                     stats.rebuild_batch_size = batch_size
                     logger.warning(
-                        "[FeatureCache][Rebuild] OOM rebuilding batch_size={}; retrying with batch_size={}",
+                        "[FeatureShard][Build] OOM rebuilding batch_size={}; retrying with batch_size={}",
                         current_batch_size,
                         batch_size,
                     )
@@ -237,11 +209,7 @@ class FeatureCacheMaterializer:
                 if current_batch_size == 1:
                     sample_id = str(samples[0].get("sample_id") or "")
                     stats.rebuild_failures += 1
-                    logger.warning(
-                        "[FeatureCache][Rebuild] sample_id={} failed error={}",
-                        sample_id,
-                        exc,
-                    )
+                    logger.warning("[FeatureShard][Build] sample_id={} failed error={}", sample_id, exc)
                     offset += 1
                     continue
                 raise
@@ -252,64 +220,47 @@ class FeatureCacheMaterializer:
                     "Feature rebuild provider returned the wrong number of payloads: "
                     f"expected {len(batch)}, got {len(payloads)}."
                 )
+            write_entries: list[dict[str, object]] = []
             for entry, sample, payload in zip(batch, samples, payloads, strict=True):
                 if payload is None:
                     stats.rebuild_failures += 1
                     continue
-                record = _record_from_payload(
-                    payload,
-                    sample=sample,
-                    runtime_context=plan.runtime_context,
-                )
-                write_started = time.perf_counter()
-                ref = self.store.write_feature_record(
-                    entry["cache_key"],
-                    record,
-                    metadata={"input_source": "rebuilt_low_quality"},
-                )
-                stats.cache_write_time += time.perf_counter() - write_started
-                stats.low_quality_rebuilt += 1
-                rebuilt_entries.append(
+                record = _record_from_payload(payload, sample=sample, runtime_context=plan.runtime_context)
+                write_entries.append(
                     {
                         "sample": sample,
-                        "feature_ref": ref,
                         "cache_key": entry["cache_key"],
                         "record": record,
                     }
                 )
+            write_started = time.perf_counter()
+            written = self.store.write_entries(
+                write_entries,
+                runtime_context=plan.runtime_context,
+                generation=plan.generation,
+                source="rebuilt_low_quality",
+            )
+            stats.cache_write_time += time.perf_counter() - write_started
+            stats.low_quality_rebuilt += len(written)
+            rebuilt_entries.extend(written)
             offset += current_batch_size
+        stats.shards_written = len({str(dict(entry.get("feature_ref").to_dict()).get("shard_id")) for entry in rebuilt_entries if isinstance(entry.get("feature_ref"), FeatureShardRef)})
         logger.info(
-            "[FeatureCache][Rebuild] requested={} rebuilt={} failures={} rebuild_batch_size={} rebuild_batches={} rebuild_time={:.3f}s cache_write_time={:.3f}s",
+            "[FeatureShard][Build] requested_samples={} rebuilt_samples={} storage_format={} shards_written={} shard_max_samples={} write_time={:.3f}s",
             len(plan.rebuild_low_quality_from_raw),
             stats.low_quality_rebuilt,
-            stats.rebuild_failures,
-            stats.rebuild_batch_size,
-            stats.rebuild_batches,
-            stats.rebuild_time,
+            self.store.storage_format,
+            stats.shards_written,
+            self.store.shard_max_samples,
             stats.cache_write_time,
         )
         return rebuilt_entries
 
-    def rebuild_low_quality_features_only(
-        self,
-        plan: FeatureCachePreparePlan,
-    ) -> list[dict[str, object]]:
-        """Rebuild only raw low-quality feature entries into the feature store."""
+    def rebuild_low_quality_features_only(self, plan: FeatureCachePreparePlan) -> list[dict[str, object]]:
         return self._rebuild_features(plan, plan.stats)
 
     def _view_dir(self, view_id: str) -> str:
         return os.path.join(self.view_root_dir, str(view_id))
-
-    @staticmethod
-    def _view_feature_relpath(feature_path: str, view_dir: str) -> str:
-        absolute_path = os.path.abspath(feature_path)
-        absolute_view_dir = os.path.abspath(view_dir)
-        try:
-            if os.path.commonpath([absolute_view_dir, absolute_path]) == absolute_view_dir:
-                return os.path.relpath(absolute_path, absolute_view_dir).replace("\\", "/")
-        except ValueError:
-            pass
-        return absolute_path
 
     def _training_ref_from_entry(
         self,
@@ -322,12 +273,12 @@ class FeatureCacheMaterializer:
         sample = dict(entry.get("sample") or {})
         started = time.perf_counter()
         ref = entry.get("feature_ref")
-        if isinstance(ref, FeatureRef):
+        if isinstance(ref, FeatureShardRef):
             feature_ref = ref
         elif isinstance(ref, Mapping):
-            feature_ref = FeatureRef.from_dict(ref)
+            feature_ref = FeatureShardRef.from_dict(ref)
         else:
-            raise ValueError("Training view entry is missing feature_ref.")
+            raise ValueError("Training view entry is missing FeatureShardRef.")
         if stats is not None:
             stats.feature_ref_resolve_time += time.perf_counter() - started
         started = time.perf_counter()
@@ -355,8 +306,6 @@ class FeatureCacheMaterializer:
                     "risk_score",
                     "sample_source",
                     "label_source",
-                    "feature_ref",
-                    "label_ref",
                     "raw_path",
                     "frame_path",
                     "has_raw_sample",
@@ -364,6 +313,7 @@ class FeatureCacheMaterializer:
                     "model_id",
                     "split_config_id",
                     "front_version",
+                    "feature_layout",
                 }
             },
         )
@@ -374,14 +324,11 @@ class FeatureCacheMaterializer:
         records: Mapping[str, Mapping[str, object]] | None,
     ) -> dict[str, object]:
         cached = (records or {}).get(sample_ref.sample_id)
-        if isinstance(cached, Mapping):
-            record = dict(cached)
-        else:
-            record = {}
+        record = dict(cached) if isinstance(cached, Mapping) else {}
         labels = dict(sample_ref.label_ref.labels or {})
         record["sample_id"] = sample_ref.sample_id
-        record.setdefault("feature_ref", sample_ref.feature_ref.to_dict())
-        record.setdefault("label_ref", sample_ref.label_ref.to_dict())
+        record["feature_ref"] = sample_ref.feature_ref.to_dict()
+        record["label_ref"] = sample_ref.label_ref.to_dict()
         record.setdefault("sample_source", sample_ref.sample_type)
         record.setdefault("label_source", sample_ref.label_ref.label_source)
         record["pseudo_boxes"] = list(labels.get("boxes") or [])
@@ -393,9 +340,9 @@ class FeatureCacheMaterializer:
                 record[str(key)] = value
         for key, value in sample_ref.metadata.items():
             record.setdefault(str(key), value)
-        record.setdefault("model_id", sample_ref.feature_ref.key.model_id)
-        record.setdefault("split_config_id", sample_ref.feature_ref.key.split_config_id)
-        record.setdefault("front_version", sample_ref.feature_ref.key.prefix_weights_fingerprint)
+        record.setdefault("model_id", sample_ref.feature_ref.metadata.get("model_id", ""))
+        record.setdefault("split_config_id", sample_ref.feature_ref.metadata.get("split_config_id", ""))
+        record.setdefault("front_version", sample_ref.metadata.get("front_version") or "")
         record.setdefault("input_tensor_shape", sample_ref.metadata.get("input_tensor_shape") or [])
         record.setdefault("input_resize_mode", sample_ref.metadata.get("input_resize_mode") or "")
         return record
@@ -416,46 +363,19 @@ class FeatureCacheMaterializer:
         base_prepare_time = float(stats.total_prepare_time if stats is not None else 0.0)
         stats = stats or FeatureCacheStats(requested_samples=len(entries))
         view_dir = self._view_dir(view_id)
-        features_dir = os.path.join(view_dir, "features")
-        os.makedirs(features_dir, exist_ok=True)
-        sample_refs: list[SampleTrainingRef] = []
-        for entry in list(entries or []):
-            sample_refs.append(
-                self._training_ref_from_entry(
-                    entry,
-                    generation=generation,
-                    stats=stats,
-                )
-            )
-        preloaded_records: dict[str, dict[str, object]] = {}
+        os.makedirs(view_dir, exist_ok=True)
+        sample_refs = [
+            self._training_ref_from_entry(entry, generation=generation, stats=stats)
+            for entry in list(entries or [])
+        ]
         metadata_samples: dict[str, dict[str, object]] = {}
         for sample_ref in sample_refs:
-            destination = os.path.join(features_dir, f"{sample_ref.sample_id}.pt")
-            op_stats = FeatureBlobStore.materialize_reference(
-                sample_ref.feature_ref,
-                destination,
-                mode=self.materialization_mode,
-            )
-            stats.bytes_copied += int(op_stats["bytes_copied"])
-            stats.files_copied += int(op_stats["files_copied"])
-            if self._should_deep_validate(sample_ref.sample_id):
-                deep_started = time.perf_counter()
-                self.store.read(sample_ref.feature_ref)
-                stats.deep_payload_validation_time += time.perf_counter() - deep_started
             record = self._metadata_record_for_ref(sample_ref, records)
-            if isinstance((records or {}).get(sample_ref.sample_id), Mapping):
-                preloaded_records[sample_ref.sample_id] = record
-            feature_path = (
-                sample_ref.feature_ref.path
-                if self.materialization_mode == "direct_ref"
-                else destination
-            )
             metadata_samples[sample_ref.sample_id] = {
                 "sample_id": sample_ref.sample_id,
                 "feature_ref": sample_ref.feature_ref.to_dict(),
                 "label_ref": sample_ref.label_ref.to_dict(),
-                "feature_relpath": self._view_feature_relpath(feature_path, view_dir),
-                "feature_file_size": int(sample_ref.feature_ref.size_bytes),
+                "feature_file_size": 0,
                 "has_raw_sample": bool(record.get("has_raw_sample", False)),
                 "runtime_contract": dict(record.get("runtime_contract") or {}),
                 "model_id": str(record.get("model_id") or ""),
@@ -466,14 +386,11 @@ class FeatureCacheMaterializer:
                 "input_resize_mode": str(record.get("input_resize_mode") or ""),
                 "sample_source": sample_ref.sample_type,
                 "label_source": sample_ref.label_ref.label_source,
-                **(
-                    {"frame_relpath": str(record.get("frame_path"))}
-                    if record.get("frame_path")
-                    else {}
-                ),
+                "pseudo_boxes": list(record.get("pseudo_boxes") or []),
+                "pseudo_labels": list(record.get("pseudo_labels") or []),
+                **({"pseudo_scores": list(record.get("pseudo_scores") or [])} if record.get("pseudo_scores") is not None else {}),
             }
         stats.direct_refs_created = len(sample_refs)
-
         manifest_path = os.path.join(view_dir, "view_manifest.json")
         metadata_index_path = os.path.join(view_dir, "metadata_index.json")
         view = TrainingCacheView(
@@ -487,13 +404,12 @@ class FeatureCacheMaterializer:
             metadata_index_path=metadata_index_path,
             created_at=time.time(),
         )
-
         manifest_started = time.perf_counter()
         _atomic_json_dump(manifest_path, view.to_dict())
         _atomic_json_dump(
             os.path.join(view_dir, "cache_manifest.json"),
             {
-                "cache_version": "feature-cache-training-view.v1",
+                "cache_version": "feature-shard-training-view.v1",
                 "view_id": view_id,
                 "generation": generation,
                 "feature_layout_id": feature_layout_id,
@@ -506,13 +422,12 @@ class FeatureCacheMaterializer:
             },
         )
         stats.manifest_write_time += time.perf_counter() - manifest_started
-
         metadata_started = time.perf_counter()
         _atomic_json_dump(
             metadata_index_path,
             {
-                "version": 1,
-                "schema_version": "feature-cache-metadata-index.v1",
+                "version": 2,
+                "schema_version": "feature-shard-metadata-index.v1",
                 "view_id": view_id,
                 "generation": generation,
                 "feature_layout_id": feature_layout_id,
@@ -524,40 +439,15 @@ class FeatureCacheMaterializer:
         )
         stats.metadata_index_time += time.perf_counter() - metadata_started
         stats.total_prepare_time = base_prepare_time + (time.perf_counter() - write_started)
-
         logger.info(
-            "[FeatureCache][View] view_id={} generation={} samples={} feature_layout_id={} contract_id={} mode={} manifest_write_time={:.3f}s metadata_index_time={:.3f}s",
+            "[FeatureCache][View] view_id={} generation={} samples={} feature_layout_id={} contract_id={} mode=shard_ref manifest_write_time={:.3f}s metadata_index_time={:.3f}s",
             view_id,
             generation,
             len(sample_refs),
             feature_layout_id,
             contract_id,
-            self.materialization_mode,
             stats.manifest_write_time,
             stats.metadata_index_time,
-        )
-        logger.info(
-            "[FeatureCache][MaterializeProfile] view_id={} feature_ref_resolve_time={:.3f}s "
-            "feature_store_lookup_time={:.3f}s feature_store_lookup_count={} "
-            "feature_store_register_time={:.3f}s feature_store_register_count={} "
-            "label_ref_resolve_time={:.3f}s fast_ref_validation_time={:.3f}s "
-            "deep_payload_validation_time={:.3f}s manifest_write_time={:.3f}s "
-            "metadata_index_time={:.3f}s total_prepare_time={:.3f}s "
-            "legacy_migration_count={} existing_feature_ref_reused={}",
-            view_id,
-            stats.feature_ref_resolve_time,
-            stats.feature_store_lookup_time,
-            stats.feature_store_lookup_count,
-            stats.feature_store_register_time,
-            stats.feature_store_register_count,
-            stats.label_ref_resolve_time,
-            stats.fast_ref_validation_time,
-            stats.deep_payload_validation_time,
-            stats.manifest_write_time,
-            stats.metadata_index_time,
-            stats.total_prepare_time,
-            stats.legacy_migration_count,
-            stats.existing_feature_ref_reused,
         )
         logger.info(
             "[FeatureCache][Materialize] view_id={} direct_refs={} rebuilt={} files_copied={} bytes_copied={} rebuild_time={:.3f}s manifest_write_time={:.3f}s total_prepare_time={:.3f}s",
@@ -570,8 +460,7 @@ class FeatureCacheMaterializer:
             stats.manifest_write_time,
             stats.total_prepare_time,
         )
-
-        plan = FeatureCachePreparePlan(
+        result_plan = FeatureCachePreparePlan(
             view_id=view_id,
             generation=generation,
             feature_layout_id=feature_layout_id,
@@ -580,10 +469,10 @@ class FeatureCacheMaterializer:
             stats=stats,
         )
         return FeatureCachePrepareResult(
-            plan=plan,
+            plan=result_plan,
             view=view,
             feature_refs={sample.feature_ref.sample_id: sample.feature_ref for sample in sample_refs},
-            records=preloaded_records,
+            records=metadata_samples,
             metadata_by_id=metadata_samples,
             bundle_info={
                 "manifest": {},
@@ -605,7 +494,7 @@ class FeatureCacheMaterializer:
         rebuilt_entries = self._rebuild_features(plan, stats)
         entries.extend(rebuilt_entries)
         record_overrides = {
-            str(entry.get("sample", {}).get("sample_id") or ""): dict(entry.get("record") or {})
+            str(dict(entry.get("sample") or {}).get("sample_id") or ""): dict(entry.get("record") or {})
             for entry in rebuilt_entries
             if isinstance(entry.get("record"), Mapping)
         }
@@ -624,8 +513,10 @@ class FeatureCacheMaterializer:
         return result
 
     @staticmethod
-    def load_view_record(path: str) -> dict[str, Any]:
-        return load_feature_record_path(path)
+    def load_cached_feature_record(path: str) -> dict[str, Any]:
+        raise RuntimeError(
+            f"Legacy per-sample feature cache loading is removed; cannot load {path!r}."
+        )
 
 
 __all__ = ["FeatureCacheMaterializer", "RebuildProvider"]

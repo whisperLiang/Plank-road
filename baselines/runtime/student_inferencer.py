@@ -27,8 +27,6 @@ from model_management.fixed_split import (
 )
 from model_management.universal_model_split import (
     UniversalModelSplitter,
-    save_split_feature_cache,
-    slice_boundary_payload_batch,
 )
 
 
@@ -98,7 +96,6 @@ class StudentInferencer:
         self.cache_features = bool(cache_features)
         self.feature_trace_batch_size = 1 if int(feature_trace_batch_size) <= 1 else 2
         self.prediction_dir = self.results_dir / "predictions" / method_name
-        self.feature_cache_dir = self.results_dir / "feature_cache" / method_name
         self._feature_splitter: UniversalModelSplitter | None = None
         self.fixed_split_constraints = fixed_split_constraints
         self.fixed_split_cache_path = (
@@ -172,20 +169,12 @@ class StudentInferencer:
         with pred_path.open("w", encoding="utf-8") as f:
             json.dump(detections, f)
 
-        feature_tensor_path = None
-        if self.cache_features:
-            feature_tensor_path = self._cache_split_feature(
-                frame,
-                device_id=device_id,
-                frame_index=frame_index,
-            )
-
         return StudentInferenceOutput(
             prediction_path=str(pred_path),
             confidence=confidence,
             latency_ms=latency_ms,
             num_detections=len(detections),
-            feature_tensor_path=feature_tensor_path,
+            feature_tensor_path=None,
         )
 
     def _bgr_to_detection_tensor(self, frame: np.ndarray) -> torch.Tensor:
@@ -262,33 +251,6 @@ class StudentInferencer:
         if plan.candidate_id is not None and str(current_id) == str(plan.candidate_id):
             return
         apply_split_plan(splitter, plan)
-
-    def _cache_split_feature(self, frame: np.ndarray, *, device_id: int, frame_index: int) -> str:
-        sample_input = prepare_split_runtime_input(self.model, frame, device=self.device)
-        if not isinstance(sample_input, torch.Tensor):
-            raise NotImplementedError(
-                f"Split feature caching for {type(self.model).__name__} requires tensor runtime input"
-            )
-        splitter = self._ensure_feature_splitter(sample_input)
-        runtime_input = self._prepare_feature_trace_input(sample_input)
-        with torch.no_grad():
-            boundary = splitter.run_prefix(runtime_input)
-        if int(runtime_input.shape[0]) != int(sample_input.shape[0]):
-            boundary = slice_boundary_payload_batch(
-                boundary,
-                start=0,
-                length=int(sample_input.shape[0]),
-            )
-        cache_root = self.feature_cache_dir / f"edge_{int(device_id)}"
-        save_split_feature_cache(
-            str(cache_root),
-            str(int(frame_index)),
-            boundary,
-            input_image_size=[int(frame.shape[0]), int(frame.shape[1])],
-            input_tensor_shape=[int(dim) for dim in sample_input.shape],
-            input_resize_mode=get_split_runtime_input_resize_mode(self.model),
-        )
-        return str(cache_root / "features" / f"{int(frame_index)}.pt")
 
     @staticmethod
     def _pad_tensor_batch(tensor: torch.Tensor, *, min_batch_size: int) -> torch.Tensor:

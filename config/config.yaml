@@ -58,6 +58,12 @@ client:
  # edge nodes
  edge_id: 1
  edge_num: 1
+ feature_upload:
+  storage_format: "safetensors_shard"
+  shard_max_samples: 64
+  shard_dtype: "float16"
+  include_index_json: true
+  include_meta_json: true
  # retrain
  retrain:
   flag: True
@@ -180,7 +186,21 @@ server:
    view_source: canonical_active
    materialization_mode: direct_ref
    view_root_dir: "./cache/cloud_training_views"
-   store_root_dir: "./cache/cloud_feature_store"
+   store_root_dir: "./cache/cloud_feature_shards"
+   shard_root_dir: "./cache/cloud_feature_shards"
+   storage_format: "safetensors_shard"
+   accepted_storage_formats:
+    - "safetensors_shard"
+    - "npy_memmap_shard"
+   shard_max_samples: 64
+   shard_dtype: "float16"
+   payload_cache_enabled: true
+   payload_cache_scope: "active_pool"
+   payload_cache_device: "cpu"
+   payload_cache_max_cpu_bytes: 4294967296
+   payload_cache_max_gpu_bytes: 1073741824
+   pin_memory: true
+   non_blocking_transfer: true
    validate_refs: true
    deep_validate_feature_payload: false
    deep_validate_sample_rate: 0

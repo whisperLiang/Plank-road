@@ -5,6 +5,7 @@ import io
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -18,6 +19,7 @@ import torch
 from loguru import logger
 
 import edge.transmit as transmit
+from edge.feature_shard import write_feature_label_shards
 from edge.quality_assessor import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
 from model_management.detection_box_projection import ORIGINAL_XYXY
@@ -101,31 +103,6 @@ def _chunks(items: Sequence[StoredSampleRecord], size: int) -> list[list[StoredS
     return [list(items[index : index + shard_size]) for index in range(0, len(items), shard_size)]
 
 
-def _tensor_only_features(intermediate: Any) -> dict[str, torch.Tensor]:
-    if isinstance(intermediate, BoundaryPayload):
-        source = dict(intermediate.tensors or {})
-    elif isinstance(intermediate, torch.Tensor):
-        source = {"payload": intermediate}
-    elif isinstance(intermediate, Mapping):
-        source = dict(intermediate.get("tensors") or intermediate)
-    else:
-        raise TypeError(f"Unsupported intermediate feature type: {type(intermediate)!r}")
-
-    tensors: dict[str, torch.Tensor] = {}
-    for label, value in source.items():
-        if isinstance(value, torch.Tensor):
-            tensors[str(label)] = value.detach().cpu()
-    if not tensors:
-        raise ValueError("Intermediate feature payload did not contain tensors.")
-    return tensors
-
-
-def _feature_sample_payload(intermediate: Any) -> dict[str, Any]:
-    if isinstance(intermediate, BoundaryPayload):
-        return {"boundary_payload": intermediate}
-    return {"tensors": _tensor_only_features(intermediate)}
-
-
 def _training_labels(result: Mapping[str, Any], record: StoredSampleRecord) -> dict[str, Any]:
     labels: dict[str, Any] = {
         "boxes": list(result.get("boxes") or []),
@@ -183,6 +160,8 @@ def pack_high_quality_sync_bundle(
     *,
     edge_id: int,
     shard_size: int,
+    storage_format: str = "safetensors_shard",
+    shard_dtype: str | None = "float16",
     request_id: str | None = None,
     split_context: Mapping[str, Any] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
@@ -191,6 +170,8 @@ def pack_high_quality_sync_bundle(
         records,
         edge_id=edge_id,
         shard_size=shard_size,
+        storage_format=storage_format,
+        shard_dtype=shard_dtype,
         request_id=request_id,
         split_context=split_context,
     )
@@ -210,6 +191,8 @@ def pack_high_quality_sync_bundle_to_file(
     *,
     edge_id: int,
     shard_size: int,
+    storage_format: str = "safetensors_shard",
+    shard_dtype: str | None = "float16",
     request_id: str | None = None,
     split_context: Mapping[str, Any] | None = None,
     output_dir: str | None = None,
@@ -217,7 +200,7 @@ def pack_high_quality_sync_bundle_to_file(
     selected = [
         record
         for record in records
-        if record.quality_bucket == HIGH_QUALITY and record.feature_relpath is not None
+        if record.quality_bucket == HIGH_QUALITY and record.feature_ref is not None
     ]
     resolved_request_id = str(request_id or uuid.uuid4().hex)
     resolved_shard_size = max(1, int(shard_size))
@@ -283,101 +266,94 @@ def pack_high_quality_sync_bundle_to_file(
         "shards": [],
     }
 
+    shard_tmp_root = ""
     try:
+        feature_entries: list[dict[str, Any]] = []
+        inferred_layout_id = str(runtime_contract.get("feature_layout_id") or "")
+        for record in selected:
+            sample_id = str(record.sample_id)
+            intermediate = sample_store.load_intermediate(record)
+            result = sample_store.load_inference_result(record)
+            feature_layout_meta = _feature_layout_metadata(intermediate)
+            inferred_layout_id = inferred_layout_id or str(feature_layout_meta.get("feature_layout_id") or "")
+            labels = _training_labels(result, record)
+            label_payload = {
+                "boxes": labels["boxes"],
+                "labels": labels["labels"],
+                "scores": list(result.get("scores") or []),
+                "label_coordinate_space": labels["label_coordinate_space"],
+                **(
+                    {"label_image_size": labels["label_image_size"]}
+                    if labels.get("label_image_size") is not None
+                    else {}
+                ),
+                **(
+                    {"label_resize_mode": labels["label_resize_mode"]}
+                    if labels.get("label_resize_mode") is not None
+                    else {}
+                ),
+                **(
+                    {"input_image_size": list(record.input_image_size or [])}
+                    if record.input_image_size is not None
+                    else {}
+                ),
+                **(
+                    {"input_tensor_shape": list(record.input_tensor_shape or [])}
+                    if record.input_tensor_shape is not None
+                    else {}
+                ),
+                **(
+                    {"input_resize_mode": str(record.input_resize_mode)}
+                    if record.input_resize_mode is not None
+                    else {}
+                ),
+            }
+            feature_entries.append(
+                {
+                    "sample": {
+                        "sample_id": sample_id,
+                        "labels": label_payload,
+                        "input_image_size": list(record.input_image_size or []),
+                        "input_tensor_shape": list(record.input_tensor_shape or []),
+                        "input_resize_mode": str(record.input_resize_mode or input_resize_mode),
+                    },
+                    "record": (
+                        {"intermediate": intermediate}
+                        if isinstance(intermediate, BoundaryPayload)
+                        else {"feature": intermediate}
+                    ),
+                }
+            )
+        runtime_context = {
+            "model_id": model_id,
+            "model_family": str(context.get("model_family") or ""),
+            "split_config_id": split_config_id,
+            "contract_id": None if runtime_contract.get("contract_id") in (None, "") else str(runtime_contract.get("contract_id")),
+            "feature_layout_id": inferred_layout_id,
+            "boundary_id": edge_split_id or canonical_split_key,
+            "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
+            "input_resize_mode": input_resize_mode,
+            "front_version": front_version,
+            "runtime_contract": runtime_contract,
+        }
+        shard_tmp_root, shard_manifest_entries, _labels_by_shard = write_feature_label_shards(
+            output_root=output_dir,
+            storage_format=storage_format,
+            shard_max_samples=resolved_shard_size,
+            shard_dtype=shard_dtype,
+            runtime_context=runtime_context,
+            generation=resolved_request_id,
+            entries=feature_entries,
+        )
+        manifest["storage_format"] = str(storage_format)
+        manifest["feature_layout_id"] = inferred_layout_id
+        manifest["shards"] = shard_manifest_entries
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-            for shard_index, shard_records in enumerate(_chunks(selected, resolved_shard_size), 1):
-                shard_id = f"edge{int(edge_id)}_high_{shard_index:06d}"
-                feature_name = f"feature_shards/high_feature_shard_{shard_index:06d}.pt"
-                label_name = f"label_shards/high_label_shard_{shard_index:06d}.jsonl"
-                feature_payload = {"schema_version": 1, "samples": {}}
-                label_lines = []
-                sample_ids = []
-                for record in shard_records:
-                    sample_id = str(record.sample_id)
-                    intermediate = sample_store.load_intermediate(record)
-                    result = sample_store.load_inference_result(record)
-                    feature_sample = _feature_sample_payload(intermediate)
-                    feature_sample.update(_feature_layout_metadata(intermediate))
-                    if runtime_contract:
-                        tensor_layout_id = str(feature_sample.get("feature_layout_id") or "")
-                        if tensor_layout_id:
-                            feature_sample.setdefault(
-                                "source_feature_layout_id",
-                                tensor_layout_id,
-                            )
-                        feature_sample["runtime_contract"] = runtime_contract
-                        if runtime_contract.get("feature_layout_id"):
-                            feature_sample["feature_layout_id"] = str(
-                                runtime_contract.get("feature_layout_id")
-                            )
-                    if record.input_image_size is not None:
-                        feature_sample["input_image_size"] = list(record.input_image_size)
-                    if record.input_tensor_shape is not None:
-                        feature_sample["input_tensor_shape"] = list(record.input_tensor_shape)
-                    if record.input_resize_mode is not None:
-                        feature_sample["input_resize_mode"] = str(record.input_resize_mode)
-                    feature_payload["samples"][sample_id] = feature_sample
-                    labels = _training_labels(result, record)
-                    label_lines.append(
-                        json.dumps(
-                            {
-                                "sample_id": sample_id,
-                                "boxes": labels["boxes"],
-                                "labels": labels["labels"],
-                                "scores": list(result.get("scores") or []),
-                                "label_coordinate_space": labels["label_coordinate_space"],
-                                **(
-                                    {"label_image_size": labels["label_image_size"]}
-                                    if labels.get("label_image_size") is not None
-                                    else {}
-                                ),
-                                **(
-                                    {"label_resize_mode": labels["label_resize_mode"]}
-                                    if labels.get("label_resize_mode") is not None
-                                    else {}
-                                ),
-                                **(
-                                    {"input_image_size": list(record.input_image_size or [])}
-                                    if record.input_image_size is not None
-                                    else {}
-                                ),
-                                **(
-                                    {"input_tensor_shape": list(record.input_tensor_shape or [])}
-                                    if record.input_tensor_shape is not None
-                                    else {}
-                                ),
-                                **(
-                                    {"input_resize_mode": str(record.input_resize_mode)}
-                                    if record.input_resize_mode is not None
-                                    else {}
-                                ),
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                    )
-                    sample_ids.append(sample_id)
-
-                feature_buffer = io.BytesIO()
-                torch.save(feature_payload, feature_buffer)
-                zf.writestr(
-                    feature_name,
-                    feature_buffer.getvalue(),
-                    compress_type=zipfile.ZIP_STORED,
-                )
-                zf.writestr(
-                    label_name,
-                    ("\n".join(label_lines) + ("\n" if label_lines else "")).encode("utf-8"),
-                    compress_type=zipfile.ZIP_STORED,
-                )
-                manifest["shards"].append(
-                    {
-                        "shard_id": shard_id,
-                        "feature_file": feature_name,
-                        "label_file": label_name,
-                        "sample_count": len(sample_ids),
-                    }
-                )
+            for root, _dirs, files in os.walk(shard_tmp_root):
+                for filename in files:
+                    path = os.path.join(root, filename)
+                    relpath = os.path.relpath(path, shard_tmp_root).replace("\\", "/")
+                    zf.write(path, relpath, compress_type=zipfile.ZIP_STORED)
             zf.writestr(
                 "bundle_manifest.json",
                 json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
@@ -396,6 +372,9 @@ def pack_high_quality_sync_bundle_to_file(
         except OSError:
             pass
         raise
+    finally:
+        if shard_tmp_root:
+            shutil.rmtree(shard_tmp_root, ignore_errors=True)
 
 
 class HighQualitySampleSyncer:
@@ -406,6 +385,7 @@ class HighQualitySampleSyncer:
         server_ip: str,
         edge_id: int,
         sample_pool_config: object | None = None,
+        feature_upload_config: object | None = None,
         shard_size: int | None = None,
         sync_interval_sec: float | None = None,
         enabled: bool = True,
@@ -435,6 +415,16 @@ class HighQualitySampleSyncer:
             ),
         )
         self.enabled = bool(getattr(sample_pool_config, "enabled", enabled))
+        self.storage_format = str(
+            getattr(feature_upload_config, "storage_format", "safetensors_shard")
+            or "safetensors_shard"
+        )
+        self.shard_dtype = str(
+            getattr(feature_upload_config, "shard_dtype", "float16") or "float16"
+        )
+        configured_max = getattr(feature_upload_config, "shard_max_samples", None)
+        if configured_max not in (None, ""):
+            self.shard_size = max(1, int(configured_max))
         self.ledger_path = os.path.join(self.sample_store.root_dir, UPLOAD_LEDGER_FILENAME)
         self._ledger_lock = threading.RLock()
         self._condition = threading.Condition()
@@ -509,10 +499,7 @@ class HighQualitySampleSyncer:
             return True
         request_id = uuid.uuid4().hex
         sample_ids = [str(record.sample_id) for record in records]
-        shard_by_sample = {
-            str(record.sample_id): f"edge{self.edge_id}_high_{(index // self.shard_size) + 1:06d}"
-            for index, record in enumerate(records)
-        }
+        shard_by_sample: dict[str, str] = {}
         zip_path = ""
         try:
             split_context = self._split_context_for_records(records)
@@ -521,10 +508,19 @@ class HighQualitySampleSyncer:
                 records,
                 edge_id=self.edge_id,
                 shard_size=self.shard_size,
+                storage_format=self.storage_format,
+                shard_dtype=self.shard_dtype,
                 request_id=request_id,
                 split_context=split_context,
                 output_dir=os.path.join(self.sample_store.root_dir, "sync_tmp"),
             )
+            for shard in list(manifest.get("shards", []) or []):
+                if not isinstance(shard, Mapping):
+                    continue
+                shard_id = str(shard.get("shard_id") or "")
+                for sample_id in list(shard.get("sample_ids") or []):
+                    if shard_id and sample_id:
+                        shard_by_sample[str(sample_id)] = shard_id
             if deadline is not None and time.monotonic() >= deadline:
                 return False
             with open(zip_path, "rb") as handle:

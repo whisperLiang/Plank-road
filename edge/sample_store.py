@@ -6,13 +6,14 @@ import shutil
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import cv2
 import torch
 
+from cloud.feature_cache import FeatureShardRef, FeatureShardStore
 from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY
-from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
+from model_management.payload import BoundaryPayload
 
 
 SAMPLE_STORE_VERSION = "edge-sample-store.v2"
@@ -25,21 +26,6 @@ def _atomic_json_dump(path: str, payload: dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
     os.replace(tmp_path, path)
-
-
-def _atomic_torch_save(payload: Any, path: str) -> None:
-    directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
-    tmp_path = f"{path}.tmp-{threading.get_ident()}"
-    try:
-        torch.save(payload, tmp_path)
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
 
 
 def _atomic_cv2_imwrite(path: str, image: Any, params: list[int]) -> None:
@@ -71,43 +57,6 @@ def _from_relpath(root_dir: str, relpath: str | None) -> str | None:
     return os.path.join(root_dir, relpath.replace("/", os.sep))
 
 
-def _detach_cpu_value(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, dict):
-        return {str(key): _detach_cpu_value(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_detach_cpu_value(item) for item in value)
-    if isinstance(value, list):
-        return [_detach_cpu_value(item) for item in value]
-    return value
-
-
-def _detach_boundary_payload(payload: BoundaryPayload) -> BoundaryPayload:
-    tensors = {
-        str(label): tensor.detach().cpu()
-        for label, tensor in dict(payload.tensors or {}).items()
-        if isinstance(tensor, torch.Tensor)
-    }
-    metadata = {str(label): _detach_cpu_value(value) for label, value in dict(payload.metadata or {}).items()}
-    return boundary_payload_from_tensors(
-        tensors,
-        split_id=str(payload.split_id),
-        graph_signature=str(
-            payload.metadata.get("graph_shape_hash")
-            or payload.metadata.get("graph_signature")
-            or ""
-        ),
-        batch_size=int(payload.batch_size),
-        schema=dict(getattr(payload, "spec", {}) or {}),
-        weight_version=payload.metadata.get("weight_version"),
-        supports_prefix_backward=bool(payload.metadata.get("supports_prefix_backward", False)),
-        prefix_backward_owner_id=payload.metadata.get("prefix_backward_owner_id"),
-        protocol_version=payload.metadata.get("protocol_version", 2),
-        metadata=metadata,
-    )
-
-
 def _normalise_payload(
     intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -129,12 +78,28 @@ def _normalise_payload(
     return tensors
 
 
-def _payload_for_storage(
-    intermediate: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor],
-) -> BoundaryPayload | dict[str, torch.Tensor]:
-    if isinstance(intermediate, BoundaryPayload):
-        return _detach_boundary_payload(intermediate)
-    return _normalise_payload(intermediate)
+def _feature_ref_paths(ref: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(ref, Mapping):
+        return []
+    paths: list[str] = []
+    for key in ("shard_path", "index_path", "meta_path"):
+        value = ref.get(key)
+        if value:
+            paths.append(str(value))
+    shard_dir = ref.get("shard_dir")
+    if shard_dir and os.path.isdir(str(shard_dir)):
+        for root, _dirs, files in os.walk(str(shard_dir)):
+            for filename in files:
+                paths.append(os.path.join(root, filename))
+    return sorted(set(paths))
+
+
+def _feature_ref_bytes(ref: Mapping[str, Any] | None) -> int:
+    total = 0
+    for path in _feature_ref_paths(ref):
+        if os.path.exists(path):
+            total += os.path.getsize(path)
+    return int(total)
 
 
 @dataclass
@@ -165,7 +130,7 @@ class StoredSampleRecord:
     input_image_size: list[int] | None = None
     input_tensor_shape: list[int] | None = None
     input_resize_mode: str | None = None
-    feature_relpath: str | None = None
+    feature_ref: dict[str, Any] | None = None
     result_relpath: str = ""
     metadata_relpath: str = ""
     raw_relpath: str | None = None
@@ -200,7 +165,7 @@ class StoredSampleRecord:
             "input_image_size": self.input_image_size,
             "input_tensor_shape": self.input_tensor_shape,
             "input_resize_mode": self.input_resize_mode,
-            "feature_relpath": self.feature_relpath,
+            "feature_ref": dict(self.feature_ref) if isinstance(self.feature_ref, Mapping) else None,
             "result_relpath": self.result_relpath,
             "metadata_relpath": self.metadata_relpath,
             "raw_relpath": self.raw_relpath,
@@ -233,7 +198,7 @@ class StoredSampleRecord:
             window_id=(None if payload.get("window_id") is None else str(payload.get("window_id"))),
             in_drift_window=bool(payload.get("in_drift_window", False)),
             has_raw_sample=bool(payload.get("has_raw_sample", False)),
-            has_feature=bool(payload.get("has_feature", False)),
+            has_feature=isinstance(payload.get("feature_ref"), Mapping),
             input_image_size=list(payload["input_image_size"]) if payload.get("input_image_size") is not None else None,
             input_tensor_shape=list(payload["input_tensor_shape"]) if payload.get("input_tensor_shape") is not None else None,
             input_resize_mode=(
@@ -241,7 +206,11 @@ class StoredSampleRecord:
                 if payload.get("input_resize_mode") is not None
                 else None
             ),
-            feature_relpath=payload.get("feature_relpath"),
+            feature_ref=(
+                dict(payload["feature_ref"])
+                if isinstance(payload.get("feature_ref"), Mapping)
+                else None
+            ),
             result_relpath=str(payload["result_relpath"]),
             metadata_relpath=str(payload["metadata_relpath"]),
             raw_relpath=payload.get("raw_relpath"),
@@ -325,7 +294,13 @@ class _SampleStoreCounters:
 class EdgeSampleStore:
     def __init__(self, root_dir: str) -> None:
         self.root_dir = os.path.abspath(root_dir)
-        self.features_dir = os.path.join(self.root_dir, "features")
+        self.feature_shard_dir = os.path.join(self.root_dir, "feature_shards")
+        self.feature_store = FeatureShardStore(
+            self.feature_shard_dir,
+            storage_format="npy_memmap_shard",
+            shard_max_samples=1,
+            shard_dtype=None,
+        )
         self.results_dir = os.path.join(self.root_dir, "results")
         self.metadata_dir = os.path.join(self.root_dir, "metadata")
         self.raw_dir = os.path.join(self.root_dir, "raw")
@@ -339,7 +314,7 @@ class EdgeSampleStore:
         self._recover_counters()
 
     def _ensure_layout(self) -> None:
-        os.makedirs(self.features_dir, exist_ok=True)
+        os.makedirs(self.feature_shard_dir, exist_ok=True)
         os.makedirs(self.results_dir, exist_ok=True)
         os.makedirs(self.metadata_dir, exist_ok=True)
         os.makedirs(self.raw_dir, exist_ok=True)
@@ -440,9 +415,6 @@ class EdgeSampleStore:
         )
 
         ts = timestamp or datetime.now(timezone.utc).isoformat()
-        payload = _payload_for_storage(intermediate)
-
-        feature_path = os.path.join(self.features_dir, f"{sample_key}.pt")
         result_path = os.path.join(self.results_dir, f"{sample_key}.json")
         metadata_path = os.path.join(self.metadata_dir, f"{sample_key}.json")
         raw_path = (
@@ -451,7 +423,35 @@ class EdgeSampleStore:
             else None
         )
 
-        _atomic_torch_save({"feature": payload}, feature_path)
+        written_features = self.feature_store.write_entries(
+            [
+                {
+                    "sample": {"sample_id": sample_key},
+                    "record": {
+                        "intermediate": (
+                            intermediate
+                            if isinstance(intermediate, BoundaryPayload)
+                            else _normalise_payload(intermediate)
+                        )
+                    },
+                }
+            ],
+            runtime_context={
+                "model_id": str(model_id),
+                "model_family": "",
+                "split_config_id": str(split_config_id),
+                "feature_layout_id": "",
+                "boundary_id": str(getattr(intermediate, "split_id", "") or ""),
+                "input_tensor_shape": list(input_tensor_shape or []),
+                "input_resize_mode": str(input_resize_mode or ""),
+            },
+            generation="edge_sample_store",
+            source="edge_sample_store",
+        )
+        feature_ref = written_features[0]["feature_ref"]
+        if not isinstance(feature_ref, FeatureShardRef):
+            raise RuntimeError("Edge sample feature shard write did not return FeatureShardRef.")
+        feature_ref_payload = feature_ref.to_dict()
         _atomic_json_dump(result_path, inference_result)
         if raw_frame is not None:
             quality = max(1, min(100, int(raw_jpeg_quality)))
@@ -484,11 +484,11 @@ class EdgeSampleStore:
             input_image_size=list(input_image_size) if input_image_size is not None else None,
             input_tensor_shape=list(input_tensor_shape) if input_tensor_shape is not None else None,
             input_resize_mode=str(input_resize_mode) if input_resize_mode is not None else None,
-            feature_relpath=_to_relpath(self.root_dir, feature_path),
+            feature_ref=feature_ref_payload,
             result_relpath=_to_relpath(self.root_dir, result_path),
             metadata_relpath=_to_relpath(self.root_dir, metadata_path),
             raw_relpath=_to_relpath(self.root_dir, raw_path),
-            feature_bytes=os.path.getsize(feature_path),
+            feature_bytes=_feature_ref_bytes(feature_ref_payload),
             raw_bytes=os.path.getsize(raw_path) if raw_path is not None else 0,
         )
 
@@ -572,26 +572,20 @@ class EdgeSampleStore:
             with open(result_path, "r", encoding="utf-8") as handle:
                 return json.load(handle)
 
-    def load_intermediate(self, record: StoredSampleRecord) -> BoundaryPayload | dict[str, torch.Tensor]:
+    def load_intermediate(self, record: StoredSampleRecord) -> BoundaryPayload:
         with self._lock:
-            feature_path = _from_relpath(self.root_dir, record.feature_relpath)
-            payload = torch.load(feature_path, map_location="cpu", weights_only=False)
-            feature = payload.get("feature") if isinstance(payload, dict) else payload
-            if isinstance(feature, BoundaryPayload):
-                return _detach_boundary_payload(feature)
-            if isinstance(feature, dict):
-                return _normalise_payload(feature)
-            if isinstance(feature, torch.Tensor):
-                return _normalise_payload(feature)
-            raise TypeError(f"Unsupported cached feature type: {type(feature)!r}")
+            if not isinstance(record.feature_ref, Mapping):
+                raise FileNotFoundError(
+                    f"Edge sample {record.sample_id!r} does not have a shard feature_ref."
+                )
+            ref = FeatureShardRef.from_dict(dict(record.feature_ref))
+            return self.feature_store.read_batch([ref])
 
     def iter_existing_paths(self, record: StoredSampleRecord) -> Iterable[str]:
-        for relpath in (
-            record.feature_relpath,
-            record.result_relpath,
-            record.metadata_relpath,
-            record.raw_relpath,
-        ):
+        for path in _feature_ref_paths(record.feature_ref):
+            if os.path.exists(path):
+                yield path
+        for relpath in (record.result_relpath, record.metadata_relpath, record.raw_relpath):
             path = _from_relpath(self.root_dir, relpath)
             if path is not None and os.path.exists(path):
                 yield path

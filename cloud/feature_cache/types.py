@@ -6,6 +6,11 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
 
+SAFETENSORS_SHARD = "safetensors_shard"
+NPY_MEMMAP_SHARD = "npy_memmap_shard"
+SUPPORTED_STORAGE_FORMATS = {SAFETENSORS_SHARD, NPY_MEMMAP_SHARD}
+
+
 def stable_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -16,6 +21,8 @@ def stable_digest(payload: object) -> str:
 
 @dataclass(frozen=True)
 class FeatureCacheKey:
+    """Stable shard grouping key, not a per-sample file path key."""
+
     cache_version: str
     sample_id: str
     image_sha1: str | None
@@ -42,64 +49,158 @@ class FeatureCacheKey:
 
 
 @dataclass(frozen=True)
-class FeatureRef:
-    key: FeatureCacheKey
-    path: str
-    codec: str
-    payload_kind: str
+class FeatureShardMetadata:
+    format_version: str
+    storage_format: str
+    model_id: str
+    model_family: str
+    split_config_id: str
     feature_layout_id: str
     contract_id: str | None
-    sample_id: str
-    source: str
-    tensor_shapes: list[list[int]] | None
-    dtype: str | None
-    size_bytes: int
-    created_at: float
+    boundary_id: str
+    boundary_schema_hash: str
+    passthrough_schema_hash: str | None
+    preprocessing_fingerprint: str | None
+    dtype: str
+    shape_bucket: str
+    num_samples: int
+    leaf_specs: dict[str, dict[str, object]]
+    sample_to_row: dict[str, int]
+    payload_kind: str = "boundary_payload"
+    shard_id: str = ""
+    shard_path: str | None = None
+    shard_dir: str | None = None
+    index_path: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "key": self.key.payload(),
-            "path": self.path,
-            "codec": self.codec,
-            "payload_kind": self.payload_kind,
-            "feature_layout_id": self.feature_layout_id,
-            "contract_id": self.contract_id,
-            "sample_id": self.sample_id,
-            "source": self.source,
-            "tensor_shapes": self.tensor_shapes,
-            "dtype": self.dtype,
-            "size_bytes": int(self.size_bytes),
-            "created_at": float(self.created_at),
-            "metadata": dict(self.metadata),
-        }
+        return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "FeatureRef":
-        key_payload = payload.get("key")
-        if not isinstance(key_payload, Mapping):
-            raise ValueError("FeatureRef payload is missing key.")
+    def from_dict(cls, payload: Mapping[str, object]) -> "FeatureShardMetadata":
         return cls(
-            key=FeatureCacheKey(**dict(key_payload)),
-            path=str(payload.get("path") or ""),
-            codec=str(payload.get("codec") or ""),
-            payload_kind=str(payload.get("payload_kind") or ""),
+            format_version=str(payload.get("format_version") or "feature-shard.v1"),
+            storage_format=str(payload.get("storage_format") or ""),
+            model_id=str(payload.get("model_id") or ""),
+            model_family=str(payload.get("model_family") or ""),
+            split_config_id=str(payload.get("split_config_id") or ""),
             feature_layout_id=str(payload.get("feature_layout_id") or ""),
             contract_id=(
                 None
                 if payload.get("contract_id") in (None, "")
                 else str(payload.get("contract_id"))
             ),
-            sample_id=str(payload.get("sample_id") or ""),
-            source=str(payload.get("source") or ""),
-            tensor_shapes=(
-                [list(map(int, shape)) for shape in list(payload.get("tensor_shapes") or [])]
-                if payload.get("tensor_shapes") is not None
-                else None
+            boundary_id=str(payload.get("boundary_id") or ""),
+            boundary_schema_hash=str(payload.get("boundary_schema_hash") or ""),
+            passthrough_schema_hash=(
+                None
+                if payload.get("passthrough_schema_hash") in (None, "")
+                else str(payload.get("passthrough_schema_hash"))
             ),
-            dtype=None if payload.get("dtype") is None else str(payload.get("dtype")),
-            size_bytes=int(payload.get("size_bytes") or 0),
-            created_at=float(payload.get("created_at") or 0.0),
+            preprocessing_fingerprint=(
+                None
+                if payload.get("preprocessing_fingerprint") in (None, "")
+                else str(payload.get("preprocessing_fingerprint"))
+            ),
+            dtype=str(payload.get("dtype") or ""),
+            shape_bucket=str(payload.get("shape_bucket") or ""),
+            num_samples=int(payload.get("num_samples") or 0),
+            leaf_specs={
+                str(key): dict(value)
+                for key, value in dict(payload.get("leaf_specs") or {}).items()
+                if isinstance(value, Mapping)
+            },
+            sample_to_row={
+                str(key): int(value)
+                for key, value in dict(payload.get("sample_to_row") or {}).items()
+            },
+            payload_kind=str(payload.get("payload_kind") or "boundary_payload"),
+            shard_id=str(payload.get("shard_id") or ""),
+            shard_path=(
+                None if payload.get("shard_path") in (None, "") else str(payload.get("shard_path"))
+            ),
+            shard_dir=(
+                None if payload.get("shard_dir") in (None, "") else str(payload.get("shard_dir"))
+            ),
+            index_path=str(payload.get("index_path") or ""),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+
+@dataclass(frozen=True)
+class FeatureShardRef:
+    storage_format: str
+    shard_id: str
+    shard_path: str | None
+    shard_dir: str | None
+    index_path: str
+    row_id: int
+    sample_id: str
+    feature_layout_id: str
+    contract_id: str | None
+    boundary_id: str
+    payload_kind: str
+    dtype: str
+    shape_bucket: str
+    leaf_keys: list[str]
+    passthrough_keys: list[str] = field(default_factory=list)
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "storage_format": self.storage_format,
+            "shard_id": self.shard_id,
+            "shard_path": self.shard_path,
+            "shard_dir": self.shard_dir,
+            "index_path": self.index_path,
+            "row_id": int(self.row_id),
+            "sample_id": self.sample_id,
+            "feature_layout_id": self.feature_layout_id,
+            "contract_id": self.contract_id,
+            "boundary_id": self.boundary_id,
+            "payload_kind": self.payload_kind,
+            "dtype": self.dtype,
+            "shape_bucket": self.shape_bucket,
+            "leaf_keys": list(self.leaf_keys),
+            "passthrough_keys": list(self.passthrough_keys),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "FeatureShardRef":
+        storage_format = str(payload.get("storage_format") or "")
+        if storage_format not in SUPPORTED_STORAGE_FORMATS:
+            raise ValueError(f"Unsupported feature shard storage_format={storage_format!r}.")
+        sample_id = str(payload.get("sample_id") or "")
+        row_id = int(payload.get("row_id") if payload.get("row_id") is not None else -1)
+        if not sample_id or row_id < 0:
+            raise ValueError("FeatureShardRef requires sample_id and non-negative row_id.")
+        return cls(
+            storage_format=storage_format,
+            shard_id=str(payload.get("shard_id") or ""),
+            shard_path=(
+                None if payload.get("shard_path") in (None, "") else str(payload.get("shard_path"))
+            ),
+            shard_dir=(
+                None if payload.get("shard_dir") in (None, "") else str(payload.get("shard_dir"))
+            ),
+            index_path=str(payload.get("index_path") or ""),
+            row_id=row_id,
+            sample_id=sample_id,
+            feature_layout_id=str(payload.get("feature_layout_id") or ""),
+            contract_id=(
+                None
+                if payload.get("contract_id") in (None, "")
+                else str(payload.get("contract_id"))
+            ),
+            boundary_id=str(payload.get("boundary_id") or ""),
+            payload_kind=str(payload.get("payload_kind") or "boundary_payload"),
+            dtype=str(payload.get("dtype") or ""),
+            shape_bucket=str(payload.get("shape_bucket") or ""),
+            leaf_keys=[str(key) for key in list(payload.get("leaf_keys") or [])],
+            passthrough_keys=[
+                str(key) for key in list(payload.get("passthrough_keys") or [])
+            ],
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -149,7 +250,7 @@ class LabelRef:
 class SampleTrainingRef:
     sample_id: str
     sample_type: str
-    feature_ref: FeatureRef
+    feature_ref: FeatureShardRef
     label_ref: LabelRef
     metadata_ref: str | None
     teacher_labeled: bool
@@ -185,7 +286,7 @@ class TrainingCacheView:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema_version": "training-cache-view.v1",
+            "schema_version": "training-cache-view.v2",
             "view_id": self.view_id,
             "generation": self.generation,
             "feature_layout_id": self.feature_layout_id,
@@ -219,6 +320,8 @@ class FeatureCacheStats:
     legacy_migration_count: int = 0
     rebuild_batch_size: int = 0
     rebuild_batches: int = 0
+    shards_written: int = 0
+    total_tensor_bytes: int = 0
     feature_ref_resolve_time: float = 0.0
     feature_store_lookup_time: float = 0.0
     feature_store_register_time: float = 0.0
@@ -227,6 +330,7 @@ class FeatureCacheStats:
     deep_payload_validation_time: float = 0.0
     rebuild_time: float = 0.0
     cache_write_time: float = 0.0
+    atomic_commit_time: float = 0.0
     manifest_write_time: float = 0.0
     metadata_index_time: float = 0.0
     total_prepare_time: float = 0.0
@@ -257,7 +361,7 @@ class FeatureCachePreparePlan:
 class FeatureCachePrepareResult:
     plan: FeatureCachePreparePlan
     view: TrainingCacheView | None = None
-    feature_refs: dict[str, FeatureRef] = field(default_factory=dict)
+    feature_refs: dict[str, FeatureShardRef] = field(default_factory=dict)
     records: dict[str, dict[str, object]] = field(default_factory=dict)
     metadata_by_id: dict[str, dict[str, object]] = field(default_factory=dict)
     bundle_info: dict[str, object] = field(default_factory=dict)

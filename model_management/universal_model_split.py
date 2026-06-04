@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import json
 import os
 import random
@@ -13,9 +12,10 @@ import torch
 from loguru import logger
 from torchlens.split.planner import plan_split
 
+from cloud.feature_cache.shard_reader import ShardFeatureBatchReader
+from cloud.feature_cache.types import FeatureShardRef
 from model_management.payload import (
     BoundaryPayload,
-    boundary_payload_from_tensors,
     deserialize_boundary_payload,
     serialize_boundary_payload,
 )
@@ -807,119 +807,6 @@ def extract_split_features(splitter: UniversalModelSplitter, sample_input: Any) 
     return splitter.edge_forward(sample_input)
 
 
-def _feature_path(cache_path: str, frame_index: Any) -> str:
-    return os.path.join(cache_path, "features", f"{frame_index}.pt")
-
-
-def _training_view_feature_path(cache_path: str, frame_index: Any) -> str | None:
-    metadata_index_path = os.path.join(cache_path, "metadata_index.json")
-    if not os.path.exists(metadata_index_path):
-        return None
-    with open(metadata_index_path, "r", encoding="utf-8") as handle:
-        metadata_index = json.load(handle)
-    if not isinstance(metadata_index, Mapping):
-        return None
-    samples = metadata_index.get("samples")
-    if not isinstance(samples, Mapping):
-        return None
-    sample = samples.get(str(frame_index))
-    if not isinstance(sample, Mapping):
-        return None
-    ref = sample.get("feature_ref")
-    path = ""
-    if isinstance(ref, Mapping):
-        path = str(ref.get("path") or "")
-    if not path:
-        path = str(sample.get("feature_relpath") or "")
-    if not path:
-        return None
-    if os.path.isabs(path):
-        return path
-    return os.path.abspath(os.path.join(cache_path, path.replace("/", os.sep)))
-
-
-def save_split_feature_cache(
-    cache_path: str,
-    frame_index: Any,
-    intermediate: BoundaryPayload,
-    **record_fields: Any,
-) -> dict[str, Any]:
-    if not isinstance(intermediate, BoundaryPayload):
-        raise TypeError(
-            "New split feature cache writes require a TorchLens ReplayBoundary; "
-            f"got {type(intermediate).__name__}."
-        )
-    os.makedirs(os.path.join(cache_path, "features"), exist_ok=True)
-    extra_metadata = dict(record_fields.pop("extra_metadata", {}) or {})
-    labels = list(getattr(intermediate, "tensors", {}) or {})
-    record = {
-        "cache_protocol": BOUNDARY_CACHE_PROTOCOL,
-        "intermediate": intermediate,
-        "candidate_id": getattr(intermediate, "split_id", None),
-        "boundary_tensor_labels": labels,
-        "split_index": None,
-        "split_label": getattr(intermediate, "split_id", None),
-        **record_fields,
-        **extra_metadata,
-    }
-    path = _feature_path(cache_path, frame_index)
-    with gzip.open(path, "wb", compresslevel=1) as f:
-        torch.save(record, f)
-    return record
-
-
-def load_split_feature_cache(cache_path: str, frame_index: Any) -> dict[str, Any]:
-    path = _feature_path(cache_path, frame_index)
-    if not os.path.exists(path):
-        view_path = _training_view_feature_path(cache_path, frame_index)
-        if view_path is None or not os.path.exists(view_path):
-            raise FileNotFoundError(path)
-        path = view_path
-    try:
-        with gzip.open(path, "rb") as f:
-            record = torch.load(f, map_location="cpu", weights_only=False)
-    except gzip.BadGzipFile:
-        record = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(record, BoundaryPayload):
-        return {
-            "cache_protocol": BOUNDARY_CACHE_PROTOCOL,
-            "intermediate": record,
-            "candidate_id": getattr(record, "split_id", None),
-            "boundary_tensor_labels": list(getattr(record, "tensors", {}) or {}),
-            "split_label": getattr(record, "split_id", None),
-        }
-    if not isinstance(record, dict):
-        raise TypeError(f"Unsupported split feature cache record: {type(record)!r}")
-    protocol = str(record.get("cache_protocol") or "")
-    if protocol and protocol != BOUNDARY_CACHE_PROTOCOL:
-        raise RuntimeError(f"Unsupported split feature cache protocol {protocol!r}; rebuild cache.")
-    if record.get("cache_protocol") == BOUNDARY_CACHE_PROTOCOL and not isinstance(
-        record.get("intermediate"),
-        BoundaryPayload,
-    ):
-        raise TypeError("TorchLens boundary cache record is missing a ReplayBoundary.")
-    return record
-
-
-def _feature_tensors_from_record(record: Mapping[str, Any]) -> dict[str, torch.Tensor]:
-    if "feature" in record and isinstance(record.get("feature"), Mapping):
-        source = dict(record["feature"])
-    else:
-        intermediate = record.get("intermediate")
-        if isinstance(intermediate, BoundaryPayload):
-            source = dict(intermediate.tensors or {})
-        elif isinstance(intermediate, torch.Tensor):
-            source = {"payload": intermediate}
-        elif isinstance(intermediate, Mapping):
-            source = dict(intermediate.get("tensors") or intermediate)
-        else:
-            source = {key: value for key, value in dict(record).items() if isinstance(value, torch.Tensor)}
-    tensors = {str(label): tensor.detach() for label, tensor in source.items() if isinstance(tensor, torch.Tensor)}
-    if not tensors:
-        raise RuntimeError("Split-tail training requires cached feature tensors.")
-    return tensors
-
-
 def slice_boundary_payload_batch(payload: BoundaryPayload, *, start: int = 0, length: int = 1) -> BoundaryPayload:
     start = max(0, int(start))
     length = max(1, int(length))
@@ -929,11 +816,6 @@ def slice_boundary_payload_batch(payload: BoundaryPayload, *, start: int = 0, le
     if len(selected) == 1:
         return selected[0]
     return codec.collate(selected)
-
-
-def _cached_boundary_payload(record: Mapping[str, Any]) -> BoundaryPayload | None:
-    intermediate = record.get("intermediate")
-    return intermediate if isinstance(intermediate, BoundaryPayload) else None
 
 
 _SPLIT_TARGET_METADATA_FIELDS = (
@@ -964,35 +846,6 @@ def _target_with_split_meta(target: Any, record: Mapping[str, Any]) -> Any:
     return enriched
 
 
-def _build_boundary_batch_from_records(records: list[Mapping[str, Any]], *, runtime: Any) -> BoundaryPayload:
-    if not records:
-        raise RuntimeError("Cannot build an empty split-tail feature batch.")
-    codec = BoundaryPayloadCacheCodec(runtime)
-    payloads = [_cached_boundary_payload(record) for record in records]
-    if all(payload is not None for payload in payloads):
-        return codec.collate([payload for payload in payloads if payload is not None])
-    tensor_groups = [_feature_tensors_from_record(record) for record in records]
-    labels = list(tensor_groups[0].keys())
-    for tensors in tensor_groups[1:]:
-        if list(tensors.keys()) != labels:
-            raise RuntimeError("Split-tail feature records have different boundary tensors.")
-    batched_tensors: dict[str, torch.Tensor] = {}
-    first_payload = next((payload for payload in payloads if payload is not None), None)
-    for label in labels:
-        pieces = [tensors[label] for tensors in tensor_groups]
-        if any(piece.ndim == 0 for piece in pieces):
-            batched_tensors[label] = torch.stack(pieces, dim=0)
-        else:
-            batched_tensors[label] = torch.cat(pieces, dim=0)
-    return boundary_payload_from_tensors(
-        batched_tensors,
-        split_id=str(getattr(_runtime_from_splitter(runtime), "split_id", "split-tail")),
-        graph_signature=_runtime_trace_signature(_runtime_from_splitter(runtime)) or "split-runtime",
-        batch_size=len(records),
-        schema=getattr(first_payload, "spec", None),
-    )
-
-
 def _runtime_from_splitter(splitter: Any) -> Any:
     ensure_runtime = getattr(splitter, "_ensure_runtime", None)
     if callable(ensure_runtime):
@@ -1010,9 +863,15 @@ def _load_cached_split_batches(
     preloaded_records: Mapping[Any, Mapping[str, Any]] | None = None,
     profile: Any | None = None,
 ) -> list[tuple[list[Any], BoundaryPayload, list[Any]]]:
-    del profile
     batches: list[tuple[list[Any], BoundaryPayload, list[Any]]] = []
-    records_by_key: dict[str, dict[str, Any]] = {}
+    metadata_index_path = os.path.join(cache_path, "metadata_index.json")
+    metadata_samples: dict[str, Any] = {}
+    if os.path.exists(metadata_index_path):
+        with open(metadata_index_path, "r", encoding="utf-8") as handle:
+            metadata_index = json.load(handle)
+        if isinstance(metadata_index, Mapping):
+            metadata_samples = dict(metadata_index.get("samples") or {})
+    shard_reader = ShardFeatureBatchReader()
 
     def _record_for_index(index: Any) -> dict[str, Any]:
         if preloaded_records is not None:
@@ -1020,13 +879,18 @@ def _load_cached_split_batches(
             if isinstance(record, Mapping):
                 return dict(record)
         key = str(index)
-        if key not in records_by_key:
-            records_by_key[key] = load_split_feature_cache(cache_path, index)
-        return dict(records_by_key[key])
+        record = metadata_samples.get(key)
+        if isinstance(record, Mapping):
+            return dict(record)
+        raise FileNotFoundError(
+            f"TrainingCacheView metadata for sample {key!r} is missing feature_ref."
+        )
 
     for offset in range(0, len(all_indices), max(1, int(batch_size))):
         batch_indices = list(all_indices[offset : offset + max(1, int(batch_size))])
+        prepare_started = time.perf_counter()
         records = [_record_for_index(index) for index in batch_indices]
+        refs = [FeatureShardRef.from_dict(dict(record.get("feature_ref") or {})) for record in records]
         targets = []
         for index, record in zip(batch_indices, records, strict=True):
             target = annotations.get(index)
@@ -1038,7 +902,14 @@ def _load_cached_split_batches(
                     "labels": list(record.get("pseudo_labels") or []),
                 }
             targets.append(_target_with_split_meta(target, record))
-        batches.append((batch_indices, _build_boundary_batch_from_records(records, runtime=runtime), targets))
+        if profile is not None:
+            profile.add("target_construction_time", time.perf_counter() - prepare_started)
+        batch_started = time.perf_counter()
+        boundary = shard_reader.read_batch(refs)
+        if profile is not None:
+            profile.add("boundary_payload_batching_time", time.perf_counter() - batch_started)
+            profile.add("training_batch_preparation_time", time.perf_counter() - prepare_started)
+        batches.append((batch_indices, boundary, targets))
     return batches
 
 
@@ -1280,11 +1151,9 @@ __all__ = [
     "compare_outputs",
     "deserialize_boundary_payload",
     "extract_split_features",
-    "load_split_feature_cache",
     "log_split_retrain_profile",
     "prepare_exact_split_runtime",
     "reconstruct_candidate_from_descriptor",
-    "save_split_feature_cache",
     "serialize_boundary_payload",
     "slice_boundary_payload_batch",
     "universal_split_retrain",
