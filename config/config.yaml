@@ -177,9 +177,10 @@ server:
   batch_size: 32
   feature_cache_mode: auto
   teacher_batch_size: 32
-  proxy_eval_interval_rounds: 5
-  proxy_eval_patience: 3
-  proxy_eval_min_delta: 0.0005
+  proxy_eval_interval_rounds: 10
+  proxy_eval_patience: 2
+  proxy_eval_min_delta: 0.002
+  proxy_eval_max_samples: 128
   # RF-DETR fixed-split jobs shrink the effective runtime batch size toward
   # this many optimizer steps per outer round so small bundles do not collapse
   # into a single heavily padded update.

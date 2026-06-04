@@ -33,6 +33,14 @@ from grpc_server.workspace import prepare_request_workspace
 from tools.grpc_options import grpc_message_options
 from cloud.edge_registry import EdgeRegistry
 from cloud.sample_pool import CloudSamplePool
+from cloud.training import (
+    FixedSplitRetrainEngine,
+    FixedSplitTrainingContext,
+    FixedSplitTrainingPlan,
+    ProxyEvalConfig,
+    deterministic_proxy_sample_ids,
+    get_training_adapter,
+)
 
 import model_management.model_zoo as model_zoo
 from model_management.object_detection import Object_Detection
@@ -61,10 +69,7 @@ from model_management.split_model_adapters import (
 from model_management.universal_model_split import (
     SplitRetrainProfile,
     UniversalModelSplitter,
-    build_split_retrain_optimizer,
     collect_suffix_trainable_parameters,
-    log_split_retrain_profile,
-    universal_split_retrain,
     load_split_feature_cache,
     prepare_exact_split_runtime,
     save_split_feature_cache,
@@ -497,10 +502,7 @@ def _normalize_proxy_sample_ids(
     *,
     max_samples: int | None = None,
 ) -> list[str]:
-    sample_ids = sorted(str(sample_id) for sample_id in gt_annotations.keys())
-    if max_samples is None or int(max_samples) <= 0:
-        return sample_ids
-    return sample_ids[: int(max_samples)]
+    return deterministic_proxy_sample_ids(gt_annotations, max_samples)
 
 
 def _lookup_preloaded_record(
@@ -2260,17 +2262,26 @@ class CloudContinualLearner:
             int(getattr(cl_cfg, "teacher_batch_size", self.batch_size))
             if cl_cfg else self.batch_size
         )
-        self.proxy_eval_interval_rounds = (
-            int(getattr(cl_cfg, "proxy_eval_interval_rounds", 1))
-            if cl_cfg else 1
+        raw_proxy_eval_interval_epochs = (
+            getattr(cl_cfg, "proxy_eval_interval_epochs", None)
+            if cl_cfg
+            else None
         )
+        if raw_proxy_eval_interval_epochs is None and cl_cfg:
+            raw_proxy_eval_interval_epochs = getattr(cl_cfg, "proxy_eval_interval_rounds", 10)
+        self.proxy_eval_interval_epochs = (
+            int(raw_proxy_eval_interval_epochs)
+            if raw_proxy_eval_interval_epochs is not None
+            else 10
+        )
+        self.proxy_eval_interval_rounds = self.proxy_eval_interval_epochs
         self.proxy_eval_patience = (
-            int(getattr(cl_cfg, "proxy_eval_patience", 0))
-            if cl_cfg else 0
+            int(getattr(cl_cfg, "proxy_eval_patience", 2))
+            if cl_cfg else 2
         )
         self.proxy_eval_min_delta = (
-            float(getattr(cl_cfg, "proxy_eval_min_delta", 0.0))
-            if cl_cfg else 0.0
+            float(getattr(cl_cfg, "proxy_eval_min_delta", 0.002))
+            if cl_cfg else 0.002
         )
         self.wrapper_fixed_split_learning_rate = (
             float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
@@ -2298,8 +2309,8 @@ class CloudContinualLearner:
         )
         raw_proxy_eval_max_samples = getattr(cl_cfg, "proxy_eval_max_samples", None) if cl_cfg else None
         self.proxy_eval_max_samples = (
-            None
-            if raw_proxy_eval_max_samples in (None, "", 0)
+            128
+            if raw_proxy_eval_max_samples in (None, "")
             else int(raw_proxy_eval_max_samples)
         )
         raw_threshold_candidates = (
@@ -5859,22 +5870,6 @@ class CloudContinualLearner:
         return None
 
     @staticmethod
-    def _uses_proxy_selected_fixed_split_epochs(
-        model_name: str,
-    ) -> bool:
-        return model_zoo.get_model_family(str(model_name)) in {"yolo", "rfdetr", "tinynext"}
-
-    @staticmethod
-    def _resolve_fixed_split_proxy_eval_inner_epochs(
-        model_name: str,
-        total_num_epoch: int,
-    ) -> int:
-        total_epochs = max(1, int(total_num_epoch))
-        if model_zoo.get_model_family(str(model_name)) != "tinynext":
-            return 1
-        return min(5, max(1, total_epochs // 10))
-
-    @staticmethod
     def _resolve_tinynext_proxy_selection_max_samples(
         *,
         available_samples: int,
@@ -5890,19 +5885,6 @@ class CloudContinualLearner:
                 return None
             return int(full_eval_budget)
         return 24
-
-    @staticmethod
-    def _resolve_rfdetr_proxy_selection_max_samples(
-        *,
-        available_samples: int,
-        full_eval_max_samples: int | None,
-    ) -> int | None:
-        full_eval_budget = max(0, int(available_samples))
-        if full_eval_max_samples is not None:
-            full_eval_budget = min(full_eval_budget, max(0, int(full_eval_max_samples)))
-        if full_eval_budget <= 32:
-            return None
-        return 32
 
     @staticmethod
     def _resolve_fixed_split_training_label(
@@ -6702,6 +6684,7 @@ class CloudContinualLearner:
         gt_annotations: dict[str, dict],
         num_epoch: int,
         proxy_metrics_before: dict[str, float | int | None],
+        proxy_metrics_before_elapsed: float,
         prepared_trace_sample_input: object | None,
         prepared_splitter: UniversalModelSplitter | None,
         prepared_candidate,
@@ -6712,7 +6695,10 @@ class CloudContinualLearner:
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
         split_runtime_model = get_split_runtime_model(model)
         if prepared_splitter is not None:
-            suffix_params = collect_suffix_trainable_parameters(prepared_splitter)
+            suffix_params = collect_suffix_trainable_parameters(
+                prepared_splitter,
+                update_requires_grad=False,
+            )
             trainable_param_count = sum(int(parameter.numel()) for parameter in suffix_params)
             if trainable_param_count <= 0:
                 raise RuntimeError(
@@ -6728,8 +6714,7 @@ class CloudContinualLearner:
                 "[FixedSplitCL] {} split retrain will resolve suffix parameters after tracing.",
                 self._resolve_fixed_split_training_label(current_model_name),
             )
-        baseline_state = _snapshot_model_state(model)
-        effective_num_epoch = num_epoch
+        effective_num_epoch = max(1, int(num_epoch))
         effective_learning_rate = self.default_split_learning_rate
         if (
             model_zoo.is_wrapper_model(current_model_name)
@@ -6750,17 +6735,6 @@ class CloudContinualLearner:
         target_steps_per_round = self._resolve_fixed_split_target_steps_per_round(
             current_model_name,
         )
-        uses_proxy_selected_epochs = self._uses_proxy_selected_fixed_split_epochs(
-            current_model_name
-        )
-        can_select_best_by_proxy = bool(gt_annotations)
-        logger.info(
-            "[FixedSplitCL] Starting split retrain configuration: Epochs={}, Learning Rate={}, Runtime Batch Size={}, Total Samples={}",
-            effective_num_epoch,
-            effective_learning_rate,
-            bs,
-            len(bundle_info["all_sample_ids"])
-        )
         if target_steps_per_round is not None:
             logger.info(
                 "[FixedSplitCL] {} effective batch size {} resolved from configured batch size {} with target_steps_per_round={} and samples={}.",
@@ -6776,6 +6750,7 @@ class CloudContinualLearner:
             )
 
         retrain_profile = SplitRetrainProfile()
+        optimizer_overrides = self._fixed_split_optimizer_overrides(current_model_name)
         split_retrain_kwargs = {
             "model": split_runtime_model,
             "sample_input": prepared_trace_sample_input,
@@ -6795,81 +6770,14 @@ class CloudContinualLearner:
             "preloaded_records": preloaded_records,
             "retrain_profile": retrain_profile,
         }
-        split_retrain_kwargs.update(
-            self._fixed_split_optimizer_overrides(current_model_name)
-        )
-        full_proxy_eval_sample_count = len(
-            _normalize_proxy_sample_ids(
-                gt_annotations,
-                max_samples=self.proxy_eval_max_samples,
-            )
-        )
-        selection_proxy_max_samples = None
-        selection_proxy_eval_sample_count = full_proxy_eval_sample_count
-        selection_uses_subset = False
-        if model_family in {"tinynext", "rfdetr"} and gt_annotations:
-            if model_family == "tinynext":
-                selection_proxy_max_samples = self._resolve_tinynext_proxy_selection_max_samples(
-                    available_samples=len(gt_annotations),
-                    full_eval_max_samples=self.proxy_eval_max_samples,
-                )
-            else:
-                selection_proxy_max_samples = self._resolve_rfdetr_proxy_selection_max_samples(
-                    available_samples=len(gt_annotations),
-                    full_eval_max_samples=self.proxy_eval_max_samples,
-                )
-            selection_proxy_eval_sample_count = len(
-                _normalize_proxy_sample_ids(
-                    gt_annotations,
-                    max_samples=selection_proxy_max_samples,
-                )
-            )
-            selection_uses_subset = (
-                selection_proxy_eval_sample_count > 0
-                and selection_proxy_eval_sample_count < full_proxy_eval_sample_count
-            )
+        split_retrain_kwargs.update(optimizer_overrides)
 
-        def _evaluate_proxy_metrics_for_current_state(
+        def _fixed_proxy_evaluator(
             *,
-            selection_eval: bool = False,
+            stage_label: str,
+            max_samples: int | None,
         ) -> dict[str, float | int | None]:
-            max_samples = (
-                selection_proxy_max_samples
-                if selection_eval and selection_uses_subset
-                else self.proxy_eval_max_samples
-            )
-            if model_family == "tinynext":
-                if selection_eval and selection_uses_subset:
-                    return self._evaluate_fixed_split_proxy_map(
-                        model,
-                        frame_dir=frame_dir,
-                        gt_annotations=gt_annotations,
-                        model_name=current_model_name,
-                        sample_metadata_by_id=sample_metadata_by_id,
-                        frame_cache=proxy_eval_frame_cache,
-                        max_samples=max_samples,
-                        inference_batch_size=bs,
-                        split_cache_path=working_cache,
-                        splitter=prepared_splitter,
-                        split_candidate=prepared_candidate,
-                        preloaded_records=preloaded_records,
-                    )
-                return self._evaluate_tinynext_proxy_map(
-                    model,
-                    frame_dir=frame_dir,
-                    gt_annotations=gt_annotations,
-                    model_name=current_model_name,
-                    sample_metadata_by_id=sample_metadata_by_id,
-                    frame_cache=proxy_eval_frame_cache,
-                    max_samples=max_samples,
-                    candidate_thresholds=self.proxy_eval_threshold_candidates,
-                    inference_batch_size=bs,
-                    stage_label="proxy selection" if selection_eval else "proxy evaluation",
-                    split_cache_path=working_cache,
-                    splitter=prepared_splitter,
-                    split_candidate=prepared_candidate,
-                    preloaded_records=preloaded_records,
-                )
+            del stage_label
             return self._evaluate_fixed_split_proxy_map(
                 model,
                 frame_dir=frame_dir,
@@ -6878,343 +6786,82 @@ class CloudContinualLearner:
                 sample_metadata_by_id=sample_metadata_by_id,
                 frame_cache=proxy_eval_frame_cache,
                 max_samples=max_samples,
-                inference_batch_size=bs,
+                inference_batch_size=int(split_retrain_kwargs["batch_size"]),
                 split_cache_path=working_cache,
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
             )
 
-        if uses_proxy_selected_epochs:
-            split_retrain_kwargs["optimizer"] = build_split_retrain_optimizer(
-                get_split_runtime_model(model),
-                runtime=prepared_splitter,
-                learning_rate=effective_learning_rate,
-                optimizer_name=str(split_retrain_kwargs.get("optimizer_name", "adam")),
-                weight_decay=float(split_retrain_kwargs.get("weight_decay", 0.0)),
-                grad_clip_norm=split_retrain_kwargs.get("grad_clip_norm"),
-            )
-            best_state = baseline_state
-            best_metrics = dict(proxy_metrics_before)
-            best_state_is_baseline = True
-            best_full_state = baseline_state
-            best_full_metrics = dict(proxy_metrics_before)
-            best_full_state_is_baseline = True
-            split_retrain_elapsed = 0.0
-            proxy_eval_elapsed = 0.0
-            rfdetr_adaptive_high_map = 0.995
-
-            def _metric_map(metrics: Mapping[str, object]) -> float | None:
-                value = metrics.get("map")
-                if value is None:
-                    return None
-                return float(value)
-
-            def _metrics_improve_by_min_delta(
-                candidate: Mapping[str, object],
-                incumbent: Mapping[str, object],
-            ) -> bool:
-                if not _proxy_metrics_are_better(candidate, incumbent):
-                    return False
-                if (
-                    proxy_eval_min_delta > 0.0
-                    and candidate.get("map") is not None
-                    and incumbent.get("map") is not None
-                    and (float(candidate["map"]) - float(incumbent["map"]))
-                    < proxy_eval_min_delta
-                ):
-                    return False
-                return True
-
-            def _rebuild_proxy_selected_optimizer() -> torch.optim.Optimizer | None:
-                return build_split_retrain_optimizer(
-                    get_split_runtime_model(model),
-                    runtime=prepared_splitter,
-                    learning_rate=effective_learning_rate,
-                    optimizer_name=str(split_retrain_kwargs.get("optimizer_name", "adam")),
-                    weight_decay=float(split_retrain_kwargs.get("weight_decay", 0.0)),
-                    grad_clip_norm=split_retrain_kwargs.get("grad_clip_norm"),
-                )
-
-            def _universal_split_retrain_with_batch_retry(**kwargs: object) -> object:
-                nonlocal bs
-                try:
-                    return universal_split_retrain(**kwargs)
-                except Exception as exc:
-                    fallback_batch_size = 16
-                    if bs <= fallback_batch_size or not _is_cuda_oom_error(exc):
-                        raise
-                    logger.warning(
-                        "[FixedSplitCL] {} split retrain hit CUDA OOM at batch_size={}; "
-                        "restoring the best checkpoint and retrying with batch_size={}.",
-                        training_label,
-                        bs,
-                        fallback_batch_size,
-                    )
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    model.load_state_dict(best_state, strict=False)
-                    _set_detection_model_eval_mode(model)
-                    bs = fallback_batch_size
-                    split_retrain_kwargs["batch_size"] = bs
-                    split_retrain_kwargs["optimizer"] = _rebuild_proxy_selected_optimizer()
-                    retry_kwargs = dict(kwargs)
-                    retry_kwargs["batch_size"] = bs
-                    retry_kwargs["optimizer"] = split_retrain_kwargs["optimizer"]
-                    return universal_split_retrain(**retry_kwargs)
-
-            proxy_eval_inner_epochs = self._resolve_fixed_split_proxy_eval_inner_epochs(
-                current_model_name,
-                int(effective_num_epoch),
-            )
-            proxy_eval_interval_rounds = max(1, int(self.proxy_eval_interval_rounds))
-            proxy_eval_patience = max(0, int(self.proxy_eval_patience))
-            proxy_eval_min_delta = max(0.0, float(self.proxy_eval_min_delta))
-            total_outer_rounds = math.ceil(
-                int(effective_num_epoch) / max(1, int(proxy_eval_inner_epochs))
-            )
-            completed_inner_epochs = 0
-            stale_proxy_eval_count = 0
-            if can_select_best_by_proxy:
-                proxy_eval_interval_epochs = (
-                    int(proxy_eval_interval_rounds) * int(proxy_eval_inner_epochs)
-                )
-                logger.info(
-                    "[FixedSplitCL] {} fixed-split retrain will train {} epoch(s); proxy mAP is evaluated after epoch {}, every {} epoch(s), and the final epoch.",
-                    training_label,
-                    int(effective_num_epoch),
-                    int(proxy_eval_inner_epochs),
-                    int(proxy_eval_interval_epochs),
-                )
-            else:
-                logger.info(
-                    "[FixedSplitCL] {} fixed-split retrain will train {} epoch(s); proxy mAP selection is skipped because no GT annotations are available.",
-                    training_label,
-                    int(effective_num_epoch),
-                )
-            if can_select_best_by_proxy and selection_uses_subset:
-                logger.info(
-                    "[FixedSplitCL] {} proxy selection will evaluate up to {} / {} GT proxy samples at each proxy eval, then run one final full proxy evaluation.",
-                    training_label,
-                    selection_proxy_eval_sample_count,
-                    full_proxy_eval_sample_count,
-                )
-                stage_started = time.perf_counter()
-                best_metrics = _evaluate_proxy_metrics_for_current_state(selection_eval=True)
-                proxy_eval_elapsed += time.perf_counter() - stage_started
-            for epoch_index in range(int(total_outer_rounds)):
-                inner_epochs_this_round = min(
-                    int(proxy_eval_inner_epochs),
-                    int(effective_num_epoch) - completed_inner_epochs,
-                )
-                projected_completed_inner_epochs = (
-                    completed_inner_epochs + inner_epochs_this_round
-                )
-                is_final_round = projected_completed_inner_epochs >= int(effective_num_epoch)
-                should_evaluate_round = can_select_best_by_proxy and (
-                    epoch_index == 0
-                    or ((epoch_index + 1) % proxy_eval_interval_rounds == 0)
-                    or is_final_round
-                )
-                should_log_round = (
-                    should_evaluate_round
-                    or epoch_index == 0
-                    or ((epoch_index + 1) % proxy_eval_interval_rounds == 0)
-                    or is_final_round
-                )
-                epoch_log_context = training_label if should_log_round else None
-                stage_started = time.perf_counter()
-                _universal_split_retrain_with_batch_retry(
-                    **split_retrain_kwargs,
-                    num_epoch=inner_epochs_this_round,
-                    epoch_log_context=epoch_log_context,
-                    log_every_n_epochs=max(1, int(inner_epochs_this_round)),
-                    log_first_epoch=False,
-                    epoch_log_start=completed_inner_epochs,
-                    epoch_log_total=effective_num_epoch,
-                    log_batches=False,
-                )
-                completed_inner_epochs = projected_completed_inner_epochs
-                split_retrain_elapsed += time.perf_counter() - stage_started
-                if not should_evaluate_round:
-                    continue
-                stage_started = time.perf_counter()
-                proxy_eval_metric_label = (
-                    "selection proxy_mAP@0.5"
-                    if selection_uses_subset
-                    else "proxy_mAP@0.5"
-                )
-                logger.info(
-                    "[FixedSplitCL] Evaluating {} after epoch {}/{}.",
-                    proxy_eval_metric_label,
-                    int(completed_inner_epochs),
-                    int(effective_num_epoch),
-                )
-                candidate_metrics = _evaluate_proxy_metrics_for_current_state(
-                    selection_eval=selection_uses_subset,
-                )
-                proxy_eval_elapsed += time.perf_counter() - stage_started
-                candidate_is_better = _metrics_improve_by_min_delta(
-                    candidate_metrics,
-                    best_metrics,
-                )
-                candidate_state: dict[str, torch.Tensor] | None = None
-                if candidate_is_better:
-                    candidate_state = _snapshot_model_state(model)
-                    best_state = candidate_state
-                    best_metrics = dict(candidate_metrics)
-                    best_state_is_baseline = False
-                    stale_proxy_eval_count = 0
-                    logger.info(
-                        "[FixedSplitCL] Kept {} candidate after epoch {}/{} with {}={:.4f}.",
-                        training_label,
-                        int(completed_inner_epochs),
-                        int(effective_num_epoch),
-                        proxy_eval_metric_label,
-                        float(candidate_metrics.get("map") or 0.0),
-                    )
-                    if not selection_uses_subset:
-                        best_full_state = best_state
-                        best_full_metrics = dict(candidate_metrics)
-                        best_full_state_is_baseline = False
-                else:
-                    stale_proxy_eval_count += 1
-
-                candidate_map = _metric_map(candidate_metrics)
-                best_full_map = _metric_map(best_full_metrics)
-                should_confirm_full_proxy = (
-                    selection_uses_subset
-                    and model_family == "rfdetr"
-                    and candidate_map is not None
-                    and candidate_map >= rfdetr_adaptive_high_map
-                    and (
-                        candidate_is_better
-                        or best_full_map is None
-                        or best_full_map < rfdetr_adaptive_high_map
-                        or is_final_round
-                    )
-                )
-                if should_confirm_full_proxy:
-                    if candidate_state is None:
-                        candidate_state = _snapshot_model_state(model)
-                    stage_started = time.perf_counter()
-                    full_candidate_metrics = _evaluate_proxy_metrics_for_current_state(
-                        selection_eval=False,
-                    )
-                    proxy_eval_elapsed += time.perf_counter() - stage_started
-                    logger.info(
-                        "[FixedSplitCL] Confirmed RF-DETR candidate after epoch {}/{} with full proxy_mAP@0.5={:.4f}.",
-                        int(completed_inner_epochs),
-                        int(effective_num_epoch),
-                        float(full_candidate_metrics.get("map") or 0.0),
-                    )
-                    if _metrics_improve_by_min_delta(
-                        full_candidate_metrics,
-                        best_full_metrics,
-                    ):
-                        best_full_state = candidate_state
-                        best_full_metrics = dict(full_candidate_metrics)
-                        best_full_state_is_baseline = False
-
-                if not candidate_is_better:
-                    best_map = (
-                        _metric_map(best_full_metrics)
-                        if selection_uses_subset and model_family == "rfdetr"
-                        else _metric_map(best_metrics)
-                    )
-                    if (
-                        model_family == "rfdetr"
-                        and int(completed_inner_epochs) >= 20
-                        and best_map is not None
-                        and best_map >= rfdetr_adaptive_high_map
-                    ):
-                        logger.info(
-                            "[FixedSplitCL] Early-stopping {} fixed-split retrain after epoch {}/{}: proxy_mAP@0.5 is already {:.4f} and the latest proxy evaluation did not improve by >= {}.",
-                            training_label,
-                            int(completed_inner_epochs),
-                            int(effective_num_epoch),
-                            float(best_map),
-                            proxy_eval_min_delta,
-                        )
-                        break
-                    if proxy_eval_patience and stale_proxy_eval_count >= proxy_eval_patience:
-                        if (
-                            selection_uses_subset
-                            and model_family == "rfdetr"
-                            and (
-                                best_map is None
-                                or best_map < rfdetr_adaptive_high_map
-                            )
-                            and not is_final_round
-                        ):
-                            continue
-                        logger.info(
-                            "[FixedSplitCL] Early-stopping {} fixed-split retrain after epoch {}/{}: {} consecutive proxy evaluation(s) without >= {} mAP improvement.",
-                            training_label,
-                            int(completed_inner_epochs),
-                            int(effective_num_epoch),
-                            stale_proxy_eval_count,
-                            proxy_eval_min_delta,
-                        )
-                        break
-            if can_select_best_by_proxy and selection_uses_subset:
-                if model_family == "rfdetr" and not best_full_state_is_baseline:
-                    best_state = best_full_state
-                    best_metrics = dict(best_full_metrics)
-                    best_state_is_baseline = False
-                else:
-                    model.load_state_dict(best_state)
-                    _set_detection_model_eval_mode(model)
-                    if best_state_is_baseline:
-                        best_metrics = dict(proxy_metrics_before)
-                    else:
-                        stage_started = time.perf_counter()
-                        best_metrics = _evaluate_proxy_metrics_for_current_state(selection_eval=False)
-                        proxy_eval_elapsed += time.perf_counter() - stage_started
-            logger.info("[FixedSplitCL] split retraining took {:.3f}s.", split_retrain_elapsed)
-            log_split_retrain_profile(retrain_profile)
-            logger.info("[FixedSplitCL] proxy evaluation after retrain took {:.3f}s.", proxy_eval_elapsed)
-            if can_select_best_by_proxy:
-                model.load_state_dict(best_state)
-                _set_detection_model_eval_mode(model)
-                return dict(best_metrics), baseline_state
-            _set_detection_model_eval_mode(model)
-            return dict(proxy_metrics_before), baseline_state
-
-        split_retrain_started = time.perf_counter()
-        universal_split_retrain(
-            **split_retrain_kwargs,
-            num_epoch=effective_num_epoch,
-            epoch_log_context=training_label,
-            log_batches=False,
-            log_every_n_epochs=max(1, int(effective_num_epoch) // 10),
-        )
-        self._log_stage_duration("split retraining", split_retrain_started)
-        log_split_retrain_profile(retrain_profile)
-        proxy_eval_started = time.perf_counter()
-        if not gt_annotations:
-            proxy_metrics_after = dict(proxy_metrics_before)
-        if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
-            proxy_metrics_after = self._evaluate_tinynext_proxy_map(
+        def _tinynext_proxy_evaluator(
+            *,
+            stage_label: str,
+            max_samples: int | None,
+            allow_dead_baseline_fast_path: bool = False,
+        ) -> dict[str, float | int | None]:
+            return self._evaluate_tinynext_proxy_map(
                 model,
                 frame_dir=frame_dir,
                 gt_annotations=gt_annotations,
                 model_name=current_model_name,
                 sample_metadata_by_id=sample_metadata_by_id,
                 frame_cache=proxy_eval_frame_cache,
-                max_samples=self.proxy_eval_max_samples,
+                max_samples=max_samples,
                 candidate_thresholds=self.proxy_eval_threshold_candidates,
-                inference_batch_size=bs,
-                stage_label="proxy evaluation after retrain",
+                inference_batch_size=int(split_retrain_kwargs["batch_size"]),
+                stage_label=stage_label,
                 split_cache_path=working_cache,
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
+                allow_dead_baseline_fast_path=allow_dead_baseline_fast_path,
             )
-        elif gt_annotations:
-            proxy_metrics_after = _evaluate_proxy_metrics_for_current_state()
-        self._log_stage_duration("proxy evaluation after retrain", proxy_eval_started)
-        return proxy_metrics_after, baseline_state
+
+        proxy_config = ProxyEvalConfig(
+            enabled=bool(gt_annotations),
+            eval_before_retrain=True,
+            eval_after_first_epoch=True,
+            eval_final=True,
+            interval_epochs=max(1, int(getattr(self, "proxy_eval_interval_epochs", 10))),
+            max_eval_samples=self.proxy_eval_max_samples,
+            min_delta=max(0.0, float(self.proxy_eval_min_delta)),
+            patience=max(0, int(self.proxy_eval_patience)),
+        )
+        plan = FixedSplitTrainingPlan(
+            model_name=current_model_name,
+            model_family=model_family,
+            total_samples=len(bundle_info["all_sample_ids"]),
+            epochs=effective_num_epoch,
+            effective_batch_size=bs,
+            learning_rate=effective_learning_rate,
+            proxy_eval_config=proxy_config,
+            training_label=training_label,
+            optimizer_name=str(split_retrain_kwargs.get("optimizer_name", "adam")),
+            weight_decay=float(split_retrain_kwargs.get("weight_decay", 0.0)),
+            grad_clip_norm=split_retrain_kwargs.get("grad_clip_norm"),
+            shuffle_samples=bool(split_retrain_kwargs.get("shuffle_samples", False)),
+        )
+        adapter = get_training_adapter(current_model_name, model_family)
+        result = FixedSplitRetrainEngine().run(
+            FixedSplitTrainingContext(
+                model=model,
+                plan=plan,
+                adapter=adapter,
+                training_kwargs=split_retrain_kwargs,
+                gt_annotations=gt_annotations,
+                initial_proxy_metrics=(
+                    dict(proxy_metrics_before) if proxy_metrics_before else None
+                ),
+                initial_proxy_eval_time=proxy_metrics_before_elapsed,
+                fixed_proxy_evaluator=_fixed_proxy_evaluator,
+                tinynext_proxy_evaluator=_tinynext_proxy_evaluator,
+                retrain_profile=retrain_profile,
+                logger=logger,
+                is_recoverable_oom=_is_cuda_oom_error,
+            )
+        )
+        _set_detection_model_eval_mode(model)
+        return dict(result.proxy_metrics_after), result.baseline_state
 
     # ------------------------------------------------------------------
     # Public API
@@ -8008,6 +7655,7 @@ class CloudContinualLearner:
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
                     )
+                proxy_metrics_before_elapsed = time.perf_counter() - stage_started
                 self._log_stage_duration("proxy evaluation before retrain", stage_started)
                 is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
 
@@ -8111,6 +7759,7 @@ class CloudContinualLearner:
                                 split_candidate=prepared_candidate,
                                 preloaded_records=preloaded_records,
                             )
+                        proxy_metrics_before_elapsed = time.perf_counter() - stage_started
                         self._log_stage_duration("proxy evaluation before retrain", stage_started)
 
                 proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
@@ -8124,6 +7773,7 @@ class CloudContinualLearner:
                     gt_annotations=gt_annotations,
                     num_epoch=effective_num_epoch,
                     proxy_metrics_before=proxy_metrics_before,
+                    proxy_metrics_before_elapsed=proxy_metrics_before_elapsed,
                     prepared_trace_sample_input=prepared_trace_sample_input,
                     prepared_splitter=prepared_splitter,
                     prepared_candidate=prepared_candidate,
