@@ -13,7 +13,7 @@ import tarfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -31,6 +31,12 @@ from grpc_server.rpc_server import MessageTransmissionServicer
 from grpc_server.training_jobs import TrainingJobManager
 from grpc_server.workspace import prepare_request_workspace
 from tools.grpc_options import grpc_message_options
+from cloud.annotation import (
+    TeacherAnnotationRequest,
+    TeacherAnnotationService,
+    TeacherAnnotationWorker,
+    TeacherLabelCache,
+)
 from cloud.edge_registry import EdgeRegistry
 from cloud.sample_pool import CloudSamplePool
 from cloud.training import (
@@ -142,6 +148,14 @@ def _stable_json_dumps(payload: object) -> str:
 
 def _json_fingerprint(payload: object) -> str:
     return hashlib.sha1(_stable_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def _file_sha1(path: str) -> str:
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _read_json_file(path: str) -> dict[str, object]:
@@ -2262,6 +2276,44 @@ class CloudContinualLearner:
             int(getattr(cl_cfg, "teacher_batch_size", self.batch_size))
             if cl_cfg else self.batch_size
         )
+        teacher_annotation_cfg = (
+            getattr(cl_cfg, "teacher_annotation", None)
+            if cl_cfg is not None
+            else None
+        )
+        self.teacher_annotation_async_enabled = bool(
+            getattr(teacher_annotation_cfg, "async_enabled", False)
+        )
+        self.teacher_annotation_cache_enabled = bool(
+            getattr(teacher_annotation_cfg, "cache_enabled", True)
+        )
+        self.teacher_annotation_wait_timeout_sec = float(
+            getattr(teacher_annotation_cfg, "wait_timeout_sec", 0.5)
+        )
+        self.teacher_annotation_worker_batch_size = int(
+            getattr(teacher_annotation_cfg, "worker_batch_size", 16)
+        )
+        self.teacher_annotation_worker_max_queue_size = int(
+            getattr(teacher_annotation_cfg, "worker_max_queue_size", 4096)
+        )
+        self.teacher_annotation_worker_max_retries = int(
+            getattr(teacher_annotation_cfg, "worker_max_retries", 2)
+        )
+        self.teacher_annotation_oom_retry_enabled = bool(
+            getattr(teacher_annotation_cfg, "oom_retry_enabled", True)
+        )
+        self.teacher_annotation_min_worker_batch_size = int(
+            getattr(teacher_annotation_cfg, "min_worker_batch_size", 1)
+        )
+        self.teacher_annotation_cache_root = os.path.abspath(
+            str(
+                getattr(
+                    teacher_annotation_cfg,
+                    "cache_root_dir",
+                    "./cache/teacher_label_cache",
+                )
+            )
+        )
         raw_proxy_eval_interval_epochs = (
             getattr(cl_cfg, "proxy_eval_interval_epochs", None)
             if cl_cfg
@@ -2431,6 +2483,45 @@ class CloudContinualLearner:
         self._teacher_queue_state = _GLOBAL_TEACHER_ANNOTATION_QUEUE
         self._initial_state_reset_lock = threading.Lock()
         self._initial_state_reset_sessions: set[str] = set()
+        self._teacher_weights_fingerprint_cache: str | None = None
+        self.teacher_label_cache = TeacherLabelCache(
+            self.teacher_annotation_cache_root,
+            enabled=self.teacher_annotation_cache_enabled,
+        )
+        self.teacher_annotation_worker: TeacherAnnotationWorker | None = None
+        if (
+            self.teacher_annotation_async_enabled
+            and self.teacher_annotation_cache_enabled
+        ):
+            self.teacher_annotation_worker = TeacherAnnotationWorker(
+                label_cache=self.teacher_label_cache,
+                batch_inference=getattr(self.large_od, "large_inference_batch", None),
+                single_inference=getattr(self.large_od, "large_inference", None),
+                label_builder=self._teacher_labels_from_request_prediction,
+                teacher_scope=self._teacher_annotation_scope,
+                max_queue_size=self.teacher_annotation_worker_max_queue_size,
+                worker_batch_size=self.teacher_annotation_worker_batch_size,
+                max_retries=self.teacher_annotation_worker_max_retries,
+                oom_retry_enabled=self.teacher_annotation_oom_retry_enabled,
+                min_worker_batch_size=self.teacher_annotation_min_worker_batch_size,
+            )
+        self.teacher_annotation_service = TeacherAnnotationService(
+            label_cache=self.teacher_label_cache,
+            worker=self.teacher_annotation_worker,
+        )
+        logger.info(
+            "[TeacherAnnotation][Worker] async_enabled={} cache_enabled={} worker_batch_size={} "
+            "max_queue_size={} cache_root={}",
+            self.teacher_annotation_async_enabled,
+            self.teacher_annotation_cache_enabled,
+            self.teacher_annotation_worker_batch_size,
+            self.teacher_annotation_worker_max_queue_size,
+            self.teacher_annotation_cache_root,
+        )
+
+    def close(self) -> None:
+        if self.teacher_annotation_worker is not None:
+            self.teacher_annotation_worker.stop()
 
     def _edge_lock(self, edge_id: int | str) -> threading.Lock:
         edge_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(edge_id).strip()) or "unknown"
@@ -3917,22 +4008,8 @@ class CloudContinualLearner:
                 with self._job_state_lock:
                     self._queued_jobs = max(0, self._queued_jobs - 1)
                     self._active_jobs += 1
-                # Reserve the teacher ticket at job start so all annotation work
-                # across edges is globally serialized in request order.
-                teacher_ticket = self._reserve_teacher_ticket()
-                self._set_current_teacher_ticket(teacher_ticket)
-                logger.info(
-                    "[FixedSplitCL] Reserved teacher ticket {} at job start for edge {}.",
-                    teacher_ticket,
-                    edge_id,
-                )
                 yield
             finally:
-                self._finalize_teacher_ticket(
-                    teacher_ticket if "teacher_ticket" in locals() else None,
-                    stage_label="teacher annotation",
-                    reason="training job completed without consuming the reserved teacher ticket",
-                )
                 self._set_current_teacher_ticket(None)
                 if acquired_slot:
                     with self._job_state_lock:
@@ -4553,6 +4630,45 @@ class CloudContinualLearner:
         teacher_model = getattr(getattr(self, "large_od", None), "model", None)
         return _normalise_label_schema(getattr(teacher_model, "label_schema", "coco_91"))
 
+    def _teacher_model_name(self) -> str:
+        return str(
+            getattr(getattr(self, "large_od", None), "model_name", "")
+            or getattr(self.config, "golden", "")
+            or "unknown"
+        )
+
+    def _teacher_weights_fingerprint(self) -> str:
+        if self._teacher_weights_fingerprint_cache:
+            return self._teacher_weights_fingerprint_cache
+        model_name = self._teacher_model_name()
+        model_info = model_lib.get(model_name, {})
+        artifact_name = str(model_info.get("model_path", "") or "").strip()
+        candidate_paths = []
+        if artifact_name:
+            candidate_paths.append(os.path.join(self.weight_folder, artifact_name))
+        model = getattr(getattr(self, "large_od", None), "model", None)
+        for attr_name in ("weights_path", "ckpt_path", "checkpoint_path"):
+            value = getattr(model, attr_name, None)
+            if value:
+                candidate_paths.append(str(value))
+        for path in candidate_paths:
+            if path and os.path.exists(path) and os.path.isfile(path):
+                try:
+                    self._teacher_weights_fingerprint_cache = _file_sha1(path)
+                    return self._teacher_weights_fingerprint_cache
+                except Exception:
+                    continue
+        class_names = self._teacher_class_names()
+        self._teacher_weights_fingerprint_cache = _json_fingerprint(
+            {
+                "teacher_model_name": model_name,
+                "teacher_label_schema": self._teacher_label_schema(),
+                "teacher_class_count": len(class_names),
+                "artifact_name": artifact_name,
+            }
+        )
+        return self._teacher_weights_fingerprint_cache
+
     def _teacher_class_names(self) -> list[str]:
         teacher_model = getattr(getattr(self, "large_od", None), "model", None)
         class_names = getattr(teacher_model, "class_names", None)
@@ -4561,6 +4677,17 @@ class CloudContinualLearner:
         if isinstance(class_names, (list, tuple)):
             return [str(item) for item in class_names]
         return []
+
+    def _teacher_num_classes(self) -> int:
+        teacher_model = getattr(getattr(self, "large_od", None), "model", None)
+        for attr_name in ("num_classes", "nc"):
+            value = _coerce_positive_int(getattr(teacher_model, attr_name, None))
+            if value is not None:
+                return value
+        class_names = self._teacher_class_names()
+        if class_names:
+            return len(class_names)
+        return len(COCO_INSTANCE_CATEGORY_NAMES)
 
     def _map_teacher_label_for_target(
         self,
@@ -4695,29 +4822,68 @@ class CloudContinualLearner:
             input_tensor_shape=_runtime_input_tensor_shape_from_metadata(sample_metadata),
         )
 
-    def _teacher_inference(self, frame):
+    def _teacher_inference(self, frame, threshold: float | None = None):
+        threshold = (
+            self.teacher_annotation_threshold
+            if threshold is None
+            else float(threshold)
+        )
         try:
             return self.large_od.large_inference(
                 frame,
-                threshold=self.teacher_annotation_threshold,
+                threshold=threshold,
             )
         except TypeError:
             return self.large_od.large_inference(frame)
 
-    def _teacher_inference_batch(self, frames):
+    def _teacher_inference_batch(self, frames, threshold: float | None = None):
+        threshold = (
+            self.teacher_annotation_threshold
+            if threshold is None
+            else float(threshold)
+        )
         batch_inference = getattr(self.large_od, "large_inference_batch", None)
         if batch_inference is None:
-            raise RuntimeError(
-                "Teacher annotation requires large_inference_batch; "
-                "per-image retry is disabled."
+            logger.warning(
+                "[TeacherAnnotation][Batch] large_inference_batch unavailable; "
+                "falling back to per-sample large_inference."
             )
+            return [self._teacher_inference(frame, threshold=threshold) for frame in frames]
         try:
             return batch_inference(
                 frames,
-                threshold=self.teacher_annotation_threshold,
+                threshold=threshold,
             )
         except TypeError:
             return batch_inference(frames)
+
+    def _teacher_labels_from_request_prediction(
+        self,
+        request: TeacherAnnotationRequest,
+        frame,
+        prediction: object,
+    ) -> dict[str, object] | None:
+        pred_boxes = pred_class = pred_score = None
+        if isinstance(prediction, (list, tuple)):
+            if len(prediction) >= 1:
+                pred_boxes = prediction[0]
+            if len(prediction) >= 2:
+                pred_class = prediction[1]
+            if len(prediction) >= 3:
+                pred_score = prediction[2]
+        metadata = dict(request.metadata or {})
+        target_model_metadata = metadata.get("target_model_metadata")
+        return self._build_teacher_targets_from_prediction(
+            pred_boxes,
+            pred_class,
+            pred_score,
+            image_size=tuple(int(value) for value in frame.shape[:2]),
+            target_model_metadata=(
+                target_model_metadata
+                if isinstance(target_model_metadata, Mapping)
+                else None
+            ),
+        )
 
     def _build_teacher_targets(
         self,
@@ -4732,6 +4898,134 @@ class CloudContinualLearner:
             pred_score,
             image_size=tuple(int(value) for value in frame.shape[:2]),
             target_model_metadata=target_model_metadata,
+        )
+
+    def _build_teacher_annotation_request(
+        self,
+        *,
+        sample_id: object,
+        image_path: str,
+        edge_id: int | str | None,
+        model_id: str | None,
+        target_model_metadata: Mapping[str, object] | None = None,
+        include_empty: bool = True,
+    ) -> TeacherAnnotationRequest | None:
+        if not image_path or not os.path.exists(image_path):
+            return None
+        try:
+            image_sha1 = _file_sha1(image_path)
+        except Exception as exc:
+            logger.warning(
+                "[TeacherAnnotation][Submit] skipped sample_id={} with unreadable image hash path={} error={}",
+                sample_id,
+                image_path,
+                exc,
+            )
+            return None
+        return TeacherAnnotationRequest(
+            sample_id=str(sample_id),
+            edge_id="" if edge_id is None else edge_id,
+            model_id=str(model_id or self.edge_model_name),
+            image_path=str(image_path),
+            image_sha1=image_sha1,
+            teacher_model_name=self._teacher_model_name(),
+            teacher_weights_fingerprint=self._teacher_weights_fingerprint(),
+            teacher_label_schema=self._teacher_label_schema(),
+            teacher_num_classes=self._teacher_num_classes(),
+            teacher_annotation_threshold=float(self.teacher_annotation_threshold),
+            label_coordinate_space=POOL_LABEL_COORDINATE_SPACE,
+            label_runtime_version=POOL_LABEL_RUNTIME_VERSION,
+            metadata={
+                "target_model_metadata": dict(target_model_metadata or {}),
+                "include_empty": bool(include_empty),
+            },
+        )
+
+    def _build_teacher_annotation_requests_from_frame_dir(
+        self,
+        frame_dir: str,
+        sample_ids,
+        *,
+        edge_id: int | str | None = None,
+        model_id: str | None = None,
+        missing_raw_message: str | None = None,
+        include_empty: bool = True,
+        target_model_metadata: Mapping[str, object] | None = None,
+    ) -> list[TeacherAnnotationRequest]:
+        requests: list[TeacherAnnotationRequest] = []
+        for sample_id in sample_ids:
+            img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
+            if not os.path.exists(img_path):
+                if missing_raw_message is not None:
+                    logger.warning(missing_raw_message, sample_id)
+                continue
+            request = self._build_teacher_annotation_request(
+                sample_id=sample_id,
+                image_path=img_path,
+                edge_id=edge_id,
+                model_id=model_id,
+                target_model_metadata=target_model_metadata,
+                include_empty=include_empty,
+            )
+            if request is not None:
+                requests.append(request)
+        return requests
+
+    def _build_low_quality_raw_teacher_annotation_requests(
+        self,
+        *,
+        bundle_cache_path: str,
+        manifest: Mapping[str, object],
+        edge_id: int | str | None,
+        model_id: str | None,
+        target_model_metadata: Mapping[str, object] | None = None,
+    ) -> list[TeacherAnnotationRequest]:
+        requests: list[TeacherAnnotationRequest] = []
+        for sample in list(manifest.get("samples", []) or []):
+            if not isinstance(sample, Mapping):
+                continue
+            if not _is_low_quality_trigger_sample(manifest, sample):
+                continue
+            sample_id = str(sample.get("sample_id", "") or "").strip()
+            raw_relpath = sample.get("raw_relpath")
+            if not sample_id or raw_relpath is None:
+                continue
+            image_path = os.path.join(
+                bundle_cache_path,
+                str(raw_relpath).replace("/", os.sep),
+            )
+            request = self._build_teacher_annotation_request(
+                sample_id=sample_id,
+                image_path=image_path,
+                edge_id=edge_id,
+                model_id=model_id,
+                target_model_metadata=target_model_metadata,
+                include_empty=True,
+            )
+            if request is not None:
+                requests.append(request)
+        return requests
+
+    def _submit_low_quality_teacher_annotations(
+        self,
+        requests: Sequence[TeacherAnnotationRequest],
+    ) -> None:
+        if (
+            not self.teacher_annotation_async_enabled
+            or not self.teacher_annotation_cache_enabled
+            or not requests
+        ):
+            return
+        result = self.teacher_annotation_service.submit_many(list(requests))
+        logger.info(
+            "[TeacherAnnotation][Submit] low_quality_raw requested_samples={} cache_hits={} "
+            "cache_misses={} submitted={} duplicate={} failed_count={}",
+            result.requested_samples,
+            result.cache_hits,
+            result.cache_misses,
+            result.submitted,
+            result.duplicate,
+            result.failed_count,
         )
 
     def _proxy_eval_frame_cache(self) -> dict[str, np.ndarray | None] | None:
@@ -6385,83 +6679,39 @@ class CloudContinualLearner:
         key_transform=None,
         include_empty: bool = False,
         target_model_metadata: Mapping[str, object] | None = None,
+        edge_id: int | str | None = None,
+        model_id: str | None = None,
     ) -> dict:
         transform = key_transform or (lambda sample_id: sample_id)
-        annotations = {}
-        logger.info("[CL] Cloud model is annotating samples.")
-        if (
-            isinstance(target_model_metadata, Mapping)
-            and _normalise_label_schema(target_model_metadata.get("label_schema")) == "zero_based"
-            and self._teacher_label_schema() != "zero_based"
-            and not _class_names_from_metadata(target_model_metadata)
-        ):
+        requests = self._build_teacher_annotation_requests_from_frame_dir(
+            frame_dir,
+            sample_ids,
+            edge_id=edge_id,
+            model_id=model_id,
+            missing_raw_message=missing_raw_message,
+            include_empty=include_empty,
+            target_model_metadata=target_model_metadata,
+        )
+        if not requests:
+            return {}
+        ensure_result = self.teacher_annotation_service.ensure_many(
+            requests,
+            wait=True,
+            timeout_sec=self.teacher_annotation_wait_timeout_sec,
+        )
+        if ensure_result.unresolved_count:
             logger.warning(
-                "[CL] Teacher uses {} labels but target model uses zero_based labels "
-                "without class_names metadata; teacher annotations will be skipped "
-                "because label ids cannot be mapped safely.",
-                self._teacher_label_schema(),
+                "[TeacherAnnotation][Ensure] deferring unresolved low-quality samples before canonical staging: "
+                "unresolved_count={} sample_ids_preview={}",
+                ensure_result.unresolved_count,
+                ensure_result.unresolved_sample_ids[:10],
             )
-        pending_samples: list[tuple[object, np.ndarray]] = []
-        for sample_id in sample_ids:
-            img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
-            if not os.path.exists(img_path):
-                if missing_raw_message is not None:
-                    logger.warning(missing_raw_message, sample_id)
-                continue
-            frame = cv2.imread(img_path)
-            if frame is None:
-                continue
-            pending_samples.append((sample_id, frame))
-
-        if not pending_samples:
-            self._finalize_teacher_ticket(
-                self._current_teacher_ticket(),
-                stage_label="teacher annotation batch",
-                reason="no samples were available for teacher annotation",
-            )
-            return annotations
-
-        batch_size = max(1, int(self.teacher_batch_size))
-        with self._teacher_annotation_scope(
-            "teacher annotation batch",
-            sample_count=len(pending_samples),
-        ):
-            for start in range(0, len(pending_samples), batch_size):
-                batch = pending_samples[start : start + batch_size]
-                batch_frames = [frame for _, frame in batch]
-                predictions = self._teacher_inference_batch(batch_frames)
-                if not isinstance(predictions, (list, tuple)) or len(predictions) != len(batch):
-                    raise RuntimeError(
-                        "Teacher annotation batch inference returned an invalid "
-                        f"result count (expected={len(batch)}, got="
-                        f"{len(predictions) if isinstance(predictions, (list, tuple)) else type(predictions).__name__})."
-                    )
-
-                for (sample_id, frame), prediction in zip(batch, predictions):
-                    pred_boxes = pred_class = pred_score = None
-                    if isinstance(prediction, (list, tuple)):
-                        if len(prediction) >= 1:
-                            pred_boxes = prediction[0]
-                        if len(prediction) >= 2:
-                            pred_class = prediction[1]
-                        if len(prediction) >= 3:
-                            pred_score = prediction[2]
-                    teacher_targets = self._build_teacher_targets_from_prediction(
-                        pred_boxes,
-                        pred_class,
-                        pred_score,
-                        image_size=tuple(int(value) for value in frame.shape[:2]),
-                        target_model_metadata=target_model_metadata,
-                    )
-                    if teacher_targets is None:
-                        if include_empty:
-                            annotations[transform(sample_id)] = {
-                                "boxes": [],
-                                "labels": [],
-                            }
-                        continue
-                    annotations[transform(sample_id)] = teacher_targets
-        return annotations
+        labels_by_sample_id = ensure_result.labels_by_sample_id
+        return {
+            transform(sample_id): labels_by_sample_id[str(sample_id)]
+            for sample_id in sample_ids
+            if str(sample_id) in labels_by_sample_id
+        }
 
     @staticmethod
     def _load_cached_sample_metadata(
@@ -7215,6 +7465,14 @@ class CloudContinualLearner:
                 manifest_runtime_input_shape = _runtime_input_tensor_shape_from_metadata(
                     manifest
                 )
+                early_teacher_requests = self._build_low_quality_raw_teacher_annotation_requests(
+                    bundle_cache_path=bundle_cache_path,
+                    manifest=manifest,
+                    edge_id=edge_id,
+                    model_id=current_model_name,
+                    target_model_metadata=manifest_model_metadata,
+                )
+                self._submit_low_quality_teacher_annotations(early_teacher_requests)
                 bundle_sample_count = self._count_manifest_training_samples(manifest)
                 effective_batch_size = self._resolve_fixed_split_runtime_batch_size(
                     current_model_name,
@@ -7402,6 +7660,8 @@ class CloudContinualLearner:
                     key_transform=str,
                     include_empty=True,
                     target_model_metadata=manifest_model_metadata,
+                    edge_id=edge_id,
+                    model_id=current_model_name,
                 )
                 self._log_stage_duration("teacher annotation", stage_started)
                 stage_started = time.perf_counter()
@@ -7966,6 +8226,7 @@ class CloudServer:
             server.wait_for_termination()
         finally:
             self.training_job_manager.close()
+            self.continual_learner.close()
 
 
 if __name__ == '__main__':

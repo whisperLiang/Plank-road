@@ -107,6 +107,19 @@ class SplitLearningConfig(ConfigSection):
 
 
 @dataclass
+class TeacherAnnotationConfig(ConfigSection):
+    async_enabled: bool = True
+    cache_enabled: bool = True
+    wait_timeout_sec: float = 0.5
+    worker_batch_size: int = 16
+    worker_max_queue_size: int = 4096
+    worker_max_retries: int = 2
+    oom_retry_enabled: bool = True
+    min_worker_batch_size: int = 1
+    cache_root_dir: str = "./cache/teacher_label_cache"
+
+
+@dataclass
 class ContinualLearningConfig(ConfigSection):
     num_epoch: int = 5
     trace_batch_size: int = 2
@@ -128,6 +141,9 @@ class ContinualLearningConfig(ConfigSection):
     yolo_fixed_split_target_steps_per_round: int = 4
     rfdetr_fixed_split_target_steps_per_round: int = 4
     max_concurrent_jobs: int = 2
+    teacher_annotation: TeacherAnnotationConfig = field(
+        default_factory=TeacherAnnotationConfig
+    )
 
     def __post_init__(self) -> None:
         if self.teacher_batch_size is None:
@@ -228,6 +244,11 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["rtsp"] = _section(RTSPConfig, known.get("rtsp"))
     elif section_cls is SplitLearningConfig:
         known["fixed_split"] = _section(FixedSplitConfig, known.get("fixed_split"))
+    elif section_cls is ContinualLearningConfig:
+        known["teacher_annotation"] = _section(
+            TeacherAnnotationConfig,
+            known.get("teacher_annotation"),
+        )
     elif section_cls is ClientConfig:
         known["sample_pool"] = _section(SamplePoolConfig, known.get("sample_pool"))
         known["source"] = _section(SourceConfig, known.get("source"))
@@ -562,6 +583,49 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.continual_learning.max_concurrent_jobs",
         int(config.server.continual_learning.max_concurrent_jobs),
     )
+    teacher_annotation = config.server.continual_learning.teacher_annotation
+    for name in (
+        "async_enabled",
+        "cache_enabled",
+        "oom_retry_enabled",
+    ):
+        value = getattr(teacher_annotation, name)
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"server.continual_learning.teacher_annotation.{name} must be a boolean, "
+                f"got {value!r}"
+            )
+    if float(teacher_annotation.wait_timeout_sec) < 0.0:
+        raise ValueError(
+            "server.continual_learning.teacher_annotation.wait_timeout_sec must be >= 0, "
+            f"got {teacher_annotation.wait_timeout_sec!r}"
+        )
+    _validate_positive(
+        "server.continual_learning.teacher_annotation.worker_batch_size",
+        int(teacher_annotation.worker_batch_size),
+    )
+    _validate_positive(
+        "server.continual_learning.teacher_annotation.worker_max_queue_size",
+        int(teacher_annotation.worker_max_queue_size),
+    )
+    _validate_positive(
+        "server.continual_learning.teacher_annotation.worker_max_retries",
+        int(teacher_annotation.worker_max_retries),
+        allow_zero=True,
+    )
+    _validate_positive(
+        "server.continual_learning.teacher_annotation.min_worker_batch_size",
+        int(teacher_annotation.min_worker_batch_size),
+    )
+    if int(teacher_annotation.min_worker_batch_size) > int(teacher_annotation.worker_batch_size):
+        raise ValueError(
+            "server.continual_learning.teacher_annotation.min_worker_batch_size "
+            "must be <= worker_batch_size"
+        )
+    if not str(teacher_annotation.cache_root_dir).strip():
+        raise ValueError(
+            "server.continual_learning.teacher_annotation.cache_root_dir must be non-empty"
+        )
     _validate_positive(
         "server.das.probe_samples",
         int(config.server.das.probe_samples),

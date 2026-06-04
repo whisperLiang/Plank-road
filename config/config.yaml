@@ -190,6 +190,16 @@ server:
   # continual learning. Lower values recover more small/far objects but
   # may introduce noisier pseudo-GT.
   teacher_annotation_threshold: 0.5
+  teacher_annotation:
+   async_enabled: true
+   cache_enabled: true
+   wait_timeout_sec: 0.5
+   worker_batch_size: 32
+   worker_max_queue_size: 4096
+   worker_max_retries: 2
+   oom_retry_enabled: true
+   min_worker_batch_size: 1
+   cache_root_dir: "./cache/teacher_label_cache"
  # Dynamic Activation Sparsity (SURGEON-style layer pruning)
  # Reference: SURGEON (CVPR 2025)
  # https://github.com/kadmkbl/SURGEON
