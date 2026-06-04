@@ -13,7 +13,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from loguru import logger
 
 from cloud.feature_cache.types import (
     NPY_MEMMAP_SHARD,
@@ -313,9 +312,8 @@ class FeatureShardWriter:
                 "payload_metadata": payload_meta.get("payload_metadata") or {},
             },
         )
-        write_started = time.perf_counter()
         if self.storage_format == SAFETENSORS_SHARD:
-            shard_path, index_path, meta_path, commit_time = self._write_safetensors(
+            shard_path, index_path, meta_path = self._write_safetensors(
                 base_dir,
                 shard_id,
                 stacked,
@@ -323,7 +321,7 @@ class FeatureShardWriter:
             )
             shard_dir = None
         elif self.storage_format == NPY_MEMMAP_SHARD:
-            shard_dir, index_path, meta_path, commit_time = self._write_npy_memmap(
+            shard_dir, index_path, meta_path = self._write_npy_memmap(
                 base_dir,
                 shard_id,
                 stacked,
@@ -332,17 +330,6 @@ class FeatureShardWriter:
             shard_path = None
         else:
             raise ValueError(f"Unsupported feature shard storage_format={self.storage_format!r}.")
-        write_time = time.perf_counter() - write_started
-        logger.info(
-            "[FeatureShard][Write] storage_format={} samples={} shard_id={} leaf_count={} tensor_bytes={} write_time={:.3f}s atomic_commit_time={:.3f}s",
-            self.storage_format,
-            len(entries),
-            shard_id,
-            len(leaf_keys),
-            _tensor_bytes(stacked),
-            write_time,
-            commit_time,
-        )
         del meta_path
         refs: list[dict[str, Any]] = []
         for entry in entries:
@@ -400,7 +387,7 @@ class FeatureShardWriter:
         shard_id: str,
         tensors: Mapping[str, torch.Tensor],
         metadata: FeatureShardMetadata,
-    ) -> tuple[str, str, str, float]:
+    ) -> tuple[str, str, str]:
         try:
             from safetensors.torch import save_file
         except ModuleNotFoundError as exc:
@@ -414,15 +401,13 @@ class FeatureShardWriter:
         meta_path = os.path.join(base_dir, f"{shard_id}.meta.json")
         tmp_path = f"{shard_path}.tmp-{threading.get_ident()}-{int(time.time() * 1000000)}"
         save_file(dict(tensors), tmp_path)
-        commit_started = time.perf_counter()
         os.replace(tmp_path, shard_path)
-        commit_time = time.perf_counter() - commit_started
         payload = metadata.to_dict()
         payload["shard_path"] = shard_path
         payload["index_path"] = index_path
         _atomic_json_dump(meta_path, payload)
         _atomic_json_dump(index_path, {"metadata_path": meta_path, **payload})
-        return shard_path, index_path, meta_path, commit_time
+        return shard_path, index_path, meta_path
 
     def _write_npy_memmap(
         self,
@@ -430,7 +415,7 @@ class FeatureShardWriter:
         shard_id: str,
         tensors: Mapping[str, torch.Tensor],
         metadata: FeatureShardMetadata,
-    ) -> tuple[str, str, str, float]:
+    ) -> tuple[str, str, str]:
         shard_dir = os.path.join(base_dir, shard_id)
         tmp_dir = f"{shard_dir}.tmp-{threading.get_ident()}-{int(time.time() * 1000000)}"
         os.makedirs(tmp_dir, exist_ok=False)
@@ -456,10 +441,8 @@ class FeatureShardWriter:
             payload["index_path"] = index_path
             _atomic_json_dump(tmp_meta_path, payload)
             _atomic_json_dump(tmp_index_path, {"metadata_path": meta_path, **payload})
-            commit_started = time.perf_counter()
             os.replace(tmp_dir, shard_dir)
-            commit_time = time.perf_counter() - commit_started
-            return shard_dir, index_path, meta_path, commit_time
+            return shard_dir, index_path, meta_path
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
