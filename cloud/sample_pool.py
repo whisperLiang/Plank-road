@@ -58,6 +58,7 @@ _CANONICAL_FEATURE_METADATA_FIELDS = {
     "in_drift_window",
     "window_id",
     "feature_ref",
+    "label_ref",
 }
 
 
@@ -498,6 +499,58 @@ def _feature_ref_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any] 
     return None
 
 
+def _label_ref_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    feature_record = candidate.get("feature_record") or candidate.get("record")
+    values = []
+    if isinstance(feature_record, Mapping):
+        values.append(feature_record.get("label_ref"))
+    values.append(candidate.get("label_ref"))
+    for value in values:
+        if isinstance(value, Mapping):
+            return dict(value)
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict()
+            if isinstance(payload, Mapping):
+                return dict(payload)
+    return None
+
+
+def _labels_from_label_ref(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    labels = value.get("labels")
+    return dict(labels) if isinstance(labels, Mapping) else {}
+
+
+def _label_ref_payload(
+    *,
+    sample_id: str,
+    label_path: str | None,
+    label_source: str,
+    labels: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "sample_id": str(sample_id),
+        "path": label_path,
+        "codec": "json" if label_path else "json_inline",
+        "label_source": str(label_source),
+        "teacher_labeled": str(label_source) == "teacher",
+        "pseudo_labeled": str(label_source) == "edge_pseudo",
+        "size_bytes": (
+            os.path.getsize(label_path)
+            if label_path and os.path.exists(label_path)
+            else 0
+        ),
+        "metadata": {
+            key: labels[key]
+            for key in POOL_LABEL_METADATA_FIELDS
+            if labels.get(key) is not None
+        },
+        "labels": dict(labels),
+    }
+
+
 def _feature_layout_source_metadata(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: candidate[key]
@@ -640,11 +693,23 @@ class CanonicalSampleRecord:
     window_id: str | None = None
     boundary_payload: BoundaryPayload | None = field(default=None, repr=False, compare=False)
     feature_ref: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+    label_ref: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+    feature_layout_metadata: dict[str, dict[str, Any]] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     source_feature_path: str | None = field(default=None, repr=False, compare=False)
     source_label_path: str | None = field(default=None, repr=False, compare=False)
     source_staging_path: str | None = field(default=None, repr=False, compare=False)
 
     def feature_layout(self) -> dict[str, dict[str, Any]]:
+        if not self.feature and self.feature_layout_metadata is not None:
+            return {
+                str(label): dict(spec)
+                for label, spec in dict(self.feature_layout_metadata).items()
+                if isinstance(spec, Mapping)
+            }
         return feature_layout_from_tensors(self.feature)
 
     def to_feature_payload(self) -> dict[str, Any]:
@@ -673,6 +738,8 @@ class CanonicalSampleRecord:
             payload["intermediate"] = _detach_boundary_payload(self.boundary_payload)
         if self.feature_ref is not None:
             payload["feature_ref"] = dict(self.feature_ref)
+        if self.label_ref is not None:
+            payload["label_ref"] = dict(self.label_ref)
         return payload
 
     def to_label_payload(self) -> dict[str, Any]:
@@ -728,6 +795,28 @@ class CanonicalSampleRecord:
                 {"feature_ref": dict(self.feature_ref)}
                 if self.feature_ref is not None
                 else {}
+            ),
+            **(
+                {
+                    "label_ref": dict(
+                        self.label_ref
+                        or _label_ref_payload(
+                            sample_id=self.sample_id,
+                            label_path=label_relpath,
+                            label_source=self.label_source,
+                            labels=self.labels,
+                        )
+                    )
+                }
+                if self.label_ref is not None
+                else {
+                    "label_ref": _label_ref_payload(
+                        sample_id=self.sample_id,
+                        label_path=label_relpath,
+                        label_source=self.label_source,
+                        labels=self.labels,
+                    )
+                }
             ),
             "input_tensor_shape": list(self.input_tensor_shape),
             "input_resize_mode": self.input_resize_mode,
@@ -891,6 +980,7 @@ class CloudSamplePool:
         metadata = _feature_metadata_from_candidate(sample)
         boundary_payload = _boundary_payload_from_candidate(sample)
         feature_ref = _feature_ref_from_candidate(sample)
+        label_ref = _label_ref_from_candidate(sample)
         return {
             "schema_version": _CANONICAL_RECORD_VERSION,
             "sample_id": sample_id,
@@ -926,6 +1016,7 @@ class CloudSamplePool:
             "in_drift_window": sample.get("in_drift_window"),
             "window_id": None if sample.get("window_id") is None else str(sample.get("window_id")),
             **({"feature_ref": feature_ref} if feature_ref is not None else {}),
+            **({"label_ref": label_ref} if label_ref is not None else {}),
             **_feature_layout_source_metadata(sample),
         }
 
@@ -1070,6 +1161,54 @@ class CloudSamplePool:
         )
         return entries
 
+    def persist_active_sample_refs(
+        self,
+        refs_by_sample_id: Mapping[str, Mapping[str, Any]],
+    ) -> int:
+        updates = {
+            str(sample_id): dict(payload)
+            for sample_id, payload in dict(refs_by_sample_id or {}).items()
+            if str(sample_id)
+        }
+        if not updates:
+            return 0
+        with self._lock:
+            generation_dir = self.current_generation_dir()
+            if generation_dir is None:
+                return 0
+            samples_path = self._generation_samples_path(generation_dir)
+            if not os.path.exists(samples_path):
+                return 0
+
+            changed = 0
+            records: list[dict[str, Any]] = []
+            with open(samples_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if not isinstance(record, Mapping):
+                        continue
+                    entry = dict(record)
+                    sample_id = str(entry.get("sample_id") or "")
+                    update = updates.get(sample_id)
+                    if update is not None:
+                        if isinstance(update.get("feature_ref"), Mapping):
+                            entry["feature_ref"] = dict(update["feature_ref"])
+                        if isinstance(update.get("label_ref"), Mapping):
+                            entry["label_ref"] = dict(update["label_ref"])
+                        changed += 1
+                    records.append(entry)
+            if changed <= 0:
+                return 0
+            payload = "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in records
+            )
+            _atomic_text_write(samples_path, payload)
+            return changed
+
     def load_active_samples_for_rebuild(
         self,
         *,
@@ -1116,6 +1255,46 @@ class CloudSamplePool:
                 sample["__hard_contract_mismatch_reason"] = hard_mismatch_reason
                 samples.append(sample)
                 continue
+            feature_ref = entry.get("feature_ref")
+            label_ref = entry.get("label_ref")
+            labels_from_ref = _labels_from_label_ref(label_ref)
+            feature_ref_payload = dict(feature_ref) if isinstance(feature_ref, Mapping) else {}
+            if (
+                feature_ref_payload.get("path")
+                and not os.path.isabs(str(feature_ref_payload["path"]))
+            ):
+                feature_ref_payload["path"] = _resolve_relpath(
+                    str(entry.get("__generation_dir") or self.root_dir),
+                    str(feature_ref_payload["path"]),
+                )
+            label_ref_payload = dict(label_ref) if isinstance(label_ref, Mapping) else {}
+            if label_ref_payload.get("path") and not os.path.isabs(str(label_ref_payload["path"])):
+                label_ref_payload["path"] = _resolve_relpath(
+                    str(entry.get("__generation_dir") or self.root_dir),
+                    str(label_ref_payload["path"]),
+                )
+            fast_ref_compatible = (
+                not contract_id_mismatch
+                and isinstance(feature_ref, Mapping)
+                and isinstance(label_ref, Mapping)
+                and bool(labels_from_ref)
+                and (
+                    split_contract is None
+                    or str(entry.get("feature_layout_id") or "")
+                    == str(split_contract.feature_layout_id)
+                )
+            )
+            if fast_ref_compatible:
+                sample.update(
+                    {
+                        "labels": labels_from_ref,
+                        "feature_ref": feature_ref_payload,
+                        "label_ref": label_ref_payload,
+                        "feature_layout": dict(entry.get("feature_layout") or {}),
+                    }
+                )
+                samples.append(sample)
+                continue
             try:
                 record = self.reader.read(entry)
             except Exception:
@@ -1134,7 +1313,12 @@ class CloudSamplePool:
                     "feature": feature_record.get("feature"),
                     "labels": record.labels,
                     "contract_id": entry.get("contract_id") or feature_record.get("contract_id"),
-                    "feature_ref": entry.get("feature_ref") or feature_record.get("feature_ref"),
+                    "feature_ref": feature_ref_payload
+                    or entry.get("feature_ref")
+                    or feature_record.get("feature_ref"),
+                    "label_ref": label_ref_payload
+                    or entry.get("label_ref")
+                    or feature_record.get("label_ref"),
                     **(
                         {"intermediate": boundary_payload}
                         if boundary_payload is not None
@@ -1154,7 +1338,23 @@ class CloudSamplePool:
         sample_id = str(candidate.get("sample_id", "") or "").strip()
         if not sample_id:
             raise ValueError("Canonical sample is missing sample_id.")
-        feature = _feature_tensors_from_candidate(candidate)
+        is_canonical_active = bool(candidate.get("__canonical_active"))
+        feature_ref = _feature_ref_from_candidate(candidate)
+        label_ref = _label_ref_from_candidate(candidate)
+        can_carry_without_payload = (
+            is_canonical_active
+            and feature_ref is not None
+            and bool(candidate.get("__source_feature_path"))
+            and bool(candidate.get("__source_label_path"))
+            and str(candidate.get("feature_layout_id") or "")
+            == str(split_contract.feature_layout_id)
+            and not _has_contract_id_metadata_mismatch(candidate, split_contract)
+        )
+        feature = (
+            {}
+            if can_carry_without_payload
+            else _feature_tensors_from_candidate(candidate)
+        )
         feature_record = dict(candidate.get("feature_record") or {})
         input_image_size = (
             candidate.get("input_image_size")
@@ -1179,7 +1379,6 @@ class CloudSamplePool:
             raise ValueError("Canonical sample is missing input_tensor_shape.")
         if not input_resize_mode:
             raise ValueError("Canonical sample is missing input_resize_mode.")
-        is_canonical_active = bool(candidate.get("__canonical_active"))
         if is_canonical_active:
             labels = dict(candidate.get("labels") or {})
             class_counts = {
@@ -1242,7 +1441,17 @@ class CloudSamplePool:
                 if is_canonical_active and not active_contract_id_mismatch
                 else _boundary_payload_from_candidate(candidate)
             ),
-            feature_ref=_feature_ref_from_candidate(candidate),
+            feature_ref=feature_ref,
+            label_ref=label_ref,
+            feature_layout_metadata=(
+                {
+                    str(label): dict(spec)
+                    for label, spec in dict(candidate.get("feature_layout") or {}).items()
+                    if isinstance(spec, Mapping)
+                }
+                if can_carry_without_payload
+                else None
+            ),
             source_feature_path=(
                 str(candidate.get("__source_feature_path"))
                 if is_canonical_active and candidate.get("__source_feature_path")
@@ -1270,24 +1479,28 @@ class CloudSamplePool:
             return "skipped_stale_contract"
         if record.front_version != split_contract.front_version:
             return "skipped_stale_contract"
-        try:
-            normalised = _feature_tensors_for_contract(
-                record.feature,
-                split_contract=split_contract,
-                boundary_payload=record.boundary_payload,
-            )
-            if normalised is None:
+        if not record.feature:
+            if record.feature_layout_id != split_contract.feature_layout_id:
                 return "skipped_feature_layout"
-        except Exception:
-            return "skipped_feature_layout"
-        record.feature, source_to_target = normalised
-        record.feature_layout_id = split_contract.feature_layout_id
-        record.boundary_payload = _normalise_boundary_payload_for_contract(
-            record.boundary_payload,
-            tensors=record.feature,
-            source_to_target=source_to_target,
-            split_contract=split_contract,
-        )
+        else:
+            try:
+                normalised = _feature_tensors_for_contract(
+                    record.feature,
+                    split_contract=split_contract,
+                    boundary_payload=record.boundary_payload,
+                )
+                if normalised is None:
+                    return "skipped_feature_layout"
+            except Exception:
+                return "skipped_feature_layout"
+            record.feature, source_to_target = normalised
+            record.feature_layout_id = split_contract.feature_layout_id
+            record.boundary_payload = _normalise_boundary_payload_for_contract(
+                record.boundary_payload,
+                tensors=record.feature,
+                source_to_target=source_to_target,
+                split_contract=split_contract,
+            )
         if [int(dim) for dim in record.input_tensor_shape] != [
             int(dim) for dim in split_contract.input_tensor_shape
         ]:
@@ -1436,6 +1649,26 @@ class CloudSamplePool:
             else:
                 _atomic_torch_save(record.to_feature_payload(), feature_path)
                 _atomic_json_dump(label_path, record.to_label_payload())
+            if isinstance(record.feature_ref, Mapping):
+                feature_ref = dict(record.feature_ref)
+                ref_path = str(feature_ref.get("path") or "")
+                if (
+                    record.source_feature_path
+                    and ref_path
+                    and os.path.abspath(ref_path)
+                    == os.path.abspath(record.source_feature_path)
+                ):
+                    feature_ref["path"] = feature_relpath
+                    feature_ref["size_bytes"] = (
+                        os.path.getsize(feature_path) if os.path.exists(feature_path) else 0
+                    )
+                    record.feature_ref = feature_ref
+            record.label_ref = _label_ref_payload(
+                sample_id=record.sample_id,
+                label_path=label_relpath,
+                label_source=record.label_source,
+                labels=record.labels,
+            )
             index_records.append(
                 record.to_index_record(
                     feature_relpath=feature_relpath,

@@ -126,6 +126,8 @@ class FeatureCacheConfig(ConfigSection):
     view_root_dir: str = "./cache/cloud_training_views"
     store_root_dir: str = "./cache/cloud_feature_store"
     validate_refs: bool = True
+    deep_validate_feature_payload: bool = False
+    deep_validate_sample_rate: float = 0.0
     feature_rebuild_batch_size: int = 16
     gc_enabled: bool = False
     gc_dry_run: bool = True
@@ -673,6 +675,19 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "server.continual_learning.feature_cache.validate_refs must be a boolean, "
             f"got {feature_cache.validate_refs!r}"
+        )
+    if not isinstance(feature_cache.deep_validate_feature_payload, bool):
+        raise ValueError(
+            "server.continual_learning.feature_cache.deep_validate_feature_payload "
+            "must be a boolean, "
+            f"got {feature_cache.deep_validate_feature_payload!r}"
+        )
+    sample_rate = float(feature_cache.deep_validate_sample_rate)
+    if sample_rate < 0.0 or sample_rate > 1.0:
+        raise ValueError(
+            "server.continual_learning.feature_cache.deep_validate_sample_rate "
+            "must be in [0.0, 1.0], "
+            f"got {feature_cache.deep_validate_sample_rate!r}"
         )
     _validate_positive(
         "server.continual_learning.feature_cache.feature_rebuild_batch_size",

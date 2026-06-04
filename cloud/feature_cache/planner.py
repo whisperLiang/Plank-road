@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -9,6 +11,7 @@ from loguru import logger
 from cloud.feature_cache.feature_store import (
     FeatureBlobStore,
     boundary_schema_fingerprint,
+    infer_record_feature_layout_id,
     load_feature_record_path,
     tensor_shapes_fingerprint,
 )
@@ -17,6 +20,7 @@ from cloud.feature_cache.types import (
     FeatureCachePreparePlan,
     FeatureCacheStats,
     FeatureRef,
+    LabelRef,
     stable_digest,
 )
 
@@ -37,6 +41,18 @@ def _feature_ref_from_sample(sample: Mapping[str, object]) -> FeatureRef | None:
     if isinstance(value, Mapping):
         try:
             return FeatureRef.from_dict(value)
+        except Exception:
+            return None
+    return None
+
+
+def _label_ref_from_sample(sample: Mapping[str, object]) -> LabelRef | None:
+    value = sample.get("label_ref")
+    if isinstance(value, LabelRef):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return LabelRef.from_dict(value)
         except Exception:
             return None
     return None
@@ -91,6 +107,28 @@ def _ref_matches_current_key(
     return True, None
 
 
+def _feature_ref_sidecar_matches(
+    store: FeatureBlobStore,
+    ref: FeatureRef,
+) -> tuple[bool, str | None]:
+    meta_path = store.metadata_path(ref.key)
+    if not os.path.exists(meta_path):
+        return False, "missing_metadata"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except Exception:
+        return False, "unreadable_metadata"
+    if not isinstance(metadata, Mapping):
+        return False, "invalid_metadata"
+    if str(metadata.get("cache_key") or "") != ref.key.digest:
+        return False, "metadata_cache_key"
+    key_payload = metadata.get("key_payload")
+    if not isinstance(key_payload, Mapping) or dict(key_payload) != ref.key.payload():
+        return False, "metadata_key_payload"
+    return True, None
+
+
 def _candidate_feature_path(sample: Mapping[str, object]) -> str | None:
     for key in (
         "feature_path",
@@ -133,6 +171,19 @@ def _label_valid(sample: Mapping[str, object], *, low_quality: bool) -> bool:
     }:
         return False
     return "boxes" in labels and "labels" in labels
+
+
+def _label_ref_valid(sample: Mapping[str, object], label_ref: LabelRef | None) -> bool:
+    labels: object = label_ref.labels if label_ref is not None else None
+    if not isinstance(labels, Mapping):
+        labels = sample.get("labels") or sample.get("label") or sample.get("target")
+    if not isinstance(labels, Mapping):
+        return False
+    if "boxes" not in labels or "labels" not in labels:
+        return False
+    if label_ref is not None and label_ref.path and not os.path.exists(label_ref.path):
+        return False
+    return True
 
 
 def _key_for_sample(
@@ -207,6 +258,8 @@ class FeatureCachePlanner:
         *,
         materialization_mode: str = "direct_ref",
         validate_refs: bool = True,
+        deep_validate_feature_payload: bool = False,
+        deep_validate_sample_rate: float = 0.0,
     ) -> None:
         self.store = store
         self.materialization_mode = str(materialization_mode or "direct_ref").strip().lower()
@@ -215,6 +268,94 @@ class FeatureCachePlanner:
                 "FeatureCachePlanner only supports materialization_mode='direct_ref'."
             )
         self.validate_refs = bool(validate_refs)
+        self.deep_validate_feature_payload = bool(deep_validate_feature_payload)
+        self.deep_validate_sample_rate = max(0.0, min(1.0, float(deep_validate_sample_rate)))
+
+    def _should_deep_validate(self, sample_id: object) -> bool:
+        if not self.deep_validate_feature_payload or self.deep_validate_sample_rate <= 0.0:
+            return False
+        if self.deep_validate_sample_rate >= 1.0:
+            return True
+        digest = stable_digest(str(sample_id or ""))
+        bucket = int(digest[:12], 16) / float(16**12 - 1)
+        return bucket < self.deep_validate_sample_rate
+
+    def _fast_validate_feature_ref(
+        self,
+        ref: FeatureRef,
+        key: FeatureCacheKey,
+        stats: FeatureCacheStats,
+    ) -> tuple[bool, str | None]:
+        started = time.perf_counter()
+        try:
+            valid, reason = _ref_matches_current_key(
+                ref,
+                key,
+                validate_ref=self.validate_refs,
+            )
+            if not valid:
+                return False, reason
+            if self.validate_refs:
+                sidecar_valid, sidecar_reason = _feature_ref_sidecar_matches(self.store, ref)
+                if not sidecar_valid:
+                    return False, sidecar_reason
+            return True, None
+        finally:
+            stats.fast_ref_validation_time += time.perf_counter() - started
+
+    def _deep_validate_feature_payload(
+        self,
+        ref: FeatureRef,
+        key: FeatureCacheKey,
+        stats: FeatureCacheStats,
+    ) -> tuple[bool, str | None]:
+        if not self._should_deep_validate(key.sample_id):
+            return True, None
+        started = time.perf_counter()
+        try:
+            record = load_feature_record_path(ref.path)
+            actual_layout = infer_record_feature_layout_id(record)
+            if actual_layout != key.feature_layout_id:
+                return False, "deep_feature_layout_id"
+            return True, None
+        except Exception as exc:
+            return False, str(exc) or type(exc).__name__
+        finally:
+            stats.deep_payload_validation_time += time.perf_counter() - started
+
+    def _store_lookup(
+        self,
+        key: FeatureCacheKey,
+        stats: FeatureCacheStats,
+    ) -> FeatureRef | None:
+        started = time.perf_counter()
+        stats.feature_store_lookup_count += 1
+        try:
+            return self.store.lookup(key, validate_ref=self.validate_refs)
+        finally:
+            stats.feature_store_lookup_time += time.perf_counter() - started
+
+    def _register_existing_feature(
+        self,
+        key: FeatureCacheKey,
+        path: str,
+        stats: FeatureCacheStats,
+        *,
+        metadata: Mapping[str, object],
+    ) -> FeatureRef:
+        started = time.perf_counter()
+        stats.feature_store_register_count += 1
+        try:
+            return self.store.register_existing_feature(
+                key,
+                path,
+                materialization_mode=self.materialization_mode,
+                validate_layout=self.validate_refs,
+                deep_validate_payload=self._should_deep_validate(key.sample_id),
+                metadata=metadata,
+            )
+        finally:
+            stats.feature_store_register_time += time.perf_counter() - started
 
     def _existing_entry(
         self,
@@ -222,7 +363,14 @@ class FeatureCachePlanner:
         runtime_context: Mapping[str, object],
         stats: FeatureCacheStats,
     ) -> dict[str, object] | None:
+        resolve_started = time.perf_counter()
         ref = _feature_ref_from_sample(sample)
+        stats.feature_ref_resolve_time += time.perf_counter() - resolve_started
+        resolve_started = time.perf_counter()
+        label_ref = _label_ref_from_sample(sample)
+        stats.label_ref_resolve_time += time.perf_counter() - resolve_started
+        had_feature_ref = ref is not None
+        registered_legacy_migration = False
         path = _candidate_feature_path(sample)
         sample_key = _sample_id(sample)
         layout_id = _layout_id(sample, ref) or str(runtime_context.get("feature_layout_id") or "")
@@ -237,11 +385,13 @@ class FeatureCachePlanner:
             feature_layout_id=layout_id,
         )
         if ref is not None:
-            valid, reason = _ref_matches_current_key(
+            valid, reason = self._fast_validate_feature_ref(
                 ref,
                 key,
-                validate_ref=self.validate_refs,
+                stats,
             )
+            if valid:
+                valid, reason = self._deep_validate_feature_payload(ref, key, stats)
             if not valid:
                 logger.warning(
                     "[FeatureCache][Lookup] existing_active sample_id={} invalid_ref reason={}",
@@ -249,15 +399,20 @@ class FeatureCachePlanner:
                     reason,
                 )
                 ref = None
+            else:
+                stats.existing_feature_ref_reused += 1
+        if had_feature_ref and ref is None:
+            return None
         if ref is None and path:
             try:
-                ref = self.store.register_existing_feature(
+                ref = self._register_existing_feature(
                     key,
                     path,
-                    materialization_mode="direct_ref",
-                    validate_layout=self.validate_refs,
+                    stats,
                     metadata={"input_source": "existing_active"},
                 )
+                stats.legacy_migration_count += 1
+                registered_legacy_migration = True
             except Exception as exc:
                 logger.warning(
                     "[FeatureCache][Lookup] existing_active sample_id={} invalid reason={}",
@@ -269,9 +424,19 @@ class FeatureCachePlanner:
             return None
         if ref.feature_layout_id != str(runtime_context.get("feature_layout_id") or ref.feature_layout_id):
             return None
+        started = time.perf_counter()
+        try:
+            if not _label_ref_valid(sample, label_ref):
+                return None
+        finally:
+            stats.fast_ref_validation_time += time.perf_counter() - started
         stats.existing_reused += 1
-        stats.direct_refs_created += 1
-        return {"sample": dict(sample), "feature_ref": ref, "cache_key": key}
+        entry = {"sample": dict(sample), "feature_ref": ref, "cache_key": key}
+        if label_ref is not None:
+            entry["label_ref"] = label_ref
+        if registered_legacy_migration:
+            entry["legacy_migration"] = True
+        return entry
 
     def _uploaded_entry(
         self,
@@ -281,16 +446,25 @@ class FeatureCachePlanner:
         *,
         sample_type: str,
     ) -> dict[str, object] | None:
+        resolve_started = time.perf_counter()
         ref = _feature_ref_from_sample(sample)
+        stats.feature_ref_resolve_time += time.perf_counter() - resolve_started
         path = _candidate_feature_path(sample)
         layout_id = _layout_id(sample, ref)
         expected_layout = str(runtime_context.get("feature_layout_id") or "")
         if expected_layout and layout_id and layout_id != expected_layout:
             return None
         record = None
-        if ref is None and path:
+        if ref is None and path and self._should_deep_validate(_sample_id(sample)):
+            started = time.perf_counter()
             try:
                 record = load_feature_record_path(path)
+                actual_layout = infer_record_feature_layout_id(record)
+                if actual_layout != (layout_id or expected_layout):
+                    raise ValueError(
+                        "Registered feature layout does not match cache key "
+                        f"(expected={layout_id or expected_layout}, actual={actual_layout})."
+                    )
             except Exception as exc:
                 logger.warning(
                     "[FeatureCache][Lookup] uploaded sample_id={} invalid reason={}",
@@ -298,6 +472,8 @@ class FeatureCachePlanner:
                     exc,
                 )
                 return None
+            finally:
+                stats.deep_payload_validation_time += time.perf_counter() - started
         key = _key_for_sample(
             sample,
             runtime_context=runtime_context,
@@ -306,11 +482,13 @@ class FeatureCachePlanner:
             record=record,
         )
         if ref is not None:
-            valid, reason = _ref_matches_current_key(
+            valid, reason = self._fast_validate_feature_ref(
                 ref,
                 key,
-                validate_ref=self.validate_refs,
+                stats,
             )
+            if valid:
+                valid, reason = self._deep_validate_feature_payload(ref, key, stats)
             if not valid:
                 logger.warning(
                     "[FeatureCache][Lookup] uploaded sample_id={} invalid_ref reason={}",
@@ -319,16 +497,15 @@ class FeatureCachePlanner:
                 )
                 ref = None
         if ref is None and path:
-            ref = self.store.lookup(key, validate_ref=self.validate_refs)
+            ref = self._store_lookup(key, stats)
             if ref is not None:
                 stats.cache_hits += 1
             else:
                 stats.cache_misses += 1
-                ref = self.store.register_existing_feature(
+                ref = self._register_existing_feature(
                     key,
                     path,
-                    materialization_mode=self.materialization_mode,
-                    validate_layout=self.validate_refs,
+                    stats,
                     metadata={"input_source": sample_type},
                 )
         if ref is None:
@@ -419,7 +596,7 @@ class FeatureCachePlanner:
                 source="cloud_rebuilt",
                 feature_layout_id=str(runtime_context.get("feature_layout_id") or ""),
             )
-            cached = self.store.lookup(key, validate_ref=self.validate_refs)
+            cached = self._store_lookup(key, stats)
             if cached is not None:
                 stats.cache_hits += 1
                 stats.low_quality_reused += 1

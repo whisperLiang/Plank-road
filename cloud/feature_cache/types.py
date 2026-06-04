@@ -129,6 +129,21 @@ class LabelRef:
             "labels": dict(self.labels or {}) if self.labels is not None else None,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "LabelRef":
+        labels = payload.get("labels")
+        return cls(
+            sample_id=str(payload.get("sample_id") or ""),
+            path=None if payload.get("path") in (None, "") else str(payload.get("path")),
+            codec=str(payload.get("codec") or ""),
+            label_source=str(payload.get("label_source") or ""),
+            teacher_labeled=bool(payload.get("teacher_labeled", False)),
+            pseudo_labeled=bool(payload.get("pseudo_labeled", False)),
+            size_bytes=int(payload.get("size_bytes") or 0),
+            metadata=dict(payload.get("metadata") or {}),
+            labels=dict(labels) if isinstance(labels, Mapping) else None,
+        )
+
 
 @dataclass(frozen=True)
 class SampleTrainingRef:
@@ -198,8 +213,18 @@ class FeatureCacheStats:
     direct_refs_created: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
+    existing_feature_ref_reused: int = 0
+    feature_store_lookup_count: int = 0
+    feature_store_register_count: int = 0
+    legacy_migration_count: int = 0
     rebuild_batch_size: int = 0
     rebuild_batches: int = 0
+    feature_ref_resolve_time: float = 0.0
+    feature_store_lookup_time: float = 0.0
+    feature_store_register_time: float = 0.0
+    label_ref_resolve_time: float = 0.0
+    fast_ref_validation_time: float = 0.0
+    deep_payload_validation_time: float = 0.0
     rebuild_time: float = 0.0
     cache_write_time: float = 0.0
     manifest_write_time: float = 0.0

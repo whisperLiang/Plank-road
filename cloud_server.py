@@ -43,6 +43,7 @@ from cloud.feature_cache import (
     FeatureCacheMaterializer,
     FeatureCachePlanner,
     FeatureRef,
+    LabelRef,
 )
 from cloud.sample_pool import CloudSamplePool
 from cloud.training import (
@@ -2223,6 +2224,16 @@ class CloudContinualLearner:
         )
         self.feature_cache_validate_refs = bool(
             getattr(feature_cache_cfg, "validate_refs", True)
+        )
+        self.feature_cache_deep_validate_feature_payload = bool(
+            getattr(feature_cache_cfg, "deep_validate_feature_payload", False)
+        )
+        self.feature_cache_deep_validate_sample_rate = max(
+            0.0,
+            min(
+                1.0,
+                float(getattr(feature_cache_cfg, "deep_validate_sample_rate", 0.0)),
+            ),
         )
         self.feature_cache_feature_rebuild_batch_size = max(
             1,
@@ -5986,6 +5997,8 @@ class CloudContinualLearner:
             materialization_mode=self.feature_cache_materialization_mode,
             feature_rebuild_batch_size=self.feature_cache_feature_rebuild_batch_size,
             rebuild_provider=rebuild_provider,
+            deep_validate_feature_payload=self.feature_cache_deep_validate_feature_payload,
+            deep_validate_sample_rate=self.feature_cache_deep_validate_sample_rate,
         )
 
     def _feature_cache_runtime_context(
@@ -6127,6 +6140,8 @@ class CloudContinualLearner:
             store,
             materialization_mode=self.feature_cache_materialization_mode,
             validate_refs=self.feature_cache_validate_refs,
+            deep_validate_feature_payload=self.feature_cache_deep_validate_feature_payload,
+            deep_validate_sample_rate=self.feature_cache_deep_validate_sample_rate,
         )
         plan = planner.build_plan(
             resolved_low_quality_samples=resolved_lq,
@@ -6174,6 +6189,8 @@ class CloudContinualLearner:
             store,
             materialization_mode=self.feature_cache_materialization_mode,
             validate_refs=self.feature_cache_validate_refs,
+            deep_validate_feature_payload=self.feature_cache_deep_validate_feature_payload,
+            deep_validate_sample_rate=self.feature_cache_deep_validate_sample_rate,
         )
         plan = planner.build_plan(
             existing_active_samples=active_samples,
@@ -6193,6 +6210,61 @@ class CloudContinualLearner:
             raise RuntimeError(
                 "Canonical active samples could not all be direct-referenced into "
                 f"the training view: dropped_preview={dropped_ids}."
+            )
+        migrated_refs: dict[str, dict[str, object]] = {}
+        for entry in plan.reuse_existing_refs:
+            if not bool(entry.get("legacy_migration")):
+                continue
+            sample = dict(entry.get("sample") or {})
+            sample_id = str(sample.get("sample_id") or "")
+            feature_ref = entry.get("feature_ref")
+            if not sample_id or not isinstance(feature_ref, FeatureRef):
+                continue
+            label_ref = entry.get("label_ref")
+            if not isinstance(label_ref, LabelRef):
+                labels = dict(sample.get("labels") or {})
+                label_source = str(
+                    sample.get("label_source")
+                    or ("teacher" if sample.get("sample_source") == "low_quality" else "edge_pseudo")
+                )
+                label_path = (
+                    str(sample.get("__source_label_path"))
+                    if sample.get("__source_label_path")
+                    else None
+                )
+                label_ref = LabelRef(
+                    sample_id=sample_id,
+                    path=label_path,
+                    codec="json" if label_path else "json_inline",
+                    label_source=label_source,
+                    teacher_labeled=label_source == "teacher",
+                    pseudo_labeled=label_source == "edge_pseudo",
+                    size_bytes=(
+                        os.path.getsize(label_path)
+                        if label_path and os.path.exists(label_path)
+                        else 0
+                    ),
+                    metadata={
+                        field_name: labels[field_name]
+                        for field_name in POOL_LABEL_METADATA_FIELDS
+                        if labels.get(field_name) is not None
+                    },
+                    labels=labels,
+                )
+                entry["label_ref"] = label_ref
+                sample["label_ref"] = label_ref.to_dict()
+                entry["sample"] = sample
+            migrated_refs[sample_id] = {
+                "feature_ref": feature_ref.to_dict(),
+                "label_ref": label_ref.to_dict(),
+            }
+        if migrated_refs:
+            persisted = sample_pool.persist_active_sample_refs(migrated_refs)
+            logger.info(
+                "[FeatureCache][LegacyMigration] generation={} migrated_refs={} persisted_refs={}",
+                generation_id,
+                len(migrated_refs),
+                persisted,
             )
         result = self._feature_cache_materializer(store).prepare(plan)
         if result.view is None:

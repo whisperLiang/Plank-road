@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from cloud.feature_cache import FeatureBlobStore, FeatureCachePlanner
+from cloud.feature_cache import FeatureBlobStore, FeatureCacheKey, FeatureCachePlanner
 from model_management.payload import boundary_payload_from_tensors
 from model_management.split_contract import feature_layout_from_tensors, feature_layout_id
 
@@ -30,6 +30,66 @@ def _runtime(layout_id: str) -> dict[str, object]:
         "input_resize_mode": "direct_resize",
         "front_version": "0",
     }
+
+
+def _cache_key(sample_id: str, layout_id: str) -> FeatureCacheKey:
+    return FeatureCacheKey(
+        cache_version="feature-cache-key.v1",
+        sample_id=sample_id,
+        image_sha1=None,
+        source="cloud_rebuilt",
+        model_id="model-a",
+        model_family="yolo",
+        split_config_id="split-a",
+        contract_id="contract-a",
+        feature_layout_id=layout_id,
+        boundary_id="after:feat",
+        boundary_payload_schema_hash="schema-a",
+        prefix_weights_fingerprint="front:0",
+        preprocessing_fingerprint="prep-a",
+        dtype=None,
+        tensor_shapes_fingerprint=None,
+        passthrough_schema_fingerprint=None,
+    )
+
+
+def test_existing_active_uses_carried_feature_ref_without_lookup(tmp_path, monkeypatch) -> None:
+    store = FeatureBlobStore(str(tmp_path / "store"))
+    record, layout_id = _record()
+    ref = store.write_feature_record(_cache_key("existing", layout_id), record)
+    runtime = _runtime(layout_id)
+    runtime["preprocessing_fingerprint"] = "prep-a"
+    runtime["boundary_payload_schema_hash"] = "schema-a"
+
+    def fail_lookup(*args, **kwargs):
+        raise AssertionError("lookup should not be called for carried feature_ref")
+
+    def fail_register(*args, **kwargs):
+        raise AssertionError("register_existing_feature should not be called")
+
+    monkeypatch.setattr(store, "lookup", fail_lookup)
+    monkeypatch.setattr(store, "register_existing_feature", fail_register)
+
+    planner = FeatureCachePlanner(store)
+    plan = planner.build_plan(
+        existing_active_samples=[
+            {
+                "sample_id": "existing",
+                "feature_ref": ref.to_dict(),
+                "feature_layout_id": layout_id,
+                "sample_source": "low_quality",
+                "labels": {"boxes": [], "labels": []},
+            }
+        ],
+        runtime_context=runtime,
+        view_id="view-a",
+        generation="gen-a",
+    )
+
+    assert len(plan.reuse_existing_refs) == 1
+    assert plan.stats.existing_feature_ref_reused == 1
+    assert plan.stats.feature_store_lookup_count == 0
+    assert plan.stats.feature_store_register_count == 0
 
 
 def test_planner_reuses_existing_registers_high_quality_rebuilds_raw_and_defers(tmp_path) -> None:

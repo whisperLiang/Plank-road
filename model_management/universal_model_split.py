@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import random
 import time
@@ -810,6 +811,33 @@ def _feature_path(cache_path: str, frame_index: Any) -> str:
     return os.path.join(cache_path, "features", f"{frame_index}.pt")
 
 
+def _training_view_feature_path(cache_path: str, frame_index: Any) -> str | None:
+    metadata_index_path = os.path.join(cache_path, "metadata_index.json")
+    if not os.path.exists(metadata_index_path):
+        return None
+    with open(metadata_index_path, "r", encoding="utf-8") as handle:
+        metadata_index = json.load(handle)
+    if not isinstance(metadata_index, Mapping):
+        return None
+    samples = metadata_index.get("samples")
+    if not isinstance(samples, Mapping):
+        return None
+    sample = samples.get(str(frame_index))
+    if not isinstance(sample, Mapping):
+        return None
+    ref = sample.get("feature_ref")
+    path = ""
+    if isinstance(ref, Mapping):
+        path = str(ref.get("path") or "")
+    if not path:
+        path = str(sample.get("feature_relpath") or "")
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(cache_path, path.replace("/", os.sep)))
+
+
 def save_split_feature_cache(
     cache_path: str,
     frame_index: Any,
@@ -843,7 +871,10 @@ def save_split_feature_cache(
 def load_split_feature_cache(cache_path: str, frame_index: Any) -> dict[str, Any]:
     path = _feature_path(cache_path, frame_index)
     if not os.path.exists(path):
-        raise FileNotFoundError(path)
+        view_path = _training_view_feature_path(cache_path, frame_index)
+        if view_path is None or not os.path.exists(view_path):
+            raise FileNotFoundError(path)
+        path = view_path
     try:
         with gzip.open(path, "rb") as f:
             record = torch.load(f, map_location="cpu", weights_only=False)

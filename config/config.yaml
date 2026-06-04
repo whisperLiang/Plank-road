@@ -182,6 +182,8 @@ server:
    view_root_dir: "./cache/cloud_training_views"
    store_root_dir: "./cache/cloud_feature_store"
    validate_refs: true
+   deep_validate_feature_payload: false
+   deep_validate_sample_rate: 0
    feature_rebuild_batch_size: 16
    gc_enabled: false
    gc_dry_run: true

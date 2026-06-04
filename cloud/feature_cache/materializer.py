@@ -18,6 +18,7 @@ from cloud.feature_cache.types import (
     LabelRef,
     SampleTrainingRef,
     TrainingCacheView,
+    stable_digest,
 )
 from model_management.payload import BoundaryPayload
 from model_management.split_runtime.boundary_cache import BOUNDARY_CACHE_PROTOCOL
@@ -72,6 +73,18 @@ def _label_ref(sample: Mapping[str, Any], *, label_path: str | None = None) -> L
         },
         labels=labels,
     )
+
+
+def _entry_label_ref(entry: Mapping[str, object], sample: Mapping[str, Any]) -> LabelRef:
+    value = entry.get("label_ref") or sample.get("label_ref")
+    if isinstance(value, LabelRef):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return LabelRef.from_dict(value)
+        except Exception:
+            pass
+    return _label_ref(sample)
 
 
 def _sample_type(sample: Mapping[str, Any]) -> str:
@@ -147,6 +160,8 @@ class FeatureCacheMaterializer:
         feature_rebuild_batch_size: int = 16,
         dynamic_batch_range: tuple[int, int] | None = None,
         rebuild_provider: RebuildProvider | None = None,
+        deep_validate_feature_payload: bool = False,
+        deep_validate_sample_rate: float = 0.0,
     ) -> None:
         self.store = store
         self.view_root_dir = os.path.abspath(str(view_root_dir))
@@ -158,7 +173,18 @@ class FeatureCacheMaterializer:
         self.feature_rebuild_batch_size = max(1, int(feature_rebuild_batch_size or 16))
         self.dynamic_batch_range = dynamic_batch_range
         self.rebuild_provider = rebuild_provider
+        self.deep_validate_feature_payload = bool(deep_validate_feature_payload)
+        self.deep_validate_sample_rate = max(0.0, min(1.0, float(deep_validate_sample_rate)))
         os.makedirs(self.view_root_dir, exist_ok=True)
+
+    def _should_deep_validate(self, sample_id: object) -> bool:
+        if not self.deep_validate_feature_payload or self.deep_validate_sample_rate <= 0.0:
+            return False
+        if self.deep_validate_sample_rate >= 1.0:
+            return True
+        digest = stable_digest(str(sample_id or ""))
+        bucket = int(digest[:12], 16) / float(16**12 - 1)
+        return bucket < self.deep_validate_sample_rate
 
     def _effective_batch_size(self, requested: int) -> int:
         size = max(1, int(requested))
@@ -291,8 +317,10 @@ class FeatureCacheMaterializer:
         *,
         generation: str,
         metadata_ref: str | None = None,
+        stats: FeatureCacheStats | None = None,
     ) -> SampleTrainingRef:
         sample = dict(entry.get("sample") or {})
+        started = time.perf_counter()
         ref = entry.get("feature_ref")
         if isinstance(ref, FeatureRef):
             feature_ref = ref
@@ -300,7 +328,12 @@ class FeatureCacheMaterializer:
             feature_ref = FeatureRef.from_dict(ref)
         else:
             raise ValueError("Training view entry is missing feature_ref.")
-        label_ref = _label_ref(sample)
+        if stats is not None:
+            stats.feature_ref_resolve_time += time.perf_counter() - started
+        started = time.perf_counter()
+        label_ref = _entry_label_ref(entry, sample)
+        if stats is not None:
+            stats.label_ref_resolve_time += time.perf_counter() - started
         return SampleTrainingRef(
             sample_id=str(sample.get("sample_id") or feature_ref.sample_id),
             sample_type=_sample_type(sample),
@@ -323,13 +356,19 @@ class FeatureCacheMaterializer:
                     "sample_source",
                     "label_source",
                     "feature_ref",
+                    "label_ref",
                     "raw_path",
                     "frame_path",
+                    "has_raw_sample",
+                    "runtime_contract",
+                    "model_id",
+                    "split_config_id",
+                    "front_version",
                 }
             },
         )
 
-    def _record_for_ref(
+    def _metadata_record_for_ref(
         self,
         sample_ref: SampleTrainingRef,
         records: Mapping[str, Mapping[str, object]] | None,
@@ -338,10 +377,11 @@ class FeatureCacheMaterializer:
         if isinstance(cached, Mapping):
             record = dict(cached)
         else:
-            record = self.store.read(sample_ref.feature_ref)
+            record = {}
         labels = dict(sample_ref.label_ref.labels or {})
         record["sample_id"] = sample_ref.sample_id
         record.setdefault("feature_ref", sample_ref.feature_ref.to_dict())
+        record.setdefault("label_ref", sample_ref.label_ref.to_dict())
         record.setdefault("sample_source", sample_ref.sample_type)
         record.setdefault("label_source", sample_ref.label_ref.label_source)
         record["pseudo_boxes"] = list(labels.get("boxes") or [])
@@ -353,6 +393,11 @@ class FeatureCacheMaterializer:
                 record[str(key)] = value
         for key, value in sample_ref.metadata.items():
             record.setdefault(str(key), value)
+        record.setdefault("model_id", sample_ref.feature_ref.key.model_id)
+        record.setdefault("split_config_id", sample_ref.feature_ref.key.split_config_id)
+        record.setdefault("front_version", sample_ref.feature_ref.key.prefix_weights_fingerprint)
+        record.setdefault("input_tensor_shape", sample_ref.metadata.get("input_tensor_shape") or [])
+        record.setdefault("input_resize_mode", sample_ref.metadata.get("input_resize_mode") or "")
         return record
 
     def write_training_view(
@@ -367,17 +412,23 @@ class FeatureCacheMaterializer:
         records: Mapping[str, Mapping[str, object]] | None = None,
         stats: FeatureCacheStats | None = None,
     ) -> FeatureCachePrepareResult:
+        write_started = time.perf_counter()
+        base_prepare_time = float(stats.total_prepare_time if stats is not None else 0.0)
         stats = stats or FeatureCacheStats(requested_samples=len(entries))
         view_dir = self._view_dir(view_id)
         features_dir = os.path.join(view_dir, "features")
         os.makedirs(features_dir, exist_ok=True)
-        sample_refs = [
-            self._training_ref_from_entry(entry, generation=generation)
-            for entry in list(entries or [])
-        ]
+        sample_refs: list[SampleTrainingRef] = []
+        for entry in list(entries or []):
+            sample_refs.append(
+                self._training_ref_from_entry(
+                    entry,
+                    generation=generation,
+                    stats=stats,
+                )
+            )
         preloaded_records: dict[str, dict[str, object]] = {}
         metadata_samples: dict[str, dict[str, object]] = {}
-        materialize_started = time.perf_counter()
         for sample_ref in sample_refs:
             destination = os.path.join(features_dir, f"{sample_ref.sample_id}.pt")
             op_stats = FeatureBlobStore.materialize_reference(
@@ -387,9 +438,13 @@ class FeatureCacheMaterializer:
             )
             stats.bytes_copied += int(op_stats["bytes_copied"])
             stats.files_copied += int(op_stats["files_copied"])
-            stats.direct_refs_created += int(op_stats["direct_refs_created"])
-            record = self._record_for_ref(sample_ref, records)
-            preloaded_records[sample_ref.sample_id] = record
+            if self._should_deep_validate(sample_ref.sample_id):
+                deep_started = time.perf_counter()
+                self.store.read(sample_ref.feature_ref)
+                stats.deep_payload_validation_time += time.perf_counter() - deep_started
+            record = self._metadata_record_for_ref(sample_ref, records)
+            if isinstance((records or {}).get(sample_ref.sample_id), Mapping):
+                preloaded_records[sample_ref.sample_id] = record
             feature_path = (
                 sample_ref.feature_ref.path
                 if self.materialization_mode == "direct_ref"
@@ -398,6 +453,7 @@ class FeatureCacheMaterializer:
             metadata_samples[sample_ref.sample_id] = {
                 "sample_id": sample_ref.sample_id,
                 "feature_ref": sample_ref.feature_ref.to_dict(),
+                "label_ref": sample_ref.label_ref.to_dict(),
                 "feature_relpath": self._view_feature_relpath(feature_path, view_dir),
                 "feature_file_size": int(sample_ref.feature_ref.size_bytes),
                 "has_raw_sample": bool(record.get("has_raw_sample", False)),
@@ -416,7 +472,7 @@ class FeatureCacheMaterializer:
                     else {}
                 ),
             }
-        stats.total_prepare_time += time.perf_counter() - materialize_started
+        stats.direct_refs_created = len(sample_refs)
 
         manifest_path = os.path.join(view_dir, "view_manifest.json")
         metadata_index_path = os.path.join(view_dir, "metadata_index.json")
@@ -467,6 +523,7 @@ class FeatureCacheMaterializer:
             },
         )
         stats.metadata_index_time += time.perf_counter() - metadata_started
+        stats.total_prepare_time = base_prepare_time + (time.perf_counter() - write_started)
 
         logger.info(
             "[FeatureCache][View] view_id={} generation={} samples={} feature_layout_id={} contract_id={} mode={} manifest_write_time={:.3f}s metadata_index_time={:.3f}s",
@@ -478,6 +535,29 @@ class FeatureCacheMaterializer:
             self.materialization_mode,
             stats.manifest_write_time,
             stats.metadata_index_time,
+        )
+        logger.info(
+            "[FeatureCache][MaterializeProfile] view_id={} feature_ref_resolve_time={:.3f}s "
+            "feature_store_lookup_time={:.3f}s feature_store_lookup_count={} "
+            "feature_store_register_time={:.3f}s feature_store_register_count={} "
+            "label_ref_resolve_time={:.3f}s fast_ref_validation_time={:.3f}s "
+            "deep_payload_validation_time={:.3f}s manifest_write_time={:.3f}s "
+            "metadata_index_time={:.3f}s total_prepare_time={:.3f}s "
+            "legacy_migration_count={} existing_feature_ref_reused={}",
+            view_id,
+            stats.feature_ref_resolve_time,
+            stats.feature_store_lookup_time,
+            stats.feature_store_lookup_count,
+            stats.feature_store_register_time,
+            stats.feature_store_register_count,
+            stats.label_ref_resolve_time,
+            stats.fast_ref_validation_time,
+            stats.deep_payload_validation_time,
+            stats.manifest_write_time,
+            stats.metadata_index_time,
+            stats.total_prepare_time,
+            stats.legacy_migration_count,
+            stats.existing_feature_ref_reused,
         )
         logger.info(
             "[FeatureCache][Materialize] view_id={} direct_refs={} rebuilt={} files_copied={} bytes_copied={} rebuild_time={:.3f}s manifest_write_time={:.3f}s total_prepare_time={:.3f}s",

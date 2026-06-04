@@ -99,7 +99,7 @@ def test_materializer_rebuilds_only_planned_samples_and_writes_view(tmp_path) ->
     assert result.view is not None
     assert result.view.source == "canonical_active"
     assert result.view.manifest_path.endswith("view_manifest.json")
-    assert set(result.records) == {"existing", "rebuilt"}
+    assert set(result.records) == {"rebuilt"}
     assert result.stats.low_quality_rebuilt == 1
     assert result.stats.files_copied == 0
     assert result.stats.bytes_copied == 0
@@ -158,3 +158,164 @@ def test_materializer_direct_ref_mode_and_oom_batch_shrink(tmp_path) -> None:
     assert result.stats.files_copied == 0
     assert result.stats.bytes_copied == 0
     assert result.stats.direct_refs_created == 2
+
+
+def test_training_view_fast_validation_does_not_torch_load(tmp_path, monkeypatch) -> None:
+    store = FeatureBlobStore(str(tmp_path / "store"))
+    payload = _payload()
+    layout_id = feature_layout_id(feature_layout_from_tensors(payload.tensors))
+    ref = store.write_feature_record(
+        _key("existing", layout_id),
+        {"intermediate": payload, "feature_layout_id": layout_id},
+    )
+    calls = []
+
+    def fail_load(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("torch.load should not run during fast view materialization")
+
+    monkeypatch.setattr(torch, "load", fail_load)
+
+    plan = FeatureCachePreparePlan(
+        view_id="view-fast",
+        generation="gen-a",
+        feature_layout_id=layout_id,
+        contract_id="contract-a",
+        materialization_mode="direct_ref",
+        create_training_view=[
+            {
+                "sample": {
+                    "sample_id": "existing",
+                    "labels": {"boxes": [], "labels": []},
+                    "sample_source": "high_quality",
+                    "label_source": "edge_pseudo",
+                },
+                "feature_ref": ref,
+            }
+        ],
+    )
+    result = FeatureCacheMaterializer(
+        store,
+        view_root_dir=str(tmp_path / "views"),
+        deep_validate_feature_payload=False,
+    ).prepare(plan)
+
+    assert calls == []
+    assert result.stats.deep_payload_validation_time == 0.0
+    assert result.stats.files_copied == 0
+    assert result.stats.bytes_copied == 0
+
+
+def test_deep_validation_optional(tmp_path, monkeypatch) -> None:
+    store = FeatureBlobStore(str(tmp_path / "store"))
+    payload = _payload()
+    layout_id = feature_layout_id(feature_layout_from_tensors(payload.tensors))
+    ref = store.write_feature_record(
+        _key("existing", layout_id),
+        {"intermediate": payload, "feature_layout_id": layout_id},
+    )
+    original_load = torch.load
+    calls = []
+
+    def counting_load(*args, **kwargs):
+        calls.append(args)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", counting_load)
+
+    base_plan = FeatureCachePreparePlan(
+        view_id="view-rate-zero",
+        generation="gen-a",
+        feature_layout_id=layout_id,
+        contract_id="contract-a",
+        materialization_mode="direct_ref",
+        create_training_view=[
+            {
+                "sample": {
+                    "sample_id": "existing",
+                    "labels": {"boxes": [], "labels": []},
+                    "sample_source": "high_quality",
+                    "label_source": "edge_pseudo",
+                },
+                "feature_ref": ref,
+            }
+        ],
+    )
+    FeatureCacheMaterializer(
+        store,
+        view_root_dir=str(tmp_path / "views"),
+        deep_validate_feature_payload=True,
+        deep_validate_sample_rate=0.0,
+    ).prepare(base_plan)
+    assert calls == []
+
+    deep_plan = FeatureCachePreparePlan(
+        view_id="view-rate-one",
+        generation="gen-a",
+        feature_layout_id=layout_id,
+        contract_id="contract-a",
+        materialization_mode="direct_ref",
+        create_training_view=list(base_plan.create_training_view),
+    )
+    materializer = FeatureCacheMaterializer(
+        store,
+        view_root_dir=str(tmp_path / "views"),
+        deep_validate_feature_payload=True,
+        deep_validate_sample_rate=1.0,
+    )
+    assert materializer._should_deep_validate("existing")
+    materializer.prepare(deep_plan)
+    assert len(calls) == 1
+
+    sampled = FeatureCacheMaterializer(
+        store,
+        view_root_dir=str(tmp_path / "views"),
+        deep_validate_feature_payload=True,
+        deep_validate_sample_rate=0.5,
+    )
+    assert sampled._should_deep_validate("existing") == sampled._should_deep_validate("existing")
+
+
+def test_materialize_profile_counts(tmp_path) -> None:
+    store = FeatureBlobStore(str(tmp_path / "store"))
+    payload = _payload()
+    layout_id = feature_layout_id(feature_layout_from_tensors(payload.tensors))
+    entries = []
+    for sample_id in ("a", "b"):
+        ref = store.write_feature_record(
+            _key(sample_id, layout_id),
+            {"intermediate": payload, "feature_layout_id": layout_id},
+        )
+        entries.append(
+            {
+                "sample": {
+                    "sample_id": sample_id,
+                    "labels": {"boxes": [], "labels": []},
+                    "sample_source": "high_quality",
+                    "label_source": "edge_pseudo",
+                },
+                "feature_ref": ref,
+            }
+        )
+    plan = FeatureCachePreparePlan(
+        view_id="view-profile",
+        generation="gen-a",
+        feature_layout_id=layout_id,
+        contract_id="contract-a",
+        materialization_mode="direct_ref",
+        create_training_view=entries,
+    )
+    plan.stats.existing_feature_ref_reused = len(entries)
+
+    result = FeatureCacheMaterializer(
+        store,
+        view_root_dir=str(tmp_path / "views"),
+    ).prepare(plan)
+
+    assert result.stats.low_quality_rebuilt == 0
+    assert result.stats.feature_store_lookup_count == 0
+    assert result.stats.feature_store_register_count == 0
+    assert result.stats.existing_feature_ref_reused == len(entries)
+    assert result.stats.direct_refs_created == len(entries)
+    assert result.stats.files_copied == 0
+    assert result.stats.bytes_copied == 0

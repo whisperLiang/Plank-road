@@ -353,12 +353,13 @@ class FeatureBlobStore:
         materialization_mode: str = "direct_ref",
         metadata: Mapping[str, Any] | None = None,
         validate_layout: bool = True,
+        deep_validate_payload: bool = False,
     ) -> FeatureRef:
         source = os.path.abspath(str(source_path))
         if not os.path.exists(source):
             raise FileNotFoundError(source)
         record: dict[str, Any] | None = None
-        if validate_layout:
+        if validate_layout and deep_validate_payload:
             record = load_feature_record_path(source)
             actual_layout = infer_record_feature_layout_id(record)
             if actual_layout != key.feature_layout_id:
