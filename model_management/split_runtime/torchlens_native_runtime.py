@@ -13,6 +13,8 @@ from torchlens.split import (
     prepare_split_replay,
 )
 
+from .torchlens_forward_guard import torchlens_forward_guard
+
 
 TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "plank-road-torchlens-native-runtime-v1"
 DEFAULT_SPLIT_MODE = "generated_eager"
@@ -106,11 +108,12 @@ def prepare_split_runtime(
     """Prepare a split runtime using the TorchLens native split API."""
 
     spec = _spec_with_mode(split_spec, mode)
-    return prepare_split(
-        model,
-        normalize_example_inputs(example_inputs),
-        spec,
-    )
+    with torchlens_forward_guard():
+        return prepare_split(
+            model,
+            normalize_example_inputs(example_inputs),
+            spec,
+        )
 
 
 def prepare_split_replay_runtime(
@@ -122,11 +125,12 @@ def prepare_split_replay_runtime(
     """Prepare an inference-style replay runtime using TorchLens native split."""
 
     spec = _spec_with_mode(split_spec, mode)
-    return prepare_split_replay(
-        model,
-        normalize_example_inputs(example_inputs),
-        spec,
-    )
+    with torchlens_forward_guard():
+        return prepare_split_replay(
+            model,
+            normalize_example_inputs(example_inputs),
+            spec,
+        )
 
 
 def _require_batch_gt1(example_batch: torch.Tensor) -> None:

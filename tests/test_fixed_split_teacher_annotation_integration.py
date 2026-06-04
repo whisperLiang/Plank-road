@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import cv2
@@ -10,6 +11,7 @@ from cloud.sample_pool import CloudSamplePool
 from cloud_server import CloudContinualLearner
 from model_management.payload import boundary_payload_from_tensors
 from model_management.split_contract import SplitRuntimeContract
+from model_management.split_runtime.torchlens_forward_guard import torchlens_forward_guard
 
 
 class FakeLargeOD:
@@ -344,5 +346,32 @@ def test_async_unresolved_without_worker_is_explicit(tmp_path) -> None:
         )
 
         assert annotations == {}
+    finally:
+        learner.close()
+
+
+def test_teacher_annotation_scope_waits_for_torchlens_forward_guard(tmp_path) -> None:
+    learner = CloudContinualLearner(
+        _config(tmp_path, async_enabled=True),
+        FakeLargeOD(),
+    )
+    entered_scope = threading.Event()
+
+    def run_scope() -> None:
+        with learner._teacher_annotation_scope(
+            "teacher annotation guard regression",
+            sample_count=1,
+        ):
+            entered_scope.set()
+
+    try:
+        with torchlens_forward_guard():
+            thread = threading.Thread(target=run_scope)
+            thread.start()
+            assert not entered_scope.wait(timeout=0.05)
+
+        assert entered_scope.wait(timeout=2.0)
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
     finally:
         learner.close()

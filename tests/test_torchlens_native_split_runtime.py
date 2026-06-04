@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import threading
 
 import pytest
 import torch
@@ -32,6 +33,7 @@ from model_management.split_runtime import (
     make_split_spec,
 )
 from model_management.split_runtime import torchlens_native_runtime as native_runtime
+from model_management.split_runtime.torchlens_forward_guard import torchlens_forward_guard
 from model_management.universal_model_split import (
     UniversalModelSplitter,
     collect_suffix_trainable_parameters,
@@ -451,6 +453,32 @@ def test_native_runtime_preserves_spec_mode_and_list_inputs(monkeypatch) -> None
     assert isinstance(example_inputs, tuple)
     assert example_inputs[0] is list_input
     assert getattr(captured["spec"], "mode") == "compiled"
+
+
+def test_native_runtime_prepare_split_uses_forward_guard(monkeypatch) -> None:
+    entered_prepare = threading.Event()
+
+    def fake_prepare_split(model, example_inputs, spec):
+        del model, example_inputs, spec
+        entered_prepare.set()
+        return object()
+
+    monkeypatch.setattr(native_runtime, "prepare_split", fake_prepare_split)
+
+    model = TinySplitModel()
+    example = torch.randn(2, 4)
+    spec = make_split_spec("50%")
+
+    with torchlens_forward_guard():
+        thread = threading.Thread(
+            target=lambda: native_runtime.prepare_split_runtime(model, example, spec),
+        )
+        thread.start()
+        assert not entered_prepare.wait(timeout=0.05)
+
+    assert entered_prepare.wait(timeout=2.0)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
 
 
 def test_tradeoff_validation_accepts_success_reports() -> None:

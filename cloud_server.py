@@ -95,6 +95,7 @@ from model_management.split_runtime import (
     compare_outputs,
     make_split_spec,
 )
+from model_management.split_runtime.torchlens_forward_guard import torchlens_forward_guard
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_contract import (
     FIXED_SPLIT_RUNTIME_CONTRACT_VERSION,
@@ -4124,7 +4125,8 @@ class CloudContinualLearner:
         )
         execution_started = time.perf_counter()
         try:
-            yield
+            with torchlens_forward_guard():
+                yield
         finally:
             execution_elapsed = time.perf_counter() - execution_started
             with queue_state.condition:
