@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
 import torch
-from loguru import logger
 
 from cloud.feature_cache.types import (
     NPY_MEMMAP_SHARD,
@@ -42,19 +40,6 @@ def _metadata_for_ref(ref: FeatureShardRef) -> FeatureShardMetadata:
         raise FileNotFoundError(ref.index_path)
     payload = _read_json(ref.index_path)
     return FeatureShardMetadata.from_dict(payload)
-
-
-@dataclass
-class ShardReadProfile:
-    batch_size: int = 0
-    shards_touched: int = 0
-    rows_read: int = 0
-    storage_formats: set[str] | None = None
-    read_time: float = 0.0
-    slice_time: float = 0.0
-    collate_time: float = 0.0
-    cpu_to_gpu_time: float = 0.0
-    payload_cache_hit_rate: float = 0.0
 
 
 class FeatureShardPayloadCache:
@@ -202,39 +187,29 @@ class ShardFeatureBatchReader:
         if cached is not None:
             return self._move_to_device(cached, device=device)
 
-        read_started = time.perf_counter()
         groups: dict[tuple[str, str], list[tuple[int, FeatureShardRef]]] = {}
         for position, ref in enumerate(parsed):
             groups.setdefault((ref.storage_format, ref.shard_id), []).append((position, ref))
 
         per_sample_tensors: list[OrderedDict[str, torch.Tensor] | None] = [None] * len(parsed)
-        profile = ShardReadProfile(
-            batch_size=len(parsed),
-            shards_touched=len(groups),
-            rows_read=len(parsed),
-            storage_formats=set(ref.storage_format for ref in parsed),
-        )
         first_metadata: FeatureShardMetadata | None = None
         for (_format, _shard_id), positioned in groups.items():
             ordered_refs = [ref for _position, ref in positioned]
             metadata = _metadata_for_ref(ordered_refs[0])
             if first_metadata is None:
                 first_metadata = metadata
-            slice_started = time.perf_counter()
             if _format == NPY_MEMMAP_SHARD:
                 group_tensors = self._npy.read_group(ordered_refs, metadata)
             elif _format == SAFETENSORS_SHARD:
                 group_tensors = self._safetensors.read_group(ordered_refs, metadata)
             else:
                 raise ValueError(f"Unsupported feature shard storage_format={_format!r}.")
-            profile.slice_time += time.perf_counter() - slice_started
             for group_index, (position, _ref) in enumerate(positioned):
                 per_sample_tensors[position] = OrderedDict(
                     (label, tensor[group_index : group_index + 1].contiguous())
                     for label, tensor in group_tensors.items()
                 )
 
-        collate_started = time.perf_counter()
         labels = list((per_sample_tensors[0] or OrderedDict()).keys())
         batched = OrderedDict(
             (
@@ -268,41 +243,21 @@ class ShardFeatureBatchReader:
                 "storage_formats": sorted({ref.storage_format for ref in parsed}),
             },
         )
-        profile.collate_time += time.perf_counter() - collate_started
         self.payload_cache.put(parsed, payload)
-        moved = self._move_to_device(payload, device=device, profile=profile)
-        profile.read_time = time.perf_counter() - read_started
-        profile.payload_cache_hit_rate = self.payload_cache.hit_rate()
-        logger.info(
-            "[FeatureShard][ReadProfile] batch_size={} shards_touched={} rows_read={} storage_format={} read_time={:.3f}s shard_slice_time={:.3f}s collate_time={:.3f}s cpu_to_gpu_time={:.3f}s payload_cache_hit_rate={:.3f}",
-            profile.batch_size,
-            profile.shards_touched,
-            profile.rows_read,
-            ",".join(sorted(profile.storage_formats or set())),
-            profile.read_time,
-            profile.slice_time,
-            profile.collate_time,
-            profile.cpu_to_gpu_time,
-            profile.payload_cache_hit_rate,
-        )
-        return moved
+        return self._move_to_device(payload, device=device)
 
     def _move_to_device(
         self,
         payload: BoundaryPayload,
         *,
         device: torch.device | str | None,
-        profile: ShardReadProfile | None = None,
     ) -> BoundaryPayload:
         if device in (None, "", "cpu"):
             return payload
         target = torch.device(device)
-        started = time.perf_counter()
         moved = {
             label: tensor.to(target, non_blocking=self.non_blocking_transfer)
             for label, tensor in dict(payload.tensors or {}).items()
             if isinstance(tensor, torch.Tensor)
         }
-        if profile is not None:
-            profile.cpu_to_gpu_time += time.perf_counter() - started
         return replace(payload, tensors=moved)
