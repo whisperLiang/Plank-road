@@ -44,6 +44,7 @@ from cloud.feature_cache import (
     FeatureShardRef,
     FeatureShardStore,
     LabelRef,
+    ShardFeatureRefValidator,
     ShardFeatureBatchReader,
 )
 from cloud.sample_pool import CloudSamplePool
@@ -2830,22 +2831,54 @@ class CloudContinualLearner:
         feature_ref = candidate.get("feature_ref")
         ref_payload = dict(feature_ref) if isinstance(feature_ref, Mapping) else {}
         layout = dict(candidate.get("feature_layout") or {})
+        shard_validation = None
+        if not layout and ref_payload.get("storage_format"):
+            shard_validation = ShardFeatureRefValidator().validate_feature_ref(
+                ref_payload,
+                {},
+                allow_abi_compatible_migration=True,
+                deep_validate_payload=False,
+            )
+            layout = dict(shard_validation.feature_layout or {})
+        metadata = shard_validation.metadata if shard_validation is not None else None
         return {
             "sample_id": str(candidate.get("sample_id") or ""),
             "feature_layout_id": str(
                 candidate.get("feature_layout_id")
                 or ref_payload.get("feature_layout_id")
+                or (metadata.feature_layout_id if metadata is not None else "")
                 or (make_feature_layout_id(layout) if layout else "")
             ),
             "feature_layout": layout,
-            "source_feature_layout_id": str(candidate.get("source_feature_layout_id") or ""),
-            "source_feature_schema_hash": str(candidate.get("source_feature_schema_hash") or ""),
+            "source_feature_layout_id": str(
+                candidate.get("source_feature_layout_id")
+                or ref_payload.get("feature_layout_id")
+                or (metadata.feature_layout_id if metadata is not None else "")
+                or ""
+            ),
+            "source_feature_schema_hash": str(
+                candidate.get("source_feature_schema_hash")
+                or (metadata.boundary_schema_hash if metadata is not None else "")
+                or ""
+            ),
             "source_feature_value_schema_hash": str(
                 candidate.get("source_feature_value_schema_hash") or ""
             ),
-            "source_feature_split_id": str(candidate.get("source_feature_split_id") or ""),
+            "source_feature_split_id": str(
+                candidate.get("source_feature_split_id")
+                or ref_payload.get("boundary_id")
+                or (metadata.boundary_id if metadata is not None else "")
+                or ""
+            ),
             "source_feature_graph_signature": str(
-                candidate.get("source_feature_graph_signature") or ""
+                candidate.get("source_feature_graph_signature")
+                or dict(ref_payload.get("metadata") or {}).get("graph_signature")
+                or (
+                    dict(metadata.metadata or {}).get("graph_signature")
+                    if metadata is not None
+                    else ""
+                )
+                or ""
             ),
         }
 
@@ -2913,13 +2946,12 @@ class CloudContinualLearner:
             if summary.get("feature_layout_id") == expected_layout_id:
                 compatible += 1
                 continue
-            can_rename_with_schema = isinstance(
-                candidate.get("intermediate") or candidate.get("boundary_payload"),
-                BoundaryPayload,
-            )
-            if (
-                can_rename_with_schema
-                and self._layout_specs_match_ignoring_labels(actual_layout, expected_layout)
+            if actual_layout == expected_layout:
+                compatible += 1
+                continue
+            if actual_layout and self._layout_specs_match_ignoring_labels(
+                actual_layout,
+                expected_layout,
             ):
                 compatible += 1
                 renamed_compatible += 1
@@ -5888,6 +5920,9 @@ class CloudContinualLearner:
             "split_config_id": str(contract.split_config_id),
             "contract_id": str(contract.contract_id),
             "feature_layout_id": str(contract.feature_layout_id),
+            "feature_layout": dict(contract.feature_layout or {}),
+            "boundary_tensor_labels": list(contract.boundary_tensor_labels or []),
+            "canonical_split_key": str(contract.canonical_split_key),
             "boundary_id": str(contract.cloud_batch_split_id or contract.canonical_split_key),
             "input_tensor_shape": [int(dim) for dim in list(contract.input_tensor_shape)],
             "input_resize_mode": str(contract.input_resize_mode),
@@ -7085,6 +7120,18 @@ class CloudContinualLearner:
                 validation_stats = dict(rebuild_stats.get("validation", {}) or {})
                 replacement_stats = dict(rebuild_stats.get("replacement", {}) or {})
                 commit_stats = dict(rebuild_stats.get("generation_commit", {}) or {})
+                shard_validation_stats = dict(
+                    rebuild_stats.get("shard_validation", {}) or {}
+                )
+                shard_carry_forward_stats = dict(
+                    rebuild_stats.get("shard_carry_forward", {}) or {}
+                )
+                shard_high_quality_stats = dict(
+                    rebuild_stats.get("shard_high_quality", {}) or {}
+                )
+                shard_cleanup_stats = dict(
+                    rebuild_stats.get("shard_cleanup", {}) or {}
+                )
                 logger.info(
                     "[SamplePool] canonical validation: "
                     "accepted_high_quality={} accepted_low_quality={} "
@@ -7105,6 +7152,61 @@ class CloudContinualLearner:
                     validation_stats.get("skipped_label_bounds", 0),
                     validation_stats.get("skipped_label_metadata", 0),
                     validation_stats.get("skipped_unreadable", 0),
+                )
+                logger.info(
+                    "[SamplePool][ShardValidation] total={} valid={} "
+                    "missing_shard_file={} missing_index={} missing_meta={} "
+                    "missing_row_id={} sample_row_mismatch={} abi_compatible={} "
+                    "abi_incompatible={} label_missing={} label_metadata_invalid={} "
+                    "legacy_pt_missing={} unreadable_legacy_pt={} unreadable_shard={}.",
+                    shard_validation_stats.get("total", 0),
+                    shard_validation_stats.get("valid", 0),
+                    shard_validation_stats.get("missing_shard_file", 0),
+                    shard_validation_stats.get("missing_index", 0),
+                    shard_validation_stats.get("missing_meta", 0),
+                    shard_validation_stats.get("missing_row_id", 0),
+                    shard_validation_stats.get("sample_row_mismatch", 0),
+                    shard_validation_stats.get("abi_compatible", 0),
+                    shard_validation_stats.get("abi_incompatible", 0),
+                    shard_validation_stats.get("label_missing", 0),
+                    shard_validation_stats.get("label_metadata_invalid", 0),
+                    shard_validation_stats.get("legacy_pt_missing", 0),
+                    shard_validation_stats.get("unreadable_legacy_pt", 0),
+                    shard_validation_stats.get("unreadable_shard", 0),
+                )
+                logger.info(
+                    "[SamplePool][ShardCarryForward] existing_active={} "
+                    "carried_forward_compatible={} migrated_contract_id={} "
+                    "dropped_incompatible={} skipped_unreadable={}.",
+                    shard_carry_forward_stats.get("existing_active", 0),
+                    shard_carry_forward_stats.get("carried_forward_compatible", 0),
+                    shard_carry_forward_stats.get("migrated_contract_id", 0),
+                    shard_carry_forward_stats.get("dropped_incompatible", 0),
+                    shard_carry_forward_stats.get("skipped_unreadable", 0),
+                )
+                logger.info(
+                    "[SamplePool][ShardHighQuality] pending={} accepted={} "
+                    "deferred_layout={} deferred_contract={} missing_meta={} "
+                    "rebuilt_layout_from_shard_meta={} deleted_from_pending={}.",
+                    shard_high_quality_stats.get("pending", 0),
+                    shard_high_quality_stats.get("accepted", 0),
+                    shard_high_quality_stats.get("deferred_layout", 0),
+                    shard_high_quality_stats.get("deferred_contract", 0),
+                    shard_high_quality_stats.get("missing_meta", 0),
+                    shard_high_quality_stats.get("rebuilt_layout_from_shard_meta", 0),
+                    shard_high_quality_stats.get("deleted_from_pending", 0),
+                )
+                logger.info(
+                    "[SamplePool][ShardCleanup] reachable_shards={} "
+                    "unreachable_shards={} dry_run={} deleted_shards={} "
+                    "preserved_pending={} preserved_active={} preserved_training_view={}.",
+                    shard_cleanup_stats.get("reachable_shards", 0),
+                    shard_cleanup_stats.get("unreachable_shards", 0),
+                    shard_cleanup_stats.get("dry_run", True),
+                    shard_cleanup_stats.get("deleted_shards", 0),
+                    shard_cleanup_stats.get("preserved_pending", 0),
+                    shard_cleanup_stats.get("preserved_active", 0),
+                    shard_cleanup_stats.get("preserved_training_view", 0),
                 )
                 deferred_preview = validation_stats.get("deferred_feature_layout_preview")
                 if deferred_preview:

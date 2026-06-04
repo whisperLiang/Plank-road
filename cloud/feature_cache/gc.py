@@ -8,6 +8,12 @@ from typing import Any
 
 from loguru import logger
 
+from cloud.feature_cache.shard_reachability import (
+    collect_refs_from_active_generations,
+    collect_refs_from_pending_annotation,
+    collect_refs_from_pending_feature_rebuild,
+    collect_refs_from_pending_high_quality,
+)
 from cloud.feature_cache.shard_writer import SHARD_FORMAT_VERSION
 from cloud.feature_cache.types import FeatureCacheGCResult
 
@@ -24,12 +30,22 @@ class FeatureCacheGC:
         *,
         store_root_dir: str,
         view_root_dir: str | None = None,
+        sample_pool_root_dir: str | None = None,
+        staging_root_dir: str | None = None,
         max_live_generations: int = 3,
         dry_run: bool = False,
     ) -> None:
         self.store_root_dir = os.path.abspath(str(store_root_dir))
         self.version_root = os.path.join(self.store_root_dir, SHARD_FORMAT_VERSION)
         self.view_root_dir = None if view_root_dir in (None, "") else os.path.abspath(str(view_root_dir))
+        self.sample_pool_root_dir = (
+            None
+            if sample_pool_root_dir in (None, "")
+            else os.path.abspath(str(sample_pool_root_dir))
+        )
+        self.staging_root_dir = (
+            None if staging_root_dir in (None, "") else os.path.abspath(str(staging_root_dir))
+        )
         self.max_live_generations = max(0, int(max_live_generations))
         self.dry_run = bool(dry_run)
 
@@ -75,6 +91,12 @@ class FeatureCacheGC:
         effective_dry_run = self.dry_run if dry_run is None else bool(dry_run)
         live = self._normalise_live_paths(live_shard_paths)
         live.update(self._view_live_paths())
+        if self.sample_pool_root_dir:
+            live.update(collect_refs_from_active_generations(self.sample_pool_root_dir))
+        if self.staging_root_dir:
+            live.update(collect_refs_from_pending_high_quality(self.staging_root_dir))
+            live.update(collect_refs_from_pending_annotation(self.staging_root_dir))
+            live.update(collect_refs_from_pending_feature_rebuild(self.staging_root_dir))
         result = FeatureCacheGCResult(dry_run=effective_dry_run)
         if not os.path.isdir(self.version_root):
             logger.info("[FeatureCache][GC] dry_run={} scanned=0 retained=0 deleted=0 deleted_bytes=0", effective_dry_run)

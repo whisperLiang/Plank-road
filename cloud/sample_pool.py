@@ -13,6 +13,17 @@ from typing import Any
 
 import torch
 
+from cloud.feature_cache.shard_validator import (
+    ShardFeatureRefValidator,
+    ValidationResult,
+    feature_layouts_abi_compatible,
+    validation_count_fields,
+)
+from cloud.feature_cache.shard_reachability import (
+    collect_refs_from_active_generations,
+    collect_refs_from_pending_high_quality,
+)
+from cloud.feature_cache.types import SUPPORTED_STORAGE_FORMATS
 from model_management.detection_box_projection import (
     ORIGINAL_XYXY,
     canonicalize_labels_to_original_xyxy,
@@ -500,6 +511,116 @@ def _label_ref_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any] | 
             if isinstance(payload, Mapping):
                 return dict(payload)
     return None
+
+
+def _is_shard_feature_ref_payload(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and str(value.get("storage_format") or "") in SUPPORTED_STORAGE_FORMATS
+    )
+
+
+def _shard_expected_abi(
+    *,
+    candidate: Mapping[str, Any],
+    split_contract: SplitRuntimeContract,
+) -> dict[str, Any]:
+    return {
+        "split_contract": split_contract,
+        "contract_id": split_contract.contract_id,
+        "split_config_id": split_contract.split_config_id,
+        "front_version": split_contract.front_version,
+        "feature_layout_id": split_contract.feature_layout_id,
+        "feature_layout": dict(split_contract.feature_layout or {}),
+        "boundary_tensor_labels": list(split_contract.boundary_tensor_labels or []),
+        "boundary_id": str(
+            split_contract.cloud_batch_split_id or split_contract.canonical_split_key
+        ),
+        "cloud_batch_split_id": split_contract.cloud_batch_split_id,
+        "canonical_split_key": split_contract.canonical_split_key,
+        "input_tensor_shape": list(split_contract.input_tensor_shape or []),
+        "input_resize_mode": split_contract.input_resize_mode,
+        "label_ref": _label_ref_from_candidate(candidate),
+        "labels": candidate.get("labels") or candidate.get("label") or candidate.get("target"),
+    }
+
+
+def _candidate_shard_requires_migration(
+    candidate: Mapping[str, Any],
+    *,
+    split_contract: SplitRuntimeContract,
+    validation: ValidationResult | None,
+) -> bool:
+    feature_ref = _feature_ref_from_candidate(candidate)
+    ref_contract = ""
+    ref_layout = ""
+    if isinstance(feature_ref, Mapping):
+        ref_contract = str(feature_ref.get("contract_id") or "")
+        ref_layout = str(feature_ref.get("feature_layout_id") or "")
+    metadata = validation.metadata if validation is not None else None
+    meta_contract = str(metadata.contract_id or "") if metadata is not None else ""
+    meta_layout = str(metadata.feature_layout_id or "") if metadata is not None else ""
+    source_contract = (
+        str(candidate.get("contract_id") or "")
+        or ref_contract
+        or meta_contract
+    )
+    source_layout = (
+        str(candidate.get("feature_layout_id") or "")
+        or ref_layout
+        or meta_layout
+    )
+    return bool(
+        (source_contract and source_contract != split_contract.contract_id)
+        or (ref_contract and ref_contract != split_contract.contract_id)
+        or (meta_contract and meta_contract != split_contract.contract_id)
+        or (source_layout and source_layout != split_contract.feature_layout_id)
+        or (ref_layout and ref_layout != split_contract.feature_layout_id)
+        or (meta_layout and meta_layout != split_contract.feature_layout_id)
+    )
+
+
+def _candidate_with_validated_shard_layout(
+    candidate: Mapping[str, Any],
+    *,
+    split_contract: SplitRuntimeContract,
+    validation: ValidationResult,
+) -> dict[str, Any]:
+    updated = dict(candidate)
+    feature_ref = _feature_ref_from_candidate(updated)
+    if validation.feature_layout:
+        updated["feature_layout"] = {
+            str(label): dict(spec)
+            for label, spec in validation.feature_layout.items()
+            if isinstance(spec, Mapping)
+        }
+    if feature_ref is not None:
+        updated.setdefault(
+            "source_feature_layout_id",
+            str(feature_ref.get("feature_layout_id") or ""),
+        )
+    updated.setdefault("source_contract_id", str(updated.get("contract_id") or ""))
+    updated["feature_layout_id"] = split_contract.feature_layout_id
+    updated["contract_id"] = split_contract.contract_id
+    updated["split_config_id"] = split_contract.split_config_id
+    updated["front_version"] = split_contract.front_version
+    updated["__allow_shard_ref_without_payload"] = True
+    updated["__shard_abi_compatible"] = True
+    updated["__shard_requires_migration"] = _candidate_shard_requires_migration(
+        candidate,
+        split_contract=split_contract,
+        validation=validation,
+    )
+    return updated
+
+
+def _increment_shard_validation_counts(
+    counts: dict[str, int],
+    validation: ValidationResult,
+) -> None:
+    counts["total"] = int(counts.get("total", 0)) + 1
+    for field_name, value in validation.counts().items():
+        counts[field_name] = int(counts.get(field_name, 0)) + int(value)
 
 
 def _labels_from_label_ref(value: object) -> dict[str, Any]:
@@ -1173,18 +1294,7 @@ class CloudSamplePool:
                     str(entry.get("__generation_dir") or self.root_dir),
                     str(label_ref_payload["path"]),
                 )
-            fast_ref_compatible = (
-                not contract_id_mismatch
-                and isinstance(feature_ref, Mapping)
-                and isinstance(label_ref, Mapping)
-                and bool(labels_from_ref)
-                and (
-                    split_contract is None
-                    or str(entry.get("feature_layout_id") or "")
-                    == str(split_contract.feature_layout_id)
-                )
-            )
-            if fast_ref_compatible:
+            if isinstance(feature_ref, Mapping) and isinstance(label_ref, Mapping) and labels_from_ref:
                 sample.update(
                     {
                         "labels": labels_from_ref,
@@ -1193,6 +1303,8 @@ class CloudSamplePool:
                         "feature_layout": dict(entry.get("feature_layout") or {}),
                     }
                 )
+                if contract_id_mismatch:
+                    sample["__contract_id_mismatch"] = True
                 samples.append(sample)
                 continue
             if contract_id_mismatch:
@@ -1217,8 +1329,11 @@ class CloudSamplePool:
         label_ref = _label_ref_from_candidate(candidate)
         can_use_ref_without_payload = (
             feature_ref is not None
-            and str(candidate.get("feature_layout_id") or "")
-            == str(split_contract.feature_layout_id)
+            and (
+                bool(candidate.get("__allow_shard_ref_without_payload"))
+                or str(candidate.get("feature_layout_id") or "")
+                == str(split_contract.feature_layout_id)
+            )
         )
         feature = (
             {}
@@ -1345,8 +1460,17 @@ class CloudSamplePool:
         if record.front_version != split_contract.front_version:
             return "skipped_stale_contract"
         if not record.feature:
-            if record.feature_layout_id != split_contract.feature_layout_id:
+            layout_metadata = record.feature_layout_metadata or {}
+            if layout_metadata and not feature_layouts_abi_compatible(
+                layout_metadata,
+                split_contract.feature_layout,
+                allow_rename_compatible=True,
+            ):
                 return "skipped_feature_layout"
+            if record.feature_layout_id != split_contract.feature_layout_id:
+                if not layout_metadata:
+                    return "skipped_feature_layout"
+                record.feature_layout_id = split_contract.feature_layout_id
         else:
             try:
                 normalised = _feature_tensors_for_contract(
@@ -1658,9 +1782,29 @@ class CloudSamplePool:
                 for key in validation_counts
                 if key.startswith("skipped_") or key.startswith("deferred_")
             }
+            shard_validation_counts = {
+                "total": 0,
+                **{field_name: 0 for field_name in validation_count_fields()},
+            }
+            shard_carry_forward = {
+                "existing_active": len(existing_active_samples or []),
+                "carried_forward_compatible": 0,
+                "migrated_contract_id": 0,
+                "dropped_incompatible": 0,
+                "skipped_unreadable": 0,
+            }
+            shard_high_quality = {
+                "pending": len(pending_high_quality_samples or []),
+                "accepted": 0,
+                "deferred_layout": 0,
+                "deferred_contract": 0,
+                "missing_meta": 0,
+                "rebuilt_layout_from_shard_meta": 0,
+                "deleted_from_pending": 0,
+            }
+            shard_validator = ShardFeatureRefValidator()
             accepted: list[CanonicalSampleRecord] = []
             invalid_records: list[CanonicalSampleRecord] = []
-            incompatible_feature_layout_paths: list[str] = []
             unreadable_staging_paths: list[str] = []
             all_inputs = (
                 [("existing_active", candidate) for candidate in list(existing_active_samples or [])]
@@ -1670,7 +1814,8 @@ class CloudSamplePool:
                 ]
                 + [("new_low_quality", candidate) for candidate in list(new_low_quality_samples or [])]
             )
-            for input_source, candidate in all_inputs:
+            for input_source, raw_candidate in all_inputs:
+                candidate = dict(raw_candidate)
                 sample_id = str(candidate.get("sample_id", "") or "")
                 contract_id_mismatch = _has_contract_id_metadata_mismatch(
                     candidate,
@@ -1685,6 +1830,89 @@ class CloudSamplePool:
                     validation_counts["skipped_stale_contract"] += 1
                     validation_previews["skipped_stale_contract"].append(sample_id)
                     continue
+                feature_ref = _feature_ref_from_candidate(candidate)
+                shard_validation: ValidationResult | None = None
+                if _is_shard_feature_ref_payload(feature_ref):
+                    had_feature_layout = bool(candidate.get("feature_layout"))
+                    shard_validation = shard_validator.validate_feature_ref(
+                        feature_ref,
+                        _shard_expected_abi(
+                            candidate=candidate,
+                            split_contract=split_contract,
+                        ),
+                        allow_abi_compatible_migration=True,
+                        deep_validate_payload=False,
+                    )
+                    _increment_shard_validation_counts(
+                        shard_validation_counts,
+                        shard_validation,
+                    )
+                    if (
+                        input_source == "pending_high_quality"
+                        and shard_validation.feature_layout
+                        and not had_feature_layout
+                    ):
+                        shard_high_quality["rebuilt_layout_from_shard_meta"] += 1
+                    if shard_validation.valid:
+                        candidate = _candidate_with_validated_shard_layout(
+                            candidate,
+                            split_contract=split_contract,
+                            validation=shard_validation,
+                        )
+                        contract_id_mismatch = bool(
+                            contract_id_mismatch
+                            or candidate.get("__shard_requires_migration")
+                        )
+                    elif shard_validation.abi_incompatible:
+                        if input_source == "pending_high_quality":
+                            validation_counts["deferred_feature_layout"] += 1
+                            shard_high_quality["deferred_layout"] += 1
+                            validation_previews["deferred_feature_layout"].append(
+                                _feature_layout_debug_summary(
+                                    sample_id=sample_id,
+                                    expected_layout=split_contract.feature_layout,
+                                    actual_layout=shard_validation.feature_layout,
+                                    source_metadata=_feature_layout_source_metadata(candidate),
+                                )
+                            )
+                            continue
+                        validation_counts["skipped_feature_layout"] += 1
+                        validation_previews["skipped_feature_layout"].append(sample_id)
+                        if input_source == "existing_active":
+                            shard_carry_forward["dropped_incompatible"] += 1
+                        elif input_source == "new_low_quality" or str(
+                            candidate.get("sample_source") or ""
+                        ) == "low_quality":
+                            validation_counts["invalid_low_quality"] += 1
+                        else:
+                            validation_counts["invalid_high_quality"] += 1
+                        continue
+                    elif shard_validation.label_missing or shard_validation.label_metadata_invalid:
+                        validation_counts["skipped_label_metadata"] += 1
+                        validation_previews["skipped_label_metadata"].append(sample_id)
+                        if input_source == "pending_high_quality":
+                            shard_high_quality["deferred_contract"] += 1
+                        elif input_source == "new_low_quality" or str(
+                            candidate.get("sample_source") or ""
+                        ) == "low_quality":
+                            validation_counts["invalid_low_quality"] += 1
+                        else:
+                            validation_counts["invalid_high_quality"] += 1
+                        continue
+                    else:
+                        validation_counts["skipped_unreadable"] += 1
+                        validation_previews["skipped_unreadable"].append(sample_id)
+                        if input_source == "existing_active":
+                            shard_carry_forward["skipped_unreadable"] += 1
+                        if input_source == "pending_high_quality" and shard_validation.missing_meta:
+                            shard_high_quality["missing_meta"] += 1
+                        elif input_source != "pending_high_quality" and candidate.get("__staging_path"):
+                            unreadable_staging_paths.append(str(candidate.get("__staging_path")))
+                        if input_source == "new_low_quality":
+                            validation_counts["invalid_low_quality"] += 1
+                        elif input_source == "pending_high_quality":
+                            validation_counts["invalid_high_quality"] += 1
+                        continue
                 try:
                     record = self._candidate_to_canonical_record(
                         candidate,
@@ -1699,7 +1927,7 @@ class CloudSamplePool:
                         ) from exc
                     validation_counts["skipped_unreadable"] += 1
                     validation_previews["skipped_unreadable"].append(sample_id)
-                    if candidate.get("__staging_path"):
+                    if input_source != "pending_high_quality" and candidate.get("__staging_path"):
                         unreadable_staging_paths.append(str(candidate.get("__staging_path")))
                     continue
                 skip_reason = self._validate_canonical_record(
@@ -1716,20 +1944,18 @@ class CloudSamplePool:
                             _feature_layout_debug_summary(
                                 sample_id=record.sample_id,
                                 expected_layout=split_contract.feature_layout,
-                                actual_layout=feature_layout_from_tensors(record.feature),
+                                actual_layout=(
+                                    record.feature_layout_metadata
+                                    or (
+                                        feature_layout_from_tensors(record.feature)
+                                        if record.feature
+                                        else {}
+                                    )
+                                ),
                                 source_metadata=_feature_layout_source_metadata(candidate),
                             )
                         )
-                        if (
-                            candidate.get("__staging_path")
-                            and (
-                                candidate.get("feature_layout_id")
-                                or candidate.get("source_feature_layout_id")
-                            )
-                        ):
-                            incompatible_feature_layout_paths.append(
-                                str(candidate.get("__staging_path"))
-                            )
+                        shard_high_quality["deferred_layout"] += 1
                         continue
                     validation_counts[skip_reason] += 1
                     validation_previews[skip_reason].append(record.sample_id)
@@ -1739,13 +1965,20 @@ class CloudSamplePool:
                         validation_counts["invalid_high_quality"] += 1
                     invalid_records.append(record)
                     continue
-                if contract_id_mismatch:
-                    validation_counts["migrated_contract_id"] += 1
-                    if input_source == "existing_active":
-                        validation_counts["carried_forward_compatible"] += 1
+                if input_source == "existing_active" and bool(
+                    candidate.get("__shard_abi_compatible")
+                ):
+                    validation_counts["carried_forward_compatible"] += 1
+                    shard_carry_forward["carried_forward_compatible"] += 1
+                if contract_id_mismatch or bool(candidate.get("__shard_abi_compatible")):
+                    if contract_id_mismatch:
+                        validation_counts["migrated_contract_id"] += 1
+                        if input_source == "existing_active":
+                            shard_carry_forward["migrated_contract_id"] += 1
                     record.contract_id = split_contract.contract_id
                     record.split_config_id = split_contract.split_config_id
                     record.front_version = split_contract.front_version
+                    record.feature_layout_id = split_contract.feature_layout_id
                     record.source_label_path = None
                     if isinstance(record.feature_ref, Mapping):
                         feature_ref = dict(record.feature_ref)
@@ -1756,6 +1989,8 @@ class CloudSamplePool:
                     validation_counts["accepted_low_quality"] += 1
                 else:
                     validation_counts["accepted_high_quality"] += 1
+                    if input_source == "pending_high_quality":
+                        shard_high_quality["accepted"] += 1
                 accepted.append(record)
 
             kept, dropped = self._select_records(
@@ -1801,18 +2036,41 @@ class CloudSamplePool:
                     },
                 },
                 "replacement": replacement_stats,
+                "shard_validation": dict(shard_validation_counts),
+                "shard_carry_forward": dict(shard_carry_forward),
+                "shard_high_quality": dict(shard_high_quality),
             }
             commit_stats = self._commit_generation(
                 kept,
                 split_contract=split_contract,
                 stats=stats,
             )
-            processed_count = self._delete_staging_records(kept + dropped + invalid_records)
-            processed_count += self._delete_staging_paths(unreadable_staging_paths)
-            quarantined_count = self._move_staging_paths(
-                incompatible_feature_layout_paths,
-                self.incompatible_feature_layout_dir,
+            pending_kept_paths = {
+                record.source_staging_path
+                for record in kept
+                if record.sample_source == "high_quality" and record.source_staging_path
+            }
+            processed_records = kept + dropped + [
+                record for record in invalid_records if record.sample_source == "low_quality"
+            ]
+            processed_count = self._delete_staging_records(processed_records)
+            shard_high_quality["deleted_from_pending"] = sum(
+                1 for path in pending_kept_paths if path and not os.path.exists(str(path))
             )
+            processed_count += self._delete_staging_paths(unreadable_staging_paths)
+            stats["shard_high_quality"] = dict(shard_high_quality)
+            quarantined_count = 0
+            active_reachable_paths = collect_refs_from_active_generations(self.root_dir)
+            pending_reachable_paths = collect_refs_from_pending_high_quality(self.staging_root)
+            stats["shard_cleanup"] = {
+                "reachable_shards": len(active_reachable_paths | pending_reachable_paths),
+                "unreachable_shards": 0,
+                "dry_run": True,
+                "deleted_shards": 0,
+                "preserved_pending": len(pending_reachable_paths),
+                "preserved_active": len(active_reachable_paths),
+                "preserved_training_view": 0,
+            }
             stats["generation_commit"] = {
                 **commit_stats,
                 "deleted_processed_staging_files": processed_count,

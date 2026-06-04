@@ -7,6 +7,7 @@ from typing import Any
 
 from loguru import logger
 
+from cloud.feature_cache.shard_validator import ShardFeatureRefValidator
 from cloud.feature_cache.shard_store import FeatureShardStore
 from cloud.feature_cache.types import (
     FeatureCacheKey,
@@ -152,6 +153,7 @@ class FeatureCachePlanner:
         if self.materialization_mode != "direct_ref":
             raise ValueError("Feature shard views only support materialization_mode='direct_ref'.")
         self.validate_refs = bool(validate_refs)
+        self._shard_validator = ShardFeatureRefValidator()
 
     def _validate_feature_ref(
         self,
@@ -161,14 +163,18 @@ class FeatureCachePlanner:
     ) -> tuple[bool, str | None]:
         started = time.perf_counter()
         try:
-            if self.validate_refs:
-                self.store.validate_ref(ref)
-            expected_layout = str(runtime_context.get("feature_layout_id") or "")
-            if expected_layout and ref.feature_layout_id != expected_layout:
-                return False, "feature_layout_id"
-            expected_contract = runtime_context.get("contract_id")
-            if expected_contract not in (None, "") and (ref.contract_id or None) != str(expected_contract):
-                return False, "contract_id"
+            if ref.storage_format not in self.store.accepted_storage_formats:
+                return False, f"storage_format:{ref.storage_format}"
+            if not self.validate_refs:
+                return True, None
+            validation = self._shard_validator.validate_feature_ref(
+                ref,
+                runtime_context,
+                allow_abi_compatible_migration=True,
+                deep_validate_payload=False,
+            )
+            if not validation.valid:
+                return False, validation.status
             return True, None
         except Exception as exc:
             return False, str(exc) or type(exc).__name__

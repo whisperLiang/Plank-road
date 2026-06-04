@@ -42,7 +42,10 @@ def test_canonical_pool_commits_shard_refs_without_feature_pt(tmp_path) -> None:
         boundary_tensor_labels=["boundary", "skip"],
         feature_layout_id="layout-a",
         front_version="1",
-        feature_layout={"boundary": {"dtype": "torch.float16", "shape_without_batch": [2, 3]}},
+        feature_layout={
+            "boundary": {"dtype": "torch.float16", "shape_without_batch": [2, 3]},
+            "skip": {"dtype": "torch.float16", "shape_without_batch": [1, 2]},
+        },
     )
     stats, kept = pool.rebuild_canonical_training_pool(
         split_contract=contract,
