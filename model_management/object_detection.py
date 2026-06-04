@@ -1,10 +1,16 @@
 import threading
-from dataclasses import dataclass
 
 import cv2
 import torch
 import numpy as np
 from loguru import logger
+from model_management.inference.artifacts import InferenceArtifacts
+from model_management.inference.confidence import summarize_detection_confidence
+from model_management.inference.prediction_filter import (
+    compute_intersection_over_min_area,
+    deduplicate_final_predictions,
+    resolve_final_dedup_thresholds,
+)
 from model_management.model_zoo import (
     build_detection_model,
     get_model_detection_thresholds,
@@ -18,48 +24,6 @@ from model_management.split_model_adapters import (
     prepare_split_runtime_input,
     summarize_split_runtime_observables,
 )
-from torchvision.ops import box_iou
-
-_FINAL_DUPLICATE_SUPPRESSION_THRESHOLDS = {
-    "tinynext": {
-        "same_label": (0.75, 0.9),
-        "cross_label": (0.75, 0.9),
-    },
-    "rfdetr": {
-        "same_label": (0.35, 0.75),
-        "cross_label": (0.5, 0.8),
-    },
-}
-
-
-@dataclass
-class InferenceArtifacts:
-    intermediate: object | None
-    final_detection_boxes: list
-    final_detection_labels: list
-    final_detection_scores: list
-    low_threshold_boxes: list
-    low_threshold_labels: list
-    low_threshold_scores: list
-    confidence: float
-    input_tensor_shape: list[int] | None = None
-    input_resize_mode: str | None = None
-    proposal_count: int = 0
-    retained_count: int = 0
-    feature_spectral_entropy: float | None = None
-    logit_entropy: float | None = None
-    logit_margin: float | None = None
-    logit_energy: float | None = None
-
-    def to_inference_result(self) -> dict[str, list]:
-        return {
-            "boxes": self.final_detection_boxes,
-            "labels": self.final_detection_labels,
-            "scores": self.final_detection_scores,
-            "low_threshold_boxes": self.low_threshold_boxes,
-            "low_threshold_labels": self.low_threshold_labels,
-            "low_threshold_scores": self.low_threshold_scores,
-        }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.debug(device)
@@ -306,14 +270,7 @@ class Object_Detection:
         return img, original_image_size, False
 
     def _summarize_detection_confidence(self, scores: list[float] | None) -> float:
-        if not scores:
-            return 0.0
-        # Use a small top-k mean to dampen long low-score tails without
-        # saturating high-confidence detectors like YOLO/RF-DETR to 1.0.
-        top_scores = sorted((float(score) for score in scores), reverse=True)[:5]
-        if not top_scores:
-            return 0.0
-        return float(np.clip(np.mean(top_scores), 0.0, 1.0))
+        return summarize_detection_confidence(scores)
 
     def _resolve_final_detection_threshold(self) -> float:
         configured_floor = 0.5
@@ -328,46 +285,19 @@ class Object_Detection:
         threshold: float,
     ) -> dict[str, tuple[float, float]] | None:
         family = get_model_family(self.model_name)
-        thresholds = _FINAL_DUPLICATE_SUPPRESSION_THRESHOLDS.get(family)
-        if thresholds is None:
-            return None
         threshold_high = float(getattr(self, "threshold_high", threshold))
-        if float(threshold) < threshold_high - 1e-6:
-            return None
-        return {
-            str(key): (float(value[0]), float(value[1]))
-            for key, value in thresholds.items()
-        }
+        return resolve_final_dedup_thresholds(
+            family,
+            float(threshold),
+            threshold_high=threshold_high,
+        )
 
     @staticmethod
     def _compute_intersection_over_min_area(
         candidate_box: torch.Tensor,
         reference_boxes: torch.Tensor,
     ) -> torch.Tensor:
-        if reference_boxes.numel() == 0:
-            return reference_boxes.new_zeros((0,), dtype=torch.float32)
-
-        inter_x1 = torch.maximum(candidate_box[0], reference_boxes[:, 0])
-        inter_y1 = torch.maximum(candidate_box[1], reference_boxes[:, 1])
-        inter_x2 = torch.minimum(candidate_box[2], reference_boxes[:, 2])
-        inter_y2 = torch.minimum(candidate_box[3], reference_boxes[:, 3])
-        inter_w = (inter_x2 - inter_x1).clamp_min(0.0)
-        inter_h = (inter_y2 - inter_y1).clamp_min(0.0)
-        intersection = inter_w * inter_h
-
-        candidate_area = (
-            (candidate_box[2] - candidate_box[0]).clamp_min(0.0)
-            * (candidate_box[3] - candidate_box[1]).clamp_min(0.0)
-        )
-        reference_areas = (
-            (reference_boxes[:, 2] - reference_boxes[:, 0]).clamp_min(0.0)
-            * (reference_boxes[:, 3] - reference_boxes[:, 1]).clamp_min(0.0)
-        )
-        min_area = torch.minimum(
-            reference_areas,
-            reference_areas.new_full(reference_areas.shape, float(candidate_area.item())),
-        ).clamp_min(1e-6)
-        return intersection / min_area
+        return compute_intersection_over_min_area(candidate_box, reference_boxes)
 
     def _deduplicate_final_predictions(
         self,
@@ -378,67 +308,11 @@ class Object_Detection:
         threshold: float,
     ) -> tuple[list[list[float]], list[int], list[float]]:
         resolved_thresholds = self._resolve_final_dedup_thresholds(float(threshold))
-        if resolved_thresholds is None or len(scores) <= 1:
-            return boxes, labels, scores
-        same_label_thresholds = resolved_thresholds["same_label"]
-        cross_label_thresholds = resolved_thresholds["cross_label"]
-
-        boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32)
-        labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
-        scores_tensor = torch.as_tensor(scores, dtype=torch.float32)
-
-        valid_geometry = (
-            (boxes_tensor[:, 2] > boxes_tensor[:, 0])
-            & (boxes_tensor[:, 3] > boxes_tensor[:, 1])
-        )
-        if not torch.any(valid_geometry):
-            return [], [], []
-
-        boxes_tensor = boxes_tensor[valid_geometry]
-        labels_tensor = labels_tensor[valid_geometry]
-        scores_tensor = scores_tensor[valid_geometry]
-
-        score_order = torch.argsort(scores_tensor, descending=True)
-        keep_indices: list[int] = []
-        for index in score_order.tolist():
-            candidate_box = boxes_tensor[index]
-            if keep_indices:
-                kept_boxes = boxes_tensor[keep_indices]
-                kept_labels = labels_tensor[keep_indices]
-                candidate_iou = box_iou(candidate_box.unsqueeze(0), kept_boxes).squeeze(0)
-                containment = self._compute_intersection_over_min_area(candidate_box, kept_boxes)
-                same_label_mask = kept_labels == labels_tensor[index]
-                cross_label_mask = ~same_label_mask
-                suppressed_by_iou = False
-                suppressed_by_containment = False
-                if bool(torch.any(same_label_mask)):
-                    same_label_iou, same_label_containment = same_label_thresholds
-                    suppressed_by_iou = suppressed_by_iou or bool(
-                        torch.any(candidate_iou[same_label_mask] >= same_label_iou)
-                    )
-                    suppressed_by_containment = suppressed_by_containment or bool(
-                        torch.any(containment[same_label_mask] >= same_label_containment)
-                    )
-                if bool(torch.any(cross_label_mask)):
-                    cross_label_iou, cross_label_containment = cross_label_thresholds
-                    suppressed_by_iou = suppressed_by_iou or bool(
-                        torch.any(candidate_iou[cross_label_mask] >= cross_label_iou)
-                    )
-                    suppressed_by_containment = suppressed_by_containment or bool(
-                        torch.any(containment[cross_label_mask] >= cross_label_containment)
-                    )
-                if suppressed_by_iou or suppressed_by_containment:
-                    continue
-            keep_indices.append(index)
-
-        if not keep_indices:
-            return [], [], []
-
-        keep = torch.as_tensor(keep_indices, dtype=torch.int64)
-        return (
-            boxes_tensor.index_select(0, keep).tolist(),
-            labels_tensor.index_select(0, keep).tolist(),
-            scores_tensor.index_select(0, keep).tolist(),
+        return deduplicate_final_predictions(
+            boxes,
+            labels,
+            scores,
+            thresholds=resolved_thresholds,
         )
 
     def _parse_prediction_output(self, res, threshold):
