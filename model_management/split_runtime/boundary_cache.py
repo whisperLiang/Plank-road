@@ -61,27 +61,51 @@ def _runtime_payload_device(runtime: Any) -> torch.device | None:
     return device
 
 
-def _payload_values_on_device(value: Any, device: torch.device) -> bool:
-    if isinstance(value, torch.Tensor):
-        return value.device == device and value.is_contiguous()
-    if isinstance(value, Mapping):
-        return all(_payload_values_on_device(item, device) for item in value.values())
-    if isinstance(value, (tuple, list)):
-        return all(_payload_values_on_device(item, device) for item in value)
+def _spec_dtype(spec: Any) -> torch.dtype | None:
+    dtype = spec.get("dtype") if isinstance(spec, Mapping) else getattr(spec, "dtype", None)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        text = dtype.replace("torch.", "")
+        candidate = getattr(torch, text, None)
+        if isinstance(candidate, torch.dtype):
+            return candidate
+    return None
+
+
+def _payload_values_match_runtime(
+    tensors: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    device: torch.device | None,
+) -> bool:
+    for label, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        target_dtype = _spec_dtype(spec.get(str(label)))
+        if target_dtype is not None and tensor.dtype != target_dtype:
+            return False
+        if device is not None and tensor.device != device:
+            return False
+        if not tensor.is_contiguous():
+            return False
     return True
 
 
-def _move_payload_value_to_device(value: Any, device: torch.device) -> Any:
-    if isinstance(value, torch.Tensor):
-        moved = value.to(device)
-        return moved if moved.is_contiguous() else moved.contiguous()
-    if isinstance(value, Mapping):
-        return {key: _move_payload_value_to_device(item, device) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_move_payload_value_to_device(item, device) for item in value)
-    if isinstance(value, list):
-        return [_move_payload_value_to_device(item, device) for item in value]
-    return value
+def _coerce_payload_tensors_for_runtime(
+    tensors: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    device: torch.device | None,
+) -> dict[str, Any]:
+    coerced: dict[str, Any] = {}
+    for label, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            coerced[label] = tensor
+            continue
+        target_dtype = _spec_dtype(spec.get(str(label))) or tensor.dtype
+        target_device = device or tensor.device
+        moved = tensor.to(device=target_device, dtype=target_dtype)
+        coerced[label] = moved if moved.is_contiguous() else moved.contiguous()
+    return coerced
 
 
 def _same_tensor(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -133,20 +157,12 @@ class BoundaryPayloadCacheCodec:
         device = _runtime_payload_device(self.runtime)
         spec = self._runtime_spec(payload)
         metadata = dict(payload.metadata)
-        if device is None:
-            if spec == dict(payload.spec):
-                return payload
-            return replace(payload, spec=spec, metadata=metadata)
         tensors = dict(payload.tensors)
-        if _payload_values_on_device(tensors, device) and spec == dict(payload.spec):
+        if _payload_values_match_runtime(tensors, spec, device) and spec == dict(payload.spec):
             return payload
         return replace(
             payload,
-            tensors=(
-                tensors
-                if _payload_values_on_device(tensors, device)
-                else _move_payload_value_to_device(tensors, device)
-            ),
+            tensors=_coerce_payload_tensors_for_runtime(tensors, spec, device),
             spec=spec,
             metadata=metadata,
         )

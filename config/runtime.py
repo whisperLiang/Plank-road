@@ -91,7 +91,7 @@ class ResourceAwareTriggerConfig(ConfigSection):
 class FeatureUploadConfig(ConfigSection):
     storage_format: str = "safetensors_shard"
     shard_max_samples: int = 64
-    shard_dtype: str = "float16"
+    shard_dtype: str | None = None
     include_index_json: bool = True
     include_meta_json: bool = True
 
@@ -143,7 +143,7 @@ class FeatureCacheConfig(ConfigSection):
         default_factory=lambda: ["safetensors_shard", "npy_memmap_shard"]
     )
     shard_max_samples: int = 64
-    shard_dtype: str = "float16"
+    shard_dtype: str | None = None
     payload_cache_enabled: bool = True
     payload_cache_scope: str = "active_pool"
     payload_cache_device: str = "cpu"

@@ -61,7 +61,7 @@ client:
  feature_upload:
   storage_format: "safetensors_shard"
   shard_max_samples: 64
-  shard_dtype: "float16"
+  shard_dtype: null # e.g. float16; null to inherit model dtype
   include_index_json: true
   include_meta_json: true
  # retrain
@@ -193,7 +193,7 @@ server:
     - "safetensors_shard"
     - "npy_memmap_shard"
    shard_max_samples: 64
-   shard_dtype: "float16"
+   shard_dtype: null
    payload_cache_enabled: true
    payload_cache_scope: "active_pool"
    payload_cache_device: "cpu"

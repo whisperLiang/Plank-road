@@ -50,6 +50,15 @@ def _first_nonempty(*values: object) -> str:
     return ""
 
 
+def _normalise_shard_dtype(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "original", "preserve"}:
+        return None
+    return text
+
+
 def _stable_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
 
@@ -161,7 +170,7 @@ def pack_high_quality_sync_bundle(
     edge_id: int,
     shard_size: int,
     storage_format: str = "safetensors_shard",
-    shard_dtype: str | None = "float16",
+    shard_dtype: str | None = None,
     request_id: str | None = None,
     split_context: Mapping[str, Any] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
@@ -192,7 +201,7 @@ def pack_high_quality_sync_bundle_to_file(
     edge_id: int,
     shard_size: int,
     storage_format: str = "safetensors_shard",
-    shard_dtype: str | None = "float16",
+    shard_dtype: str | None = None,
     request_id: str | None = None,
     split_context: Mapping[str, Any] | None = None,
     output_dir: str | None = None,
@@ -340,7 +349,7 @@ def pack_high_quality_sync_bundle_to_file(
             output_root=output_dir,
             storage_format=storage_format,
             shard_max_samples=resolved_shard_size,
-            shard_dtype=shard_dtype,
+            shard_dtype=_normalise_shard_dtype(shard_dtype),
             runtime_context=runtime_context,
             generation=resolved_request_id,
             entries=feature_entries,
@@ -419,8 +428,8 @@ class HighQualitySampleSyncer:
             getattr(feature_upload_config, "storage_format", "safetensors_shard")
             or "safetensors_shard"
         )
-        self.shard_dtype = str(
-            getattr(feature_upload_config, "shard_dtype", "float16") or "float16"
+        self.shard_dtype = _normalise_shard_dtype(
+            getattr(feature_upload_config, "shard_dtype", None)
         )
         configured_max = getattr(feature_upload_config, "shard_max_samples", None)
         if configured_max not in (None, ""):

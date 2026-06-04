@@ -44,7 +44,7 @@ class FeatureShardStore:
         storage_format: str = SAFETENSORS_SHARD,
         accepted_storage_formats: Sequence[str] | None = None,
         shard_max_samples: int = 64,
-        shard_dtype: str | None = "float16",
+        shard_dtype: str | None = None,
         payload_cache_enabled: bool = True,
         payload_cache_max_cpu_bytes: int = 4 * 1024 * 1024 * 1024,
         pin_memory: bool = True,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import threading
+from dataclasses import replace
 
 import pytest
 import torch
@@ -205,6 +206,29 @@ def test_boundary_cache_uses_torchlens_protocol_and_rejects_old_protocol(tmp_pat
         torch.save({"cache_protocol": "old-boundary-cache", "intermediate": boundary}, handle)
     with pytest.raises(RuntimeError, match="rebuild feature cache"):
         codec.load(old_path)
+
+
+def test_boundary_cache_restores_runtime_dtype_for_compressed_payloads() -> None:
+    model, example, splitter = _prepared_splitter()
+    boundary = splitter.edge_forward(example)
+    compressed = replace(
+        boundary,
+        tensors={
+            label: tensor.to(torch.float16) if tensor.is_floating_point() else tensor
+            for label, tensor in dict(boundary.tensors).items()
+        },
+    )
+    assert any(tensor.dtype == torch.float16 for tensor in compressed.tensors.values())
+
+    codec = BoundaryPayloadCacheCodec(splitter.runtime)
+    restored = codec.to_runtime_device(compressed)
+
+    for label, tensor in restored.tensors.items():
+        expected_dtype = restored.spec[label].dtype
+        assert tensor.dtype == expected_dtype
+    codec.validate(restored)
+    replayed = splitter.cloud_forward(compressed)
+    assert torch.allclose(replayed, model(example), atol=1e-2, rtol=1e-2)
 
 
 def test_splitter_corrects_folded_boundary_batch_metadata() -> None:

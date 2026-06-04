@@ -613,6 +613,15 @@ def _coerce_positive_int(value: object) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _normalise_shard_dtype(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "original", "preserve"}:
+        return None
+    return text
+
+
 def _normalise_label_schema(value: object, default: str = "coco_91") -> str:
     schema = str(value or default).strip().lower()
     return schema or default
@@ -2184,8 +2193,8 @@ class CloudContinualLearner:
             1,
             int(getattr(feature_cache_cfg, "shard_max_samples", 64)),
         )
-        self.feature_cache_shard_dtype = str(
-            getattr(feature_cache_cfg, "shard_dtype", "float16") or ""
+        self.feature_cache_shard_dtype = _normalise_shard_dtype(
+            getattr(feature_cache_cfg, "shard_dtype", None)
         )
         self.feature_cache_payload_cache_enabled = bool(
             getattr(feature_cache_cfg, "payload_cache_enabled", True)
