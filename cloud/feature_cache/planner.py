@@ -210,6 +210,10 @@ class FeatureCachePlanner:
     ) -> None:
         self.store = store
         self.materialization_mode = str(materialization_mode or "direct_ref").strip().lower()
+        if self.materialization_mode != "direct_ref":
+            raise ValueError(
+                "FeatureCachePlanner only supports materialization_mode='direct_ref'."
+            )
         self.validate_refs = bool(validate_refs)
 
     def _existing_entry(
@@ -222,10 +226,14 @@ class FeatureCachePlanner:
         path = _candidate_feature_path(sample)
         sample_key = _sample_id(sample)
         layout_id = _layout_id(sample, ref) or str(runtime_context.get("feature_layout_id") or "")
+        sample_source = str(sample.get("sample_source") or sample.get("sample_type") or "")
         key = _key_for_sample(
             sample,
             runtime_context=runtime_context,
-            source=str(sample.get("feature_source") or "cloud_rebuilt"),
+            source=str(
+                sample.get("feature_source")
+                or ("edge_uploaded" if sample_source == "high_quality" else "cloud_rebuilt")
+            ),
             feature_layout_id=layout_id,
         )
         if ref is not None:

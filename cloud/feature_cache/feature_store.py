@@ -4,7 +4,6 @@ import gzip
 import json
 import os
 import re
-import shutil
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -369,28 +368,15 @@ class FeatureBlobStore:
                 )
 
         mode = str(materialization_mode or "direct_ref").strip().lower()
-        target = source if mode == "direct_ref" else self.feature_path(key)
+        if mode != "direct_ref":
+            raise ValueError(
+                "FeatureBlobStore only supports materialization_mode='direct_ref'."
+            )
+        target = source
         with self._lock:
             existing = self.lookup(key)
             if existing is not None:
                 return existing
-            if mode == "hardlink":
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                try:
-                    os.link(source, target)
-                except OSError:
-                    shutil.copyfile(source, target)
-            elif mode == "symlink":
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                try:
-                    os.symlink(source, target)
-                except FileExistsError:
-                    pass
-            elif mode == "copy":
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                shutil.copyfile(source, target)
-            elif mode != "direct_ref":
-                raise ValueError(f"Unsupported feature materialization mode: {materialization_mode!r}")
 
             ref = self._build_ref(
                 key,
@@ -424,41 +410,17 @@ class FeatureBlobStore:
         *,
         mode: str,
     ) -> dict[str, int]:
+        del destination_path
         mode = str(mode or "direct_ref").strip().lower()
         stats = {
             "bytes_copied": 0,
             "files_copied": 0,
-            "hardlinks_created": 0,
-            "symlinks_created": 0,
             "direct_refs_created": 0,
         }
         if mode == "direct_ref":
             stats["direct_refs_created"] = 1
             return stats
-        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-        try:
-            if os.path.lexists(destination_path):
-                os.remove(destination_path)
-        except OSError:
-            pass
-        if mode == "hardlink":
-            try:
-                os.link(ref.path, destination_path)
-                stats["hardlinks_created"] = 1
-            except OSError:
-                shutil.copyfile(ref.path, destination_path)
-                stats["files_copied"] = 1
-                stats["bytes_copied"] = int(os.path.getsize(destination_path))
-        elif mode == "symlink":
-            os.symlink(ref.path, destination_path)
-            stats["symlinks_created"] = 1
-        elif mode == "copy":
-            shutil.copyfile(ref.path, destination_path)
-            stats["files_copied"] = 1
-            stats["bytes_copied"] = int(os.path.getsize(destination_path))
-        else:
-            raise ValueError(f"Unsupported materialization mode: {mode!r}")
-        return stats
+        raise ValueError("FeatureBlobStore only supports materialization mode 'direct_ref'.")
 
 
 __all__ = [

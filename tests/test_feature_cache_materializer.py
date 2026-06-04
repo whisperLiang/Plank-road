@@ -97,13 +97,15 @@ def test_materializer_rebuilds_only_planned_samples_and_writes_view(tmp_path) ->
 
     assert calls == [([str(raw_path)], ["rebuilt"])]
     assert result.view is not None
+    assert result.view.source == "canonical_active"
     assert result.view.manifest_path.endswith("view_manifest.json")
     assert set(result.records) == {"existing", "rebuilt"}
     assert result.stats.low_quality_rebuilt == 1
     assert result.stats.files_copied == 0
+    assert result.stats.bytes_copied == 0
 
 
-def test_materializer_copy_mode_and_oom_batch_shrink(tmp_path) -> None:
+def test_materializer_direct_ref_mode_and_oom_batch_shrink(tmp_path) -> None:
     store = FeatureBlobStore(str(tmp_path / "store"))
     payload = _payload()
     layout_id = feature_layout_id(feature_layout_from_tensors(payload.tensors))
@@ -135,18 +137,17 @@ def test_materializer_copy_mode_and_oom_batch_shrink(tmp_path) -> None:
             }
         )
     plan = FeatureCachePreparePlan(
-        view_id="view-copy",
+        view_id="view-direct-ref",
         generation="gen-a",
         feature_layout_id=layout_id,
         contract_id="contract-a",
-        materialization_mode="copy",
+        materialization_mode="direct_ref",
         runtime_context={"feature_layout_id": layout_id, "feature_rebuild_batch_size": 2},
         rebuild_low_quality_from_raw=rebuilds,
     )
     result = FeatureCacheMaterializer(
         store,
         view_root_dir=str(tmp_path / "views"),
-        materialization_mode="copy",
         feature_rebuild_batch_size=2,
         rebuild_provider=provider,
     ).prepare(plan)
@@ -154,4 +155,6 @@ def test_materializer_copy_mode_and_oom_batch_shrink(tmp_path) -> None:
     assert calls[0] == (2, 2)
     assert calls[1:] == [(1, 1), (1, 1)]
     assert result.stats.low_quality_rebuilt == 2
-    assert result.stats.files_copied == 2
+    assert result.stats.files_copied == 0
+    assert result.stats.bytes_copied == 0
+    assert result.stats.direct_refs_created == 2

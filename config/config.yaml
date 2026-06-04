@@ -177,12 +177,14 @@ server:
   batch_size: 32
   feature_cache_mode: auto
   feature_cache:
-   enabled: true
-   store_root_dir: "./cache/feature_cache/store"
-   view_root_dir: "./cache/feature_cache/views"
+   view_source: canonical_active
    materialization_mode: direct_ref
+   view_root_dir: "./cache/cloud_training_views"
+   store_root_dir: "./cache/cloud_feature_store"
+   validate_refs: true
    feature_rebuild_batch_size: 16
-   max_live_generations: 3
+   gc_enabled: false
+   gc_dry_run: true
   teacher_batch_size: 32
   proxy_eval_interval_rounds: 10
   proxy_eval_patience: 2

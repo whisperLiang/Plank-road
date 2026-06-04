@@ -162,6 +162,7 @@ class TrainingCacheView:
     generation: str
     feature_layout_id: str
     contract_id: str
+    source: str
     samples: list[SampleTrainingRef]
     manifest_path: str
     metadata_index_path: str
@@ -174,6 +175,7 @@ class TrainingCacheView:
             "generation": self.generation,
             "feature_layout_id": self.feature_layout_id,
             "contract_id": self.contract_id,
+            "source": self.source,
             "sample_count": len(self.samples),
             "created_at": float(self.created_at),
             "manifest_path": self.manifest_path,
@@ -193,8 +195,6 @@ class FeatureCacheStats:
     invalid_dropped: int = 0
     bytes_copied: int = 0
     files_copied: int = 0
-    hardlinks_created: int = 0
-    symlinks_created: int = 0
     direct_refs_created: int = 0
     cache_hits: int = 0
     cache_misses: int = 0

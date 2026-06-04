@@ -121,14 +121,17 @@ class TeacherAnnotationConfig(ConfigSection):
 
 @dataclass
 class FeatureCacheConfig(ConfigSection):
-    enabled: bool = True
-    store_root_dir: str = "./cache/feature_cache/store"
-    view_root_dir: str = "./cache/feature_cache/views"
+    view_source: str = "canonical_active"
     materialization_mode: str = "direct_ref"
+    view_root_dir: str = "./cache/cloud_training_views"
+    store_root_dir: str = "./cache/cloud_feature_store"
+    validate_refs: bool = True
     feature_rebuild_batch_size: int = 16
-    max_live_generations: int = 3
+    gc_enabled: bool = False
+    gc_dry_run: bool = True
 
     def __post_init__(self) -> None:
+        self.view_source = str(self.view_source).strip().lower()
         self.materialization_mode = str(self.materialization_mode).strip().lower()
 
 
@@ -645,10 +648,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "server.continual_learning.teacher_annotation.cache_root_dir must be non-empty"
         )
     feature_cache = config.server.continual_learning.feature_cache
-    if not isinstance(feature_cache.enabled, bool):
+    if str(feature_cache.view_source).strip().lower() != "canonical_active":
         raise ValueError(
-            "server.continual_learning.feature_cache.enabled must be a boolean, "
-            f"got {feature_cache.enabled!r}"
+            "server.continual_learning.feature_cache.view_source must be "
+            "'canonical_active', "
+            f"got {feature_cache.view_source!r}"
         )
     if not str(feature_cache.store_root_dir).strip():
         raise ValueError(
@@ -659,21 +663,31 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "server.continual_learning.feature_cache.view_root_dir must be non-empty"
         )
     feature_cache_mode = str(feature_cache.materialization_mode).strip().lower()
-    if feature_cache_mode not in {"direct_ref", "copy", "hardlink", "symlink"}:
+    if feature_cache_mode != "direct_ref":
         raise ValueError(
-            "server.continual_learning.feature_cache.materialization_mode must be one of "
-            "{'direct_ref', 'copy', 'hardlink', 'symlink'}, "
+            "server.continual_learning.feature_cache.materialization_mode must be "
+            "'direct_ref', "
             f"got {feature_cache.materialization_mode!r}"
+        )
+    if not isinstance(feature_cache.validate_refs, bool):
+        raise ValueError(
+            "server.continual_learning.feature_cache.validate_refs must be a boolean, "
+            f"got {feature_cache.validate_refs!r}"
         )
     _validate_positive(
         "server.continual_learning.feature_cache.feature_rebuild_batch_size",
         int(feature_cache.feature_rebuild_batch_size),
     )
-    _validate_positive(
-        "server.continual_learning.feature_cache.max_live_generations",
-        int(feature_cache.max_live_generations),
-        allow_zero=True,
-    )
+    if not isinstance(feature_cache.gc_enabled, bool):
+        raise ValueError(
+            "server.continual_learning.feature_cache.gc_enabled must be a boolean, "
+            f"got {feature_cache.gc_enabled!r}"
+        )
+    if not isinstance(feature_cache.gc_dry_run, bool):
+        raise ValueError(
+            "server.continual_learning.feature_cache.gc_dry_run must be a boolean, "
+            f"got {feature_cache.gc_dry_run!r}"
+        )
     _validate_positive(
         "server.das.probe_samples",
         int(config.server.das.probe_samples),

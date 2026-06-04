@@ -151,6 +151,10 @@ class FeatureCacheMaterializer:
         self.store = store
         self.view_root_dir = os.path.abspath(str(view_root_dir))
         self.materialization_mode = str(materialization_mode or "direct_ref").strip().lower()
+        if self.materialization_mode != "direct_ref":
+            raise ValueError(
+                "FeatureCacheMaterializer only supports materialization_mode='direct_ref'."
+            )
         self.feature_rebuild_batch_size = max(1, int(feature_rebuild_batch_size or 16))
         self.dynamic_batch_range = dynamic_batch_range
         self.rebuild_provider = rebuild_provider
@@ -165,6 +169,10 @@ class FeatureCacheMaterializer:
 
     def _rebuild_features(self, plan: FeatureCachePreparePlan, stats: FeatureCacheStats) -> list[dict[str, object]]:
         if not plan.rebuild_low_quality_from_raw:
+            logger.info(
+                "[FeatureCache][Rebuild] requested=0 rebuilt=0 failures=0 rebuild_batch_size={} rebuild_batches=0 rebuild_time=0.000s cache_write_time=0.000s",
+                self.feature_rebuild_batch_size,
+            )
             return []
         if self.rebuild_provider is None:
             raise RuntimeError("FeatureCacheMaterializer requires a rebuild_provider for raw rebuild entries.")
@@ -255,6 +263,13 @@ class FeatureCacheMaterializer:
             stats.cache_write_time,
         )
         return rebuilt_entries
+
+    def rebuild_low_quality_features_only(
+        self,
+        plan: FeatureCachePreparePlan,
+    ) -> list[dict[str, object]]:
+        """Rebuild only raw low-quality feature entries into the feature store."""
+        return self._rebuild_features(plan, plan.stats)
 
     def _view_dir(self, view_id: str) -> str:
         return os.path.join(self.view_root_dir, str(view_id))
@@ -348,6 +363,7 @@ class FeatureCacheMaterializer:
         feature_layout_id: str,
         contract_id: str,
         entries: Sequence[Mapping[str, object]],
+        source: str = "canonical_active",
         records: Mapping[str, Mapping[str, object]] | None = None,
         stats: FeatureCacheStats | None = None,
     ) -> FeatureCachePrepareResult:
@@ -371,8 +387,6 @@ class FeatureCacheMaterializer:
             )
             stats.bytes_copied += int(op_stats["bytes_copied"])
             stats.files_copied += int(op_stats["files_copied"])
-            stats.hardlinks_created += int(op_stats["hardlinks_created"])
-            stats.symlinks_created += int(op_stats["symlinks_created"])
             stats.direct_refs_created += int(op_stats["direct_refs_created"])
             record = self._record_for_ref(sample_ref, records)
             preloaded_records[sample_ref.sample_id] = record
@@ -411,6 +425,7 @@ class FeatureCacheMaterializer:
             generation=str(generation),
             feature_layout_id=str(feature_layout_id),
             contract_id=str(contract_id),
+            source=str(source),
             samples=sample_refs,
             manifest_path=manifest_path,
             metadata_index_path=metadata_index_path,
@@ -427,6 +442,7 @@ class FeatureCacheMaterializer:
                 "generation": generation,
                 "feature_layout_id": feature_layout_id,
                 "contract_id": contract_id,
+                "source": str(source),
                 "all_sample_ids": [sample.sample_id for sample in sample_refs],
                 "cache_reused": False,
                 "materialization_mode": self.materialization_mode,
@@ -445,6 +461,7 @@ class FeatureCacheMaterializer:
                 "generation": generation,
                 "feature_layout_id": feature_layout_id,
                 "contract_id": contract_id,
+                "source": str(source),
                 "all_sample_ids": [sample.sample_id for sample in sample_refs],
                 "samples": metadata_samples,
             },
@@ -495,7 +512,7 @@ class FeatureCacheMaterializer:
                 "generation_id": generation,
                 "training_view_id": view_id,
                 "training_view_path": view_dir,
-                "feature_cache_enabled": True,
+                "feature_cache_view_source": str(source),
             },
             frame_dir=os.path.join(view_dir, "frames"),
             stats=stats,

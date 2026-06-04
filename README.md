@@ -331,14 +331,13 @@ When the trigger fires:
 
 The cloud:
 1. receives the versioned bundle
-2. expands it into a working cache
-3. reconstructs low-confidence features if necessary
-4. annotates drift samples, plus low-confidence raw samples in both low-confidence modes, with the large model
+2. ensures teacher labels for low-confidence raw samples with the large model
    using `teacher_annotation_threshold`
-5. detects fully-collapsed wrapper checkpoints and falls back to native pretrained weights for that retrain round
-6. runs split-tail retraining
-7. logs a before/after proxy `mAP@0.5` summary on the GT-annotated subset
-8. returns updated edge model weights
+3. plans feature readiness and rebuilds only missing or incompatible low-confidence features
+4. rebuilds the canonical cloud sample pool and creates a direct-ref training view
+5. runs split-tail retraining from `TrainingCacheView(source=canonical_active)`
+6. logs a before/after proxy `mAP@0.5` summary on the GT-annotated subset
+7. returns updated edge model weights
 
 ## Usage
 

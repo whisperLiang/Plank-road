@@ -181,16 +181,18 @@ workspace_root/
     edge_1/
       job_20260408_0001/
         bundle/
-        working_cache/
         outputs/
           model.pth
           metrics.json
           train.log
+  cloud_sample_pool/
+  cloud_training_views/
+  cloud_feature_store/
 ```
 
 要求：
 
-- bundle、工作缓存、模型输出完全按 `job_id` 隔离。
+- bundle、模型输出完全按 `job_id` 隔离；训练输入来自 canonical sample pool 生成的 direct-ref training view。
 - 当前“按请求随机目录隔离”的思路保留，但要把随机目录升级为可追踪的 `job_id`。
 
 ### 4.6 模型版本管理

@@ -127,10 +127,18 @@ def test_canonical_kept_records_can_train_from_feature_cache_view(tmp_path) -> N
         ],
     )
     assert result.bundle_info["all_sample_ids"] == ["sample-1"]
+    assert result.view is not None
+    assert result.view.source == "canonical_active"
+    assert {sample.sample_id for sample in result.view.samples} == {
+        entry["sample_id"] for entry in pool.list_active_samples()
+    }
+    assert result.stats.files_copied == 0
+    assert result.stats.bytes_copied == 0
     assert result.records["sample-1"]["pseudo_boxes"] == []
 
 
-def test_feature_cache_config_defaults_to_enabled_view_path() -> None:
+def test_feature_cache_config_defaults_to_canonical_active_direct_ref() -> None:
     config = ContinualLearningConfig()
     assert config.feature_cache is not None
-    assert config.feature_cache.enabled is True
+    assert config.feature_cache.view_source == "canonical_active"
+    assert config.feature_cache.materialization_mode == "direct_ref"

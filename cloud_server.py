@@ -38,6 +38,12 @@ from cloud.annotation import (
     TeacherLabelCache,
 )
 from cloud.edge_registry import EdgeRegistry
+from cloud.feature_cache import (
+    FeatureBlobStore,
+    FeatureCacheMaterializer,
+    FeatureCachePlanner,
+    FeatureRef,
+)
 from cloud.sample_pool import CloudSamplePool
 from cloud.training import (
     FixedSplitRetrainEngine,
@@ -78,7 +84,6 @@ from model_management.universal_model_split import (
     collect_suffix_trainable_parameters,
     load_split_feature_cache,
     prepare_exact_split_runtime,
-    save_split_feature_cache,
 )
 from model_management.fixed_split_runtime_template import (
     FixedSplitRuntimeTemplate,
@@ -112,7 +117,6 @@ from torchvision.models.detection.image_list import ImageList
 from grpc_server import message_transmission_pb2_grpc
 
 
-_FIXED_SPLIT_WORKING_CACHE_VERSION = 3
 _FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
 _FIXED_SPLIT_DYNAMIC_BATCH_MIN = _FIXED_SPLIT_DYNAMIC_BATCH[0]
 _FIXED_SPLIT_DYNAMIC_BATCH_MAX = _FIXED_SPLIT_DYNAMIC_BATCH[1]
@@ -127,7 +131,6 @@ POOL_LABEL_METADATA_FIELDS = (
     "label_runtime_version",
 )
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
-_AUTO_MEMORY_FEATURE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
 
 class _TeacherAnnotationQueueState:
@@ -248,34 +251,6 @@ def _validate_rfdetr_weights_match_metadata(
         f"at {weights_path} contain {actual}. Configure server.weights_path to "
         "the same custom checkpoint as client.weights_path."
     )
-
-
-def _build_fixed_split_cache_identity(
-    manifest: Mapping[str, object],
-) -> dict[str, object]:
-    manifest_payload = dict(manifest)
-    model_meta = dict(manifest_payload.get("model", {}))
-    split_plan = dict(manifest_payload.get("split_plan", {}))
-    sample_ids = sorted(
-        str(sample.get("sample_id", "")).strip()
-        for sample in manifest_payload.get("samples", [])
-        if isinstance(sample, Mapping) and str(sample.get("sample_id", "")).strip()
-    )
-    identity_payload = {
-        "manifest": manifest_payload,
-        "split_plan": split_plan,
-        "model_id": str(model_meta.get("model_id", "")).strip(),
-        "model_version": str(model_meta.get("model_version", "")).strip(),
-    }
-    return {
-        "cache_version": _FIXED_SPLIT_WORKING_CACHE_VERSION,
-        "fingerprint": _json_fingerprint(identity_payload),
-        "manifest_hash": _json_fingerprint(manifest_payload),
-        "split_plan_hash": _json_fingerprint(split_plan),
-        "model_id": identity_payload["model_id"],
-        "model_version": identity_payload["model_version"],
-        "sample_ids": sample_ids,
-    }
 
 
 def _fixed_split_boundary_from_plan(split_plan: Mapping[str, object]) -> str:
@@ -449,14 +424,6 @@ def _iter_tensors(value: object):
             yield from _iter_tensors(item)
 
 
-def _working_cache_manifest_path(working_cache: str) -> str:
-    return os.path.join(working_cache, "cache_manifest.json")
-
-
-def _working_cache_metadata_index_path(working_cache: str) -> str:
-    return os.path.join(working_cache, "metadata_index.json")
-
-
 def _sanitize_cache_segment(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value).strip()) or "unknown"
 
@@ -482,14 +449,6 @@ def _increment_model_version(
     field_name: str = "model version",
 ) -> str:
     return str(int(_normalize_model_version(value, field_name=field_name)) + 1)
-
-
-def _can_deserialize_split_feature_cache(cache_path: str, sample_id: str) -> bool:
-    try:
-        load_split_feature_cache(cache_path, sample_id)
-    except Exception:
-        return False
-    return True
 
 
 def _load_proxy_eval_frame(
@@ -738,33 +697,6 @@ def _infer_yolo_model_num_classes(model: torch.nn.Module) -> int | None:
         return _infer_yolo_state_dict_num_classes(model.state_dict())
     except Exception:
         return None
-
-
-def _select_fixed_split_gt_sample_ids(
-    manifest: Mapping[str, object],
-    *,
-    prepared_sample_ids: list[str] | tuple[str, ...],
-) -> list[str]:
-    """Choose bundle samples that should receive cloud-side GT annotations.
-
-    Low-quality samples that uploaded a raw frame are annotated by the cloud
-    teacher. High-quality feature-only samples keep edge pseudo labels.
-    """
-    prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
-
-    selected: list[str] = []
-    for sample in manifest.get("samples", []):
-        if not isinstance(sample, Mapping):
-            continue
-        sample_id = str(sample.get("sample_id", "")).strip()
-        if not sample_id or sample_id not in prepared_lookup:
-            continue
-        if not _is_low_quality_trigger_sample(manifest, sample):
-            continue
-        if sample.get("raw_relpath") is None:
-            continue
-        selected.append(sample_id)
-    return selected
 
 
 def _is_low_quality_trigger_sample(
@@ -2246,6 +2178,62 @@ class CloudContinualLearner:
                 "server.continual_learning.feature_cache_mode must be one of: "
                 "auto, memory, disk."
             )
+        feature_cache_cfg = (
+            getattr(cl_cfg, "feature_cache", None)
+            if cl_cfg is not None
+            else None
+        )
+        self.feature_cache_view_source = (
+            str(getattr(feature_cache_cfg, "view_source", "canonical_active"))
+            .strip()
+            .lower()
+        )
+        if self.feature_cache_view_source != "canonical_active":
+            raise ValueError(
+                "server.continual_learning.feature_cache.view_source must be "
+                "'canonical_active'."
+            )
+        self.feature_cache_materialization_mode = (
+            str(getattr(feature_cache_cfg, "materialization_mode", "direct_ref"))
+            .strip()
+            .lower()
+        )
+        if self.feature_cache_materialization_mode != "direct_ref":
+            raise ValueError(
+                "server.continual_learning.feature_cache.materialization_mode must be "
+                "'direct_ref'."
+            )
+        self.feature_cache_store_root_dir = os.path.abspath(
+            str(
+                getattr(
+                    feature_cache_cfg,
+                    "store_root_dir",
+                    "./cache/cloud_feature_store",
+                )
+            )
+        )
+        self.feature_cache_view_root_dir = os.path.abspath(
+            str(
+                getattr(
+                    feature_cache_cfg,
+                    "view_root_dir",
+                    "./cache/cloud_training_views",
+                )
+            )
+        )
+        self.feature_cache_validate_refs = bool(
+            getattr(feature_cache_cfg, "validate_refs", True)
+        )
+        self.feature_cache_feature_rebuild_batch_size = max(
+            1,
+            int(getattr(feature_cache_cfg, "feature_rebuild_batch_size", 16)),
+        )
+        self.feature_cache_gc_enabled = bool(
+            getattr(feature_cache_cfg, "gc_enabled", False)
+        )
+        self.feature_cache_gc_dry_run = bool(
+            getattr(feature_cache_cfg, "gc_dry_run", True)
+        )
         removed_cl_fields = {
             "rebuild_batch_size": (
                 "server.continual_learning.rebuild_batch_size has been removed; "
@@ -2388,11 +2376,8 @@ class CloudContinualLearner:
         self.workspace_root = os.path.abspath(
             str(getattr(config, "workspace_root", "./cache/server_workspace"))
         )
-        self.fixed_split_cache_root = os.path.join(
-            self.workspace_root,
-            "fixed_split_working_cache",
-        )
-        os.makedirs(self.fixed_split_cache_root, exist_ok=True)
+        os.makedirs(self.feature_cache_store_root_dir, exist_ok=True)
+        os.makedirs(self.feature_cache_view_root_dir, exist_ok=True)
         sample_pool_cfg = getattr(config, "sample_pool", None)
         self.sample_pool_enabled = (
             bool(getattr(sample_pool_cfg, "enabled", True))
@@ -2532,19 +2517,6 @@ class CloudContinualLearner:
                 lock = threading.Lock()
                 self._edge_locks[edge_key] = lock
             return lock
-
-    def _fixed_split_working_cache_path(
-        self,
-        *,
-        edge_id: int | str,
-        model_name: str,
-    ) -> str:
-        return os.path.join(
-            self.fixed_split_cache_root,
-            f"edge_{_sanitize_cache_segment(edge_id)}",
-            _sanitize_cache_segment(model_name),
-            "working_cache",
-        )
 
     @staticmethod
     def _sample_pool_manifest_context(
@@ -2796,10 +2768,6 @@ class CloudContinualLearner:
             edge_segment,
             model_segment,
         )
-        working_cache = self._fixed_split_working_cache_path(
-            edge_id=edge_id,
-            model_name=model_name or model_id,
-        )
         stale_contract_dir = os.path.join(
             self.split_contract_root,
             "stale",
@@ -2814,7 +2782,6 @@ class CloudContinualLearner:
             reset_paths = [
                 (pool_front_dir, self.sample_pool_root, "sample_pool"),
                 (staging_model_dir, self.sample_pool_staging_root, "sample_staging"),
-                (working_cache, self.fixed_split_cache_root, "working_cache"),
                 (stale_contract_dir, self.split_contract_root, "stale_contracts"),
             ]
             if split_config_id:
@@ -3321,7 +3288,7 @@ class CloudContinualLearner:
             raise RuntimeError(
                 "SplitRuntimeContract creation requires an exact split id."
             )
-        if feature_tensors is None:
+        if feature_tensors is None and contract_layout_tensors is None:
             raise RuntimeError(
                 "SplitRuntimeContract creation requires a representative feature tensor."
             )
@@ -3447,11 +3414,8 @@ class CloudContinualLearner:
     def _build_low_quality_staging_candidates(
         self,
         *,
-        manifest: Mapping[str, object],
-        prepared_sample_ids,
-        working_cache: str,
-        gt_annotations: Mapping[str, Mapping[str, object]],
-        preloaded_records: Mapping[object, Mapping[str, object]] | None,
+        feature_entries: Sequence[Mapping[str, object]],
+        feature_store: FeatureBlobStore,
         model_input_size: tuple[int, int] | None = None,
         resize_mode: str | None = None,
     ) -> list[dict[str, object]]:
@@ -3461,44 +3425,42 @@ class CloudContinualLearner:
         in canonical ``original_xyxy`` coordinates, and the contract reference
         metadata required by :meth:`CloudSamplePool.rebuild_canonical_training_pool`.
         """
-        prepared_lookup = {str(sample_id) for sample_id in prepared_sample_ids}
         processed_samples: list[dict[str, object]] = []
-        for sample in manifest.get("samples", []):
-            if not isinstance(sample, Mapping):
+        for entry in list(feature_entries or []):
+            if not isinstance(entry, Mapping):
                 continue
-            if not _is_low_quality_trigger_sample(manifest, sample):
-                continue
+            sample = dict(entry.get("sample") or {})
             sample_id = str(sample.get("sample_id", "")).strip()
-            if not sample_id or sample_id not in prepared_lookup:
+            if not sample_id:
                 continue
-            labels = gt_annotations.get(sample_id)
-            if labels is None:
+            labels = sample.get("labels")
+            if not isinstance(labels, Mapping):
                 continue
-            record = _lookup_preloaded_record(preloaded_records, sample_id)
-            if record is None:
-                try:
-                    record = load_split_feature_cache(working_cache, sample_id)
-                except FileNotFoundError:
+            record = dict(entry.get("record") or {})
+            feature_ref = entry.get("feature_ref")
+            if not isinstance(feature_ref, FeatureRef):
+                if isinstance(feature_ref, Mapping):
+                    feature_ref = FeatureRef.from_dict(feature_ref)
+                else:
                     logger.warning(
-                        "[FixedSplitCL] Low-quality sample {} was teacher-labeled but has no cached split feature record; skipping staging.",
+                        "[FeatureCache][Rebuild] low-quality sample_id={} has no feature_ref after readiness planning; skipping staging.",
                         sample_id,
                     )
                     continue
-            split_plan = dict(manifest.get("split_plan", {}) or {})
+            if not record:
+                record = feature_store.read(feature_ref)
             original_size = _original_image_size_from_metadata(record)
             resolved_model_input_size = (
                 model_input_size or self._model_input_size_from_record(record)
             )
             input_tensor_shape = (
                 record.get("input_tensor_shape")
-                or manifest.get("input_tensor_shape")
-                or split_plan.get("input_tensor_shape", [])
+                or sample.get("input_tensor_shape")
                 or []
             )
             metadata_resize_mode = str(
                 record.get("input_resize_mode")
-                or manifest.get("input_resize_mode")
-                or split_plan.get("input_resize_mode")
+                or sample.get("input_resize_mode")
                 or ""
             )
             resolved_resize_mode = str(resize_mode or metadata_resize_mode or "")
@@ -3559,7 +3521,6 @@ class CloudContinualLearner:
                     exc,
                 )
                 continue
-            model_meta = dict(manifest.get("model", {}) or {})
             processed_samples.append(
                 {
                     "sample_id": sample_id,
@@ -3572,16 +3533,14 @@ class CloudContinualLearner:
                     "labels": self._pool_annotations_from_labels(trainable_labels),
                     "sample_source": "low_quality",
                     "label_source": "teacher",
-                    "model_id": str(model_meta.get("model_id", "") or manifest.get("model_id", "") or ""),
+                    "feature_ref": feature_ref.to_dict(),
+                    "feature_record": record,
+                    "model_id": str(sample.get("model_id") or record.get("model_id") or ""),
                     "split_config_id": str(
-                        manifest.get("split_config_id")
-                        or split_plan.get("split_config_id")
-                        or ""
+                        sample.get("split_config_id") or record.get("split_config_id") or ""
                     ),
                     "front_version": str(
-                        manifest.get("front_version")
-                        or split_plan.get("front_version")
-                        or "0"
+                        sample.get("front_version") or record.get("front_version") or "0"
                     ),
                     "input_image_size": [int(dim) for dim in list(original_size)],
                     "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape)],
@@ -3605,141 +3564,6 @@ class CloudContinualLearner:
                 }
             )
         return processed_samples
-
-    def _build_pool_training_inputs(
-        self,
-        sample_pool: CloudSamplePool,
-        *,
-        contract: SplitRuntimeContract,
-        runtime_input_tensor_shape: tuple[int, ...] | list[int] | None = None,
-        input_resize_mode: str | None = None,
-    ) -> tuple[
-        dict[str, object],
-        dict[str, dict[str, object]],
-        dict[str, dict[str, object]],
-        dict[str, dict[str, object]],
-    ]:
-        """Read the current canonical generation into training-ready structures.
-
-        The canonical rebuild that commits the current generation already
-        validated every record against ``contract``. This function therefore
-        performs no filtering, deactivation, or legacy-format cleanup: it only
-        materialises the feature tensors and labels that training needs.
-        """
-        active_entries = sample_pool.list_active_samples()
-        sample_ids: list[str] = []
-        preloaded_records: dict[str, dict[str, object]] = {}
-        annotations: dict[str, dict[str, object]] = {}
-        sample_metadata_by_id: dict[str, dict[str, object]] = {}
-        high_quality_count = 0
-        low_quality_count = 0
-        teacher_count = 0
-        pseudo_count = 0
-        skipped_coordinate_reasons: dict[str, int] = {}
-        runtime_shape = [
-            int(dim)
-            for dim in (runtime_input_tensor_shape or contract.input_tensor_shape)
-        ]
-        effective_resize_mode = str(input_resize_mode or contract.input_resize_mode)
-        for entry in active_entries:
-            sample_id = str(entry.get("sample_id", "") or "")
-            if not sample_id:
-                continue
-            feature_label = sample_pool.reader.read(entry)
-            feature_tensors = self._feature_tensors_from_record(feature_label.feature_record)
-            training_record = dict(feature_label.feature_record)
-            record_shape = [
-                int(dim)
-                for dim in list(
-                    training_record.get("input_tensor_shape")
-                    or entry.get("input_tensor_shape")
-                    or []
-                )
-            ]
-            record_resize_mode = str(
-                training_record.get("input_resize_mode")
-                or entry.get("input_resize_mode")
-                or ""
-            )
-            record_image_size = (
-                training_record.get("input_image_size")
-                or entry.get("input_image_size")
-            )
-            if record_shape != list(runtime_shape) or record_resize_mode != effective_resize_mode:
-                skipped_coordinate_reasons["runtime_metadata_mismatch"] = (
-                    skipped_coordinate_reasons.get("runtime_metadata_mismatch", 0) + 1
-                )
-                logger.warning(
-                    "[FixedSplitCL] Skipping pool sample {} with mismatched runtime metadata "
-                    "(sample_shape={}, sample_resize_mode={}, runtime_shape={}, runtime_resize_mode={}).",
-                    sample_id,
-                    record_shape,
-                    record_resize_mode,
-                    list(runtime_shape),
-                    effective_resize_mode,
-                )
-                continue
-            if record_image_size is None:
-                skipped_coordinate_reasons["missing_input_image_size"] = (
-                    skipped_coordinate_reasons.get("missing_input_image_size", 0) + 1
-                )
-                logger.warning(
-                    "[FixedSplitCL] Skipping pool sample {} with missing input_image_size metadata.",
-                    sample_id,
-                )
-                continue
-            training_record["sample_id"] = sample_id
-            training_record["feature"] = feature_tensors
-            training_record["cloud_batch_split_id"] = contract.cloud_batch_split_id
-            training_record["input_image_size"] = list(record_image_size)
-            training_record["input_tensor_shape"] = record_shape
-            training_record["input_resize_mode"] = record_resize_mode
-            labels = self._pool_annotations_from_labels(feature_label.labels)
-            if self.sample_pool_enable_coordinate_debug:
-                self._log_coordinate_debug_summary(
-                    model_name=str(contract.model_id),
-                    sample_id=sample_id,
-                    metadata=training_record,
-                    labels=labels,
-                )
-            sample_ids.append(sample_id)
-            preloaded_records[sample_id] = training_record
-            annotations[sample_id] = labels
-            sample_metadata_by_id[sample_id] = dict(training_record)
-            source = str(entry.get("sample_source") or training_record.get("sample_source") or "")
-            label_source = str(entry.get("label_source") or training_record.get("label_source") or "")
-            if source == "high_quality":
-                high_quality_count += 1
-            elif source == "low_quality":
-                low_quality_count += 1
-            if label_source == "teacher":
-                teacher_count += 1
-            elif label_source == "edge_pseudo":
-                pseudo_count += 1
-        generation_id = sample_pool.current_generation_id() or "<none>"
-        logger.info(
-            "[FixedSplitCL] Training from canonical pool: generation={} active={} "
-            "high_quality={} low_quality={} teacher_labeled={} pseudo_labeled={}.",
-            generation_id,
-            len(sample_ids),
-            high_quality_count,
-            low_quality_count,
-            teacher_count,
-            pseudo_count,
-        )
-        if self.sample_pool_enable_coordinate_debug:
-            logger.info(
-                "[CoordinateDebug] skipped_sample_count={} reasons={}",
-                sum(skipped_coordinate_reasons.values()),
-                skipped_coordinate_reasons,
-            )
-        bundle_info = {
-            "manifest": {},
-            "all_sample_ids": sample_ids,
-            "from_sample_pool": True,
-            "generation_id": generation_id,
-        }
-        return bundle_info, preloaded_records, annotations, sample_metadata_by_id
 
     @staticmethod
     def _log_coordinate_debug_summary(
@@ -6044,100 +5868,6 @@ class CloudContinualLearner:
             runtime_batch_size=runtime_batch_size,
         )
 
-    @staticmethod
-    def _working_cache_manifest_matches(
-        existing_manifest: Mapping[str, object],
-        expected_identity: Mapping[str, object],
-    ) -> bool:
-        if not existing_manifest:
-            return False
-        return (
-            int(existing_manifest.get("cache_version", -1)) == int(expected_identity["cache_version"])
-            and str(existing_manifest.get("fingerprint", "")).strip()
-            == str(expected_identity["fingerprint"]).strip()
-        )
-
-    def _write_fixed_split_working_cache_manifest(
-        self,
-        working_cache: str,
-        *,
-        cache_identity: Mapping[str, object],
-        bundle_info: Mapping[str, object],
-        cache_reused: bool,
-    ) -> None:
-        manifest_payload = {
-            **dict(cache_identity),
-            "all_sample_ids": list(bundle_info.get("all_sample_ids", [])),
-            "cache_reused": bool(cache_reused),
-            "updated_at": (
-                datetime.now(timezone.utc)
-                .isoformat(timespec="seconds")
-                .replace("+00:00", "Z")
-            ),
-        }
-        _write_json_file(
-            _working_cache_manifest_path(working_cache),
-            manifest_payload,
-        )
-
-    def _validate_fixed_split_working_cache(
-        self,
-        *,
-        working_cache: str,
-        bundle_info: Mapping[str, object],
-        cache_identity: Mapping[str, object],
-        verify_feature_records: bool = False,
-    ) -> tuple[bool, str | None]:
-        if not os.path.isdir(working_cache):
-            return False, "working cache directory is missing"
-
-        feature_dir = os.path.join(working_cache, "features")
-        frame_dir = os.path.join(working_cache, "frames")
-        if not os.path.isdir(feature_dir):
-            return False, "feature cache directory is missing"
-
-        metadata_index = _read_json_file(
-            _working_cache_metadata_index_path(working_cache),
-        )
-        metadata_samples = metadata_index.get("samples")
-        if not isinstance(metadata_samples, Mapping):
-            return False, "metadata index is missing sample entries"
-
-        cached_manifest = _read_json_file(_working_cache_manifest_path(working_cache))
-        if cached_manifest and not self._working_cache_manifest_matches(
-            cached_manifest,
-            cache_identity,
-        ):
-            return False, "cache manifest fingerprint does not match the current bundle"
-
-        for sample_id in bundle_info.get("all_sample_ids", []):
-            sample_key = str(sample_id)
-            feature_path = os.path.join(feature_dir, f"{sample_key}.pt")
-            if not os.path.exists(feature_path):
-                return False, f"cached feature record missing for {sample_key}"
-            if os.path.getsize(feature_path) <= 0:
-                return False, f"cached feature record is empty for {sample_key}"
-            if verify_feature_records and not _can_deserialize_split_feature_cache(
-                working_cache,
-                sample_key,
-            ):
-                return False, f"cached feature record is unreadable for {sample_key}"
-
-            sample_metadata = metadata_samples.get(sample_key)
-            if not isinstance(sample_metadata, Mapping):
-                return False, f"metadata index missing entry for {sample_key}"
-
-            if bool(sample_metadata.get("has_raw_sample")):
-                if not os.path.isdir(frame_dir):
-                    return False, "frame cache directory is missing"
-                frame_path = os.path.join(frame_dir, f"{sample_key}.jpg")
-                if not os.path.exists(frame_path):
-                    return False, f"raw frame missing for {sample_key}"
-                if os.path.getsize(frame_path) <= 0:
-                    return False, f"raw frame is empty for {sample_key}"
-
-        return True, None
-
     def _resolve_fixed_split_learning_rate(
         self,
         model_name: str,
@@ -6241,69 +5971,53 @@ class CloudContinualLearner:
         )
         return int(effective_batch_size)
 
-    def _should_preload_fixed_split_feature_records(
-        self,
-        manifest: Mapping[str, object],
-    ) -> bool:
-        mode = str(getattr(self, "feature_cache_mode", "auto")).strip().lower()
-        if mode == "memory":
-            return True
-        if mode == "disk":
-            return False
-        samples = [
-            sample
-            for sample in list(manifest.get("samples", []) or [])
-            if isinstance(sample, Mapping)
-        ]
-        feature_bytes = sum(int(sample.get("feature_bytes", 0) or 0) for sample in samples)
-        raw_bytes = sum(int(sample.get("raw_bytes", 0) or 0) for sample in samples)
-        estimated_bytes = max(feature_bytes, feature_bytes + raw_bytes // 4)
-        return estimated_bytes <= _AUTO_MEMORY_FEATURE_CACHE_MAX_BYTES
+    def _feature_cache_store(self) -> FeatureBlobStore:
+        return FeatureBlobStore(self.feature_cache_store_root_dir)
 
-    def _cloud_dataloader_kwargs(self, dataset_size: int) -> dict[str, object]:
-        if os.name == "nt" or int(dataset_size) <= 1:
-            num_workers = 0
-        else:
-            cpu_count = os.cpu_count() or 1
-            num_workers = max(0, min(4, cpu_count - 1, int(dataset_size)))
-        kwargs: dict[str, object] = {
-            "num_workers": num_workers,
-            "pin_memory": bool(torch.cuda.is_available()),
+    def _feature_cache_materializer(
+        self,
+        store: FeatureBlobStore,
+        *,
+        rebuild_provider=None,
+    ) -> FeatureCacheMaterializer:
+        return FeatureCacheMaterializer(
+            store,
+            view_root_dir=self.feature_cache_view_root_dir,
+            materialization_mode=self.feature_cache_materialization_mode,
+            feature_rebuild_batch_size=self.feature_cache_feature_rebuild_batch_size,
+            rebuild_provider=rebuild_provider,
+        )
+
+    def _feature_cache_runtime_context(
+        self,
+        *,
+        contract: SplitRuntimeContract,
+        model_name: str,
+    ) -> dict[str, object]:
+        return {
+            "model_id": str(contract.model_id or model_name),
+            "model_family": model_zoo.get_model_family(str(model_name)),
+            "split_config_id": str(contract.split_config_id),
+            "contract_id": str(contract.contract_id),
+            "feature_layout_id": str(contract.feature_layout_id),
+            "boundary_id": str(contract.cloud_batch_split_id or contract.canonical_split_key),
+            "input_tensor_shape": [int(dim) for dim in list(contract.input_tensor_shape)],
+            "input_resize_mode": str(contract.input_resize_mode),
+            "front_version": str(contract.front_version),
+            "feature_rebuild_batch_size": int(self.feature_cache_feature_rebuild_batch_size),
         }
-        if num_workers > 0:
-            kwargs["persistent_workers"] = True
-        return kwargs
 
-    def _prepare_low_quality_trigger_training_cache(
+    def _low_quality_feature_readiness_samples(
         self,
-        model: torch.nn.Module,
-        manifest: dict[str, object],
         *,
         bundle_cache_path: str,
-        working_cache: str,
-        splitter: UniversalModelSplitter | None,
-        candidate: object | None,
-        runtime_batch_size: int | None = None,
-        preloaded_records: dict[str, dict[str, object]] | None = None,
-    ) -> dict[str, object]:
-        os.makedirs(os.path.join(working_cache, "features"), exist_ok=True)
-        os.makedirs(os.path.join(working_cache, "frames"), exist_ok=True)
-        if preloaded_records is not None:
-            preloaded_records.clear()
-
+        manifest: Mapping[str, object],
+        gt_annotations: Mapping[str, Mapping[str, object]],
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         split_plan = dict(manifest.get("split_plan", {}) or {})
-        runtime_contract = dict(
-            manifest.get("_cloud_runtime_contract")
-            or split_plan.get("runtime_contract")
-            or {}
-        )
-        all_sample_ids: list[str] = []
-        processed_items: list[dict[str, object]] = []
-        pending_rebuilds: list[dict[str, object]] = []
-        force_rebuild_features = bool(
-            manifest.get("_cloud_rebuild_features_for_runtime_contract_mismatch")
-        )
-
+        model_meta = dict(manifest.get("model", {}) or {})
+        resolved: list[dict[str, object]] = []
+        unresolved: list[dict[str, object]] = []
         for sample in list(manifest.get("samples", []) or []):
             if not isinstance(sample, Mapping):
                 continue
@@ -6313,363 +6027,215 @@ class CloudContinualLearner:
             raw_relpath = sample.get("raw_relpath")
             if not sample_id or raw_relpath is None:
                 continue
-            raw_path = os.path.join(bundle_cache_path, str(raw_relpath).replace("/", os.sep))
-            if not os.path.exists(raw_path):
-                raise FileNotFoundError(raw_path)
-
-            frame_path = os.path.join(working_cache, "frames", f"{sample_id}.jpg")
-            if (
-                not os.path.exists(frame_path)
-                or os.path.getsize(frame_path) != int(sample.get("raw_bytes") or os.path.getsize(raw_path))
-            ):
-                shutil.copyfile(raw_path, frame_path)
-            frame = cv2.imread(frame_path)
-            input_image_size = (
-                [int(frame.shape[0]), int(frame.shape[1])]
-                if frame is not None and frame.ndim >= 2
-                else None
+            raw_path = os.path.join(
+                bundle_cache_path,
+                str(raw_relpath).replace("/", os.sep),
             )
-
-            item = {
-                "sample": dict(sample),
-                "sample_id": sample_id,
-                "input_image_size": input_image_size,
-                "frame_path": frame_path,
-            }
+            labels = gt_annotations.get(sample_id)
+            if labels is None:
+                unresolved.append({**dict(sample), "sample_id": sample_id, "raw_path": raw_path})
+                continue
+            if not os.path.exists(raw_path):
+                logger.warning(
+                    "[FeatureCache][Plan] low-quality sample_id={} missing raw_path={} and cannot be rebuilt.",
+                    sample_id,
+                    raw_path,
+                )
+                unresolved.append({**dict(sample), "sample_id": sample_id, "raw_path": raw_path})
+                continue
+            input_image_size = sample.get("input_image_size")
+            if input_image_size is None:
+                frame = cv2.imread(raw_path)
+                input_image_size = (
+                    [int(frame.shape[0]), int(frame.shape[1])]
+                    if frame is not None and frame.ndim >= 2
+                    else None
+                )
             feature_relpath = sample.get("feature_relpath")
             feature_path = (
                 os.path.join(bundle_cache_path, str(feature_relpath).replace("/", os.sep))
                 if feature_relpath
                 else None
             )
-            if feature_path and os.path.exists(feature_path) and not force_rebuild_features:
-                record = torch.load(feature_path, map_location="cpu", weights_only=False)
-                if not isinstance(record, dict):
-                    raise TypeError(
-                        f"Low-quality uploaded feature record must be a dict, got {type(record)!r}"
-                    )
-                if input_image_size is not None:
-                    record.setdefault("input_image_size", input_image_size)
-                record.setdefault("runtime_contract", runtime_contract)
-                if runtime_contract.get("feature_layout_id"):
-                    record.setdefault(
-                        "feature_layout_id",
-                        str(runtime_contract.get("feature_layout_id")),
-                    )
-                record.setdefault(
-                    "input_tensor_shape",
-                    list(
-                        manifest.get("input_tensor_shape")
+            resolved.append(
+                {
+                    **dict(sample),
+                    "sample_id": sample_id,
+                    "sample_source": "low_quality",
+                    "label_source": "teacher",
+                    "labels": dict(labels),
+                    "raw_path": raw_path,
+                    **(
+                        {"feature_path": feature_path}
+                        if feature_path and os.path.exists(feature_path)
+                        else {}
+                    ),
+                    "model_id": str(model_meta.get("model_id") or manifest.get("model_id") or ""),
+                    "model_version": str(model_meta.get("model_version") or ""),
+                    "split_config_id": str(
+                        manifest.get("split_config_id")
+                        or split_plan.get("split_config_id")
+                        or ""
+                    ),
+                    "front_version": str(
+                        manifest.get("front_version")
+                        or split_plan.get("front_version")
+                        or "0"
+                    ),
+                    "input_image_size": input_image_size,
+                    "input_tensor_shape": list(
+                        sample.get("input_tensor_shape")
+                        or manifest.get("input_tensor_shape")
                         or split_plan.get("input_tensor_shape", [])
                         or []
                     ),
-                )
-                record.setdefault(
-                    "input_resize_mode",
-                    str(
-                        manifest.get("input_resize_mode")
+                    "input_resize_mode": str(
+                        sample.get("input_resize_mode")
+                        or manifest.get("input_resize_mode")
                         or split_plan.get("input_resize_mode")
                         or "direct_resize"
                     ),
-                )
-                record.setdefault("has_raw_sample", True)
-                processed_items.append({**item, "record": record})
-            else:
-                pending_rebuilds.append({**item, "raw_path": raw_path})
-            all_sample_ids.append(sample_id)
-
-        if pending_rebuilds:
-            provider = self._bundle_batch_feature_provider(
-                model,
-                manifest,
-                bundle_root=bundle_cache_path,
-                splitter=splitter,
-                candidate=candidate,
-                runtime_batch_size=runtime_batch_size,
+                    "has_raw_sample": True,
+                }
             )
-            started = time.perf_counter()
-            logger.info(
-                "[ShardCL][FeatureRebuild] Reconstructing {} low-quality trigger sample(s) on the cloud.",
-                len(pending_rebuilds),
-            )
-            rebuilt_payloads = provider(
-                [str(item["raw_path"]) for item in pending_rebuilds],
-                [dict(item["sample"]) for item in pending_rebuilds],
-                manifest,
-            )
-            if len(rebuilt_payloads) != len(pending_rebuilds):
-                raise RuntimeError(
-                    "Cloud feature reconstruction returned the wrong number of payloads: "
-                    f"expected {len(pending_rebuilds)}, got {len(rebuilt_payloads)}."
-                )
-            for item, intermediate in zip(pending_rebuilds, rebuilt_payloads):
-                processed_items.append({**item, "intermediate": intermediate})
-            logger.info(
-                "[ShardCL][FeatureRebuild] reconstructed_samples={} elapsed={:.3f}s",
-                len(pending_rebuilds),
-                time.perf_counter() - started,
-            )
+        return resolved, unresolved
 
-        metadata_samples: dict[str, dict[str, object]] = {}
-        model_meta = dict(manifest.get("model", {}) or {})
-        for item in processed_items:
-            sample = dict(item["sample"])
-            sample_id = str(item["sample_id"])
-            frame_path = str(item["frame_path"])
-            input_image_size = item.get("input_image_size")
-            if "record" in item:
-                record = dict(item["record"])
-                feature_path = os.path.join(working_cache, "features", f"{sample_id}.pt")
-                os.makedirs(os.path.dirname(feature_path), exist_ok=True)
-                torch.save(record, feature_path)
-            else:
-                record = save_split_feature_cache(
-                    cache_path=working_cache,
-                    frame_index=sample_id,
-                    intermediate=item["intermediate"],
-                    extra_metadata={
-                        "runtime_contract": runtime_contract,
-                        "feature_layout_id": str(
-                            runtime_contract.get("feature_layout_id") or ""
-                        ),
-                        "sample_id": sample_id,
-                        "model_id": str(model_meta.get("model_id", "") or ""),
-                        "model_version": str(model_meta.get("model_version", "") or ""),
-                        "split_config_id": str(
-                            manifest.get("split_config_id")
-                            or split_plan.get("split_config_id")
-                            or ""
-                        ),
-                        "front_version": str(
-                            manifest.get("front_version")
-                            or split_plan.get("front_version")
-                            or "0"
-                        ),
-                        "input_tensor_shape": list(
-                            manifest.get("input_tensor_shape")
-                            or split_plan.get("input_tensor_shape", [])
-                            or []
-                        ),
-                        "input_resize_mode": str(
-                            manifest.get("input_resize_mode")
-                            or split_plan.get("input_resize_mode")
-                            or "direct_resize"
-                        ),
-                        **(
-                            {"input_image_size": input_image_size}
-                            if input_image_size is not None
-                            else {}
-                        ),
-                        "has_raw_sample": True,
-                    },
-                )
-                feature_path = os.path.join(working_cache, "features", f"{sample_id}.pt")
-            if preloaded_records is not None:
-                preloaded_records[sample_id] = record
-            metadata_samples[sample_id] = {
-                "sample_id": sample_id,
-                "feature_relpath": os.path.relpath(feature_path, working_cache).replace("\\", "/"),
-                "feature_file_size": os.path.getsize(feature_path),
-                "frame_relpath": os.path.relpath(frame_path, working_cache).replace("\\", "/"),
-                "frame_file_size": os.path.getsize(frame_path),
-                "has_raw_sample": True,
-                "runtime_contract": runtime_contract,
-                "source_feature_relpath": sample.get("feature_relpath"),
-                "source_feature_bytes": int(sample.get("feature_bytes") or 0),
-                "source_raw_relpath": sample.get("raw_relpath"),
-                "source_raw_bytes": int(sample.get("raw_bytes") or 0),
-                "model_id": str(model_meta.get("model_id", "") or ""),
-                "model_version": str(model_meta.get("model_version", "") or ""),
-                "split_config_id": str(
-                    manifest.get("split_config_id")
-                    or split_plan.get("split_config_id")
-                    or ""
-                ),
-                "front_version": str(
-                    manifest.get("front_version")
-                    or split_plan.get("front_version")
-                    or "0"
-                ),
-                "input_tensor_shape": list(
-                    manifest.get("input_tensor_shape")
-                    or split_plan.get("input_tensor_shape", [])
-                    or []
-                ),
-                "input_resize_mode": str(
-                    manifest.get("input_resize_mode")
-                    or split_plan.get("input_resize_mode")
-                    or "direct_resize"
-                ),
-                **(
-                    {"input_image_size": input_image_size}
-                    if input_image_size is not None
-                    else {}
-                ),
-            }
-
-        _write_json_file(
-            _working_cache_metadata_index_path(working_cache),
-            {
-                "version": 1,
-                "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
-                "model": model_meta,
-                "runtime_contract": runtime_contract,
-                "all_sample_ids": all_sample_ids,
-                "samples": metadata_samples,
-            },
-        )
-        return {
-            "manifest": manifest,
-            "all_sample_ids": all_sample_ids,
-            "from_trigger_shards": True,
-        }
-
-    def _prepare_fixed_split_working_cache(
+    def _prepare_low_quality_feature_entries(
         self,
         model: torch.nn.Module,
         manifest: dict[str, object],
         *,
         bundle_cache_path: str,
-        working_cache: str,
-        force_rebuild: bool = False,
+        gt_annotations: Mapping[str, Mapping[str, object]],
+        split_contract: SplitRuntimeContract,
+        splitter: UniversalModelSplitter,
+        candidate: object,
+        model_name: str,
         runtime_batch_size: int | None = None,
-    ) -> tuple[
-        dict[str, object],
-        str,
-        torch.Tensor | None,
-        UniversalModelSplitter | None,
-        object | None,
-        dict[str, dict[str, object]],
-    ]:
-        cache_identity = _build_fixed_split_cache_identity(manifest)
-        cached_manifest = _read_json_file(_working_cache_manifest_path(working_cache))
-        can_attempt_reuse = (
-            not force_rebuild
-            and os.path.isdir(working_cache)
-            and self._working_cache_manifest_matches(cached_manifest, cache_identity)
+    ) -> list[dict[str, object]]:
+        store = self._feature_cache_store()
+        runtime_context = self._feature_cache_runtime_context(
+            contract=split_contract,
+            model_name=model_name,
         )
-        if force_rebuild or (
-            os.path.isdir(working_cache)
-            and not can_attempt_reuse
-        ):
-            shutil.rmtree(working_cache, ignore_errors=True)
-
-        stage_started = time.perf_counter()
-        prepared_splitter, prepared_candidate = self._build_bundle_splitter(
+        resolved_lq, unresolved_lq = self._low_quality_feature_readiness_samples(
+            bundle_cache_path=bundle_cache_path,
+            manifest=manifest,
+            gt_annotations=gt_annotations,
+        )
+        planner = FeatureCachePlanner(
+            store,
+            materialization_mode=self.feature_cache_materialization_mode,
+            validate_refs=self.feature_cache_validate_refs,
+        )
+        plan = planner.build_plan(
+            resolved_low_quality_samples=resolved_lq,
+            unresolved_low_quality_samples=unresolved_lq,
+            runtime_context=runtime_context,
+            view_id="low_quality_feature_readiness",
+            generation="pending_canonical_rebuild",
+        )
+        provider = self._bundle_batch_feature_provider(
             model,
             manifest,
             bundle_root=bundle_cache_path,
+            splitter=splitter,
+            candidate=candidate,
             runtime_batch_size=runtime_batch_size,
         )
-        self._log_stage_duration("runtime template load / bind", stage_started)
+        rebuilt_entries = self._feature_cache_materializer(
+            store,
+            rebuild_provider=provider,
+        ).rebuild_low_quality_features_only(plan)
+        entries = list(plan.create_training_view)
+        entries.extend(rebuilt_entries)
+        return entries
 
-        preload_records = self._should_preload_fixed_split_feature_records(manifest)
-        preloaded_records: dict[str, dict[str, object]] | None = (
-            {} if preload_records else None
+    def _build_training_cache_view_from_canonical_active(
+        self,
+        sample_pool: CloudSamplePool,
+        *,
+        contract: SplitRuntimeContract,
+        model_name: str,
+        edge_id: int | str,
+    ):
+        active_samples = sample_pool.load_active_samples_for_rebuild(
+            split_contract=contract,
         )
-
-        if can_attempt_reuse:
-            cached_bundle_info = {
-                "manifest": manifest,
-                "all_sample_ids": list(cached_manifest.get("all_sample_ids") or cache_identity["sample_ids"]),
-            }
-            cache_valid, cache_error = self._validate_fixed_split_working_cache(
-                working_cache=working_cache,
-                bundle_info=cached_bundle_info,
-                cache_identity=cache_identity,
-                verify_feature_records=preloaded_records is None,
-            )
-            if cache_valid:
-                if preloaded_records is not None:
-                    try:
-                        for sample_id in cached_bundle_info["all_sample_ids"]:
-                            preloaded_records[str(sample_id)] = load_split_feature_cache(
-                                working_cache,
-                                str(sample_id),
-                            )
-                    except Exception as exc:
-                        cache_valid = False
-                        cache_error = f"cached feature record preload failed: {exc}"
-                if cache_valid:
-                    logger.info(
-                        "[FixedSplitCL] Fixed-split working cache hit; skipped cache prepare/rebuild."
-                    )
-                    self._write_fixed_split_working_cache_manifest(
-                        working_cache,
-                        cache_identity=cache_identity,
-                        bundle_info=cached_bundle_info,
-                        cache_reused=True,
-                    )
-                    return (
-                        cached_bundle_info,
-                        os.path.join(working_cache, "frames"),
-                        None,
-                        prepared_splitter,
-                        prepared_candidate,
-                        dict(preloaded_records or {}),
-                    )
-                if preloaded_records is not None:
-                    preloaded_records.clear()
-            logger.warning(
-                "[FixedSplitCL] Fixed-split working cache reuse skipped ({}); preparing cache.",
-                cache_error,
-            )
-
-        def _prepare_cache() -> dict[str, object]:
-            return self._prepare_low_quality_trigger_training_cache(
-                model,
-                manifest,
-                bundle_cache_path=bundle_cache_path,
-                working_cache=working_cache,
-                splitter=prepared_splitter,
-                candidate=prepared_candidate,
-                runtime_batch_size=runtime_batch_size,
-                preloaded_records=preloaded_records,
-            )
-
-        stage_started = time.perf_counter()
-        bundle_info = _prepare_cache()
-        self._log_stage_duration("cache prepare", stage_started)
-        cache_valid, cache_error = self._validate_fixed_split_working_cache(
-            working_cache=working_cache,
-            bundle_info=bundle_info,
-            cache_identity=cache_identity,
-            verify_feature_records=can_attempt_reuse,
+        generation_id = sample_pool.current_generation_id() or "none"
+        view_id = (
+            f"edge_{_sanitize_cache_segment(edge_id)}_"
+            f"{_sanitize_cache_segment(model_name)}_"
+            f"{_sanitize_cache_segment(generation_id)}_"
+            f"{int(time.time() * 1000)}"
         )
-        if not cache_valid and can_attempt_reuse:
-            logger.warning(
-                "[FixedSplitCL] Fixed-split working cache failed validation ({}); rebuilding.",
-                cache_error,
-            )
-            shutil.rmtree(working_cache, ignore_errors=True)
-            stage_started = time.perf_counter()
-            bundle_info = _prepare_cache()
-            self._log_stage_duration("cache prepare", stage_started)
-            cache_valid, cache_error = self._validate_fixed_split_working_cache(
-                working_cache=working_cache,
-                bundle_info=bundle_info,
-                cache_identity=cache_identity,
-                verify_feature_records=False,
-            )
-        if not cache_valid:
+        store = self._feature_cache_store()
+        planner = FeatureCachePlanner(
+            store,
+            materialization_mode=self.feature_cache_materialization_mode,
+            validate_refs=self.feature_cache_validate_refs,
+        )
+        plan = planner.build_plan(
+            existing_active_samples=active_samples,
+            runtime_context=self._feature_cache_runtime_context(
+                contract=contract,
+                model_name=model_name,
+            ),
+            view_id=view_id,
+            generation=generation_id,
+        )
+        if plan.drop_invalid_samples:
+            dropped_ids = [
+                str(dict(item.get("sample") or {}).get("sample_id") or "")
+                for item in plan.drop_invalid_samples[:10]
+                if isinstance(item, Mapping)
+            ]
             raise RuntimeError(
-                "Fixed-split working cache is incomplete after preparation: "
-                f"{cache_error or 'unknown validation failure'}."
+                "Canonical active samples could not all be direct-referenced into "
+                f"the training view: dropped_preview={dropped_ids}."
             )
-
-        self._write_fixed_split_working_cache_manifest(
-            working_cache,
-            cache_identity=cache_identity,
-            bundle_info=bundle_info,
-            cache_reused=can_attempt_reuse,
+        result = self._feature_cache_materializer(store).prepare(plan)
+        if result.view is None:
+            raise RuntimeError("Feature cache materializer did not create a TrainingCacheView.")
+        active_ids = {str(sample.get("sample_id") or "") for sample in active_samples}
+        view_ids = {sample.sample_id for sample in result.view.samples}
+        if active_ids != view_ids:
+            raise RuntimeError(
+                "TrainingCacheView(source=canonical_active) sample mismatch: "
+                f"active={sorted(active_ids)} view={sorted(view_ids)}."
+            )
+        if int(result.stats.files_copied) != 0 or int(result.stats.bytes_copied) != 0:
+            raise RuntimeError(
+                "TrainingCacheView(source=canonical_active) must use direct refs "
+                f"only; files_copied={result.stats.files_copied} "
+                f"bytes_copied={result.stats.bytes_copied}."
+            )
+        logger.info(
+            "[FeatureCache][CanonicalActive] generation={} active={} view_id={} source=canonical_active",
+            generation_id,
+            len(active_ids),
+            view_id,
         )
+        gt_annotations = {
+            sample.sample_id: self._pool_annotations_from_labels(sample.label_ref.labels or {})
+            for sample in result.view.samples
+        }
+        sample_metadata_by_id = {
+            sample_id: dict(record)
+            for sample_id, record in result.records.items()
+        }
         return (
-            bundle_info,
-            os.path.join(working_cache, "frames"),
-            None,
-            prepared_splitter,
-            prepared_candidate,
-            dict(preloaded_records or {}),
+            result.bundle_info,
+            result.frame_dir or os.path.join(
+                self.feature_cache_view_root_dir,
+                view_id,
+                "frames",
+            ),
+            result.records,
+            gt_annotations,
+            sample_metadata_by_id,
+            result.view,
+            result.stats,
         )
 
     def _collect_teacher_annotations(
@@ -6714,41 +6280,6 @@ class CloudContinualLearner:
             for sample_id in sample_ids
             if str(sample_id) in labels_by_sample_id
         }
-
-    @staticmethod
-    def _load_cached_sample_metadata(
-        cache_path: str,
-        sample_ids,
-        preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
-    ) -> dict[str, dict[str, object]]:
-        metadata: dict[str, dict[str, object]] = {}
-        metadata_index = _read_json_file(_working_cache_metadata_index_path(cache_path))
-        metadata_samples = metadata_index.get("samples")
-        pending_sample_ids: list[str] = []
-        for sample_id in sample_ids:
-            sample_key = str(sample_id)
-            sample_metadata = (
-                metadata_samples.get(sample_key)
-                if isinstance(metadata_samples, Mapping)
-                else None
-            )
-            if isinstance(sample_metadata, Mapping):
-                metadata[sample_key] = dict(sample_metadata)
-                continue
-            record = _lookup_preloaded_record(preloaded_records, sample_key)
-            if record is not None:
-                metadata[sample_key] = dict(record)
-                continue
-            pending_sample_ids.append(sample_key)
-
-        for sample_key in pending_sample_ids:
-            try:
-                record = load_split_feature_cache(cache_path, sample_key)
-            except FileNotFoundError:
-                continue
-            if isinstance(record, dict):
-                metadata[sample_key] = record
-        return metadata
 
     def _evaluate_fixed_split_proxy_map(
         self,
@@ -6931,7 +6462,7 @@ class CloudContinualLearner:
         bundle_info: dict[str, object],
         manifest: dict[str, object],
         bundle_cache_path: str,
-        working_cache: str,
+        training_cache_path: str,
         frame_dir: str,
         gt_annotations: dict[str, dict],
         num_epoch: int,
@@ -7006,7 +6537,7 @@ class CloudContinualLearner:
         split_retrain_kwargs = {
             "model": split_runtime_model,
             "sample_input": prepared_trace_sample_input,
-            "cache_path": working_cache,
+            "cache_path": training_cache_path,
             "all_indices": bundle_info["all_sample_ids"],
             "gt_annotations": gt_annotations,
             "device": self.device,
@@ -7039,7 +6570,7 @@ class CloudContinualLearner:
                 frame_cache=proxy_eval_frame_cache,
                 max_samples=max_samples,
                 inference_batch_size=int(split_retrain_kwargs["batch_size"]),
-                split_cache_path=working_cache,
+                split_cache_path=training_cache_path,
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
@@ -7062,7 +6593,7 @@ class CloudContinualLearner:
                 candidate_thresholds=self.proxy_eval_threshold_candidates,
                 inference_batch_size=int(split_retrain_kwargs["batch_size"]),
                 stage_label=stage_label,
-                split_cache_path=working_cache,
+                split_cache_path=training_cache_path,
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
@@ -7609,28 +7140,15 @@ class CloudContinualLearner:
                     )
                     if tinynext_num_classes is not None:
                         weights_metadata["tinynext_head_num_classes"] = int(tinynext_num_classes)
-                working_cache = self._fixed_split_working_cache_path(
-                    edge_id=edge_id,
-                    model_name=current_model_name,
-                )
                 stage_started = time.perf_counter()
-                (
-                    bundle_info,
-                    frame_dir,
-                    prepared_trace_sample_input,
-                    prepared_splitter,
-                    prepared_candidate,
-                    preloaded_records,
-                ) = (
-                    self._prepare_fixed_split_working_cache(
-                        tmp_model,
-                        manifest,
-                        bundle_cache_path=bundle_cache_path,
-                        working_cache=working_cache,
-                        runtime_batch_size=effective_batch_size,
-                    )
+                prepared_splitter, prepared_candidate = self._build_bundle_splitter(
+                    tmp_model,
+                    manifest,
+                    bundle_root=bundle_cache_path,
+                    runtime_batch_size=effective_batch_size,
                 )
-                self._log_stage_duration("preparing/reusing working cache", stage_started)
+                prepared_trace_sample_input = None
+                self._log_stage_duration("runtime template load / bind", stage_started)
                 pool_runtime_input_tensor_shape = self._infer_pool_runtime_input_tensor_shape(
                     tmp_model,
                     bundle_root=bundle_cache_path,
@@ -7650,36 +7168,29 @@ class CloudContinualLearner:
                     get_split_runtime_input_resize_mode(get_split_runtime_model(tmp_model))
                     or "direct_resize"
                 )
-                gt_sample_ids = _select_fixed_split_gt_sample_ids(
-                    manifest,
-                    prepared_sample_ids=bundle_info["all_sample_ids"],
-                )
                 stage_started = time.perf_counter()
-                gt_annotations = self._collect_teacher_annotations(
-                    frame_dir,
-                    gt_sample_ids,
-                    missing_raw_message="[FixedSplitCL] GT sample {} missing raw frame.",
-                    key_transform=str,
-                    include_empty=True,
-                    target_model_metadata=manifest_model_metadata,
+                teacher_requests = self._build_low_quality_raw_teacher_annotation_requests(
+                    bundle_cache_path=bundle_cache_path,
+                    manifest=manifest,
                     edge_id=edge_id,
                     model_id=current_model_name,
+                    target_model_metadata=manifest_model_metadata,
                 )
-                self._log_stage_duration("teacher annotation", stage_started)
-                stage_started = time.perf_counter()
-                low_quality_staging_candidates = self._build_low_quality_staging_candidates(
-                    manifest=manifest,
-                    prepared_sample_ids=bundle_info["all_sample_ids"],
-                    working_cache=working_cache,
-                    gt_annotations=gt_annotations,
-                    preloaded_records=preloaded_records,
-                    model_input_size=pool_model_input_size,
-                    resize_mode=pool_input_resize_mode,
+                ensure_result = self.teacher_annotation_service.ensure_many(
+                    teacher_requests,
+                    wait=True,
+                    timeout_sec=self.teacher_annotation_wait_timeout_sec,
                 )
+                if ensure_result.unresolved_count:
+                    logger.warning(
+                        "[TeacherAnnotation][Ensure] deferring unresolved low-quality samples before canonical staging: "
+                        "unresolved_count={} sample_ids_preview={}",
+                        ensure_result.unresolved_count,
+                        ensure_result.unresolved_sample_ids[:10],
+                    )
+                gt_annotations = dict(ensure_result.labels_by_sample_id)
+                self._log_stage_duration("teacher annotation ensure", stage_started)
                 pending_high_quality = sample_pool.load_pending_high_quality_samples()
-                low_quality_representative_features = self._first_candidate_feature_tensors(
-                    low_quality_staging_candidates
-                )
                 contract_layout_tensors = self._contract_layout_tensors_from_runtime(
                     splitter=prepared_splitter,
                     candidate=prepared_candidate,
@@ -7694,34 +7205,40 @@ class CloudContinualLearner:
                         )
                     ],
                 )
-                representative_features = (
-                    contract_layout_tensors or low_quality_representative_features
-                )
-                if representative_features is None:
-                    raise RuntimeError(
-                        "No rebuilt low-quality feature sample was available to create "
-                        "the SplitRuntimeContract."
-                    )
-                self._log_pending_high_quality_layout_alignment(
-                    pending_high_quality=pending_high_quality,
-                    expected_tensors=representative_features,
-                    expected_source=(
-                        "runtime"
-                        if contract_layout_tensors is not None
-                        else "low_quality_rebuild"
-                    ),
-                    low_quality_tensors=low_quality_representative_features,
-                )
                 split_contract = self._get_or_create_split_runtime_contract(
                     edge_id=edge_id,
                     manifest=manifest,
-                    feature_tensors=representative_features,
+                    feature_tensors=contract_layout_tensors,
                     contract_layout_tensors=contract_layout_tensors,
                     model=tmp_model,
                     splitter=prepared_splitter,
                     candidate=prepared_candidate,
                     bundle_root=bundle_cache_path,
                     create_if_missing=True,
+                )
+                self._log_pending_high_quality_layout_alignment(
+                    pending_high_quality=pending_high_quality,
+                    expected_tensors=contract_layout_tensors,
+                    expected_source="runtime",
+                    low_quality_tensors=None,
+                )
+                stage_started = time.perf_counter()
+                low_quality_feature_entries = self._prepare_low_quality_feature_entries(
+                    tmp_model,
+                    manifest,
+                    bundle_cache_path=bundle_cache_path,
+                    gt_annotations=gt_annotations,
+                    split_contract=split_contract,
+                    splitter=prepared_splitter,
+                    candidate=prepared_candidate,
+                    model_name=current_model_name,
+                    runtime_batch_size=effective_batch_size,
+                )
+                low_quality_staging_candidates = self._build_low_quality_staging_candidates(
+                    feature_entries=low_quality_feature_entries,
+                    feature_store=self._feature_cache_store(),
+                    model_input_size=pool_model_input_size,
+                    resize_mode=pool_input_resize_mode,
                 )
                 staging_stats = sample_pool.stage_low_quality_samples(
                     low_quality_staging_candidates
@@ -7736,7 +7253,7 @@ class CloudContinualLearner:
                     pending_high_quality_samples=pending_high_quality,
                     new_low_quality_samples=staging_low_quality,
                 )
-                self._log_stage_duration("canonical sample-pool rebuild", stage_started)
+                self._log_stage_duration("feature readiness + canonical sample-pool rebuild", stage_started)
                 logger.info(
                     "[SamplePool] canonical rebuild started: "
                     "existing_active={} pending_high_quality={} new_low_quality={} "
@@ -7818,17 +7335,22 @@ class CloudContinualLearner:
                     len(low_quality_staging_candidates),
                 )
 
+                stage_started = time.perf_counter()
                 (
                     bundle_info,
+                    frame_dir,
                     preloaded_records,
                     gt_annotations,
                     sample_metadata_by_id,
-                ) = self._build_pool_training_inputs(
+                    _training_view,
+                    _training_view_stats,
+                ) = self._build_training_cache_view_from_canonical_active(
                     sample_pool,
                     contract=split_contract,
-                    runtime_input_tensor_shape=pool_runtime_input_tensor_shape,
-                    input_resize_mode=pool_input_resize_mode,
+                    model_name=current_model_name,
+                    edge_id=edge_id,
                 )
+                self._log_stage_duration("training cache view materialization", stage_started)
                 active_sample_count = len(bundle_info["all_sample_ids"])
                 required_dynamic_batch_min = max(
                     _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
@@ -7847,11 +7369,9 @@ class CloudContinualLearner:
                     current_model_name,
                     num_train_samples=active_sample_count,
                 )
-                working_cache = sample_pool.root_dir
-                frame_dir = os.path.join(sample_pool.root_dir, "frames")
-                os.makedirs(frame_dir, exist_ok=True)
+                training_cache_path = str(bundle_info.get("training_view_path") or "")
                 logger.info(
-                    "[FixedSplitCL] Training from {} active cloud sample-pool sample(s) ({} label entry/entries).",
+                    "[FixedSplitCL] Training from {} canonical-active sample(s) via TrainingCacheView(source=canonical_active) ({} label entry/entries).",
                     len(bundle_info["all_sample_ids"]),
                     len(gt_annotations),
                 )
@@ -7896,7 +7416,7 @@ class CloudContinualLearner:
                         candidate_thresholds=self.proxy_eval_threshold_candidates,
                         inference_batch_size=effective_batch_size,
                         stage_label="proxy evaluation before retrain",
-                        split_cache_path=working_cache,
+                        split_cache_path=training_cache_path,
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
@@ -7912,7 +7432,7 @@ class CloudContinualLearner:
                         frame_cache=proxy_eval_frame_cache,
                         max_samples=self.proxy_eval_max_samples,
                         inference_batch_size=effective_batch_size,
-                        split_cache_path=working_cache,
+                        split_cache_path=training_cache_path,
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
@@ -7934,103 +7454,13 @@ class CloudContinualLearner:
                         len(gt_annotations),
                     )
 
-                if (
-                    gt_annotations
-                    and is_wrapper_fixed_split
-                    and _proxy_metrics_indicate_dead_detector(proxy_metrics_before)
-                    and not bool(bundle_info.get("from_sample_pool", False))
-                ):
-                    if str(current_model_name).lower().startswith("rfdetr_"):
-                        logger.warning(
-                            "[FixedSplitCL] Cached {} weights produced no detections on {} GT samples, "
-                            "but keeping the cached model because resetting RF-DETR changes split-boundary labels "
-                            "and invalidates the uploaded edge features.",
-                            current_model_name,
-                            len(gt_annotations),
-                        )
-                    else:
-                        logger.warning(
-                            "[FixedSplitCL] Cached {} weights produced no detections on {} GT samples; "
-                            "resetting to native pretrained weights for this retrain round.",
-                            current_model_name,
-                            len(gt_annotations),
-                        )
-                        tmp_model = self._build_native_training_model(
-                            current_model_name,
-                            runtime_input_tensor_shape=manifest_runtime_input_shape,
-                            model_metadata=manifest_model_metadata,
-                        )
-                        baseline_source = "native pretrained"
-                        tmp_model.to(self.device)
-                        get_split_runtime_model(tmp_model).eval()
-                        stage_started = time.perf_counter()
-                        (
-                            bundle_info,
-                            frame_dir,
-                            prepared_trace_sample_input,
-                            prepared_splitter,
-                            prepared_candidate,
-                            preloaded_records,
-                        ) = (
-                            self._prepare_fixed_split_working_cache(
-                                tmp_model,
-                                manifest,
-                                bundle_cache_path=bundle_cache_path,
-                                working_cache=working_cache,
-                                force_rebuild=True,
-                                runtime_batch_size=effective_batch_size,
-                            )
-                        )
-                        self._log_stage_duration("preparing/reusing working cache", stage_started)
-                        sample_metadata_by_id = self._load_cached_sample_metadata(
-                            working_cache,
-                            bundle_info["all_sample_ids"],
-                            preloaded_records=preloaded_records,
-                        )
-                        stage_started = time.perf_counter()
-                        if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
-                            proxy_metrics_before = self._evaluate_tinynext_proxy_map(
-                                tmp_model,
-                                frame_dir=frame_dir,
-                                gt_annotations=gt_annotations,
-                                model_name=current_model_name,
-                                sample_metadata_by_id=sample_metadata_by_id,
-                                frame_cache=proxy_eval_frame_cache,
-                                max_samples=self.proxy_eval_max_samples,
-                                candidate_thresholds=self.proxy_eval_threshold_candidates,
-                                inference_batch_size=effective_batch_size,
-                                stage_label="proxy evaluation before retrain",
-                                split_cache_path=working_cache,
-                                splitter=prepared_splitter,
-                                split_candidate=prepared_candidate,
-                                preloaded_records=preloaded_records,
-                                allow_dead_baseline_fast_path=True,
-                            )
-                        else:
-                            proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
-                                tmp_model,
-                                frame_dir=frame_dir,
-                                gt_annotations=gt_annotations,
-                                model_name=current_model_name,
-                                sample_metadata_by_id=sample_metadata_by_id,
-                                frame_cache=proxy_eval_frame_cache,
-                                max_samples=self.proxy_eval_max_samples,
-                                inference_batch_size=effective_batch_size,
-                                split_cache_path=working_cache,
-                                splitter=prepared_splitter,
-                                split_candidate=prepared_candidate,
-                                preloaded_records=preloaded_records,
-                            )
-                        proxy_metrics_before_elapsed = time.perf_counter() - stage_started
-                        self._log_stage_duration("proxy evaluation before retrain", stage_started)
-
                 proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
                     tmp_model,
                     current_model_name=current_model_name,
                     bundle_info=bundle_info,
                     manifest=manifest,
                     bundle_cache_path=bundle_cache_path,
-                    working_cache=working_cache,
+                    training_cache_path=training_cache_path,
                     frame_dir=frame_dir,
                     gt_annotations=gt_annotations,
                     num_epoch=effective_num_epoch,
@@ -8087,7 +7517,7 @@ class CloudContinualLearner:
                         candidate_thresholds=self.proxy_eval_threshold_candidates,
                         inference_batch_size=effective_batch_size,
                         stage_label="full baseline proxy recheck",
-                        split_cache_path=working_cache,
+                        split_cache_path=training_cache_path,
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
