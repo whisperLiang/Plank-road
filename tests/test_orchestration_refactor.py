@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from cloud.orchestration.sample_stage import CanonicalSampleStage
-from cloud.training.proxy_eval import FixedSplitProxyEvaluator
+from cloud.training import FixedSplitProxyEvaluator
 
 
 class FakeLargeOD:
@@ -108,8 +108,55 @@ def test_cloud_orchestrator_imports_initializes_and_alias_survives(tmp_path) -> 
 def test_orchestrator_does_not_import_private_proxy_helpers() -> None:
     source = Path("cloud/orchestrator.py").read_text(encoding="utf-8")
 
-    assert "from cloud.training.proxy_eval" not in source
+    assert "from cloud.training." + "proxy_eval" not in source
     assert "import _" not in source
+
+
+def test_fixed_split_pipeline_does_not_import_private_proxy_helpers() -> None:
+    source = Path("cloud/orchestration/fixed_split_pipeline.py").read_text(
+        encoding="utf-8",
+    )
+
+    assert "from cloud.training." + "proxy_eval import (" not in source
+    assert "_evaluate_detection_proxy_map" not in source
+    assert "_snapshot_model_state" not in source
+    assert "_proxy_metrics_indicate_dead_detector" not in source
+    assert "_fixed_split_proxy_rejection_reason" not in source
+    assert "_load" + "_cached_split_batches" not in source
+
+
+def test_fixed_split_dependencies_does_not_bridge_private_proxy_helpers() -> None:
+    source = Path("cloud/orchestration/fixed_split_dependencies.py").read_text(
+        encoding="utf-8",
+    )
+
+    assert "import cloud.training." + "proxy_eval as " + "_proxy" + "_eval" not in source
+    assert "_proxy" + "_eval." not in source
+    assert "from cloud.training." + "proxy_eval import " + "_" not in source
+
+
+def test_sample_stage_preserves_canonical_rebuild_argument_order() -> None:
+    calls = {}
+
+    class FakePool:
+        def rebuild_canonical_training_pool(self, **kwargs):
+            calls.update(kwargs)
+            return {"generation_commit": {"active": 0}}, []
+
+    existing_active = [{"sample_id": "active"}]
+    pending_high_quality = [{"sample_id": "pending"}]
+    new_low_quality = [{"sample_id": "low"}]
+
+    CanonicalSampleStage(FakePool()).rebuild(
+        split_contract=object(),
+        existing_active=existing_active,
+        pending_high_quality=pending_high_quality,
+        new_low_quality=new_low_quality,
+    )
+
+    assert calls["existing_active_samples"] is existing_active
+    assert calls["pending_high_quality_samples"] is pending_high_quality
+    assert calls["new_low_quality_samples"] is new_low_quality
 
 
 def test_full_image_retrain_remains_rejected_public_stub(tmp_path) -> None:

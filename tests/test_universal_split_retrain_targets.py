@@ -4,7 +4,7 @@ import torch
 
 from cloud.feature_cache import FeatureShardStore
 from model_management.payload import boundary_payload_from_tensors
-from model_management.universal_model_split import _load_cached_split_batches
+from model_management.universal_model_split import load_cached_split_batches
 
 
 def _record_with_ref(tmp_path, payload):
@@ -48,7 +48,7 @@ def test_cached_split_batches_attach_coordinate_metadata_to_targets(tmp_path) ->
         "label_coordinate_space": "original_xyxy",
     }
 
-    batches = _load_cached_split_batches(
+    batches = load_cached_split_batches(
         cache_path=str(tmp_path),
         all_indices=["sample-1"],
         annotations={"sample-1": annotation},
@@ -83,7 +83,7 @@ def test_cached_split_batches_preserve_existing_target_split_meta(tmp_path) -> N
         },
     }
 
-    batches = _load_cached_split_batches(
+    batches = load_cached_split_batches(
         cache_path=str(tmp_path),
         all_indices=["sample-1"],
         annotations={"sample-1": annotation},

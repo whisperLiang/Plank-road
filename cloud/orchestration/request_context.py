@@ -148,3 +148,326 @@ class RequestContext:
     workspace: str
     manifest_metadata: dict[str, object]
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
+from cloud.orchestration.runtime_stage import (
+    FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
+    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
+    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
+    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
+    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
+    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
+    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
+    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
+    fixed_split_validation_batches as _fixed_split_validation_batches,
+    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
+    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
+    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
+)
+
+
+class RequestContextMixin:
+    @staticmethod
+    def _sample_pool_manifest_context(
+        manifest: Mapping[str, object],
+    ) -> dict[str, object]:
+        model_meta = dict(manifest.get("model", {}) or {})
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        runtime_contract = dict(
+            manifest.get("runtime_contract")
+            if isinstance(manifest.get("runtime_contract"), Mapping)
+            else split_plan.get("runtime_contract")
+            if isinstance(split_plan.get("runtime_contract"), Mapping)
+            else {}
+        )
+        return {
+            "model_id": str(manifest.get("model_id") or model_meta.get("model_id", "") or ""),
+            "front_version": str(
+                manifest.get("front_version")
+                or split_plan.get("front_version")
+                or "0"
+            ),
+            "split_config_id": str(
+                manifest.get("split_config_id") or split_plan.get("split_config_id", "") or ""
+            ),
+            "feature_layout_id": str(runtime_contract.get("feature_layout_id") or ""),
+            "boundary_tensor_labels": list(
+                runtime_contract.get("boundary_tensor_labels", [])
+                or []
+            ),
+            "canonical_split_key": str(
+                manifest.get("canonical_split_key")
+                or split_plan.get("canonical_split_key")
+                or runtime_contract.get("logical_split_id")
+                or ""
+            ),
+            "edge_split_id": str(
+                manifest.get("edge_split_id")
+                or split_plan.get("edge_split_id")
+                or runtime_contract.get("logical_split_id")
+                or ""
+            ),
+            "input_tensor_shape": list(
+                runtime_contract.get("input_tensor_shape")
+                or manifest.get("input_tensor_shape")
+                or split_plan.get("input_tensor_shape", [])
+                or []
+            ),
+            "input_resize_mode": str(
+                runtime_contract.get("input_resize_mode")
+                or manifest.get("input_resize_mode")
+                or split_plan.get("input_resize_mode")
+                or "direct_resize"
+            ),
+            "runtime_contract": runtime_contract,
+        }
+
+
+    def _cloud_sample_pool_path(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+    ) -> str:
+        context = self._sample_pool_manifest_context(manifest)
+        layout_key = str(context.get("feature_layout_id", "") or "").strip()
+        split_key = (
+            f"feature_layout_{layout_key}"
+            if layout_key
+            else str(context.get("split_config_id", "") or "").strip()
+        )
+        if not split_key:
+            split_key = _json_fingerprint(
+                {
+                    "canonical_split_key": context.get("canonical_split_key"),
+                    "boundary_tensor_labels": list(
+                        context.get("boundary_tensor_labels", []) or []
+                    ),
+                }
+            )[:16]
+        return os.path.join(
+            self.sample_pool_root,
+            f"edge_{_sanitize_cache_segment(edge_id)}",
+            _sanitize_cache_segment(context.get("model_id") or "unknown_model"),
+            f"front_version_{_sanitize_cache_segment(context.get('front_version') or '0')}",
+            _sanitize_cache_segment(split_key),
+        )
+
+
+    def _cloud_sample_staging_path(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+    ) -> str:
+        context = self._sample_pool_manifest_context(manifest)
+        layout_key = str(context.get("feature_layout_id", "") or "").strip()
+        split_key = (
+            f"feature_layout_{layout_key}"
+            if layout_key
+            else str(context.get("split_config_id", "") or "").strip()
+        )
+        if not split_key:
+            split_key = _json_fingerprint(
+                {
+                    "canonical_split_key": context.get("canonical_split_key"),
+                    "boundary_tensor_labels": list(
+                        context.get("boundary_tensor_labels", []) or []
+                    ),
+                }
+            )[:16]
+        return os.path.join(
+            self.sample_pool_staging_root,
+            f"edge_{_sanitize_cache_segment(edge_id)}",
+            _sanitize_cache_segment(context.get("model_id") or "unknown_model"),
+            _sanitize_cache_segment(split_key),
+        )
+
+
+    def _cloud_sample_pool_for_manifest(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+    ) -> CloudSamplePool:
+        context = self._sample_pool_manifest_context(manifest)
+        return CloudSamplePool(
+            self._cloud_sample_pool_path(edge_id=edge_id, manifest=manifest),
+            model_id=str(context.get("model_id", "") or ""),
+            front_version=str(context.get("front_version", "") or "0"),
+            split_config_id=str(context.get("split_config_id", "") or ""),
+            edge_id=edge_id,
+            staging_root=self._cloud_sample_staging_path(edge_id=edge_id, manifest=manifest),
+            boundary_tensor_labels=list(
+                context.get("boundary_tensor_labels", []) or []
+            ),
+            max_active_samples=self.sample_pool_max_active_samples,
+            shard_size=self.sample_pool_shard_size,
+        )
+
+
+    @staticmethod
+    def _manifest_edge_session_id(manifest: Mapping[str, object]) -> str:
+        return str(
+            manifest.get("edge_session_id")
+            or manifest.get("client_session_id")
+            or manifest.get("session_id")
+            or ""
+        ).strip()
+
+
+    @staticmethod
+    def _manifest_model_version(
+        manifest: Mapping[str, object],
+        *,
+        fallback: object = "",
+    ) -> str:
+        model_meta = manifest.get("model")
+        model_meta = dict(model_meta) if isinstance(model_meta, Mapping) else {}
+        return str(
+            manifest.get("model_version")
+            or model_meta.get("model_version")
+            or fallback
+            or ""
+        ).strip()
+
+
+    @staticmethod
+    def _remove_reset_path_if_safe(
+        *,
+        path: str,
+        root: str,
+        label: str,
+    ) -> bool:
+        abs_path = os.path.abspath(str(path or ""))
+        abs_root = os.path.abspath(str(root or ""))
+        if not abs_path or not abs_root:
+            return False
+        if abs_path == abs_root or not abs_path.startswith(abs_root + os.sep):
+            logger.warning(
+                "[FixedSplitCL][InitialReset] Skipping unsafe {} path outside {}: {}",
+                label,
+                abs_root,
+                abs_path,
+            )
+            return False
+        if not os.path.exists(abs_path):
+            return False
+        if os.path.isdir(abs_path):
+            shutil.rmtree(abs_path, ignore_errors=True)
+        else:
+            os.remove(abs_path)
+        return True
+
+
+    def _reset_initial_cloud_state_if_needed(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+        model_name: str,
+        sample_pool: CloudSamplePool,
+        fallback_model_version: object = "",
+        allow_without_session: bool = False,
+    ) -> CloudSamplePool:
+        model_version = self._manifest_model_version(
+            manifest,
+            fallback=fallback_model_version,
+        )
+        if not model_version:
+            return sample_pool
+        try:
+            is_initial_model = (
+                _normalize_model_version(
+                    model_version,
+                    field_name="initial reset model_version",
+                )
+                == "0"
+            )
+        except Exception:
+            is_initial_model = False
+        if not is_initial_model:
+            return sample_pool
+
+        context = self._sample_pool_manifest_context(manifest)
+        model_id = str(context.get("model_id") or model_name or self.edge_model_name)
+        split_config_id = str(context.get("split_config_id") or "").strip()
+        front_version = str(context.get("front_version") or "0")
+        edge_session_id = self._manifest_edge_session_id(manifest)
+        if not edge_session_id and not allow_without_session:
+            return sample_pool
+
+        reset_key = (
+            _stable_json_dumps(
+                {
+                    "edge_id": str(edge_id),
+                    "model_id": model_id,
+                    "front_version": front_version,
+                    "split_config_id": split_config_id,
+                    "edge_session_id": edge_session_id,
+                }
+            )
+            if edge_session_id
+            else ""
+        )
+        edge_segment = f"edge_{_sanitize_cache_segment(edge_id)}"
+        model_segment = _sanitize_cache_segment(model_id)
+        front_segment = f"front_version_{_sanitize_cache_segment(front_version)}"
+        pool_front_dir = os.path.join(
+            self.sample_pool_root,
+            edge_segment,
+            model_segment,
+            front_segment,
+        )
+        staging_model_dir = os.path.join(
+            self.sample_pool_staging_root,
+            edge_segment,
+            model_segment,
+        )
+        stale_contract_dir = os.path.join(
+            self.split_contract_root,
+            "stale",
+            edge_segment,
+            model_segment,
+        )
+        deleted_labels: list[str] = []
+
+        with self._initial_state_reset_lock:
+            if reset_key and reset_key in self._initial_state_reset_sessions:
+                return sample_pool
+            reset_paths = [
+                (pool_front_dir, self.sample_pool_root, "sample_pool"),
+                (staging_model_dir, self.sample_pool_staging_root, "sample_staging"),
+                (stale_contract_dir, self.split_contract_root, "stale_contracts"),
+            ]
+            if split_config_id:
+                reset_paths.append(
+                    (
+                        contract_path(
+                            self.split_contract_root,
+                            edge_id=edge_id,
+                            model_id=model_id,
+                            split_config_id=split_config_id,
+                        ),
+                        self.split_contract_root,
+                        "split_contract",
+                    )
+                )
+            for path, root, label in reset_paths:
+                if self._remove_reset_path_if_safe(path=path, root=root, label=label):
+                    deleted_labels.append(label)
+            if reset_key:
+                self._initial_state_reset_sessions.add(reset_key)
+
+        logger.info(
+            "[FixedSplitCL][InitialReset] edge_id={} model_id={} split_config_id={} "
+            "front_version={} session_id={} cleared={}.",
+            edge_id,
+            model_id,
+            split_config_id or "<none>",
+            front_version,
+            edge_session_id or "<legacy-no-session>",
+            deleted_labels,
+        )
+        return self._cloud_sample_pool_for_manifest(edge_id=edge_id, manifest=manifest)

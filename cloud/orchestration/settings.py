@@ -146,3 +146,403 @@ class OrchestrationSettings:
                 shard_size=max(1, int(getattr(sample_pool_cfg, "shard_size", 64))) if sample_pool_cfg is not None else 64,
             ),
         )
+
+from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
+from cloud.orchestration.runtime_stage import (
+    FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
+    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
+    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
+    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
+    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
+    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
+    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
+    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
+    fixed_split_validation_batches as _fixed_split_validation_batches,
+    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
+    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
+    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
+)
+
+
+class PipelineLifecycleMixin:
+    def __init__(self, config, large_object_detection: Object_Detection):
+        self.config = config
+        self.large_od = large_object_detection
+        self.settings = OrchestrationSettings.from_config(config)
+        settings = self.settings
+
+        # Name of the lightweight model to retrain (mirrors edge model)
+        self.edge_model_name = settings.edge_model_name
+        self.weight_folder = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "model_management",
+            "models",
+        )
+        os.makedirs(self.weight_folder, exist_ok=True)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Resolve and validate configured weights_path if provided
+        configured_weights = str(getattr(config, "weights_path", "") or "").strip()
+        if configured_weights:
+            # Convert relative path to absolute path
+            if not os.path.isabs(configured_weights):
+                configured_weights = os.path.abspath(configured_weights)
+
+            if os.path.exists(configured_weights):
+                configured_model = self._known_model_name_for_weights_path(
+                    configured_weights
+                )
+                if (
+                    configured_model is not None
+                    and configured_model
+                    != self._normalize_model_name_for_lookup(self.edge_model_name)
+                ):
+                    logger.warning(
+                        "[CloudCL] server.weights_path {} is the known artifact for {}, "
+                        "not edge_model_name {}; it will be ignored for edge retraining.",
+                        configured_weights,
+                        configured_model,
+                        self.edge_model_name,
+                    )
+                else:
+                    logger.info(
+                        "[CloudCL] Using configured weights_path for {}: {}",
+                        self.edge_model_name,
+                        configured_weights,
+                    )
+                # Update config with resolved absolute path
+                config.weights_path = configured_weights
+            else:
+                logger.error(
+                    "[CloudCL] Configured weights_path does not exist: {}. "
+                    "This will cause model incompatibility issues!",
+                    configured_weights,
+                )
+        else:
+            logger.warning(
+                "[CloudCL] No weights_path configured for edge model {}. "
+                "Will use default pretrained weights which may be incompatible with edge model.",
+                self.edge_model_name,
+            )
+
+        # Default training hyper-parameters (overridable from config)
+        cl_cfg = getattr(config, "continual_learning", None)
+        self.default_num_epoch = settings.default_num_epoch
+        self.max_concurrent_jobs = settings.max_concurrent_jobs
+        self.batch_size = settings.batch_size
+        self.trace_batch_size = settings.trace_batch_size
+        self.feature_cache_mode = (
+            str(getattr(cl_cfg, "feature_cache_mode", "auto"))
+            if cl_cfg
+            else "auto"
+        ).strip().lower()
+        if self.feature_cache_mode not in {"auto", "memory", "disk"}:
+            raise ValueError(
+                "server.continual_learning.feature_cache_mode must be one of: "
+                "auto, memory, disk."
+            )
+        feature_cache_cfg = (
+            getattr(cl_cfg, "feature_cache", None)
+            if cl_cfg is not None
+            else None
+        )
+        self.feature_cache_view_source = settings.feature_cache.view_source
+        if self.feature_cache_view_source != "canonical_active":
+            raise ValueError(
+                "server.continual_learning.feature_cache.view_source must be "
+                "'canonical_active'."
+            )
+        self.feature_cache_materialization_mode = settings.feature_cache.materialization_mode
+        if self.feature_cache_materialization_mode != "direct_ref":
+            raise ValueError(
+                "server.continual_learning.feature_cache.materialization_mode must be "
+                "'direct_ref'."
+            )
+        self.feature_cache_store_root_dir = settings.feature_cache.store_root_dir
+        self.feature_cache_storage_format = settings.feature_cache.storage_format
+        self.feature_cache_accepted_storage_formats = list(
+            settings.feature_cache.accepted_storage_formats
+        )
+        self.feature_cache_shard_max_samples = max(
+            1,
+            int(getattr(feature_cache_cfg, "shard_max_samples", 64)),
+        )
+        self.feature_cache_shard_dtype = _normalise_shard_dtype(
+            getattr(feature_cache_cfg, "shard_dtype", None)
+        )
+        self.feature_cache_payload_cache_enabled = bool(
+            getattr(feature_cache_cfg, "payload_cache_enabled", True)
+        )
+        self.feature_cache_payload_cache_max_cpu_bytes = int(
+            getattr(feature_cache_cfg, "payload_cache_max_cpu_bytes", 4294967296)
+        )
+        self.feature_cache_pin_memory = bool(getattr(feature_cache_cfg, "pin_memory", True))
+        self.feature_cache_non_blocking_transfer = bool(
+            getattr(feature_cache_cfg, "non_blocking_transfer", True)
+        )
+        self.feature_cache_view_root_dir = settings.feature_cache.view_root_dir
+        self.feature_cache_validate_refs = bool(
+            getattr(feature_cache_cfg, "validate_refs", True)
+        )
+        self.feature_cache_deep_validate_feature_payload = bool(
+            getattr(feature_cache_cfg, "deep_validate_feature_payload", False)
+        )
+        self.feature_cache_deep_validate_sample_rate = max(
+            0.0,
+            min(
+                1.0,
+                float(getattr(feature_cache_cfg, "deep_validate_sample_rate", 0.0)),
+            ),
+        )
+        self.feature_cache_feature_rebuild_batch_size = max(
+            1,
+            int(getattr(feature_cache_cfg, "feature_rebuild_batch_size", 16)),
+        )
+        self.feature_cache_gc_enabled = bool(
+            getattr(feature_cache_cfg, "gc_enabled", False)
+        )
+        self.feature_cache_gc_dry_run = bool(
+            getattr(feature_cache_cfg, "gc_dry_run", True)
+        )
+        removed_cl_fields = {
+            "rebuild_batch_size": (
+                "server.continual_learning.rebuild_batch_size has been removed; "
+                "use server.continual_learning.batch_size for the shared "
+                "cloud continual-learning batch size."
+            ),
+            "min_wrapper_fixed_split_num_epoch": (
+                "server.continual_learning.min_wrapper_fixed_split_num_epoch has been removed; "
+                "cloud fixed-split retraining no longer forces a minimum epoch count."
+            ),
+            "min_rfdetr_fixed_split_num_epoch": (
+                "server.continual_learning.min_rfdetr_fixed_split_num_epoch has been removed; "
+                "cloud fixed-split retraining no longer forces a minimum epoch count."
+            ),
+        }
+        if cl_cfg:
+            for field_name, message in removed_cl_fields.items():
+                if getattr(cl_cfg, field_name, None) is not None:
+                    raise ValueError(message)
+        self.default_split_learning_rate = (
+            float(getattr(cl_cfg, "split_learning_rate", 1e-3))
+            if cl_cfg else 1e-3
+        )
+        self.teacher_annotation_threshold = (
+            float(getattr(cl_cfg, "teacher_annotation_threshold", 0.6))
+            if cl_cfg else 0.6
+        )
+        self.teacher_batch_size = (
+            int(getattr(cl_cfg, "teacher_batch_size", self.batch_size))
+            if cl_cfg else self.batch_size
+        )
+        teacher_settings = settings.teacher_annotation
+        self.teacher_annotation_async_enabled = teacher_settings.async_enabled
+        self.teacher_annotation_cache_enabled = teacher_settings.cache_enabled
+        self.teacher_annotation_wait_timeout_sec = teacher_settings.wait_timeout_sec
+        self.teacher_annotation_worker_batch_size = teacher_settings.worker_batch_size
+        self.teacher_annotation_worker_max_queue_size = (
+            teacher_settings.worker_max_queue_size
+        )
+        self.teacher_annotation_worker_max_retries = teacher_settings.worker_max_retries
+        self.teacher_annotation_oom_retry_enabled = teacher_settings.oom_retry_enabled
+        self.teacher_annotation_min_worker_batch_size = (
+            teacher_settings.min_worker_batch_size
+        )
+        self.teacher_annotation_cache_root = teacher_settings.cache_root_dir
+        raw_proxy_eval_interval_epochs = (
+            getattr(cl_cfg, "proxy_eval_interval_epochs", None)
+            if cl_cfg
+            else None
+        )
+        if raw_proxy_eval_interval_epochs is None and cl_cfg:
+            raw_proxy_eval_interval_epochs = getattr(cl_cfg, "proxy_eval_interval_rounds", 10)
+        self.proxy_eval_interval_epochs = (
+            int(raw_proxy_eval_interval_epochs)
+            if raw_proxy_eval_interval_epochs is not None
+            else 10
+        )
+        self.proxy_eval_interval_rounds = self.proxy_eval_interval_epochs
+        self.proxy_eval_patience = (
+            int(getattr(cl_cfg, "proxy_eval_patience", 2))
+            if cl_cfg else 2
+        )
+        self.proxy_eval_min_delta = (
+            float(getattr(cl_cfg, "proxy_eval_min_delta", 0.002))
+            if cl_cfg else 0.002
+        )
+        self.wrapper_fixed_split_learning_rate = (
+            float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
+            if cl_cfg else 3e-5
+        )
+        self.tinynext_fixed_split_learning_rate = (
+            float(getattr(cl_cfg, "tinynext_fixed_split_learning_rate", 1e-3))
+            if cl_cfg else 1e-3
+        )
+        self.rfdetr_fixed_split_learning_rate = (
+            float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
+            if cl_cfg else 1e-4
+        )
+        self.tinynext_fixed_split_target_steps_per_round = (
+            int(getattr(cl_cfg, "tinynext_fixed_split_target_steps_per_round", 4))
+            if cl_cfg else 4
+        )
+        self.yolo_fixed_split_target_steps_per_round = (
+            int(getattr(cl_cfg, "yolo_fixed_split_target_steps_per_round", 4))
+            if cl_cfg else 4
+        )
+        self.rfdetr_fixed_split_target_steps_per_round = (
+            int(getattr(cl_cfg, "rfdetr_fixed_split_target_steps_per_round", 4))
+            if cl_cfg else 4
+        )
+        raw_proxy_eval_max_samples = getattr(cl_cfg, "proxy_eval_max_samples", None) if cl_cfg else None
+        self.proxy_eval_max_samples = (
+            128
+            if raw_proxy_eval_max_samples in (None, "")
+            else int(raw_proxy_eval_max_samples)
+        )
+        raw_threshold_candidates = (
+            getattr(cl_cfg, "proxy_eval_threshold_candidates", None)
+            if cl_cfg else None
+        )
+        if isinstance(raw_threshold_candidates, (list, tuple)):
+            self.proxy_eval_threshold_candidates = [
+                float(candidate)
+                for candidate in raw_threshold_candidates
+            ]
+        else:
+            self.proxy_eval_threshold_candidates = None
+        self.proxy_eval_frame_cache_enabled = (
+            bool(getattr(cl_cfg, "proxy_eval_frame_cache_enabled", True))
+            if cl_cfg else True
+        )
+        self.connectivity_smoke_only = (
+            bool(getattr(cl_cfg, "connectivity_smoke_only", False))
+            if cl_cfg else False
+        )
+        self.workspace_root = settings.workspace_root
+        os.makedirs(self.feature_cache_store_root_dir, exist_ok=True)
+        os.makedirs(self.feature_cache_view_root_dir, exist_ok=True)
+        sample_pool_cfg = getattr(config, "sample_pool", None)
+        self.sample_pool_enabled = settings.sample_pool.enabled
+        self.sample_pool_root = settings.sample_pool.root_dir
+        os.makedirs(self.sample_pool_root, exist_ok=True)
+        self.sample_pool_staging_root = settings.sample_pool.staging_root
+        os.makedirs(self.sample_pool_staging_root, exist_ok=True)
+        self.split_contract_root = settings.sample_pool.split_contract_root
+        os.makedirs(self.split_contract_root, exist_ok=True)
+        self.sample_pool_max_active_samples = settings.sample_pool.max_active_samples
+        self.sample_pool_shard_size = settings.sample_pool.shard_size
+        self.sample_pool_enable_timing_logs = (
+            bool(getattr(sample_pool_cfg, "enable_timing_logs", False))
+            if sample_pool_cfg is not None
+            else False
+        )
+        self.sample_pool_enable_coordinate_debug = (
+            bool(getattr(sample_pool_cfg, "enable_coordinate_debug", False))
+            if sample_pool_cfg is not None
+            else False
+        )
+        self._fixed_split_runtime_template_cache = (
+            get_fixed_split_runtime_template_cache()
+        )
+
+        # Dynamic Activation Sparsity (SURGEON) config
+        das_cfg = getattr(config, "das", None)
+        self.das_enabled = bool(getattr(das_cfg, "enabled", False)) if das_cfg else False
+        self.das_bn_only = bool(getattr(das_cfg, "bn_only", False)) if das_cfg else False
+        self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
+        self.das_strategy = str(getattr(das_cfg, "strategy", "tgi")) if das_cfg else "tgi"
+        if das_cfg and bool(getattr(das_cfg, "use_spectral_entropy", False)):
+            self.das_strategy = "entropy"
+
+        self._edge_locks_guard = threading.Lock()
+        self._edge_locks: dict[str, threading.Lock] = {}
+        self._job_state_lock = threading.Lock()
+        self._queued_jobs = 0
+        self._active_jobs = 0
+        self._training_slots = threading.BoundedSemaphore(self.max_concurrent_jobs)
+        self._teacher_queue_state = _GLOBAL_TEACHER_ANNOTATION_QUEUE
+        self._initial_state_reset_lock = threading.Lock()
+        self._initial_state_reset_sessions: set[str] = set()
+        self._teacher_weights_fingerprint_cache: str | None = None
+        self.teacher_label_cache = TeacherLabelCache(
+            self.teacher_annotation_cache_root,
+            enabled=self.teacher_annotation_cache_enabled,
+        )
+        self.teacher_annotation_worker: TeacherAnnotationWorker | None = None
+        if (
+            self.teacher_annotation_async_enabled
+            and self.teacher_annotation_cache_enabled
+        ):
+            self.teacher_annotation_worker = TeacherAnnotationWorker(
+                label_cache=self.teacher_label_cache,
+                batch_inference=getattr(self.large_od, "large_inference_batch", None),
+                single_inference=getattr(self.large_od, "large_inference", None),
+                label_builder=self._teacher_labels_from_request_prediction,
+                teacher_scope=self._teacher_annotation_scope,
+                max_queue_size=self.teacher_annotation_worker_max_queue_size,
+                worker_batch_size=self.teacher_annotation_worker_batch_size,
+                max_retries=self.teacher_annotation_worker_max_retries,
+                oom_retry_enabled=self.teacher_annotation_oom_retry_enabled,
+                min_worker_batch_size=self.teacher_annotation_min_worker_batch_size,
+            )
+        self.teacher_annotation_service = TeacherAnnotationService(
+            label_cache=self.teacher_label_cache,
+            worker=self.teacher_annotation_worker,
+        )
+        logger.info(
+            "[TeacherAnnotation][Worker] async_enabled={} cache_enabled={} worker_batch_size={} "
+            "max_queue_size={} cache_root={}",
+            self.teacher_annotation_async_enabled,
+            self.teacher_annotation_cache_enabled,
+            self.teacher_annotation_worker_batch_size,
+            self.teacher_annotation_worker_max_queue_size,
+            self.teacher_annotation_cache_root,
+        )
+
+
+    def close(self) -> None:
+        if self.teacher_annotation_worker is not None:
+            self.teacher_annotation_worker.stop()
+
+
+    def _edge_lock(self, edge_id: int | str) -> threading.Lock:
+        edge_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(edge_id).strip()) or "unknown"
+        with self._edge_locks_guard:
+            lock = self._edge_locks.get(edge_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._edge_locks[edge_key] = lock
+            return lock
+
+
+    @contextmanager
+    def _training_job_scope(self, edge_id: int | str):
+        edge_lock = self._edge_lock(edge_id)
+        with self._job_state_lock:
+            self._queued_jobs += 1
+
+        acquired_slot = False
+        with edge_lock:
+            try:
+                self._training_slots.acquire()
+                acquired_slot = True
+                with self._job_state_lock:
+                    self._queued_jobs = max(0, self._queued_jobs - 1)
+                    self._active_jobs += 1
+                yield
+            finally:
+                self._set_current_teacher_ticket(None)
+                if acquired_slot:
+                    with self._job_state_lock:
+                        self._active_jobs = max(0, self._active_jobs - 1)
+                    self._training_slots.release()
+                else:
+                    with self._job_state_lock:
+                        self._queued_jobs = max(0, self._queued_jobs - 1)
+
+
+    def training_queue_state(self) -> tuple[int, int]:
+        with self._job_state_lock:
+            return self._queued_jobs + self._active_jobs, self.max_concurrent_jobs

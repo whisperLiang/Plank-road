@@ -16,7 +16,9 @@ from cloud.feature_cache import (
     FeatureShardStore,
 )
 from cloud.sample_pool import CloudSamplePool
-from cloud.training.proxy_eval import _is_low_quality_trigger_sample
+from cloud.training.proxy_metadata import (
+    is_low_quality_trigger_sample as _is_low_quality_trigger_sample,
+)
 from model_management.split_contract import SplitRuntimeContract
 
 

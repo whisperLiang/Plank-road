@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import torch
+from loguru import logger
 
 from cloud.contracts import validate_fixed_split_plan
+from model_management.universal_model_split import load_cached_split_batches
 
 
 FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
@@ -146,6 +151,123 @@ def fixed_split_runtime_validation_signature(
     )
 
 
+def splitter_dynamic_batch_range(
+    splitter: object | None,
+) -> tuple[int, int] | None:
+    sources = [
+        getattr(splitter, "split_spec", None),
+        getattr(getattr(splitter, "runtime", None), "split_spec", None),
+    ]
+    for split_spec in sources:
+        dynamic_batch = getattr(split_spec, "dynamic_batch", None)
+        if dynamic_batch is None:
+            continue
+        try:
+            lower, upper = list(dynamic_batch)[:2]
+            lower_int = max(1, int(lower))
+            upper_int = max(lower_int, int(upper))
+        except (TypeError, ValueError):
+            continue
+        return lower_int, upper_int
+    return None
+
+
+def splitter_dynamic_batch_min(splitter: object | None) -> int:
+    dynamic_batch = splitter_dynamic_batch_range(splitter)
+    return int(dynamic_batch[0]) if dynamic_batch is not None else 1
+
+
+def cached_split_runtime_batch_size_candidates(
+    *,
+    configured_batch_size: int,
+    trace_batch_size: int,
+    dynamic_batch_min: int,
+) -> list[int]:
+    candidates: list[int] = []
+    for value in (configured_batch_size, trace_batch_size, dynamic_batch_min, 1):
+        value = max(1, int(value))
+        if value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def negotiate_cached_split_runtime_batch_size(
+    *,
+    model_name: str,
+    training_cache_path: str,
+    all_sample_ids: Sequence[object],
+    gt_annotations: Mapping[object, object],
+    splitter: Any | None,
+    candidate: Any,
+    configured_batch_size: int,
+    trace_batch_size: int,
+    preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
+) -> int:
+    if splitter is None or not training_cache_path or not all_sample_ids:
+        return max(1, int(configured_batch_size))
+
+    candidates = cached_split_runtime_batch_size_candidates(
+        configured_batch_size=int(configured_batch_size),
+        trace_batch_size=int(trace_batch_size),
+        dynamic_batch_min=splitter_dynamic_batch_min(splitter),
+    )
+    sample_ids = list(all_sample_ids)
+    errors: dict[int, str] = {}
+    for candidate_batch_size in candidates:
+        smoke_indices = sample_ids[
+            : max(1, min(len(sample_ids), int(candidate_batch_size)))
+        ]
+        try:
+            batches = load_cached_split_batches(
+                cache_path=training_cache_path,
+                all_indices=smoke_indices,
+                annotations=gt_annotations,
+                batch_size=int(candidate_batch_size),
+                runtime=splitter,
+                preloaded_records=preloaded_records,
+            )
+            if not batches:
+                raise RuntimeError("cached split smoke validation prepared no batches")
+            _batch_indices, boundary, _targets = batches[0]
+            with torch.no_grad():
+                splitter.cloud_forward(boundary, candidate=candidate)
+        except Exception as exc:  # noqa: BLE001 - negotiation probes candidate sizes.
+            errors[int(candidate_batch_size)] = str(exc) or type(exc).__name__
+            logger.debug(
+                "[FixedSplitCL] cached split runtime batch-size candidate failed "
+                "(model_name={}, batch_size={}, error={}).",
+                model_name,
+                int(candidate_batch_size),
+                errors[int(candidate_batch_size)],
+            )
+            continue
+
+        logger.info(
+            "[FixedSplitCL] negotiated cached split runtime batch size "
+            "(model_name={}, configured_batch_size={}, selected_batch_size={}, candidates={}).",
+            model_name,
+            int(configured_batch_size),
+            int(candidate_batch_size),
+            candidates,
+        )
+        return int(candidate_batch_size)
+
+    error_summary = ", ".join(
+        f"batch_size={batch_size}: {error}" for batch_size, error in errors.items()
+    )
+    logger.warning(
+        "[FixedSplitCL] cached split runtime batch-size negotiation failed "
+        "(model_name={}, candidates={}, errors={}).",
+        model_name,
+        candidates,
+        error_summary,
+    )
+    raise RuntimeError(
+        "Fixed-split cached runtime batch-size negotiation failed for all "
+        f"candidate batch sizes ({error_summary})."
+    )
+
+
 __all__ = [
     "FIXED_SPLIT_DYNAMIC_BATCH",
     "FIXED_SPLIT_DYNAMIC_BATCH_MAX",
@@ -161,4 +283,656 @@ __all__ = [
     "fixed_split_trace_batch_mode_from_plan",
     "fixed_split_trace_batch_size_from_plan",
     "fixed_split_validation_batches",
+    "cached_split_runtime_batch_size_candidates",
+    "negotiate_cached_split_runtime_batch_size",
+    "splitter_dynamic_batch_min",
+    "splitter_dynamic_batch_range",
 ]
+
+from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
+
+
+class FixedSplitRuntimeContractMixin:
+    @staticmethod
+    def _feature_layout_summary_from_candidate(
+        candidate: Mapping[str, object],
+    ) -> dict[str, object]:
+        feature_ref = candidate.get("feature_ref")
+        ref_payload = dict(feature_ref) if isinstance(feature_ref, Mapping) else {}
+        layout = dict(candidate.get("feature_layout") or {})
+        shard_validation = None
+        if not layout and ref_payload.get("storage_format"):
+            shard_validation = ShardFeatureRefValidator().validate_feature_ref(
+                ref_payload,
+                {},
+                allow_abi_compatible_migration=False,
+                deep_validate_payload=False,
+            )
+            layout = dict(shard_validation.feature_layout or {})
+        metadata = shard_validation.metadata if shard_validation is not None else None
+        return {
+            "sample_id": str(candidate.get("sample_id") or ""),
+            "feature_layout_id": str(
+                candidate.get("feature_layout_id")
+                or ref_payload.get("feature_layout_id")
+                or (metadata.feature_layout_id if metadata is not None else "")
+                or (make_feature_layout_id(layout) if layout else "")
+            ),
+            "feature_layout": layout,
+            "source_feature_layout_id": str(
+                candidate.get("source_feature_layout_id")
+                or ref_payload.get("feature_layout_id")
+                or (metadata.feature_layout_id if metadata is not None else "")
+                or ""
+            ),
+            "source_feature_abi_id": str(
+                candidate.get("source_feature_abi_id")
+                or ref_payload.get("feature_abi_id")
+                or (metadata.feature_abi_id if metadata is not None else "")
+                or ""
+            ),
+            "source_feature_schema_hash": str(
+                candidate.get("source_feature_schema_hash")
+                or (metadata.boundary_schema_hash if metadata is not None else "")
+                or ""
+            ),
+            "source_feature_value_schema_hash": str(
+                candidate.get("source_feature_value_schema_hash") or ""
+            ),
+            "source_feature_split_id": str(
+                candidate.get("source_feature_split_id")
+                or ref_payload.get("boundary_id")
+                or (metadata.boundary_id if metadata is not None else "")
+                or ""
+            ),
+            "source_feature_graph_signature": str(
+                candidate.get("source_feature_graph_signature")
+                or dict(ref_payload.get("metadata") or {}).get("graph_signature")
+                or (
+                    dict(metadata.metadata or {}).get("graph_signature")
+                    if metadata is not None
+                    else ""
+                )
+                or ""
+            ),
+        }
+
+
+    @staticmethod
+    def _layout_specs_match_ignoring_labels(
+        actual: Mapping[str, Mapping[str, object]],
+        expected: Mapping[str, Mapping[str, object]],
+    ) -> bool:
+        def normalised_specs(layout: Mapping[str, Mapping[str, object]]) -> list[dict[str, object]]:
+            specs: list[dict[str, object]] = []
+            for spec in dict(layout or {}).values():
+                if not isinstance(spec, Mapping):
+                    continue
+                specs.append(
+                    {
+                        "dtype": str(spec.get("dtype") or ""),
+                        "shape_without_batch": [
+                            int(dim) for dim in list(spec.get("shape_without_batch") or [])
+                        ],
+                    }
+                )
+            return sorted(specs, key=lambda item: _stable_json_dumps(item))
+
+        return normalised_specs(actual) == normalised_specs(expected)
+
+
+    def _log_pending_high_quality_layout_alignment(
+        self,
+        *,
+        pending_high_quality: list[Mapping[str, object]],
+        split_contract: SplitRuntimeContract,
+        expected_source: str,
+        low_quality_tensors: Mapping[str, torch.Tensor] | None,
+    ) -> None:
+        if not pending_high_quality:
+            return
+        expected_layout = dict(split_contract.feature_layout or {})
+        expected_layout_id = str(split_contract.feature_layout_id or "")
+        low_quality_layout = (
+            feature_layout_from_tensors(low_quality_tensors)
+            if low_quality_tensors is not None
+            else None
+        )
+        compatible = 0
+        renamed_compatible = 0
+        mismatches: list[dict[str, object]] = []
+        shard_validator = ShardFeatureRefValidator()
+        for candidate in pending_high_quality:
+            alignment = align_sample_feature_contract(
+                candidate,
+                split_contract=split_contract,
+                input_source="pending_high_quality",
+                shard_validator=shard_validator,
+            )
+            if alignment.status == "accepted":
+                compatible += 1
+                continue
+            if len(mismatches) < 5:
+                actual_layout = (
+                    dict(alignment.validation.feature_layout or {})
+                    if alignment.validation is not None
+                    else {}
+                )
+                mismatches.append(
+                    {
+                        "sample_id": str(candidate.get("sample_id") or ""),
+                        "reason": alignment.reason or alignment.status,
+                        "feature_layout": actual_layout,
+                        "expected_feature_layout_id": expected_layout_id,
+                        "expected_feature_layout": expected_layout,
+                        "expected_source": expected_source,
+                        "source_metadata": dict(
+                            candidate.get("source_metadata")
+                            if isinstance(candidate.get("source_metadata"), Mapping)
+                            else {}
+                        )
+                        or {
+                            key: candidate[key]
+                            for key in (
+                                "feature_abi_id",
+                                "source_feature_abi_id",
+                                "source_feature_layout_id",
+                                "source_feature_schema_hash",
+                                "source_feature_value_schema_hash",
+                                "source_feature_split_id",
+                                "source_feature_graph_signature",
+                                "rebinding_reason",
+                            )
+                            if candidate.get(key) is not None
+                        },
+                    }
+                )
+        logger.info(
+            "[SamplePool] pending high-quality layout alignment: pending={} compatible={} rename_compatible={} mismatched={} expected_source={} expected_feature_layout_id={} low_quality_feature_layout_id={}.",
+            len(pending_high_quality),
+            compatible,
+            renamed_compatible,
+            len(pending_high_quality) - compatible,
+            expected_source,
+            expected_layout_id,
+            make_feature_layout_id(low_quality_layout) if low_quality_layout else "",
+        )
+        if mismatches:
+            logger.info(
+                "[SamplePool] pending high-quality feature-only samples are not compatible "
+                "with the active runtime layout and will remain deferred: preview={}",
+                mismatches,
+            )
+
+
+    def _contract_layout_tensors_from_runtime(
+        self,
+        *,
+        splitter: UniversalModelSplitter,
+        candidate: object | None,
+        input_tensor_shape: list[int],
+        device: torch.device | str | None = None,
+    ) -> dict[str, torch.Tensor] | None:
+        if len(input_tensor_shape) < 4:
+            return None
+        batch_shape = [2, *[int(dim) for dim in input_tensor_shape[1:]]]
+        example = torch.zeros(
+            batch_shape,
+            dtype=torch.float32,
+            device=self.device if device is None else device,
+        )
+        try:
+            with torch.no_grad():
+                payload = splitter.edge_forward(example, candidate=candidate)
+        except Exception as exc:
+            logger.warning(
+                "[FixedSplitCL] Could not sample cloud batch feature layout from runtime; using uploaded feature layout for contract creation: {}",
+                exc,
+            )
+            return None
+        if not isinstance(payload, BoundaryPayload):
+            return None
+        sample_payload = BoundaryPayloadCacheCodec(splitter).split_batch(
+            payload,
+            actual_batch_size=1,
+        )[0]
+        return {
+            str(label): tensor.detach().cpu()
+            for label, tensor in dict(sample_payload.tensors or {}).items()
+            if isinstance(tensor, torch.Tensor)
+        } or None
+
+
+    def _load_split_runtime_contract(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+    ) -> SplitRuntimeContract | None:
+        context = self._sample_pool_manifest_context(manifest)
+        model_id = str(context.get("model_id") or self.edge_model_name)
+        split_config_id = str(context.get("split_config_id") or "").strip()
+        if not split_config_id:
+            raise RuntimeError("SplitRuntimeContract requires split_config_id.")
+        existing = SplitRuntimeContract.load(
+            self.split_contract_root,
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+        )
+        if existing is None:
+            return None
+        canonical_from_context = str(context.get("canonical_split_key") or "").strip()
+        if canonical_from_context and canonical_from_context != existing.canonical_split_key:
+            logger.info(
+                "[FixedSplitCL] Ignoring stale SplitRuntimeContract for sync/read: "
+                "existing canonical_split_key={!r}, incoming={!r}.",
+                existing.canonical_split_key,
+                canonical_from_context,
+            )
+            return None
+        front_from_context = str(context.get("front_version") or "0")
+        if front_from_context != existing.front_version:
+            logger.info(
+                "[FixedSplitCL] Ignoring stale SplitRuntimeContract for sync/read: "
+                "existing front_version={!r}, incoming={!r}.",
+                existing.front_version,
+                front_from_context,
+            )
+            return None
+        return existing
+
+
+    @staticmethod
+    def _candidate_cloud_batch_split_id(
+        *,
+        splitter: UniversalModelSplitter,
+        candidate: object | None,
+        canonical_split_key: str,
+    ) -> str:
+        runtime = getattr(splitter, "runtime", None)
+        return str(
+            getattr(candidate, "candidate_id", None)
+            or getattr(candidate, "split_id", None)
+            or getattr(runtime, "split_id", "")
+            or canonical_split_key
+        )
+
+
+    def _stale_split_contract_path(
+        self,
+        *,
+        edge_id: int | str,
+        model_id: str,
+        split_config_id: str,
+    ) -> str:
+        source_path = contract_path(
+            self.split_contract_root,
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+        )
+        stale_dir = os.path.join(
+            self.split_contract_root,
+            "stale",
+            f"edge_{_sanitize_cache_segment(edge_id)}",
+            _sanitize_cache_segment(model_id),
+        )
+        os.makedirs(stale_dir, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        return source_path, os.path.join(
+            stale_dir,
+            f"{_sanitize_cache_segment(split_config_id)}.{stamp}.json",
+        )
+
+
+    def _move_stale_split_runtime_contract(
+        self,
+        *,
+        edge_id: int | str,
+        model_id: str,
+        split_config_id: str,
+        reason: str,
+    ) -> bool:
+        source_path, stale_path = self._stale_split_contract_path(
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+        )
+        if not os.path.exists(source_path):
+            return False
+        shutil.move(source_path, stale_path)
+        logger.info(
+            "[FixedSplitCL] Moved stale SplitRuntimeContract to {} reason={}.",
+            stale_path,
+            reason,
+        )
+        return True
+
+
+    def _runtime_identity_for_contract(
+        self,
+        *,
+        manifest: Mapping[str, object],
+        splitter: UniversalModelSplitter,
+        cloud_batch_split_id: str,
+        feature_layout_id: str,
+    ) -> dict[str, object]:
+        context = self._sample_pool_manifest_context(manifest)
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
+        runtime = getattr(splitter, "runtime", splitter)
+        dynamic_batch = _splitter_dynamic_batch_range(splitter)
+        symbolic_schema = getattr(runtime, "symbolic_input_schema", None)
+        model_id = str(context.get("model_id") or self.edge_model_name)
+        return {
+            "model_id": model_id,
+            "model_family": model_zoo.get_model_family(model_id),
+            "model_version": str(
+                dict(manifest.get("model", {}) or {}).get("model_version", "") or "0"
+            ),
+            "front_version": str(context.get("front_version") or "0"),
+            "split_config_id": str(context.get("split_config_id") or ""),
+            "canonical_split_key": str(context.get("canonical_split_key") or ""),
+            "cloud_batch_split_id": str(cloud_batch_split_id),
+            "input_tensor_shape": [
+                int(dim) for dim in list(context.get("input_tensor_shape", []) or [])
+            ],
+            "input_resize_mode": str(context.get("input_resize_mode") or "direct_resize"),
+            "runtime_version": str(
+                getattr(runtime, "runtime_version", None)
+                or getattr(runtime, "version", None)
+                or type(runtime).__name__
+            ),
+            "graph_signature": str(
+                getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "")
+                or ""
+            ),
+            "adapter_version": str(getattr(runtime, "adapter_version", "") or ""),
+            "split_plan_hash": _json_fingerprint(split_plan),
+            "symbolic_input_schema_hash": _json_fingerprint(symbolic_schema or {}),
+            "dynamic_batch": (
+                [int(dynamic_batch[0]), int(dynamic_batch[1])]
+                if dynamic_batch is not None
+                else None
+            ),
+            "trace_batch_size": getattr(runtime, "trace_batch_size", None),
+            "mode": str(getattr(getattr(runtime, "split_spec", None), "mode", "") or getattr(runtime, "mode", "") or ""),
+            "feature_layout_id": str(feature_layout_id),
+            "runtime_contract": cloud_runtime_contract,
+        }
+
+
+    def _get_or_create_split_runtime_contract(
+        self,
+        *,
+        edge_id: int | str,
+        manifest: Mapping[str, object],
+        feature_tensors: Mapping[str, torch.Tensor] | None = None,
+        contract_layout_tensors: Mapping[str, torch.Tensor] | None = None,
+        model: torch.nn.Module | None = None,
+        splitter: UniversalModelSplitter | None = None,
+        candidate: object | None = None,
+        bundle_root: str | None = None,
+        create_if_missing: bool = False,
+    ) -> SplitRuntimeContract:
+        context = self._sample_pool_manifest_context(manifest)
+        model_id = str(context.get("model_id") or self.edge_model_name)
+        split_config_id = str(context.get("split_config_id") or "").strip()
+        if not split_config_id:
+            raise RuntimeError("SplitRuntimeContract requires split_config_id.")
+        existing = SplitRuntimeContract.load(
+            self.split_contract_root,
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+        )
+        stale_replaced = False
+        if existing is not None:
+            stale_reason = None
+            canonical_from_context = str(context.get("canonical_split_key") or "").strip()
+            front_from_context = str(context.get("front_version") or "0")
+            if canonical_from_context and canonical_from_context != existing.canonical_split_key:
+                stale_reason = "canonical_split_key"
+            elif front_from_context != existing.front_version:
+                stale_reason = "front_version"
+            if (
+                stale_reason is None
+                and create_if_missing
+                and splitter is not None
+                and candidate is not None
+            ):
+                runtime_split_id = self._candidate_cloud_batch_split_id(
+                    splitter=splitter,
+                    candidate=candidate,
+                    canonical_split_key=existing.canonical_split_key,
+                )
+                if runtime_split_id != existing.cloud_batch_split_id:
+                    stale_reason = "cloud_batch_split_id"
+                layout_tensors_for_existing = (
+                    {
+                        str(label): tensor
+                        for label, tensor in dict(contract_layout_tensors or {}).items()
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                    or self._contract_layout_tensors_from_runtime(
+                        splitter=splitter,
+                        candidate=candidate,
+                        input_tensor_shape=[
+                            int(dim)
+                            for dim in list(context.get("input_tensor_shape", []) or [])
+                        ],
+                    )
+                )
+                if stale_reason is None and layout_tensors_for_existing is not None:
+                    cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
+                    contract_layout = feature_layout_from_tensors(layout_tensors_for_existing)
+                    contract_layout_id = str(
+                        cloud_runtime_contract.get("feature_layout_id")
+                        or make_feature_layout_id(contract_layout)
+                    )
+                    runtime_identity = self._runtime_identity_for_contract(
+                        manifest=manifest,
+                        splitter=splitter,
+                        cloud_batch_split_id=runtime_split_id,
+                        feature_layout_id=contract_layout_id,
+                    )
+                    boundary_tensor_labels = list(
+                        getattr(candidate, "boundary_tensor_labels", None)
+                        or cloud_runtime_contract.get("boundary_tensor_labels")
+                        or context.get("boundary_tensor_labels")
+                        or []
+                    )
+                    proposed = SplitRuntimeContract.create(
+                        edge_id=edge_id,
+                        model_id=model_id,
+                        split_config_id=split_config_id,
+                        canonical_split_key=existing.canonical_split_key,
+                        edge_split_id=str(context.get("edge_split_id") or existing.edge_split_id),
+                        cloud_batch_split_id=runtime_split_id,
+                        input_tensor_shape=list(context.get("input_tensor_shape", []) or []),
+                        input_resize_mode=str(context.get("input_resize_mode") or "direct_resize"),
+                        boundary_tensor_labels=boundary_tensor_labels,
+                        front_version=front_from_context,
+                        feature_tensors=layout_tensors_for_existing,
+                        tail_version=str(dict(manifest.get("model", {}) or {}).get("model_version", "") or "")
+                        or None,
+                        runtime_identity=runtime_identity,
+                    )
+                    compatibility = classify_contract_compatibility(existing, proposed)
+                    if bool(compatibility.get("compatible")):
+                        if (
+                            proposed.runtime_identity_id != existing.runtime_identity_id
+                            or proposed.contract_id != existing.contract_id
+                            or proposed.feature_layout_id != existing.feature_layout_id
+                        ):
+                            aliases = [
+                                dict(item)
+                                for item in list(existing.contract_aliases or [])
+                                if isinstance(item, Mapping)
+                            ]
+                            if not any(
+                                str(alias.get("contract_id") or "") == existing.contract_id
+                                for alias in aliases
+                            ):
+                                aliases.append(
+                                    {
+                                        "contract_id": existing.contract_id,
+                                        "runtime_identity_id": existing.runtime_identity_id,
+                                        "feature_layout_id": existing.feature_layout_id,
+                                        "feature_abi_id": existing.feature_abi_id,
+                                        "reason": str(compatibility.get("reason") or "compatible_rebind"),
+                                    }
+                                )
+                            proposed.contract_aliases = aliases
+                            path = proposed.save(self.split_contract_root)
+                            if proposed.runtime_identity_id != existing.runtime_identity_id:
+                                logger.info(
+                                    "Runtime identity changed but feature ABI is compatible; rebinding contract without dropping active samples."
+                                )
+                            logger.info(
+                                "[FixedSplitCL] SplitRuntimeContract rebound edge_id={} model_id={} split_config_id={} feature_abi_id={} source_contract_id={} current_contract_id={} path={}",
+                                edge_id,
+                                model_id,
+                                split_config_id,
+                                proposed.feature_abi_id,
+                                existing.contract_id,
+                                proposed.contract_id,
+                                path,
+                            )
+                            return proposed
+                        return existing
+                    stale_reason = str(compatibility.get("reason") or "feature_abi")
+            if stale_reason is not None:
+                stale_replaced = self._move_stale_split_runtime_contract(
+                    edge_id=edge_id,
+                    model_id=model_id,
+                    split_config_id=split_config_id,
+                    reason=stale_reason,
+                )
+                existing = None
+            else:
+                return existing
+
+        if not create_if_missing:
+            raise RuntimeError(
+                "SplitRuntimeContract is not ready for this split_config_id; "
+                "wait for a continual learning training job to create it."
+            )
+        front_version = str(context.get("front_version") or "0")
+        bundle_model_version = str(
+            dict(manifest.get("model", {}) or {}).get("model_version", "0") or "0"
+        )
+        if front_version == "0" and bundle_model_version != "0" and not stale_replaced:
+            raise RuntimeError(
+                "SplitRuntimeContract for front_version=0 must be created from "
+                "native pretrained model_version=0, not tail checkpoint "
+                f"model_version={bundle_model_version}."
+            )
+
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        edge_runtime_contract = fixed_split_plan_runtime_contract(split_plan)
+        cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
+        canonical_split_key = str(
+            context.get("canonical_split_key")
+            or context.get("edge_split_id")
+            or edge_runtime_contract.get("logical_split_id")
+            or fixed_split_boundary_from_plan(split_plan)
+        ).strip()
+        if (
+            canonical_split_key
+            and canonical_split_key != "auto"
+            and not canonical_split_key.startswith("after:")
+        ):
+            canonical_split_key = f"after:{canonical_split_key}"
+        if not canonical_split_key:
+            raise RuntimeError(
+                "SplitRuntimeContract creation requires an exact split id."
+            )
+        if feature_tensors is None and contract_layout_tensors is None:
+            raise RuntimeError(
+                "SplitRuntimeContract creation requires a representative feature tensor."
+            )
+        if splitter is None or candidate is None:
+            raise RuntimeError(
+                "SplitRuntimeContract creation requires the training job's "
+                "already-bound cloud batch runtime."
+            )
+
+        batch_candidate = candidate
+        cloud_batch_split_id = self._candidate_cloud_batch_split_id(
+            splitter=splitter,
+            candidate=batch_candidate,
+            canonical_split_key=canonical_split_key,
+        )
+        if cloud_batch_split_id != canonical_split_key:
+            raise RuntimeError(
+                "SplitRuntimeContract runtime split does not match the exact plan split "
+                f"(expected={canonical_split_key!r}, actual={cloud_batch_split_id!r})."
+            )
+        layout_tensors = (
+            {
+                str(label): tensor
+                for label, tensor in dict(contract_layout_tensors or {}).items()
+                if isinstance(tensor, torch.Tensor)
+            }
+            or self._contract_layout_tensors_from_runtime(
+                splitter=splitter,
+                candidate=batch_candidate,
+                input_tensor_shape=[
+                    int(dim) for dim in list(context.get("input_tensor_shape", []) or [])
+                ],
+            )
+        )
+        contract_feature_tensors = layout_tensors or feature_tensors
+        if contract_feature_tensors is None:
+            raise RuntimeError(
+                "SplitRuntimeContract creation requires a representative feature tensor."
+            )
+        contract_layout = feature_layout_from_tensors(contract_feature_tensors)
+        contract_layout_id = str(
+            cloud_runtime_contract.get("feature_layout_id")
+            or make_feature_layout_id(contract_layout)
+        )
+        runtime_identity = self._runtime_identity_for_contract(
+            manifest=manifest,
+            splitter=splitter,
+            cloud_batch_split_id=cloud_batch_split_id,
+            feature_layout_id=contract_layout_id,
+        )
+        edge_split_id = str(context.get("edge_split_id") or canonical_split_key)
+        boundary_tensor_labels = list(
+            getattr(batch_candidate, "boundary_tensor_labels", None)
+            or cloud_runtime_contract.get("boundary_tensor_labels")
+            or context.get("boundary_tensor_labels")
+            or []
+        )
+        contract = SplitRuntimeContract.create(
+            edge_id=edge_id,
+            model_id=model_id,
+            split_config_id=split_config_id,
+            canonical_split_key=canonical_split_key,
+            edge_split_id=edge_split_id,
+            cloud_batch_split_id=cloud_batch_split_id,
+            input_tensor_shape=list(context.get("input_tensor_shape", []) or []),
+            input_resize_mode=str(context.get("input_resize_mode") or "direct_resize"),
+            boundary_tensor_labels=boundary_tensor_labels,
+            front_version=str(context.get("front_version") or "0"),
+            feature_tensors=contract_feature_tensors,
+            tail_version=str(dict(manifest.get("model", {}) or {}).get("model_version", "") or "")
+            or None,
+            runtime_identity=runtime_identity,
+        )
+        path = contract.save(self.split_contract_root)
+        logger.info(
+            "[FixedSplitCL] SplitRuntimeContract created edge_id={} model_id={} split_config_id={} canonical_split_key={} cloud_batch_split_id={} feature_layout_id={} feature_abi_id={} path={}",
+            edge_id,
+            model_id,
+            split_config_id,
+            canonical_split_key,
+            cloud_batch_split_id,
+            contract.feature_layout_id,
+            contract.feature_abi_id,
+            path,
+        )
+        return contract

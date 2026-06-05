@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 import torch
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 from torch import nn
 from torchvision.models.detection.anchor_utils import DefaultBoxGenerator
 from torchvision.models.detection.ssd import SSD

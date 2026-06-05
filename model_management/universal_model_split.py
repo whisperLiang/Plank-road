@@ -853,7 +853,7 @@ def _runtime_from_splitter(splitter: Any) -> Any:
     return getattr(splitter, "runtime", splitter)
 
 
-def _load_cached_split_batches(
+def load_cached_split_batches(
     *,
     cache_path: str,
     all_indices: list[Any],
@@ -1095,7 +1095,7 @@ def universal_split_retrain(
             grad_clip_norm=grad_clip_norm,
         )
     annotations = dict(gt_annotations or {})
-    prepared_batches = _load_cached_split_batches(
+    prepared_batches = load_cached_split_batches(
         cache_path=cache_path,
         all_indices=list(all_indices),
         annotations=annotations,
@@ -1152,6 +1152,7 @@ __all__ = [
     "deserialize_boundary_payload",
     "extract_split_features",
     "log_split_retrain_profile",
+    "load_cached_split_batches",
     "prepare_exact_split_runtime",
     "reconstruct_candidate_from_descriptor",
     "serialize_boundary_payload",

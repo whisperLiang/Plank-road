@@ -5,13 +5,17 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import torch
+from torchlens.options import CaptureOptions, VisualizationOptions
 from torchlens.split import (
     ReplayBoundary,
     SplitRuntime,
     SplitSpec,
-    prepare_split,
-    prepare_split_replay,
 )
+from torchlens.split.codegen import build_segments
+from torchlens.split.planner import plan_split
+from torchlens.split.shape import infer_traced_batch_size
+from torchlens.split.trace_graph import trace_graph_from_model_log
+from torchlens.user_funcs import log_forward_pass
 
 from .torchlens_forward_guard import torchlens_forward_guard
 
@@ -99,6 +103,68 @@ def _spec_with_mode(split_spec: SplitSpec | str, mode: str | None) -> SplitSpec:
     return replace(spec, mode=normalized_mode)
 
 
+def _prepare_split_without_deprecated_options(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    spec: SplitSpec,
+) -> SplitRuntime:
+    inputs = normalize_example_inputs(example_inputs)
+    model_log = log_forward_pass(
+        model,
+        inputs,
+        {},
+        capture=CaptureOptions(
+            layers_to_save="all",
+            keep_unsaved_layers=True,
+            detach_saved_tensors=False,
+            save_function_args=True,
+            intervention_ready=True,
+        ),
+        visualization=VisualizationOptions(view="none"),
+    )
+    traced_batch_size = infer_traced_batch_size(inputs)
+    graph = trace_graph_from_model_log(
+        model_log,
+        traced_batch_size=traced_batch_size,
+        batch_symbol=spec.batch_symbol,
+        dynamic_batch=spec.dynamic_batch,
+    )
+    plan = plan_split(graph, spec)
+    segments = build_segments(graph, plan, mode=spec.mode)
+    return SplitRuntime(
+        model=model,
+        trace_graph=graph,
+        split_spec=spec,
+        plan=plan,
+        segments=segments,
+    )
+
+
+def prepare_split(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    spec: SplitSpec,
+) -> SplitRuntime:
+    return _prepare_split_without_deprecated_options(model, example_inputs, spec)
+
+
+def prepare_split_replay(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    spec: SplitSpec,
+) -> SplitRuntime:
+    replay_spec = SplitSpec(
+        boundary=spec.boundary,
+        batch_symbol=spec.batch_symbol,
+        dynamic_batch=spec.dynamic_batch,
+        trainable=False,
+        trace_batch_mode=spec.trace_batch_mode,
+        device_policy=spec.device_policy,
+        mode=spec.mode,
+    )
+    return prepare_split(model, example_inputs, replay_spec)
+
+
 def prepare_split_runtime(
     model: torch.nn.Module,
     example_inputs: Any,
@@ -109,11 +175,7 @@ def prepare_split_runtime(
 
     spec = _spec_with_mode(split_spec, mode)
     with torchlens_forward_guard():
-        return prepare_split(
-            model,
-            normalize_example_inputs(example_inputs),
-            spec,
-        )
+        return prepare_split(model, normalize_example_inputs(example_inputs), spec)
 
 
 def prepare_split_replay_runtime(
@@ -126,11 +188,7 @@ def prepare_split_replay_runtime(
 
     spec = _spec_with_mode(split_spec, mode)
     with torchlens_forward_guard():
-        return prepare_split_replay(
-            model,
-            normalize_example_inputs(example_inputs),
-            spec,
-        )
+        return prepare_split_replay(model, normalize_example_inputs(example_inputs), spec)
 
 
 def _require_batch_gt1(example_batch: torch.Tensor) -> None:
