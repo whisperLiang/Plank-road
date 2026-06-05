@@ -104,6 +104,172 @@ def feature_layout_id(layout: Mapping[str, Mapping[str, Any]]) -> str:
     return hashlib.sha1(_stable_json(layout).encode("utf-8")).hexdigest()
 
 
+def _normalise_dtype(value: object) -> str:
+    return str(value or "").replace("torch.", "")
+
+
+def _normalise_shape_dim(value: object) -> int | str:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _symbolic_shape_without_batch(shape: object) -> list[int | str]:
+    dims = list(shape or []) if isinstance(shape, (list, tuple)) else []
+    if not dims:
+        return []
+    return [_normalise_shape_dim(dim) for dim in dims[1:]]
+
+
+def _symbolize_batch_shape(shape: object, *, batch_symbol: str = "B") -> list[int | str]:
+    dims = list(shape or []) if isinstance(shape, (list, tuple)) else []
+    if not dims:
+        return []
+    return [batch_symbol, *[_normalise_shape_dim(dim) for dim in dims[1:]]]
+
+
+@dataclass(frozen=True)
+class FeatureAbiSpec:
+    version: str
+    model_family: str
+    adapter_version: str
+    runtime_version: str
+    canonical_split_key: str
+    graph_signature: str
+    boundary_tensor_labels: list[str]
+    boundary_tensors: list[dict[str, Any]]
+    boundary_schema: dict[str, dict[str, Any]]
+    preprocessing_abi: dict[str, Any]
+    passthrough_specs: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _ordered_feature_layout(
+    feature_layout: Mapping[str, Mapping[str, Any]] | None,
+    labels: list[str],
+) -> list[dict[str, Any]]:
+    layout = {
+        str(label): dict(spec)
+        for label, spec in dict(feature_layout or {}).items()
+        if isinstance(spec, Mapping)
+    }
+    ordered_labels = [label for label in labels if label in layout]
+    seen = set(ordered_labels)
+    ordered_labels.extend(label for label in sorted(layout) if label not in seen)
+    tensors: list[dict[str, Any]] = []
+    for label in ordered_labels:
+        spec = dict(layout.get(label) or {})
+        shape_without_batch = list(spec.get("shape_without_batch") or [])
+        if not shape_without_batch:
+            shape_without_batch = _symbolic_shape_without_batch(
+                spec.get("shape") or spec.get("sample_shape")
+            )
+        normalised_shape = [_normalise_shape_dim(dim) for dim in shape_without_batch]
+        rank = spec.get("rank")
+        try:
+            rank_value = int(rank) if rank is not None else len(normalised_shape) + 1
+        except (TypeError, ValueError):
+            rank_value = len(normalised_shape) + 1
+        tensors.append(
+            {
+                "label": str(label),
+                "dtype": _normalise_dtype(spec.get("dtype")),
+                "rank": rank_value,
+                "shape_without_batch": normalised_shape,
+            }
+        )
+    return tensors
+
+
+def _normalise_boundary_schema_for_abi(
+    boundary_schema: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    schema = _normalise_boundary_schema(boundary_schema)
+    for spec in schema.values():
+        spec["symbolic_shape"] = _symbolize_batch_shape(spec.get("symbolic_shape"))
+        spec["dtype"] = _normalise_dtype(spec.get("dtype"))
+    return schema
+
+
+def build_feature_abi_spec(
+    *,
+    model_id: str = "",
+    model_family: str = "",
+    adapter_version: str = "",
+    runtime_version: str = "",
+    canonical_split_key: str = "",
+    graph_signature: str = "",
+    boundary_tensor_labels: list[str] | tuple[str, ...] | None = None,
+    boundary_schema: Mapping[str, Any] | None = None,
+    feature_layout: Mapping[str, Mapping[str, Any]] | None = None,
+    input_tensor_shape: list[int] | tuple[int, ...] | None = None,
+    input_resize_mode: str = "",
+    passthrough_specs: Mapping[str, Any] | None = None,
+    runtime_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    identity = dict(runtime_identity or {})
+    runtime_contract = dict(identity.get("runtime_contract") or {})
+    labels = [str(label) for label in list(boundary_tensor_labels or [])]
+    if not labels:
+        labels = [str(label) for label in list(runtime_contract.get("boundary_tensor_labels") or [])]
+    resolved_boundary_schema = boundary_schema
+    if resolved_boundary_schema is None and isinstance(runtime_contract.get("boundary_schema"), Mapping):
+        resolved_boundary_schema = runtime_contract.get("boundary_schema")  # type: ignore[assignment]
+    resolved_model_family = (
+        str(model_family or "")
+        or str(identity.get("model_family") or "")
+        or str(runtime_contract.get("model_family") or "")
+        or str(model_id or identity.get("model_id") or runtime_contract.get("model_id") or "")
+    )
+    resolved_graph_signature = (
+        str(graph_signature or "")
+        or str(identity.get("graph_signature") or "")
+        or str(runtime_contract.get("trace_signature") or "")
+    )
+    preprocessing_shape = input_tensor_shape or identity.get("input_tensor_shape") or runtime_contract.get("input_tensor_shape") or []
+    spec = FeatureAbiSpec(
+        version="feature-abi.v1",
+        model_family=resolved_model_family,
+        adapter_version=str(adapter_version or identity.get("adapter_version") or ""),
+        runtime_version=str(runtime_version or identity.get("runtime_version") or ""),
+        canonical_split_key=str(
+            canonical_split_key
+            or identity.get("canonical_split_key")
+            or identity.get("cloud_batch_split_id")
+            or runtime_contract.get("logical_split_id")
+            or ""
+        ),
+        graph_signature=resolved_graph_signature,
+        boundary_tensor_labels=labels,
+        boundary_tensors=_ordered_feature_layout(feature_layout, labels),
+        boundary_schema=_normalise_boundary_schema_for_abi(resolved_boundary_schema),
+        preprocessing_abi={
+            "input_tensor_shape": _symbolize_batch_shape(preprocessing_shape),
+            "input_resize_mode": str(
+                input_resize_mode
+                or identity.get("input_resize_mode")
+                or runtime_contract.get("input_resize_mode")
+                or "direct_resize"
+            ).strip().lower(),
+        },
+        passthrough_specs=dict(
+            passthrough_specs
+            or identity.get("passthrough_specs")
+            or identity.get("passthrough_schema")
+            or {}
+        ),
+    )
+    return spec.to_dict()
+
+
+def feature_abi_id(spec: FeatureAbiSpec | Mapping[str, Any]) -> str:
+    payload = spec.to_dict() if isinstance(spec, FeatureAbiSpec) else dict(spec)
+    return hashlib.sha1(_stable_json(payload).encode("utf-8")).hexdigest()
+
+
 def _normalise_boundary_schema(
     boundary_schema: Mapping[str, Any] | None,
 ) -> dict[str, dict[str, Any]]:
@@ -215,6 +381,18 @@ def build_runtime_contract(
         boundary_schema=schema,
         feature_layout=layout,
     )
+    abi_spec = build_feature_abi_spec(
+        model_id=str(model_id),
+        model_family=str(model_id),
+        canonical_split_key=str(logical_split_id),
+        graph_signature=str(trace_signature),
+        boundary_tensor_labels=labels,
+        boundary_schema=schema,
+        feature_layout=layout,
+        input_tensor_shape=[int(dim) for dim in list(input_tensor_shape or [])],
+        input_resize_mode=str(input_resize_mode or ""),
+    )
+    abi_id = feature_abi_id(abi_spec)
     return {
         "contract_version": FIXED_SPLIT_RUNTIME_CONTRACT_VERSION,
         "logical_split_id": str(logical_split_id),
@@ -225,6 +403,8 @@ def build_runtime_contract(
         "boundary_schema": schema,
         "feature_layout": layout,
         "feature_layout_id": layout_id,
+        "feature_abi_id": abi_id,
+        "feature_abi_spec": abi_spec,
         "model_id": str(model_id or ""),
         "model_version": str(model_version or ""),
         "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
@@ -232,27 +412,123 @@ def build_runtime_contract(
     }
 
 
-def _contract_payload(contract: Mapping[str, Any] | None) -> dict[str, Any]:
-    return dict(contract or {})
+def _contract_payload(contract: Mapping[str, Any] | object | None) -> dict[str, Any]:
+    if contract is None:
+        return {}
+    if isinstance(contract, Mapping):
+        return dict(contract)
+    to_dict = getattr(contract, "to_dict", None)
+    if callable(to_dict):
+        payload = to_dict()
+        return dict(payload) if isinstance(payload, Mapping) else {}
+    return {}
 
 
-def classify_feature_layout_compatibility(
-    edge_contract: Mapping[str, Any] | None,
-    cloud_contract: Mapping[str, Any] | None,
+def _payload_feature_abi_id(payload: Mapping[str, Any]) -> str:
+    abi_id = str(payload.get("feature_abi_id") or "")
+    if abi_id:
+        return abi_id
+    abi_spec = payload.get("feature_abi_spec")
+    if isinstance(abi_spec, Mapping) and abi_spec:
+        return feature_abi_id(abi_spec)
+    feature_layout_payload = {
+        str(label): dict(spec)
+        for label, spec in dict(payload.get("feature_layout") or {}).items()
+        if isinstance(spec, Mapping)
+    }
+    if not feature_layout_payload:
+        return ""
+    runtime_identity = dict(payload.get("runtime_identity") or {})
+    spec = build_feature_abi_spec(
+        model_id=str(payload.get("model_id") or runtime_identity.get("model_id") or ""),
+        model_family=str(payload.get("model_family") or runtime_identity.get("model_family") or ""),
+        canonical_split_key=str(
+            payload.get("canonical_split_key")
+            or payload.get("cloud_batch_split_id")
+            or runtime_identity.get("canonical_split_key")
+            or runtime_identity.get("cloud_batch_split_id")
+            or payload.get("logical_split_id")
+            or ""
+        ),
+        graph_signature=str(
+            payload.get("graph_signature")
+            or runtime_identity.get("graph_signature")
+            or payload.get("trace_signature")
+            or ""
+        ),
+        boundary_tensor_labels=[
+            str(label) for label in list(payload.get("boundary_tensor_labels") or [])
+        ],
+        boundary_schema=(
+            payload.get("boundary_schema")
+            if isinstance(payload.get("boundary_schema"), Mapping)
+            else None
+        ),
+        feature_layout=feature_layout_payload,
+        input_tensor_shape=list(payload.get("input_tensor_shape") or []),
+        input_resize_mode=str(payload.get("input_resize_mode") or ""),
+        runtime_identity=runtime_identity,
+    )
+    return feature_abi_id(spec)
+
+
+def _payload_runtime_identity_id(payload: Mapping[str, Any]) -> str:
+    identity_id = str(payload.get("runtime_identity_id") or "")
+    if identity_id:
+        return identity_id
+    identity = payload.get("runtime_identity")
+    if isinstance(identity, Mapping) and identity:
+        return runtime_identity_id(identity)
+    return str(payload.get("contract_id") or "")
+
+
+def classify_contract_compatibility(
+    edge_contract: Mapping[str, Any] | object | None,
+    cloud_contract: Mapping[str, Any] | object | None,
 ) -> dict[str, Any]:
     edge = _contract_payload(edge_contract)
     cloud = _contract_payload(cloud_contract)
     edge_layout_id = str(edge.get("feature_layout_id") or "")
     cloud_layout_id = str(cloud.get("feature_layout_id") or "")
-    compatible = bool(edge_layout_id and cloud_layout_id and edge_layout_id == cloud_layout_id)
-    reason = "compatible" if compatible else "feature_layout_id"
+    edge_abi_id = _payload_feature_abi_id(edge)
+    cloud_abi_id = _payload_feature_abi_id(cloud)
+    edge_runtime_id = _payload_runtime_identity_id(edge)
+    cloud_runtime_id = _payload_runtime_identity_id(cloud)
+
+    compatible = False
+    reason = "feature_abi_id"
     if not edge:
         reason = "missing_edge_runtime_contract"
     elif not cloud:
         reason = "missing_cloud_runtime_contract"
+    elif edge_abi_id and cloud_abi_id:
+        compatible = edge_abi_id == cloud_abi_id
+        reason = "compatible" if compatible else "feature_abi_id"
+    else:
+        edge_spec = edge.get("feature_abi_spec")
+        cloud_spec = cloud.get("feature_abi_spec")
+        if isinstance(edge_spec, Mapping) and isinstance(cloud_spec, Mapping):
+            compatible = _stable_json(edge_spec) == _stable_json(cloud_spec)
+            reason = "compatible" if compatible else "feature_abi_spec"
+        else:
+            compatible = bool(edge_layout_id and cloud_layout_id and edge_layout_id == cloud_layout_id)
+            reason = "legacy_feature_layout_id_compatible" if compatible else "feature_layout_id"
+
+    if (
+        compatible
+        and edge_runtime_id
+        and cloud_runtime_id
+        and edge_runtime_id != cloud_runtime_id
+    ):
+        reason = "runtime_identity_changed_but_feature_abi_compatible"
+
     return {
         "compatible": compatible,
         "reason": reason,
+        "edge_feature_abi_id": edge_abi_id,
+        "cloud_feature_abi_id": cloud_abi_id,
+        "edge_runtime_identity_id": edge_runtime_id,
+        "cloud_runtime_identity_id": cloud_runtime_id,
         "edge_feature_layout_id": edge_layout_id,
         "cloud_feature_layout_id": cloud_layout_id,
         "edge_trace_device_type": str(edge.get("trace_device_type") or ""),
@@ -264,6 +540,13 @@ def classify_feature_layout_compatibility(
             str(label) for label in list(cloud.get("boundary_tensor_labels") or [])
         ],
     }
+
+
+def classify_feature_layout_compatibility(
+    edge_contract: Mapping[str, Any] | None,
+    cloud_contract: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    return classify_contract_compatibility(edge_contract, cloud_contract)
 
 
 def _first_tensor_device_type(value: object) -> str:
@@ -404,6 +687,30 @@ class SplitRuntimeContract:
     tail_version: str | None = None
     feature_layout: dict[str, dict[str, Any]] = field(default_factory=dict)
     runtime_identity: dict[str, Any] = field(default_factory=dict)
+    runtime_identity_id: str = ""
+    feature_abi_id: str = ""
+    feature_abi_spec: dict[str, Any] = field(default_factory=dict)
+    contract_aliases: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.runtime_identity_id:
+            self.runtime_identity_id = (
+                runtime_identity_id(self.runtime_identity)
+                if self.runtime_identity
+                else str(self.contract_id)
+            )
+        if not self.feature_abi_spec:
+            self.feature_abi_spec = build_feature_abi_spec(
+                model_id=self.model_id,
+                canonical_split_key=self.canonical_split_key,
+                boundary_tensor_labels=self.boundary_tensor_labels,
+                feature_layout=self.feature_layout,
+                input_tensor_shape=self.input_tensor_shape,
+                input_resize_mode=self.input_resize_mode,
+                runtime_identity=self.runtime_identity,
+            )
+        if not self.feature_abi_id and self.feature_abi_spec:
+            self.feature_abi_id = feature_abi_id(self.feature_abi_spec)
 
     @classmethod
     def create(
@@ -464,9 +771,21 @@ class SplitRuntimeContract:
             feature_layout_id_value=layout_id,
             runtime_identity=runtime_identity,
         )
+        identity_id = runtime_identity_id(identity)
+        abi_spec = build_feature_abi_spec(
+            model_id=str(model_id),
+            canonical_split_key=str(canonical_split_key),
+            boundary_tensor_labels=[str(label) for label in list(boundary_tensor_labels or [])],
+            boundary_schema=boundary_schema,
+            feature_layout=layout,
+            input_tensor_shape=[int(dim) for dim in input_tensor_shape],
+            input_resize_mode=str(input_resize_mode or "direct_resize"),
+            runtime_identity=identity,
+        )
+        abi_id = feature_abi_id(abi_spec)
         return cls(
             contract_version=SPLIT_RUNTIME_CONTRACT_VERSION,
-            contract_id=runtime_identity_id(identity),
+            contract_id=identity_id,
             edge_id=str(edge_id),
             model_id=str(model_id),
             split_config_id=str(split_config_id),
@@ -481,6 +800,9 @@ class SplitRuntimeContract:
             tail_version=None if tail_version is None else str(tail_version),
             feature_layout=layout,
             runtime_identity=identity,
+            runtime_identity_id=identity_id,
+            feature_abi_id=abi_id,
+            feature_abi_spec=abi_spec,
         )
 
     @classmethod
@@ -513,11 +835,34 @@ class SplitRuntimeContract:
                 feature_layout_id_value=layout_id,
                 runtime_identity=None,
             )
+        identity_id = str(payload.get("runtime_identity_id") or runtime_identity_id(identity))
+        abi_spec = {
+            str(key): value
+            for key, value in dict(payload.get("feature_abi_spec") or {}).items()
+        }
+        if not abi_spec:
+            abi_spec = build_feature_abi_spec(
+                model_id=str(payload["model_id"]),
+                canonical_split_key=str(payload["canonical_split_key"]),
+                boundary_tensor_labels=[
+                    str(label) for label in list(payload.get("boundary_tensor_labels", []) or [])
+                ],
+                feature_layout=feature_layout_payload,
+                input_tensor_shape=[int(dim) for dim in payload.get("input_tensor_shape", [])],
+                input_resize_mode=str(payload.get("input_resize_mode") or "direct_resize"),
+                runtime_identity=identity,
+            )
+        abi_id = str(payload.get("feature_abi_id") or feature_abi_id(abi_spec))
+        aliases = [
+            dict(item)
+            for item in list(payload.get("contract_aliases") or [])
+            if isinstance(item, Mapping)
+        ]
         return cls(
             contract_version=str(
                 payload.get("contract_version") or SPLIT_RUNTIME_CONTRACT_VERSION
             ),
-            contract_id=str(payload.get("contract_id") or runtime_identity_id(identity)),
+            contract_id=str(payload.get("contract_id") or identity_id),
             edge_id=str(payload["edge_id"]),
             model_id=str(payload["model_id"]),
             split_config_id=str(payload["split_config_id"]),
@@ -536,6 +881,10 @@ class SplitRuntimeContract:
             ),
             feature_layout=feature_layout_payload,
             runtime_identity=identity,
+            runtime_identity_id=identity_id,
+            feature_abi_id=abi_id,
+            feature_abi_spec=abi_spec,
+            contract_aliases=aliases,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -587,12 +936,16 @@ class SplitRuntimeContract:
 
 __all__ = [
     "FIXED_SPLIT_RUNTIME_CONTRACT_VERSION",
+    "FeatureAbiSpec",
     "SPLIT_RUNTIME_CONTRACT_VERSION",
     "SplitRuntimeContract",
+    "build_feature_abi_spec",
     "build_runtime_contract",
+    "classify_contract_compatibility",
     "classify_feature_layout_compatibility",
     "compute_feature_layout_id",
     "contract_path",
+    "feature_abi_id",
     "feature_layout_from_tensors",
     "feature_layout_id",
     "feature_layout_matches",

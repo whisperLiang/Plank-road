@@ -119,6 +119,7 @@ from model_management.split_runtime.torchlens_forward_guard import torchlens_for
 from model_management.payload import BoundaryPayload
 from model_management.split_contract import (
     SplitRuntimeContract,
+    classify_contract_compatibility,
     classify_feature_layout_compatibility,
     contract_path,
     feature_layout_from_tensors,
@@ -1521,8 +1522,10 @@ class CloudFixedSplitOrchestrator:
         runtime = getattr(splitter, "runtime", splitter)
         dynamic_batch = _splitter_dynamic_batch_range(splitter)
         symbolic_schema = getattr(runtime, "symbolic_input_schema", None)
+        model_id = str(context.get("model_id") or self.edge_model_name)
         return {
-            "model_id": str(context.get("model_id") or self.edge_model_name),
+            "model_id": model_id,
+            "model_family": model_zoo.get_model_family(model_id),
             "model_version": str(
                 dict(manifest.get("model", {}) or {}).get("model_version", "") or "0"
             ),
@@ -1618,24 +1621,85 @@ class CloudFixedSplitOrchestrator:
                         ],
                     )
                 )
-                if (
-                    stale_reason is None
-                    and layout_tensors_for_existing is not None
-                    and feature_layout_from_tensors(layout_tensors_for_existing)
-                    != existing.feature_layout
-                ):
-                    stale_reason = "feature_layout"
                 if stale_reason is None and layout_tensors_for_existing is not None:
+                    cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
+                    contract_layout = feature_layout_from_tensors(layout_tensors_for_existing)
+                    contract_layout_id = str(
+                        cloud_runtime_contract.get("feature_layout_id")
+                        or make_feature_layout_id(contract_layout)
+                    )
                     runtime_identity = self._runtime_identity_for_contract(
                         manifest=manifest,
                         splitter=splitter,
                         cloud_batch_split_id=runtime_split_id,
-                        feature_layout_id=existing.feature_layout_id,
+                        feature_layout_id=contract_layout_id,
                     )
-                    if _stable_json_dumps(runtime_identity) != _stable_json_dumps(
-                        existing.runtime_identity
-                    ):
-                        stale_reason = "runtime_identity"
+                    boundary_tensor_labels = list(
+                        getattr(candidate, "boundary_tensor_labels", None)
+                        or cloud_runtime_contract.get("boundary_tensor_labels")
+                        or context.get("boundary_tensor_labels")
+                        or []
+                    )
+                    proposed = SplitRuntimeContract.create(
+                        edge_id=edge_id,
+                        model_id=model_id,
+                        split_config_id=split_config_id,
+                        canonical_split_key=existing.canonical_split_key,
+                        edge_split_id=str(context.get("edge_split_id") or existing.edge_split_id),
+                        cloud_batch_split_id=runtime_split_id,
+                        input_tensor_shape=list(context.get("input_tensor_shape", []) or []),
+                        input_resize_mode=str(context.get("input_resize_mode") or "direct_resize"),
+                        boundary_tensor_labels=boundary_tensor_labels,
+                        front_version=front_from_context,
+                        feature_tensors=layout_tensors_for_existing,
+                        tail_version=str(dict(manifest.get("model", {}) or {}).get("model_version", "") or "")
+                        or None,
+                        runtime_identity=runtime_identity,
+                    )
+                    compatibility = classify_contract_compatibility(existing, proposed)
+                    if bool(compatibility.get("compatible")):
+                        if (
+                            proposed.runtime_identity_id != existing.runtime_identity_id
+                            or proposed.contract_id != existing.contract_id
+                            or proposed.feature_layout_id != existing.feature_layout_id
+                        ):
+                            aliases = [
+                                dict(item)
+                                for item in list(existing.contract_aliases or [])
+                                if isinstance(item, Mapping)
+                            ]
+                            if not any(
+                                str(alias.get("contract_id") or "") == existing.contract_id
+                                for alias in aliases
+                            ):
+                                aliases.append(
+                                    {
+                                        "contract_id": existing.contract_id,
+                                        "runtime_identity_id": existing.runtime_identity_id,
+                                        "feature_layout_id": existing.feature_layout_id,
+                                        "feature_abi_id": existing.feature_abi_id,
+                                        "reason": str(compatibility.get("reason") or "compatible_rebind"),
+                                    }
+                                )
+                            proposed.contract_aliases = aliases
+                            path = proposed.save(self.split_contract_root)
+                            if proposed.runtime_identity_id != existing.runtime_identity_id:
+                                logger.info(
+                                    "Runtime identity changed but feature ABI is compatible; rebinding contract without dropping active samples."
+                                )
+                            logger.info(
+                                "[FixedSplitCL] SplitRuntimeContract rebound edge_id={} model_id={} split_config_id={} feature_abi_id={} source_contract_id={} current_contract_id={} path={}",
+                                edge_id,
+                                model_id,
+                                split_config_id,
+                                proposed.feature_abi_id,
+                                existing.contract_id,
+                                proposed.contract_id,
+                                path,
+                            )
+                            return proposed
+                        return existing
+                    stale_reason = str(compatibility.get("reason") or "feature_abi")
             if stale_reason is not None:
                 stale_replaced = self._move_stale_split_runtime_contract(
                     edge_id=edge_id,
@@ -1758,13 +1822,14 @@ class CloudFixedSplitOrchestrator:
         )
         path = contract.save(self.split_contract_root)
         logger.info(
-            "[FixedSplitCL] SplitRuntimeContract created edge_id={} model_id={} split_config_id={} canonical_split_key={} cloud_batch_split_id={} feature_layout_id={} path={}",
+            "[FixedSplitCL] SplitRuntimeContract created edge_id={} model_id={} split_config_id={} canonical_split_key={} cloud_batch_split_id={} feature_layout_id={} feature_abi_id={} path={}",
             edge_id,
             model_id,
             split_config_id,
             canonical_split_key,
             cloud_batch_split_id,
             contract.feature_layout_id,
+            contract.feature_abi_id,
             path,
         )
         return contract
@@ -1912,6 +1977,8 @@ class CloudFixedSplitOrchestrator:
                     "input_resize_mode": resolved_resize_mode,
                     "created_at": time.time(),
                     "feature_layout_id": feature_ref.feature_layout_id,
+                    "feature_abi_id": feature_ref.feature_abi_id,
+                    "runtime_identity_id": feature_ref.runtime_identity_id,
                     "source_feature_layout_id": feature_ref.feature_layout_id,
                     "source_feature_schema_hash": "",
                     "source_feature_value_schema_hash": "",
@@ -4868,12 +4935,13 @@ class CloudFixedSplitOrchestrator:
                 logger.info(
                     "[SamplePool] canonical rebuild started: "
                     "existing_active={} pending_high_quality={} new_low_quality={} "
-                    "contract_id={} feature_layout_id={}.",
+                    "contract_id={} feature_layout_id={} feature_abi_id={}.",
                     len(existing_active),
                     len(pending_high_quality),
                     len(staging_low_quality),
                     split_contract.contract_id,
                     split_contract.feature_layout_id,
+                    split_contract.feature_abi_id,
                 )
                 validation_stats = dict(rebuild_stats.get("validation", {}) or {})
                 selection_stats = dict(rebuild_stats.get("selection", {}) or {})
@@ -4893,12 +4961,14 @@ class CloudFixedSplitOrchestrator:
                 logger.info(
                     "[SamplePool] canonical validation: "
                     "accepted_high_quality={} accepted_low_quality={} "
+                    "rebound_existing_active={} "
                     "invalid_high_quality={} invalid_low_quality={} "
                     "deferred_feature_layout={} skipped_stale_contract={} skipped_feature_layout={} "
                     "skipped_label_bounds={} skipped_label_metadata={} "
                     "skipped_unreadable={}.",
                     validation_stats.get("accepted_high_quality", 0),
                     validation_stats.get("accepted_low_quality", 0),
+                    validation_stats.get("rebound_existing_active", 0),
                     validation_stats.get("invalid_high_quality", 0),
                     validation_stats.get("invalid_low_quality", 0),
                     validation_stats.get("deferred_feature_layout", 0),
@@ -4929,8 +4999,9 @@ class CloudFixedSplitOrchestrator:
                 )
                 logger.info(
                     "[SamplePool][ShardCarryForward] existing_active={} "
-                    "dropped_incompatible={} skipped_unreadable={}.",
+                    "rebound_existing_active={} dropped_incompatible={} skipped_unreadable={}.",
                     shard_carry_forward_stats.get("existing_active", 0),
+                    shard_carry_forward_stats.get("rebound_existing_active", 0),
                     shard_carry_forward_stats.get("dropped_incompatible", 0),
                     shard_carry_forward_stats.get("skipped_unreadable", 0),
                 )

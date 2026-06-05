@@ -46,6 +46,8 @@ def test_canonical_pool_commits_shard_refs_without_feature_pt(tmp_path) -> None:
             "boundary": {"dtype": "torch.float16", "shape_without_batch": [2, 3]},
             "skip": {"dtype": "torch.float16", "shape_without_batch": [1, 2]},
         },
+        feature_abi_id="feature-abi-a",
+        runtime_identity_id="runtime-identity-a",
     )
     stats, kept = pool.rebuild_canonical_training_pool(
         split_contract=contract,

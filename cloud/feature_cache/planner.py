@@ -113,6 +113,7 @@ def _key_for_sample(
             else str(_runtime_value(runtime_context, "contract_id", None))
         ),
         feature_layout_id=str(feature_layout_id or _runtime_value(runtime_context, "feature_layout_id", "")),
+        feature_abi_id=str(_runtime_value(runtime_context, "feature_abi_id", "")),
         boundary_id=str(_runtime_value(runtime_context, "boundary_id", "")),
         boundary_payload_schema_hash=str(
             _runtime_value(runtime_context, "boundary_payload_schema_hash", stable_digest({}))
@@ -242,6 +243,8 @@ class FeatureCachePlanner:
             feature_layout_id=str(runtime_context.get("feature_layout_id") or ""),
             contract_id=str(runtime_context.get("contract_id") or ""),
             materialization_mode=self.materialization_mode,
+            feature_abi_id=str(runtime_context.get("feature_abi_id") or ""),
+            runtime_identity_id=str(runtime_context.get("runtime_identity_id") or ""),
             runtime_context=dict(runtime_context),
             stats=stats,
         )
@@ -249,12 +252,24 @@ class FeatureCachePlanner:
         for sample in existing:
             entry = self._ref_entry(sample, runtime_context, stats, source=str(sample.get("feature_source") or "canonical_active"))
             if entry is None:
-                stats.invalid_dropped += 1
-                plan.drop_invalid_samples.append({"sample": dict(sample), "reason": "missing_or_invalid_shard_ref"})
+                if _candidate_raw_path(sample):
+                    stats.existing_rebuild_required += 1
+                else:
+                    stats.invalid_dropped += 1
+                    stats.existing_dropped_incompatible += 1
+                    plan.drop_invalid_samples.append({"sample": dict(sample), "reason": "missing_or_invalid_shard_ref"})
                 continue
-            stats.existing_reused += 1
+            source_contract = str(sample.get("source_contract_id") or sample.get("contract_id") or "")
+            current_contract = str(runtime_context.get("contract_id") or "")
+            is_rebound = bool(sample.get("rebinding_reason")) or bool(
+                source_contract and current_contract and source_contract != current_contract
+            )
+            if is_rebound:
+                stats.existing_rebound += 1
+            else:
+                stats.existing_reused += 1
+                plan.reuse_existing_refs.append(entry)
             stats.existing_feature_ref_reused += 1
-            plan.reuse_existing_refs.append(entry)
             plan.create_training_view.append(entry)
 
         for sample in pending_hq:
@@ -301,9 +316,12 @@ class FeatureCachePlanner:
             plan.defer_unresolved_low_quality.append({"sample": dict(sample), "reason": "unresolved_teacher_label"})
 
         logger.info(
-            "[FeatureCache][Plan] requested={} existing_reused={} high_quality_registered={} low_quality_reused={} low_quality_rebuild_required={} low_quality_deferred={} invalid_dropped={} mode=shard_ref",
+            "[FeatureCache][Plan] requested={} existing_reused={} existing_rebound={} existing_rebuild_required={} existing_dropped_incompatible={} high_quality_registered={} low_quality_reused={} low_quality_rebuild_required={} low_quality_deferred={} invalid_dropped={} mode=shard_ref",
             stats.requested_samples,
             stats.existing_reused,
+            stats.existing_rebound,
+            stats.existing_rebuild_required,
+            stats.existing_dropped_incompatible,
             stats.high_quality_registered,
             stats.low_quality_reused,
             len(plan.rebuild_low_quality_from_raw),

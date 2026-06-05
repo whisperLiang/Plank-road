@@ -436,7 +436,10 @@ class FeatureShardWriter:
                 "source": source,
                 "graph_signature": payload_meta.get("graph_signature"),
                 "payload_metadata": payload_meta.get("payload_metadata") or {},
+                "feature_abi_spec": dict(runtime_context.get("feature_abi_spec") or {}),
             },
+            feature_abi_id=str(runtime_context.get("feature_abi_id") or ""),
+            runtime_identity_id=str(runtime_context.get("runtime_identity_id") or ""),
         )
         if self.storage_format == SAFETENSORS_SHARD:
             shard_path, index_path, meta_path = self._write_safetensors(
@@ -493,6 +496,8 @@ class FeatureShardWriter:
                     "tensor_bytes": _tensor_bytes(stacked),
                     "leaf_specs": leaf_specs,
                 },
+                feature_abi_id=str(runtime_context.get("feature_abi_id") or ""),
+                runtime_identity_id=str(runtime_context.get("runtime_identity_id") or ""),
             )
             refs.append(
                 {

@@ -23,6 +23,11 @@ CANONICAL_FEATURE_METADATA_FIELDS = {
     "split_config_id",
     "front_version",
     "feature_layout_id",
+    "feature_abi_id",
+    "runtime_identity_id",
+    "source_contract_id",
+    "source_feature_layout_id",
+    "rebinding_reason",
     "sample_source",
     "label_source",
     "input_image_size",
@@ -107,6 +112,11 @@ class CanonicalSampleRecord:
     )
     source_label_path: str | None = field(default=None, repr=False, compare=False)
     source_staging_path: str | None = field(default=None, repr=False, compare=False)
+    feature_abi_id: str = ""
+    runtime_identity_id: str = ""
+    source_contract_id: str | None = None
+    source_feature_layout_id: str | None = None
+    rebinding_reason: str | None = None
 
     def feature_layout(self) -> dict[str, dict[str, Any]]:
         if not self.feature and self.feature_layout_metadata is not None:
@@ -148,6 +158,11 @@ class CanonicalSampleRecord:
             "split_config_id": self.split_config_id,
             "front_version": self.front_version,
             "feature_layout_id": self.feature_layout_id,
+            "feature_abi_id": self.feature_abi_id,
+            "runtime_identity_id": self.runtime_identity_id,
+            "source_contract_id": self.source_contract_id,
+            "source_feature_layout_id": self.source_feature_layout_id,
+            "rebinding_reason": self.rebinding_reason,
             "sample_source": self.sample_source,
             "label_source": self.label_source,
             "feature_layout": self.feature_layout(),

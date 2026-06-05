@@ -185,6 +185,8 @@ def _expected_mapping(expected_abi: object) -> dict[str, Any]:
             "split_config_id",
             "front_version",
             "feature_layout_id",
+            "feature_abi_id",
+            "feature_abi_spec",
             "feature_layout",
             "boundary_tensor_labels",
             "canonical_split_key",
@@ -192,6 +194,7 @@ def _expected_mapping(expected_abi: object) -> dict[str, Any]:
             "input_tensor_shape",
             "input_resize_mode",
             "runtime_identity",
+            "runtime_identity_id",
         ):
             if key not in source and hasattr(contract, key):
                 source[key] = getattr(contract, key)
@@ -280,6 +283,27 @@ def _abi_status(
             return False
 
     expected_layout = expected.get("feature_layout")
+    expected_abi_id = str(expected.get("feature_abi_id") or "")
+    actual_abi_id = str(ref.feature_abi_id or metadata.feature_abi_id or "")
+    if expected_abi_id and actual_abi_id:
+        return actual_abi_id == expected_abi_id
+
+    expected_abi_spec = expected.get("feature_abi_spec")
+    metadata_abi_spec = metadata.metadata.get("feature_abi_spec") if isinstance(metadata.metadata, Mapping) else None
+    if (
+        isinstance(expected_abi_spec, Mapping)
+        and expected_abi_spec
+        and isinstance(metadata_abi_spec, Mapping)
+        and metadata_abi_spec
+    ):
+        import json
+
+        return json.dumps(dict(expected_abi_spec), sort_keys=True, separators=(",", ":")) == json.dumps(
+            dict(metadata_abi_spec),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
     if isinstance(expected_layout, Mapping) and expected_layout:
         return feature_layouts_abi_compatible(
             feature_layout,

@@ -47,6 +47,10 @@ from model_management.split_contract import (
     normalise_feature_tensors,
 )
 
+_REBIND_REASON_FEATURE_ABI_COMPATIBLE = (
+    "runtime_identity_changed_but_feature_abi_compatible"
+)
+
 
 def _stable_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -402,6 +406,72 @@ def _feature_ref_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any] 
     return None
 
 
+def _first_text(*values: object) -> str:
+    for value in values:
+        if value in (None, ""):
+            continue
+        return str(value)
+    return ""
+
+
+def _candidate_contract_ref(
+    candidate: Mapping[str, Any],
+    *,
+    metadata: object | None = None,
+    feature_ref: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    runtime_contract_value = candidate.get("runtime_contract")
+    runtime_contract = (
+        dict(runtime_contract_value)
+        if isinstance(runtime_contract_value, Mapping)
+        else {}
+    )
+    ref = dict(feature_ref or _feature_ref_from_candidate(candidate) or {})
+    if isinstance(metadata, Mapping):
+        meta = dict(metadata)
+    else:
+        to_dict = getattr(metadata, "to_dict", None)
+        meta = dict(to_dict()) if callable(to_dict) else {}
+    return {
+        "contract_id": _first_text(
+            candidate.get("contract_id"),
+            runtime_contract.get("contract_id"),
+            ref.get("contract_id"),
+            meta.get("contract_id"),
+        ),
+        "feature_layout_id": _first_text(
+            runtime_contract.get("feature_layout_id"),
+            meta.get("feature_layout_id"),
+            candidate.get("feature_layout_id"),
+            ref.get("feature_layout_id"),
+        ),
+        "feature_abi_id": _first_text(
+            runtime_contract.get("feature_abi_id"),
+            meta.get("feature_abi_id"),
+            candidate.get("feature_abi_id"),
+            ref.get("feature_abi_id"),
+        ),
+        "runtime_identity_id": _first_text(
+            runtime_contract.get("runtime_identity_id"),
+            meta.get("runtime_identity_id"),
+            candidate.get("runtime_identity_id"),
+            ref.get("runtime_identity_id"),
+        ),
+        "source_contract_id": _first_text(
+            candidate.get("source_contract_id"),
+            candidate.get("contract_id"),
+            ref.get("contract_id"),
+            meta.get("contract_id"),
+        ),
+        "source_feature_layout_id": _first_text(
+            candidate.get("source_feature_layout_id"),
+            ref.get("feature_layout_id"),
+            candidate.get("feature_layout_id"),
+            meta.get("feature_layout_id"),
+        ),
+    }
+
+
 def _label_ref_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
     feature_record = candidate.get("feature_record") or candidate.get("record")
     values = []
@@ -437,6 +507,9 @@ def _shard_expected_abi(
         "split_config_id": split_contract.split_config_id,
         "front_version": split_contract.front_version,
         "feature_layout_id": split_contract.feature_layout_id,
+        "feature_abi_id": split_contract.feature_abi_id,
+        "feature_abi_spec": dict(split_contract.feature_abi_spec or {}),
+        "runtime_identity_id": split_contract.runtime_identity_id,
         "feature_layout": dict(split_contract.feature_layout or {}),
         "boundary_tensor_labels": list(split_contract.boundary_tensor_labels or []),
         "boundary_id": str(
@@ -449,41 +522,6 @@ def _shard_expected_abi(
         "label_ref": _label_ref_from_candidate(candidate),
         "labels": candidate.get("labels") or candidate.get("label") or candidate.get("target"),
     }
-
-
-def _candidate_shard_requires_migration(
-    candidate: Mapping[str, Any],
-    *,
-    split_contract: SplitRuntimeContract,
-    validation: ValidationResult | None,
-) -> bool:
-    feature_ref = _feature_ref_from_candidate(candidate)
-    ref_contract = ""
-    ref_layout = ""
-    if isinstance(feature_ref, Mapping):
-        ref_contract = str(feature_ref.get("contract_id") or "")
-        ref_layout = str(feature_ref.get("feature_layout_id") or "")
-    metadata = validation.metadata if validation is not None else None
-    meta_contract = str(metadata.contract_id or "") if metadata is not None else ""
-    meta_layout = str(metadata.feature_layout_id or "") if metadata is not None else ""
-    source_contract = (
-        str(candidate.get("contract_id") or "")
-        or ref_contract
-        or meta_contract
-    )
-    source_layout = (
-        str(candidate.get("feature_layout_id") or "")
-        or ref_layout
-        or meta_layout
-    )
-    return bool(
-        (source_contract and source_contract != split_contract.contract_id)
-        or (ref_contract and ref_contract != split_contract.contract_id)
-        or (meta_contract and meta_contract != split_contract.contract_id)
-        or (source_layout and source_layout != split_contract.feature_layout_id)
-        or (ref_layout and ref_layout != split_contract.feature_layout_id)
-        or (meta_layout and meta_layout != split_contract.feature_layout_id)
-    )
 
 
 def _candidate_with_validated_shard_layout(
@@ -500,23 +538,38 @@ def _candidate_with_validated_shard_layout(
             for label, spec in validation.feature_layout.items()
             if isinstance(spec, Mapping)
         }
-    if feature_ref is not None:
-        updated.setdefault(
-            "source_feature_layout_id",
-            str(feature_ref.get("feature_layout_id") or ""),
+    source_ref = _candidate_contract_ref(
+        updated,
+        metadata=validation.metadata,
+        feature_ref=feature_ref,
+    )
+    if not updated.get("source_feature_layout_id"):
+        updated["source_feature_layout_id"] = source_ref["source_feature_layout_id"]
+    if not updated.get("source_contract_id"):
+        updated["source_contract_id"] = source_ref["source_contract_id"]
+    source_contract_id = str(updated.get("source_contract_id") or "")
+    source_feature_layout_id = str(updated.get("source_feature_layout_id") or "")
+    if (
+        (
+            (
+                source_contract_id
+                and source_contract_id != split_contract.contract_id
+            )
+            or (
+                source_feature_layout_id
+                and source_feature_layout_id != split_contract.feature_layout_id
+            )
         )
-    updated.setdefault("source_contract_id", str(updated.get("contract_id") or ""))
+        and not updated.get("rebinding_reason")
+    ):
+        updated["rebinding_reason"] = _REBIND_REASON_FEATURE_ABI_COMPATIBLE
     updated["feature_layout_id"] = split_contract.feature_layout_id
+    updated["feature_abi_id"] = split_contract.feature_abi_id
+    updated["runtime_identity_id"] = split_contract.runtime_identity_id
     updated["contract_id"] = split_contract.contract_id
     updated["split_config_id"] = split_contract.split_config_id
     updated["front_version"] = split_contract.front_version
     updated["__allow_shard_ref_without_payload"] = True
-    updated["__shard_abi_compatible"] = True
-    updated["__shard_requires_migration"] = _candidate_shard_requires_migration(
-        candidate,
-        split_contract=split_contract,
-        validation=validation,
-    )
     return updated
 
 
@@ -568,11 +621,14 @@ def _feature_layout_source_metadata(candidate: Mapping[str, Any]) -> dict[str, A
     return {
         key: candidate[key]
         for key in (
+            "feature_abi_id",
+            "source_contract_id",
             "source_feature_layout_id",
             "source_feature_schema_hash",
             "source_feature_value_schema_hash",
             "source_feature_split_id",
             "source_feature_graph_signature",
+            "rebinding_reason",
         )
         if candidate.get(key) is not None
     }
@@ -609,23 +665,24 @@ def _metadata_present(value: Any) -> bool:
     return value not in (None, "", [])
 
 
-def _runtime_contract_feature_layout_id(candidate: Mapping[str, Any]) -> str:
-    runtime_contract = candidate.get("runtime_contract")
-    if not isinstance(runtime_contract, Mapping):
-        return ""
-    return str(runtime_contract.get("feature_layout_id") or "")
-
-
-def _candidate_feature_layout_id(
+def _contract_alias_matches(
     candidate: Mapping[str, Any],
-    *,
     split_contract: SplitRuntimeContract,
-) -> str:
-    return (
-        _runtime_contract_feature_layout_id(candidate)
-        or str(candidate.get("feature_layout_id") or "")
-        or str(split_contract.feature_layout_id)
-    )
+) -> bool:
+    contract_ref = _candidate_contract_ref(candidate)
+    candidate_contract = str(candidate.get("contract_id") or "")
+    candidate_layout = contract_ref["feature_layout_id"]
+    candidate_abi = contract_ref["feature_abi_id"]
+    for alias in list(split_contract.contract_aliases or []):
+        if not isinstance(alias, Mapping):
+            continue
+        if candidate_contract and candidate_contract == str(alias.get("contract_id") or ""):
+            return True
+        if candidate_abi and candidate_abi == str(alias.get("feature_abi_id") or ""):
+            return True
+        if candidate_layout and candidate_layout == str(alias.get("feature_layout_id") or ""):
+            return True
+    return False
 
 
 def _has_contract_id_metadata_mismatch(
@@ -633,7 +690,11 @@ def _has_contract_id_metadata_mismatch(
     split_contract: SplitRuntimeContract,
 ) -> bool:
     value = candidate.get("contract_id")
-    return _metadata_present(value) and str(value) != str(split_contract.contract_id)
+    return (
+        _metadata_present(value)
+        and str(value) != str(split_contract.contract_id)
+        and not _contract_alias_matches(candidate, split_contract)
+    )
 
 
 def _hard_contract_metadata_mismatch_reason(
@@ -641,7 +702,6 @@ def _hard_contract_metadata_mismatch_reason(
     split_contract: SplitRuntimeContract,
 ) -> str | None:
     expected_text = {
-        "contract_id": split_contract.contract_id,
         "split_config_id": split_contract.split_config_id,
         "front_version": split_contract.front_version,
     }
@@ -666,16 +726,6 @@ def _hard_contract_metadata_mismatch_reason(
         != str(split_contract.input_resize_mode).strip().lower()
     ):
         return "input_resize_mode"
-
-    feature_layout_id = (
-        _runtime_contract_feature_layout_id(candidate)
-        or candidate.get("feature_layout_id")
-    )
-    if (
-        _metadata_present(feature_layout_id)
-        and str(feature_layout_id) != str(split_contract.feature_layout_id)
-    ):
-        return "feature_layout_id"
 
     return None
 
@@ -785,11 +835,10 @@ class CloudSamplePool:
         if feature_ref is None:
             raise ValueError("Staged sample is missing shard feature_ref.")
         label_ref = _label_ref_from_candidate(sample)
-        feature_layout_id = (
-            _runtime_contract_feature_layout_id(sample)
-            or str(metadata.get("feature_layout_id") or "")
-            or str(sample.get("feature_layout_id") or "")
-            or str(feature_ref.get("feature_layout_id") or "")
+        contract_ref = _candidate_contract_ref(
+            sample,
+            metadata=metadata,
+            feature_ref=feature_ref,
         )
         return {
             "schema_version": _CANONICAL_RECORD_VERSION,
@@ -809,7 +858,12 @@ class CloudSamplePool:
                 or self.front_version
                 or "0"
             ),
-            "feature_layout_id": feature_layout_id,
+            "feature_layout_id": contract_ref["feature_layout_id"],
+            "feature_abi_id": contract_ref["feature_abi_id"],
+            "runtime_identity_id": contract_ref["runtime_identity_id"],
+            "source_contract_id": sample.get("source_contract_id"),
+            "source_feature_layout_id": sample.get("source_feature_layout_id"),
+            "rebinding_reason": sample.get("rebinding_reason"),
             "input_image_size": list(input_image_size) if input_image_size is not None else None,
             "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
             "input_resize_mode": input_resize_mode,
@@ -1027,6 +1081,11 @@ class CloudSamplePool:
                 "split_config_id": entry.get("split_config_id"),
                 "front_version": entry.get("front_version"),
                 "feature_layout_id": entry.get("feature_layout_id"),
+                "feature_abi_id": entry.get("feature_abi_id"),
+                "runtime_identity_id": entry.get("runtime_identity_id"),
+                "source_contract_id": entry.get("source_contract_id"),
+                "source_feature_layout_id": entry.get("source_feature_layout_id"),
+                "rebinding_reason": entry.get("rebinding_reason"),
                 "sample_source": entry.get("sample_source"),
                 "label_source": entry.get("label_source"),
                 "input_image_size": entry.get("input_image_size"),
@@ -1113,6 +1172,11 @@ class CloudSamplePool:
             feature_ref is not None
             and (
                 bool(candidate.get("__allow_shard_ref_without_payload"))
+                or (
+                    str(split_contract.feature_abi_id)
+                    and _candidate_contract_ref(candidate)["feature_abi_id"]
+                    == str(split_contract.feature_abi_id)
+                )
                 or str(candidate.get("feature_layout_id") or "")
                 == str(split_contract.feature_layout_id)
             )
@@ -1167,19 +1231,34 @@ class CloudSamplePool:
             candidate.get("label_source")
             or ("teacher" if sample_source == "low_quality" else "edge_pseudo")
         )
-        contract_id = str(candidate.get("contract_id") or split_contract.contract_id)
-        active_contract_id_mismatch = (
-            is_canonical_active
-            and bool(contract_id)
-            and contract_id != split_contract.contract_id
+        contract_ref = _candidate_contract_ref(candidate, feature_ref=feature_ref)
+        raw_contract_id = contract_ref["contract_id"]
+        source_contract_id = contract_ref["source_contract_id"]
+        if source_contract_id == split_contract.contract_id:
+            source_contract_id = ""
+        if not source_contract_id and raw_contract_id and raw_contract_id != split_contract.contract_id:
+            source_contract_id = raw_contract_id
+        source_feature_layout_id = contract_ref["source_feature_layout_id"]
+        if source_feature_layout_id == split_contract.feature_layout_id:
+            source_feature_layout_id = ""
+        if not source_feature_layout_id:
+            candidate_layout_id = contract_ref["feature_layout_id"]
+            if candidate_layout_id and candidate_layout_id != split_contract.feature_layout_id:
+                source_feature_layout_id = candidate_layout_id
+        rebinding_reason = (
+            None
+            if candidate.get("rebinding_reason") in (None, "")
+            else str(candidate.get("rebinding_reason"))
         )
+        if source_contract_id and source_contract_id != split_contract.contract_id and not rebinding_reason:
+            rebinding_reason = _REBIND_REASON_FEATURE_ABI_COMPATIBLE
         return CanonicalSampleRecord(
             sample_id=sample_id,
-            contract_id=contract_id,
+            contract_id=split_contract.contract_id,
             split_config_id=str(candidate.get("split_config_id") or split_contract.split_config_id),
             front_version=str(candidate.get("front_version") or split_contract.front_version),
             feature_layout_id=str(
-                _candidate_feature_layout_id(candidate, split_contract=split_contract)
+                split_contract.feature_layout_id
             ),
             sample_source=sample_source,
             label_source=label_source,
@@ -1229,6 +1308,11 @@ class CloudSamplePool:
                 if candidate.get("__staging_path") is None
                 else str(candidate.get("__staging_path"))
             ),
+            feature_abi_id=str(split_contract.feature_abi_id),
+            runtime_identity_id=str(split_contract.runtime_identity_id),
+            source_contract_id=source_contract_id or None,
+            source_feature_layout_id=source_feature_layout_id or None,
+            rebinding_reason=rebinding_reason,
         )
 
     def _validate_canonical_record(
@@ -1442,6 +1526,8 @@ class CloudSamplePool:
             "split_config_id": split_contract.split_config_id,
             "front_version": split_contract.front_version,
             "feature_layout_id": split_contract.feature_layout_id,
+            "feature_abi_id": split_contract.feature_abi_id,
+            "runtime_identity_id": split_contract.runtime_identity_id,
             "model_id": split_contract.model_id,
             "edge_id": split_contract.edge_id,
             "generation_id": generation_id,
@@ -1546,6 +1632,7 @@ class CloudSamplePool:
             validation_counts = {
                 "accepted_high_quality": 0,
                 "accepted_low_quality": 0,
+                "rebound_existing_active": 0,
                 "skipped_stale_contract": 0,
                 "skipped_feature_layout": 0,
                 "deferred_feature_layout": 0,
@@ -1566,6 +1653,7 @@ class CloudSamplePool:
             }
             shard_carry_forward = {
                 "existing_active": len(existing_active_samples or []),
+                "rebound_existing_active": 0,
                 "dropped_incompatible": 0,
                 "skipped_unreadable": 0,
             }
@@ -1736,10 +1824,9 @@ class CloudSamplePool:
                         validation_counts["invalid_high_quality"] += 1
                     invalid_records.append(record)
                     continue
-                if contract_id_mismatch:
-                    validation_counts["skipped_stale_contract"] += 1
-                    validation_previews["skipped_stale_contract"].append(record.sample_id)
-                    continue
+                if input_source == "existing_active" and record.rebinding_reason:
+                    validation_counts["rebound_existing_active"] += 1
+                    shard_carry_forward["rebound_existing_active"] += 1
                 if record.sample_source == "low_quality":
                     validation_counts["accepted_low_quality"] += 1
                 else:

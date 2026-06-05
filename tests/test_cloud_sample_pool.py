@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -67,11 +68,14 @@ def _contract_with_labels(
     *,
     graph_signature: str = "test-graph",
     shapes: tuple[tuple[int, ...], ...] = ((2, 3), (1, 2)),
+    runtime_identity_extra: dict | None = None,
 ) -> SplitRuntimeContract:
     tensors = {
         label: torch.zeros((1, *shape), dtype=torch.float16)
         for label, shape in zip(labels, shapes, strict=True)
     }
+    runtime_identity = {"graph_signature": graph_signature}
+    runtime_identity.update(dict(runtime_identity_extra or {}))
     return SplitRuntimeContract.create(
         edge_id=1,
         model_id="yolo26n",
@@ -84,7 +88,7 @@ def _contract_with_labels(
         boundary_tensor_labels=list(labels),
         front_version="1",
         feature_tensors=tensors,
-        runtime_identity={"graph_signature": graph_signature},
+        runtime_identity=runtime_identity,
     )
 
 
@@ -146,6 +150,9 @@ def _write_shard_samples(
             "split_config_id": contract.split_config_id,
             "contract_id": contract.contract_id,
             "feature_layout_id": contract.feature_layout_id,
+            "feature_abi_id": contract.feature_abi_id,
+            "feature_abi_spec": dict(contract.feature_abi_spec),
+            "runtime_identity_id": contract.runtime_identity_id,
             "boundary_id": contract.cloud_batch_split_id,
         },
         generation="gen",
@@ -160,6 +167,8 @@ def _write_shard_samples(
                 "label_source": label_source,
                 "feature_ref": entry["feature_ref"].to_dict(),
                 "feature_layout_id": contract.feature_layout_id,
+                "feature_abi_id": contract.feature_abi_id,
+                "runtime_identity_id": contract.runtime_identity_id,
                 "split_config_id": contract.split_config_id,
                 "front_version": contract.front_version,
                 "model_id": contract.model_id,
@@ -187,6 +196,9 @@ def _training_view_for_pool(
             "split_config_id": contract.split_config_id,
             "contract_id": contract.contract_id,
             "feature_layout_id": contract.feature_layout_id,
+            "feature_abi_id": contract.feature_abi_id,
+            "feature_abi_spec": dict(contract.feature_abi_spec),
+            "runtime_identity_id": contract.runtime_identity_id,
             "feature_layout": dict(contract.feature_layout),
             "boundary_tensor_labels": list(contract.boundary_tensor_labels),
             "boundary_id": contract.cloud_batch_split_id,
@@ -231,6 +243,9 @@ def _candidate_with_shard_ref(
             "split_config_id": contract.split_config_id,
             "contract_id": contract.contract_id,
             "feature_layout_id": contract.feature_layout_id,
+            "feature_abi_id": contract.feature_abi_id,
+            "feature_abi_spec": dict(contract.feature_abi_spec),
+            "runtime_identity_id": contract.runtime_identity_id,
             "boundary_id": contract.cloud_batch_split_id,
         },
         generation="test",
@@ -240,6 +255,8 @@ def _candidate_with_shard_ref(
         "sample_id": sample_id,
         "feature_ref": written[0]["feature_ref"].to_dict(),
         "feature_layout_id": contract.feature_layout_id,
+        "feature_abi_id": contract.feature_abi_id,
+        "runtime_identity_id": contract.runtime_identity_id,
         "labels": dict(labels or {"boxes": [], "labels": []}),
         "split_config_id": contract.split_config_id,
         "front_version": contract.front_version,
@@ -288,50 +305,33 @@ def test_sample_pool_accepts_folded_single_sample_boundary_payload(tmp_path) -> 
     assert kept_records[0].feature_ref is not None
 
 
-def test_feature_layout_mismatch_drops_old_active_shards(tmp_path) -> None:
-    old_boundary = boundary_payload_from_tensors(
-        {"old_label": torch.randn(1, 4)},
-        split_id="after:linear",
-        graph_signature="old-runtime",
-        batch_size=1,
-        schema={
-            "old_label": {
-                "canonical_id": "old_label",
-                "torchlens_label": "old_label",
-                "module_path": "fake.old",
-                "op_type": "linear",
-                "shape": (1, 4),
-                "dtype": torch.float32,
-                "requires_grad": False,
-                "role": "primary",
-                "output_index": None,
-                "device_policy": "runtime",
-            }
-        },
+def test_incompatible_boundary_tensor_shape_rebuilds_or_drops_old_active(tmp_path) -> None:
+    old_contract = _contract_with_labels(
+        graph_signature="shape-abi",
+        shapes=((2, 3), (1, 2)),
     )
-    old_tensors = dict(old_boundary.tensors)
-    new_tensors = {"new_label": torch.randn(1, 4)}
-    old_contract = _split_contract(old_tensors)
-    new_contract = _split_contract(new_tensors)
+    new_contract = _contract_with_labels(
+        graph_signature="shape-abi",
+        shapes=((4, 3), (1, 2)),
+    )
     pool = CloudSamplePool(
         str(tmp_path / "pool"),
-        model_id="rfdetr_nano",
-        front_version="0",
+        model_id="yolo26n",
+        front_version="1",
         split_config_id="split-a",
         edge_id=1,
         staging_root=str(tmp_path / "staging"),
     )
 
-    pool.stage_low_quality_samples(
-        [
-            _candidate_with_shard_ref(
-                tmp_path,
-                sample_id="sample-1",
-                boundary=old_boundary,
-                contract=old_contract,
-            )
-        ]
+    _store, initial_low = _write_shard_samples(
+        tmp_path,
+        ["sample-1"],
+        contract=old_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+        shapes=((2, 3), (1, 2)),
     )
+    pool.stage_low_quality_samples(initial_low)
     _stats, kept_records = pool.rebuild_canonical_training_pool(
         split_contract=old_contract,
         existing_active_samples=[],
@@ -348,10 +348,214 @@ def test_feature_layout_mismatch_drops_old_active_shards(tmp_path) -> None:
         new_low_quality_samples=[],
     )
 
-    assert rebuild_stats["validation"]["skipped_stale_contract"] == 1
+    assert rebuild_stats["validation"]["skipped_stale_contract"] == 0
+    assert rebuild_stats["validation"]["skipped_feature_layout"] == 1
+    assert rebuild_stats["shard_carry_forward"]["dropped_incompatible"] == 1
     assert rebuild_stats["validation"]["skipped_unreadable"] == 0
     assert rebuild_stats["generation_commit"]["active"] == 0
     assert kept_records == []
+
+
+def test_rfdetr_feature_abi_ignores_batch_dimension() -> None:
+    contract_batch_1 = SplitRuntimeContract.create(
+        edge_id=1,
+        model_id="rfdetr_nano",
+        split_config_id="split-a",
+        canonical_split_key="after:linear_4_32",
+        edge_split_id="after:linear_4_32",
+        cloud_batch_split_id="after:linear_4_32",
+        input_tensor_shape=[1, 3, 384, 384],
+        input_resize_mode="direct_resize",
+        boundary_tensor_labels=["dropout_1_17"],
+        front_version="0",
+        feature_tensors={"dropout_1_17": torch.zeros(1, 145, 384)},
+        runtime_identity={"graph_signature": "rfdetr-stable"},
+    )
+    contract_batch_20 = SplitRuntimeContract.create(
+        edge_id=1,
+        model_id="rfdetr_nano",
+        split_config_id="split-a",
+        canonical_split_key="after:linear_4_32",
+        edge_split_id="after:linear_4_32",
+        cloud_batch_split_id="after:linear_4_32",
+        input_tensor_shape=[20, 3, 384, 384],
+        input_resize_mode="direct_resize",
+        boundary_tensor_labels=["dropout_1_17"],
+        front_version="0",
+        feature_tensors={"dropout_1_17": torch.zeros(20, 145, 384)},
+        runtime_identity={"graph_signature": "rfdetr-stable"},
+    )
+
+    assert contract_batch_1.feature_abi_id == contract_batch_20.feature_abi_id
+
+
+def test_sample_pool_accumulates_when_runtime_validation_signature_changes_but_feature_abi_same(tmp_path) -> None:
+    gen1_contract = _contract_with_labels(
+        graph_signature="stable-feature-abi",
+        runtime_identity_extra={"runtime_batch_validation_signature": "batch-smoke-a"},
+    )
+    gen2_contract = _contract_with_labels(
+        graph_signature="stable-feature-abi",
+        runtime_identity_extra={"runtime_batch_validation_signature": "batch-smoke-b"},
+    )
+    assert gen1_contract.contract_id != gen2_contract.contract_id
+    assert gen1_contract.runtime_identity_id != gen2_contract.runtime_identity_id
+    assert gen1_contract.feature_abi_id == gen2_contract.feature_abi_id
+    gen2_contract.contract_aliases = [
+        {
+            "contract_id": gen1_contract.contract_id,
+            "runtime_identity_id": gen1_contract.runtime_identity_id,
+            "feature_layout_id": gen1_contract.feature_layout_id,
+            "feature_abi_id": gen1_contract.feature_abi_id,
+            "reason": "runtime_identity_changed_but_feature_abi_compatible",
+        }
+    ]
+    pool = CloudSamplePool(
+        str(tmp_path / "pool"),
+        model_id="yolo26n",
+        front_version="1",
+        split_config_id="split-a",
+        edge_id=1,
+        staging_root=str(tmp_path / "staging"),
+    )
+
+    _store, initial_low = _write_shard_samples(
+        tmp_path,
+        [f"active-{index}" for index in range(80)],
+        contract=gen1_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+    )
+    pool.stage_low_quality_samples(initial_low)
+    first_stats, _first_kept = pool.rebuild_canonical_training_pool(
+        split_contract=gen1_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    assert first_stats["generation_commit"]["active"] == 80
+
+    _store, pending_high = _write_shard_samples(
+        tmp_path,
+        [f"pending-{index}" for index in range(215)],
+        contract=gen2_contract,
+        sample_source="high_quality",
+        label_source="edge_pseudo",
+    )
+    pool.store_pending_high_quality_samples(pending_high)
+    _store, new_low = _write_shard_samples(
+        tmp_path,
+        [f"new-low-{index}" for index in range(35)],
+        contract=gen2_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+    )
+    pool.stage_low_quality_samples(new_low)
+
+    second_stats, kept = pool.rebuild_canonical_training_pool(
+        split_contract=gen2_contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(split_contract=gen2_contract),
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert second_stats["validation"]["skipped_stale_contract"] == 0
+    assert second_stats["validation"]["rebound_existing_active"] == 80
+    assert second_stats["selection"]["dropped_stale"] == 0
+    assert second_stats["generation_commit"]["active"] == 330
+    assert len(kept) == 330
+    active_samples, view = _training_view_for_pool(tmp_path, pool, contract=gen2_contract)
+    assert len(active_samples) == 330
+    assert view.feature_abi_id == gen2_contract.feature_abi_id
+    view_dir = os.path.dirname(view.manifest_path)
+    assert not os.path.exists(os.path.join(view_dir, "features"))
+    manifest = json.loads(open(view.manifest_path, encoding="utf-8").read())
+    assert manifest["feature_abi_id"] == gen2_contract.feature_abi_id
+    rebound_samples = [
+        sample
+        for sample in manifest["samples"]
+        if dict(sample.get("metadata") or {}).get("rebinding_reason")
+    ]
+    assert len(rebound_samples) == 80
+    assert all(
+        dict(sample.get("metadata") or {}).get("source_contract_id") == gen1_contract.contract_id
+        for sample in rebound_samples
+    )
+
+
+def test_third_round_keeps_previous_250_active_samples(tmp_path) -> None:
+    previous_contract = _contract_with_labels(
+        graph_signature="third-round-feature-abi",
+        runtime_identity_extra={"runtime_batch_validation_signature": "round-2"},
+    )
+    current_contract = _contract_with_labels(
+        graph_signature="third-round-feature-abi",
+        runtime_identity_extra={"runtime_batch_validation_signature": "round-3"},
+    )
+    assert previous_contract.feature_abi_id == current_contract.feature_abi_id
+    current_contract.contract_aliases = [
+        {
+            "contract_id": previous_contract.contract_id,
+            "runtime_identity_id": previous_contract.runtime_identity_id,
+            "feature_layout_id": previous_contract.feature_layout_id,
+            "feature_abi_id": previous_contract.feature_abi_id,
+            "reason": "runtime_identity_changed_but_feature_abi_compatible",
+        }
+    ]
+    pool = CloudSamplePool(
+        str(tmp_path / "pool"),
+        model_id="yolo26n",
+        front_version="1",
+        split_config_id="split-a",
+        edge_id=1,
+        staging_root=str(tmp_path / "staging"),
+    )
+
+    _store, previous_active = _write_shard_samples(
+        tmp_path,
+        [f"previous-{index}" for index in range(250)],
+        contract=previous_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+    )
+    pool.stage_low_quality_samples(previous_active)
+    previous_stats, _previous_kept = pool.rebuild_canonical_training_pool(
+        split_contract=previous_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    assert previous_stats["generation_commit"]["active"] == 250
+
+    _store, pending_high = _write_shard_samples(
+        tmp_path,
+        [f"pending-third-{index}" for index in range(49)],
+        contract=current_contract,
+        sample_source="high_quality",
+        label_source="edge_pseudo",
+    )
+    pool.store_pending_high_quality_samples(pending_high)
+    _store, new_low = _write_shard_samples(
+        tmp_path,
+        [f"new-third-low-{index}" for index in range(31)],
+        contract=current_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+    )
+    pool.stage_low_quality_samples(new_low)
+
+    third_stats, kept = pool.rebuild_canonical_training_pool(
+        split_contract=current_contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(split_contract=current_contract),
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert third_stats["validation"]["skipped_stale_contract"] == 0
+    assert third_stats["validation"]["rebound_existing_active"] == 250
+    assert third_stats["selection"]["dropped_stale"] == 0
+    assert third_stats["generation_commit"]["active"] == 330
+    assert len(kept) == 330
 
 
 def test_sample_pool_rejects_raw_feature_without_shard_ref(tmp_path) -> None:

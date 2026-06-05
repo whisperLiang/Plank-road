@@ -14,6 +14,8 @@ def runtime_context(layout_id: str = "layout-a") -> dict[str, Any]:
         "split_config_id": "split-a",
         "contract_id": "contract-a",
         "feature_layout_id": layout_id,
+        "feature_abi_id": "feature-abi-a",
+        "runtime_identity_id": "runtime-identity-a",
         "boundary_id": "after:test",
         "input_tensor_shape": [1, 3, 320, 320],
         "input_resize_mode": "direct_resize",

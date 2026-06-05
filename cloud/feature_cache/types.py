@@ -39,6 +39,7 @@ class FeatureCacheKey:
     dtype: str | None
     tensor_shapes_fingerprint: str | None
     passthrough_schema_fingerprint: str | None
+    feature_abi_id: str = ""
 
     def payload(self) -> dict[str, object]:
         return asdict(self)
@@ -72,6 +73,8 @@ class FeatureShardMetadata:
     shard_dir: str | None = None
     index_path: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
+    feature_abi_id: str = ""
+    runtime_identity_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -124,6 +127,8 @@ class FeatureShardMetadata:
             ),
             index_path=str(payload.get("index_path") or ""),
             metadata=dict(payload.get("metadata") or {}),
+            feature_abi_id=str(payload.get("feature_abi_id") or ""),
+            runtime_identity_id=str(payload.get("runtime_identity_id") or ""),
         )
 
 
@@ -145,6 +150,8 @@ class FeatureShardRef:
     leaf_keys: list[str]
     passthrough_keys: list[str] = field(default_factory=list)
     metadata: dict[str, object] = field(default_factory=dict)
+    feature_abi_id: str = ""
+    runtime_identity_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -164,6 +171,8 @@ class FeatureShardRef:
             "leaf_keys": list(self.leaf_keys),
             "passthrough_keys": list(self.passthrough_keys),
             "metadata": dict(self.metadata),
+            "feature_abi_id": self.feature_abi_id,
+            "runtime_identity_id": self.runtime_identity_id,
         }
 
     @classmethod
@@ -202,6 +211,8 @@ class FeatureShardRef:
                 str(key) for key in list(payload.get("passthrough_keys") or [])
             ],
             metadata=dict(payload.get("metadata") or {}),
+            feature_abi_id=str(payload.get("feature_abi_id") or ""),
+            runtime_identity_id=str(payload.get("runtime_identity_id") or ""),
         )
 
 
@@ -283,6 +294,8 @@ class TrainingCacheView:
     manifest_path: str
     metadata_index_path: str
     created_at: float
+    feature_abi_id: str = ""
+    runtime_identity_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -290,6 +303,8 @@ class TrainingCacheView:
             "view_id": self.view_id,
             "generation": self.generation,
             "feature_layout_id": self.feature_layout_id,
+            "feature_abi_id": self.feature_abi_id,
+            "runtime_identity_id": self.runtime_identity_id,
             "contract_id": self.contract_id,
             "source": self.source,
             "sample_count": len(self.samples),
@@ -304,6 +319,9 @@ class TrainingCacheView:
 class FeatureCacheStats:
     requested_samples: int = 0
     existing_reused: int = 0
+    existing_rebound: int = 0
+    existing_rebuild_required: int = 0
+    existing_dropped_incompatible: int = 0
     high_quality_registered: int = 0
     low_quality_reused: int = 0
     low_quality_rebuilt: int = 0
@@ -347,6 +365,8 @@ class FeatureCachePreparePlan:
     feature_layout_id: str
     contract_id: str
     materialization_mode: str
+    feature_abi_id: str = ""
+    runtime_identity_id: str = ""
     runtime_context: dict[str, object] = field(default_factory=dict)
     reuse_existing_refs: list[dict[str, object]] = field(default_factory=list)
     register_uploaded_feature_refs: list[dict[str, object]] = field(default_factory=list)

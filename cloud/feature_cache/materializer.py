@@ -103,6 +103,8 @@ def _record_from_payload(
             "split_label": getattr(payload, "split_id", None),
             "runtime_contract": dict(runtime_context.get("runtime_contract") or {}),
             "feature_layout_id": str(runtime_context.get("feature_layout_id") or ""),
+            "feature_abi_id": str(runtime_context.get("feature_abi_id") or ""),
+            "runtime_identity_id": str(runtime_context.get("runtime_identity_id") or ""),
             "sample_id": str(sample.get("sample_id") or ""),
             "model_id": str(runtime_context.get("model_id") or ""),
             "split_config_id": str(runtime_context.get("split_config_id") or ""),
@@ -314,6 +316,11 @@ class FeatureCacheMaterializer:
                     "split_config_id",
                     "front_version",
                     "feature_layout",
+                    "feature_abi_id",
+                    "runtime_identity_id",
+                    "source_contract_id",
+                    "source_feature_layout_id",
+                    "rebinding_reason",
                 }
             },
         )
@@ -345,6 +352,8 @@ class FeatureCacheMaterializer:
         record.setdefault("front_version", sample_ref.metadata.get("front_version") or "")
         record.setdefault("input_tensor_shape", sample_ref.metadata.get("input_tensor_shape") or [])
         record.setdefault("input_resize_mode", sample_ref.metadata.get("input_resize_mode") or "")
+        record.setdefault("feature_abi_id", sample_ref.metadata.get("feature_abi_id") or sample_ref.feature_ref.feature_abi_id)
+        record.setdefault("runtime_identity_id", sample_ref.metadata.get("runtime_identity_id") or sample_ref.feature_ref.runtime_identity_id)
         return record
 
     def write_training_view(
@@ -356,6 +365,8 @@ class FeatureCacheMaterializer:
         contract_id: str,
         entries: Sequence[Mapping[str, object]],
         source: str = "canonical_active",
+        feature_abi_id: str = "",
+        runtime_identity_id: str = "",
         records: Mapping[str, Mapping[str, object]] | None = None,
         stats: FeatureCacheStats | None = None,
     ) -> FeatureCachePrepareResult:
@@ -368,6 +379,12 @@ class FeatureCacheMaterializer:
             self._training_ref_from_entry(entry, generation=generation, stats=stats)
             for entry in list(entries or [])
         ]
+        view_contract = {
+            "feature_layout_id": str(feature_layout_id or ""),
+            "feature_abi_id": str(feature_abi_id or ""),
+            "runtime_identity_id": str(runtime_identity_id or ""),
+            "contract_id": str(contract_id or ""),
+        }
         metadata_samples: dict[str, dict[str, object]] = {}
         for sample_ref in sample_refs:
             record = self._metadata_record_for_ref(sample_ref, records)
@@ -381,6 +398,12 @@ class FeatureCacheMaterializer:
                 "model_id": str(record.get("model_id") or ""),
                 "split_config_id": str(record.get("split_config_id") or ""),
                 "front_version": str(record.get("front_version") or ""),
+                "feature_abi_id": str(record.get("feature_abi_id") or view_contract["feature_abi_id"]),
+                "runtime_identity_id": str(record.get("runtime_identity_id") or view_contract["runtime_identity_id"]),
+                "contract_id": view_contract["contract_id"],
+                "source_contract_id": str(record.get("source_contract_id") or ""),
+                "source_feature_layout_id": str(record.get("source_feature_layout_id") or ""),
+                "rebinding_reason": str(record.get("rebinding_reason") or ""),
                 "input_image_size": record.get("input_image_size"),
                 "input_tensor_shape": list(record.get("input_tensor_shape") or []),
                 "input_resize_mode": str(record.get("input_resize_mode") or ""),
@@ -403,6 +426,8 @@ class FeatureCacheMaterializer:
             manifest_path=manifest_path,
             metadata_index_path=metadata_index_path,
             created_at=time.time(),
+            feature_abi_id=view_contract["feature_abi_id"],
+            runtime_identity_id=view_contract["runtime_identity_id"],
         )
         manifest_started = time.perf_counter()
         _atomic_json_dump(manifest_path, view.to_dict())
@@ -412,8 +437,7 @@ class FeatureCacheMaterializer:
                 "cache_version": "feature-shard-training-view.v1",
                 "view_id": view_id,
                 "generation": generation,
-                "feature_layout_id": feature_layout_id,
-                "contract_id": contract_id,
+                **view_contract,
                 "source": str(source),
                 "all_sample_ids": [sample.sample_id for sample in sample_refs],
                 "cache_reused": False,
@@ -430,8 +454,7 @@ class FeatureCacheMaterializer:
                 "schema_version": "feature-shard-metadata-index.v1",
                 "view_id": view_id,
                 "generation": generation,
-                "feature_layout_id": feature_layout_id,
-                "contract_id": contract_id,
+                **view_contract,
                 "source": str(source),
                 "all_sample_ids": [sample.sample_id for sample in sample_refs],
                 "samples": metadata_samples,
@@ -466,6 +489,8 @@ class FeatureCacheMaterializer:
             feature_layout_id=feature_layout_id,
             contract_id=contract_id,
             materialization_mode=self.materialization_mode,
+            feature_abi_id=view_contract["feature_abi_id"],
+            runtime_identity_id=view_contract["runtime_identity_id"],
             stats=stats,
         )
         return FeatureCachePrepareResult(
@@ -482,6 +507,9 @@ class FeatureCacheMaterializer:
                 "training_view_id": view_id,
                 "training_view_path": view_dir,
                 "feature_cache_view_source": str(source),
+                "feature_abi_id": view_contract["feature_abi_id"],
+                "runtime_identity_id": view_contract["runtime_identity_id"],
+                "contract_id": view_contract["contract_id"],
             },
             frame_dir=os.path.join(view_dir, "frames"),
             stats=stats,
@@ -505,6 +533,8 @@ class FeatureCacheMaterializer:
             feature_layout_id=plan.feature_layout_id,
             contract_id=plan.contract_id,
             entries=entries,
+            feature_abi_id=plan.feature_abi_id,
+            runtime_identity_id=plan.runtime_identity_id,
             records=record_overrides,
             stats=stats,
         )

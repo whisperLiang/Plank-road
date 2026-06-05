@@ -138,6 +138,16 @@ class FeatureShardStore:
             or manifest.get("feature_layout_id")
             or ""
         )
+        feature_abi_id = str(
+            dict(manifest.get("runtime_contract") or {}).get("feature_abi_id")
+            or manifest.get("feature_abi_id")
+            or ""
+        )
+        runtime_identity_id = str(
+            dict(manifest.get("runtime_contract") or {}).get("runtime_identity_id")
+            or manifest.get("runtime_identity_id")
+            or ""
+        )
         generation = str(manifest.get("request_id") or manifest.get("generation") or "edge_upload")
         target_dir = os.path.join(
             self.root_dir,
@@ -230,6 +240,8 @@ class FeatureShardStore:
                         "split_config_id": str(index_payload.get("split_config_id") or ""),
                         "leaf_specs": dict(index_payload.get("leaf_specs") or {}),
                     },
+                    feature_abi_id=str(index_payload.get("feature_abi_id") or feature_abi_id),
+                    runtime_identity_id=str(index_payload.get("runtime_identity_id") or runtime_identity_id),
                 )
                 registered.append({"sample_id": str(sample_id), "feature_ref": ref})
             logger.info(

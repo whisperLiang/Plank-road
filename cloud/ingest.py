@@ -154,6 +154,12 @@ def materialize_low_quality_trigger_bundle(
             sample["feature_ref"] = feature_ref
             sample["has_feature"] = True
             sample["feature_layout_id"] = str(feature_ref.get("feature_layout_id") or "")
+            sample["feature_abi_id"] = str(
+                feature_ref.get("feature_abi_id")
+                or runtime_contract_payload.get("feature_abi_id")
+                or ""
+            )
+            sample["runtime_identity_id"] = str(feature_ref.get("runtime_identity_id") or "")
             sample["runtime_contract"] = runtime_contract_payload
     normalized_manifest = dict(trigger_manifest)
     normalized_manifest.update(
@@ -325,6 +331,12 @@ def load_high_quality_shard_candidates(
                 "front_version": manifest_front_version,
                 "runtime_contract": manifest_runtime_contract,
                 "feature_layout_id": str(manifest_feature_layout_id or feature_ref.feature_layout_id),
+                "feature_abi_id": str(
+                    feature_ref.feature_abi_id
+                    or manifest_runtime_contract.get("feature_abi_id")
+                    or ""
+                ),
+                "runtime_identity_id": str(feature_ref.runtime_identity_id or ""),
                 "source_feature_layout_id": str(feature_ref.feature_layout_id),
                 "source_feature_schema_hash": "",
                 "source_feature_value_schema_hash": "",

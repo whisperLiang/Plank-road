@@ -31,6 +31,8 @@ def test_training_cache_view_contains_only_shard_refs_and_no_feature_files(tmp_p
         generation="gen_000001",
         feature_layout_id="layout-a",
         contract_id="contract-a",
+        feature_abi_id="feature-abi-a",
+        runtime_identity_id="runtime-identity-a",
         entries=written,
     )
     assert result.view is not None
@@ -38,6 +40,8 @@ def test_training_cache_view_contains_only_shard_refs_and_no_feature_files(tmp_p
     view_dir = os.path.dirname(result.view.manifest_path)
     assert not os.path.exists(os.path.join(view_dir, "features"))
     manifest = json.loads(open(result.view.manifest_path, encoding="utf-8").read())
+    assert manifest["feature_abi_id"] == "feature-abi-a"
+    assert manifest["runtime_identity_id"] == "runtime-identity-a"
     assert all(sample["feature_ref"]["storage_format"] == "npy_memmap_shard" for sample in manifest["samples"])
     assert result.stats.files_copied == 0
     assert result.stats.bytes_copied == 0
