@@ -1754,3 +1754,309 @@ def _fixed_split_proxy_rejection_reason(
         )
 
     return None
+
+
+@dataclass(frozen=True)
+class FixedSplitProxyDecision:
+    accepted: bool
+    reason: str | None = None
+    summary: str | None = None
+
+
+class FixedSplitProxyEvaluator:
+    """Public fixed-split proxy-evaluation facade.
+
+    The detailed scoring, dead-detector checks, threshold calibration, and state
+    snapshots stay private to this module. Orchestration code uses this class so
+    those internals remain in one place.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        default_batch_size: int,
+        max_samples: int | None,
+        frame_cache_enabled: bool = True,
+        tinynext_threshold_candidates: list[float] | None = None,
+    ) -> None:
+        self.device = device
+        self.default_batch_size = max(1, int(default_batch_size))
+        self.max_samples = max_samples
+        self.frame_cache_enabled = bool(frame_cache_enabled)
+        self.tinynext_threshold_candidates = (
+            list(tinynext_threshold_candidates)
+            if tinynext_threshold_candidates is not None
+            else None
+        )
+
+    def new_frame_cache(self) -> dict[str, np.ndarray | None] | None:
+        if not self.frame_cache_enabled:
+            return None
+        return {}
+
+    def evaluate_detection(
+        self,
+        model: torch.nn.Module,
+        *,
+        frame_dir: str,
+        gt_annotations: Mapping[str, Mapping[str, object]],
+        model_name: str,
+        sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
+        frame_cache: dict[str, np.ndarray | None] | None = None,
+        max_samples: int | None = None,
+        inference_batch_size: int | None = None,
+        split_cache_path: str | None = None,
+        splitter: UniversalModelSplitter | None = None,
+        split_candidate=None,
+        preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
+        proxy_cache_threshold_low: float | None = None,
+    ) -> dict[str, float | int | None]:
+        threshold_low = None
+        threshold_high = None
+        if proxy_cache_threshold_low is not None:
+            current_low, current_high = get_model_detection_thresholds(model, model_name)
+            threshold_low = _proxy_prediction_cache_threshold_low(
+                float(current_low),
+                [float(proxy_cache_threshold_low), float(current_high)],
+            )
+            threshold_high = float(current_high)
+        return _evaluate_detection_proxy_map(
+            model,
+            frame_dir=frame_dir,
+            gt_annotations=gt_annotations,
+            device=self.device,
+            threshold_low=threshold_low,
+            threshold_high=threshold_high,
+            model_name=model_name,
+            sample_metadata_by_id=sample_metadata_by_id,
+            frame_cache=frame_cache,
+            max_samples=self.max_samples if max_samples is None else max_samples,
+            inference_batch_size=(
+                self.default_batch_size
+                if inference_batch_size is None
+                else max(1, int(inference_batch_size))
+            ),
+            split_cache_path=split_cache_path,
+            splitter=splitter,
+            split_candidate=split_candidate,
+            preloaded_records=preloaded_records,
+        )
+
+    def evaluate_tinynext(
+        self,
+        model: torch.nn.Module,
+        *,
+        frame_dir: str,
+        gt_annotations: Mapping[str, Mapping[str, object]],
+        model_name: str,
+        sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
+        frame_cache: dict[str, np.ndarray | None] | None = None,
+        max_samples: int | None = None,
+        candidate_thresholds: list[float] | None = None,
+        inference_batch_size: int | None = None,
+        stage_label: str,
+        split_cache_path: str | None = None,
+        splitter: UniversalModelSplitter | None = None,
+        split_candidate=None,
+        preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
+        allow_dead_baseline_fast_path: bool = False,
+        logger=None,
+    ) -> dict[str, float | int | None]:
+        effective_max_samples = self.max_samples if max_samples is None else max_samples
+        full_proxy_sample_count = len(
+            _normalize_proxy_sample_ids(
+                gt_annotations,
+                max_samples=effective_max_samples,
+            )
+        )
+        calibration_max_samples = self._resolve_tinynext_proxy_selection_max_samples(
+            available_samples=len(gt_annotations),
+            full_eval_max_samples=effective_max_samples,
+        )
+        use_subset_calibration = (
+            calibration_max_samples is not None
+            and calibration_max_samples < full_proxy_sample_count
+        )
+        thresholds = (
+            candidate_thresholds
+            if candidate_thresholds is not None
+            else self.tinynext_threshold_candidates
+        )
+        batch_size = (
+            self.default_batch_size
+            if inference_batch_size is None
+            else max(1, int(inference_batch_size))
+        )
+        if use_subset_calibration:
+            subset_metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                device=self.device,
+                model_name=model_name,
+                frame_cache=frame_cache,
+                max_samples=calibration_max_samples,
+                candidate_thresholds=thresholds,
+                inference_batch_size=batch_size,
+                split_cache_path=split_cache_path,
+                splitter=splitter,
+                split_candidate=split_candidate,
+                preloaded_records=preloaded_records,
+            )
+            if logger is not None and abs(calibrated_high - initial_high) > 1e-6:
+                logger.info(
+                    "[FixedSplitCL] Calibrated {} threshold_high {} -> {} on {}-sample proxy subset during {}.",
+                    model_name,
+                    initial_high,
+                    calibrated_high,
+                    calibration_max_samples,
+                    stage_label,
+                )
+            if (
+                allow_dead_baseline_fast_path
+                and _proxy_metrics_indicate_dead_detector(subset_metrics)
+            ):
+                metrics = dict(subset_metrics)
+                metrics["full_proxy_evaluation_skipped"] = 1
+                metrics["full_proxy_sample_count"] = int(full_proxy_sample_count)
+                metrics["subset_proxy_sample_count"] = int(
+                    metrics.get("evaluated_samples", 0) or 0
+                )
+                if logger is not None:
+                    logger.info(
+                        "[FixedSplitCL] Skipping full TinyNeXt baseline proxy evaluation during {}: "
+                        "{}-sample subset produced no detections; full_proxy_samples={}.",
+                        stage_label,
+                        int(metrics["subset_proxy_sample_count"]),
+                        int(full_proxy_sample_count),
+                    )
+                return metrics
+            return self.evaluate_detection(
+                model,
+                frame_dir=frame_dir,
+                gt_annotations=gt_annotations,
+                model_name=model_name,
+                sample_metadata_by_id=sample_metadata_by_id,
+                frame_cache=frame_cache,
+                max_samples=effective_max_samples,
+                inference_batch_size=batch_size,
+                split_cache_path=split_cache_path,
+                splitter=splitter,
+                split_candidate=split_candidate,
+                preloaded_records=preloaded_records,
+                proxy_cache_threshold_low=calibrated_high,
+            )
+
+        metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+            model,
+            frame_dir=frame_dir,
+            gt_annotations=gt_annotations,
+            device=self.device,
+            model_name=model_name,
+            frame_cache=frame_cache,
+            max_samples=effective_max_samples,
+            candidate_thresholds=thresholds,
+            inference_batch_size=batch_size,
+            split_cache_path=split_cache_path,
+            splitter=splitter,
+            split_candidate=split_candidate,
+            preloaded_records=preloaded_records,
+        )
+        if logger is not None and abs(calibrated_high - initial_high) > 1e-6:
+            logger.info(
+                "[FixedSplitCL] Calibrated {} threshold_high {} -> {} during {}.",
+                model_name,
+                initial_high,
+                calibrated_high,
+                stage_label,
+            )
+        return dict(metrics)
+
+    def format_summary(
+        self,
+        metrics_before: Mapping[str, object] | None,
+        metrics_after: Mapping[str, object] | None,
+    ) -> str | None:
+        return _format_proxy_map_summary(metrics_before, metrics_after)
+
+    def metrics_indicate_dead_detector(
+        self,
+        metrics: Mapping[str, object] | None,
+    ) -> bool:
+        return _proxy_metrics_indicate_dead_detector(metrics)
+
+    def metrics_skipped_full_proxy(
+        self,
+        metrics: Mapping[str, object] | None,
+    ) -> bool:
+        return _proxy_metrics_skipped_full_proxy(metrics)
+
+    def rejection_reason(
+        self,
+        metrics_before: Mapping[str, object] | None,
+        metrics_after: Mapping[str, object] | None,
+        *,
+        tolerance: float = 1e-6,
+    ) -> str | None:
+        return _fixed_split_proxy_rejection_reason(
+            metrics_before,
+            metrics_after,
+            tolerance=tolerance,
+        )
+
+    def snapshot_model_state(self, model: torch.nn.Module) -> dict[str, object]:
+        return _snapshot_model_state(model)
+
+    def restore_model_state(
+        self,
+        model: torch.nn.Module,
+        state: Mapping[str, object],
+    ) -> None:
+        model.load_state_dict(state)
+        self.set_detection_model_eval_mode(model)
+
+    def set_detection_model_eval_mode(self, model: torch.nn.Module) -> None:
+        _set_detection_model_eval_mode(model)
+
+    def decide(
+        self,
+        metrics_before: Mapping[str, object] | None,
+        metrics_after: Mapping[str, object] | None,
+    ) -> FixedSplitProxyDecision:
+        summary = self.format_summary(metrics_before, metrics_after)
+        reason = self.rejection_reason(metrics_before, metrics_after)
+        return FixedSplitProxyDecision(
+            accepted=reason is None,
+            reason=reason,
+            summary=summary,
+        )
+
+    def rollback_if_rejected(
+        self,
+        model: torch.nn.Module,
+        *,
+        baseline_state: Mapping[str, object],
+        decision: FixedSplitProxyDecision,
+    ) -> bool:
+        if decision.accepted:
+            return False
+        self.restore_model_state(model, baseline_state)
+        return True
+
+    @staticmethod
+    def _resolve_tinynext_proxy_selection_max_samples(
+        *,
+        available_samples: int,
+        full_eval_max_samples: int | None,
+    ) -> int | None:
+        full_eval_budget = max(0, int(available_samples))
+        if full_eval_max_samples is not None:
+            full_eval_budget = min(full_eval_budget, max(0, int(full_eval_max_samples)))
+        if full_eval_budget <= 0:
+            return None
+        if full_eval_budget <= 24:
+            if full_eval_max_samples is None or full_eval_budget == int(available_samples):
+                return None
+            return int(full_eval_budget)
+        return 24

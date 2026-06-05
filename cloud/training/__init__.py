@@ -5,6 +5,8 @@ from cloud.training.adapters import (
 )
 from cloud.training.fixed_split_engine import FixedSplitRetrainEngine
 from cloud.training.proxy_eval import (
+    FixedSplitProxyDecision,
+    FixedSplitProxyEvaluator,
     ProxyEarlyStopper,
     ProxyEvalConfig,
     ProxyEvalHistory,
@@ -27,6 +29,8 @@ __all__ = [
     "EarlyStopDecision",
     "EpochTrainResult",
     "FixedSplitRetrainEngine",
+    "FixedSplitProxyDecision",
+    "FixedSplitProxyEvaluator",
     "FixedSplitTrainingContext",
     "FixedSplitTrainingPlan",
     "FixedSplitTrainingResult",
