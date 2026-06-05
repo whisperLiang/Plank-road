@@ -26,6 +26,7 @@ CANONICAL_FEATURE_METADATA_FIELDS = {
     "feature_abi_id",
     "runtime_identity_id",
     "source_contract_id",
+    "source_feature_abi_id",
     "source_feature_layout_id",
     "rebinding_reason",
     "sample_source",
@@ -115,6 +116,7 @@ class CanonicalSampleRecord:
     feature_abi_id: str = ""
     runtime_identity_id: str = ""
     source_contract_id: str | None = None
+    source_feature_abi_id: str | None = None
     source_feature_layout_id: str | None = None
     rebinding_reason: str | None = None
 
@@ -161,6 +163,7 @@ class CanonicalSampleRecord:
             "feature_abi_id": self.feature_abi_id,
             "runtime_identity_id": self.runtime_identity_id,
             "source_contract_id": self.source_contract_id,
+            "source_feature_abi_id": self.source_feature_abi_id,
             "source_feature_layout_id": self.source_feature_layout_id,
             "rebinding_reason": self.rebinding_reason,
             "sample_source": self.sample_source,

@@ -319,6 +319,7 @@ class FeatureCacheMaterializer:
                     "feature_abi_id",
                     "runtime_identity_id",
                     "source_contract_id",
+                    "source_feature_abi_id",
                     "source_feature_layout_id",
                     "rebinding_reason",
                 }
@@ -402,6 +403,7 @@ class FeatureCacheMaterializer:
                 "runtime_identity_id": str(record.get("runtime_identity_id") or view_contract["runtime_identity_id"]),
                 "contract_id": view_contract["contract_id"],
                 "source_contract_id": str(record.get("source_contract_id") or ""),
+                "source_feature_abi_id": str(record.get("source_feature_abi_id") or ""),
                 "source_feature_layout_id": str(record.get("source_feature_layout_id") or ""),
                 "rebinding_reason": str(record.get("rebinding_reason") or ""),
                 "input_image_size": record.get("input_image_size"),

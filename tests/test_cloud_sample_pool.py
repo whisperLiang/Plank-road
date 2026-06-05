@@ -13,7 +13,8 @@ from cloud.feature_cache import (
     ShardFeatureRefValidator,
     collect_refs_from_active_generations,
 )
-from cloud.sample_pool import CloudSamplePool
+from cloud.sample_pool import CloudSamplePool, align_sample_feature_contract
+from cloud.feature_cache.shard_validator import ABI_REASON_LAYOUT_EQUIVALENT_REBIND
 from model_management.payload import boundary_payload_from_tensors
 from model_management.split_contract import SplitRuntimeContract
 
@@ -730,6 +731,227 @@ def test_pending_high_quality_shard_refs_are_accepted_when_abi_compatible(tmp_pa
     assert stats["shard_high_quality"]["rebuilt_layout_from_shard_meta"] == 3
     assert stats["generation_commit"]["active"] == 3
     assert len(kept) == 3
+
+
+def test_pending_high_quality_rebound_when_feature_abi_id_differs_but_layout_equal(tmp_path) -> None:
+    source_contract = _contract_with_labels(graph_signature="source-feature-abi")
+    current_contract = _contract_with_labels(graph_signature="current-feature-abi")
+    assert source_contract.feature_abi_id != current_contract.feature_abi_id
+    assert source_contract.feature_layout == current_contract.feature_layout
+    pool = CloudSamplePool(
+        str(tmp_path / "pool"),
+        model_id="yolo26n",
+        front_version="1",
+        split_config_id="split-a",
+        edge_id=1,
+        staging_root=str(tmp_path / "staging"),
+    )
+    _store, pending_high = _write_shard_samples(
+        tmp_path,
+        ["hq-layout-equal-a", "hq-layout-equal-b"],
+        contract=source_contract,
+        sample_source="high_quality",
+        label_source="edge_pseudo",
+    )
+    pool.store_pending_high_quality_samples(pending_high)
+
+    stats, kept = pool.rebuild_canonical_training_pool(
+        split_contract=current_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=[],
+    )
+
+    assert stats["validation"]["accepted_high_quality"] == 2
+    assert stats["validation"]["deferred_feature_layout"] == 0
+    assert stats["shard_high_quality"]["deferred_layout"] == 0
+    assert stats["generation_commit"]["active"] == 2
+    assert {record.rebinding_reason for record in kept} == {
+        ABI_REASON_LAYOUT_EQUIVALENT_REBIND
+    }
+    assert {record.source_feature_abi_id for record in kept} == {
+        source_contract.feature_abi_id
+    }
+    active = pool.list_active_samples()
+    assert {sample["feature_abi_id"] for sample in active} == {current_contract.feature_abi_id}
+    assert {
+        dict(sample["feature_ref"])["feature_abi_id"] for sample in active
+    } == {current_contract.feature_abi_id}
+    assert {sample["source_feature_abi_id"] for sample in active} == {
+        source_contract.feature_abi_id
+    }
+
+
+def test_pending_high_quality_not_deferred_after_runtime_rebind(tmp_path) -> None:
+    source_contract = _contract_with_labels(graph_signature="round-two-source")
+    current_contract = _contract_with_labels(graph_signature="round-two-current")
+    assert source_contract.feature_abi_id != current_contract.feature_abi_id
+    assert source_contract.feature_layout == current_contract.feature_layout
+    pool = CloudSamplePool(
+        str(tmp_path / "pool"),
+        model_id="yolo26n",
+        front_version="1",
+        split_config_id="split-a",
+        edge_id=1,
+        staging_root=str(tmp_path / "staging"),
+    )
+    _store, initial_low = _write_shard_samples(
+        tmp_path,
+        [f"active-{index}" for index in range(80)],
+        contract=source_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+    )
+    pool.stage_low_quality_samples(initial_low)
+    first_stats, _first_kept = pool.rebuild_canonical_training_pool(
+        split_contract=source_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    assert first_stats["generation_commit"]["active"] == 80
+    _store, pending_high = _write_shard_samples(
+        tmp_path,
+        [f"pending-{index}" for index in range(210)],
+        contract=source_contract,
+        sample_source="high_quality",
+        label_source="edge_pseudo",
+    )
+    pool.store_pending_high_quality_samples(pending_high)
+    _store, new_low = _write_shard_samples(
+        tmp_path,
+        [f"new-low-{index}" for index in range(28)],
+        contract=current_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+    )
+    pool.stage_low_quality_samples(new_low)
+
+    second_stats, kept = pool.rebuild_canonical_training_pool(
+        split_contract=current_contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(split_contract=current_contract),
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert second_stats["validation"]["accepted_high_quality"] == 210
+    assert second_stats["validation"]["accepted_low_quality"] == 108
+    assert second_stats["validation"]["rebound_existing_active"] == 80
+    assert second_stats["validation"]["deferred_feature_layout"] == 0
+    assert second_stats["generation_commit"]["active"] == 318
+    assert second_stats["generation_commit"]["high_quality"] == 210
+    assert second_stats["generation_commit"]["low_quality"] == 108
+    assert len(kept) == 318
+
+
+def test_third_round_accepts_deferred_high_quality_after_layout_equivalent_rebind(tmp_path) -> None:
+    source_contract = _contract_with_labels(graph_signature="round-three-source")
+    current_contract = _contract_with_labels(graph_signature="round-three-current")
+    assert source_contract.feature_abi_id != current_contract.feature_abi_id
+    assert source_contract.feature_layout == current_contract.feature_layout
+    pool = CloudSamplePool(
+        str(tmp_path / "pool"),
+        model_id="yolo26n",
+        front_version="1",
+        split_config_id="split-a",
+        edge_id=1,
+        staging_root=str(tmp_path / "staging"),
+    )
+    _store, initial_low = _write_shard_samples(
+        tmp_path,
+        [f"active-third-{index}" for index in range(108)],
+        contract=source_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+    )
+    pool.stage_low_quality_samples(initial_low)
+    previous_stats, _previous_kept = pool.rebuild_canonical_training_pool(
+        split_contract=source_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=[],
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+    assert previous_stats["generation_commit"]["active"] == 108
+    _store, pending_high = _write_shard_samples(
+        tmp_path,
+        [f"pending-third-{index}" for index in range(256)],
+        contract=source_contract,
+        sample_source="high_quality",
+        label_source="edge_pseudo",
+    )
+    pool.store_pending_high_quality_samples(pending_high)
+    _store, new_low = _write_shard_samples(
+        tmp_path,
+        [f"new-third-low-{index}" for index in range(34)],
+        contract=current_contract,
+        sample_source="low_quality",
+        label_source="teacher",
+    )
+    pool.stage_low_quality_samples(new_low)
+
+    third_stats, kept = pool.rebuild_canonical_training_pool(
+        split_contract=current_contract,
+        existing_active_samples=pool.load_active_samples_for_rebuild(split_contract=current_contract),
+        pending_high_quality_samples=pool.load_pending_high_quality_samples(),
+        new_low_quality_samples=pool.load_staging_low_quality_samples(),
+    )
+
+    assert third_stats["validation"]["accepted_high_quality"] == 256
+    assert third_stats["validation"]["accepted_low_quality"] == 142
+    assert third_stats["validation"]["rebound_existing_active"] == 108
+    assert third_stats["validation"]["deferred_feature_layout"] == 0
+    assert third_stats["generation_commit"]["active"] == 398
+    assert third_stats["generation_commit"]["high_quality"] == 256
+    assert third_stats["generation_commit"]["low_quality"] == 142
+    assert len(kept) == 398
+
+
+def test_layout_alignment_log_and_canonical_validation_share_same_result(tmp_path) -> None:
+    source_contract = _contract_with_labels(graph_signature="alignment-source")
+    current_contract = _contract_with_labels(graph_signature="alignment-current")
+    assert source_contract.feature_abi_id != current_contract.feature_abi_id
+    assert source_contract.feature_layout == current_contract.feature_layout
+    pool = CloudSamplePool(
+        str(tmp_path / "pool"),
+        model_id="yolo26n",
+        front_version="1",
+        split_config_id="split-a",
+        edge_id=1,
+        staging_root=str(tmp_path / "staging"),
+    )
+    _store, pending_high = _write_shard_samples(
+        tmp_path,
+        [f"align-{index}" for index in range(5)],
+        contract=source_contract,
+        sample_source="high_quality",
+        label_source="edge_pseudo",
+    )
+    pool.store_pending_high_quality_samples(pending_high)
+    staged = pool.load_pending_high_quality_samples()
+    validator = ShardFeatureRefValidator()
+    alignment_results = [
+        align_sample_feature_contract(
+            sample,
+            split_contract=current_contract,
+            input_source="pending_high_quality",
+            shard_validator=validator,
+        )
+        for sample in staged
+    ]
+    compatible = sum(1 for result in alignment_results if result.status == "accepted")
+    assert compatible == 5
+
+    stats, kept = pool.rebuild_canonical_training_pool(
+        split_contract=current_contract,
+        existing_active_samples=[],
+        pending_high_quality_samples=staged,
+        new_low_quality_samples=[],
+    )
+
+    assert stats["validation"]["accepted_high_quality"] == compatible
+    assert stats["validation"]["deferred_feature_layout"] == 0
+    assert stats["shard_high_quality"]["accepted"] == compatible
+    assert len(kept) == compatible
 
 
 def test_pending_high_quality_shard_refs_are_deferred_not_deleted_when_incompatible(tmp_path) -> None:

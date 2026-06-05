@@ -337,6 +337,7 @@ def load_high_quality_shard_candidates(
                     or ""
                 ),
                 "runtime_identity_id": str(feature_ref.runtime_identity_id or ""),
+                "source_feature_abi_id": str(feature_ref.feature_abi_id or ""),
                 "source_feature_layout_id": str(feature_ref.feature_layout_id),
                 "source_feature_schema_hash": "",
                 "source_feature_value_schema_hash": "",

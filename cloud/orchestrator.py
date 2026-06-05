@@ -41,7 +41,7 @@ from cloud.ingest import (
     materialize_low_quality_trigger_bundle,
 )
 from cloud.model_update import serialize_model_update
-from cloud.sample_pool import CloudSamplePool
+from cloud.sample_pool import CloudSamplePool, align_sample_feature_contract
 from cloud.training import (
     FixedSplitRetrainEngine,
     FixedSplitTrainingContext,
@@ -1242,6 +1242,12 @@ class CloudFixedSplitOrchestrator:
                 or (metadata.feature_layout_id if metadata is not None else "")
                 or ""
             ),
+            "source_feature_abi_id": str(
+                candidate.get("source_feature_abi_id")
+                or ref_payload.get("feature_abi_id")
+                or (metadata.feature_abi_id if metadata is not None else "")
+                or ""
+            ),
             "source_feature_schema_hash": str(
                 candidate.get("source_feature_schema_hash")
                 or (metadata.boundary_schema_hash if metadata is not None else "")
@@ -1294,21 +1300,14 @@ class CloudFixedSplitOrchestrator:
         self,
         *,
         pending_high_quality: list[Mapping[str, object]],
-        expected_tensors: Mapping[str, torch.Tensor] | None,
+        split_contract: SplitRuntimeContract,
         expected_source: str,
         low_quality_tensors: Mapping[str, torch.Tensor] | None,
     ) -> None:
         if not pending_high_quality:
             return
-        if expected_tensors is None:
-            logger.warning(
-                "[SamplePool] pending high-quality layout alignment skipped: no {} layout is available (pending={}).",
-                expected_source,
-                len(pending_high_quality),
-            )
-            return
-        expected_layout = feature_layout_from_tensors(expected_tensors)
-        expected_layout_id = make_feature_layout_id(expected_layout)
+        expected_layout = dict(split_contract.feature_layout or {})
+        expected_layout_id = str(split_contract.feature_layout_id or "")
         low_quality_layout = (
             feature_layout_from_tensors(low_quality_tensors)
             if low_quality_tensors is not None
@@ -1317,38 +1316,50 @@ class CloudFixedSplitOrchestrator:
         compatible = 0
         renamed_compatible = 0
         mismatches: list[dict[str, object]] = []
+        shard_validator = ShardFeatureRefValidator()
         for candidate in pending_high_quality:
-            try:
-                summary = self._feature_layout_summary_from_candidate(candidate)
-            except Exception as exc:
+            alignment = align_sample_feature_contract(
+                candidate,
+                split_contract=split_contract,
+                input_source="pending_high_quality",
+                shard_validator=shard_validator,
+            )
+            if alignment.status == "accepted":
+                compatible += 1
+                continue
+            if len(mismatches) < 5:
+                actual_layout = (
+                    dict(alignment.validation.feature_layout or {})
+                    if alignment.validation is not None
+                    else {}
+                )
                 mismatches.append(
                     {
                         "sample_id": str(candidate.get("sample_id") or ""),
-                        "reason": f"unreadable:{type(exc).__name__}",
-                    }
-                )
-                continue
-            actual_layout = dict(summary.get("feature_layout") or {})
-            if summary.get("feature_layout_id") == expected_layout_id:
-                compatible += 1
-                continue
-            if actual_layout == expected_layout:
-                compatible += 1
-                continue
-            if actual_layout and self._layout_specs_match_ignoring_labels(
-                actual_layout,
-                expected_layout,
-            ):
-                compatible += 1
-                renamed_compatible += 1
-                continue
-            if len(mismatches) < 5:
-                mismatches.append(
-                    {
-                        **summary,
+                        "reason": alignment.reason or alignment.status,
+                        "feature_layout": actual_layout,
                         "expected_feature_layout_id": expected_layout_id,
                         "expected_feature_layout": expected_layout,
                         "expected_source": expected_source,
+                        "source_metadata": dict(
+                            candidate.get("source_metadata")
+                            if isinstance(candidate.get("source_metadata"), Mapping)
+                            else {}
+                        )
+                        or {
+                            key: candidate[key]
+                            for key in (
+                                "feature_abi_id",
+                                "source_feature_abi_id",
+                                "source_feature_layout_id",
+                                "source_feature_schema_hash",
+                                "source_feature_value_schema_hash",
+                                "source_feature_split_id",
+                                "source_feature_graph_signature",
+                                "rebinding_reason",
+                            )
+                            if candidate.get(key) is not None
+                        },
                     }
                 )
         logger.info(
@@ -1979,6 +1990,7 @@ class CloudFixedSplitOrchestrator:
                     "feature_layout_id": feature_ref.feature_layout_id,
                     "feature_abi_id": feature_ref.feature_abi_id,
                     "runtime_identity_id": feature_ref.runtime_identity_id,
+                    "source_feature_abi_id": feature_ref.feature_abi_id,
                     "source_feature_layout_id": feature_ref.feature_layout_id,
                     "source_feature_schema_hash": "",
                     "source_feature_value_schema_hash": "",
@@ -4897,7 +4909,7 @@ class CloudFixedSplitOrchestrator:
                 )
                 self._log_pending_high_quality_layout_alignment(
                     pending_high_quality=pending_high_quality,
-                    expected_tensors=contract_layout_tensors,
+                    split_contract=split_contract,
                     expected_source="runtime",
                     low_quality_tensors=None,
                 )

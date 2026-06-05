@@ -24,7 +24,11 @@ from edge.quality_assessor import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
 from model_management.detection_box_projection import ORIGINAL_XYXY
 from model_management.payload import BoundaryPayload
-from model_management.split_contract import feature_layout_from_tensors
+from model_management.split_contract import (
+    build_feature_abi_spec,
+    feature_abi_id,
+    feature_layout_from_tensors,
+)
 HIGH_QUALITY_SYNC_PROTOCOL_VERSION = "high-quality-feature-label-shard.v2"
 UPLOAD_LEDGER_VERSION = "edge-sample-upload-ledger.v1"
 UPLOAD_LEDGER_FILENAME = "upload_ledger.json"
@@ -243,6 +247,14 @@ def pack_high_quality_sync_bundle_to_file(
         or "direct_resize"
     )
     runtime_contract = dict(context.get("runtime_contract") or {})
+    inferred_feature_layout = {
+        str(label): dict(spec)
+        for label, spec in dict(runtime_contract.get("feature_layout") or {}).items()
+        if isinstance(spec, Mapping)
+    }
+    inferred_boundary_labels = [
+        str(label) for label in list(runtime_contract.get("boundary_tensor_labels") or [])
+    ]
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
@@ -285,6 +297,14 @@ def pack_high_quality_sync_bundle_to_file(
             result = sample_store.load_inference_result(record)
             feature_layout_meta = _feature_layout_metadata(intermediate)
             inferred_layout_id = inferred_layout_id or str(feature_layout_meta.get("feature_layout_id") or "")
+            if not inferred_feature_layout and isinstance(feature_layout_meta.get("feature_layout"), Mapping):
+                inferred_feature_layout = {
+                    str(label): dict(spec)
+                    for label, spec in dict(feature_layout_meta.get("feature_layout") or {}).items()
+                    if isinstance(spec, Mapping)
+                }
+            if not inferred_boundary_labels and inferred_feature_layout:
+                inferred_boundary_labels = list(inferred_feature_layout)
             labels = _training_labels(result, record)
             label_payload = {
                 "boxes": labels["boxes"],
@@ -333,12 +353,53 @@ def pack_high_quality_sync_bundle_to_file(
                     ),
                 }
             )
+        feature_abi_spec = dict(runtime_contract.get("feature_abi_spec") or {})
+        feature_abi_value = str(runtime_contract.get("feature_abi_id") or "")
+        if not feature_abi_spec and inferred_feature_layout:
+            boundary_schema = (
+                runtime_contract.get("boundary_schema")
+                if isinstance(runtime_contract.get("boundary_schema"), Mapping)
+                else None
+            )
+            feature_abi_spec = build_feature_abi_spec(
+                model_id=model_id,
+                model_family=str(context.get("model_family") or runtime_contract.get("model_family") or ""),
+                canonical_split_key=str(
+                    canonical_split_key
+                    or runtime_contract.get("logical_split_id")
+                    or edge_split_id
+                    or ""
+                ),
+                graph_signature=str(
+                    runtime_contract.get("trace_signature")
+                    or runtime_contract.get("graph_signature")
+                    or ""
+                ),
+                boundary_tensor_labels=inferred_boundary_labels,
+                boundary_schema=boundary_schema,
+                feature_layout=inferred_feature_layout,
+                input_tensor_shape=[int(dim) for dim in input_tensor_shape],
+                input_resize_mode=input_resize_mode,
+                runtime_identity={"runtime_contract": runtime_contract},
+            )
+        if not feature_abi_value and feature_abi_spec:
+            feature_abi_value = feature_abi_id(feature_abi_spec)
+        if feature_abi_value:
+            runtime_contract.setdefault("feature_abi_id", feature_abi_value)
+        if feature_abi_spec:
+            runtime_contract.setdefault("feature_abi_spec", dict(feature_abi_spec))
         runtime_context = {
             "model_id": model_id,
             "model_family": str(context.get("model_family") or ""),
             "split_config_id": split_config_id,
             "contract_id": None if runtime_contract.get("contract_id") in (None, "") else str(runtime_contract.get("contract_id")),
             "feature_layout_id": inferred_layout_id,
+            "feature_abi_id": feature_abi_value,
+            "feature_abi_spec": dict(feature_abi_spec),
+            "runtime_identity_id": str(runtime_contract.get("runtime_identity_id") or ""),
+            "feature_layout": dict(inferred_feature_layout),
+            "boundary_tensor_labels": list(inferred_boundary_labels),
+            "canonical_split_key": canonical_split_key,
             "boundary_id": edge_split_id or canonical_split_key,
             "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
             "input_resize_mode": input_resize_mode,
@@ -356,6 +417,7 @@ def pack_high_quality_sync_bundle_to_file(
         )
         manifest["storage_format"] = str(storage_format)
         manifest["feature_layout_id"] = inferred_layout_id
+        manifest["feature_abi_id"] = feature_abi_value
         manifest["shards"] = shard_manifest_entries
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
             for root, _dirs, files in os.walk(shard_tmp_root):

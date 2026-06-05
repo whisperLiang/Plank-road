@@ -28,6 +28,22 @@ _VALIDATION_FIELDS = (
     "unreadable_shard",
 )
 
+ABI_REASON_FEATURE_ABI_ID = "feature_abi_id"
+ABI_REASON_FEATURE_ABI_SPEC = "feature_abi_spec"
+ABI_REASON_FEATURE_LAYOUT = "feature_layout"
+ABI_REASON_FEATURE_LAYOUT_ID = "feature_layout_id"
+ABI_REASON_LAYOUT_EQUIVALENT_REBIND = (
+    "feature_abi_id_mismatch_but_boundary_layout_equivalent"
+)
+
+
+@dataclass(frozen=True)
+class AbiCompatibilityResult:
+    compatible: bool
+    reason: str
+    expected_feature_abi_id: str = ""
+    actual_feature_abi_id: str = ""
+
 
 @dataclass(frozen=True)
 class ValidationResult:
@@ -251,11 +267,11 @@ def _abi_status(
     expected: Mapping[str, object],
     feature_layout: Mapping[str, Mapping[str, object]],
     allow_abi_compatible_migration: bool,
-) -> bool:
+) -> AbiCompatibilityResult:
     expected_split = expected.get("split_config_id")
     if expected_split not in (None, "") and metadata.split_config_id:
         if metadata.split_config_id != str(expected_split):
-            return False
+            return AbiCompatibilityResult(False, "split_config_id")
 
     expected_boundary = str(
         expected.get("boundary_id")
@@ -264,29 +280,60 @@ def _abi_status(
         or ""
     )
     if expected_boundary and metadata.boundary_id and metadata.boundary_id != expected_boundary:
-        return False
+        return AbiCompatibilityResult(False, "boundary_id")
 
     expected_payload_kind = str(expected.get("payload_kind") or "boundary_payload")
     if expected_payload_kind and metadata.payload_kind and metadata.payload_kind != expected_payload_kind:
-        return False
+        return AbiCompatibilityResult(False, "payload_kind")
 
     expected_passthrough = expected.get("passthrough_schema_hash") or expected.get(
         "passthrough_schema_fingerprint"
     )
     if expected_passthrough not in (None, "") and metadata.passthrough_schema_hash not in (None, ""):
         if str(expected_passthrough) != str(metadata.passthrough_schema_hash):
-            return False
+            return AbiCompatibilityResult(False, "passthrough_schema")
 
     expected_preprocessing = expected.get("preprocessing_fingerprint")
     if expected_preprocessing not in (None, "") and metadata.preprocessing_fingerprint not in (None, ""):
         if str(expected_preprocessing) != str(metadata.preprocessing_fingerprint):
-            return False
+            return AbiCompatibilityResult(False, "preprocessing")
 
     expected_layout = expected.get("feature_layout")
     expected_abi_id = str(expected.get("feature_abi_id") or "")
     actual_abi_id = str(ref.feature_abi_id or metadata.feature_abi_id or "")
+    if isinstance(expected_layout, Mapping) and expected_layout:
+        if feature_layouts_abi_compatible(
+            feature_layout,
+            expected_layout,
+            allow_rename_compatible=allow_abi_compatible_migration,
+        ):
+            reason = ABI_REASON_FEATURE_LAYOUT
+            if expected_abi_id and actual_abi_id:
+                reason = (
+                    ABI_REASON_FEATURE_ABI_ID
+                    if actual_abi_id == expected_abi_id
+                    else ABI_REASON_LAYOUT_EQUIVALENT_REBIND
+                )
+            return AbiCompatibilityResult(
+                True,
+                reason,
+                expected_feature_abi_id=expected_abi_id,
+                actual_feature_abi_id=actual_abi_id,
+            )
+        return AbiCompatibilityResult(
+            False,
+            ABI_REASON_FEATURE_LAYOUT,
+            expected_feature_abi_id=expected_abi_id,
+            actual_feature_abi_id=actual_abi_id,
+        )
+
     if expected_abi_id and actual_abi_id:
-        return actual_abi_id == expected_abi_id
+        return AbiCompatibilityResult(
+            actual_abi_id == expected_abi_id,
+            ABI_REASON_FEATURE_ABI_ID,
+            expected_feature_abi_id=expected_abi_id,
+            actual_feature_abi_id=actual_abi_id,
+        )
 
     expected_abi_spec = expected.get("feature_abi_spec")
     metadata_abi_spec = metadata.metadata.get("feature_abi_spec") if isinstance(metadata.metadata, Mapping) else None
@@ -298,23 +345,33 @@ def _abi_status(
     ):
         import json
 
-        return json.dumps(dict(expected_abi_spec), sort_keys=True, separators=(",", ":")) == json.dumps(
+        compatible = json.dumps(dict(expected_abi_spec), sort_keys=True, separators=(",", ":")) == json.dumps(
             dict(metadata_abi_spec),
             sort_keys=True,
             separators=(",", ":"),
         )
-
-    if isinstance(expected_layout, Mapping) and expected_layout:
-        return feature_layouts_abi_compatible(
-            feature_layout,
-            expected_layout,
-            allow_rename_compatible=allow_abi_compatible_migration,
+        return AbiCompatibilityResult(
+            compatible,
+            ABI_REASON_FEATURE_ABI_SPEC,
+            expected_feature_abi_id=expected_abi_id,
+            actual_feature_abi_id=actual_abi_id,
         )
 
     expected_layout_id = str(expected.get("feature_layout_id") or "")
     if expected_layout_id:
-        return ref.feature_layout_id == expected_layout_id or metadata.feature_layout_id == expected_layout_id
-    return True
+        compatible = ref.feature_layout_id == expected_layout_id or metadata.feature_layout_id == expected_layout_id
+        return AbiCompatibilityResult(
+            compatible,
+            ABI_REASON_FEATURE_LAYOUT_ID,
+            expected_feature_abi_id=expected_abi_id,
+            actual_feature_abi_id=actual_abi_id,
+        )
+    return AbiCompatibilityResult(
+        True,
+        "unspecified",
+        expected_feature_abi_id=expected_abi_id,
+        actual_feature_abi_id=actual_abi_id,
+    )
 
 
 class ShardFeatureRefValidator:
@@ -433,16 +490,17 @@ class ShardFeatureRefValidator:
             )
 
         feature_layout = shard_feature_layout_from_metadata(metadata)
-        if not _abi_status(
+        abi_status = _abi_status(
             ref=ref,
             metadata=metadata,
             expected=expected,
             feature_layout=feature_layout,
             allow_abi_compatible_migration=allow_abi_compatible_migration,
-        ):
+        )
+        if not abi_status.compatible:
             return ValidationResult(
                 abi_incompatible=True,
-                reason="abi_incompatible",
+                reason=abi_status.reason or "abi_incompatible",
                 feature_ref=ref,
                 metadata=metadata,
                 feature_layout=feature_layout,
@@ -465,7 +523,7 @@ class ShardFeatureRefValidator:
         return ValidationResult(
             valid=True,
             abi_compatible=True,
-            reason="valid",
+            reason=abi_status.reason or "valid",
             feature_ref=ref,
             metadata=metadata,
             feature_layout=feature_layout,
@@ -474,6 +532,8 @@ class ShardFeatureRefValidator:
 
 
 __all__ = [
+    "ABI_REASON_LAYOUT_EQUIVALENT_REBIND",
+    "AbiCompatibilityResult",
     "ShardFeatureRefValidator",
     "ValidationResult",
     "feature_layouts_abi_compatible",
