@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -35,14 +36,23 @@ def _sanitize_segment(value: object) -> str:
 
 
 def _atomic_json_dump(path: str, payload: Mapping[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp-{threading.get_ident()}-{int(time.time() * 1000000)}"
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd: int | None = None
+    tmp_path = ""
     try:
-        with open(tmp_path, "w", encoding="utf-8") as handle:
+        fd, tmp_path = tempfile.mkstemp(prefix=".json-", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
             json.dump(dict(payload), handle, indent=2, sort_keys=True)
             handle.write("\n")
         os.replace(tmp_path, path)
     except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.remove(tmp_path)
         except OSError:
@@ -533,8 +543,7 @@ class FeatureShardWriter:
         metadata: FeatureShardMetadata,
     ) -> tuple[str, str, str]:
         shard_dir = os.path.join(base_dir, shard_id)
-        tmp_dir = f"{shard_dir}.tmp-{threading.get_ident()}-{int(time.time() * 1000000)}"
-        os.makedirs(tmp_dir, exist_ok=False)
+        tmp_dir = tempfile.mkdtemp(prefix=".npy-", dir=base_dir)
         try:
             for key, tensor in tensors.items():
                 array = tensor.detach().cpu().numpy()

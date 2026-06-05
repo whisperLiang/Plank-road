@@ -6,6 +6,7 @@ import os
 import numpy as np
 import torch
 
+import cloud.feature_cache.shard_writer as shard_writer
 from cloud.feature_cache import FeatureShardStore
 from tests.test_feature_shard_common import make_entries, make_folded_entries, runtime_context
 
@@ -94,3 +95,63 @@ def test_npy_memmap_reader_does_not_call_torch_load(tmp_path, monkeypatch) -> No
 
     monkeypatch.setattr(torch, "load", fail_load)
     assert store.read_batch(refs).batch_size == 2
+
+
+def test_npy_memmap_writer_keeps_temporary_paths_short(tmp_path, monkeypatch) -> None:
+    context = runtime_context("d" * 40)
+    context["model_id"] = "rfdetr_nano"
+    generation = "edge_sample_store"
+    base_len = len(
+        shard_writer.FeatureShardWriter(
+            root_dir=str(tmp_path),
+            storage_format="npy_memmap_shard",
+        )._base_dir(context, generation)
+    )
+    original_dump = shard_writer._atomic_json_dump
+    original_mkstemp = shard_writer.tempfile.mkstemp
+    original_mkdtemp = shard_writer.tempfile.mkdtemp
+    atomic_targets: list[str] = []
+    json_tmp_names: list[str] = []
+    tmp_dirs: list[str] = []
+
+    def guarded_dump(path, payload):
+        atomic_targets.append(path)
+        assert len(path) <= base_len + 70
+        return original_dump(path, payload)
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = original_mkstemp(*args, **kwargs)
+        json_tmp_names.append(os.path.basename(path))
+        return fd, path
+
+    def tracking_mkdtemp(*args, **kwargs):
+        path = original_mkdtemp(*args, **kwargs)
+        tmp_dirs.append(path)
+        return path
+
+    monkeypatch.setattr(shard_writer, "_atomic_json_dump", guarded_dump)
+    monkeypatch.setattr(shard_writer.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(shard_writer.tempfile, "mkdtemp", tracking_mkdtemp)
+
+    store = FeatureShardStore(
+        str(tmp_path),
+        storage_format="npy_memmap_shard",
+        shard_dtype="float16",
+    )
+    refs = [
+        entry["feature_ref"]
+        for entry in store.write_entries(
+            make_entries(1),
+            runtime_context=context,
+            generation=generation,
+            source="test",
+        )
+    ]
+
+    assert refs[0].shard_dir and os.path.isdir(refs[0].shard_dir)
+    assert atomic_targets
+    assert tmp_dirs
+    assert all(os.path.basename(path).startswith(".npy-") for path in tmp_dirs)
+    assert all(not os.path.exists(path) for path in tmp_dirs)
+    assert json_tmp_names
+    assert all(name.startswith(".json-") and len(name) <= 32 for name in json_tmp_names)
