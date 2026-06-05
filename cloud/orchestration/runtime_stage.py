@@ -622,7 +622,7 @@ class FixedSplitRuntimeContractMixin:
         split_plan = dict(manifest.get("split_plan", {}) or {})
         cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
         runtime = getattr(splitter, "runtime", splitter)
-        dynamic_batch = _splitter_dynamic_batch_range(splitter)
+        dynamic_batch = splitter_dynamic_batch_range(splitter)
         symbolic_schema = getattr(runtime, "symbolic_input_schema", None)
         model_id = str(context.get("model_id") or self.edge_model_name)
         return {
