@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import threading
+import warnings
 from dataclasses import replace
 
 import pytest
@@ -503,6 +504,19 @@ def test_native_runtime_prepare_split_uses_forward_guard(monkeypatch) -> None:
     assert entered_prepare.wait(timeout=2.0)
     thread.join(timeout=2.0)
     assert not thread.is_alive()
+
+
+def test_torchlens_forward_guard_suppresses_tuple_iterator_warning() -> None:
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        with torchlens_forward_guard():
+            warnings.warn(
+                "TorchLens intervention-ready output traversal does not support tuple_iterator; "
+                "falling back to BFS without stable output paths.",
+                UserWarning,
+            )
+
+    assert captured == []
 
 
 def test_tradeoff_validation_accepts_success_reports() -> None:

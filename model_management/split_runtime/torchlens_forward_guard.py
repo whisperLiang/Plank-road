@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import threading
+import warnings
 from contextlib import contextmanager
 from collections.abc import Iterator
 
 
 _TORCHLENS_FORWARD_LOCK = threading.RLock()
+_UNSTABLE_TUPLE_ITERATOR_WARNING = (
+    "TorchLens intervention-ready output traversal does not support tuple_iterator; "
+    "falling back to BFS without stable output paths."
+)
 
 
 @contextmanager
@@ -18,6 +23,11 @@ def torchlens_forward_guard() -> Iterator[None]:
     guard.
     """
 
-    with _TORCHLENS_FORWARD_LOCK:
+    with _TORCHLENS_FORWARD_LOCK, warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_UNSTABLE_TUPLE_ITERATOR_WARNING,
+            category=UserWarning,
+        )
         yield
 

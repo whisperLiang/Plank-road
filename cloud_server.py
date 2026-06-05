@@ -3,8 +3,8 @@ import os
 from concurrent import futures
 
 import grpc
-from loguru import logger
 
+from loguru import logger
 from cloud.edge_registry import EdgeRegistry
 from cloud.orchestrator import CloudFixedSplitOrchestrator, CloudContinualLearner
 from config import load_runtime_config
@@ -81,6 +81,10 @@ class CloudServer:
 
 
 if __name__ == "__main__":
+    from tools.logging_config import configure_logging
+
+    configure_logging()
+
     parser = argparse.ArgumentParser(description="configuration description")
     parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
     args = parser.parse_args()

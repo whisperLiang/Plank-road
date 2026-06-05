@@ -26,7 +26,6 @@ from model_management.split_model_adapters import (
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logger.debug(device)
 
 
 def bgr_image_to_tensor(img, *, target_device=None):

@@ -4,8 +4,8 @@ import time
 from pathlib import Path
 
 import cv2
-from loguru import logger
 
+from loguru import logger
 from config import load_runtime_config
 from edge.edge_worker import EdgeWorker
 from edge.info import TASK_STATE
@@ -286,6 +286,10 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
 
 
 if __name__ == '__main__':
+    from tools.logging_config import configure_logging
+
+    configure_logging()
+
     parser = argparse.ArgumentParser(description="configuration description")
     parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
     parser.add_argument("--edge_id", type=int, default=None, help="override client.edge_id for multi-edge deployment")
