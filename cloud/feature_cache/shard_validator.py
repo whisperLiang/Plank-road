@@ -25,8 +25,6 @@ _VALIDATION_FIELDS = (
     "abi_incompatible",
     "label_missing",
     "label_metadata_invalid",
-    "legacy_pt_missing",
-    "unreadable_legacy_pt",
     "unreadable_shard",
 )
 
@@ -43,8 +41,6 @@ class ValidationResult:
     abi_incompatible: bool = False
     label_missing: bool = False
     label_metadata_invalid: bool = False
-    legacy_pt_missing: bool = False
-    unreadable_legacy_pt: bool = False
     unreadable_shard: bool = False
     reason: str = ""
     feature_ref: FeatureShardRef | None = None
@@ -68,8 +64,6 @@ class ValidationResult:
             or self.missing_row_id
             or self.sample_row_mismatch
             or self.unreadable_shard
-            or self.legacy_pt_missing
-            or self.unreadable_legacy_pt
         )
 
     def counts(self) -> dict[str, int]:
@@ -166,7 +160,7 @@ def feature_layouts_abi_compatible(
     actual: Mapping[str, Mapping[str, object]] | None,
     expected: Mapping[str, Mapping[str, object]] | None,
     *,
-    allow_rename_compatible: bool = True,
+    allow_rename_compatible: bool = False,
 ) -> bool:
     if _layout_matches_by_label(actual or {}, expected or {}):
         return True
@@ -308,7 +302,7 @@ class ShardFeatureRefValidator:
         feature_ref: FeatureShardRef | Mapping[str, object],
         expected_abi: object,
         *,
-        allow_abi_compatible_migration: bool = True,
+        allow_abi_compatible_migration: bool = False,
         deep_validate_payload: bool = False,
         runtime: object | None = None,
     ) -> ValidationResult:

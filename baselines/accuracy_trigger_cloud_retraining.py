@@ -19,7 +19,6 @@ class BufferedFrame:
 
     frame_index: int
     confidence: float
-    proxy_map: float
     in_drift_window: bool
     latency_ms: float
     frame_path: str | None = None
@@ -105,7 +104,6 @@ class AccuracyTriggerCloudRetraining(BaseMethod):
         dev.record_inference(
             latency_ms=result.latency_ms,
             confidence=result.confidence,
-            proxy_map=result.proxy_map,
             metric_f1=result.metric_f1,
             metric_map50=result.metric_map50,
         )
@@ -116,7 +114,6 @@ class AccuracyTriggerCloudRetraining(BaseMethod):
             BufferedFrame(
                 frame_index=result.frame_index,
                 confidence=result.confidence,
-                proxy_map=result.proxy_map,
                 in_drift_window=result.in_drift_window,
                 latency_ms=result.latency_ms,
                 frame_path=result.frame_path,

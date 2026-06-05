@@ -288,7 +288,7 @@ def test_sample_pool_accepts_folded_single_sample_boundary_payload(tmp_path) -> 
     assert kept_records[0].feature_ref is not None
 
 
-def test_feature_layout_abi_compatible_migration_for_shards(tmp_path) -> None:
+def test_feature_layout_mismatch_drops_old_active_shards(tmp_path) -> None:
     old_boundary = boundary_payload_from_tensors(
         {"old_label": torch.randn(1, 4)},
         split_id="after:linear",
@@ -348,15 +348,10 @@ def test_feature_layout_abi_compatible_migration_for_shards(tmp_path) -> None:
         new_low_quality_samples=[],
     )
 
-    assert rebuild_stats["validation"]["skipped_stale_contract"] == 0
-    assert rebuild_stats["validation"]["migrated_contract_id"] == 1
-    assert rebuild_stats["validation"]["carried_forward_compatible"] == 1
+    assert rebuild_stats["validation"]["skipped_stale_contract"] == 1
     assert rebuild_stats["validation"]["skipped_unreadable"] == 0
-    assert rebuild_stats["generation_commit"]["active"] == 1
-    assert len(kept_records) == 1
-    assert kept_records[0].feature == {}
-    assert kept_records[0].feature_ref is not None
-    assert kept_records[0].feature_ref["feature_layout_id"] == new_contract.feature_layout_id
+    assert rebuild_stats["generation_commit"]["active"] == 0
+    assert kept_records == []
 
 
 def test_sample_pool_rejects_raw_feature_without_shard_ref(tmp_path) -> None:
@@ -390,8 +385,7 @@ def test_sample_pool_rejects_raw_feature_without_shard_ref(tmp_path) -> None:
 
 
 def test_sample_pool_accumulates_with_shard_refs(tmp_path) -> None:
-    old_contract = _contract_with_labels(graph_signature="old-runtime")
-    new_contract = _contract_with_labels(graph_signature="new-runtime")
+    contract = _contract_with_labels(graph_signature="current-runtime")
     pool = CloudSamplePool(
         str(tmp_path / "pool"),
         model_id="yolo26n",
@@ -404,13 +398,13 @@ def test_sample_pool_accumulates_with_shard_refs(tmp_path) -> None:
     _store, initial_low = _write_shard_samples(
         tmp_path,
         [f"active-{index}" for index in range(79)],
-        contract=old_contract,
+        contract=contract,
         sample_source="low_quality",
         label_source="teacher",
     )
     pool.stage_low_quality_samples(initial_low)
     first_stats, _first_kept = pool.rebuild_canonical_training_pool(
-        split_contract=old_contract,
+        split_contract=contract,
         existing_active_samples=[],
         pending_high_quality_samples=[],
         new_low_quality_samples=pool.load_staging_low_quality_samples(),
@@ -420,7 +414,7 @@ def test_sample_pool_accumulates_with_shard_refs(tmp_path) -> None:
     _store, pending_high = _write_shard_samples(
         tmp_path,
         [f"pending-{index}" for index in range(178)],
-        contract=new_contract,
+        contract=contract,
         sample_source="high_quality",
         label_source="edge_pseudo",
     )
@@ -428,15 +422,15 @@ def test_sample_pool_accumulates_with_shard_refs(tmp_path) -> None:
     _store, new_low = _write_shard_samples(
         tmp_path,
         [f"new-low-{index}" for index in range(35)],
-        contract=new_contract,
+        contract=contract,
         sample_source="low_quality",
         label_source="teacher",
     )
     pool.stage_low_quality_samples(new_low)
 
-    existing_active = pool.load_active_samples_for_rebuild(split_contract=new_contract)
+    existing_active = pool.load_active_samples_for_rebuild(split_contract=contract)
     second_stats, kept = pool.rebuild_canonical_training_pool(
-        split_contract=new_contract,
+        split_contract=contract,
         existing_active_samples=existing_active,
         pending_high_quality_samples=pool.load_pending_high_quality_samples(),
         new_low_quality_samples=pool.load_staging_low_quality_samples(),
@@ -444,19 +438,16 @@ def test_sample_pool_accumulates_with_shard_refs(tmp_path) -> None:
 
     assert second_stats["validation"]["accepted_high_quality"] == 178
     assert second_stats["validation"]["accepted_low_quality"] == 114
-    assert second_stats["validation"]["carried_forward_compatible"] == 79
-    assert second_stats["validation"]["migrated_contract_id"] == 79
     assert second_stats["validation"]["skipped_unreadable"] == 0
     assert second_stats["generation_commit"]["active"] == 292
     assert len(kept) == 292
-    active_samples, view = _training_view_for_pool(tmp_path, pool, contract=new_contract)
+    active_samples, view = _training_view_for_pool(tmp_path, pool, contract=contract)
     assert len(active_samples) == 292
     assert len(view.samples) == 292
 
 
 def test_existing_active_shard_refs_are_carried_forward(tmp_path, monkeypatch) -> None:
-    old_contract = _contract_with_labels(graph_signature="old-runtime")
-    new_contract = _contract_with_labels(graph_signature="new-runtime")
+    contract = _contract_with_labels(graph_signature="current-runtime")
     pool = CloudSamplePool(
         str(tmp_path / "pool"),
         model_id="yolo26n",
@@ -468,13 +459,13 @@ def test_existing_active_shard_refs_are_carried_forward(tmp_path, monkeypatch) -
     _store, initial_low = _write_shard_samples(
         tmp_path,
         ["sample-a"],
-        contract=old_contract,
+        contract=contract,
         sample_source="low_quality",
         label_source="teacher",
     )
     pool.stage_low_quality_samples(initial_low)
     pool.rebuild_canonical_training_pool(
-        split_contract=old_contract,
+        split_contract=contract,
         existing_active_samples=[],
         pending_high_quality_samples=[],
         new_low_quality_samples=pool.load_staging_low_quality_samples(),
@@ -484,17 +475,16 @@ def test_existing_active_shard_refs_are_carried_forward(tmp_path, monkeypatch) -
         raise AssertionError("torch.load must not run for shard carry-forward")
 
     monkeypatch.setattr(torch, "load", fail_load)
-    existing_active = pool.load_active_samples_for_rebuild(split_contract=new_contract)
+    existing_active = pool.load_active_samples_for_rebuild(split_contract=contract)
     assert existing_active[0].get("feature_ref")
     assert existing_active[0].get("feature_path") is None
     stats, kept = pool.rebuild_canonical_training_pool(
-        split_contract=new_contract,
+        split_contract=contract,
         existing_active_samples=existing_active,
         pending_high_quality_samples=[],
         new_low_quality_samples=[],
     )
 
-    assert stats["validation"]["carried_forward_compatible"] == 1
     assert stats["validation"]["skipped_unreadable"] == 0
     assert stats["generation_commit"]["active"] == 1
     assert kept[0].feature == {}
@@ -747,7 +737,7 @@ def test_capacity_dropped_pending_high_quality_staging_is_processed(tmp_path) ->
 
     assert [record.sample_id for record in kept] == ["teacher-kept"]
     assert stats["validation"]["accepted_high_quality"] == 1
-    assert stats["replacement"]["dropped_high_quality"] == 1
+    assert stats["selection"]["dropped_high_quality"] == 1
     assert stats["generation_commit"]["deleted_processed_staging_files"] == 1
     assert not os.path.exists(staging_path)
 

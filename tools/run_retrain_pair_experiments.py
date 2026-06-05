@@ -45,8 +45,8 @@ class ExperimentResult:
     golden_model: str
     success: bool
     accepted_updated_weights: bool
-    before_proxy_map: float | None
-    after_proxy_map: float | None
+    before_metric_map50: float | None
+    after_metric_map50: float | None
     absolute_delta: float | None
     relative_delta_percent: float | None
     sampled_frame_indices: list[int]
@@ -434,8 +434,8 @@ def _run_pair_experiment(
         golden_model=golden_model,
         success=bool(success),
         accepted_updated_weights=accepted_updated_weights,
-        before_proxy_map=before_map,
-        after_proxy_map=after_map,
+        before_metric_map50=before_map,
+        after_metric_map50=after_map,
         absolute_delta=absolute_delta,
         relative_delta_percent=relative_delta_percent,
         sampled_frame_indices=frame_indices,
@@ -454,8 +454,8 @@ def _run_pair_experiment(
         golden_model,
         result.success,
         result.accepted_updated_weights,
-        result.before_proxy_map,
-        result.after_proxy_map,
+        result.before_metric_map50,
+        result.after_metric_map50,
         result.absolute_delta,
     )
     if torch.cuda.is_available():
@@ -508,8 +508,8 @@ def main() -> None:
                     golden_model=golden_model,
                     success=False,
                     accepted_updated_weights=False,
-                    before_proxy_map=None,
-                    after_proxy_map=None,
+                    before_metric_map50=None,
+                    after_metric_map50=None,
                     absolute_delta=None,
                     relative_delta_percent=None,
                     sampled_frame_indices=[],
@@ -534,8 +534,8 @@ def main() -> None:
                     "golden_model": result.golden_model,
                     "success": result.success,
                     "accepted_updated_weights": result.accepted_updated_weights,
-                    "before_proxy_map": result.before_proxy_map,
-                    "after_proxy_map": result.after_proxy_map,
+                    "before_metric_map50": result.before_metric_map50,
+                    "after_metric_map50": result.after_metric_map50,
                     "absolute_delta": result.absolute_delta,
                     "relative_delta_percent": result.relative_delta_percent,
                     "low_quality_count": result.sample_stats.get("low_quality_count", 0),

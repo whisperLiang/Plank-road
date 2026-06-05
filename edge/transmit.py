@@ -12,6 +12,7 @@ from typing import Any
 import grpc
 from loguru import logger
 
+from cloud.feature_cache.types import NPY_MEMMAP_SHARD, SAFETENSORS_SHARD
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from tools.grpc_options import grpc_message_options
 import zipfile
@@ -65,19 +66,74 @@ def _record_abs_path(sample_store: EdgeSampleStore, relpath: str | None) -> str 
     return os.path.join(sample_store.root_dir, str(relpath).replace("/", os.sep))
 
 
-def _low_quality_trigger_source_bytes(
-    sample_store: EdgeSampleStore,
+def _read_json_payload(path: str | None) -> dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _metadata_path_from_feature_ref(ref: Mapping[str, Any]) -> str | None:
+    index_path = str(ref.get("index_path") or "")
+    index_payload = _read_json_payload(index_path)
+    metadata_path = index_payload.get("metadata_path") or index_payload.get("meta_path")
+    if metadata_path:
+        path = str(metadata_path)
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(index_path), path)
+        return path
+    if index_path.endswith(".index.json"):
+        return index_path[: -len(".index.json")] + ".meta.json"
+    return f"{index_path}.meta.json" if index_path else None
+
+
+def _feature_ref_paths(ref: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(ref, Mapping):
+        return []
+    paths: list[str] = []
+    for key in ("shard_path", "index_path"):
+        value = ref.get(key)
+        if value:
+            paths.append(str(value))
+    metadata_path = _metadata_path_from_feature_ref(ref)
+    if metadata_path:
+        paths.append(metadata_path)
+    shard_dir = ref.get("shard_dir")
+    if shard_dir and os.path.isdir(str(shard_dir)):
+        for root, _dirs, files in os.walk(str(shard_dir)):
+            for filename in files:
+                paths.append(os.path.join(root, filename))
+    return sorted(set(paths))
+
+
+def _feature_ref_matches_split(ref: Mapping[str, Any], split_plan: SplitPlan) -> bool:
+    runtime_contract = dict(getattr(split_plan, "runtime_contract", {}) or {})
+    expected_layout = str(runtime_contract.get("feature_layout_id") or "")
+    expected_contract = str(runtime_contract.get("contract_id") or "")
+    if expected_layout and str(ref.get("feature_layout_id") or "") != expected_layout:
+        return False
+    if expected_contract and str(ref.get("contract_id") or "") != expected_contract:
+        return False
+    return True
+
+
+def _low_quality_trigger_feature_paths(
     record,
     *,
-    send_low_conf_features: bool,
-) -> int:
-    del send_low_conf_features
-    total = 0
-    for relpath in (record.raw_relpath,):
-        path = _record_abs_path(sample_store, relpath)
-        if path and os.path.exists(path):
-            total += os.path.getsize(path)
-    return int(total)
+    split_plan: SplitPlan | None = None,
+) -> list[str]:
+    feature_ref = getattr(record, "feature_ref", None)
+    if (
+        isinstance(feature_ref, Mapping)
+        and split_plan is not None
+        and not _feature_ref_matches_split(feature_ref, split_plan)
+    ):
+        return []
+    return [path for path in _feature_ref_paths(feature_ref) if os.path.exists(path)]
 
 
 def _select_low_quality_trigger_records(
@@ -86,10 +142,12 @@ def _select_low_quality_trigger_records(
     *,
     send_low_conf_features: bool,
     bundle_cap_bytes: int | None,
+    split_plan: SplitPlan | None = None,
 ) -> tuple[list, dict[str, Any]]:
     cap = None if bundle_cap_bytes is None else max(1, int(bundle_cap_bytes))
     selected = []
     selected_bytes = 0
+    selected_feature_paths: set[str] = set()
     omitted = 0
     for record in sorted(
         [record for record in records if record.quality_bucket == LOW_QUALITY],
@@ -99,10 +157,16 @@ def _select_low_quality_trigger_records(
         if raw_path is None or not os.path.exists(raw_path):
             omitted += 1
             continue
-        source_bytes = _low_quality_trigger_source_bytes(
-            sample_store,
-            record,
-            send_low_conf_features=send_low_conf_features,
+        feature_paths = (
+            _low_quality_trigger_feature_paths(record, split_plan=split_plan)
+            if send_low_conf_features
+            else []
+        )
+        new_feature_paths = [
+            path for path in feature_paths if path not in selected_feature_paths
+        ]
+        source_bytes = os.path.getsize(raw_path) + sum(
+            os.path.getsize(path) for path in new_feature_paths
         )
         protected = bool(getattr(record, "in_drift_window", False))
         if cap is not None and not protected and selected and selected_bytes + source_bytes > cap:
@@ -110,8 +174,13 @@ def _select_low_quality_trigger_records(
             continue
         selected.append(record)
         selected_bytes += source_bytes
+        selected_feature_paths.update(new_feature_paths)
     return selected, {
-        "policy": "low_quality_trigger_raw_only",
+        "policy": (
+            "low_quality_trigger_raw_feature"
+            if send_low_conf_features
+            else "low_quality_trigger_raw_only"
+        ),
         "bundle_cap_bytes": 0 if cap is None else int(cap),
         "selected_sample_count": len(selected),
         "omitted_sample_count": omitted + max(0, len(records) - len(selected) - omitted),
@@ -158,6 +227,94 @@ def _write_low_quality_raw_tar(
         manifest_info.mtime = int(time.time())
         tf.addfile(manifest_info, io.BytesIO(manifest_bytes))
     return tar_buffer.getvalue(), manifest_entries
+
+
+def _build_low_quality_feature_shard_uploads(
+    records: Sequence,
+    *,
+    split_plan: SplitPlan,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    manifest_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    artifacts_by_arcname: dict[str, str] = {}
+
+    def add_artifact(path: str, arcname: str) -> None:
+        if os.path.exists(path):
+            artifacts_by_arcname.setdefault(arcname.replace("\\", "/"), path)
+
+    for record in records:
+        ref = getattr(record, "feature_ref", None)
+        if not isinstance(ref, Mapping) or not _feature_ref_matches_split(ref, split_plan):
+            continue
+        storage_format = str(ref.get("storage_format") or "")
+        shard_id = str(ref.get("shard_id") or "")
+        if storage_format not in {SAFETENSORS_SHARD, NPY_MEMMAP_SHARD} or not shard_id:
+            continue
+        safe_shard_id = _safe_sample_filename(shard_id, "").strip("._") or uuid.uuid4().hex
+        sample_id = str(getattr(record, "sample_id", "") or ref.get("sample_id") or "")
+        if storage_format == SAFETENSORS_SHARD:
+            shard_path = str(ref.get("shard_path") or "")
+            index_path = str(ref.get("index_path") or "")
+            meta_path = _metadata_path_from_feature_ref(ref)
+            if not shard_path or not index_path or not meta_path:
+                continue
+            if not all(os.path.exists(path) for path in (shard_path, index_path, meta_path)):
+                continue
+            key = (storage_format, shard_id, index_path)
+            base = f"feature_shards/{safe_shard_id}"
+            entry = manifest_by_key.setdefault(
+                key,
+                {
+                    "shard_id": shard_id,
+                    "storage_format": storage_format,
+                    "shard_file": f"{base}/{os.path.basename(shard_path)}",
+                    "index_file": f"{base}/{os.path.basename(index_path)}",
+                    "meta_file": f"{base}/{os.path.basename(meta_path)}",
+                    "sample_ids": [],
+                },
+            )
+            add_artifact(shard_path, str(entry["shard_file"]))
+            add_artifact(index_path, str(entry["index_file"]))
+            add_artifact(meta_path, str(entry["meta_file"]))
+        elif storage_format == NPY_MEMMAP_SHARD:
+            shard_dir = str(ref.get("shard_dir") or "")
+            index_path = str(ref.get("index_path") or "")
+            if not shard_dir or not index_path or not os.path.isdir(shard_dir):
+                continue
+            key = (storage_format, shard_id, shard_dir)
+            base = f"feature_shards/{safe_shard_id}/{os.path.basename(shard_dir.rstrip(os.sep))}"
+            entry = manifest_by_key.setdefault(
+                key,
+                {
+                    "shard_id": shard_id,
+                    "storage_format": storage_format,
+                    "shard_dir": base,
+                    "index_file_name": os.path.basename(index_path),
+                    "meta_file_name": os.path.basename(index_path).replace(
+                        ".index.json",
+                        ".meta.json",
+                    ),
+                    "sample_ids": [],
+                },
+            )
+            for root, _dirs, files in os.walk(shard_dir):
+                for filename in files:
+                    path = os.path.join(root, filename)
+                    relpath = os.path.relpath(path, shard_dir).replace("\\", "/")
+                    add_artifact(path, f"{base}/{relpath}")
+        else:
+            continue
+        sample_ids = entry.setdefault("sample_ids", [])
+        if sample_id and sample_id not in sample_ids:
+            sample_ids.append(sample_id)
+
+    manifest_entries: list[dict[str, Any]] = []
+    for entry in manifest_by_key.values():
+        sample_ids = [str(sample_id) for sample_id in list(entry.get("sample_ids") or [])]
+        entry["sample_ids"] = sample_ids
+        entry["sample_count"] = len(sample_ids)
+        manifest_entries.append(dict(entry))
+    artifacts = [(path, arcname) for arcname, path in sorted(artifacts_by_arcname.items())]
+    return manifest_entries, artifacts
 
 
 def pack_low_quality_trigger_bundle(
@@ -220,11 +377,11 @@ def pack_low_quality_trigger_bundle_to_file(
         and record.quality_bucket == LOW_QUALITY
     ]
     send_features_requested = bool(send_low_conf_features)
-    send_low_conf_features = False
     selected, selection_policy = _select_low_quality_trigger_records(
         sample_store,
         records,
         send_low_conf_features=send_low_conf_features,
+        split_plan=split_plan,
         bundle_cap_bytes=bundle_cap_bytes,
     )
     resolved_shard_size = max(1, int(shard_size or 64))
@@ -252,14 +409,14 @@ def pack_low_quality_trigger_bundle_to_file(
         ],
         "input_resize_mode": str(getattr(split_plan, "input_resize_mode", "") or "direct_resize"),
         "runtime_contract": dict(getattr(split_plan, "runtime_contract", {}) or {}),
-        "upload_mode": "raw-only",
+        "upload_mode": "raw+feature" if send_low_conf_features else "raw-only",
         "created_at": _utc_now(),
         "model": model_meta,
         "split_plan": split_plan.to_dict(),
         "training_mode": {
             "send_low_conf_features": bool(send_low_conf_features),
             "send_low_conf_features_requested": send_features_requested,
-            "low_quality_mode": "raw-only",
+            "low_quality_mode": "raw+feature" if send_low_conf_features else "raw-only",
         },
         "selection_policy": selection_policy,
         "shard_size": resolved_shard_size,
@@ -296,12 +453,26 @@ def pack_low_quality_trigger_bundle_to_file(
             }
             for index, (name, _payload, sample_ids) in enumerate(raw_shard_payloads, 1)
         ]
-        manifest["feature_shards"] = []
+        feature_shard_entries, feature_artifacts = (
+            _build_low_quality_feature_shard_uploads(
+                selected,
+                split_plan=split_plan,
+            )
+            if send_low_conf_features
+            else ([], [])
+        )
+        manifest["feature_shards"] = feature_shard_entries
+        if not feature_shard_entries:
+            manifest["upload_mode"] = "raw-only"
+            manifest["training_mode"]["send_low_conf_features"] = False
+            manifest["training_mode"]["low_quality_mode"] = "raw-only"
 
         def _write_zip() -> None:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
                 for name, payload, _sample_ids in raw_shard_payloads:
                     zf.writestr(name, payload, compress_type=zipfile.ZIP_STORED)
+                for source_path, arcname in feature_artifacts:
+                    zf.write(source_path, arcname, compress_type=zipfile.ZIP_STORED)
                 zf.writestr(
                     "trigger_manifest.json",
                     json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),

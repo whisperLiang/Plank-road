@@ -20,7 +20,6 @@ class InferenceResult:
     device_id: int
     frame_index: int
     confidence: float
-    proxy_map: float = 0.0
     latency_ms: float = 0.0
     in_drift_window: bool = False
     frame_path: str | None = None

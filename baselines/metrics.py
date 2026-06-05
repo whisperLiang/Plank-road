@@ -31,7 +31,6 @@ class DeviceMetrics:
     update_count: int = 0
 
     avg_confidence: float = 0.0
-    avg_proxy_map: float = 0.0
     avg_f1: float = 0.0
     avg_map50: float = 0.0
     accuracy_time_auc: float = 0.0
@@ -69,7 +68,6 @@ class DeviceMetrics:
     trigger_reason_histogram: dict[str, int] = field(default_factory=dict)
 
     _confidence_values: list[float] = field(default_factory=list, repr=False)
-    _proxy_map_values: list[float] = field(default_factory=list, repr=False)
     _f1_values: list[float] = field(default_factory=list, repr=False)
     _map50_values: list[float] = field(default_factory=list, repr=False)
     _accuracy_before_values: list[float] = field(default_factory=list, repr=False)
@@ -82,14 +80,12 @@ class DeviceMetrics:
         *,
         latency_ms: float,
         confidence: float,
-        proxy_map: float = 0.0,
         metric_f1: float | None = None,
         metric_map50: float | None = None,
     ) -> None:
         """Record a single real inference result."""
         self.inference_latencies_ms.append(float(latency_ms))
         self._confidence_values.append(float(confidence))
-        self._proxy_map_values.append(float(proxy_map))
         if metric_f1 is not None:
             self._f1_values.append(float(metric_f1))
         if metric_map50 is not None:
@@ -167,7 +163,6 @@ class DeviceMetrics:
 
     def finalize(self) -> None:
         self.avg_confidence = _mean(self._confidence_values)
-        self.avg_proxy_map = _mean(self._proxy_map_values)
         self.avg_f1 = _mean(self._f1_values)
         self.avg_map50 = _mean(self._map50_values)
         self.accuracy_time_auc = _mean(self._f1_values)
@@ -186,7 +181,6 @@ class DeviceMetrics:
             "trigger_count": self.trigger_count,
             "update_count": self.update_count,
             "avg_confidence": round(self.avg_confidence, 6),
-            "avg_proxy_map": round(self.avg_proxy_map, 6),
             "avg_f1": round(self.avg_f1, 6),
             "avg_map50": round(self.avg_map50, 6),
             "accuracy_time_auc": round(self.accuracy_time_auc, 6),
@@ -225,7 +219,7 @@ class OverallMetrics:
     method_name: str = ""
     num_devices: int = 0
     total_frames: int = 0
-    avg_proxy_map: float = 0.0
+    avg_map50: float = 0.0
     avg_inference_latency_ms: float = 0.0
     p95_inference_latency_ms: float = 0.0
     total_trigger_count: int = 0
@@ -277,8 +271,8 @@ class MetricsCollector:
         all_latencies: list[float] = []
         all_recovery: list[float] = []
         device_f1: list[float] = []
+        device_map50: list[float] = []
         device_auc: list[float] = []
-        proxy_map_values: list[float] = []
         total_wait = 0.0
         total_training = 0.0
 
@@ -287,8 +281,8 @@ class MetricsCollector:
             all_latencies.extend(dev.inference_latencies_ms)
             all_recovery.extend(dev.recovery_times_sec)
             device_f1.append(dev.avg_f1)
+            device_map50.append(dev.avg_map50)
             device_auc.append(dev.accuracy_time_auc)
-            proxy_map_values.append(dev.avg_proxy_map)
             overall.total_trigger_count += dev.trigger_count
             overall.total_update_count += dev.update_count
             total_wait += dev.central_wait_time_sec
@@ -298,7 +292,6 @@ class MetricsCollector:
             overall.total_frames += len(dev.inference_latencies_ms)
 
         update_count = max(1, overall.total_update_count)
-        overall.avg_proxy_map = round(_mean(proxy_map_values), 6)
         overall.avg_inference_latency_ms = round(_mean(all_latencies), 6)
         overall.p95_inference_latency_ms = round(_p95(all_latencies), 6)
         overall.avg_update_wait_time_sec = round(total_wait / update_count, 6)
@@ -309,6 +302,7 @@ class MetricsCollector:
         overall.max_recovery_time_sec = round(max(all_recovery), 6) if all_recovery else 0.0
         overall.avg_update_end_to_end_time_sec = round(_mean(all_recovery), 6)
         overall.mean_time_averaged_f1 = round(_mean(device_f1), 6)
+        overall.avg_map50 = round(_mean(device_map50), 6)
         overall.mean_accuracy_time_auc = round(_mean(device_auc), 6)
         overall.worst_edge_f1 = round(min(device_f1), 6) if device_f1 else 0.0
 

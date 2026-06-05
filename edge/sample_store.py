@@ -399,6 +399,8 @@ class EdgeSampleStore:
         input_image_size: list[int] | tuple[int, int] | None = None,
         input_tensor_shape: list[int] | tuple[int, ...] | None = None,
         input_resize_mode: str | None = None,
+        runtime_contract: Mapping[str, Any] | None = None,
+        model_family: str | None = None,
     ) -> StoredSampleRecord:
         sample_key = str(sample_id)
         with self._lock:
@@ -423,6 +425,7 @@ class EdgeSampleStore:
             else None
         )
 
+        runtime_contract_payload = dict(runtime_contract or {})
         written_features = self.feature_store.write_entries(
             [
                 {
@@ -438,12 +441,24 @@ class EdgeSampleStore:
             ],
             runtime_context={
                 "model_id": str(model_id),
-                "model_family": "",
+                "model_family": str(model_family or ""),
                 "split_config_id": str(split_config_id),
-                "feature_layout_id": "",
-                "boundary_id": str(getattr(intermediate, "split_id", "") or ""),
+                "contract_id": (
+                    None
+                    if runtime_contract_payload.get("contract_id") in (None, "")
+                    else str(runtime_contract_payload.get("contract_id"))
+                ),
+                "feature_layout_id": str(
+                    runtime_contract_payload.get("feature_layout_id") or ""
+                ),
+                "boundary_id": str(
+                    runtime_contract_payload.get("logical_split_id")
+                    or getattr(intermediate, "split_id", "")
+                    or ""
+                ),
                 "input_tensor_shape": list(input_tensor_shape or []),
                 "input_resize_mode": str(input_resize_mode or ""),
+                "runtime_contract": runtime_contract_payload,
             },
             generation="edge_sample_store",
             source="edge_sample_store",

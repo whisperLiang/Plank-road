@@ -170,7 +170,7 @@ class FeatureCachePlanner:
             validation = self._shard_validator.validate_feature_ref(
                 ref,
                 runtime_context,
-                allow_abi_compatible_migration=True,
+                allow_abi_compatible_migration=False,
                 deep_validate_payload=False,
             )
             if not validation.valid:

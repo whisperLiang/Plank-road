@@ -773,7 +773,6 @@ def run_one_method(
                 device_id=frame.device_id,
                 frame_index=frame.frame_index,
                 confidence=student.confidence,
-                proxy_map=0.0,
                 latency_ms=student.latency_ms,
                 in_drift_window=in_drift,
                 frame_path=frame.frame_path,

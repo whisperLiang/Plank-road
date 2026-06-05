@@ -43,7 +43,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import model_management.object_detection as object_detection_module
-from cloud_server import _evaluate_detection_proxy_map
+from cloud.training.proxy_eval import _evaluate_detection_proxy_map
 from config import load_runtime_config
 from model_management.model_zoo import (
     ensure_local_model_artifact,
@@ -1505,7 +1505,7 @@ def _resolve_exact_split_choices(
 # ---------------------------------------------------------------------------
 
 
-def _evaluate_proxy_map(
+def _evaluate_metric_map50(
     *,
     model: torch.nn.Module,
     model_name: str,
@@ -2211,7 +2211,7 @@ def _run_one_experiment(
             "Optimizer parameter set does not match suffix trainable parameters."
         )
 
-    before_metrics = _evaluate_proxy_map(
+    before_metrics = _evaluate_metric_map50(
         model=edge_model,
         model_name=model_name,
         frame_dir=frame_dir,
@@ -2274,7 +2274,7 @@ def _run_one_experiment(
             optimizer=optimizer,
         )
 
-    after_metrics = _evaluate_proxy_map(
+    after_metrics = _evaluate_metric_map50(
         model=edge_model,
         model_name=model_name,
         frame_dir=frame_dir,

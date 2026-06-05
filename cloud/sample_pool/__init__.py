@@ -7,7 +7,7 @@ import shutil
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,53 +24,28 @@ from cloud.feature_cache.shard_reachability import (
     collect_refs_from_pending_high_quality,
 )
 from cloud.feature_cache.types import SUPPORTED_STORAGE_FORMATS
-from model_management.detection_box_projection import (
-    ORIGINAL_XYXY,
-    canonicalize_labels_to_original_xyxy,
-    validate_box_coordinate_space,
+from cloud.sample_pool.labels import (
+    POOL_LABEL_COORDINATE_SPACE,
+    POOL_LABEL_METADATA_FIELDS,
+    POOL_LABEL_RUNTIME_VERSION,
+    class_counts as _class_counts,
+    labels_from_result as _labels_from_result,
+    labels_with_default_metadata as _labels_with_default_metadata,
+    object_count as _object_count,
 )
+from cloud.sample_pool.records import (
+    CANONICAL_FEATURE_METADATA_FIELDS as _CANONICAL_FEATURE_METADATA_FIELDS,
+    CANONICAL_RECORD_VERSION as _CANONICAL_RECORD_VERSION,
+    GENERATION_MANIFEST_VERSION as _GENERATION_MANIFEST_VERSION,
+    CanonicalSampleRecord,
+)
+from model_management.detection_box_projection import validate_box_coordinate_space
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_contract import (
     SplitRuntimeContract,
     feature_layout_from_tensors,
     normalise_feature_tensors,
 )
-
-
-POOL_LABEL_COORDINATE_SPACE = ORIGINAL_XYXY
-POOL_LABEL_RUNTIME_VERSION = "fixed-split-pool-labels.v1"
-POOL_LABEL_METADATA_FIELDS = (
-    "label_coordinate_space",
-    "label_image_size",
-    "label_input_size",
-    "label_resize_mode",
-    "label_runtime_version",
-)
-
-_CANONICAL_RECORD_VERSION = "canonical-sample-record.v1"
-_GENERATION_MANIFEST_VERSION = "canonical-cloud-sample-pool.v1"
-
-_CANONICAL_FEATURE_METADATA_FIELDS = {
-    "sample_id",
-    "contract_id",
-    "split_config_id",
-    "front_version",
-    "feature_layout_id",
-    "sample_source",
-    "label_source",
-    "input_image_size",
-    "input_tensor_shape",
-    "input_resize_mode",
-    "created_at",
-    "quality_score",
-    "risk_score",
-    "object_count",
-    "class_counts",
-    "in_drift_window",
-    "window_id",
-    "feature_ref",
-    "label_ref",
-}
 
 
 def _stable_json(payload: object) -> str:
@@ -394,75 +369,6 @@ def _boundary_payload_from_candidate(candidate: Mapping[str, Any]) -> BoundaryPa
     return None
 
 
-def _labels_from_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
-    result = dict(result or {})
-    labels = {
-        "boxes": list(result.get("boxes") or result.get("pseudo_boxes") or []),
-        "labels": list(result.get("labels") or result.get("pseudo_labels") or []),
-    }
-    scores = result.get("scores")
-    if scores is None:
-        scores = result.get("pseudo_scores")
-    if scores is not None:
-        labels["scores"] = list(scores or [])
-    for field_name in POOL_LABEL_METADATA_FIELDS:
-        if result.get(field_name) is not None:
-            labels[field_name] = result[field_name]
-    return labels
-
-
-def _class_counts(labels: Mapping[str, Any]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for label in list(labels.get("labels") or []):
-        key = str(label)
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
-
-def _object_count(labels: Mapping[str, Any]) -> int:
-    boxes = list(labels.get("boxes") or [])
-    label_values = list(labels.get("labels") or [])
-    if boxes and label_values:
-        return min(len(boxes), len(label_values))
-    return max(len(boxes), len(label_values))
-
-
-def _dominant_class(class_counts: Mapping[str, int]) -> int | None:
-    if not class_counts:
-        return None
-    label = sorted(
-        ((int(count), str(label)) for label, count in class_counts.items()),
-        key=lambda item: (-item[0], item[1]),
-    )[0][1]
-    try:
-        return int(label)
-    except (TypeError, ValueError):
-        return None
-
-
-def _labels_with_default_metadata(
-    labels: Mapping[str, Any],
-    *,
-    input_image_size: list[int] | tuple[int, int] | None,
-    input_tensor_shape: list[int],
-    input_resize_mode: str,
-) -> dict[str, Any]:
-    payload = _labels_from_result(labels)
-    if not str(payload.get("label_coordinate_space") or "").strip():
-        if payload.get("boxes"):
-            raise ValueError("Sample labels are missing label_coordinate_space.")
-        payload["label_coordinate_space"] = POOL_LABEL_COORDINATE_SPACE
-    payload.setdefault("label_runtime_version", POOL_LABEL_RUNTIME_VERSION)
-    metadata = {
-        "input_image_size": list(input_image_size) if input_image_size is not None else None,
-        "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
-        "input_resize_mode": str(input_resize_mode or ""),
-    }
-    canonical = canonicalize_labels_to_original_xyxy(payload, metadata)
-    canonical.setdefault("label_runtime_version", POOL_LABEL_RUNTIME_VERSION)
-    return canonical
-
-
 def _feature_metadata_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(candidate.get("feature_record") or {})
     source.update(
@@ -733,10 +639,9 @@ def _has_contract_id_metadata_mismatch(
 def _hard_contract_metadata_mismatch_reason(
     candidate: Mapping[str, Any],
     split_contract: SplitRuntimeContract,
-    *,
-    allow_feature_layout_migration: bool = False,
 ) -> str | None:
     expected_text = {
+        "contract_id": split_contract.contract_id,
         "split_config_id": split_contract.split_config_id,
         "front_version": split_contract.front_version,
     }
@@ -770,131 +675,9 @@ def _hard_contract_metadata_mismatch_reason(
         _metadata_present(feature_layout_id)
         and str(feature_layout_id) != str(split_contract.feature_layout_id)
     ):
-        if allow_feature_layout_migration:
-            return None
         return "feature_layout_id"
 
     return None
-
-
-@dataclass
-class CanonicalSampleRecord:
-    sample_id: str
-    contract_id: str
-    split_config_id: str
-    front_version: str
-    feature_layout_id: str
-    sample_source: str
-    label_source: str
-    feature: dict[str, torch.Tensor]
-    labels: dict[str, Any]
-    input_image_size: list[int]
-    input_tensor_shape: list[int]
-    input_resize_mode: str
-    created_at: str
-    quality_score: float = 0.0
-    risk_score: float = 0.0
-    object_count: int = 0
-    class_counts: dict[str, int] = field(default_factory=dict)
-    in_drift_window: bool | None = None
-    window_id: str | None = None
-    boundary_payload: BoundaryPayload | None = field(default=None, repr=False, compare=False)
-    feature_ref: dict[str, Any] | None = field(default=None, repr=False, compare=False)
-    label_ref: dict[str, Any] | None = field(default=None, repr=False, compare=False)
-    feature_layout_metadata: dict[str, dict[str, Any]] | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-    source_label_path: str | None = field(default=None, repr=False, compare=False)
-    source_staging_path: str | None = field(default=None, repr=False, compare=False)
-
-    def feature_layout(self) -> dict[str, dict[str, Any]]:
-        if not self.feature and self.feature_layout_metadata is not None:
-            return {
-                str(label): dict(spec)
-                for label, spec in dict(self.feature_layout_metadata).items()
-                if isinstance(spec, Mapping)
-            }
-        return feature_layout_from_tensors(self.feature)
-
-    def to_label_payload(self) -> dict[str, Any]:
-        return {
-            "schema_version": _CANONICAL_RECORD_VERSION,
-            "sample_id": self.sample_id,
-            "boxes": list(self.labels.get("boxes") or []),
-            "labels": list(self.labels.get("labels") or []),
-            **(
-                {"scores": list(self.labels.get("scores") or [])}
-                if self.labels.get("scores") is not None
-                else {}
-            ),
-            **{
-                field_name: self.labels[field_name]
-                for field_name in POOL_LABEL_METADATA_FIELDS
-                if self.labels.get(field_name) is not None
-            },
-        }
-
-    def to_index_record(
-        self,
-        *,
-        label_relpath: str,
-        generation_id: str,
-    ) -> dict[str, Any]:
-        return {
-            "schema_version": _CANONICAL_RECORD_VERSION,
-            "sample_id": self.sample_id,
-            "contract_id": self.contract_id,
-            "split_config_id": self.split_config_id,
-            "front_version": self.front_version,
-            "feature_layout_id": self.feature_layout_id,
-            "sample_source": self.sample_source,
-            "label_source": self.label_source,
-            "feature_layout": self.feature_layout(),
-            "label_shard": label_relpath,
-            "label_key": self.sample_id,
-            "object_count": int(self.object_count),
-            "class_counts": dict(self.class_counts),
-            "class_counts_json": _stable_json(self.class_counts),
-            "dominant_class": _dominant_class(self.class_counts),
-            "created_at": self.created_at,
-            "quality_score": float(self.quality_score),
-            "risk_score": float(self.risk_score),
-            "in_drift_window": self.in_drift_window,
-            "window_id": self.window_id,
-            "input_image_size": list(self.input_image_size),
-            **(
-                {"feature_ref": dict(self.feature_ref)}
-                if self.feature_ref is not None
-                else {}
-            ),
-            **(
-                {
-                    "label_ref": dict(
-                        self.label_ref
-                        or _label_ref_payload(
-                            sample_id=self.sample_id,
-                            label_path=label_relpath,
-                            label_source=self.label_source,
-                            labels=self.labels,
-                        )
-                    )
-                }
-                if self.label_ref is not None
-                else {
-                    "label_ref": _label_ref_payload(
-                        sample_id=self.sample_id,
-                        label_path=label_relpath,
-                        label_source=self.label_source,
-                        labels=self.labels,
-                    )
-                }
-            ),
-            "input_tensor_shape": list(self.input_tensor_shape),
-            "input_resize_mode": self.input_resize_mode,
-            "generation_id": generation_id,
-        }
 
 
 class CloudSamplePool:
@@ -1267,7 +1050,6 @@ class CloudSamplePool:
                 _hard_contract_metadata_mismatch_reason(
                     entry,
                     split_contract,
-                    allow_feature_layout_migration=True,
                 )
                 if split_contract is not None
                 else None
@@ -1464,13 +1246,11 @@ class CloudSamplePool:
             if layout_metadata and not feature_layouts_abi_compatible(
                 layout_metadata,
                 split_contract.feature_layout,
-                allow_rename_compatible=True,
+                allow_rename_compatible=False,
             ):
                 return "skipped_feature_layout"
             if record.feature_layout_id != split_contract.feature_layout_id:
-                if not layout_metadata:
-                    return "skipped_feature_layout"
-                record.feature_layout_id = split_contract.feature_layout_id
+                return "skipped_feature_layout"
         else:
             try:
                 normalised = _feature_tensors_for_contract(
@@ -1766,8 +1546,6 @@ class CloudSamplePool:
             validation_counts = {
                 "accepted_high_quality": 0,
                 "accepted_low_quality": 0,
-                "migrated_contract_id": 0,
-                "carried_forward_compatible": 0,
                 "skipped_stale_contract": 0,
                 "skipped_feature_layout": 0,
                 "deferred_feature_layout": 0,
@@ -1788,8 +1566,6 @@ class CloudSamplePool:
             }
             shard_carry_forward = {
                 "existing_active": len(existing_active_samples or []),
-                "carried_forward_compatible": 0,
-                "migrated_contract_id": 0,
                 "dropped_incompatible": 0,
                 "skipped_unreadable": 0,
             }
@@ -1824,7 +1600,6 @@ class CloudSamplePool:
                 hard_mismatch_reason = _hard_contract_metadata_mismatch_reason(
                     candidate,
                     split_contract,
-                    allow_feature_layout_migration=input_source == "existing_active",
                 )
                 if input_source == "existing_active" and hard_mismatch_reason is not None:
                     validation_counts["skipped_stale_contract"] += 1
@@ -1840,7 +1615,7 @@ class CloudSamplePool:
                             candidate=candidate,
                             split_contract=split_contract,
                         ),
-                        allow_abi_compatible_migration=True,
+                        allow_abi_compatible_migration=False,
                         deep_validate_payload=False,
                     )
                     _increment_shard_validation_counts(
@@ -1858,10 +1633,6 @@ class CloudSamplePool:
                             candidate,
                             split_contract=split_contract,
                             validation=shard_validation,
-                        )
-                        contract_id_mismatch = bool(
-                            contract_id_mismatch
-                            or candidate.get("__shard_requires_migration")
                         )
                     elif shard_validation.abi_incompatible:
                         if input_source == "pending_high_quality":
@@ -1965,26 +1736,10 @@ class CloudSamplePool:
                         validation_counts["invalid_high_quality"] += 1
                     invalid_records.append(record)
                     continue
-                if input_source == "existing_active" and bool(
-                    candidate.get("__shard_abi_compatible")
-                ):
-                    validation_counts["carried_forward_compatible"] += 1
-                    shard_carry_forward["carried_forward_compatible"] += 1
-                if contract_id_mismatch or bool(candidate.get("__shard_abi_compatible")):
-                    if contract_id_mismatch:
-                        validation_counts["migrated_contract_id"] += 1
-                        if input_source == "existing_active":
-                            shard_carry_forward["migrated_contract_id"] += 1
-                    record.contract_id = split_contract.contract_id
-                    record.split_config_id = split_contract.split_config_id
-                    record.front_version = split_contract.front_version
-                    record.feature_layout_id = split_contract.feature_layout_id
-                    record.source_label_path = None
-                    if isinstance(record.feature_ref, Mapping):
-                        feature_ref = dict(record.feature_ref)
-                        feature_ref["contract_id"] = split_contract.contract_id
-                        feature_ref["feature_layout_id"] = split_contract.feature_layout_id
-                        record.feature_ref = feature_ref
+                if contract_id_mismatch:
+                    validation_counts["skipped_stale_contract"] += 1
+                    validation_previews["skipped_stale_contract"].append(record.sample_id)
+                    continue
                 if record.sample_source == "low_quality":
                     validation_counts["accepted_low_quality"] += 1
                 else:
@@ -1997,7 +1752,7 @@ class CloudSamplePool:
                 accepted,
                 max_samples=max_samples,
             )
-            replacement_stats = {
+            selection_stats = {
                 "before": len(existing_active_samples or []),
                 "incoming": len(pending_high_quality_samples or [])
                 + len(new_low_quality_samples or []),
@@ -2021,10 +1776,6 @@ class CloudSamplePool:
                         "skipped_unreadable",
                     )
                 ),
-                "migrated_contract_id": validation_counts["migrated_contract_id"],
-                "carried_forward_compatible": validation_counts[
-                    "carried_forward_compatible"
-                ],
                 "deferred_feature_layout": validation_counts["deferred_feature_layout"],
             }
             stats = {
@@ -2035,7 +1786,7 @@ class CloudSamplePool:
                         for key, value in validation_previews.items()
                     },
                 },
-                "replacement": replacement_stats,
+                "selection": selection_stats,
                 "shard_validation": dict(shard_validation_counts),
                 "shard_carry_forward": dict(shard_carry_forward),
                 "shard_high_quality": dict(shard_high_quality),

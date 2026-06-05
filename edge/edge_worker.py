@@ -1210,6 +1210,9 @@ class EdgeWorker:
             "input_image_size": list(frame.shape[:2]),
             "input_tensor_shape": inference.input_tensor_shape,
             "input_resize_mode": inference.input_resize_mode,
+            "runtime_contract": dict(
+                getattr(self.fixed_split_plan, "runtime_contract", {}) or {}
+            ),
         }
         self._submit_sample_write(
             SampleWriteJob(

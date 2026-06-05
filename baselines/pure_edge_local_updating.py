@@ -40,7 +40,6 @@ class PureEdgeLocalUpdating(BaseMethod):
         dev.record_inference(
             latency_ms=result.latency_ms,
             confidence=result.confidence,
-            proxy_map=result.proxy_map,
             metric_f1=result.metric_f1,
             metric_map50=result.metric_map50,
         )
