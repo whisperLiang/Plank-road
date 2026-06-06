@@ -140,38 +140,38 @@ Core files:
 
 ```text
 Plank-road/
-├── edge_client.py            # Edge client entry (supports --edge_id override)
-├── cloud_server.py            # Cloud server entry
-├── launch_multi_edge.py       # Multi-edge launcher (start N edges at once)
-├── config/
-├── cloud/
-│   └── edge_registry.py       # Cloud-side edge node registry
-├── edge/
-│   ├── edge_worker.py
-│   ├── resource_aware_trigger.py
-│   ├── sample_store.py
-│   └── transmit.py
-├── grpc_server/
-│   ├── protos/
-│   │   └── message_transmission.proto
-│   ├── message_transmission_pb2.py
-│   ├── message_transmission_pb2_grpc.py
-│   ├── rpc_server.py
-│   └── training_jobs.py       # Async job queue with round-robin scheduling
-├── difference/
-├── tools/
-├── model_management/
-│   ├── activation_sparsity.py
-│   ├── fixed_split.py
-│   ├── fixed_split_runtime_template.py
-│   ├── split_candidate.py
-│   ├── payload.py
-│   ├── candidate_profiler.py
-│   ├── split_runtime/
-│   ├── universal_model_split.py
-│   ├── object_detection.py
-│   └── model_zoo.py
-└── tests/
+|-- edge_client.py            # Edge client entry (supports --edge_id override)
+|-- cloud_server.py           # Cloud server entry
+|-- launch_multi_edge.py      # Multi-edge launcher (start N edges at once)
+|-- config/
+|-- cloud/
+|   `-- edge_registry.py      # Cloud-side edge node registry
+|-- edge/
+|   |-- diff.py               # Frame differencing/filtering strategies
+|   |-- edge_worker.py
+|   |-- resource_aware_trigger.py
+|   |-- sample_store.py
+|   `-- transmit.py
+|-- grpc_server/
+|   |-- protos/
+|   |   `-- message_transmission.proto
+|   |-- message_transmission_pb2.py
+|   |-- message_transmission_pb2_grpc.py
+|   |-- rpc_server.py
+|   `-- training_jobs.py      # Async job queue with round-robin scheduling
+|-- tools/
+|-- video_data/               # Checked-in sample videos used by defaults/examples
+|-- model_management/
+|   |-- activation_sparsity.py
+|   |-- fixed_split.py
+|   |-- split_candidate.py
+|   |-- payload.py
+|   |-- candidate_profiler.py
+|   |-- split_runtime/
+|   |-- universal_model_split.py
+|   |-- object_detection.py
+|   `-- model_zoo.py
+`-- tests/
 ```
 
 ## Installation
@@ -369,7 +369,7 @@ python launch_multi_edge.py --num_edges 3
 
 # Start 3 edges with different video sources
 python launch_multi_edge.py --num_edges 3 \
-    --video_paths video_data/road1.mp4 video_data/road2.mp4 video_data/road3.mp4
+    --video_paths video_data/road.mp4 video_data/cam1-rin.mp4 video_data/suwon#86_04_01.mp4
 
 # Start edges with custom IDs (e.g., 10,11,12)
 python launch_multi_edge.py --num_edges 3 --start_edge_id 10
@@ -393,7 +393,7 @@ Start each edge in a separate terminal with `--edge_id`:
 python edge_client.py --edge_id 1
 
 # Terminal 3: Edge 2
-python edge_client.py --edge_id 2 --video_path video_data/road2.mp4
+python edge_client.py --edge_id 2 --video_path video_data/cam1-rin.mp4
 
 # Terminal 4: Edge 3 (custom cache and server)
 python edge_client.py --edge_id 3 --cache_path ./cache/edge_3 --server_ip 10.0.0.5:50051

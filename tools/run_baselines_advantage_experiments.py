@@ -28,7 +28,7 @@ from tools.baselines_real_common import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", default="config/baselines_real_advantage.yaml")
     return parser.parse_args()
 
 

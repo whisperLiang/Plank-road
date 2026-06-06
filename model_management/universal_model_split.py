@@ -986,6 +986,37 @@ def _suffix_parameters(runtime: Any) -> list[torch.nn.Parameter]:
     return params
 
 
+def _suffix_parameter_names(runtime: Any) -> list[str]:
+    runtime_obj = _runtime_from_splitter(runtime)
+    graph = getattr(runtime_obj, "trace_graph", None)
+    plan = getattr(runtime_obj, "plan", None)
+    model = _runtime_model(runtime_obj)
+    if graph is None or plan is None:
+        raise RuntimeError("TorchLens suffix optimizer requires runtime.trace_graph and runtime.plan.")
+    if model is None:
+        raise RuntimeError("TorchLens suffix optimizer requires runtime.model.")
+    named_parameters = dict(model.named_parameters())
+    parameter_names_by_id = {id(parameter): name for name, parameter in named_parameters.items()}
+    suffix_nodes = set(getattr(plan, "suffix_nodes", ()) or ())
+    if not suffix_nodes:
+        raise RuntimeError("TorchLens suffix optimizer found no suffix nodes.")
+    names: list[str] = []
+    seen: set[int] = set()
+    for node in graph.ordered_nodes():
+        if str(getattr(node, "torchlens_label", "")) not in suffix_nodes:
+            continue
+        for log in _parameter_logs_for_node(node):
+            param = _parameter_from_log(log, named_parameters)
+            if param is None or id(param) in seen:
+                continue
+            name = parameter_names_by_id.get(id(param))
+            if name is None:
+                continue
+            seen.add(id(param))
+            names.append(str(name))
+    return names
+
+
 def collect_suffix_trainable_parameters(
     runtime: Any,
     *,

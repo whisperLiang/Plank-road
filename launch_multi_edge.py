@@ -10,7 +10,7 @@ Launch 3 edges using the same video source:
 Launch 3 edges with different video sources:
 
     python launch_multi_edge.py --num_edges 3 \
-        --video_paths video_data/road1.mp4 video_data/road2.mp4 video_data/road3.mp4
+        --video_paths video_data/road.mp4 video_data/cam1-rin.mp4 video_data/suwon#86_04_01.mp4
 
 Launch with custom starting edge_id:
 

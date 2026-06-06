@@ -12,7 +12,7 @@ import grpc
 import torch
 from loguru import logger
 
-from difference.diff import DiffProcessor
+from edge.diff import DiffProcessor
 from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
 from edge.info import TASK_STATE
 from edge.box_motion import compensate_boxes_between_frames

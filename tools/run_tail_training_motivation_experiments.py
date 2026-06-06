@@ -180,7 +180,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="generated_eager",
     )
     parser.add_argument("--dynamic-batch-max", type=int, default=64)
-    parser.add_argument("--output-root", default="./tmp/tail_training_motivation")
+    parser.add_argument("--output-root", default="./results/tail_training_motivation")
     parser.add_argument(
         "--append-results",
         action="store_true",

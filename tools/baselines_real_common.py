@@ -37,7 +37,7 @@ from baselines.runtime.teacher_annotator import TeacherAnnotator
 from baselines.runtime.upload_meter import UploadMeter
 from baselines.runtime.video_stream import build_streams
 from config.experiment import ExperimentConfig
-from difference.diff import DiffProcessor
+from edge.diff import DiffProcessor
 from edge.box_motion import compensate_boxes_between_frames
 from model_management.fixed_split import SplitConstraints
 
