@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
 from collections import OrderedDict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -165,12 +166,35 @@ class ProxyEarlyStopper:
 def deterministic_proxy_sample_ids(
     gt_annotations: Mapping[object, object],
     max_samples: int | None,
+    *,
+    priority_sample_ids: Iterable[object] | None = None,
+    random_fill_seed: object | None = None,
 ) -> list[str]:
     sample_ids = [str(sample_id) for sample_id in gt_annotations.keys()]
     sample_ids.sort()
     if max_samples is None or int(max_samples) <= 0:
         return sample_ids
-    return sample_ids[: int(max_samples)]
+    priority_ids = {str(sample_id) for sample_id in priority_sample_ids or []}
+    if not priority_ids and random_fill_seed is None:
+        return sample_ids[: int(max_samples)]
+
+    def _selection_key(sample_id: str) -> tuple[str, str]:
+        if random_fill_seed is None:
+            return ("", sample_id)
+        digest = hashlib.sha1(
+            f"{random_fill_seed}\0{sample_id}".encode("utf-8"),
+        ).hexdigest()
+        return digest, sample_id
+
+    prioritized = sorted(
+        [sample_id for sample_id in sample_ids if sample_id in priority_ids],
+        key=_selection_key,
+    )
+    remaining = sorted(
+        [sample_id for sample_id in sample_ids if sample_id not in priority_ids],
+        key=_selection_key,
+    )
+    return (prioritized + remaining)[: int(max_samples)]
 
 
 def _load_proxy_eval_frame(
@@ -197,8 +221,15 @@ def _normalize_proxy_sample_ids(
     gt_annotations: Mapping[str, Mapping[str, object]],
     *,
     max_samples: int | None = None,
+    priority_sample_ids: Iterable[object] | None = None,
+    random_fill_seed: object | None = None,
 ) -> list[str]:
-    return deterministic_proxy_sample_ids(gt_annotations, max_samples)
+    return deterministic_proxy_sample_ids(
+        gt_annotations,
+        max_samples,
+        priority_sample_ids=priority_sample_ids,
+        random_fill_seed=random_fill_seed,
+    )
 
 
 def _lookup_preloaded_record(
@@ -1053,10 +1084,21 @@ def _build_detection_proxy_prediction_cache(
     splitter: UniversalModelSplitter | None = None,
     split_candidate=None,
     preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
+    priority_sample_ids: Iterable[object] | None = None,
+    random_fill_seed: object | None = None,
 ) -> dict[str, object]:
     sample_ids = _normalize_proxy_sample_ids(
         gt_annotations,
         max_samples=max_samples,
+        priority_sample_ids=priority_sample_ids,
+        random_fill_seed=random_fill_seed,
+    )
+    priority_id_set = {str(sample_id) for sample_id in priority_sample_ids or []}
+    priority_gt_samples = sum(1 for sample_id in sample_ids if sample_id in priority_id_set)
+    random_fill_gt_samples = (
+        int(len(sample_ids) - priority_gt_samples)
+        if random_fill_seed is not None
+        else 0
     )
     skipped_empty_gt = 0
     skipped_missing_frame = 0
@@ -1188,6 +1230,8 @@ def _build_detection_proxy_prediction_cache(
             "skipped_empty_gt": skipped_empty_gt,
             "skipped_missing_frame": skipped_missing_frame,
             "total_gt_samples": len(sample_ids),
+            "priority_gt_samples": int(priority_gt_samples),
+            "random_fill_gt_samples": random_fill_gt_samples,
             "threshold_low": float(threshold_low),
         }
 
@@ -1241,6 +1285,8 @@ def _build_detection_proxy_prediction_cache(
         "skipped_empty_gt": skipped_empty_gt,
         "skipped_missing_frame": skipped_missing_frame,
         "total_gt_samples": len(sample_ids),
+        "priority_gt_samples": int(priority_gt_samples),
+        "random_fill_gt_samples": random_fill_gt_samples,
         "threshold_low": float(threshold_low),
     }
 
@@ -1276,6 +1322,8 @@ def _evaluate_detection_proxy_map_from_cache(
         "skipped_empty_gt": int(prediction_cache.get("skipped_empty_gt", 0)),
         "skipped_missing_frame": int(prediction_cache.get("skipped_missing_frame", 0)),
         "total_gt_samples": int(prediction_cache.get("total_gt_samples", 0)),
+        "priority_gt_samples": int(prediction_cache.get("priority_gt_samples", 0)),
+        "random_fill_gt_samples": int(prediction_cache.get("random_fill_gt_samples", 0)),
         "nonempty_predictions": nonempty_predictions,
         "total_prediction_boxes": total_prediction_boxes,
     }
@@ -1299,6 +1347,8 @@ def _evaluate_detection_proxy_map(
     splitter: UniversalModelSplitter | None = None,
     split_candidate=None,
     preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
+    priority_sample_ids: Iterable[object] | None = None,
+    random_fill_seed: object | None = None,
 ) -> dict[str, float | int | None]:
     if threshold_low is None or threshold_high is None:
         threshold_low, threshold_high = get_model_detection_thresholds(
@@ -1323,6 +1373,8 @@ def _evaluate_detection_proxy_map(
             splitter=splitter,
             split_candidate=split_candidate,
             preloaded_records=preloaded_records,
+            priority_sample_ids=priority_sample_ids,
+            random_fill_seed=random_fill_seed,
         )
 
     return _evaluate_detection_proxy_map_from_cache(
@@ -1419,6 +1471,8 @@ def _calibrate_tinynext_proxy_thresholds(
     split_candidate=None,
     preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
     proxy_cache_threshold_low: float | None = None,
+    priority_sample_ids: Iterable[object] | None = None,
+    random_fill_seed: object | None = None,
 ) -> tuple[dict[str, float | int | None], float, float]:
     current_low, current_high = get_model_detection_thresholds(model, model_name)
     _, default_high = get_detection_thresholds(model_name)
@@ -1451,6 +1505,8 @@ def _calibrate_tinynext_proxy_thresholds(
         splitter=splitter,
         split_candidate=split_candidate,
         preloaded_records=preloaded_records,
+        priority_sample_ids=priority_sample_ids,
+        random_fill_seed=random_fill_seed,
     )
     metrics_by_threshold: dict[float, dict[str, float | int | None]] = {}
 
@@ -1604,6 +1660,8 @@ class FixedSplitProxyEvaluator:
         split_candidate=None,
         preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
         proxy_cache_threshold_low: float | None = None,
+        priority_sample_ids: Iterable[object] | None = None,
+        random_fill_seed: object | None = None,
     ) -> dict[str, float | int | None]:
         threshold_low = None
         threshold_high = None
@@ -1634,6 +1692,8 @@ class FixedSplitProxyEvaluator:
             splitter=splitter,
             split_candidate=split_candidate,
             preloaded_records=preloaded_records,
+            priority_sample_ids=priority_sample_ids,
+            random_fill_seed=random_fill_seed,
         )
 
     def evaluate_tinynext(
@@ -1655,12 +1715,16 @@ class FixedSplitProxyEvaluator:
         preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
         allow_dead_baseline_fast_path: bool = False,
         logger=None,
+        priority_sample_ids: Iterable[object] | None = None,
+        random_fill_seed: object | None = None,
     ) -> dict[str, float | int | None]:
         effective_max_samples = self.max_samples if max_samples is None else max_samples
         full_proxy_sample_count = len(
             _normalize_proxy_sample_ids(
                 gt_annotations,
                 max_samples=effective_max_samples,
+                priority_sample_ids=priority_sample_ids,
+                random_fill_seed=random_fill_seed,
             )
         )
         calibration_max_samples = self._resolve_tinynext_proxy_selection_max_samples(
@@ -1696,6 +1760,8 @@ class FixedSplitProxyEvaluator:
                 splitter=splitter,
                 split_candidate=split_candidate,
                 preloaded_records=preloaded_records,
+                priority_sample_ids=priority_sample_ids,
+                random_fill_seed=random_fill_seed,
             )
             if logger is not None and abs(calibrated_high - initial_high) > 1e-6:
                 logger.info(
@@ -1739,6 +1805,8 @@ class FixedSplitProxyEvaluator:
                 split_candidate=split_candidate,
                 preloaded_records=preloaded_records,
                 proxy_cache_threshold_low=calibrated_high,
+                priority_sample_ids=priority_sample_ids,
+                random_fill_seed=random_fill_seed,
             )
 
         metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
@@ -1755,6 +1823,8 @@ class FixedSplitProxyEvaluator:
             splitter=splitter,
             split_candidate=split_candidate,
             preloaded_records=preloaded_records,
+            priority_sample_ids=priority_sample_ids,
+            random_fill_seed=random_fill_seed,
         )
         if logger is not None and abs(calibrated_high - initial_high) > 1e-6:
             logger.info(

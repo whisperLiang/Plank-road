@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from cloud.training import FixedSplitProxyDecision, FixedSplitProxyEvaluator
 
 __all__ = ["FixedSplitProxyDecision", "FixedSplitProxyEvaluator"]
@@ -53,6 +55,8 @@ class ProxyStageMixin:
         split_candidate=None,
         preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
         proxy_cache_threshold_low: float | None = None,
+        priority_sample_ids: Iterable[object] | None = None,
+        random_fill_seed: object | None = None,
     ) -> dict[str, float | int | None]:
         return self._fixed_split_proxy_evaluator().evaluate_detection(
             model,
@@ -68,6 +72,8 @@ class ProxyStageMixin:
             split_candidate=split_candidate,
             preloaded_records=preloaded_records,
             proxy_cache_threshold_low=proxy_cache_threshold_low,
+            priority_sample_ids=priority_sample_ids,
+            random_fill_seed=random_fill_seed,
         )
 
 
@@ -89,6 +95,8 @@ class ProxyStageMixin:
         split_candidate=None,
         preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
         allow_dead_baseline_fast_path: bool = False,
+        priority_sample_ids: Iterable[object] | None = None,
+        random_fill_seed: object | None = None,
     ) -> dict[str, float | int | None]:
         return self._fixed_split_proxy_evaluator().evaluate_tinynext(
             model,
@@ -106,5 +114,7 @@ class ProxyStageMixin:
             split_candidate=split_candidate,
             preloaded_records=preloaded_records,
             allow_dead_baseline_fast_path=allow_dead_baseline_fast_path,
+            priority_sample_ids=priority_sample_ids,
+            random_fill_seed=random_fill_seed,
             logger=logger,
         )

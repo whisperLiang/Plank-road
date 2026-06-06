@@ -53,6 +53,30 @@ def test_deterministic_proxy_sample_ids_are_stable_and_bounded() -> None:
     ]
 
 
+def test_proxy_sample_ids_prioritize_relabels_then_stable_random_fill() -> None:
+    annotations = {f"sample-{index:02d}": {} for index in range(8)}
+    priority = ["sample-06", "sample-01"]
+
+    selected = deterministic_proxy_sample_ids(
+        annotations,
+        5,
+        priority_sample_ids=priority,
+        random_fill_seed="view-a",
+    )
+    selected_again = deterministic_proxy_sample_ids(
+        dict(reversed(list(annotations.items()))),
+        5,
+        priority_sample_ids=list(reversed(priority)),
+        random_fill_seed="view-a",
+    )
+
+    assert selected == selected_again
+    assert len(selected) == 5
+    assert set(selected[:2]) == set(priority)
+    assert set(selected[2:]).isdisjoint(priority)
+    assert len(set(selected)) == len(selected)
+
+
 def test_proxy_early_stopper_uses_patience_and_min_delta() -> None:
     config = ProxyEvalConfig(min_delta=0.002, patience=2)
     stopper = ProxyEarlyStopper(config, baseline_metric=0.5)

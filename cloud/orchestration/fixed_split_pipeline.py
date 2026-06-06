@@ -226,6 +226,9 @@ class FixedSplitPipeline(
                 gt_annotations = self._teacher_annotation_stage().ensure_low_quality(
                     teacher_requests,
                 )
+                current_low_quality_gt_sample_ids = {
+                    str(sample_id) for sample_id in gt_annotations.keys()
+                }
                 self._log_stage_duration("teacher annotation ensure", stage_started)
                 pending_high_quality = sample_pool.load_pending_high_quality_samples()
                 contract_layout_tensors = self._contract_layout_tensors_from_runtime(
@@ -337,6 +340,11 @@ class FixedSplitPipeline(
                     num_train_samples=active_sample_count,
                 )
                 training_cache_path = str(bundle_info.get("training_view_path") or "")
+                proxy_sample_random_seed = str(
+                    bundle_info.get("training_view_id")
+                    or bundle_info.get("generation_id")
+                    or f"{edge_id}:{current_model_name}"
+                )
                 effective_batch_size = self._negotiate_cached_split_runtime_batch_size(
                     current_model_name=current_model_name,
                     training_cache_path=training_cache_path,
@@ -400,6 +408,8 @@ class FixedSplitPipeline(
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
                         allow_dead_baseline_fast_path=True,
+                        priority_sample_ids=current_low_quality_gt_sample_ids,
+                        random_fill_seed=proxy_sample_random_seed,
                     )
                 else:
                     proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
@@ -415,6 +425,8 @@ class FixedSplitPipeline(
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
+                        priority_sample_ids=current_low_quality_gt_sample_ids,
+                        random_fill_seed=proxy_sample_random_seed,
                     )
                 proxy_metrics_before_elapsed = time.perf_counter() - stage_started
                 self._log_stage_duration("proxy evaluation before retrain", stage_started)
@@ -452,6 +464,8 @@ class FixedSplitPipeline(
                     sample_metadata_by_id=sample_metadata_by_id,
                     proxy_eval_frame_cache=proxy_eval_frame_cache,
                     preloaded_records=preloaded_records,
+                    proxy_priority_sample_ids=current_low_quality_gt_sample_ids,
+                    proxy_sample_random_seed=proxy_sample_random_seed,
                 )
                 proxy_summary = proxy_evaluator.format_summary(
                     proxy_metrics_before,
@@ -499,6 +513,8 @@ class FixedSplitPipeline(
                         splitter=prepared_splitter,
                         split_candidate=prepared_candidate,
                         preloaded_records=preloaded_records,
+                        priority_sample_ids=current_low_quality_gt_sample_ids,
+                        random_fill_seed=proxy_sample_random_seed,
                     )
                     proxy_evaluator.restore_model_state(tmp_model, candidate_state)
                     proxy_metrics_before = full_baseline_metrics

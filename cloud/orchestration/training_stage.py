@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
+
 from cloud.training import FixedSplitRetrainEngine, FixedSplitTrainingContext
 from cloud.training.types import FixedSplitTrainingResult
 
@@ -179,6 +181,8 @@ class TrainingStageMixin:
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
         proxy_eval_frame_cache: dict[str, np.ndarray | None] | None = None,
         preloaded_records: Mapping[str, Mapping[str, object]] | None = None,
+        proxy_priority_sample_ids: Iterable[object] | None = None,
+        proxy_sample_random_seed: object | None = None,
     ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
         split_runtime_model = get_split_runtime_model(model)
         if prepared_splitter is not None:
@@ -278,6 +282,8 @@ class TrainingStageMixin:
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
+                priority_sample_ids=proxy_priority_sample_ids,
+                random_fill_seed=proxy_sample_random_seed,
             )
 
         def _tinynext_proxy_evaluator(
@@ -302,6 +308,8 @@ class TrainingStageMixin:
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
                 allow_dead_baseline_fast_path=allow_dead_baseline_fast_path,
+                priority_sample_ids=proxy_priority_sample_ids,
+                random_fill_seed=proxy_sample_random_seed,
             )
 
         proxy_config = ProxyEvalConfig(

@@ -270,13 +270,16 @@ class FixedSplitRetrainEngine:
     ) -> None:
         log.info(
             "[FixedSplitCL][ProxyEval] model_name={} model_family={} stage={} "
-            "epoch={} proxy_metric={} evaluated_samples={} elapsed={:.3f}s",
+            "epoch={} proxy_metric={} evaluated_samples={} priority_samples={} "
+            "random_fill_samples={} elapsed={:.3f}s",
             plan.model_name,
             plan.model_family,
             result.stage_label,
             result.epoch,
             _format_metric(result.metric),
             int(result.metrics.get("evaluated_samples", 0) or 0),
+            int(result.metrics.get("priority_gt_samples", 0) or 0),
+            int(result.metrics.get("random_fill_gt_samples", 0) or 0),
             float(result.elapsed),
         )
 
