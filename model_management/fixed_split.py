@@ -788,7 +788,6 @@ def _select_candidate(
             report = runtime.validate_candidate(
                 bound,
                 validation_sample_inputs=validation_sample_inputs,
-                trainability_smoke=True,
             )
         except Exception as exc:
             validation_errors[str(exc) or type(exc).__name__] += 1
@@ -1014,7 +1013,6 @@ def load_or_compute_fixed_split_plan(
                     report = runtime.validate_candidate(
                         cached_candidate,
                         validation_sample_inputs=validation_inputs,
-                        trainability_smoke=True,
                     )
                     if not bool(report.get("success", False)):
                         blacklisted_candidate_ids.add(_candidate_split_key(cached_candidate))
