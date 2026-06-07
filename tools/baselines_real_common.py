@@ -37,10 +37,9 @@ from baselines.runtime.teacher_annotator import TeacherAnnotator
 from baselines.runtime.upload_meter import UploadMeter
 from baselines.runtime.video_stream import build_streams
 from config.experiment import ExperimentConfig
-from edge.diff import DiffProcessor
 from edge.box_motion import compensate_boxes_between_frames
+from edge.diff import DiffProcessor
 from model_management.fixed_split import SplitConstraints
-
 
 PER_FRAME_FIELDNAMES = [
     "run_id",
@@ -257,15 +256,13 @@ def _write_reused_prediction(
         }
         for box, label, score in zip(boxes, labels, scores)
     ]
-    pred_path = inferencer.prediction_dir / f"edge_{int(device_id)}" / f"{int(frame_index):08d}.json"
+    pred_path = (
+        inferencer.prediction_dir / f"edge_{int(device_id)}" / f"{int(frame_index):08d}.json"
+    )
     pred_path.parent.mkdir(parents=True, exist_ok=True)
     with pred_path.open("w", encoding="utf-8") as f:
         json.dump(reused, f)
-    confidence = (
-        sum(float(item["score"]) for item in reused) / len(reused)
-        if reused
-        else 0.0
-    )
+    confidence = sum(float(item["score"]) for item in reused) / len(reused) if reused else 0.0
     return StudentInferenceOutput(
         prediction_path=str(pred_path),
         confidence=confidence,
@@ -346,7 +343,10 @@ def _time_weighted(rows: list[dict[str, Any]], metric: str) -> float:
             continue
         by_device.setdefault(int(row.get("device_id", 0)), []).append(row)
     for device_rows in by_device.values():
-        ordered = sorted(device_rows, key=lambda item: (float(item.get("timestamp", 0.0)), int(item.get("frame_index", 0))))
+        ordered = sorted(
+            device_rows,
+            key=lambda item: (float(item.get("timestamp", 0.0)), int(item.get("frame_index", 0))),
+        )
         for index, row in enumerate(ordered):
             current = float(row.get("timestamp", index))
             if index + 1 < len(ordered):
@@ -359,7 +359,11 @@ def _time_weighted(rows: list[dict[str, Any]], metric: str) -> float:
     if not values:
         return 0.0
     denominator = sum(weights)
-    return sum(value * weight for value, weight in zip(values, weights)) / denominator if denominator else _mean(values)
+    return (
+        sum(value * weight for value, weight in zip(values, weights)) / denominator
+        if denominator
+        else _mean(values)
+    )
 
 
 def _base_run_columns(config: ExperimentConfig, method_name: str) -> dict[str, Any]:
@@ -383,13 +387,18 @@ def compute_summary_with_sla(
     update_rows: list[dict[str, Any]],
     metrics_summary: dict[str, Any],
 ) -> dict[str, Any]:
-    f1_values = [float(row["metric_f1"]) for row in frame_rows if row.get("metric_f1") not in ("", None)]
-    map_values = [float(row["metric_map50"]) for row in frame_rows if row.get("metric_map50") not in ("", None)]
+    f1_values = [
+        float(row["metric_f1"]) for row in frame_rows if row.get("metric_f1") not in ("", None)
+    ]
+    map_values = [
+        float(row["metric_map50"])
+        for row in frame_rows
+        if row.get("metric_map50") not in ("", None)
+    ]
     latencies = [
         float(row["inference_latency_ms"])
         for row in frame_rows
-        if row.get("inference_latency_ms") not in ("", None)
-        and _is_actual_inference_row(row)
+        if row.get("inference_latency_ms") not in ("", None) and _is_actual_inference_row(row)
     ]
     queue_waits = [
         float(row.get("queue_wait_sec", row.get("queue_wait_time_sec", 0)) or 0)
@@ -409,7 +418,9 @@ def compute_summary_with_sla(
     if config.latency_sla_ms is not None:
         sla_satisfied = sla_satisfied and p95_latency <= float(config.latency_sla_ms)
 
-    total_training_time = _sum_numeric(update_rows, "training_time_sec") + _sum_numeric(update_rows, "microprofile_time_sec")
+    total_training_time = _sum_numeric(update_rows, "training_time_sec") + _sum_numeric(
+        update_rows, "microprofile_time_sec"
+    )
     total_cloud_busy = (
         _sum_numeric(update_rows, "training_time_sec")
         + _sum_numeric(update_rows, "model_update_time_sec")
@@ -450,7 +461,9 @@ def compute_summary_with_sla(
             "avg_queue_wait_time_sec": summary["mean_queue_wait_sec"],
             "avg_recovery_time_sec": summary["mean_recovery_time_sec"],
             "max_queue_length": int(metrics_summary.get("max_queue_length", 0)),
-            "max_supported_edges_under_sla": config.num_devices if config.capacity_mode and sla_satisfied else (0 if config.capacity_mode else ""),
+            "max_supported_edges_under_sla": config.num_devices
+            if config.capacity_mode and sla_satisfied
+            else (0 if config.capacity_mode else ""),
         }
     )
     return summary
@@ -484,18 +497,13 @@ def _plank_fixed_split_constraints(config: ExperimentConfig) -> SplitConstraints
         privacy_leakage_upper_bound=float(
             getattr(cfg, "fixed_split_privacy_leakage_upper_bound", 0.0)
         ),
-        max_layer_freezing_ratio=float(
-            getattr(cfg, "fixed_split_max_layer_freezing_ratio", 1.0)
-        ),
+        max_layer_freezing_ratio=float(getattr(cfg, "fixed_split_max_layer_freezing_ratio", 1.0)),
         validate_candidates=bool(getattr(cfg, "fixed_split_validate_candidates", True)),
+        configured_training_batch=max(1, int(config.batch_size)),
         max_candidates=int(getattr(cfg, "fixed_split_max_candidates", 0)),
         max_boundary_count=int(getattr(cfg, "fixed_split_max_boundary_count", 8)),
-        max_payload_bytes=int(
-            getattr(cfg, "fixed_split_max_payload_bytes", 32 * 1024 * 1024)
-        ),
-        privacy_leakage_epsilon=float(
-            getattr(cfg, "fixed_split_privacy_leakage_epsilon", 1.0e-12)
-        ),
+        max_payload_bytes=int(getattr(cfg, "fixed_split_max_payload_bytes", 32 * 1024 * 1024)),
+        privacy_leakage_epsilon=float(getattr(cfg, "fixed_split_privacy_leakage_epsilon", 1.0e-12)),
     )
 
 
@@ -528,9 +536,8 @@ def build_real_baseline_context(
     evaluator: DetectionEvaluator,
     root_results: Path,
 ) -> RealBaselineContext:
-    cache_features = (
-        method_name == "plank_road_multi_device"
-        and bool(getattr(config.plank_road_multi_device, "enable_feature_cache", True))
+    cache_features = method_name == "plank_road_multi_device" and bool(
+        getattr(config.plank_road_multi_device, "enable_feature_cache", True)
     )
     bandwidth = BandwidthEmulator(
         config.bandwidth_mbps,
@@ -550,16 +557,13 @@ def build_real_baseline_context(
     inferencers: dict[int, StudentInferencer] = {}
     trainers: dict[int, RealTrainer] = {}
     initial_checkpoints: dict[int, str] = {}
-    
+
     # Enforce CPU for pure-edge method
     actual_device = "cpu" if method_name == "pure_edge_local_updating" else config.device
 
     for device_id in range(max(1, int(config.num_devices))):
         fixed_split_cache_path = (
-            root_results
-            / "fixed_split_plans"
-            / method_name
-            / f"edge_{int(device_id)}.json"
+            root_results / "fixed_split_plans" / method_name / f"edge_{int(device_id)}.json"
             if fixed_split_enabled
             else None
         )
@@ -580,10 +584,7 @@ def build_real_baseline_context(
         if device_id == 0:
             teacher.configure_target(
                 label_schema=getattr(inferencer.model, "label_schema", "coco_91"),
-                class_names=(
-                    config.class_names
-                    or getattr(inferencer.model, "class_names", [])
-                ),
+                class_names=(config.class_names or getattr(inferencer.model, "class_names", [])),
             )
         initial_checkpoint = checkpoint_manager.create_initial(
             method_name,
@@ -718,8 +719,7 @@ def run_one_method(
                 filter_state = _plank_filter_state(frame.device_id)
                 filter_decision = filter_state.decide(frame.frame_path)
                 actual_inference = (
-                    bool(filter_decision.should_infer)
-                    or filter_state.latest_output is None
+                    bool(filter_decision.should_infer) or filter_state.latest_output is None
                 )
             if actual_inference:
                 student = inferencer.infer(
@@ -746,9 +746,15 @@ def run_one_method(
                     current_frame=filter_decision.frame,
                 )
             teacher_label = context.teacher_annotator.annotate(frame.frame_path)
-            metrics = context.evaluator.evaluate_files(student.prediction_path, teacher_label.label_path)
-            f1_drift = method_config.f1_threshold is not None and metrics.f1 < float(method_config.f1_threshold)
-            map_drift = method_config.map50_threshold is not None and metrics.map50 < float(method_config.map50_threshold)
+            metrics = context.evaluator.evaluate_files(
+                student.prediction_path, teacher_label.label_path
+            )
+            f1_drift = method_config.f1_threshold is not None and metrics.f1 < float(
+                method_config.f1_threshold
+            )
+            map_drift = method_config.map50_threshold is not None and metrics.map50 < float(
+                method_config.map50_threshold
+            )
             in_drift = bool(f1_drift or map_drift)
             sample = None
             if actual_inference:
@@ -856,7 +862,9 @@ def _build_base_checkpoint(config: ExperimentConfig, root_results: Path) -> str:
     return seed_inferencer.save_checkpoint(root_results / "checkpoints" / "initial_student.pt")
 
 
-def _aggregate_root_summary(config: ExperimentConfig, summaries: list[dict[str, Any]]) -> dict[str, Any]:
+def _aggregate_root_summary(
+    config: ExperimentConfig, summaries: list[dict[str, Any]]
+) -> dict[str, Any]:
     if len(summaries) == 1:
         return dict(summaries[0])
     return {
@@ -866,16 +874,29 @@ def _aggregate_root_summary(config: ExperimentConfig, summaries: list[dict[str, 
         "method_variant": "mixed",
         "num_edges": config.num_devices,
         "total_frames": int(sum(int(summary.get("total_frames", 0)) for summary in summaries)),
-        "mean_time_averaged_f1": _mean(summary.get("mean_time_averaged_f1", 0.0) for summary in summaries),
+        "mean_time_averaged_f1": _mean(
+            summary.get("mean_time_averaged_f1", 0.0) for summary in summaries
+        ),
         "mean_map50": _mean(summary.get("mean_map50", 0.0) for summary in summaries),
-        "avg_training_time_sec": _mean(summary.get("avg_training_time_sec", 0.0) for summary in summaries),
-        "total_measured_upload_bytes": int(sum(int(summary.get("total_measured_upload_bytes", 0)) for summary in summaries)),
-        "avg_queue_wait_time_sec": _mean(summary.get("avg_queue_wait_time_sec", 0.0) for summary in summaries),
-        "avg_recovery_time_sec": _mean(summary.get("avg_recovery_time_sec", 0.0) for summary in summaries),
-        "max_queue_length": int(max((summary.get("max_queue_length", 0) for summary in summaries), default=0)),
+        "avg_training_time_sec": _mean(
+            summary.get("avg_training_time_sec", 0.0) for summary in summaries
+        ),
+        "total_measured_upload_bytes": int(
+            sum(int(summary.get("total_measured_upload_bytes", 0)) for summary in summaries)
+        ),
+        "avg_queue_wait_time_sec": _mean(
+            summary.get("avg_queue_wait_time_sec", 0.0) for summary in summaries
+        ),
+        "avg_recovery_time_sec": _mean(
+            summary.get("avg_recovery_time_sec", 0.0) for summary in summaries
+        ),
+        "max_queue_length": int(
+            max((summary.get("max_queue_length", 0) for summary in summaries), default=0)
+        ),
         "max_supported_edges_under_sla": (
             config.num_devices
-            if config.capacity_mode and all(summary.get("sla_satisfied", True) for summary in summaries)
+            if config.capacity_mode
+            and all(summary.get("sla_satisfied", True) for summary in summaries)
             else (0 if config.capacity_mode else "")
         ),
         "sla_satisfied": all(summary.get("sla_satisfied", True) for summary in summaries),
@@ -934,7 +955,9 @@ def run_one_experiment_case(
         write_csv(root_results / "per_frame_metrics.csv", frame_rows, PER_FRAME_FIELDNAMES)
         write_csv(root_results / "update_events.csv", update_rows, UPDATE_EVENT_FIELDNAMES)
         write_csv(root_results / "upload_events.csv", upload_rows, UPLOAD_EVENT_FIELDNAMES)
-        write_csv(root_results / "training_breakdown.csv", breakdown_rows, TRAINING_BREAKDOWN_FIELDNAMES)
+        write_csv(
+            root_results / "training_breakdown.csv", breakdown_rows, TRAINING_BREAKDOWN_FIELDNAMES
+        )
     return {
         "summary": root_summary,
         "method_summaries": summaries,

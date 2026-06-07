@@ -16,17 +16,17 @@ from baselines.runtime.detection_evaluator import DetectionEvaluator
 from baselines.runtime.sample_store import SampleRecord
 from cloud.feature_cache.shard_store import FeatureShardStore
 from cloud.feature_cache.types import FeatureShardRef
-from model_management.split_model_adapters import (
-    build_split_training_loss,
-    get_split_runtime_input_resize_mode,
-    get_split_runtime_model,
-    prepare_split_runtime_input,
-)
 from model_management.fixed_split import (
     SplitConstraints,
     SplitPlan,
     apply_split_plan,
     load_or_compute_fixed_split_plan,
+)
+from model_management.split_model_adapters import (
+    build_split_training_loss,
+    get_split_runtime_input_resize_mode,
+    get_split_runtime_model,
+    prepare_split_runtime_input,
 )
 from model_management.universal_model_split import (
     SplitRetrainProfile,
@@ -120,7 +120,9 @@ class RealTrainer:
             trainable_scope=trainable_scope,
         )
 
-    def train_local(self, samples: list[SampleRecord], *, epochs: int | None = None) -> TrainingReport:
+    def train_local(
+        self, samples: list[SampleRecord], *, epochs: int | None = None
+    ) -> TrainingReport:
         return self.train_raw_frames(samples, epochs=epochs, trainable_scope="full")
 
     def train_split_tail(
@@ -205,7 +207,9 @@ class RealTrainer:
         for written in written_refs:
             feature_ref = written.get("feature_ref")
             if not isinstance(feature_ref, FeatureShardRef):
-                raise RuntimeError("Baseline split-tail shard write did not return FeatureShardRef.")
+                raise RuntimeError(
+                    "Baseline split-tail shard write did not return FeatureShardRef."
+                )
             sample_payload = dict(written.get("sample") or {})
             cache_key = str(sample_payload.get("sample_id") or "")
             if not cache_key or cache_key not in samples_by_key:
@@ -251,7 +255,8 @@ class RealTrainer:
         return TrainingReport(
             checkpoint_path=checkpoint_path,
             training_time_sec=total,
-            optimizer_steps=len(losses) * max(1, (len(selected) + self.batch_size - 1) // self.batch_size),
+            optimizer_steps=len(losses)
+            * max(1, (len(selected) + self.batch_size - 1) // self.batch_size),
             raw_replay_time_sec=0.0,
             feature_reconstruction_time_sec=reconstruction_time,
             tail_training_time_sec=tail_training,
@@ -518,14 +523,17 @@ class RealTrainer:
             device=self.device,
             model_name=self._split_model_name(),
             cache_path=(
-                None
-                if self.fixed_split_cache_path is None
-                else str(self.fixed_split_cache_path)
+                None if self.fixed_split_cache_path is None else str(self.fixed_split_cache_path)
             ),
             splitter=splitter,
             validate_cached_plan=self.fixed_split_validate_cached_plan,
             input_resize_mode=get_split_runtime_input_resize_mode(self.model) or "direct_resize",
             front_version="0",
+            validation_batches=(
+                None
+                if tuple(getattr(self.fixed_split_constraints, "validation_batches", ()) or ())
+                else (1, self.batch_size)
+            ),
         )
         self._apply_fixed_split_plan(splitter, plan)
         self.fixed_split_plan = plan
@@ -540,7 +548,9 @@ class RealTrainer:
         apply_split_plan(splitter, plan)
 
     def _batches(self, samples: list[SampleRecord]) -> list[list[SampleRecord]]:
-        batches = [samples[i : i + self.batch_size] for i in range(0, len(samples), self.batch_size)]
+        batches = [
+            samples[i : i + self.batch_size] for i in range(0, len(samples), self.batch_size)
+        ]
         if self._requires_non_singleton_train_batches():
             return [batch + batch if len(batch) == 1 else batch for batch in batches]
         return batches
@@ -574,10 +584,14 @@ class RealTrainer:
         padding = [tensor[-1:]] * (min_batch_size - batch_size)
         return torch.cat([tensor, *padding], dim=0)
 
-    def _prepare_detection_sample(self, sample: SampleRecord) -> tuple[torch.Tensor, dict[str, object]]:
+    def _prepare_detection_sample(
+        self, sample: SampleRecord
+    ) -> tuple[torch.Tensor, dict[str, object]]:
         frame = cv2.imread(str(sample.frame_path))
         if frame is None:
-            raise FileNotFoundError(f"Unable to read frame for detection training: {sample.frame_path}")
+            raise FileNotFoundError(
+                f"Unable to read frame for detection training: {sample.frame_path}"
+            )
         tensor = prepare_split_runtime_input(self.model, frame, device=self.device)
         if not isinstance(tensor, torch.Tensor):
             raise NotImplementedError(
@@ -606,7 +620,9 @@ class RealTrainer:
     def _read_frame_and_split_input(self, sample: SampleRecord) -> tuple[np.ndarray, torch.Tensor]:
         frame = cv2.imread(str(sample.frame_path))
         if frame is None:
-            raise FileNotFoundError(f"Unable to read frame for split-tail training: {sample.frame_path}")
+            raise FileNotFoundError(
+                f"Unable to read frame for split-tail training: {sample.frame_path}"
+            )
         tensor = prepare_split_runtime_input(self.model, frame, device=self.device)
         if not isinstance(tensor, torch.Tensor):
             raise NotImplementedError(
@@ -623,7 +639,9 @@ class RealTrainer:
     def _baseline_feature_layout_id(cls, splitter: UniversalModelSplitter) -> str:
         return f"baseline:{cls._baseline_boundary_id(splitter)}"
 
-    def _target_from_feature_record(self, sample: SampleRecord, record: dict[str, Any]) -> dict[str, object]:
+    def _target_from_feature_record(
+        self, sample: SampleRecord, record: dict[str, Any]
+    ) -> dict[str, object]:
         split_meta = {
             key: record.get(key)
             for key in ("input_image_size", "input_tensor_shape", "input_resize_mode")
@@ -636,12 +654,15 @@ class RealTrainer:
         ]
         if missing:
             raise RuntimeError(
-                f"Cached split feature record for sample {sample.sample_id} is missing metadata: {missing}"
+                "Cached split feature record for sample "
+                f"{sample.sample_id} is missing metadata: {missing}"
             )
         return self._target_from_labels(sample.label_path, split_meta)
 
     @staticmethod
-    def _target_from_labels(label_path: str | Path, split_meta: dict[str, object]) -> dict[str, object]:
+    def _target_from_labels(
+        label_path: str | Path, split_meta: dict[str, object]
+    ) -> dict[str, object]:
         with Path(label_path).open("r", encoding="utf-8") as f:
             labels = json.load(f)
         return {

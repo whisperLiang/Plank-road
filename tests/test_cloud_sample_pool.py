@@ -13,8 +13,8 @@ from cloud.feature_cache import (
     ShardFeatureRefValidator,
     collect_refs_from_active_generations,
 )
-from cloud.sample_pool import CloudSamplePool, align_sample_feature_contract
 from cloud.feature_cache.shard_validator import ABI_REASON_LAYOUT_EQUIVALENT_REBIND
+from cloud.sample_pool import CloudSamplePool, align_sample_feature_contract
 from model_management.payload import boundary_payload_from_tensors
 from model_management.split_contract import SplitRuntimeContract
 
@@ -390,14 +390,24 @@ def test_rfdetr_feature_abi_ignores_batch_dimension() -> None:
     assert contract_batch_1.feature_abi_id == contract_batch_20.feature_abi_id
 
 
-def test_sample_pool_accumulates_when_runtime_validation_signature_changes_but_feature_abi_same(tmp_path) -> None:
+def test_sample_pool_accumulates_when_runtime_validation_signature_changes_but_feature_abi_same(
+    tmp_path,
+) -> None:
     gen1_contract = _contract_with_labels(
         graph_signature="stable-feature-abi",
-        runtime_identity_extra={"runtime_batch_validation_signature": "batch-smoke-a"},
+        runtime_identity_extra={
+            "runtime_batch_validation_signature": "batch-smoke-a",
+            "validated_batch_max": 2,
+            "trace_batch_size": 1,
+        },
     )
     gen2_contract = _contract_with_labels(
         graph_signature="stable-feature-abi",
-        runtime_identity_extra={"runtime_batch_validation_signature": "batch-smoke-b"},
+        runtime_identity_extra={
+            "runtime_batch_validation_signature": "batch-smoke-b",
+            "validated_batch_max": 4,
+            "trace_batch_size": 1,
+        },
     )
     assert gen1_contract.contract_id != gen2_contract.contract_id
     assert gen1_contract.runtime_identity_id != gen2_contract.runtime_identity_id
@@ -547,7 +557,9 @@ def test_third_round_keeps_previous_250_active_samples(tmp_path) -> None:
 
     third_stats, kept = pool.rebuild_canonical_training_pool(
         split_contract=current_contract,
-        existing_active_samples=pool.load_active_samples_for_rebuild(split_contract=current_contract),
+        existing_active_samples=pool.load_active_samples_for_rebuild(
+            split_contract=current_contract
+        ),
         pending_high_quality_samples=pool.load_pending_high_quality_samples(),
         new_low_quality_samples=pool.load_staging_low_quality_samples(),
     )
@@ -733,7 +745,9 @@ def test_pending_high_quality_shard_refs_are_accepted_when_abi_compatible(tmp_pa
     assert len(kept) == 3
 
 
-def test_pending_high_quality_rebound_when_feature_abi_id_differs_but_layout_equal(tmp_path) -> None:
+def test_pending_high_quality_rebound_when_feature_abi_id_differs_but_layout_equal(
+    tmp_path,
+) -> None:
     source_contract = _contract_with_labels(graph_signature="source-feature-abi")
     current_contract = _contract_with_labels(graph_signature="current-feature-abi")
     assert source_contract.feature_abi_id != current_contract.feature_abi_id
@@ -766,17 +780,13 @@ def test_pending_high_quality_rebound_when_feature_abi_id_differs_but_layout_equ
     assert stats["validation"]["deferred_feature_layout"] == 0
     assert stats["shard_high_quality"]["deferred_layout"] == 0
     assert stats["generation_commit"]["active"] == 2
-    assert {record.rebinding_reason for record in kept} == {
-        ABI_REASON_LAYOUT_EQUIVALENT_REBIND
-    }
-    assert {record.source_feature_abi_id for record in kept} == {
-        source_contract.feature_abi_id
-    }
+    assert {record.rebinding_reason for record in kept} == {ABI_REASON_LAYOUT_EQUIVALENT_REBIND}
+    assert {record.source_feature_abi_id for record in kept} == {source_contract.feature_abi_id}
     active = pool.list_active_samples()
     assert {sample["feature_abi_id"] for sample in active} == {current_contract.feature_abi_id}
-    assert {
-        dict(sample["feature_ref"])["feature_abi_id"] for sample in active
-    } == {current_contract.feature_abi_id}
+    assert {dict(sample["feature_ref"])["feature_abi_id"] for sample in active} == {
+        current_contract.feature_abi_id
+    }
     assert {sample["source_feature_abi_id"] for sample in active} == {
         source_contract.feature_abi_id
     }
@@ -829,7 +839,9 @@ def test_pending_high_quality_not_deferred_after_runtime_rebind(tmp_path) -> Non
 
     second_stats, kept = pool.rebuild_canonical_training_pool(
         split_contract=current_contract,
-        existing_active_samples=pool.load_active_samples_for_rebuild(split_contract=current_contract),
+        existing_active_samples=pool.load_active_samples_for_rebuild(
+            split_contract=current_contract
+        ),
         pending_high_quality_samples=pool.load_pending_high_quality_samples(),
         new_low_quality_samples=pool.load_staging_low_quality_samples(),
     )
@@ -891,7 +903,9 @@ def test_third_round_accepts_deferred_high_quality_after_layout_equivalent_rebin
 
     third_stats, kept = pool.rebuild_canonical_training_pool(
         split_contract=current_contract,
-        existing_active_samples=pool.load_active_samples_for_rebuild(split_contract=current_contract),
+        existing_active_samples=pool.load_active_samples_for_rebuild(
+            split_contract=current_contract
+        ),
         pending_high_quality_samples=pool.load_pending_high_quality_samples(),
         new_low_quality_samples=pool.load_staging_low_quality_samples(),
     )
@@ -954,7 +968,9 @@ def test_layout_alignment_log_and_canonical_validation_share_same_result(tmp_pat
     assert len(kept) == compatible
 
 
-def test_pending_high_quality_shard_refs_are_deferred_not_deleted_when_incompatible(tmp_path) -> None:
+def test_pending_high_quality_shard_refs_are_deferred_not_deleted_when_incompatible(
+    tmp_path,
+) -> None:
     contract = _contract_with_labels()
     incompatible_contract = _contract_with_labels(
         graph_signature="incompatible",

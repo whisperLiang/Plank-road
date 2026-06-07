@@ -104,6 +104,8 @@ class FixedSplitConfig(ConfigSection):
     privacy_leakage_upper_bound: float = 0.15
     max_layer_freezing_ratio: float = 0.75
     validate_candidates: bool = True
+    configured_training_batch: int | None = None
+    validation_batches: list[int] | None = None
     # Deprecated compatibility field; fixed split planning validates all candidates.
     max_candidates: int = 0
     max_boundary_count: int = 8
@@ -167,7 +169,7 @@ class FeatureCacheConfig(ConfigSection):
 @dataclass
 class ContinualLearningConfig(ConfigSection):
     num_epoch: int = 5
-    trace_batch_size: int = 2
+    trace_batch_size: int = 1
     batch_size: int = 2
     feature_cache_mode: str = "auto"
     teacher_batch_size: int | None = None
@@ -186,9 +188,7 @@ class ContinualLearningConfig(ConfigSection):
     yolo_fixed_split_target_steps_per_round: int = 4
     rfdetr_fixed_split_target_steps_per_round: int = 4
     max_concurrent_jobs: int = 2
-    teacher_annotation: TeacherAnnotationConfig = field(
-        default_factory=TeacherAnnotationConfig
-    )
+    teacher_annotation: TeacherAnnotationConfig = field(default_factory=TeacherAnnotationConfig)
     feature_cache: FeatureCacheConfig = field(default_factory=FeatureCacheConfig)
 
     def __post_init__(self) -> None:
@@ -352,7 +352,7 @@ def _apply_env_overrides(raw_config: Mapping[str, Any]) -> dict[str, Any]:
             continue
         path = [
             segment.strip().lower()
-            for segment in env_name[len(prefix):].split("__")
+            for segment in env_name[len(prefix) :].split("__")
             if segment.strip()
         ]
         if not path:
@@ -388,36 +388,27 @@ def _validate_threshold_candidates(name: str, value: object) -> None:
         raise ValueError(f"{name} must be a non-empty sequence of thresholds")
     for index, candidate in enumerate(value):
         if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
-            raise ValueError(
-                f"{name}[{index}] must be a numeric threshold, got {candidate!r}"
-            )
+            raise ValueError(f"{name}[{index}] must be a numeric threshold, got {candidate!r}")
         if not 0.0 <= float(candidate) <= 1.0:
-            raise ValueError(
-                f"{name}[{index}] must be within [0, 1], got {candidate!r}"
-            )
+            raise ValueError(f"{name}[{index}] must be within [0, 1], got {candidate!r}")
 
 
 def _validate_sample_pool_config(name: str, value: SamplePoolConfig) -> None:
     if not isinstance(value.enabled, bool):
-        raise ValueError(
-            f"{name}.enabled must be a boolean, "
-            f"got {value.enabled!r}"
-        )
+        raise ValueError(f"{name}.enabled must be a boolean, got {value.enabled!r}")
     _validate_positive(f"{name}.shard_size", int(value.shard_size))
     _validate_positive(f"{name}.sync_interval_sec", float(value.sync_interval_sec))
     _validate_positive(f"{name}.max_samples", int(value.max_samples))
     compact_threshold = float(value.compact_threshold)
     if not 0.0 < compact_threshold <= 1.0:
         raise ValueError(
-            f"{name}.compact_threshold must be within (0, 1], "
-            f"got {value.compact_threshold!r}"
+            f"{name}.compact_threshold must be within (0, 1], got {value.compact_threshold!r}"
         )
     if not isinstance(value.root_dir, str) or not value.root_dir.strip():
         raise ValueError(f"{name}.root_dir must be non-empty")
     if not isinstance(value.enable_timing_logs, bool):
         raise ValueError(
-            f"{name}.enable_timing_logs must be a boolean, "
-            f"got {value.enable_timing_logs!r}"
+            f"{name}.enable_timing_logs must be a boolean, got {value.enable_timing_logs!r}"
         )
     if not isinstance(value.enable_coordinate_debug, bool):
         raise ValueError(
@@ -455,6 +446,19 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(removed_fields["client.retrain.batch_size"])
     if getattr(config.client.retrain, "num_epoch", None) is not None:
         raise ValueError(removed_fields["client.retrain.num_epoch"])
+
+    fixed_split_cfg = config.client.split_learning.fixed_split
+    if fixed_split_cfg.configured_training_batch is not None:
+        _validate_positive(
+            "client.split_learning.fixed_split.configured_training_batch",
+            int(fixed_split_cfg.configured_training_batch),
+        )
+    if fixed_split_cfg.validation_batches is not None:
+        for index, batch_size in enumerate(list(fixed_split_cfg.validation_batches)):
+            _validate_positive(
+                f"client.split_learning.fixed_split.validation_batches[{index}]",
+                int(batch_size),
+            )
 
     for field_name, message in removed_fields.items():
         if field_name.startswith("client."):
@@ -713,13 +717,9 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             f"got {feature_cache.view_source!r}"
         )
     if not str(feature_cache.store_root_dir).strip():
-        raise ValueError(
-            "server.continual_learning.feature_cache.store_root_dir must be non-empty"
-        )
+        raise ValueError("server.continual_learning.feature_cache.store_root_dir must be non-empty")
     if not str(feature_cache.shard_root_dir).strip():
-        raise ValueError(
-            "server.continual_learning.feature_cache.shard_root_dir must be non-empty"
-        )
+        raise ValueError("server.continual_learning.feature_cache.shard_root_dir must be non-empty")
     storage_format = str(feature_cache.storage_format).strip().lower()
     if storage_format not in {"safetensors_shard", "npy_memmap_shard"}:
         raise ValueError(
@@ -727,7 +727,9 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "safetensors_shard, npy_memmap_shard, "
             f"got {feature_cache.storage_format!r}"
         )
-    accepted_formats = [str(item).strip().lower() for item in list(feature_cache.accepted_storage_formats or [])]
+    accepted_formats = [
+        str(item).strip().lower() for item in list(feature_cache.accepted_storage_formats or [])
+    ]
     if not accepted_formats or any(
         item not in {"safetensors_shard", "npy_memmap_shard"} for item in accepted_formats
     ):
@@ -740,9 +742,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         int(feature_cache.shard_max_samples),
     )
     if not str(feature_cache.view_root_dir).strip():
-        raise ValueError(
-            "server.continual_learning.feature_cache.view_root_dir must be non-empty"
-        )
+        raise ValueError("server.continual_learning.feature_cache.view_root_dir must be non-empty")
     feature_cache_mode = str(feature_cache.materialization_mode).strip().lower()
     if feature_cache_mode != "direct_ref":
         raise ValueError(

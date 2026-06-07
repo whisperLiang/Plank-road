@@ -26,6 +26,7 @@ from model_management.split_runtime import (
     compare_outputs,
     make_split_spec,
     prepare_split_runtime,
+    reduce_output_to_loss,
 )
 
 AUTO_TRACE_PROBE_BOUNDARY = "50%"
@@ -810,6 +811,8 @@ class UniversalModelSplitter:
     def validate_candidate(
         self,
         candidate: SplitCandidate | None = None,
+        validation_sample_inputs: Sequence[Any] | None = None,
+        trainability_smoke: bool = False,
         **_: Any,
     ) -> dict[str, Any]:
         chosen = candidate or self.current_candidate
@@ -836,13 +839,53 @@ class UniversalModelSplitter:
                     "error": str(exc),
                 }
         report = dict(self._last_replay_validation or {"success": True})
-        if self.model is not None and self._trace_sample_input is not None:
-            report = _runtime_replay_report(
-                self.runtime,
-                self.model,
-                self._trace_sample_input,
-                require_trainable=bool(getattr(chosen, "is_trainable_tail", False)),
+        if self.model is not None and (
+            self._trace_sample_input is not None or validation_sample_inputs
+        ):
+            sample_inputs = (
+                list(validation_sample_inputs)
+                if validation_sample_inputs
+                else [self._trace_sample_input]
             )
+            batch_reports: list[dict[str, Any]] = []
+            for sample_input in sample_inputs:
+                batch_size = _first_tensor_batch_size(sample_input)
+                batch_report = _runtime_replay_report(
+                    self.runtime,
+                    self.model,
+                    sample_input,
+                    require_trainable=bool(getattr(chosen, "is_trainable_tail", False)),
+                    trainability_smoke=bool(trainability_smoke),
+                )
+                batch_report["batch_size"] = batch_size
+                batch_reports.append(batch_report)
+                if not bool(batch_report.get("success", False)):
+                    report = {
+                        **batch_report,
+                        "validation_batches": [
+                            item.get("batch_size") for item in batch_reports
+                        ],
+                        "batch_reports": batch_reports,
+                    }
+                    break
+            else:
+                max_diff = max(
+                    float(item.get("max_diff", 0.0) or 0.0)
+                    for item in batch_reports
+                )
+                report = {
+                    "success": True,
+                    "tail_trainability": all(
+                        bool(item.get("tail_trainability", False))
+                        for item in batch_reports
+                    ),
+                    "max_diff": max_diff,
+                    "error": None,
+                    "validation_batches": [
+                        item.get("batch_size") for item in batch_reports
+                    ],
+                    "batch_reports": batch_reports,
+                }
             self._last_replay_validation = report
         return {
             **report,
@@ -871,6 +914,7 @@ def _runtime_replay_report(
     sample_input: Any,
     *,
     require_trainable: bool,
+    trainability_smoke: bool = False,
 ) -> dict[str, Any]:
     try:
         tail_trainability = bool(
@@ -891,6 +935,14 @@ def _runtime_replay_report(
             replayed = runtime.run_suffix(boundary)
             expected = model(*inputs)
         ok, max_diff = compare_outputs(expected, replayed)
+        if ok and trainability_smoke and tail_trainability:
+            runtime.train_suffix(
+                boundary,
+                None,
+                loss_fn=reduce_output_to_loss,
+                optimizer=None,
+            )
+            model.zero_grad(set_to_none=True)
     except Exception as exc:
         return {
             "success": False,

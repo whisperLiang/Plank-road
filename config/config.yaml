@@ -149,6 +149,9 @@ client:
    privacy_leakage_upper_bound: 1.0e-6
    max_layer_freezing_ratio: 0.75
    validate_candidates: True
+   # Mirror server.continual_learning.batch_size for edge-side fixed split
+   # candidate validation; trace remains batch 1.
+   configured_training_batch: 32
    max_boundary_count: 8
    max_payload_bytes: 33554432
    privacy_leakage_epsilon: 1.0e-12

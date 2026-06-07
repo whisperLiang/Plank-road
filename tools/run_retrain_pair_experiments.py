@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import copy
@@ -21,18 +21,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import load_runtime_config
 from cloud_server import CloudContinualLearner
+from config import load_runtime_config
 from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
 from edge.quality_assessor import LOW_QUALITY, QualityAssessor
 from edge.sample_store import EdgeSampleStore
 from edge.transmit import pack_low_quality_trigger_bundle
-from model_management.fixed_split import SplitConstraints, SplitPlan, load_or_compute_fixed_split_plan
+from model_management.fixed_split import (
+    SplitConstraints,
+    SplitPlan,
+    load_or_compute_fixed_split_plan,
+)
 from model_management.model_zoo import ensure_local_model_artifact, get_model_artifact_path
 from model_management.object_detection import Object_Detection
 from model_management.split_model_adapters import build_split_training_loss
 from model_management.universal_model_split import UniversalModelSplitter
-
 
 PROXY_MAP_PATTERN = re.compile(
     r"proxy_mAP@0\.5\s+([0-9.]+)\s+->\s+([0-9.]+)\s+\(delta=([+-][0-9.]+)"
@@ -130,7 +133,9 @@ def _resolve_local_weights_path(model_name: str, *, refresh: bool = False) -> st
             logger.info("Removing existing artifact for {}: {}", model_name, artifact_path)
             artifact_path.unlink()
         elif artifact_path.is_dir():
-            logger.info("Removing existing artifact directory for {}: {}", model_name, artifact_path)
+            logger.info(
+                "Removing existing artifact directory for {}: {}", model_name, artifact_path
+            )
             shutil.rmtree(artifact_path, ignore_errors=True)
         tmp_download = artifact_path.with_name(artifact_path.name + ".tmp")
         if tmp_download.exists():
@@ -149,7 +154,9 @@ def _resolve_local_weights_path(model_name: str, *, refresh: bool = False) -> st
 
     artifact_path = ensure_local_model_artifact(model_name)
     if not artifact_path.exists():
-        raise FileNotFoundError(f"Failed to prepare local weights for {model_name}: {artifact_path}")
+        raise FileNotFoundError(
+            f"Failed to prepare local weights for {model_name}: {artifact_path}"
+        )
     return str(artifact_path)
 
 
@@ -193,22 +200,35 @@ def _build_split_runtime(
     model_name: str,
     fixed_split_cfg,
     cache_path: Path,
+    configured_training_batch: int | None = None,
 ) -> tuple[UniversalModelSplitter, SplitPlan]:
     split_model = small_detector.get_split_runtime_model()
     splitter = UniversalModelSplitter(device=next(split_model.parameters()).device)
     splitter.trainability_loss_fn = build_split_training_loss(small_detector.model)
     sample_input = small_detector.prepare_splitter_input(first_frame)
     splitter.trace(split_model, sample_input)
+    constraints = SplitConstraints.from_config(fixed_split_cfg)
+    validation_batches = None
+    if not tuple(getattr(constraints, "validation_batches", ()) or ()):
+        try:
+            batch = int(configured_training_batch)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            batch = 0
+        if batch > 0:
+            validation_batches = (1, batch)
     plan = load_or_compute_fixed_split_plan(
         split_model,
-        SplitConstraints.from_config(fixed_split_cfg),
+        constraints,
         sample_input=sample_input,
         device=next(split_model.parameters()).device,
         model_name=model_name,
         cache_path=str(cache_path),
         splitter=splitter,
+        validation_batches=validation_batches,
     )
     return splitter, plan
+
+
 def _collect_edge_samples(
     *,
     small_detector: Object_Detection,
@@ -298,7 +318,9 @@ def _collect_edge_samples(
     return sample_store.stats()
 
 
-def _parse_proxy_summary(message: str) -> tuple[float | None, float | None, float | None, float | None]:
+def _parse_proxy_summary(
+    message: str,
+) -> tuple[float | None, float | None, float | None, float | None]:
     match = PROXY_MAP_PATTERN.search(message or "")
     if not match:
         return None, None, None, None
@@ -343,7 +365,8 @@ def _run_pair_experiment(
         server_cfg.continual_learning.teacher_annotation_threshold = float(teacher_threshold)
 
     logger.info(
-        "Running experiment edge={} golden={} samples={} stride={} epochs={} send_low_conf_features={}",
+        "Running experiment edge={} golden={} samples={} stride={} epochs={} "
+        "send_low_conf_features={}",
         edge_model,
         golden_model,
         max_samples,
@@ -378,6 +401,7 @@ def _run_pair_experiment(
             model_name=edge_model,
             fixed_split_cfg=client_cfg.split_learning.fixed_split,
             cache_path=pair_root / "fixed_split_plan.json",
+            configured_training_batch=server_cfg.continual_learning.batch_size,
         )
 
         sample_store = EdgeSampleStore(str(pair_root / "sample_store"))
@@ -411,7 +435,9 @@ def _run_pair_experiment(
             num_epoch=int(epochs),
         )
 
-        before_map, after_map, absolute_delta, relative_delta_percent = _parse_proxy_summary(message)
+        before_map, after_map, absolute_delta, relative_delta_percent = _parse_proxy_summary(
+            message
+        )
         accepted_updated_weights = bool(success) and "Kept " not in (message or "")
     except RuntimeError as exc:
         split_runtime_failure = str(exc)

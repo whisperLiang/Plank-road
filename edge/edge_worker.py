@@ -12,10 +12,10 @@ import grpc
 import torch
 from loguru import logger
 
+from edge.box_motion import compensate_boxes_between_frames
 from edge.diff import DiffProcessor
 from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
 from edge.info import TASK_STATE
-from edge.box_motion import compensate_boxes_between_frames
 from edge.quality_assessor import LOW_QUALITY, QualityAssessor
 from edge.resource_aware_trigger import (
     CloudResourceState,
@@ -26,8 +26,8 @@ from edge.resource_aware_trigger import (
     estimate_bandwidth,
     query_cloud_resource,
 )
-from edge.sample_sync import HighQualitySampleSyncer
 from edge.sample_store import EdgeSampleStore
+from edge.sample_sync import HighQualitySampleSyncer
 from edge.task import Task
 from edge.transmit import (
     download_trained_model,
@@ -103,11 +103,43 @@ def resize_batch(value: object, current_batch_size: int, target_batch_size: int)
     return value
 
 
-def _fixed_split_trace_sample_input(sample_input: object, trace_batch_size: int = 2) -> object:
+def _fixed_split_trace_sample_input(sample_input: object, trace_batch_size: int = 1) -> object:
     current_batch_size = _first_tensor_batch_size(sample_input)
     if current_batch_size is None or current_batch_size >= trace_batch_size:
         return sample_input
     return resize_batch(sample_input, current_batch_size, trace_batch_size)
+
+
+def _fixed_split_validation_batches(
+    fixed_split_cfg: object | None,
+    sample_input: object,
+) -> list[int]:
+    configured: int | None = None
+    raw_batches = getattr(fixed_split_cfg, "validation_batches", None)
+    if isinstance(raw_batches, (list, tuple)):
+        batches: list[int] = []
+        for value in raw_batches:
+            parsed = _coerce_positive_int(value)
+            if parsed is not None and parsed not in batches:
+                batches.append(parsed)
+        if 1 not in batches:
+            batches.insert(0, 1)
+        if batches:
+            return batches
+    for field_name in (
+        "configured_training_batch",
+        "fixed_split_training_batch",
+        "training_batch_size",
+    ):
+        configured = _coerce_positive_int(getattr(fixed_split_cfg, field_name, None))
+        if configured is not None:
+            break
+    if configured is None:
+        configured = _first_tensor_batch_size(sample_input) or 1
+    batches = [1]
+    if int(configured) not in batches:
+        batches.append(int(configured))
+    return batches
 
 
 @dataclass(frozen=True)
@@ -156,7 +188,8 @@ class AsyncSampleWriter:
         *,
         maxsize: int = 0,
         worker_count: int = 1,
-        on_done: Callable[[SampleWriteJob, object | None, BaseException | None], None] | None = None,
+        on_done: Callable[[SampleWriteJob, object | None, BaseException | None], None]
+        | None = None,
     ) -> None:
         self.sample_store = sample_store
         self._queue: Queue = Queue(maxsize=max(0, int(maxsize)))
@@ -315,7 +348,9 @@ class EdgeWorker:
             window_size=int(getattr(drift_cfg, "window_size", 100)),
             min_window_size=int(getattr(drift_cfg, "min_window_size", 30)),
             low_quality_rate_threshold=float(getattr(drift_cfg, "low_quality_rate_threshold", 0.3)),
-            uncovered_evidence_rate_threshold=float(getattr(drift_cfg, "uncovered_evidence_rate_threshold", 0.35)),
+            uncovered_evidence_rate_threshold=float(
+                getattr(drift_cfg, "uncovered_evidence_rate_threshold", 0.35)
+            ),
             persistence_windows=int(getattr(drift_cfg, "persistence_windows", 3)),
         )
         self.previous_quality_frame = None
@@ -457,11 +492,19 @@ class EdgeWorker:
                 sample_input = self.small_object_detection.build_split_sample_input(
                     trace_image_size
                 )
-            trace_sample_input = _fixed_split_trace_sample_input(sample_input, 2)
+            trace_sample_input = _fixed_split_trace_sample_input(sample_input, 1)
+            validation_batches = _fixed_split_validation_batches(
+                fixed_split_cfg,
+                trace_sample_input,
+            )
             constraints = SplitConstraints.from_config(fixed_split_cfg)
             cache_path = os.path.join(self.config.retrain.cache_path, "fixed_split_plan.json")
             plan_started = time.perf_counter()
-            logger.info("Loading or computing fixed split plan with batch_gt1 lazy trace.")
+            logger.info(
+                "Loading or computing fixed split plan with trace_batch=1 and "
+                "validation_batches={}.",
+                validation_batches,
+            )
             self.fixed_split_plan = load_or_compute_fixed_split_plan(
                 split_model,
                 constraints,
@@ -472,11 +515,11 @@ class EdgeWorker:
                 splitter=self.universal_splitter,
                 validate_cached_plan=False,
                 input_resize_mode=(
-                    get_split_runtime_input_resize_mode(split_model)
-                    or "direct_resize"
+                    get_split_runtime_input_resize_mode(split_model) or "direct_resize"
                 ),
                 front_version=str(getattr(self, "front_version", "0") or "0"),
                 model_version=str(getattr(self, "model_version", "0") or "0"),
+                validation_batches=validation_batches,
             )
             logger.info(
                 "Fixed split plan load/compute completed (elapsed={:.3f}s).",
@@ -568,23 +611,19 @@ class EdgeWorker:
                 ),
                 drift_window_sample_count=max(
                     0,
-                    current.drift_window_sample_count
-                    + factor * delta.drift_window_sample_count,
+                    current.drift_window_sample_count + factor * delta.drift_window_sample_count,
                 ),
                 uncovered_evidence_sum=max(
                     0.0,
-                    current.uncovered_evidence_sum
-                    + factor * delta.uncovered_evidence_sum,
+                    current.uncovered_evidence_sum + factor * delta.uncovered_evidence_sum,
                 ),
                 candidate_uncovered_sum=max(
                     0.0,
-                    current.candidate_uncovered_sum
-                    + factor * delta.candidate_uncovered_sum,
+                    current.candidate_uncovered_sum + factor * delta.candidate_uncovered_sum,
                 ),
                 motion_uncovered_sum=max(
                     0.0,
-                    current.motion_uncovered_sum
-                    + factor * delta.motion_uncovered_sum,
+                    current.motion_uncovered_sum + factor * delta.motion_uncovered_sum,
                 ),
                 track_uncovered_sum=max(
                     0.0,
@@ -668,8 +707,7 @@ class EdgeWorker:
         raw_metadata = update_payload.get("weights_metadata", {})
         metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
         cloud_head = _coerce_positive_int(
-            metadata.get("rfdetr_head_num_classes")
-            or metadata.get("num_classes")
+            metadata.get("rfdetr_head_num_classes") or metadata.get("num_classes")
         )
         edge_head = _coerce_positive_int(getattr(model, "num_classes", None))
         if (
@@ -689,8 +727,7 @@ class EdgeWorker:
         if len(mismatches) > 4:
             preview += f"; ... (+{len(mismatches) - 4} more)"
         raise RuntimeError(
-            "Cloud model update contains tensors with incompatible shapes: "
-            f"{preview}"
+            f"Cloud model update contains tensors with incompatible shapes: {preview}"
         )
 
     def _sample_sync_context(self) -> dict[str, object]:
@@ -751,9 +788,7 @@ class EdgeWorker:
                     "track_uncovered_rate",
                     pending.track_uncovered_sum,
                 ),
-                "drift_window_sample_count": int(
-                    stats.get("drift_window_sample_count", 0) or 0
-                )
+                "drift_window_sample_count": int(stats.get("drift_window_sample_count", 0) or 0)
                 + int(pending.drift_window_sample_count),
             }
         )
@@ -1034,7 +1069,7 @@ class EdgeWorker:
                 self._resource_probe_failure_count += 1
                 backoff_sec = min(
                     max(30.0, base_interval),
-                    base_interval * (2 ** self._resource_probe_failure_count),
+                    base_interval * (2**self._resource_probe_failure_count),
                 )
                 next_allowed_at = time.time() + backoff_sec
             self._resource_probe_next_allowed_at = next_allowed_at
@@ -1047,7 +1082,7 @@ class EdgeWorker:
                 self._resource_probe_failure_count += 1
                 backoff_sec = min(
                     max(30.0, base_interval),
-                    base_interval * (2 ** self._resource_probe_failure_count),
+                    base_interval * (2**self._resource_probe_failure_count),
                 )
                 next_allowed_at = time.time() + backoff_sec
             self._resource_probe_next_allowed_at = next_allowed_at
@@ -1172,10 +1207,10 @@ class EdgeWorker:
         drift_state = window_detector.update(
             quality,
             feature_stats={
-            "feature_spectral_entropy": getattr(inference, "feature_spectral_entropy", None),
-            "logit_entropy": getattr(inference, "logit_entropy", None),
-            "logit_margin": getattr(inference, "logit_margin", None),
-            "logit_energy": getattr(inference, "logit_energy", None),
+                "feature_spectral_entropy": getattr(inference, "feature_spectral_entropy", None),
+                "logit_entropy": getattr(inference, "logit_entropy", None),
+                "logit_margin": getattr(inference, "logit_margin", None),
+                "logit_energy": getattr(inference, "logit_energy", None),
             },
         )
         self.previous_quality_frame = frame.copy()
@@ -1210,9 +1245,7 @@ class EdgeWorker:
             "input_image_size": list(frame.shape[:2]),
             "input_tensor_shape": inference.input_tensor_shape,
             "input_resize_mode": inference.input_resize_mode,
-            "runtime_contract": dict(
-                getattr(self.fixed_split_plan, "runtime_contract", {}) or {}
-            ),
+            "runtime_contract": dict(getattr(self.fixed_split_plan, "runtime_contract", {}) or {}),
         }
         self._submit_sample_write(
             SampleWriteJob(
@@ -1255,7 +1288,8 @@ class EdgeWorker:
             self.collect_flag = False
             self._retrain_requested.set()
             logger.info(
-                "Continual learning triggered (samples={}, low_quality={}, send_low_conf_features={}, reason={})",
+                "Continual learning triggered (samples={}, low_quality={}, "
+                "send_low_conf_features={}, reason={})",
                 stats.total_samples,
                 stats.low_quality_count,
                 decision.send_low_conf_features,
@@ -1289,7 +1323,8 @@ class EdgeWorker:
             try:
                 if not self._flush_sample_writer(timeout=30.0):
                     logger.warning(
-                        "Timed out while flushing pending sample writes before continual learning upload."
+                        "Timed out while flushing pending sample writes before "
+                        "continual learning upload."
                     )
                 if not self._flush_sample_syncer(timeout=30.0):
                     logger.warning(
@@ -1359,10 +1394,7 @@ class EdgeWorker:
                                 break
                             continue
 
-                        terminal_message = (
-                            "Training job not found on cloud after "
-                            f"{elapsed:.1f}s."
-                        )
+                        terminal_message = f"Training job not found on cloud after {elapsed:.1f}s."
                         logger.error(
                             "Cloud continual learning failed for job {}: {}",
                             job_id,
@@ -1482,16 +1514,14 @@ class EdgeWorker:
                     )
                     if terminal_message:
                         logger.success(
-                            "Edge model updated from cloud successfully "
-                            "(v{} -> v{}, {})",
+                            "Edge model updated from cloud successfully (v{} -> v{}, {})",
                             submitted_model_version,
                             self.model_version,
                             terminal_message,
                         )
                     else:
                         logger.success(
-                            "Edge model updated from cloud successfully "
-                            "(v{} -> v{})",
+                            "Edge model updated from cloud successfully (v{} -> v{})",
                             submitted_model_version,
                             self.model_version,
                         )

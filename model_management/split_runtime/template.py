@@ -11,7 +11,7 @@ from loguru import logger
 from .runtime_cache import RuntimeCacheKey, make_runtime_cache_key
 from .torchlens_native_runtime import SplitRuntime, SplitSpec, prepare_split_runtime
 
-FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 5
+FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -57,9 +57,17 @@ def fixed_split_runtime_template_key(
     )
     return FixedSplitRuntimeTemplateKey(
         **key.__dict__,
-        trace_batch_size=None,
-        validated_batch_max=None,
-        runtime_batch_validation_signature=None,
+        trace_batch_size=(
+            None if trace_batch_size is None else max(1, int(trace_batch_size))
+        ),
+        validated_batch_max=(
+            None if validated_batch_max is None else max(1, int(validated_batch_max))
+        ),
+        runtime_batch_validation_signature=(
+            str(runtime_batch_validation_signature)
+            if runtime_batch_validation_signature
+            else None
+        ),
     )
 
 

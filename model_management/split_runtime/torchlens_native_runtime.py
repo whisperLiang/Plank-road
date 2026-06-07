@@ -36,8 +36,8 @@ def require_torchlens_native_split_api() -> None:
 @dataclass(frozen=True)
 class SplitRuntimeConfig:
     boundary: str
-    dynamic_batch: tuple[int, int] = (2, 64)
-    trace_batch_size: int = 2
+    dynamic_batch: tuple[int, int] = (1, 64)
+    trace_batch_size: int = 1
     mode: Literal["generated_eager", "compiled"] = DEFAULT_SPLIT_MODE
     trainable: bool = True
 
@@ -79,9 +79,9 @@ def make_split_spec(
     boundary: str | SplitRuntimeConfig,
     *,
     batch_symbol: str = "B",
-    dynamic_batch: tuple[int, int] | None = (2, 64),
+    dynamic_batch: tuple[int, int] | None = (1, 64),
     trainable: bool = True,
-    trace_batch_mode: str = "batch_gt1",
+    trace_batch_mode: str = "batch_1",
     model_family: str | None = None,
     mode: str = DEFAULT_SPLIT_MODE,
 ) -> SplitSpec:
@@ -95,7 +95,9 @@ def make_split_spec(
             batch_symbol=batch_symbol,
             dynamic_batch=config.dynamic_batch,
             trainable=bool(config.trainable),
-            trace_batch_mode="batch_gt1",
+            trace_batch_mode=(
+                "batch_gt1" if int(config.trace_batch_size) > 1 else "batch_1"
+            ),
             device_policy="runtime",
             mode=_normalize_mode(config.mode),
         )

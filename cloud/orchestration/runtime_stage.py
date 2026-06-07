@@ -11,8 +11,7 @@ from loguru import logger
 from cloud.contracts import validate_fixed_split_plan
 from model_management.universal_model_split import load_cached_split_batches
 
-
-FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
+FIXED_SPLIT_DYNAMIC_BATCH = (1, 64)
 FIXED_SPLIT_DYNAMIC_BATCH_MIN = FIXED_SPLIT_DYNAMIC_BATCH[0]
 FIXED_SPLIT_DYNAMIC_BATCH_MAX = FIXED_SPLIT_DYNAMIC_BATCH[1]
 
@@ -52,7 +51,7 @@ def fixed_split_dynamic_batch_from_plan(
 
 def fixed_split_trace_batch_mode_from_plan(split_plan: Mapping[str, object]) -> str:
     mode = str(split_plan.get("trace_batch_mode") or "").strip()
-    return mode if mode in {"batch_1", "batch_gt1"} else "batch_gt1"
+    return mode if mode in {"batch_1", "batch_gt1"} else "batch_1"
 
 
 def fixed_split_trace_batch_size_from_plan(
@@ -73,9 +72,7 @@ def cloud_fixed_split_dynamic_batch(
 ) -> tuple[int, int] | None:
     family = str(model_family or "").lower()
     default = (
-        (1, FIXED_SPLIT_DYNAMIC_BATCH_MAX)
-        if family == "rfdetr"
-        else FIXED_SPLIT_DYNAMIC_BATCH
+        (1, FIXED_SPLIT_DYNAMIC_BATCH_MAX) if family == "rfdetr" else FIXED_SPLIT_DYNAMIC_BATCH
     )
     return fixed_split_dynamic_batch_from_plan(split_plan, default)
 
@@ -85,8 +82,7 @@ def cloud_fixed_split_trace_batch_mode(
     *,
     model_family: str | None,
 ) -> str:
-    if str(model_family or "").lower() == "rfdetr":
-        return "batch_gt1"
+    del model_family
     return fixed_split_trace_batch_mode_from_plan(split_plan)
 
 
@@ -96,8 +92,7 @@ def cloud_fixed_split_trace_batch_size(
     model_family: str | None,
     default: int,
 ) -> int:
-    if str(model_family or "").lower() == "rfdetr":
-        return max(FIXED_SPLIT_DYNAMIC_BATCH_MIN, int(default))
+    del model_family
     return fixed_split_trace_batch_size_from_plan(split_plan, default)
 
 
@@ -108,26 +103,23 @@ def fixed_split_validation_batches(
     runtime_batch_size: int | None,
     dynamic_batch: tuple[int, int] | None,
 ) -> list[int]:
-    if str(model_family or "").lower() != "rfdetr":
-        return []
-    lower, upper = dynamic_batch or FIXED_SPLIT_DYNAMIC_BATCH
-    max_batch = min(
-        int(upper),
-        max(int(trace_batch_size), 4, int(runtime_batch_size or trace_batch_size)),
-    )
-    candidates = [int(trace_batch_size), 4, max_batch]
-    if int(lower) <= 1:
-        candidates.insert(0, 1)
-    return sorted({batch for batch in candidates if int(lower) <= batch <= int(upper)})
+    del model_family, trace_batch_size
+    upper = (dynamic_batch or FIXED_SPLIT_DYNAMIC_BATCH)[1]
+    training_batch = max(1, int(runtime_batch_size or 1))
+    candidates = [1, min(int(upper), training_batch)]
+    batches: list[int] = []
+    for batch_size in candidates:
+        batch = max(1, int(batch_size))
+        if batch not in batches:
+            batches.append(batch)
+    return batches
 
 
 def fixed_split_manifest_has_rebuildable_raw_samples(
     manifest: Mapping[str, object],
 ) -> bool:
     samples = [
-        sample
-        for sample in list(manifest.get("samples", []) or [])
-        if isinstance(sample, Mapping)
+        sample for sample in list(manifest.get("samples", []) or []) if isinstance(sample, Mapping)
     ]
     if not samples:
         return False
@@ -214,9 +206,7 @@ def negotiate_cached_split_runtime_batch_size(
     sample_ids = list(all_sample_ids)
     errors: dict[int, str] = {}
     for candidate_batch_size in candidates:
-        smoke_indices = sample_ids[
-            : max(1, min(len(sample_ids), int(candidate_batch_size)))
-        ]
+        smoke_indices = sample_ids[: max(1, min(len(sample_ids), int(candidate_batch_size)))]
         try:
             batches = load_cached_split_batches(
                 cache_path=training_cache_path,
@@ -289,7 +279,25 @@ __all__ = [
     "splitter_dynamic_batch_range",
 ]
 
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
+from cloud.orchestration.fixed_split_dependencies import (
+    BoundaryPayload,
+    BoundaryPayloadCacheCodec,
+    ShardFeatureRefValidator,
+    SplitRuntimeContract,
+    UniversalModelSplitter,
+    _sanitize_cache_segment,
+    _stable_json_dumps,
+    align_sample_feature_contract,
+    classify_contract_compatibility,
+    contract_path,
+    datetime,
+    feature_layout_from_tensors,
+    make_feature_layout_id,
+    model_zoo,
+    os,
+    shutil,
+    timezone,
+)
 
 
 class FixedSplitRuntimeContractMixin:
@@ -357,7 +365,6 @@ class FixedSplitRuntimeContractMixin:
             ),
         }
 
-
     @staticmethod
     def _layout_specs_match_ignoring_labels(
         actual: Mapping[str, Mapping[str, object]],
@@ -379,7 +386,6 @@ class FixedSplitRuntimeContractMixin:
             return sorted(specs, key=lambda item: _stable_json_dumps(item))
 
         return normalised_specs(actual) == normalised_specs(expected)
-
 
     def _log_pending_high_quality_layout_alignment(
         self,
@@ -448,7 +454,9 @@ class FixedSplitRuntimeContractMixin:
                     }
                 )
         logger.info(
-            "[SamplePool] pending high-quality layout alignment: pending={} compatible={} rename_compatible={} mismatched={} expected_source={} expected_feature_layout_id={} low_quality_feature_layout_id={}.",
+            "[SamplePool] pending high-quality layout alignment: pending={} "
+            "compatible={} rename_compatible={} mismatched={} expected_source={} "
+            "expected_feature_layout_id={} low_quality_feature_layout_id={}.",
             len(pending_high_quality),
             compatible,
             renamed_compatible,
@@ -463,7 +471,6 @@ class FixedSplitRuntimeContractMixin:
                 "with the active runtime layout and will remain deferred: preview={}",
                 mismatches,
             )
-
 
     def _contract_layout_tensors_from_runtime(
         self,
@@ -486,7 +493,8 @@ class FixedSplitRuntimeContractMixin:
                 payload = splitter.edge_forward(example, candidate=candidate)
         except Exception as exc:
             logger.warning(
-                "[FixedSplitCL] Could not sample cloud batch feature layout from runtime; using uploaded feature layout for contract creation: {}",
+                "[FixedSplitCL] Could not sample cloud batch feature layout from "
+                "runtime; using uploaded feature layout for contract creation: {}",
                 exc,
             )
             return None
@@ -501,7 +509,6 @@ class FixedSplitRuntimeContractMixin:
             for label, tensor in dict(sample_payload.tensors or {}).items()
             if isinstance(tensor, torch.Tensor)
         } or None
-
 
     def _load_split_runtime_contract(
         self,
@@ -542,7 +549,6 @@ class FixedSplitRuntimeContractMixin:
             return None
         return existing
 
-
     @staticmethod
     def _candidate_cloud_batch_split_id(
         *,
@@ -557,7 +563,6 @@ class FixedSplitRuntimeContractMixin:
             or getattr(runtime, "split_id", "")
             or canonical_split_key
         )
-
 
     def _stale_split_contract_path(
         self,
@@ -585,7 +590,6 @@ class FixedSplitRuntimeContractMixin:
             f"{_sanitize_cache_segment(split_config_id)}.{stamp}.json",
         )
 
-
     def _move_stale_split_runtime_contract(
         self,
         *,
@@ -608,7 +612,6 @@ class FixedSplitRuntimeContractMixin:
             reason,
         )
         return True
-
 
     def _runtime_identity_for_contract(
         self,
@@ -645,8 +648,7 @@ class FixedSplitRuntimeContractMixin:
                 or type(runtime).__name__
             ),
             "graph_signature": str(
-                getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "")
-                or ""
+                getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "") or ""
             ),
             "adapter_version": str(getattr(runtime, "adapter_version", "") or ""),
             "split_plan_hash": _json_fingerprint(split_plan),
@@ -657,11 +659,14 @@ class FixedSplitRuntimeContractMixin:
                 else None
             ),
             "trace_batch_size": getattr(runtime, "trace_batch_size", None),
-            "mode": str(getattr(getattr(runtime, "split_spec", None), "mode", "") or getattr(runtime, "mode", "") or ""),
+            "mode": str(
+                getattr(getattr(runtime, "split_spec", None), "mode", "")
+                or getattr(runtime, "mode", "")
+                or ""
+            ),
             "feature_layout_id": str(feature_layout_id),
             "runtime_contract": cloud_runtime_contract,
         }
-
 
     def _get_or_create_split_runtime_contract(
         self,
@@ -709,20 +714,16 @@ class FixedSplitRuntimeContractMixin:
                 )
                 if runtime_split_id != existing.cloud_batch_split_id:
                     stale_reason = "cloud_batch_split_id"
-                layout_tensors_for_existing = (
-                    {
-                        str(label): tensor
-                        for label, tensor in dict(contract_layout_tensors or {}).items()
-                        if isinstance(tensor, torch.Tensor)
-                    }
-                    or self._contract_layout_tensors_from_runtime(
-                        splitter=splitter,
-                        candidate=candidate,
-                        input_tensor_shape=[
-                            int(dim)
-                            for dim in list(context.get("input_tensor_shape", []) or [])
-                        ],
-                    )
+                layout_tensors_for_existing = {
+                    str(label): tensor
+                    for label, tensor in dict(contract_layout_tensors or {}).items()
+                    if isinstance(tensor, torch.Tensor)
+                } or self._contract_layout_tensors_from_runtime(
+                    splitter=splitter,
+                    candidate=candidate,
+                    input_tensor_shape=[
+                        int(dim) for dim in list(context.get("input_tensor_shape", []) or [])
+                    ],
                 )
                 if stale_reason is None and layout_tensors_for_existing is not None:
                     cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
@@ -755,7 +756,9 @@ class FixedSplitRuntimeContractMixin:
                         boundary_tensor_labels=boundary_tensor_labels,
                         front_version=front_from_context,
                         feature_tensors=layout_tensors_for_existing,
-                        tail_version=str(dict(manifest.get("model", {}) or {}).get("model_version", "") or "")
+                        tail_version=str(
+                            dict(manifest.get("model", {}) or {}).get("model_version", "") or ""
+                        )
                         or None,
                         runtime_identity=runtime_identity,
                     )
@@ -781,17 +784,23 @@ class FixedSplitRuntimeContractMixin:
                                         "runtime_identity_id": existing.runtime_identity_id,
                                         "feature_layout_id": existing.feature_layout_id,
                                         "feature_abi_id": existing.feature_abi_id,
-                                        "reason": str(compatibility.get("reason") or "compatible_rebind"),
+                                        "reason": str(
+                                            compatibility.get("reason") or "compatible_rebind"
+                                        ),
                                     }
                                 )
                             proposed.contract_aliases = aliases
                             path = proposed.save(self.split_contract_root)
                             if proposed.runtime_identity_id != existing.runtime_identity_id:
                                 logger.info(
-                                    "Runtime identity changed but feature ABI is compatible; rebinding contract without dropping active samples."
+                                    "Runtime identity changed but feature ABI is "
+                                    "compatible; rebinding contract without dropping "
+                                    "active samples."
                                 )
                             logger.info(
-                                "[FixedSplitCL] SplitRuntimeContract rebound edge_id={} model_id={} split_config_id={} feature_abi_id={} source_contract_id={} current_contract_id={} path={}",
+                                "[FixedSplitCL] SplitRuntimeContract rebound edge_id={} "
+                                "model_id={} split_config_id={} feature_abi_id={} "
+                                "source_contract_id={} current_contract_id={} path={}",
                                 edge_id,
                                 model_id,
                                 split_config_id,
@@ -846,9 +855,7 @@ class FixedSplitRuntimeContractMixin:
         ):
             canonical_split_key = f"after:{canonical_split_key}"
         if not canonical_split_key:
-            raise RuntimeError(
-                "SplitRuntimeContract creation requires an exact split id."
-            )
+            raise RuntimeError("SplitRuntimeContract creation requires an exact split id.")
         if feature_tensors is None and contract_layout_tensors is None:
             raise RuntimeError(
                 "SplitRuntimeContract creation requires a representative feature tensor."
@@ -870,19 +877,16 @@ class FixedSplitRuntimeContractMixin:
                 "SplitRuntimeContract runtime split does not match the exact plan split "
                 f"(expected={canonical_split_key!r}, actual={cloud_batch_split_id!r})."
             )
-        layout_tensors = (
-            {
-                str(label): tensor
-                for label, tensor in dict(contract_layout_tensors or {}).items()
-                if isinstance(tensor, torch.Tensor)
-            }
-            or self._contract_layout_tensors_from_runtime(
-                splitter=splitter,
-                candidate=batch_candidate,
-                input_tensor_shape=[
-                    int(dim) for dim in list(context.get("input_tensor_shape", []) or [])
-                ],
-            )
+        layout_tensors = {
+            str(label): tensor
+            for label, tensor in dict(contract_layout_tensors or {}).items()
+            if isinstance(tensor, torch.Tensor)
+        } or self._contract_layout_tensors_from_runtime(
+            splitter=splitter,
+            candidate=batch_candidate,
+            input_tensor_shape=[
+                int(dim) for dim in list(context.get("input_tensor_shape", []) or [])
+            ],
         )
         contract_feature_tensors = layout_tensors or feature_tensors
         if contract_feature_tensors is None:
@@ -925,7 +929,9 @@ class FixedSplitRuntimeContractMixin:
         )
         path = contract.save(self.split_contract_root)
         logger.info(
-            "[FixedSplitCL] SplitRuntimeContract created edge_id={} model_id={} split_config_id={} canonical_split_key={} cloud_batch_split_id={} feature_layout_id={} feature_abi_id={} path={}",
+            "[FixedSplitCL] SplitRuntimeContract created edge_id={} model_id={} "
+            "split_config_id={} canonical_split_key={} cloud_batch_split_id={} "
+            "feature_layout_id={} feature_abi_id={} path={}",
             edge_id,
             model_id,
             split_config_id,

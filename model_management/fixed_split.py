@@ -97,11 +97,21 @@ class CandidateEnumerationStats:
         }
 
 
+def _positive_int_or_none(value: object) -> int | None:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 @dataclass(frozen=True)
 class SplitConstraints:
     privacy_leakage_upper_bound: float = 0.0
     max_layer_freezing_ratio: float = 1.0
     validate_candidates: bool = True
+    configured_training_batch: int | None = field(default=None, compare=False)
+    validation_batches: tuple[int, ...] = field(default_factory=tuple, compare=False)
     # Deprecated compatibility field; fixed split planning now considers all candidates.
     max_candidates: int = 0
     max_boundary_count: int = 8
@@ -120,6 +130,18 @@ class SplitConstraints:
                 float(self.privacy_metric_lower_bound),
             )
         object.__setattr__(self, "privacy_metric_lower_bound", None)
+        if self.configured_training_batch is not None:
+            object.__setattr__(
+                self,
+                "configured_training_batch",
+                max(1, int(self.configured_training_batch)),
+            )
+        batches: list[int] = []
+        for batch_size in self.validation_batches:
+            batch = max(1, int(batch_size))
+            if batch not in batches:
+                batches.append(batch)
+        object.__setattr__(self, "validation_batches", tuple(batches))
 
     @classmethod
     def from_config(cls, config: Any | None) -> "SplitConstraints":
@@ -129,23 +151,34 @@ class SplitConstraints:
         legacy_privacy_bound = getattr(config, "privacy_metric_lower_bound", None)
         privacy_leakage_upper_bound = getattr(config, "privacy_leakage_upper_bound", None)
         default_privacy_bound = getattr(type(config), "privacy_leakage_upper_bound", None)
-        if (
-            "privacy_metric_lower_bound" in extras
-            and (
-                privacy_leakage_upper_bound is None
-                or (
-                    default_privacy_bound is not None
-                    and float(privacy_leakage_upper_bound) == float(default_privacy_bound)
-                )
+        if "privacy_metric_lower_bound" in extras and (
+            privacy_leakage_upper_bound is None
+            or (
+                default_privacy_bound is not None
+                and float(privacy_leakage_upper_bound) == float(default_privacy_bound)
             )
         ):
             privacy_leakage_upper_bound = legacy_privacy_bound
         if privacy_leakage_upper_bound is None:
-            privacy_leakage_upper_bound = legacy_privacy_bound if legacy_privacy_bound is not None else 0.0
+            privacy_leakage_upper_bound = (
+                legacy_privacy_bound if legacy_privacy_bound is not None else 0.0
+            )
+        configured_training_batch = _positive_int_or_none(
+            getattr(config, "configured_training_batch", None)
+        )
+        raw_validation_batches = getattr(config, "validation_batches", None)
+        validation_batches: list[int] = []
+        if isinstance(raw_validation_batches, (list, tuple)):
+            for value in raw_validation_batches:
+                batch = _positive_int_or_none(value)
+                if batch is not None and batch not in validation_batches:
+                    validation_batches.append(batch)
         return cls(
             privacy_leakage_upper_bound=float(privacy_leakage_upper_bound),
             max_layer_freezing_ratio=float(getattr(config, "max_layer_freezing_ratio", 1.0)),
             validate_candidates=bool(getattr(config, "validate_candidates", True)),
+            configured_training_batch=configured_training_batch,
+            validation_batches=tuple(validation_batches),
             max_candidates=int(getattr(config, "max_candidates", 0)),
             max_boundary_count=int(getattr(config, "max_boundary_count", 8)),
             max_payload_bytes=int(getattr(config, "max_payload_bytes", 32 * 1024 * 1024)),
@@ -239,11 +272,15 @@ class SplitPlan:
     def describe(self, *, max_boundary_labels: int = 4) -> str:
         labels = [str(label) for label in self.boundary_tensor_labels]
         if len(labels) > max_boundary_labels:
-            label_text = f"[{', '.join(labels[:max_boundary_labels])}, ... (+{len(labels)-max_boundary_labels} more)]"
+            label_text = (
+                f"[{', '.join(labels[:max_boundary_labels])}, "
+                f"... (+{len(labels) - max_boundary_labels} more)]"
+            )
         else:
             label_text = "[" + ", ".join(labels) + "]"
         return (
-            f"canonical_split_key={self.canonical_split_key}, logical_split_id={self.logical_split_id}, "
+            f"canonical_split_key={self.canonical_split_key}, "
+            f"logical_split_id={self.logical_split_id}, "
             f"split_granularity={self.split_granularity}, boundary_count={self.boundary_count}, "
             f"boundary_tensor_labels={label_text}, feature_layout_id={self.feature_layout_id}, "
             f"payload_bytes={self.payload_bytes}, privacy_leakage={self.privacy_leakage:.6g}, "
@@ -262,7 +299,9 @@ class SplitPlan:
             or payload.get("split_label")
             or ""
         )
-        edge_split_id = str(payload.get("edge_split_id") or payload.get("candidate_id") or canonical_split_key)
+        edge_split_id = str(
+            payload.get("edge_split_id") or payload.get("candidate_id") or canonical_split_key
+        )
         return cls(
             split_config_id=str(payload["split_config_id"]),
             canonical_split_key=canonical_split_key,
@@ -273,7 +312,9 @@ class SplitPlan:
             split_label=payload.get("split_label"),
             boundary_tensor_labels=list(payload.get("boundary_tensor_labels", [])),
             runtime_contract=dict(payload.get("runtime_contract") or {}),
-            input_tensor_shape=[int(dim) for dim in list(payload.get("input_tensor_shape", []) or [])],
+            input_tensor_shape=[
+                int(dim) for dim in list(payload.get("input_tensor_shape", []) or [])
+            ],
             input_resize_mode=str(payload.get("input_resize_mode") or "direct_resize"),
             front_version=str(payload.get("front_version") or "0"),
             payload_bytes=int(payload.get("payload_bytes", 0)),
@@ -281,7 +322,10 @@ class SplitPlan:
             privacy_risk=float(payload.get("privacy_risk", 0.0)),
             layer_freezing_ratio=float(payload.get("layer_freezing_ratio", 0.0)),
             privacy_leakage=float(
-                payload.get("privacy_leakage", payload.get("privacy_risk", payload.get("privacy_metric", 0.0)))
+                payload.get(
+                    "privacy_leakage",
+                    payload.get("privacy_risk", payload.get("privacy_metric", 0.0)),
+                )
             ),
             edge_parameter_count=int(payload.get("edge_parameter_count", 0)),
             total_parameter_count=int(payload.get("total_parameter_count", 0)),
@@ -296,7 +340,11 @@ class SplitPlan:
                 if payload.get("dynamic_batch") is not None
                 else None
             ),
-            trace_batch_size=(int(payload["trace_batch_size"]) if payload.get("trace_batch_size") is not None else None),
+            trace_batch_size=(
+                int(payload["trace_batch_size"])
+                if payload.get("trace_batch_size") is not None
+                else None
+            ),
             plan_version=str(payload.get("plan_version") or ""),
         )
 
@@ -311,7 +359,11 @@ class SplitPlan:
         front_version: str = "0",
         model_version: str = "0",
     ) -> bool:
-        expected_shape = [int(dim) for dim in list(input_tensor_shape)] if input_tensor_shape is not None else None
+        expected_shape = (
+            [int(dim) for dim in list(input_tensor_shape)]
+            if input_tensor_shape is not None
+            else None
+        )
         cached_model_version = str(dict(self.runtime_contract or {}).get("model_version") or "0")
         return (
             self.plan_version == FIXED_SPLIT_PLAN_VERSION
@@ -411,7 +463,9 @@ def _satisfies_privacy_constraint(
     total_parameter_count = int(getattr(candidate, "total_parameter_count", 0))
     if total_parameter_count <= 0:
         return privacy_leakage <= float(constraints.privacy_leakage_upper_bound)
-    return int(getattr(candidate, "edge_parameter_count", 0)) >= _privacy_min_edge_parameter_count(constraints)
+    return int(getattr(candidate, "edge_parameter_count", 0)) >= _privacy_min_edge_parameter_count(
+        constraints
+    )
 
 
 def _make_plan_id(
@@ -480,8 +534,80 @@ def _first_tensor_batch_size(value: Any) -> int | None:
     return None
 
 
+def _unique_validation_batches(
+    validation_batches: Sequence[int] | None,
+    *,
+    default_training_batch: int,
+) -> list[int]:
+    batches: list[int] = []
+    raw_batches = list(validation_batches or [1, int(default_training_batch)])
+    for batch_size in raw_batches:
+        batch = max(1, int(batch_size))
+        if batch not in batches:
+            batches.append(batch)
+    if 1 not in batches:
+        batches.insert(0, 1)
+    return batches
+
+
+def _resolve_validation_batches(
+    constraints: SplitConstraints,
+    validation_batches: Sequence[int] | None,
+) -> Sequence[int] | None:
+    if validation_batches is not None:
+        return validation_batches
+    configured_batches = tuple(getattr(constraints, "validation_batches", ()) or ())
+    if configured_batches:
+        return configured_batches
+    configured_training_batch = getattr(constraints, "configured_training_batch", None)
+    if configured_training_batch is not None:
+        return (1, int(configured_training_batch))
+    return None
+
+
+def _resize_batch(value: Any, current_batch_size: int, target_batch_size: int) -> Any:
+    current = max(1, int(current_batch_size))
+    target = max(1, int(target_batch_size))
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0 or int(value.shape[0]) != current:
+            return value
+        if target <= current:
+            return value.narrow(0, 0, target)
+        pad = value[-1:].expand(target - current, *value.shape[1:]).clone()
+        return torch.cat([value, pad], dim=0)
+    if isinstance(value, Mapping):
+        return {
+            key: _resize_batch(item, current_batch_size, target_batch_size)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_resize_batch(item, current_batch_size, target_batch_size) for item in value)
+    if isinstance(value, list):
+        return [_resize_batch(item, current_batch_size, target_batch_size) for item in value]
+    return value
+
+
+def _validation_sample_inputs(
+    sample_input: Any,
+    validation_batches: Sequence[int] | None,
+) -> list[Any]:
+    current_batch = _first_tensor_batch_size(sample_input) or 1
+    batches = _unique_validation_batches(
+        validation_batches,
+        default_training_batch=current_batch,
+    )
+    return [
+        sample_input
+        if int(batch_size) == int(current_batch)
+        else _resize_batch(sample_input, current_batch, int(batch_size))
+        for batch_size in batches
+    ]
+
+
 def _splitter_dynamic_batch(splitter: UniversalModelSplitter) -> list[int] | None:
-    split_spec = getattr(splitter, "split_spec", None) or getattr(getattr(splitter, "runtime", None), "split_spec", None)
+    split_spec = getattr(splitter, "split_spec", None) or getattr(
+        getattr(splitter, "runtime", None), "split_spec", None
+    )
     dynamic_batch = getattr(split_spec, "dynamic_batch", None)
     if dynamic_batch is None:
         return None
@@ -493,7 +619,9 @@ def _splitter_dynamic_batch(splitter: UniversalModelSplitter) -> list[int] | Non
 
 
 def _splitter_trace_batch_mode(splitter: UniversalModelSplitter) -> str:
-    split_spec = getattr(splitter, "split_spec", None) or getattr(getattr(splitter, "runtime", None), "split_spec", None)
+    split_spec = getattr(splitter, "split_spec", None) or getattr(
+        getattr(splitter, "runtime", None), "split_spec", None
+    )
     return str(getattr(split_spec, "trace_batch_mode", "") or "")
 
 
@@ -599,10 +727,14 @@ def _profile_from_report(
     )
 
 
-def _build_validation_payload(chosen: SplitCandidate, profile: CandidateProfile | None) -> dict[str, Any]:
+def _build_validation_payload(
+    chosen: SplitCandidate, profile: CandidateProfile | None
+) -> dict[str, Any]:
     validation = {
         "validation_passed": bool(profile.validation_passed) if profile is not None else True,
-        "tail_trainability": bool(profile.tail_trainability) if profile is not None else bool(chosen.is_trainable_tail),
+        "tail_trainability": bool(profile.tail_trainability)
+        if profile is not None
+        else bool(chosen.is_trainable_tail),
         "replay_success_rate": float(profile.replay_success_rate) if profile is not None else 1.0,
         "stability_score": float(profile.stability_score) if profile is not None else 1.0,
     }
@@ -620,6 +752,9 @@ def _select_candidate(
     eligible: list[EligibleCandidate],
     constraints: SplitConstraints,
     stats: CandidateEnumerationStats | None = None,
+    *,
+    validation_sample_inputs: Sequence[Any] | None = None,
+    blacklisted_candidate_ids: set[str] | None = None,
 ) -> tuple[SplitCandidate, float, float, CandidateProfile | None, Mapping[str, Any] | None]:
     if not eligible:
         stats_suffix = (
@@ -635,24 +770,48 @@ def _select_candidate(
             f"{stats_suffix}"
         )
     validation_errors: dict[str, int] = defaultdict(int)
+    blacklist = {
+        _normalise_after_key(candidate_id)
+        for candidate_id in set(blacklisted_candidate_ids or set())
+        if str(candidate_id or "").strip()
+    }
     for candidate, privacy_leakage, freezing_ratio in sorted(eligible, key=_eligible_candidate_key):
-        if not constraints.validate_candidates:
+        candidate_key = _candidate_split_key(candidate)
+        if candidate_key in blacklist:
+            validation_errors[f"candidate blacklisted this attempt: {candidate_key}"] += 1
+            continue
+        if not constraints.validate_candidates and not validation_sample_inputs:
             runtime.split(candidate=candidate)
             return candidate, privacy_leakage, freezing_ratio, None, None
         try:
             bound = runtime.split(candidate=candidate)
-            report = runtime.validate_candidate(bound)
+            report = runtime.validate_candidate(
+                bound,
+                validation_sample_inputs=validation_sample_inputs,
+                trainability_smoke=True,
+            )
         except Exception as exc:
             validation_errors[str(exc) or type(exc).__name__] += 1
+            blacklist.add(candidate_key)
             continue
         if not bool(report.get("success", False)):
             validation_errors[str(report.get("error") or "unknown")] += 1
+            blacklist.add(candidate_key)
             continue
         if not bool(report.get("tail_trainability", bound.is_trainable_tail)):
             validation_errors["selected split does not have trainable suffix parameters"] += 1
+            blacklist.add(candidate_key)
             continue
-        return bound, privacy_leakage, freezing_ratio, _profile_from_report(runtime, bound, report), report
-    top_errors = "; ".join(f"{error} x{count}" for error, count in sorted(validation_errors.items())[:3])
+        return (
+            bound,
+            privacy_leakage,
+            freezing_ratio,
+            _profile_from_report(runtime, bound, report),
+            report,
+        )
+    top_errors = "; ".join(
+        f"{error} x{count}" for error, count in sorted(validation_errors.items())[:3]
+    )
     raise RuntimeError(
         "No replayable TorchLens split candidate satisfies the fixed split constraints. "
         f"eligible_candidates={len(eligible)}, validation_errors={top_errors}"
@@ -662,7 +821,10 @@ def _select_candidate(
 def apply_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> SplitCandidate:
     raw_candidate_id = plan.candidate_id or plan.edge_split_id or plan.canonical_split_key
     if raw_candidate_id is None:
-        raise RuntimeError(f"Fixed split plans must include candidate_id (split_config_id={plan.split_config_id!r}).")
+        raise RuntimeError(
+            "Fixed split plans must include candidate_id "
+            f"(split_config_id={plan.split_config_id!r})."
+        )
     return splitter.split(candidate_id=_normalise_after_key(raw_candidate_id))
 
 
@@ -690,6 +852,8 @@ def compute_fixed_split_for_model(
     input_resize_mode: str = "direct_resize",
     front_version: str = "0",
     model_version: str = "0",
+    validation_batches: Sequence[int] | None = None,
+    blacklisted_candidate_ids: set[str] | None = None,
 ) -> SplitPlan:
     del cache_path
     if sample_kwargs:
@@ -706,11 +870,18 @@ def compute_fixed_split_for_model(
             dynamic_batch_max=FIXED_SPLIT_DYNAMIC_BATCH_MAX,
         )
     eligible, enumeration_stats = _enumerate_feasible_candidates(runtime, constraints)
+    resolved_validation_batches = _resolve_validation_batches(
+        constraints,
+        validation_batches,
+    )
+    validation_inputs = _validation_sample_inputs(sample_input, resolved_validation_batches)
     chosen, privacy_leakage, freezing_ratio, profile, report = _select_candidate(
         runtime,
         eligible,
         constraints,
         enumeration_stats,
+        validation_sample_inputs=validation_inputs,
+        blacklisted_candidate_ids=blacklisted_candidate_ids,
     )
     validation = _build_validation_payload(chosen, profile)
     if report is not None:
@@ -800,10 +971,17 @@ def load_or_compute_fixed_split_plan(
     input_resize_mode: str = "direct_resize",
     front_version: str = "0",
     model_version: str = "0",
+    validation_batches: Sequence[int] | None = None,
 ) -> SplitPlan:
     runtime = splitter or UniversalModelSplitter(device=device)
     sample_input_shape = _input_tensor_shape_from_sample(sample_input)
     model_key = model_name or model.__class__.__name__
+    resolved_validation_batches = _resolve_validation_batches(
+        constraints,
+        validation_batches,
+    )
+    validation_inputs = _validation_sample_inputs(sample_input, resolved_validation_batches)
+    blacklisted_candidate_ids: set[str] = set()
     cached = load_split_plan(cache_path) if cache_path else None
     cached_invalidated = False
     if cached is not None and cached.plan_version != FIXED_SPLIT_PLAN_VERSION:
@@ -831,13 +1009,19 @@ def load_or_compute_fixed_split_plan(
         if cache_matches:
             try:
                 cached_candidate = apply_split_plan(runtime, cached)
-                if validate_cached_plan:
+                if validate_cached_plan or validation_inputs:
                     started = time.perf_counter()
-                    report = runtime.validate_candidate(cached_candidate)
+                    report = runtime.validate_candidate(
+                        cached_candidate,
+                        validation_sample_inputs=validation_inputs,
+                        trainability_smoke=True,
+                    )
                     if not bool(report.get("success", False)):
+                        blacklisted_candidate_ids.add(_candidate_split_key(cached_candidate))
                         raise RuntimeError(
                             "Persisted split plan is no longer replayable. "
-                            f"candidate_id={cached_candidate.candidate_id}, error={report.get('error')}"
+                            f"candidate_id={cached_candidate.candidate_id}, "
+                            f"error={report.get('error')}"
                         )
                     cached.validation = {
                         **cached.validation,
@@ -863,6 +1047,8 @@ def load_or_compute_fixed_split_plan(
         input_resize_mode=input_resize_mode,
         front_version=front_version,
         model_version=model_version,
+        validation_batches=resolved_validation_batches,
+        blacklisted_candidate_ids=blacklisted_candidate_ids,
     )
     if cache_path and (cached is None or cached_invalidated):
         persist_split_plan(cache_path, plan)

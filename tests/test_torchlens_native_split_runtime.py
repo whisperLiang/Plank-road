@@ -98,6 +98,38 @@ def _fixed_runtime_template(
     )
 
 
+def test_template_cache_key_includes_validation_identity_fields() -> None:
+    spec = make_split_spec("after:head", dynamic_batch=(1, 8), trainable=True)
+    example = torch.randn(1, 4)
+    key_a = fixed_split_runtime_template_key(
+        model_name="tiny",
+        model_family="tiny",
+        split_spec=spec,
+        example_inputs=example,
+        graph_signature="graph",
+        split_plan_hash="plan",
+        trace_batch_size=1,
+        validated_batch_max=2,
+        runtime_batch_validation_signature="sig-a",
+    )
+    key_b = fixed_split_runtime_template_key(
+        model_name="tiny",
+        model_family="tiny",
+        split_spec=spec,
+        example_inputs=example,
+        graph_signature="graph",
+        split_plan_hash="plan",
+        trace_batch_size=1,
+        validated_batch_max=4,
+        runtime_batch_validation_signature="sig-b",
+    )
+
+    assert key_a != key_b
+    assert key_a.as_dict()["trace_batch_size"] == 1
+    assert key_a.as_dict()["validated_batch_max"] == 2
+    assert key_a.as_dict()["runtime_batch_validation_signature"] == "sig-a"
+
+
 def _poison_trace_graph_deepcopy(runtime) -> None:
     node = next(iter(runtime.trace_graph.nodes.values()))
     setattr(
@@ -409,7 +441,7 @@ def test_fixed_split_validates_all_eligible_candidates_without_limit() -> None:
         def split(self, *, candidate):
             return candidate
 
-        def validate_candidate(self, candidate):
+        def validate_candidate(self, candidate, **_kwargs):
             self.validated.append(candidate.candidate_id)
             return {
                 "success": candidate.candidate_id == "after:success",
@@ -434,6 +466,146 @@ def test_fixed_split_validates_all_eligible_candidates_without_limit() -> None:
     assert runtime.validated == ["after:fail", "after:success"]
     assert report is not None
     assert report["success"] is True
+
+
+def test_fixed_split_blacklists_batch_validation_failure_without_resorting() -> None:
+    def candidate(candidate_id: str, *, payload_bytes: int) -> SplitCandidate:
+        return SplitCandidate(
+            candidate_id=candidate_id,
+            edge_nodes=[],
+            cloud_nodes=[],
+            boundary_edges=[],
+            boundary_tensor_labels=["x"],
+            edge_input_labels=[],
+            cloud_input_labels=["x"],
+            cloud_output_labels=[],
+            estimated_edge_flops=0.0,
+            estimated_cloud_flops=0.0,
+            estimated_payload_bytes=payload_bytes,
+            estimated_privacy_risk=0.0,
+            estimated_latency=float(payload_bytes),
+            is_trainable_tail=True,
+            is_validated=True,
+            legacy_layer_index=0,
+            boundary_count=1,
+            edge_parameter_count=1000,
+            total_parameter_count=1000,
+            edge_parameter_ratio=1.0,
+        )
+
+    class FakeSplitter:
+        def __init__(self) -> None:
+            self.validated: list[tuple[str, tuple[int, ...]]] = []
+
+        def split(self, *, candidate):
+            return candidate
+
+        def validate_candidate(self, candidate, *, validation_sample_inputs, **_kwargs):
+            batches = tuple(int(sample.shape[0]) for sample in validation_sample_inputs)
+            self.validated.append((candidate.candidate_id, batches))
+            ok = candidate.candidate_id == "after:success"
+            return {
+                "success": ok,
+                "tail_trainability": True,
+                "validation_batches": list(batches),
+                "error": None if ok else "batch=1 replay failed",
+            }
+
+    runtime = FakeSplitter()
+    constraints = SplitConstraints(validate_candidates=True)
+    eligible = [
+        (candidate("after:first", payload_bytes=1), 0.0, 0.0),
+        (candidate("after:success", payload_bytes=2), 0.0, 0.0),
+    ]
+
+    chosen, _privacy, _freezing, _profile, report = _select_candidate(
+        runtime,
+        eligible,
+        constraints,
+        validation_sample_inputs=[torch.zeros(1, 4), torch.zeros(4, 4)],
+    )
+
+    assert chosen.candidate_id == "after:success"
+    assert runtime.validated == [
+        ("after:first", (1, 4)),
+        ("after:success", (1, 4)),
+    ]
+    assert report is not None
+    assert report["validation_batches"] == [1, 4]
+
+
+def test_fixed_split_uses_configured_training_batch_when_validation_batches_omitted() -> None:
+    def candidate(candidate_id: str) -> SplitCandidate:
+        return SplitCandidate(
+            candidate_id=candidate_id,
+            edge_nodes=[],
+            cloud_nodes=[],
+            boundary_edges=[],
+            boundary_tensor_labels=["x"],
+            edge_input_labels=[],
+            cloud_input_labels=["x"],
+            cloud_output_labels=[],
+            estimated_edge_flops=0.0,
+            estimated_cloud_flops=0.0,
+            estimated_payload_bytes=1,
+            estimated_privacy_risk=0.0,
+            estimated_latency=1.0,
+            is_trainable_tail=True,
+            is_validated=True,
+            legacy_layer_index=0,
+            boundary_count=1,
+            edge_parameter_count=1000,
+            total_parameter_count=1000,
+            edge_parameter_ratio=1.0,
+        )
+
+    class FixedSplitConfig:
+        configured_training_batch = 4
+        validate_candidates = True
+
+    class TraceGraph:
+        graph_shape_hash = "fake-graph"
+
+    class RuntimeObject:
+        trace_graph = TraceGraph()
+
+    class FakeSplitter:
+        def __init__(self, model: nn.Module) -> None:
+            self.model = model
+            self.runtime = RuntimeObject()
+            self.validated: list[tuple[int, ...]] = []
+
+        def enumerate_candidates(self, **_kwargs):
+            return [candidate("after:success")]
+
+        def split(self, *, candidate):
+            return candidate
+
+        def validate_candidate(self, _candidate, *, validation_sample_inputs, **_kwargs):
+            batches = tuple(int(sample.shape[0]) for sample in validation_sample_inputs)
+            self.validated.append(batches)
+            return {
+                "success": True,
+                "tail_trainability": True,
+                "validation_batches": list(batches),
+                "error": None,
+            }
+
+    model = TinySplitModel()
+    splitter = FakeSplitter(model)
+    constraints = SplitConstraints.from_config(FixedSplitConfig())
+
+    plan = compute_fixed_split_for_model(
+        model,
+        constraints,
+        sample_input=torch.zeros(1, 4),
+        model_name="tiny",
+        splitter=splitter,
+    )
+
+    assert constraints.configured_training_batch == 4
+    assert splitter.validated == [(1, 4)]
+    assert plan.validation["validation_batches"] == [1, 4]
 
 
 def test_rfdetr_aux_outputs_pack_uses_tensor_marker_for_split_replay() -> None:

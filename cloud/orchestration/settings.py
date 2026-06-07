@@ -1,8 +1,26 @@
 from __future__ import annotations
 
 import os
+import re
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+
+import torch
+from loguru import logger
+
+from cloud.annotation import (
+    TeacherAnnotationService,
+    TeacherAnnotationWorker,
+    TeacherLabelCache,
+)
+from cloud.orchestration.fixed_split_dependencies import _GLOBAL_TEACHER_ANNOTATION_QUEUE
+from cloud.training.proxy_metadata import normalise_shard_dtype as _normalise_shard_dtype
+from model_management.fixed_split_runtime_template import (
+    get_fixed_split_runtime_template_cache,
+)
+from model_management.object_detection import Object_Detection
 
 
 @dataclass(frozen=True)
@@ -55,7 +73,9 @@ class OrchestrationSettings:
         cl_cfg = getattr(config, "continual_learning", None)
         feature_cache_cfg = getattr(cl_cfg, "feature_cache", None) if cl_cfg is not None else None
         sample_pool_cfg = getattr(config, "sample_pool", None)
-        workspace_root = os.path.abspath(str(getattr(config, "workspace_root", "./cache/server_workspace")))
+        workspace_root = os.path.abspath(
+            str(getattr(config, "workspace_root", "./cache/server_workspace"))
+        )
         sample_pool_root = os.path.abspath(
             str(
                 getattr(
@@ -79,21 +99,27 @@ class OrchestrationSettings:
             default_num_epoch=int(getattr(cl_cfg, "num_epoch", 2)) if cl_cfg else 2,
             max_concurrent_jobs=int(getattr(cl_cfg, "max_concurrent_jobs", 2)) if cl_cfg else 2,
             batch_size=int(getattr(cl_cfg, "batch_size", 2)) if cl_cfg else 2,
-            trace_batch_size=int(getattr(cl_cfg, "trace_batch_size", 2)) if cl_cfg else 2,
+            trace_batch_size=int(getattr(cl_cfg, "trace_batch_size", 1)) if cl_cfg else 1,
             feature_cache=FeatureCacheSettings(
                 store_root_dir=os.path.abspath(
                     str(
                         getattr(
                             feature_cache_cfg,
                             "shard_root_dir",
-                            getattr(feature_cache_cfg, "store_root_dir", "./cache/cloud_feature_shards"),
+                            getattr(
+                                feature_cache_cfg, "store_root_dir", "./cache/cloud_feature_shards"
+                            ),
                         )
                     )
                 ),
                 view_root_dir=os.path.abspath(
                     str(getattr(feature_cache_cfg, "view_root_dir", "./cache/cloud_training_views"))
                 ),
-                storage_format=str(getattr(feature_cache_cfg, "storage_format", "safetensors_shard")).strip().lower(),
+                storage_format=str(
+                    getattr(feature_cache_cfg, "storage_format", "safetensors_shard")
+                )
+                .strip()
+                .lower(),
                 accepted_storage_formats=tuple(
                     str(item).strip().lower()
                     for item in list(
@@ -105,8 +131,14 @@ class OrchestrationSettings:
                         or []
                     )
                 ),
-                materialization_mode=str(getattr(feature_cache_cfg, "materialization_mode", "direct_ref")).strip().lower(),
-                view_source=str(getattr(feature_cache_cfg, "view_source", "canonical_active")).strip().lower(),
+                materialization_mode=str(
+                    getattr(feature_cache_cfg, "materialization_mode", "direct_ref")
+                )
+                .strip()
+                .lower(),
+                view_source=str(getattr(feature_cache_cfg, "view_source", "canonical_active"))
+                .strip()
+                .lower(),
             ),
             teacher_annotation=TeacherAnnotationSettings(
                 async_enabled=bool(getattr(teacher_cfg, "async_enabled", False)),
@@ -122,7 +154,9 @@ class OrchestrationSettings:
                 ),
             ),
             sample_pool=SamplePoolSettings(
-                enabled=bool(getattr(sample_pool_cfg, "enabled", True)) if sample_pool_cfg is not None else True,
+                enabled=bool(getattr(sample_pool_cfg, "enabled", True))
+                if sample_pool_cfg is not None
+                else True,
                 root_dir=sample_pool_root,
                 staging_root=os.path.abspath(
                     str(
@@ -142,28 +176,14 @@ class OrchestrationSettings:
                         )
                     )
                 ),
-                max_active_samples=None if raw_sample_pool_max in (None, "", 0) else int(raw_sample_pool_max),
-                shard_size=max(1, int(getattr(sample_pool_cfg, "shard_size", 64))) if sample_pool_cfg is not None else 64,
+                max_active_samples=None
+                if raw_sample_pool_max in (None, "", 0)
+                else int(raw_sample_pool_max),
+                shard_size=max(1, int(getattr(sample_pool_cfg, "shard_size", 64)))
+                if sample_pool_cfg is not None
+                else 64,
             ),
         )
-
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
-from cloud.orchestration.runtime_stage import (
-    FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
-    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
-    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
-    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
-    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
-    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
-    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
-    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
-    fixed_split_validation_batches as _fixed_split_validation_batches,
-    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
-    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
-    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
-)
-
 
 class PipelineLifecycleMixin:
     def __init__(self, config, large_object_detection: Object_Detection):
@@ -190,9 +210,7 @@ class PipelineLifecycleMixin:
                 configured_weights = os.path.abspath(configured_weights)
 
             if os.path.exists(configured_weights):
-                configured_model = self._known_model_name_for_weights_path(
-                    configured_weights
-                )
+                configured_model = self._known_model_name_for_weights_path(configured_weights)
                 if (
                     configured_model is not None
                     and configured_model
@@ -233,31 +251,24 @@ class PipelineLifecycleMixin:
         self.batch_size = settings.batch_size
         self.trace_batch_size = settings.trace_batch_size
         self.feature_cache_mode = (
-            str(getattr(cl_cfg, "feature_cache_mode", "auto"))
-            if cl_cfg
-            else "auto"
-        ).strip().lower()
+            (str(getattr(cl_cfg, "feature_cache_mode", "auto")) if cl_cfg else "auto")
+            .strip()
+            .lower()
+        )
         if self.feature_cache_mode not in {"auto", "memory", "disk"}:
             raise ValueError(
-                "server.continual_learning.feature_cache_mode must be one of: "
-                "auto, memory, disk."
+                "server.continual_learning.feature_cache_mode must be one of: auto, memory, disk."
             )
-        feature_cache_cfg = (
-            getattr(cl_cfg, "feature_cache", None)
-            if cl_cfg is not None
-            else None
-        )
+        feature_cache_cfg = getattr(cl_cfg, "feature_cache", None) if cl_cfg is not None else None
         self.feature_cache_view_source = settings.feature_cache.view_source
         if self.feature_cache_view_source != "canonical_active":
             raise ValueError(
-                "server.continual_learning.feature_cache.view_source must be "
-                "'canonical_active'."
+                "server.continual_learning.feature_cache.view_source must be 'canonical_active'."
             )
         self.feature_cache_materialization_mode = settings.feature_cache.materialization_mode
         if self.feature_cache_materialization_mode != "direct_ref":
             raise ValueError(
-                "server.continual_learning.feature_cache.materialization_mode must be "
-                "'direct_ref'."
+                "server.continual_learning.feature_cache.materialization_mode must be 'direct_ref'."
             )
         self.feature_cache_store_root_dir = settings.feature_cache.store_root_dir
         self.feature_cache_storage_format = settings.feature_cache.storage_format
@@ -282,9 +293,7 @@ class PipelineLifecycleMixin:
             getattr(feature_cache_cfg, "non_blocking_transfer", True)
         )
         self.feature_cache_view_root_dir = settings.feature_cache.view_root_dir
-        self.feature_cache_validate_refs = bool(
-            getattr(feature_cache_cfg, "validate_refs", True)
-        )
+        self.feature_cache_validate_refs = bool(getattr(feature_cache_cfg, "validate_refs", True))
         self.feature_cache_deep_validate_feature_payload = bool(
             getattr(feature_cache_cfg, "deep_validate_feature_payload", False)
         )
@@ -299,12 +308,8 @@ class PipelineLifecycleMixin:
             1,
             int(getattr(feature_cache_cfg, "feature_rebuild_batch_size", 16)),
         )
-        self.feature_cache_gc_enabled = bool(
-            getattr(feature_cache_cfg, "gc_enabled", False)
-        )
-        self.feature_cache_gc_dry_run = bool(
-            getattr(feature_cache_cfg, "gc_dry_run", True)
-        )
+        self.feature_cache_gc_enabled = bool(getattr(feature_cache_cfg, "gc_enabled", False))
+        self.feature_cache_gc_dry_run = bool(getattr(feature_cache_cfg, "gc_dry_run", True))
         removed_cl_fields = {
             "rebuild_batch_size": (
                 "server.continual_learning.rebuild_batch_size has been removed; "
@@ -325,35 +330,28 @@ class PipelineLifecycleMixin:
                 if getattr(cl_cfg, field_name, None) is not None:
                     raise ValueError(message)
         self.default_split_learning_rate = (
-            float(getattr(cl_cfg, "split_learning_rate", 1e-3))
-            if cl_cfg else 1e-3
+            float(getattr(cl_cfg, "split_learning_rate", 1e-3)) if cl_cfg else 1e-3
         )
         self.teacher_annotation_threshold = (
-            float(getattr(cl_cfg, "teacher_annotation_threshold", 0.6))
-            if cl_cfg else 0.6
+            float(getattr(cl_cfg, "teacher_annotation_threshold", 0.6)) if cl_cfg else 0.6
         )
         self.teacher_batch_size = (
             int(getattr(cl_cfg, "teacher_batch_size", self.batch_size))
-            if cl_cfg else self.batch_size
+            if cl_cfg
+            else self.batch_size
         )
         teacher_settings = settings.teacher_annotation
         self.teacher_annotation_async_enabled = teacher_settings.async_enabled
         self.teacher_annotation_cache_enabled = teacher_settings.cache_enabled
         self.teacher_annotation_wait_timeout_sec = teacher_settings.wait_timeout_sec
         self.teacher_annotation_worker_batch_size = teacher_settings.worker_batch_size
-        self.teacher_annotation_worker_max_queue_size = (
-            teacher_settings.worker_max_queue_size
-        )
+        self.teacher_annotation_worker_max_queue_size = teacher_settings.worker_max_queue_size
         self.teacher_annotation_worker_max_retries = teacher_settings.worker_max_retries
         self.teacher_annotation_oom_retry_enabled = teacher_settings.oom_retry_enabled
-        self.teacher_annotation_min_worker_batch_size = (
-            teacher_settings.min_worker_batch_size
-        )
+        self.teacher_annotation_min_worker_batch_size = teacher_settings.min_worker_batch_size
         self.teacher_annotation_cache_root = teacher_settings.cache_root_dir
         raw_proxy_eval_interval_epochs = (
-            getattr(cl_cfg, "proxy_eval_interval_epochs", None)
-            if cl_cfg
-            else None
+            getattr(cl_cfg, "proxy_eval_interval_epochs", None) if cl_cfg else None
         )
         if raw_proxy_eval_interval_epochs is None and cl_cfg:
             raw_proxy_eval_interval_epochs = getattr(cl_cfg, "proxy_eval_interval_rounds", 10)
@@ -363,62 +361,48 @@ class PipelineLifecycleMixin:
             else 10
         )
         self.proxy_eval_interval_rounds = self.proxy_eval_interval_epochs
-        self.proxy_eval_patience = (
-            int(getattr(cl_cfg, "proxy_eval_patience", 2))
-            if cl_cfg else 2
-        )
+        self.proxy_eval_patience = int(getattr(cl_cfg, "proxy_eval_patience", 2)) if cl_cfg else 2
         self.proxy_eval_min_delta = (
-            float(getattr(cl_cfg, "proxy_eval_min_delta", 0.002))
-            if cl_cfg else 0.002
+            float(getattr(cl_cfg, "proxy_eval_min_delta", 0.002)) if cl_cfg else 0.002
         )
         self.wrapper_fixed_split_learning_rate = (
-            float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5))
-            if cl_cfg else 3e-5
+            float(getattr(cl_cfg, "wrapper_fixed_split_learning_rate", 3e-5)) if cl_cfg else 3e-5
         )
         self.tinynext_fixed_split_learning_rate = (
-            float(getattr(cl_cfg, "tinynext_fixed_split_learning_rate", 1e-3))
-            if cl_cfg else 1e-3
+            float(getattr(cl_cfg, "tinynext_fixed_split_learning_rate", 1e-3)) if cl_cfg else 1e-3
         )
         self.rfdetr_fixed_split_learning_rate = (
-            float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4))
-            if cl_cfg else 1e-4
+            float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4)) if cl_cfg else 1e-4
         )
         self.tinynext_fixed_split_target_steps_per_round = (
-            int(getattr(cl_cfg, "tinynext_fixed_split_target_steps_per_round", 4))
-            if cl_cfg else 4
+            int(getattr(cl_cfg, "tinynext_fixed_split_target_steps_per_round", 4)) if cl_cfg else 4
         )
         self.yolo_fixed_split_target_steps_per_round = (
-            int(getattr(cl_cfg, "yolo_fixed_split_target_steps_per_round", 4))
-            if cl_cfg else 4
+            int(getattr(cl_cfg, "yolo_fixed_split_target_steps_per_round", 4)) if cl_cfg else 4
         )
         self.rfdetr_fixed_split_target_steps_per_round = (
-            int(getattr(cl_cfg, "rfdetr_fixed_split_target_steps_per_round", 4))
-            if cl_cfg else 4
+            int(getattr(cl_cfg, "rfdetr_fixed_split_target_steps_per_round", 4)) if cl_cfg else 4
         )
-        raw_proxy_eval_max_samples = getattr(cl_cfg, "proxy_eval_max_samples", None) if cl_cfg else None
+        raw_proxy_eval_max_samples = (
+            getattr(cl_cfg, "proxy_eval_max_samples", None) if cl_cfg else None
+        )
         self.proxy_eval_max_samples = (
-            128
-            if raw_proxy_eval_max_samples in (None, "")
-            else int(raw_proxy_eval_max_samples)
+            128 if raw_proxy_eval_max_samples in (None, "") else int(raw_proxy_eval_max_samples)
         )
         raw_threshold_candidates = (
-            getattr(cl_cfg, "proxy_eval_threshold_candidates", None)
-            if cl_cfg else None
+            getattr(cl_cfg, "proxy_eval_threshold_candidates", None) if cl_cfg else None
         )
         if isinstance(raw_threshold_candidates, (list, tuple)):
             self.proxy_eval_threshold_candidates = [
-                float(candidate)
-                for candidate in raw_threshold_candidates
+                float(candidate) for candidate in raw_threshold_candidates
             ]
         else:
             self.proxy_eval_threshold_candidates = None
         self.proxy_eval_frame_cache_enabled = (
-            bool(getattr(cl_cfg, "proxy_eval_frame_cache_enabled", True))
-            if cl_cfg else True
+            bool(getattr(cl_cfg, "proxy_eval_frame_cache_enabled", True)) if cl_cfg else True
         )
         self.connectivity_smoke_only = (
-            bool(getattr(cl_cfg, "connectivity_smoke_only", False))
-            if cl_cfg else False
+            bool(getattr(cl_cfg, "connectivity_smoke_only", False)) if cl_cfg else False
         )
         self.workspace_root = settings.workspace_root
         os.makedirs(self.feature_cache_store_root_dir, exist_ok=True)
@@ -443,9 +427,7 @@ class PipelineLifecycleMixin:
             if sample_pool_cfg is not None
             else False
         )
-        self._fixed_split_runtime_template_cache = (
-            get_fixed_split_runtime_template_cache()
-        )
+        self._fixed_split_runtime_template_cache = get_fixed_split_runtime_template_cache()
 
         # Dynamic Activation Sparsity (SURGEON) config
         das_cfg = getattr(config, "das", None)
@@ -471,10 +453,7 @@ class PipelineLifecycleMixin:
             enabled=self.teacher_annotation_cache_enabled,
         )
         self.teacher_annotation_worker: TeacherAnnotationWorker | None = None
-        if (
-            self.teacher_annotation_async_enabled
-            and self.teacher_annotation_cache_enabled
-        ):
+        if self.teacher_annotation_async_enabled and self.teacher_annotation_cache_enabled:
             self.teacher_annotation_worker = TeacherAnnotationWorker(
                 label_cache=self.teacher_label_cache,
                 batch_inference=getattr(self.large_od, "large_inference_batch", None),
@@ -501,11 +480,9 @@ class PipelineLifecycleMixin:
             self.teacher_annotation_cache_root,
         )
 
-
     def close(self) -> None:
         if self.teacher_annotation_worker is not None:
             self.teacher_annotation_worker.stop()
-
 
     def _edge_lock(self, edge_id: int | str) -> threading.Lock:
         edge_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(edge_id).strip()) or "unknown"
@@ -515,7 +492,6 @@ class PipelineLifecycleMixin:
                 lock = threading.Lock()
                 self._edge_locks[edge_key] = lock
             return lock
-
 
     @contextmanager
     def _training_job_scope(self, edge_id: int | str):
@@ -541,7 +517,6 @@ class PipelineLifecycleMixin:
                 else:
                     with self._job_state_lock:
                         self._queued_jobs = max(0, self._queued_jobs - 1)
-
 
     def training_queue_state(self) -> tuple[int, int]:
         with self._job_state_lock:
