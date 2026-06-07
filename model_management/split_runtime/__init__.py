@@ -4,20 +4,6 @@ from typing import Any
 
 import torch
 
-from .torchlens_native_runtime import (
-    TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
-    BoundaryPayload,
-    SplitRuntimeConfig,
-    SplitRuntime,
-    SplitSpec,
-    build_replay_runtime,
-    build_split_runtime,
-    get_split_runtime_metadata,
-    make_split_spec,
-    maybe_warmup_runtime,
-    prepare_split_replay_runtime,
-    prepare_split_runtime,
-)
 from .boundary_cache import BOUNDARY_CACHE_PROTOCOL, BoundaryPayloadCacheCodec
 from .detection_adapters import (
     DetectionSplitAdapter,
@@ -43,6 +29,22 @@ from .template import (
     bind_request_runtime_from_template,
     fixed_split_runtime_template_key,
     get_fixed_split_runtime_template_cache,
+)
+from .torchlens_native_runtime import (
+    TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
+    BoundaryPayload,
+    SplitCandidateMetadata,
+    SplitRuntime,
+    SplitRuntimeConfig,
+    SplitSpec,
+    build_replay_runtime,
+    build_split_runtime,
+    get_split_runtime_metadata,
+    make_split_spec,
+    maybe_warmup_runtime,
+    prepare_split_replay_runtime,
+    prepare_split_runtime,
+    resolve_split_candidate_metadata,
 )
 
 
@@ -127,6 +129,7 @@ __all__ = [
     "PlankDetectionSplitAdapter",
     "RuntimeCache",
     "RuntimeCacheKey",
+    "SplitCandidateMetadata",
     "SplitRuntimeConfig",
     "SplitRuntime",
     "SplitRuntimeError",
@@ -146,6 +149,7 @@ __all__ = [
     "prepare_split_runtime",
     "prepare_split_replay_runtime",
     "reduce_output_to_loss",
+    "resolve_split_candidate_metadata",
     "select_detection_adapter",
     "maybe_warmup_runtime",
 ]

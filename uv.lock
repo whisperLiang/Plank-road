@@ -1733,7 +1733,7 @@ requires-dist = [
     { name = "timm", specifier = ">=1.0.26" },
     { name = "timm", marker = "extra == 'integration'", specifier = ">=1.0.26" },
     { name = "torch", specifier = ">=2.11.0" },
-    { name = "torchlens", path = "torchlens-2.17.0-py3-none-any.whl" },
+    { name = "torchlens", path = "torchlens-2.18.0-py3-none-any.whl" },
     { name = "torchvision", specifier = ">=0.26.0" },
     { name = "torchvision", marker = "extra == 'integration'", specifier = ">=0.26.0" },
     { name = "tqdm", specifier = ">=4.66" },
@@ -2637,8 +2637,8 @@ wheels = [
 
 [[package]]
 name = "torchlens"
-version = "2.17.0"
-source = { path = "torchlens-2.17.0-py3-none-any.whl" }
+version = "2.18.0"
+source = { path = "torchlens-2.18.0-py3-none-any.whl" }
 dependencies = [
     { name = "graphviz" },
     { name = "numpy" },
@@ -2648,7 +2648,7 @@ dependencies = [
     { name = "tqdm" },
 ]
 wheels = [
-    { filename = "torchlens-2.17.0-py3-none-any.whl", hash = "sha256:e546b11501d8d02005bca20eadeefdee3cceeb58d5423145993f6897ecfbdfbb" },
+    { filename = "torchlens-2.18.0-py3-none-any.whl", hash = "sha256:3dd94165a345a77bc9dd093be4ca84aecb296ae11b7a3994b44a4e9e0caed128" },
 ]
 
 [package.metadata]

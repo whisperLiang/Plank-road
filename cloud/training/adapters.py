@@ -3,17 +3,29 @@ from __future__ import annotations
 import time
 from typing import Any, Mapping, Protocol
 
-from model_management.universal_model_split import (
-    build_split_retrain_optimizer,
-    universal_split_retrain,
-)
-
 from cloud.training.types import (
     EpochTrainResult,
     FixedSplitTrainingContext,
     ProxyEvalResult,
     ProxyMetrics,
 )
+from model_management.universal_model_split import (
+    build_split_retrain_optimizer,
+    universal_split_retrain,
+)
+from model_management.universal_model_split import (
+    train_split_suffix_batch as _train_split_suffix_batch,
+)
+
+
+def train_split_suffix_batch(
+    runtime: Any,
+    boundary: Any,
+    targets: Any,
+    loss_fn: Any,
+    optimizer: Any,
+) -> Any:
+    return _train_split_suffix_batch(runtime, boundary, targets, loss_fn, optimizer)
 
 
 class DetectionTrainingAdapter(Protocol):

@@ -11,7 +11,7 @@ from loguru import logger
 from .runtime_cache import RuntimeCacheKey, make_runtime_cache_key
 from .torchlens_native_runtime import SplitRuntime, SplitSpec, prepare_split_runtime
 
-FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 4
+FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -57,9 +57,9 @@ def fixed_split_runtime_template_key(
     )
     return FixedSplitRuntimeTemplateKey(
         **key.__dict__,
-        trace_batch_size=None if trace_batch_size is None else int(trace_batch_size),
-        validated_batch_max=None if validated_batch_max is None else int(validated_batch_max),
-        runtime_batch_validation_signature=runtime_batch_validation_signature,
+        trace_batch_size=None,
+        validated_batch_max=None,
+        runtime_batch_validation_signature=None,
     )
 
 
@@ -112,7 +112,10 @@ class FixedSplitRuntimeTemplateCache:
         with self._lock:
             cached = self._templates.get(cache_key)
             if cached is not None:
-                logger.info("[FixedSplitCL] TorchLens runtime template cache hit (key={}).", cache_key)
+                logger.info(
+                    "[FixedSplitCL] TorchLens runtime template cache hit (key={}).",
+                    cache_key,
+                )
                 return FixedSplitRuntimeTemplateLookup(template=cached, cache_status="hit")
 
             inflight = self._inflight.get(cache_key)
@@ -120,10 +123,16 @@ class FixedSplitRuntimeTemplateCache:
                 inflight = _InflightTemplateBuild(event=threading.Event())
                 self._inflight[cache_key] = inflight
                 build_owner = True
-                logger.info("[FixedSplitCL] TorchLens runtime template cache miss (key={}).", cache_key)
+                logger.info(
+                    "[FixedSplitCL] TorchLens runtime template cache miss (key={}).",
+                    cache_key,
+                )
             else:
                 build_owner = False
-                logger.info("[FixedSplitCL] Waiting for TorchLens runtime template build (key={}).", cache_key)
+                logger.info(
+                    "[FixedSplitCL] Waiting for TorchLens runtime template build (key={}).",
+                    cache_key,
+                )
 
         if not build_owner:
             wait_started = time.perf_counter()
@@ -132,7 +141,10 @@ class FixedSplitRuntimeTemplateCache:
             if inflight.error is not None:
                 raise inflight.error
             if inflight.template is None:
-                raise RuntimeError(f"TorchLens runtime template build completed without a template (key={cache_key}).")
+                raise RuntimeError(
+                    "TorchLens runtime template build completed without a template "
+                    f"(key={cache_key})."
+                )
             return FixedSplitRuntimeTemplateLookup(
                 template=inflight.template,
                 cache_status="wait",

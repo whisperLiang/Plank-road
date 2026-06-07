@@ -5,24 +5,32 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import torch
-from torchlens.options import CaptureOptions, VisualizationOptions
-from torchlens.split import (
-    ReplayBoundary,
-    SplitRuntime,
-    SplitSpec,
-)
-from torchlens.split.codegen import build_segments
-from torchlens.split.planner import plan_split
-from torchlens.split.shape import infer_traced_batch_size
-from torchlens.split.trace_graph import trace_graph_from_model_log
-from torchlens.user_funcs import log_forward_pass
+import torchlens as tl
 
 from .torchlens_forward_guard import torchlens_forward_guard
 
-
-TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "plank-road-torchlens-native-runtime-v1"
+TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "plank-road-torchlens-native-runtime-v2"
 DEFAULT_SPLIT_MODE = "generated_eager"
-BoundaryPayload = ReplayBoundary
+BoundaryPayload = tl.ReplayBoundary
+ReplayBoundary = tl.ReplayBoundary
+SplitRuntime = tl.SplitRuntime
+SplitSpec = tl.SplitSpec
+
+
+def require_torchlens_native_split_api() -> None:
+    required = [
+        "SplitSpec",
+        "ReplayBoundary",
+        "SplitRuntime",
+        "prepare_split",
+        "prepare_split_replay",
+    ]
+    missing = [name for name in required if not hasattr(tl, name)]
+    if missing:
+        raise RuntimeError(
+            "Installed torchlens wheel does not expose native split API: "
+            + ", ".join(missing)
+        )
 
 
 @dataclass(frozen=True)
@@ -32,6 +40,19 @@ class SplitRuntimeConfig:
     trace_batch_size: int = 2
     mode: Literal["generated_eager", "compiled"] = DEFAULT_SPLIT_MODE
     trainable: bool = True
+
+
+@dataclass(frozen=True)
+class SplitCandidateMetadata:
+    """Metadata-only split resolution used by fixed candidate enumeration."""
+
+    requested_boundary: str
+    actual_split_id: str
+    split_label: str
+    graph_signature: str
+    boundary_nodes: tuple[str, ...]
+    prefix_nodes: tuple[str, ...]
+    suffix_nodes: tuple[str, ...]
 
 
 def torchlens_runtime_version() -> str:
@@ -103,68 +124,6 @@ def _spec_with_mode(split_spec: SplitSpec | str, mode: str | None) -> SplitSpec:
     return replace(spec, mode=normalized_mode)
 
 
-def _prepare_split_without_deprecated_options(
-    model: torch.nn.Module,
-    example_inputs: Any,
-    spec: SplitSpec,
-) -> SplitRuntime:
-    inputs = normalize_example_inputs(example_inputs)
-    model_log = log_forward_pass(
-        model,
-        inputs,
-        {},
-        capture=CaptureOptions(
-            layers_to_save="all",
-            keep_unsaved_layers=True,
-            detach_saved_tensors=False,
-            save_function_args=True,
-            intervention_ready=True,
-        ),
-        visualization=VisualizationOptions(view="none"),
-    )
-    traced_batch_size = infer_traced_batch_size(inputs)
-    graph = trace_graph_from_model_log(
-        model_log,
-        traced_batch_size=traced_batch_size,
-        batch_symbol=spec.batch_symbol,
-        dynamic_batch=spec.dynamic_batch,
-    )
-    plan = plan_split(graph, spec)
-    segments = build_segments(graph, plan, mode=spec.mode)
-    return SplitRuntime(
-        model=model,
-        trace_graph=graph,
-        split_spec=spec,
-        plan=plan,
-        segments=segments,
-    )
-
-
-def prepare_split(
-    model: torch.nn.Module,
-    example_inputs: Any,
-    spec: SplitSpec,
-) -> SplitRuntime:
-    return _prepare_split_without_deprecated_options(model, example_inputs, spec)
-
-
-def prepare_split_replay(
-    model: torch.nn.Module,
-    example_inputs: Any,
-    spec: SplitSpec,
-) -> SplitRuntime:
-    replay_spec = SplitSpec(
-        boundary=spec.boundary,
-        batch_symbol=spec.batch_symbol,
-        dynamic_batch=spec.dynamic_batch,
-        trainable=False,
-        trace_batch_mode=spec.trace_batch_mode,
-        device_policy=spec.device_policy,
-        mode=spec.mode,
-    )
-    return prepare_split(model, example_inputs, replay_spec)
-
-
 def prepare_split_runtime(
     model: torch.nn.Module,
     example_inputs: Any,
@@ -175,7 +134,16 @@ def prepare_split_runtime(
 
     spec = _spec_with_mode(split_spec, mode)
     with torchlens_forward_guard():
-        return prepare_split(model, normalize_example_inputs(example_inputs), spec)
+        require_torchlens_native_split_api()
+        try:
+            return tl.prepare_split(model, normalize_example_inputs(example_inputs), spec)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to build TorchLens native split runtime with the installed "
+                "torchlens wheel. Please ensure the new torchlens.whl exposing "
+                "SplitSpec, ReplayBoundary, SplitRuntime, prepare_split, and "
+                "prepare_split_replay is installed."
+            ) from exc
 
 
 def prepare_split_replay_runtime(
@@ -188,7 +156,89 @@ def prepare_split_replay_runtime(
 
     spec = _spec_with_mode(split_spec, mode)
     with torchlens_forward_guard():
-        return prepare_split_replay(model, normalize_example_inputs(example_inputs), spec)
+        require_torchlens_native_split_api()
+        try:
+            return tl.prepare_split_replay(model, normalize_example_inputs(example_inputs), spec)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to build TorchLens native replay runtime with the installed "
+                "torchlens wheel. Please ensure the new torchlens.whl exposing "
+                "SplitSpec, ReplayBoundary, SplitRuntime, prepare_split, and "
+                "prepare_split_replay is installed."
+            ) from exc
+
+
+def resolve_split_candidate_metadata(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    split_specs: list[SplitSpec | str] | tuple[SplitSpec | str, ...],
+    *,
+    mode: str | None = None,
+) -> list[SplitCandidateMetadata]:
+    """Resolve candidate split ids without constructing SplitRuntime objects.
+
+    This is the only remaining TorchLens plan-metadata path in the adapter. It
+    preserves Plank-road's existing candidate selection semantics while keeping
+    final selected runtime construction on the public ``tl.prepare_split`` API.
+    It intentionally does not lower executable prefix/suffix segments.
+    """
+
+    specs = [_spec_with_mode(split_spec, mode) for split_spec in split_specs]
+    inputs = normalize_example_inputs(example_inputs)
+    with torchlens_forward_guard():
+        require_torchlens_native_split_api()
+        try:
+            from torchlens.options import CaptureOptions, VisualizationOptions
+            from torchlens.split.planner import plan_split
+            from torchlens.split.shape import infer_traced_batch_size
+            from torchlens.split.trace_graph import trace_graph_from_model_log
+            from torchlens.user_funcs import log_forward_pass
+        except Exception as exc:  # pragma: no cover - import failure is wheel-specific.
+            raise RuntimeError(
+                "TorchLens candidate metadata resolution requires the installed "
+                "torchlens wheel to expose split planning metadata internals. "
+                "Final runtime construction still uses the public native split API."
+            ) from exc
+        model_log = log_forward_pass(
+            model,
+            inputs,
+            {},
+            capture=CaptureOptions(
+                layers_to_save="all",
+                keep_unsaved_layers=True,
+                detach_saved_tensors=False,
+                save_function_args=True,
+                intervention_ready=True,
+            ),
+            visualization=VisualizationOptions(view="none"),
+        )
+        graph = trace_graph_from_model_log(
+            model_log,
+            traced_batch_size=infer_traced_batch_size(inputs),
+            batch_symbol=specs[0].batch_symbol if specs else "B",
+            dynamic_batch=specs[0].dynamic_batch if specs else None,
+        )
+        resolved: list[SplitCandidateMetadata] = []
+        for spec in specs:
+            plan = plan_split(graph, spec)
+            resolved.append(
+                SplitCandidateMetadata(
+                    requested_boundary=str(spec.boundary),
+                    actual_split_id=str(getattr(plan, "split_id", spec.boundary)),
+                    split_label=str(getattr(plan, "split_label", "")),
+                    graph_signature=str(getattr(graph, "graph_shape_hash", "") or ""),
+                    boundary_nodes=tuple(
+                        str(item) for item in getattr(plan, "boundary_nodes", ()) or ()
+                    ),
+                    prefix_nodes=tuple(
+                        str(item) for item in getattr(plan, "prefix_nodes", ()) or ()
+                    ),
+                    suffix_nodes=tuple(
+                        str(item) for item in getattr(plan, "suffix_nodes", ()) or ()
+                    ),
+                )
+            )
+        return resolved
 
 
 def _require_batch_gt1(example_batch: torch.Tensor) -> None:
@@ -258,6 +308,7 @@ __all__ = [
     "SplitRuntime",
     "SplitRuntimeConfig",
     "SplitSpec",
+    "SplitCandidateMetadata",
     "TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION",
     "build_replay_runtime",
     "build_split_runtime",
@@ -267,6 +318,8 @@ __all__ = [
     "normalize_example_inputs",
     "prepare_split_replay_runtime",
     "prepare_split_runtime",
+    "require_torchlens_native_split_api",
+    "resolve_split_candidate_metadata",
     "torchlens_runtime_version",
     "trace_signature",
 ]

@@ -178,7 +178,7 @@ Plank-road/
 ### Recommended Environment
 
 The current lockfile has been validated with:
-- `torchlens==2.17.0` from the checked-in local wheel
+- `torchlens==2.18.0` from the checked-in local wheel
 - `numpy==2.2.6`
 - `opencv-python==4.11.0.86`
 

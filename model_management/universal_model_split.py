@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 from loguru import logger
-from torchlens.split.planner import plan_split
 
 from cloud.feature_cache.shard_reader import ShardFeatureBatchReader
 from cloud.feature_cache.types import FeatureShardRef
@@ -21,7 +20,6 @@ from model_management.payload import (
 )
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 from model_management.split_runtime import (
-    BOUNDARY_CACHE_PROTOCOL,
     BoundaryPayloadCacheCodec,
     SplitRuntime,
     SplitSpec,
@@ -120,6 +118,31 @@ def _move_boundary_to_runtime_device(runtime: Any, boundary: BoundaryPayload) ->
     return codec.to_runtime_device(boundary)
 
 
+def train_split_suffix_batch(
+    runtime: Any,
+    boundary: BoundaryPayload,
+    targets: Any,
+    loss_fn: Any,
+    optimizer: torch.optim.Optimizer | None,
+) -> torch.Tensor:
+    """Train one split-suffix batch through TorchLens.
+
+    TorchLens SplitRuntime.train_suffix owns zero_grad, backward, and
+    optimizer.step. This helper only adapts Plank-road boundaries to the runtime
+    device and returns the detached loss.
+    """
+
+    runtime_obj = _runtime_from_splitter(runtime)
+    boundary = _move_boundary_to_runtime_device(runtime_obj, boundary)
+    loss, _boundary_grads = runtime_obj.train_suffix(
+        boundary,
+        targets,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+    )
+    return loss
+
+
 def _runtime_trace_signature(runtime: Any) -> str:
     graph = getattr(runtime, "trace_graph", None)
     return str(getattr(graph, "graph_shape_hash", "") or "")
@@ -210,7 +233,10 @@ def _parameter_logs_for_node(node: Any) -> list[Any]:
     return list(getattr(getattr(node, "layer", None), "parent_param_logs", []) or [])
 
 
-def _parameter_from_log(log: Any, named_parameters: Mapping[str, torch.nn.Parameter]) -> torch.nn.Parameter | None:
+def _parameter_from_log(
+    log: Any,
+    named_parameters: Mapping[str, torch.nn.Parameter],
+) -> torch.nn.Parameter | None:
     param = getattr(log, "_param_ref", None)
     if isinstance(param, torch.nn.Parameter):
         return param
@@ -287,7 +313,11 @@ def _candidate_from_plan(runtime: SplitRuntime, split_spec: SplitSpec, plan: Any
     boundary_labels = list(getattr(plan, "boundary_nodes", ()) or ())
     specs = dict(getattr(plan, "boundary_specs", {}) or {})
     payload_bytes = _payload_bytes_from_specs(specs)
-    total_nodes = [str(getattr(node, "torchlens_label", "")) for node in graph.ordered_nodes()] if graph else []
+    total_nodes = (
+        [str(getattr(node, "torchlens_label", "")) for node in graph.ordered_nodes()]
+        if graph
+        else []
+    )
     edge_parameter_count = _parameter_count_for_nodes(runtime, prefix_nodes)
     suffix_parameter_count = _parameter_count_for_nodes(runtime, suffix_nodes)
     total_parameter_count = _parameter_count_for_nodes(runtime, total_nodes)
@@ -296,8 +326,12 @@ def _candidate_from_plan(runtime: SplitRuntime, split_spec: SplitSpec, plan: Any
         if total_parameter_count > 0
         else 0.0
     )
-    privacy_risk = 1.0 / float(edge_parameter_count) if edge_parameter_count > 0 else float("inf")
-    split_id = _normalise_after_id(getattr(plan, "split_label", None) or getattr(plan, "split_id", None))
+    privacy_risk = (
+        1.0 / float(edge_parameter_count) if edge_parameter_count > 0 else float("inf")
+    )
+    split_id = _normalise_after_id(
+        getattr(plan, "split_label", None) or getattr(plan, "split_id", None)
+    )
     split_id = split_id or str(getattr(plan, "split_id", split_spec.boundary))
     return SplitCandidate(
         candidate_id=split_id,
@@ -313,7 +347,9 @@ def _candidate_from_plan(runtime: SplitRuntime, split_spec: SplitSpec, plan: Any
         estimated_payload_bytes=payload_bytes,
         estimated_privacy_risk=privacy_risk,
         estimated_latency=float(payload_bytes),
-        is_trainable_tail=suffix_parameter_count > 0 or bool(getattr(split_spec, "trainable", True)),
+        is_trainable_tail=(
+            suffix_parameter_count > 0 or bool(getattr(split_spec, "trainable", True))
+        ),
         is_validated=True,
         legacy_layer_index=_candidate_legacy_index(runtime, plan),
         boundary_count=len(boundary_labels),
@@ -499,13 +535,15 @@ class UniversalModelSplitter:
         if requested_boundary == "auto":
             logger.info(
                 "[FixedSplit] TorchLens trace probe runtime completed in {:.3f}s "
-                "(trace_probe_split_id={}; final split will be selected from enumerated candidates).",
+                "(trace_probe_split_id={}; final split will be selected from "
+                "enumerated candidates).",
                 time.perf_counter() - prepare_started,
                 getattr(self.runtime, "split_id", None),
             )
         else:
             logger.info(
-                "[FixedSplit] TorchLens prepare_split_runtime completed in {:.3f}s (split_id={}).",
+                "[FixedSplit] TorchLens prepare_split_runtime completed in {:.3f}s "
+                "(split_id={}).",
                 time.perf_counter() - prepare_started,
                 getattr(self.runtime, "split_id", None),
             )
@@ -535,14 +573,23 @@ class UniversalModelSplitter:
         self._last_replay_validation = None
         return self
 
-    def bind_graph(self, model: torch.nn.Module, graph: Any, **_: Any) -> "UniversalModelSplitter":
+    def bind_graph(
+        self,
+        model: torch.nn.Module,
+        graph: Any,
+        **_: Any,
+    ) -> "UniversalModelSplitter":
         if isinstance(graph, SplitRuntime):
             return self.bind_runtime(graph, model=model)
-        raise RuntimeError("Graph templates are no longer supported; bind a TorchLens SplitRuntime.")
+        raise RuntimeError(
+            "Graph templates are no longer supported; bind a TorchLens SplitRuntime."
+        )
 
     def _ensure_runtime(self) -> SplitRuntime:
         if self.runtime is None:
-            raise RuntimeError("prepare_split_runtime() or trace() must be called before split execution.")
+            raise RuntimeError(
+                "prepare_split_runtime() or trace() must be called before split execution."
+            )
         return self.runtime
 
     def _bind_candidate_id(self, candidate_id: str) -> SplitCandidate:
@@ -550,10 +597,21 @@ class UniversalModelSplitter:
         if self.model is None or self._trace_sample_input is None:
             if self.current_candidate and self.current_candidate.candidate_id == candidate_id:
                 return self.current_candidate
-            raise KeyError(f"TorchLens split candidate {candidate_id!r} is not available for rebinding.")
-        base_spec = self.split_spec or getattr(runtime, "split_spec", None) or make_split_spec(candidate_id)
+            raise KeyError(
+                f"TorchLens split candidate {candidate_id!r} is not available for rebinding."
+            )
+        base_spec = (
+            self.split_spec
+            or getattr(runtime, "split_spec", None)
+            or make_split_spec(candidate_id)
+        )
         exact_spec = replace(base_spec, boundary=_normalise_after_key(candidate_id))
-        self.runtime = prepare_split_runtime(self.model, self._trace_sample_input, exact_spec, mode=exact_spec.mode)
+        self.runtime = prepare_split_runtime(
+            self.model,
+            self._trace_sample_input,
+            exact_spec,
+            mode=exact_spec.mode,
+        )
         self.split_spec = exact_spec
         self.graph = _runtime_trace_signature(self.runtime)
         self.current_candidate = _candidate_from_runtime(self.runtime, exact_spec)
@@ -571,7 +629,10 @@ class UniversalModelSplitter:
     ) -> SplitCandidate:
         del layer_index, boundary_tensor_labels
         if candidate is not None:
-            if self.current_candidate and self.current_candidate.candidate_id == candidate.candidate_id:
+            if (
+                self.current_candidate
+                and self.current_candidate.candidate_id == candidate.candidate_id
+            ):
                 return self.current_candidate
             if self.model is not None and self._trace_sample_input is not None:
                 return self._bind_candidate_id(candidate.candidate_id)
@@ -585,7 +646,9 @@ class UniversalModelSplitter:
             runtime = self._ensure_runtime()
             self.current_candidate = _candidate_from_runtime(
                 runtime,
-                self.split_spec or getattr(runtime, "split_spec", None) or make_split_spec(runtime.split_id),
+                self.split_spec
+                or getattr(runtime, "split_spec", None)
+                or make_split_spec(runtime.split_id),
             )
         return self.current_candidate
 
@@ -597,10 +660,20 @@ class UniversalModelSplitter:
         max_boundary_count = kwargs.get("max_boundary_count")
         max_payload_bytes = kwargs.get("max_payload_bytes")
         max_candidates = kwargs.get("max_candidates")
-        base_spec = self.split_spec or getattr(runtime, "split_spec", None) or make_split_spec("50%")
+        base_spec = (
+            self.split_spec
+            or getattr(runtime, "split_spec", None)
+            or make_split_spec("50%")
+        )
         candidates: list[SplitCandidate] = []
+        # Metadata-only candidate enumeration. Final selected runtime construction
+        # remains centralized in prepare_split_runtime/tl.prepare_split.
+        from torchlens.split.planner import plan_split
+
         for node in graph.ordered_nodes():
-            if bool(getattr(node, "is_input", False)) or bool(getattr(node, "is_output", False)):
+            if bool(getattr(node, "is_input", False)) or bool(
+                getattr(node, "is_output", False)
+            ):
                 continue
             boundary = f"after:{node.torchlens_label}"
             try:
@@ -609,9 +682,15 @@ class UniversalModelSplitter:
             except Exception:
                 continue
             candidate = _candidate_from_plan(runtime, spec, plan)
-            if max_boundary_count is not None and candidate.boundary_count > int(max_boundary_count):
+            if (
+                max_boundary_count is not None
+                and candidate.boundary_count > int(max_boundary_count)
+            ):
                 continue
-            if max_payload_bytes is not None and candidate.estimated_payload_bytes > int(max_payload_bytes):
+            if (
+                max_payload_bytes is not None
+                and candidate.estimated_payload_bytes > int(max_payload_bytes)
+            ):
                 continue
             candidates.append(candidate)
         candidates.sort(
@@ -641,7 +720,12 @@ class UniversalModelSplitter:
             self.candidates = [candidate]
         return candidate
 
-    def edge_forward(self, *args: Any, candidate: SplitCandidate | None = None, **kwargs: Any) -> BoundaryPayload:
+    def edge_forward(
+        self,
+        *args: Any,
+        candidate: SplitCandidate | None = None,
+        **kwargs: Any,
+    ) -> BoundaryPayload:
         del candidate
         if kwargs:
             raise RuntimeError("TorchLens prefix execution expects positional runtime inputs.")
@@ -683,7 +767,14 @@ class UniversalModelSplitter:
         )
         return None, loss
 
-    def train_suffix(self, boundary: BoundaryPayload, targets: Any, *, loss_fn=None, optimizer=None):
+    def train_suffix(
+        self,
+        boundary: BoundaryPayload,
+        targets: Any,
+        *,
+        loss_fn=None,
+        optimizer=None,
+    ):
         runtime = self._ensure_runtime()
         return runtime.train_suffix(
             _move_boundary_to_runtime_device(runtime, boundary),
@@ -716,7 +807,11 @@ class UniversalModelSplitter:
 
     full_replay = full_forward
 
-    def validate_candidate(self, candidate: SplitCandidate | None = None, **_: Any) -> dict[str, Any]:
+    def validate_candidate(
+        self,
+        candidate: SplitCandidate | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
         chosen = candidate or self.current_candidate
         if self.runtime is None:
             return {
@@ -725,7 +820,11 @@ class UniversalModelSplitter:
                 "runtime": "torchlens_native",
                 "error": "runtime is not prepared",
             }
-        if candidate is not None and self.current_candidate and candidate.candidate_id != self.current_candidate.candidate_id:
+        if (
+            candidate is not None
+            and self.current_candidate
+            and candidate.candidate_id != self.current_candidate.candidate_id
+        ):
             try:
                 chosen = self.split(candidate=candidate)
             except Exception as exc:
@@ -758,7 +857,10 @@ class UniversalModelSplitter:
         del chosen
         collect_suffix_trainable_parameters(self)
 
-    def get_tail_trainable_params(self, chosen: SplitCandidate | None = None) -> Iterable[torch.nn.Parameter]:
+    def get_tail_trainable_params(
+        self,
+        chosen: SplitCandidate | None = None,
+    ) -> Iterable[torch.nn.Parameter]:
         del chosen
         return collect_suffix_trainable_parameters(self)
 
@@ -807,7 +909,12 @@ def extract_split_features(splitter: UniversalModelSplitter, sample_input: Any) 
     return splitter.edge_forward(sample_input)
 
 
-def slice_boundary_payload_batch(payload: BoundaryPayload, *, start: int = 0, length: int = 1) -> BoundaryPayload:
+def slice_boundary_payload_batch(
+    payload: BoundaryPayload,
+    *,
+    start: int = 0,
+    length: int = 1,
+) -> BoundaryPayload:
     start = max(0, int(start))
     length = max(1, int(length))
     codec = BoundaryPayloadCacheCodec(None)
@@ -890,7 +997,10 @@ def load_cached_split_batches(
         batch_indices = list(all_indices[offset : offset + max(1, int(batch_size))])
         prepare_started = time.perf_counter()
         records = [_record_for_index(index) for index in batch_indices]
-        refs = [FeatureShardRef.from_dict(dict(record.get("feature_ref") or {})) for record in records]
+        refs = [
+            FeatureShardRef.from_dict(dict(record.get("feature_ref") or {}))
+            for record in records
+        ]
         targets = []
         for index, record in zip(batch_indices, records, strict=True):
             target = annotations.get(index)
@@ -914,7 +1024,12 @@ def load_cached_split_batches(
 
 
 class _GradClippingOptimizer:
-    def __init__(self, optimizer: torch.optim.Optimizer, params: list[torch.nn.Parameter], max_norm: float) -> None:
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        params: list[torch.nn.Parameter],
+        max_norm: float,
+    ) -> None:
         self._optimizer = optimizer
         self._params = list(params)
         self._max_norm = float(max_norm)
@@ -964,7 +1079,9 @@ def _suffix_parameters(runtime: Any) -> list[torch.nn.Parameter]:
     plan = getattr(runtime_obj, "plan", None)
     model = _runtime_model(runtime_obj)
     if graph is None or plan is None:
-        raise RuntimeError("TorchLens suffix optimizer requires runtime.trace_graph and runtime.plan.")
+        raise RuntimeError(
+            "TorchLens suffix optimizer requires runtime.trace_graph and runtime.plan."
+        )
     if model is None:
         raise RuntimeError("TorchLens suffix optimizer requires runtime.model.")
     named_parameters = dict(model.named_parameters())
@@ -992,11 +1109,15 @@ def _suffix_parameter_names(runtime: Any) -> list[str]:
     plan = getattr(runtime_obj, "plan", None)
     model = _runtime_model(runtime_obj)
     if graph is None or plan is None:
-        raise RuntimeError("TorchLens suffix optimizer requires runtime.trace_graph and runtime.plan.")
+        raise RuntimeError(
+            "TorchLens suffix optimizer requires runtime.trace_graph and runtime.plan."
+        )
     if model is None:
         raise RuntimeError("TorchLens suffix optimizer requires runtime.model.")
     named_parameters = dict(model.named_parameters())
-    parameter_names_by_id = {id(parameter): name for name, parameter in named_parameters.items()}
+    parameter_names_by_id = {
+        id(parameter): name for name, parameter in named_parameters.items()
+    }
     suffix_nodes = set(getattr(plan, "suffix_nodes", ()) or ())
     if not suffix_nodes:
         raise RuntimeError("TorchLens suffix optimizer found no suffix nodes.")
@@ -1028,7 +1149,9 @@ def collect_suffix_trainable_parameters(
         for parameter in params:
             parameter.requires_grad_(True)
     if not params:
-        raise RuntimeError("TorchLens suffix optimizer found no trainable suffix parameters.")
+        raise RuntimeError(
+            "TorchLens suffix optimizer found no trainable suffix parameters."
+        )
     return params
 
 
@@ -1047,11 +1170,23 @@ def build_split_retrain_optimizer(
         return None
     normalized_name = str(optimizer_name or "adam").strip().lower()
     if normalized_name == "adamw":
-        optimizer = torch.optim.AdamW(params, lr=float(learning_rate), weight_decay=float(weight_decay))
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=float(learning_rate),
+            weight_decay=float(weight_decay),
+        )
     elif normalized_name == "sgd":
-        optimizer = torch.optim.SGD(params, lr=float(learning_rate), weight_decay=float(weight_decay))
+        optimizer = torch.optim.SGD(
+            params,
+            lr=float(learning_rate),
+            weight_decay=float(weight_decay),
+        )
     else:
-        optimizer = torch.optim.Adam(params, lr=float(learning_rate), weight_decay=float(weight_decay))
+        optimizer = torch.optim.Adam(
+            params,
+            lr=float(learning_rate),
+            weight_decay=float(weight_decay),
+        )
     if grad_clip_norm is not None and float(grad_clip_norm) > 0.0:
         return _GradClippingOptimizer(optimizer, params, float(grad_clip_norm))
     return optimizer
@@ -1111,7 +1246,15 @@ def universal_split_retrain(
     retrain_profile: SplitRetrainProfile | None = None,
     **_: Any,
 ) -> list[float]:
-    del device, log_every_n_batches, log_batches, log_every_n_epochs, log_first_epoch, epoch_log_start, epoch_log_total
+    del (
+        device,
+        log_every_n_batches,
+        log_batches,
+        log_every_n_epochs,
+        log_first_epoch,
+        epoch_log_start,
+        epoch_log_total,
+    )
     retrain_started = time.perf_counter()
     if loss_fn is None:
         raise RuntimeError("Split-tail training requires an explicit loss function.")
@@ -1146,10 +1289,18 @@ def universal_split_retrain(
             epoch_losses: list[float] = []
             for _batch_indices, boundary, targets in epoch_batches:
                 started = time.perf_counter()
-                boundary = _move_boundary_to_runtime_device(runtime, boundary)
-                loss, _grads = runtime.train_suffix(boundary, targets, loss_fn=loss_fn, optimizer=optimizer)
+                loss = train_split_suffix_batch(
+                    runtime,
+                    boundary,
+                    targets,
+                    loss_fn,
+                    optimizer,
+                )
                 if retrain_profile is not None:
-                    retrain_profile.add("suffix_forward_backward_time", time.perf_counter() - started)
+                    retrain_profile.add(
+                        "suffix_forward_backward_time",
+                        time.perf_counter() - started,
+                    )
                 epoch_losses.append(float(loss.detach().cpu().item()))
             if not epoch_losses:
                 raise RuntimeError("Split retraining did not produce any finite batch loss.")
@@ -1188,5 +1339,6 @@ __all__ = [
     "reconstruct_candidate_from_descriptor",
     "serialize_boundary_payload",
     "slice_boundary_payload_batch",
+    "train_split_suffix_batch",
     "universal_split_retrain",
 ]

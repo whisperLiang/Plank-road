@@ -10,8 +10,7 @@ import torch
 
 from model_management.payload import BoundaryPayload
 
-
-BOUNDARY_CACHE_PROTOCOL = "torchlens-native-boundary-v1"
+BOUNDARY_CACHE_PROTOCOL = "torchlens-native-boundary-v2"
 
 
 def _runtime_from(value: Any) -> Any:
@@ -108,6 +107,17 @@ def _coerce_payload_tensors_for_runtime(
     return coerced
 
 
+def _cpu_cache_payload(payload: BoundaryPayload) -> BoundaryPayload:
+    tensors: dict[str, Any] = {}
+    for label, tensor in dict(payload.tensors).items():
+        if isinstance(tensor, torch.Tensor):
+            cpu = tensor.detach().to("cpu")
+            tensors[str(label)] = cpu if cpu.is_contiguous() else cpu.contiguous()
+        else:
+            tensors[str(label)] = tensor
+    return replace(payload, tensors=tensors, metadata=dict(payload.metadata))
+
+
 def _same_tensor(left: torch.Tensor, right: torch.Tensor) -> bool:
     if tuple(left.shape) != tuple(right.shape) or left.dtype != right.dtype:
         return False
@@ -180,7 +190,8 @@ class BoundaryPayloadCacheCodec:
         actual = payload_batch_size if actual_batch_size is None else int(actual_batch_size)
         if actual < 0 or actual > payload_batch_size:
             raise RuntimeError(
-                f"Cannot split {actual} sample(s) from BoundaryPayload batch_size={payload_batch_size}."
+                "Cannot split "
+                f"{actual} sample(s) from BoundaryPayload batch_size={payload_batch_size}."
             )
 
         spec = self._runtime_spec(payload)
@@ -232,7 +243,9 @@ class BoundaryPayloadCacheCodec:
             raise RuntimeError("BoundaryPayload cache collate requires TorchLens boundary spec.")
         for payload in payloads[1:]:
             if str(payload.split_id) != str(first.split_id):
-                raise RuntimeError("Cannot collate BoundaryPayload objects with different split_id.")
+                raise RuntimeError(
+                    "Cannot collate BoundaryPayload objects with different split_id."
+                )
             if dict(payload.spec) != dict(first.spec):
                 raise RuntimeError("Cannot collate BoundaryPayload objects with different spec.")
 
@@ -260,7 +273,8 @@ class BoundaryPayloadCacheCodec:
                 for piece in pieces[1:]:
                     if not _same_tensor(first_piece, piece):
                         raise RuntimeError(
-                            f"Boundary tensor {label!r} is schema-shared but differs across samples."
+                            f"Boundary tensor {label!r} is schema-shared "
+                            "but differs across samples."
                         )
                 batched_tensors[str(label)] = first_piece
                 continue
@@ -289,7 +303,7 @@ class BoundaryPayloadCacheCodec:
         payload: BoundaryPayload,
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload = self.validate(self.to_runtime_device(payload))
+        payload = _cpu_cache_payload(self.validate(self.to_runtime_device(payload)))
         record = dict(metadata or {})
         record.update(
             {
@@ -308,25 +322,16 @@ class BoundaryPayloadCacheCodec:
                 record = torch.load(handle, map_location="cpu", weights_only=False)
         except gzip.BadGzipFile:
             record = torch.load(path, map_location="cpu", weights_only=False)
-        if isinstance(record, BoundaryPayload):
-            return self.validate(self.to_runtime_device(record))
         if not isinstance(record, Mapping):
             raise TypeError(f"Unsupported boundary cache record: {type(record).__name__}.")
         protocol = str(record.get("cache_protocol") or "")
-        if protocol and protocol != BOUNDARY_CACHE_PROTOCOL:
+        if protocol != BOUNDARY_CACHE_PROTOCOL:
             raise RuntimeError(
                 f"Unsupported boundary cache protocol {protocol!r}; rebuild feature cache."
             )
-        payload = record.get("intermediate") or record.get("boundary_payload")
+        payload = record.get("intermediate")
         if isinstance(payload, BoundaryPayload):
             return self.validate(self.to_runtime_device(payload))
-        if isinstance(payload, Mapping) and "tensors" in payload:
-            boundary = BoundaryPayload(
-                tensors=dict(payload["tensors"]),
-                spec=dict(payload.get("spec") or {}),
-                metadata=dict(payload.get("metadata") or {}),
-            )
-            return self.validate(self.to_runtime_device(boundary))
         raise TypeError("Boundary cache record did not contain a BoundaryPayload.")
 
     def _dimension_multiplier(self, value: Any) -> int | None:
@@ -346,7 +351,9 @@ class BoundaryPayloadCacheCodec:
             return None
         offset = int(getattr(value, "offset", 0) or 0)
         if offset != 0:
-            raise RuntimeError(f"Cannot split affine boundary dimension with non-zero offset: {value}.")
+            raise RuntimeError(
+                f"Cannot split affine boundary dimension with non-zero offset: {value}."
+            )
         multiplier = int(getattr(value, "multiplier", 1) or 1)
         if multiplier <= 0:
             raise RuntimeError(f"Cannot split boundary dimension with multiplier={multiplier}.")

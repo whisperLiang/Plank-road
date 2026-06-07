@@ -22,13 +22,13 @@ from model_management.fixed_split_runtime_template import (
     bind_request_splitter_from_template,
     fixed_split_runtime_template_key,
 )
+from model_management.payload import boundary_payload_from_tensors
 from model_management.split_candidate import SplitCandidate
 from model_management.split_model_adapters import (
     _RFDETR_PACKED_AUX_OUTPUTS_MARKER,
     _pack_rfdetr_aux_outputs,
     _unpack_rfdetr_aux_outputs,
 )
-from model_management.payload import boundary_payload_from_tensors
 from model_management.split_runtime import (
     BOUNDARY_CACHE_PROTOCOL,
     BoundaryPayloadCacheCodec,
@@ -178,7 +178,10 @@ def test_native_split_replays_and_enumerates_compute_boundaries() -> None:
 
     candidates = splitter.enumerate_candidates()
     assert all(candidate.candidate_id.startswith("after:") for candidate in candidates)
-    assert all(candidate.metadata.get("runtime_backend") == "torchlens_native" for candidate in candidates)
+    assert all(
+        candidate.metadata.get("runtime_backend") == "torchlens_native"
+        for candidate in candidates
+    )
 
     boundary = splitter.edge_forward(example)
     replayed = splitter.cloud_forward(boundary)
@@ -467,7 +470,7 @@ def test_native_runtime_preserves_spec_mode_and_list_inputs(monkeypatch) -> None
         captured["spec"] = spec
         return object()
 
-    monkeypatch.setattr(native_runtime, "prepare_split", fake_prepare_split)
+    monkeypatch.setattr(native_runtime.tl, "prepare_split", fake_prepare_split)
 
     model = TinySplitModel()
     list_input = [torch.randn(2, 4)]
@@ -488,7 +491,7 @@ def test_native_runtime_prepare_split_uses_forward_guard(monkeypatch) -> None:
         entered_prepare.set()
         return object()
 
-    monkeypatch.setattr(native_runtime, "prepare_split", fake_prepare_split)
+    monkeypatch.setattr(native_runtime.tl, "prepare_split", fake_prepare_split)
 
     model = TinySplitModel()
     example = torch.randn(2, 4)
