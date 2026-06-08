@@ -1,8 +1,8 @@
 # Plank-Road
 
-Plank-Road is a distributed edge-cloud video analytics system with drift-aware continual learning and TorchLens-native split execution.
+Plank-Road is a multi-edge edge-cloud video analytics system for drift-aware continual learning under resource constraints. It targets low-latency edge inference and on-demand cloud continual learning when bandwidth, edge compute, and privacy-constrained cloud training resources are limited.
 
-The current implementation uses a fixed split plan that is computed once at startup, structured edge-local sample storage, and a versioned upload contract for continual learning.
+The current implementation uses a startup-time fixed split plan, structured edge-local sample storage, Lyapunov-based resource-aware training triggers, versioned gRPC training bundles, split-tail cloud retraining, and dynamic activation sparsity.
 
 ## Real Baseline Experiments
 
@@ -23,23 +23,18 @@ The runner writes `summary.json`, `per_device_metrics.csv`, `per_frame_metrics.c
 ## Overview
 
 <div align="center">
-<img src="./docs/structure.png" width="60%" height="60%">
+<img src="./docs/system-overview.png" alt="System Overview" width="90%">
 </div>
 
-The runtime is organized as three chains:
+Plank-Road consists of multiple edge clients and one cloud server. Each edge first performs computation-graph-based split planning at startup and chooses the minimum-transfer-cost split plan that satisfies privacy and trainability constraints. The privacy constraint limits the risk of reconstructing raw images from intermediate features even when related weights are available. The trainability constraint keeps enough server-side tail network capacity for later continual-learning updates.
 
-1. Edge preprocessing:
-   `input -> differencing/filtering -> local inference queue`
-2. Edge inference with a fixed split plan:
-   local inference always produces `intermediate feature + final result + confidence`
-3. Lyapunov-based continual learning trigger:
-   decides `train_now` and `send_low_conf_features`
+During online execution, input video frames pass through differencing/filtering and then enter the local inference queue. Inference always produces three pieces of information: intermediate features, detection results, and sample confidence. The edge stores samples by quality: high-confidence samples keep `feature + result`, while low-quality samples keep `feature + result + raw sample`. Drift-related samples are explicitly marked in metadata so the cloud can later identify which data reflects distribution shift.
 
-The edge no longer uses normal cloud inference offloading as a branch after filtering. Filtered frames always enter the local inference queue first.
+The continual-learning decision is made by a Lyapunov-based resource-aware trigger. It combines low-confidence signals, drift signals, cloud compute pressure, upload volume, and link bandwidth, with runtime state coming from the monitor and state tracker. The trigger chooses one of three actions: skip training, upload low-confidence raw samples only, or upload low-confidence raw samples together with intermediate features. This avoids retraining on every uncertain sample and creates an explicit balance between model adaptation benefit and system resource cost.
 
-<div align="center">
-<img src="./docs/modules.png" width="75%" height="75%">
-</div>
+When training is triggered, the edge packages high-confidence features/results, low-quality raw samples/results, optional low-confidence features, drift tags, and split metadata into a versioned training bundle and uploads it to the cloud through gRPC. The cloud expands the working cache, rebuilds missing intermediate features when the edge used `raw-only` upload mode, uses the large teacher model to annotate drift and low-confidence raw samples, and retrains the split-tail network behind the selected boundary. During training, dynamic activation sparsity estimates activation importance and prunes less important activations to reduce cloud-side training overhead.
+
+After continual learning finishes, the cloud returns updated lightweight model weights to the corresponding edge. The edge atomically replaces the local model, clears consumed sample cache, and resets drift state, completing the closed loop: `edge inference -> drift awareness -> resource-aware trigger -> cloud retraining -> weight return`.
 
 ## Current Architecture
 
