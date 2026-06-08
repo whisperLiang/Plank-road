@@ -22,6 +22,22 @@ class CountingModel(nn.Module):
         return self.head(torch.relu(self.stem(x)))
 
 
+class BatchNormPolicyModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prefix = nn.Sequential(
+            nn.BatchNorm1d(4),
+            nn.Dropout(p=0.5),
+            nn.Linear(4, 4),
+        )
+        self.head_bn = nn.BatchNorm1d(4)
+        self.suffix_dropout = nn.Dropout(p=0.5)
+        self.head = nn.Linear(4, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.suffix_dropout(self.head_bn(self.prefix(x))))
+
+
 def _patch_raw_batches(monkeypatch, inputs: torch.Tensor, targets: torch.Tensor) -> None:
     monkeypatch.setattr(exp, "get_split_runtime_input_resize_mode", lambda _model: "direct_resize")
 
@@ -37,8 +53,11 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
     inputs = torch.randn(2, 4)
     targets = torch.zeros(2, 1)
     _patch_raw_batches(monkeypatch, inputs, targets)
-    choice = exp.SplitChoice(bucket="Middle50%", boundary="percent:50")
-    suffix_names, suffix_params = exp._configure_raw_freeze_eval_forward_training(model, choice)
+    suffix_names = ("head.weight", "head.bias")
+    _suffix_names, suffix_params = exp._configure_raw_freeze_eval_forward_training(
+        model,
+        suffix_names,
+    )
     optimizer = torch.optim.SGD(suffix_params, lr=0.01)
 
     monkeypatch.setattr(
@@ -51,7 +70,7 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
 
     exp._run_raw_freeze_mode(
         split_model=model,
-        choice=choice,
+        suffix_param_names=suffix_names,
         edge_model=model,
         frames_by_id={1: object(), 2: object(), 3: object(), 4: object()},
         sample_ids=[1, 2, 3, 4],
@@ -64,22 +83,100 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
     )
 
     assert model.forward_calls == 4
-    assert suffix_names
+    assert _suffix_names == suffix_names
 
 
-def test_freeze_full_forwards_each_epoch_without_cached_boundaries(monkeypatch) -> None:
+def test_raw_freeze_can_use_torchlens_suffix_names() -> None:
+    model = CountingModel()
+
+    suffix_names, suffix_params = exp._configure_raw_freeze_eval_forward_training(
+        model,
+        ("head.weight", "head.bias"),
+    )
+
+    assert suffix_names == ("head.weight", "head.bias")
+    assert suffix_params == [model.head.weight, model.head.bias]
+    assert model.head.weight.requires_grad
+    assert model.head.bias.requires_grad
+    assert not model.stem.weight.requires_grad
+    assert not model.stem.bias.requires_grad
+
+
+def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
+    monkeypatch,
+) -> None:
+    suffix_names = ("head_bn.weight", "head_bn.bias", "head.weight", "head.bias")
+    monkeypatch.setattr(exp, "_suffix_parameter_names", lambda _runtime: suffix_names)
+
+    full_model = BatchNormPolicyModel()
+    full_runtime = SimpleNamespace(
+        prefix_segment=full_model.prefix,
+        suffix_segment=nn.Sequential(
+            full_model.head_bn,
+            full_model.suffix_dropout,
+            full_model.head,
+        ),
+    )
+    exp._configure_fixed_prefix_training(
+        full_model,
+        full_runtime,
+    )
+    assert not full_model.prefix[0].training
+    assert not full_model.prefix[1].training
+    assert full_model.head_bn.training
+    assert full_model.suffix_dropout.training
+    assert not full_model.prefix[2].weight.requires_grad
+    assert full_model.head.weight.requires_grad
+
+    split_model = BatchNormPolicyModel()
+    split_runtime = SimpleNamespace(
+        prefix_segment=split_model.prefix,
+        suffix_segment=nn.Sequential(
+            split_model.head_bn,
+            split_model.suffix_dropout,
+            split_model.head,
+        ),
+    )
+    exp._configure_fixed_prefix_training(
+        split_model,
+        split_runtime,
+    )
+    assert not split_model.prefix[0].training
+    assert not split_model.prefix[1].training
+    assert split_model.head_bn.training
+    assert split_model.suffix_dropout.training
+
+    raw_model = BatchNormPolicyModel()
+    exp._configure_raw_freeze_eval_forward_training(
+        raw_model,
+        suffix_names,
+    )
+    assert not raw_model.prefix[0].training
+    assert not raw_model.prefix[1].training
+    assert raw_model.head_bn.training
+    assert not raw_model.suffix_dropout.training
+    assert not raw_model.prefix[2].weight.requires_grad
+    assert raw_model.head.weight.requires_grad
+
+
+def test_freeze_rebuilds_prefix_each_batch_without_cached_boundaries(monkeypatch) -> None:
     model = CountingModel()
     inputs = torch.randn(2, 4)
     targets = torch.zeros(2, 1)
     _patch_raw_batches(monkeypatch, inputs, targets)
+    boundary = boundary_payload_from_tensors(
+        {"x": torch.ones(2, 1)},
+        split_id="after:x",
+        graph_signature="graph",
+        batch_size=2,
+    )
+    prefix_calls = []
+    train_calls = []
     runtime = SimpleNamespace(
-        run_prefix=lambda *_args: (_ for _ in ()).throw(AssertionError("run_prefix used")),
-        train_suffix=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("train_suffix used")
-        ),
+        run_prefix=lambda batch_inputs: prefix_calls.append(batch_inputs) or boundary,
     )
 
-    def configure_fixed(split_model, runtime_arg):
+    def configure_fixed(split_model, runtime_arg, **_kwargs):
         assert runtime_arg is runtime
         split_model.eval()
         for parameter in split_model.parameters():
@@ -90,6 +187,16 @@ def test_freeze_full_forwards_each_epoch_without_cached_boundaries(monkeypatch) 
         return ("head.weight", "head.bias"), suffix
 
     monkeypatch.setattr(exp, "_configure_fixed_prefix_training", configure_fixed)
+    monkeypatch.setattr(
+        exp,
+        "train_split_suffix_batch",
+        lambda runtime_arg, batch_boundary, batch_targets, loss_fn, optimizer_arg: (
+            train_calls.append(
+                (runtime_arg, batch_boundary, batch_targets, loss_fn, optimizer_arg)
+            )
+            or torch.tensor(0.25)
+        ),
+    )
     suffix_names, suffix_params = configure_fixed(model, runtime)
     optimizer = torch.optim.SGD(suffix_params, lr=0.01)
 
@@ -108,7 +215,9 @@ def test_freeze_full_forwards_each_epoch_without_cached_boundaries(monkeypatch) 
     )
 
     assert suffix_names == ("head.weight", "head.bias")
-    assert model.forward_calls == 6
+    assert model.forward_calls == 0
+    assert len(prefix_calls) == 6
+    assert len(train_calls) == 6
 
 
 def test_split_suffix_loop_uses_shared_train_suffix_helper(monkeypatch) -> None:
@@ -142,6 +251,7 @@ def test_split_suffix_loop_uses_shared_train_suffix_helper(monkeypatch) -> None:
     assert len(calls) == 4
     assert all(call[0] == "runtime" for call in calls)
     assert all(call[4] is optimizer for call in calls)
+    assert all(call[1] is boundary for call in calls)
 
 
 def test_candidate_resolution_does_not_prepare_runtime_per_candidate(monkeypatch) -> None:

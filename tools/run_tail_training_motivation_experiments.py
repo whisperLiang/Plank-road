@@ -2,15 +2,15 @@
 
 All modes implement fixed-prefix tail training:
 
-* the prefix segment is a frozen feature extractor (parameters frozen,
-  ``BatchNorm`` running stats frozen, dropout off, ``eval`` state, forward under
-  ``torch.no_grad`` when the mode uses an explicit prefix pass);
+* the prefix segment has frozen parameters and stays eval/cache-compatible;
+* the suffix segment enters train mode, so suffix BatchNorm/Dropout follow the
+  normal tail-training path;
 * ``raw_freeze`` runs the original unsplit model forward/backward in eval
   module state, freezes prefix parameters directly on the PyTorch model, and
   never uses TorchLens runtime or boundary APIs;
-* ``freeze`` resolves suffix parameters from the TorchLens runtime plan, but
-  still runs the original full-model forward/backward every epoch and never
-  uses cached boundary features;
+* ``freeze`` resolves suffix parameters from the TorchLens runtime plan,
+  rebuilds prefix boundary features from raw inputs every batch, and trains the
+  same TorchLens suffix path without caching those boundary features;
 * ``split_rebuild`` and ``split_cached`` train the TorchLens suffix via
   ``runtime.train_suffix``; TorchLens owns zero-grad/backward/step for those
   suffix batches;
@@ -25,14 +25,17 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
-import hashlib
+import gc
 import json
+import os
 import random
 import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import cv2
 import numpy as np
@@ -69,7 +72,6 @@ from model_management.split_runtime import (
 from model_management.universal_model_split import (
     _suffix_parameter_names,
     build_split_retrain_optimizer,
-    collect_suffix_trainable_parameters,
     prepare_exact_split_runtime,
     train_split_suffix_batch,
 )
@@ -120,6 +122,7 @@ class CachedSplitRuntime:
     feature_rebuild_time: float
     runtime_build_time: float
     suffix_param_names: tuple[str, ...]
+    feature_source: str = "prebuilt"
 
     @property
     def cached_sample_count(self) -> int:
@@ -127,19 +130,10 @@ class CachedSplitRuntime:
 
 
 @dataclass(frozen=True)
-class PreflightReport:
-    percent: str
-    actual_split_id: str
-    graph_signature: str
-    trainable_parameter_names: tuple[str, ...]
-    trainable_parameter_count: int
-    full_loss: float
-    split_loss: float
-    full_output_max_diff: float
-    tolerance: float
-    train_full_loss: float | None = None
-    train_split_loss: float | None = None
-    suffix_gradient_max_diff: float | None = None
+class _SplitRebuildModeResult:
+    metrics: dict[str, Any]
+    cached_batches: list[CachedSplitBatch]
+    feature_rebuild_time: float
 
 
 @dataclass(frozen=True)
@@ -147,6 +141,16 @@ class _PreparedBatch:
     sample_ids: tuple[int, ...]
     boundary: Any
     targets: tuple[Any, ...]
+
+
+def _default_num_threads() -> int:
+    raw_value = os.environ.get("TAIL_TRAINING_NUM_THREADS")
+    if raw_value is None:
+        return 0
+    try:
+        return max(0, int(raw_value or "0"))
+    except (TypeError, ValueError):
+        return 0
 
 
 
@@ -182,32 +186,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="generated_eager",
     )
     parser.add_argument("--dynamic-batch-max", type=int, default=64)
-    parser.add_argument("--output-root", default="./results/tail_training_motivation")
     parser.add_argument(
-        "--append-results",
-        action="store_true",
+        "--num-threads",
+        type=int,
+        default=_default_num_threads(),
         help=(
-            "Append raw JSONL rows instead of clearing result files at startup, "
-            "skipping rows that already exist for the same repeat/boundary/mode "
-            "configuration."
+            "CPU worker threads for Torch/OpenCV/native math libraries; "
+            "0 leaves library defaults unchanged."
         ),
     )
+    parser.add_argument("--output-root", default="./results/tail_training_motivation")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--optimizer-name",
+        choices=("auto", "sgd", "adam", "adamw"),
+        default="auto",
+        help=(
+            "Optimizer for the motivation experiment. auto keeps the model-specific "
+            "original default, e.g. AdamW for RF-DETR."
+        ),
+    )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Torch device used for model construction and training.",
     )
     return parser.parse_args(argv)
-
-
-def _safe_segment(value: object, *, max_len: int = 64) -> str:
-    text = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(value))
-    text = text.strip("._-") or "item"
-    if len(text) <= max_len:
-        return text
-    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
-    return f"{text[: max_len - 11]}_{digest}"
 
 
 def _json_ready(value: Any) -> Any:
@@ -238,6 +242,12 @@ def _csv_value(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return value
+
+
+def _maybe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def _write_summary_csv(path: Path, rows: list[Mapping[str, Any]]) -> None:
@@ -309,24 +319,21 @@ def _write_aggregate_summary_csv(path: Path, rows: list[Mapping[str, Any]]) -> N
     _write_summary_csv(path, _aggregate_rows(rows))
 
 
-def _result_resume_key(row: Mapping[str, Any]) -> tuple[int, str, str, int, int, int, int]:
-    return (
-        int(row.get("repeat_id")),
-        str(row.get("split_boundary")),
-        str(row.get("mode")),
-        int(row.get("seed")),
-        int(row.get("sample_count")),
-        int(row.get("epochs")),
-        int(row.get("batch_size")),
-    )
-
-
 def _set_random_seed(seed: int) -> None:
     random.seed(int(seed))
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
+
+
+def _set_training_step_seed(seed: int, epoch_index: int, batch_index: int) -> None:
+    step_seed = (
+        int(seed) * 1_000_003
+        + int(epoch_index) * 10_007
+        + int(batch_index)
+    ) % (2**63 - 1)
+    _set_random_seed(step_seed)
 
 
 def _synchronize(device: torch.device) -> None:
@@ -337,6 +344,50 @@ def _synchronize(device: torch.device) -> None:
 def _clear_cuda_cache() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _release_unused_memory() -> None:
+    gc.collect()
+    _clear_cuda_cache()
+
+
+def _configure_process_threading(num_threads: int) -> None:
+    threads = int(num_threads)
+    if threads <= 0:
+        logger.info(
+            "Using library default CPU threading; experiments still run serially."
+        )
+        return
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[key] = str(threads)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    torch.set_num_threads(threads)
+    try:
+        torch.set_num_interop_threads(threads)
+    except RuntimeError as exc:
+        logger.warning("Torch interop thread count was already initialized: {}", exc)
+    if hasattr(cv2, "setNumThreads"):
+        cv2.setNumThreads(threads)
+    torch_interop_threads = (
+        torch.get_num_interop_threads()
+        if hasattr(torch, "get_num_interop_threads")
+        else None
+    )
+    opencv_threads = cv2.getNumThreads() if hasattr(cv2, "getNumThreads") else None
+    logger.info(
+        "Configured single-process threading: torch_threads={} torch_interop_threads={} "
+        "opencv_threads={} native_thread_env={}",
+        torch.get_num_threads(),
+        torch_interop_threads,
+        opencv_threads,
+        threads,
+    )
 
 
 def _cuda_sdp_flags() -> dict[str, Any]:
@@ -850,7 +901,7 @@ def _require_boundary_graph_signature(boundary: Any) -> str:
 
 def _contiguous_tensor_tree(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
-        return value.detach().contiguous()
+        return value.detach().contiguous().clone()
     if isinstance(value, Mapping):
         return {key: _contiguous_tensor_tree(item) for key, item in value.items()}
     if isinstance(value, tuple):
@@ -952,12 +1003,12 @@ def _configure_fixed_prefix_training(
 ) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
     """Apply the fixed-prefix + trainable-suffix regime to ``split_model``.
 
-    * suffix params -> ``requires_grad=True`` and ``.train()`` module state;
+    * suffix params -> ``requires_grad=True`` and the TorchLens suffix segment
+      uses ``.train()`` state;
     * every other parameter -> ``requires_grad=False``;
-    * the whole model is placed in ``eval`` mode first, and only the modules
-      owning suffix parameters are switched to ``train`` mode. This keeps
-      prefix ``BatchNorm`` running stats, dropout, and any other
-      train-mode-only behaviour frozen.
+    * frozen prefix modules stay eval/cache-compatible;
+    * the suffix segment enters train mode, so suffix BatchNorm/Dropout behave
+      like normal tail training.
     """
     torchlens_runtime = (
         runtime._ensure_runtime()
@@ -1007,87 +1058,66 @@ def _configure_fixed_prefix_training(
         if module is None:
             continue
         module.train()
-
     return suffix_names, suffix_params
 
 
-def _parse_percent_boundary(value: str) -> float:
-    text = str(value or "").strip()
-    if text.startswith("percent:"):
-        text = text.split(":", maxsplit=1)[1]
-    elif text.endswith("%"):
-        text = text[:-1]
-    try:
-        percent = float(text)
-    except ValueError as exc:
-        raise ValueError(f"raw_freeze requires a percent boundary, got {value!r}.") from exc
-    return max(0.0, min(100.0, percent)) / 100.0
+def _set_runtime_prefix_module_state(
+    runtime: Any,
+) -> None:
+    torchlens_runtime = (
+        runtime._ensure_runtime()
+        if callable(getattr(runtime, "_ensure_runtime", None))
+        else runtime
+    )
+    for segment_name in ("prefix_segment", "training_prefix_segment"):
+        prefix_segment = getattr(torchlens_runtime, segment_name, None)
+        if not isinstance(prefix_segment, torch.nn.Module):
+            continue
+        prefix_segment.eval()
 
 
-def _raw_freeze_suffix_parameter_names(
-    split_model: torch.nn.Module,
-    choice: SplitChoice,
-) -> tuple[str, ...]:
-    named = [(name, parameter) for name, parameter in split_model.named_parameters()]
-    if not named:
-        return ()
-    prefix_count = int(round(len(named) * _parse_percent_boundary(choice.boundary)))
-    prefix_count = max(0, min(len(named) - 1, prefix_count))
-    return tuple(name for name, _parameter in named[prefix_count:])
+def _set_runtime_suffix_module_state(runtime: Any) -> None:
+    torchlens_runtime = (
+        runtime._ensure_runtime()
+        if callable(getattr(runtime, "_ensure_runtime", None))
+        else runtime
+    )
+    suffix_segment = getattr(torchlens_runtime, "suffix_segment", None)
+    if isinstance(suffix_segment, torch.nn.Module):
+        suffix_segment.train()
 
 
 def _configure_raw_freeze_eval_forward_training(
     split_model: torch.nn.Module,
-    choice: SplitChoice,
+    suffix_names: tuple[str, ...],
 ) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
     """Configure raw_freeze directly on the original PyTorch model."""
 
-    suffix_names = _raw_freeze_suffix_parameter_names(split_model, choice)
+    suffix_names = tuple(suffix_names)
     suffix_name_set = set(suffix_names)
     split_model.eval()
     for parameter in split_model.parameters():
         parameter.requires_grad_(False)
         parameter.grad = None
     suffix_params: list[torch.nn.Parameter] = []
+    modules_with_suffix: set[str] = set()
     for name, parameter in split_model.named_parameters():
         if name in suffix_name_set:
             parameter.requires_grad_(True)
             suffix_params.append(parameter)
+            modules_with_suffix.add(name.rsplit(".", 1)[0])
+    missing = sorted(suffix_name_set - set(dict(split_model.named_parameters()).keys()))
+    if missing:
+        raise RuntimeError(
+            "raw_freeze suffix parameters missing from split model: "
+            + ", ".join(missing)
+        )
+    module_lookup = dict(split_model.named_modules())
+    for module_name in modules_with_suffix:
+        module = module_lookup.get(module_name)
+        if module is not None:
+            module.train()
     return suffix_names, suffix_params
-
-
-def _collect_frozen_batchnorm_stats(
-    model: torch.nn.Module,
-    runtime: Any | None = None,
-) -> dict[str, torch.Tensor]:
-    snapshot: dict[str, torch.Tensor] = {}
-    torchlens_runtime = (
-        runtime._ensure_runtime()
-        if runtime is not None and callable(getattr(runtime, "_ensure_runtime", None))
-        else runtime
-    )
-    segments: list[tuple[str, torch.nn.Module]] = []
-    seen_segments: set[int] = set()
-    for segment_name in ("prefix_segment", "training_prefix_segment"):
-        segment = getattr(torchlens_runtime, segment_name, None)
-        if isinstance(segment, torch.nn.Module) and id(segment) not in seen_segments:
-            seen_segments.add(id(segment))
-            segments.append((segment_name, segment))
-    if not segments:
-        segments = [("model", model)]
-
-    for segment_name, segment in segments:
-        for module_name, module in segment.named_modules():
-            key_prefix = segment_name if not module_name else f"{segment_name}.{module_name}"
-            if not isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
-                continue
-            running_mean = getattr(module, "running_mean", None)
-            running_var = getattr(module, "running_var", None)
-            if isinstance(running_mean, torch.Tensor):
-                snapshot[f"{key_prefix}.running_mean"] = running_mean.detach().clone()
-            if isinstance(running_var, torch.Tensor):
-                snapshot[f"{key_prefix}.running_var"] = running_var.detach().clone()
-    return snapshot
 
 # ---------------------------------------------------------------------------
 # Trainable-suffix loop (shared by freeze / split_rebuild / split_cached)
@@ -1102,6 +1132,7 @@ def _train_suffix_loop(
     device: torch.device,
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
+    seed: int = 0,
 ) -> dict[str, Any]:
     """Train the TorchLens suffix over a fixed list of precomputed batches.
 
@@ -1113,16 +1144,16 @@ def _train_suffix_loop(
     losses: list[float] = []
     _synchronize(device)
     training_started = time.perf_counter()
-    for _epoch in range(int(epochs)):
+    for epoch_index in range(int(epochs)):
         epoch_started = time.perf_counter()
-        for prepared in prepared_batches:
+        for batch_index, prepared in enumerate(prepared_batches):
             _synchronize(device)
             batch_started = time.perf_counter()
-            boundary = _contiguous_boundary_payload(prepared.boundary)
             targets = list(copy.deepcopy(prepared.targets))
+            _set_training_step_seed(seed, epoch_index, batch_index)
             loss = train_split_suffix_batch(
                 runtime,
-                boundary,
+                prepared.boundary,
                 targets,
                 loss_fn,
                 optimizer,
@@ -1152,12 +1183,15 @@ def _build_cached_batches(
     annotations: Mapping[str, Mapping[str, Any]],
     batch_size: int,
     device: torch.device,
+    seed: int = 0,
 ) -> tuple[list[CachedSplitBatch], float]:
     resize_mode = get_split_runtime_input_resize_mode(edge_model)
     batches: list[CachedSplitBatch] = []
     _synchronize(device)
     started = time.perf_counter()
-    for batch_ids in _ordered_epoch_batches(sample_ids, batch_size=max(2, int(batch_size))):
+    for batch_index, batch_ids in enumerate(
+        _ordered_epoch_batches(sample_ids, batch_size=max(2, int(batch_size)))
+    ):
         inputs, targets = _prepare_raw_batch(
             model=edge_model,
             frame_ids=batch_ids,
@@ -1166,6 +1200,7 @@ def _build_cached_batches(
             device=device,
             resize_mode=resize_mode,
         )
+        _set_training_step_seed(seed, 0, batch_index)
         with torch.no_grad():
             boundary = runtime.run_prefix(inputs)
         boundary_split_id = _require_boundary_split_id(boundary)
@@ -1209,273 +1244,6 @@ def _prepared_batches_from_cache(
         for batch in cached_batches
     ]
 
-
-
-# ---------------------------------------------------------------------------
-# Preflight equivalence check
-# ---------------------------------------------------------------------------
-
-
-def _walk_tensors(value: Any):
-    if isinstance(value, torch.Tensor):
-        yield value
-        return
-    if isinstance(value, Mapping):
-        for item in value.values():
-            yield from _walk_tensors(item)
-        return
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _walk_tensors(item)
-
-
-def _max_abs_output_diff(expected: Any, actual: Any) -> float:
-    expected_tensors = list(_walk_tensors(expected))
-    actual_tensors = list(_walk_tensors(actual))
-    if not expected_tensors or not actual_tensors:
-        return 0.0
-    pairs = list(zip(expected_tensors, actual_tensors))
-    if not pairs:
-        return 0.0
-    max_diff = 0.0
-    for expected_tensor, actual_tensor in pairs:
-        if expected_tensor.shape != actual_tensor.shape:
-            return float("inf")
-        diff = (expected_tensor.detach().float() - actual_tensor.detach().float()).abs().max()
-        max_diff = max(max_diff, float(diff.item()))
-    return float(max_diff)
-
-
-def _zero_model_gradients(model: torch.nn.Module) -> None:
-    for parameter in model.parameters():
-        parameter.grad = None
-
-
-def _cuda_rng_devices(device: torch.device) -> list[int]:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return []
-    if device.index is not None:
-        return [int(device.index)]
-    return [torch.cuda.current_device()]
-
-
-def _suffix_gradients_by_name(
-    model: torch.nn.Module,
-    suffix_names: tuple[str, ...],
-) -> dict[str, torch.Tensor | None]:
-    named_parameters = dict(model.named_parameters())
-    gradients: dict[str, torch.Tensor | None] = {}
-    for name in suffix_names:
-        parameter = named_parameters.get(name)
-        gradient = None if parameter is None else parameter.grad
-        gradients[name] = None if gradient is None else gradient.detach().float().cpu().clone()
-    return gradients
-
-
-def _max_suffix_gradient_diff(
-    full_grads: Mapping[str, torch.Tensor | None],
-    split_grads: Mapping[str, torch.Tensor | None],
-) -> float:
-    max_diff = 0.0
-    for name in sorted(set(full_grads) | set(split_grads)):
-        full_grad = full_grads.get(name)
-        split_grad = split_grads.get(name)
-        if full_grad is None and split_grad is None:
-            continue
-        if full_grad is None or split_grad is None:
-            return float("inf")
-        if tuple(full_grad.shape) != tuple(split_grad.shape):
-            return float("inf")
-        if full_grad.numel() == 0:
-            continue
-        diff = (full_grad - split_grad).abs().max()
-        max_diff = max(max_diff, float(diff.item()))
-    return float(max_diff)
-
-
-def _preflight_equivalence_check(
-    *,
-    runtime: Any,
-    split_model: torch.nn.Module,
-    edge_model: torch.nn.Module,
-    choice: SplitChoice,
-    frames_by_id: Mapping[int, np.ndarray],
-    sample_ids: list[int],
-    annotations: Mapping[str, Mapping[str, Any]],
-    batch_size: int,
-    device: torch.device,
-    loss_fn: Callable[[Any, Any], torch.Tensor],
-    freeze_trainable_names: tuple[str, ...],
-    split_trainable_names: tuple[str, ...],
-    cached_split: CachedSplitRuntime | None,
-    runtime_split_id: str,
-    runtime_graph_signature: str,
-    loss_tolerance: float = 5e-2,
-    output_tolerance: float = 1e-1,
-    gradient_tolerance: float = 5e-5,
-) -> PreflightReport:
-    """Fail loudly if freeze / split paths are not equivalent on one batch."""
-    if freeze_trainable_names != split_trainable_names:
-        raise RuntimeError(
-            "Freeze vs split trainable parameter names differ. "
-            f"freeze={freeze_trainable_names}; split={split_trainable_names}."
-        )
-
-    if cached_split is not None:
-        if cached_split.split_id != runtime_split_id:
-            raise RuntimeError(
-                "Preflight cached split_id does not match live runtime: "
-                f"cached={cached_split.split_id!r}; runtime={runtime_split_id!r}; "
-                f"percent={choice.boundary!r}."
-            )
-        if tuple(cached_split.suffix_param_names) != tuple(split_trainable_names):
-            raise RuntimeError(
-                "Preflight cached suffix parameter names differ from live runtime. "
-                f"cached={cached_split.suffix_param_names}; "
-                f"runtime={split_trainable_names}."
-            )
-
-    check_batch_size = max(2, min(int(batch_size), len(sample_ids)))
-    probe_ids = list(sample_ids[:check_batch_size])
-    resize_mode = get_split_runtime_input_resize_mode(edge_model)
-    inputs, targets = _prepare_raw_batch(
-        model=edge_model,
-        frame_ids=probe_ids,
-        frames_by_id=frames_by_id,
-        annotations=annotations,
-        device=device,
-        resize_mode=resize_mode,
-    )
-
-    previous_training = split_model.training
-    split_model.eval()
-    try:
-        with torch.no_grad():
-            full_output = split_model(inputs)
-            boundary = runtime.run_prefix(inputs)
-            suffix_output = runtime.run_suffix(_contiguous_boundary_payload(boundary))
-            full_loss = loss_fn(full_output, copy.deepcopy(targets))
-            split_loss = loss_fn(suffix_output, copy.deepcopy(targets))
-    finally:
-        split_model.train(previous_training)
-
-    boundary_split_id = _require_boundary_split_id(boundary)
-    boundary_graph_signature = _require_boundary_graph_signature(boundary)
-    if boundary_split_id != runtime_split_id:
-        raise RuntimeError(
-            "Preflight boundary split_id mismatch: "
-            f"boundary={boundary_split_id!r}; runtime={runtime_split_id!r}."
-        )
-    if boundary_graph_signature != runtime_graph_signature:
-        raise RuntimeError(
-            "Preflight boundary graph_signature mismatch: "
-            f"boundary={boundary_graph_signature!r}; runtime={runtime_graph_signature!r}."
-        )
-
-    full_loss_value = float(full_loss.detach().cpu().item())
-    split_loss_value = float(split_loss.detach().cpu().item())
-    loss_diff = abs(full_loss_value - split_loss_value)
-    if loss_diff > float(loss_tolerance):
-        raise RuntimeError(
-            "Preflight full-path vs split-path loss mismatch: "
-            f"full={full_loss_value}; split={split_loss_value}; "
-            f"diff={loss_diff}; tolerance={loss_tolerance}; "
-            f"percent={choice.boundary!r}; split_id={runtime_split_id!r}."
-        )
-
-    output_max_diff = _max_abs_output_diff(full_output, suffix_output)
-    if not np.isfinite(output_max_diff) or output_max_diff > float(output_tolerance):
-        raise RuntimeError(
-            "Preflight full-path vs split-path output mismatch: "
-            f"max_abs_diff={output_max_diff}; tolerance={output_tolerance}; "
-            f"percent={choice.boundary!r}; split_id={runtime_split_id!r}."
-        )
-
-    # The eval-mode forward check above catches replay drift, but it does not
-    # prove that raw_freeze and TorchLens freeze will apply the same suffix update.
-    # Probe one backward pass on the raw eval-forward path without stepping the
-    # optimizer.
-    train_full_loss_value: float | None = None
-    train_split_loss_value: float | None = None
-    suffix_gradient_max_diff: float | None = None
-    named_parameters = dict(split_model.named_parameters())
-    can_probe_gradients = all(name in named_parameters for name in split_trainable_names)
-    if can_probe_gradients:
-        _configure_fixed_prefix_training(split_model, runtime)
-        rng_devices = _cuda_rng_devices(device)
-        _zero_model_gradients(split_model)
-        try:
-            with torch.random.fork_rng(devices=rng_devices, enabled=True):
-                train_full_output = split_model(inputs)
-                train_full_loss_tensor = loss_fn(train_full_output, copy.deepcopy(targets))
-                if not isinstance(train_full_loss_tensor, torch.Tensor):
-                    raise RuntimeError(
-                        "Preflight raw full-path loss_fn returned "
-                        f"{type(train_full_loss_tensor)!r}, not a tensor."
-                    )
-                if not train_full_loss_tensor.requires_grad:
-                    raise RuntimeError("Preflight raw full-path loss does not require gradients.")
-                train_full_loss_tensor.backward()
-            full_grads = _suffix_gradients_by_name(split_model, tuple(split_trainable_names))
-
-            _zero_model_gradients(split_model)
-            _configure_fixed_prefix_training(split_model, runtime)
-            with torch.random.fork_rng(devices=rng_devices, enabled=True):
-                with torch.no_grad():
-                    train_boundary = runtime.run_prefix(inputs)
-                train_split_loss_tensor, _split_boundary_grads = runtime.train_suffix(
-                    _contiguous_boundary_payload(train_boundary),
-                    copy.deepcopy(targets),
-                    loss_fn=loss_fn,
-                    optimizer=None,
-                )
-            split_grads = _suffix_gradients_by_name(split_model, tuple(split_trainable_names))
-        finally:
-            _zero_model_gradients(split_model)
-            _configure_fixed_prefix_training(split_model, runtime)
-
-        train_full_loss_value = float(train_full_loss_tensor.detach().cpu().item())
-        train_split_loss_value = float(train_split_loss_tensor.detach().cpu().item())
-        train_loss_diff = abs(train_full_loss_value - train_split_loss_value)
-        if train_loss_diff > float(loss_tolerance):
-            raise RuntimeError(
-                "Preflight freeze full-path vs split loss mismatch: "
-                f"raw={train_full_loss_value}; split={train_split_loss_value}; "
-                f"diff={train_loss_diff}; tolerance={loss_tolerance}; "
-                f"percent={choice.boundary!r}; split_id={runtime_split_id!r}."
-            )
-
-        suffix_gradient_max_diff = _max_suffix_gradient_diff(full_grads, split_grads)
-        if (
-            not np.isfinite(suffix_gradient_max_diff)
-            or suffix_gradient_max_diff > float(gradient_tolerance)
-        ):
-            raise RuntimeError(
-                "Preflight freeze full-path vs split-path suffix gradient mismatch: "
-                f"max_abs_diff={suffix_gradient_max_diff}; "
-                f"tolerance={gradient_tolerance}; "
-                f"percent={choice.boundary!r}; split_id={runtime_split_id!r}."
-            )
-
-    return PreflightReport(
-        percent=choice.boundary,
-        actual_split_id=runtime_split_id,
-        graph_signature=runtime_graph_signature,
-        trainable_parameter_names=tuple(split_trainable_names),
-        trainable_parameter_count=sum(
-            int(param.numel())
-            for param in collect_suffix_trainable_parameters(runtime)
-        ),
-        full_loss=full_loss_value,
-        split_loss=split_loss_value,
-        full_output_max_diff=output_max_diff,
-        tolerance=float(loss_tolerance),
-        train_full_loss=train_full_loss_value,
-        train_split_loss=train_split_loss_value,
-        suffix_gradient_max_diff=suffix_gradient_max_diff,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Runtime construction / boundary resolution
 # ---------------------------------------------------------------------------
@@ -1487,7 +1255,6 @@ def _build_runtime_for_boundary(
     example_batch: torch.Tensor,
     boundary: str,
     args: argparse.Namespace,
-    warmup: bool,
 ) -> tuple[Any, float]:
     config = SplitRuntimeConfig(
         boundary=str(boundary),
@@ -1512,8 +1279,7 @@ def _build_runtime_for_boundary(
         )
     else:
         runtime = build_split_runtime(split_model, example_batch, config)
-    if warmup:
-        maybe_warmup_runtime(runtime, example_batch)
+    maybe_warmup_runtime(runtime, example_batch)
     return runtime, float(time.perf_counter() - started)
 
 
@@ -1530,7 +1296,6 @@ def _build_runtime_for_choice(
         example_batch=example_batch,
         boundary=runtime_boundary,
         args=args,
-        warmup=True,
     )
     split_id = _require_runtime_split_id(runtime)
     logger.info(
@@ -1928,7 +1693,7 @@ def plot_split_time_accuracy_subplots(
 def _run_raw_freeze_mode(
     *,
     split_model: torch.nn.Module,
-    choice: SplitChoice,
+    suffix_param_names: tuple[str, ...] | None = None,
     edge_model: torch.nn.Module,
     frames_by_id: Mapping[int, np.ndarray],
     sample_ids: list[int],
@@ -1938,21 +1703,27 @@ def _run_raw_freeze_mode(
     device: torch.device,
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
+    seed: int = 0,
 ) -> dict[str, Any]:
     """Raw full-model eval-forward training with only the suffix trainable."""
-    _configure_raw_freeze_eval_forward_training(split_model, choice)
+    if suffix_param_names is None:
+        raise RuntimeError("raw_freeze requires TorchLens suffix parameter names.")
+    _configure_raw_freeze_eval_forward_training(
+        split_model,
+        tuple(suffix_param_names),
+    )
     resize_mode = get_split_runtime_input_resize_mode(edge_model)
     epoch_times: list[float] = []
     batch_times: list[float] = []
     losses: list[float] = []
     _synchronize(device)
     training_started = time.perf_counter()
-    for _epoch in range(int(epochs)):
+    for epoch_index in range(int(epochs)):
         epoch_started = time.perf_counter()
-        for batch_ids in _ordered_epoch_batches(
+        for batch_index, batch_ids in enumerate(_ordered_epoch_batches(
             sample_ids,
             batch_size=max(2, int(batch_size)),
-        ):
+        )):
             _synchronize(device)
             batch_started = time.perf_counter()
             inputs, targets = _prepare_raw_batch(
@@ -1963,6 +1734,7 @@ def _run_raw_freeze_mode(
                 device=device,
                 resize_mode=resize_mode,
             )
+            _set_training_step_seed(seed, epoch_index, batch_index)
             optimizer.zero_grad(set_to_none=True)
             outputs = split_model(inputs)
             loss = loss_fn(outputs, copy.deepcopy(targets))
@@ -1999,21 +1771,30 @@ def _run_freeze_mode(
     device: torch.device,
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
+    seed: int = 0,
 ) -> dict[str, Any]:
-    """Trace-graph frozen-prefix training with full forward/backward each epoch."""
-    _configure_fixed_prefix_training(split_model, runtime)
+    """Recompute raw-input prefix features each batch, then train the suffix.
+
+    This mode intentionally shares the same ``runtime.train_suffix`` path as the
+    split modes. Its cost baseline is the repeated prefix rebuild, not a
+    different suffix optimizer/backward implementation.
+    """
+    _configure_fixed_prefix_training(
+        split_model,
+        runtime,
+    )
     resize_mode = get_split_runtime_input_resize_mode(edge_model)
     epoch_times: list[float] = []
     batch_times: list[float] = []
     losses: list[float] = []
     _synchronize(device)
     training_started = time.perf_counter()
-    for _epoch in range(int(epochs)):
+    for epoch_index in range(int(epochs)):
         epoch_started = time.perf_counter()
-        for batch_ids in _ordered_epoch_batches(
+        for batch_index, batch_ids in enumerate(_ordered_epoch_batches(
             sample_ids,
             batch_size=max(2, int(batch_size)),
-        ):
+        )):
             _synchronize(device)
             batch_started = time.perf_counter()
             inputs, targets = _prepare_raw_batch(
@@ -2024,15 +1805,23 @@ def _run_freeze_mode(
                 device=device,
                 resize_mode=resize_mode,
             )
-            optimizer.zero_grad(set_to_none=True)
-            outputs = split_model(inputs)
-            loss = loss_fn(outputs, copy.deepcopy(targets))
+            _set_training_step_seed(seed, 0, batch_index)
+            _set_runtime_prefix_module_state(runtime)
+            with torch.no_grad():
+                boundary = runtime.run_prefix(inputs)
+            _set_runtime_suffix_module_state(runtime)
+            _set_training_step_seed(seed, epoch_index, batch_index)
+            loss = train_split_suffix_batch(
+                runtime,
+                boundary,
+                copy.deepcopy(targets),
+                loss_fn,
+                optimizer,
+            )
             if not isinstance(loss, torch.Tensor):
-                raise RuntimeError(f"Freeze loss_fn returned {type(loss)!r}, not a tensor.")
-            if not loss.requires_grad:
-                raise RuntimeError("Freeze loss does not require gradients.")
-            loss.backward()
-            optimizer.step()
+                raise RuntimeError(
+                    f"Freeze train_suffix returned {type(loss)!r}, not a tensor."
+                )
             _synchronize(device)
             batch_times.append(time.perf_counter() - batch_started)
             losses.append(float(loss.detach().cpu().item()))
@@ -2059,7 +1848,8 @@ def _run_split_rebuild_mode(
     device: torch.device,
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
-) -> dict[str, Any]:
+    seed: int = 0,
+) -> _SplitRebuildModeResult:
     """split_rebuild: rebuild features once, reuse for every epoch."""
     split_id = _require_runtime_split_id(runtime)
     graph_signature = _require_runtime_graph_signature(runtime)
@@ -2074,6 +1864,7 @@ def _run_split_rebuild_mode(
         annotations=annotations,
         batch_size=int(batch_size),
         device=device,
+        seed=seed,
     )
     prepared = _prepared_batches_from_cache(cached_batches)
     train_metrics = _train_suffix_loop(
@@ -2083,9 +1874,14 @@ def _run_split_rebuild_mode(
         device=device,
         loss_fn=loss_fn,
         optimizer=optimizer,
+        seed=seed,
     )
     train_metrics["feature_rebuild_time_sec"] = float(feature_rebuild_time)
-    return train_metrics
+    return _SplitRebuildModeResult(
+        metrics=train_metrics,
+        cached_batches=cached_batches,
+        feature_rebuild_time=float(feature_rebuild_time),
+    )
 
 
 def _run_split_cached_mode(
@@ -2095,6 +1891,7 @@ def _run_split_cached_mode(
     device: torch.device,
     loss_fn: Callable[[Any, Any], torch.Tensor],
     optimizer: torch.optim.Optimizer,
+    seed: int = 0,
 ) -> dict[str, Any]:
     """split_cached: reuse the pre-built boundary payload cache."""
     _validate_cached_split_runtime(cached_split)
@@ -2106,32 +1903,85 @@ def _run_split_cached_mode(
         device=device,
         loss_fn=loss_fn,
         optimizer=optimizer,
+        seed=seed,
     )
     train_metrics["feature_rebuild_time_sec"] = 0.0
     return train_metrics
 
 
-# Public alias for tests that import the legacy name.
-def _train_split_cached_loop(
+def _split_cached_can_reuse_split_rebuild(modes: tuple[str, ...]) -> bool:
+    try:
+        rebuild_index = modes.index("split_rebuild")
+        cached_index = modes.index("split_cached")
+    except ValueError:
+        return False
+    return rebuild_index < cached_index
+
+
+def _make_cached_split_runtime(
     *,
-    cached_split: CachedSplitRuntime,
-    epochs: int,
-    loss_fn: Callable[[Any, Any], torch.Tensor],
-    optimizer: torch.optim.Optimizer | None,
-    seed: int,
-    shuffle_samples: bool,
-    device: torch.device,
-) -> dict[str, Any]:
-    del seed, shuffle_samples  # ordered deterministic loop; API compat only
-    metrics = _run_split_cached_mode(
-        cached_split=cached_split,
-        epochs=int(epochs),
-        device=device,
-        loss_fn=loss_fn,
-        optimizer=optimizer,
+    percent: str,
+    runtime: Any,
+    cached_batches: list[CachedSplitBatch],
+    feature_rebuild_time: float,
+    runtime_build_time: float,
+    suffix_param_names: tuple[str, ...],
+    feature_source: str,
+) -> CachedSplitRuntime:
+    cached_split = CachedSplitRuntime(
+        percent=percent,
+        split_id=_require_runtime_split_id(runtime),
+        graph_signature=_require_runtime_graph_signature(runtime),
+        runtime=runtime,
+        cached_batches=cached_batches,
+        feature_rebuild_time=float(feature_rebuild_time),
+        runtime_build_time=float(runtime_build_time),
+        suffix_param_names=tuple(suffix_param_names),
+        feature_source=str(feature_source),
     )
-    metrics["train_time_sec"] = float(metrics.get("suffix_train_time_sec", 0.0))
-    return metrics
+    _validate_cached_split_runtime(cached_split)
+    return cached_split
+
+
+def _build_cached_split_runtime_for_choice(
+    *,
+    percent: str,
+    runtime: Any,
+    runtime_build_time: float,
+    suffix_param_names: tuple[str, ...],
+    edge_model: torch.nn.Module,
+    frames_by_id: Mapping[int, np.ndarray],
+    sample_ids: list[int],
+    annotations: Mapping[str, Mapping[str, Any]],
+    batch_size: int,
+    device: torch.device,
+    feature_source: str,
+    seed: int = 0,
+) -> CachedSplitRuntime:
+    split_id = _require_runtime_split_id(runtime)
+    graph_signature = _require_runtime_graph_signature(runtime)
+    cached_batches, feature_rebuild_time = _build_cached_batches(
+        runtime=runtime,
+        percent=percent,
+        split_id=split_id,
+        graph_signature=graph_signature,
+        edge_model=edge_model,
+        frames_by_id=frames_by_id,
+        sample_ids=sample_ids,
+        annotations=annotations,
+        batch_size=int(batch_size),
+        device=device,
+        seed=seed,
+    )
+    return _make_cached_split_runtime(
+        percent=percent,
+        runtime=runtime,
+        cached_batches=cached_batches,
+        feature_rebuild_time=feature_rebuild_time,
+        runtime_build_time=runtime_build_time,
+        suffix_param_names=suffix_param_names,
+        feature_source=feature_source,
+    )
 
 
 
@@ -2141,12 +1991,17 @@ def _train_split_cached_loop(
 
 
 def _assert_trainable_parameter_equivalence(rows: list[Mapping[str, Any]]) -> None:
-    torchlens_suffix_modes = {"freeze", "split_rebuild", "split_cached"}
+    aligned_suffix_modes = {"raw_freeze", "freeze", "split_rebuild", "split_cached"}
     by_boundary: dict[str, dict[str, tuple[tuple[str, ...], int]]] = {}
     for row in rows:
         boundary = str(row.get("split_boundary"))
         mode = str(row.get("mode"))
-        if mode not in torchlens_suffix_modes:
+        if mode not in aligned_suffix_modes:
+            continue
+        if (
+            mode == "raw_freeze"
+            and row.get("raw_freeze_suffix_source") != "torchlens_runtime"
+        ):
             continue
         names = tuple(row.get("trainable_parameter_names") or ())
         count = int(row.get("trainable_parameter_count") or 0)
@@ -2198,6 +2053,7 @@ def _run_one_experiment(
     seed: int,
     args: argparse.Namespace,
     device: torch.device,
+    rebuild_cache_sink: list[CachedSplitRuntime] | None = None,
 ) -> dict[str, Any]:
     del example_batch  # retained for API symmetry; runtime reused across modes
     _set_random_seed(seed)
@@ -2222,33 +2078,27 @@ def _run_one_experiment(
                 "split_cached runtime does not match the shared per-boundary runtime."
             )
         logger.info(
-            "Using cached TorchLens runtime for {} split_id={} samples={}",
+            "Using cached TorchLens runtime for {} split_id={} samples={} source={}",
             cached_split.percent,
             cached_split.split_id,
             cached_split.cached_sample_count,
+            cached_split.feature_source,
         )
-    elif mode in {"freeze", "split_rebuild"}:
+    elif mode in {"raw_freeze", "freeze", "split_rebuild"}:
         if runtime is None:
-            raise RuntimeError(f"{mode} requires a shared TorchLens runtime.")
+            raise RuntimeError(
+                f"{mode} requires a shared TorchLens runtime so suffix parameters align."
+            )
     elif mode not in {"raw_freeze", "freeze", "split_rebuild"}:
         raise RuntimeError(f"Unsupported mode: {mode}")
 
-    metadata = (
-        {
-            "actual_split_id": _runtime_boundary_for_choice(choice),
-            "graph_signature": None,
+    metadata = get_split_runtime_metadata(runtime)
+    if mode == "raw_freeze":
+        metadata = {
+            **metadata,
             "runtime_backend": "raw_pytorch_freeze",
-            "torchlens_mode": None,
-            "boundary_after": _runtime_boundary_for_choice(choice),
-            "boundary_nodes": [],
-            "prefix_nodes": [],
-            "suffix_nodes": [],
-            "boundary_bytes": 0,
-            "trainable_suffix": True,
+            "raw_freeze_suffix_source": "torchlens_runtime",
         }
-        if mode == "raw_freeze"
-        else get_split_runtime_metadata(runtime)
-    )
     row = _base_result_row(
         mode=mode,
         choice=choice,
@@ -2265,14 +2115,25 @@ def _run_one_experiment(
         sampled_frame_indices=sampled_frame_indices,
     )
     row["runtime_build_time_sec"] = runtime_build_time
+    row["learning_rate"] = float(learning_rate)
+    row["optimizer_name"] = str(optimizer_config.get("optimizer_name", "adam"))
+    row["optimizer_name_request"] = str(getattr(args, "optimizer_name", "auto") or "auto")
+    row["weight_decay"] = float(optimizer_config.get("weight_decay", 0.0))
+    row["grad_clip_norm"] = _maybe_float(optimizer_config.get("grad_clip_norm"))
+    if mode == "split_cached":
+        assert cached_split is not None
+        row["cached_feature_source"] = cached_split.feature_source
+    elif mode == "split_rebuild":
+        row["cached_feature_source"] = "split_rebuild"
 
     # Freeze the prefix, mark only suffix parameters trainable. This MUST happen
     # before the optimizer is constructed so the optimizer only sees the active
     # mode's suffix parameters.
     if mode == "raw_freeze":
+        raw_suffix_names = tuple(_suffix_parameter_names(runtime))
         suffix_param_names, suffix_params = _configure_raw_freeze_eval_forward_training(
             split_model,
-            choice,
+            raw_suffix_names,
         )
     else:
         suffix_param_names, suffix_params = _configure_fixed_prefix_training(
@@ -2281,12 +2142,6 @@ def _run_one_experiment(
         )
     row["trainable_parameter_names"] = list(suffix_param_names)
     row["trainable_parameter_count"] = sum(int(param.numel()) for param in suffix_params)
-
-    # Snapshot prefix BatchNorm stats so we can assert they stayed frozen.
-    prefix_bn_snapshot = _collect_frozen_batchnorm_stats(
-        split_model,
-        None if mode == "raw_freeze" else runtime,
-    )
 
     if mode == "raw_freeze":
         optimizer = _build_optimizer_for_parameters(
@@ -2330,14 +2185,20 @@ def _run_one_experiment(
         batch_size=batch_size,
     )
     if mode == "raw_freeze":
-        _configure_raw_freeze_eval_forward_training(split_model, choice)
+        _configure_raw_freeze_eval_forward_training(
+            split_model,
+            tuple(suffix_param_names),
+        )
     else:
-        _configure_fixed_prefix_training(split_model, runtime)
+        _configure_fixed_prefix_training(
+            split_model,
+            runtime,
+        )
 
     if mode == "raw_freeze":
         train_metrics = _run_raw_freeze_mode(
             split_model=split_model,
-            choice=choice,
+            suffix_param_names=tuple(suffix_param_names),
             edge_model=edge_model,
             frames_by_id=frames_by_id,
             sample_ids=sampled_frame_indices,
@@ -2347,6 +2208,7 @@ def _run_one_experiment(
             device=device,
             loss_fn=loss_fn,
             optimizer=optimizer,
+            seed=seed,
         )
     elif mode == "freeze":
         train_metrics = _run_freeze_mode(
@@ -2361,9 +2223,10 @@ def _run_one_experiment(
             device=device,
             loss_fn=loss_fn,
             optimizer=optimizer,
+            seed=seed,
         )
     elif mode == "split_rebuild":
-        train_metrics = _run_split_rebuild_mode(
+        rebuild_result = _run_split_rebuild_mode(
             runtime=runtime,
             edge_model=edge_model,
             frames_by_id=frames_by_id,
@@ -2374,7 +2237,21 @@ def _run_one_experiment(
             device=device,
             loss_fn=loss_fn,
             optimizer=optimizer,
+            seed=seed,
         )
+        train_metrics = rebuild_result.metrics
+        if rebuild_cache_sink is not None:
+            rebuild_cache_sink.append(
+                _make_cached_split_runtime(
+                    percent=choice.boundary,
+                    runtime=runtime,
+                    cached_batches=rebuild_result.cached_batches,
+                    feature_rebuild_time=rebuild_result.feature_rebuild_time,
+                    runtime_build_time=runtime_build_time,
+                    suffix_param_names=tuple(suffix_param_names),
+                    feature_source="split_rebuild",
+                )
+            )
     else:
         assert cached_split is not None
         train_metrics = _run_split_cached_mode(
@@ -2383,6 +2260,7 @@ def _run_one_experiment(
             device=device,
             loss_fn=loss_fn,
             optimizer=optimizer,
+            seed=seed,
         )
 
     after_metrics = _evaluate_metric_map50(
@@ -2393,27 +2271,6 @@ def _run_one_experiment(
         device=device,
         batch_size=batch_size,
     )
-
-    # Verify that frozen prefix BatchNorm running stats were not updated.
-    post_bn_snapshot = _collect_frozen_batchnorm_stats(
-        split_model,
-        None if mode == "raw_freeze" else runtime,
-    )
-    for key, before_tensor in prefix_bn_snapshot.items():
-        after_tensor = post_bn_snapshot.get(key)
-        if after_tensor is None:
-            continue
-        module_name = key.rsplit(".", 1)[0]
-        if any(
-            param_name.startswith(module_name + ".")
-            for param_name in suffix_param_names
-        ):
-            continue
-        if not torch.equal(before_tensor.to(after_tensor.device), after_tensor):
-            raise RuntimeError(
-                "Frozen prefix BatchNorm running statistic drifted during training: "
-                f"key={key}; mode={mode}; split_id={metadata.get('actual_split_id')!r}."
-            )
 
     suffix_train = float(train_metrics.get("suffix_train_time_sec", 0.0))
     feature_rebuild = float(train_metrics.get("feature_rebuild_time_sec", 0.0))
@@ -2439,15 +2296,15 @@ def _run_one_experiment(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    _configure_process_threading(int(args.num_threads))
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     results_path = output_root / "results.jsonl"
     summary_path = output_root / "summary.csv"
     aggregate_summary_path = output_root / "aggregate_summary.csv"
-    if not bool(getattr(args, "append_results", False)):
-        for path in (results_path, summary_path, aggregate_summary_path):
-            if path.exists():
-                path.unlink()
+    for path in (results_path, summary_path, aggregate_summary_path):
+        if path.exists():
+            path.unlink()
 
     device = torch.device(str(args.device))
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -2462,7 +2319,6 @@ def main(argv: list[str] | None = None) -> int:
     repeat = max(1, int(args.repeat))
     choices = _split_choices([str(boundary) for boundary in args.split_boundaries])
     modes = tuple(str(mode) for mode in args.modes)
-    uses_torchlens_runtime = any(mode != "raw_freeze" for mode in modes)
 
     client_cfg, server_cfg = _prepare_configs(args)
 
@@ -2502,228 +2358,174 @@ def main(argv: list[str] | None = None) -> int:
         str(frame_id): dict(annotations.get(str(frame_id), {"boxes": [], "labels": []}))
         for frame_id in sampled_ids
     }
+    try:
+        teacher_detector.model.to("cpu")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to move teacher model back to CPU after annotation: {}", exc)
+    del teacher_detector
+    _release_unused_memory()
 
     split_model = get_split_runtime_model(edge_detector.model)
-    example_batch: torch.Tensor | None = None
-    if uses_torchlens_runtime:
-        example_batch = _make_trace_batch(
-            model=edge_detector.model,
-            frames_by_id=frames_by_id,
-            sample_ids=sampled_ids,
-            device=device,
-            trace_batch_size=2,
-        )
-        choices = _resolve_exact_split_choices(
-            split_model=split_model,
-            example_batch=example_batch,
-            choices=choices,
-            args=args,
-        )
+    example_batch = _make_trace_batch(
+        model=edge_detector.model,
+        frames_by_id=frames_by_id,
+        sample_ids=sampled_ids,
+        device=device,
+        trace_batch_size=2,
+    )
+    choices = _resolve_exact_split_choices(
+        split_model=split_model,
+        example_batch=example_batch,
+        choices=choices,
+        args=args,
+    )
     initial_state = _snapshot_model_state(edge_detector.model)
     learning_rate = _resolve_experiment_learning_rate(server_cfg, str(args.edge_model))
     optimizer_config = _optimizer_overrides(str(args.edge_model))
+    requested_optimizer_name = str(getattr(args, "optimizer_name", "auto") or "auto")
+    if requested_optimizer_name != "auto":
+        optimizer_config = {
+            **optimizer_config,
+            "optimizer_name": requested_optimizer_name,
+        }
 
-    cached_by_boundary: dict[str, CachedSplitRuntime] = {}
-    runtime_by_boundary: dict[str, Any] = {}
-    runtime_build_time_by_boundary: dict[str, float] = {}
-
-    if uses_torchlens_runtime:
-        assert example_batch is not None
-        # Build exactly one selected TorchLens runtime per boundary and reuse it
-        # for all enabled TorchLens modes. Candidate metadata has already been
-        # resolved without constructing runtimes for each candidate.
-        for choice in choices:
+    rows: list[dict[str, Any]] = []
+    mode_set = set(modes)
+    reuse_split_rebuild_cache = _split_cached_can_reuse_split_rebuild(modes)
+    for choice in choices:
+        cached_split: CachedSplitRuntime | None = None
+        shared_runtime: Any = None
+        shared_runtime_build_time = 0.0
+        try:
             _restore_model_state(edge_detector.model, initial_state)
-            runtime, build_time = _build_runtime_for_choice(
+            shared_runtime, shared_runtime_build_time = _build_runtime_for_choice(
                 split_model=split_model,
                 example_batch=example_batch,
                 choice=choice,
                 args=args,
             )
-            runtime_by_boundary[choice.boundary] = runtime
-            runtime_build_time_by_boundary[choice.boundary] = float(build_time)
+            shared_runtime_build_time = float(shared_runtime_build_time)
 
-    if "split_cached" in set(modes):
-        for choice in choices:
-            _restore_model_state(edge_detector.model, initial_state)
-            runtime = runtime_by_boundary[choice.boundary]
-            split_id = _require_runtime_split_id(runtime)
-            graph_signature = _require_runtime_graph_signature(runtime)
-            suffix_param_names = tuple(_suffix_parameter_names(runtime))
-            _configure_fixed_prefix_training(split_model, runtime)
-            split_model.eval()
-            logger.info(
-                "Prebuilding cached TorchLens boundaries for {} using split_id {}",
-                choice.boundary,
-                split_id,
-            )
-            cached_batches, feature_rebuild_time = _build_cached_batches(
-                runtime=runtime,
-                percent=choice.boundary,
-                split_id=split_id,
-                graph_signature=graph_signature,
-                edge_model=edge_detector.model,
-                frames_by_id=frames_by_id,
-                sample_ids=sampled_ids,
-                annotations=sample_annotations,
-                batch_size=int(args.batch_size),
-                device=device,
-            )
-            cached_split = CachedSplitRuntime(
-                percent=choice.boundary,
-                split_id=split_id,
-                graph_signature=graph_signature,
-                runtime=runtime,
-                cached_batches=cached_batches,
-                feature_rebuild_time=feature_rebuild_time,
-                runtime_build_time=runtime_build_time_by_boundary[choice.boundary],
-                suffix_param_names=suffix_param_names,
-            )
-            _validate_cached_split_runtime(cached_split)
-            cached_by_boundary[choice.boundary] = cached_split
-            logger.info(
-                "Cached {} boundary batch(es) for {} split_id={} samples={}",
-                len(cached_batches),
-                choice.boundary,
-                split_id,
-                cached_split.cached_sample_count,
-            )
-        _restore_model_state(edge_detector.model, initial_state)
-
-    # Preflight equivalence check: probe one batch per boundary BEFORE the
-    # repeat loop so the experiment fails fast if freeze vs split paths would
-    # disagree.
-    preflight_reports: list[PreflightReport] = []
-    if uses_torchlens_runtime:
-        preflight_loss_fn = build_split_training_loss(edge_detector.model)
-        for choice in choices:
-            _restore_model_state(edge_detector.model, initial_state)
-            runtime = runtime_by_boundary[choice.boundary]
-            runtime_split_id = _require_runtime_split_id(runtime)
-            runtime_graph_signature = _require_runtime_graph_signature(runtime)
-            suffix_names, _ = _configure_fixed_prefix_training(split_model, runtime)
-            report = _preflight_equivalence_check(
-                runtime=runtime,
-                split_model=split_model,
-                edge_model=edge_detector.model,
-                choice=choice,
-                frames_by_id=frames_by_id,
-                sample_ids=sampled_ids,
-                annotations=sample_annotations,
-                batch_size=int(args.batch_size),
-                device=device,
-                loss_fn=preflight_loss_fn,
-                freeze_trainable_names=suffix_names,
-                split_trainable_names=suffix_names,
-                cached_split=cached_by_boundary.get(choice.boundary),
-                runtime_split_id=runtime_split_id,
-                runtime_graph_signature=runtime_graph_signature,
-            )
-            preflight_reports.append(report)
-            logger.info(
-                "Preflight OK percent={} split_id={} trainable_params={} "
-                "full_loss={:.6f} split_loss={:.6f} output_max_diff={:.3e} "
-                "train_full_loss={:.6f} train_split_loss={:.6f} suffix_grad_max_diff={:.3e}",
-                report.percent,
-                report.actual_split_id,
-                report.trainable_parameter_count,
-                report.full_loss,
-                report.split_loss,
-                report.full_output_max_diff,
-                float(report.train_full_loss or 0.0),
-                float(report.train_split_loss or 0.0),
-                float(report.suffix_gradient_max_diff or 0.0),
-            )
-            _clear_cuda_cache()
-    preflight_path = output_root / "preflight.jsonl"
-    if preflight_path.exists():
-        preflight_path.unlink()
-    for report in preflight_reports:
-        _append_jsonl(
-            preflight_path,
-            {
-                "percent": report.percent,
-                "actual_split_id": report.actual_split_id,
-                "graph_signature": report.graph_signature,
-                "trainable_parameter_names": list(report.trainable_parameter_names),
-                "trainable_parameter_count": report.trainable_parameter_count,
-                "full_loss": report.full_loss,
-                "split_loss": report.split_loss,
-                "full_output_max_diff": report.full_output_max_diff,
-                "train_full_loss": report.train_full_loss,
-                "train_split_loss": report.train_split_loss,
-                "suffix_gradient_max_diff": report.suffix_gradient_max_diff,
-                "tolerance": report.tolerance,
-            },
-        )
-
-    rows: list[dict[str, Any]] = []
-    if bool(getattr(args, "append_results", False)) and results_path.exists():
-        with results_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    rows.append(json.loads(line))
-    completed_result_keys = {_result_resume_key(row) for row in rows}
-
-    for repeat_id in range(repeat):
-        run_seed = int(args.seed) + repeat_id
-        for choice in choices:
-            cached_split = cached_by_boundary.get(choice.boundary)
-            shared_runtime = runtime_by_boundary.get(choice.boundary)
-            shared_runtime_build_time = runtime_build_time_by_boundary.get(choice.boundary, 0.0)
-            for mode in modes:
-                expected_key = (
-                    int(repeat_id),
-                    str(choice.boundary),
-                    str(mode),
-                    int(run_seed),
-                    int(sample_count),
-                    int(epochs),
-                    int(args.batch_size),
-                )
-                if (
-                    bool(getattr(args, "append_results", False))
-                    and expected_key in completed_result_keys
-                ):
-                    logger.info(
-                        "Skipping completed result repeat={} boundary={} mode={}",
-                        repeat_id,
-                        choice.boundary,
-                        mode,
-                    )
-                    continue
-                row = _run_one_experiment(
-                    mode=str(mode),
-                    choice=choice,
-                    edge_model=edge_detector.model,
-                    split_model=split_model,
-                    model_name=str(args.edge_model),
-                    golden_model=str(args.golden_model),
-                    initial_state=initial_state,
-                    example_batch=example_batch,
-                    cached_split=cached_split,
-                    shared_runtime=shared_runtime,
-                    shared_runtime_build_time=shared_runtime_build_time,
-                    frame_dir=frame_dir,
-                    frames_by_id=frames_by_id,
-                    sampled_frame_indices=sampled_ids,
-                    annotations=sample_annotations,
-                    sample_count=sample_count,
-                    epochs=epochs,
-                    batch_size=int(args.batch_size),
-                    teacher_annotation_time=teacher_annotation_time,
-                    learning_rate=learning_rate,
-                    optimizer_config=optimizer_config,
-                    repeat_id=repeat_id,
-                    seed=run_seed,
-                    args=args,
-                    device=device,
-                )
-                rows.append(row)
-                completed_result_keys.add(_result_resume_key(row))
-                _append_jsonl(results_path, row)
+            if "split_cached" in mode_set and not reuse_split_rebuild_cache:
                 _restore_model_state(edge_detector.model, initial_state)
-                _clear_cuda_cache()
+                suffix_param_names = tuple(_suffix_parameter_names(shared_runtime))
+                _configure_fixed_prefix_training(split_model, shared_runtime)
+                logger.info(
+                    "Prebuilding cached TorchLens boundaries for {} using split_id {}",
+                    choice.boundary,
+                    _require_runtime_split_id(shared_runtime),
+                )
+                cached_split = _build_cached_split_runtime_for_choice(
+                    percent=choice.boundary,
+                    runtime=shared_runtime,
+                    runtime_build_time=shared_runtime_build_time,
+                    suffix_param_names=suffix_param_names,
+                    edge_model=edge_detector.model,
+                    frames_by_id=frames_by_id,
+                    sample_ids=sampled_ids,
+                    annotations=sample_annotations,
+                    batch_size=int(args.batch_size),
+                    device=device,
+                    feature_source="prebuilt",
+                    seed=int(args.seed),
+                )
+                logger.info(
+                    "Cached {} boundary batch(es) for {} split_id={} samples={} source={}",
+                    len(cached_split.cached_batches),
+                    choice.boundary,
+                    cached_split.split_id,
+                    cached_split.cached_sample_count,
+                    cached_split.feature_source,
+                )
+                _restore_model_state(edge_detector.model, initial_state)
+            elif "split_cached" in mode_set:
+                logger.info(
+                    "split_cached will reuse split_rebuild boundary cache for {}.",
+                    choice.boundary,
+                )
+
+            for repeat_id in range(repeat):
+                run_seed = int(args.seed) + repeat_id
+                if reuse_split_rebuild_cache:
+                    cached_split = None
+                for mode in modes:
+                    if str(mode) == "split_cached" and cached_split is None:
+                        logger.info(
+                            "No split_rebuild boundary cache is available for repeat={} "
+                            "boundary={}; prebuilding a split_cached fallback.",
+                            repeat_id,
+                            choice.boundary,
+                        )
+                        _restore_model_state(edge_detector.model, initial_state)
+                        suffix_param_names = tuple(_suffix_parameter_names(shared_runtime))
+                        _configure_fixed_prefix_training(split_model, shared_runtime)
+                        cached_split = _build_cached_split_runtime_for_choice(
+                            percent=choice.boundary,
+                            runtime=shared_runtime,
+                            runtime_build_time=shared_runtime_build_time,
+                            suffix_param_names=suffix_param_names,
+                            edge_model=edge_detector.model,
+                            frames_by_id=frames_by_id,
+                            sample_ids=sampled_ids,
+                            annotations=sample_annotations,
+                            batch_size=int(args.batch_size),
+                            device=device,
+                            feature_source="fallback_prebuilt",
+                            seed=int(run_seed),
+                        )
+                        _restore_model_state(edge_detector.model, initial_state)
+                    rebuild_cache_sink: list[CachedSplitRuntime] = []
+                    row = _run_one_experiment(
+                        mode=str(mode),
+                        choice=choice,
+                        edge_model=edge_detector.model,
+                        split_model=split_model,
+                        model_name=str(args.edge_model),
+                        golden_model=str(args.golden_model),
+                        initial_state=initial_state,
+                        example_batch=example_batch,
+                        cached_split=cached_split,
+                        shared_runtime=shared_runtime,
+                        shared_runtime_build_time=shared_runtime_build_time,
+                        frame_dir=frame_dir,
+                        frames_by_id=frames_by_id,
+                        sampled_frame_indices=sampled_ids,
+                        annotations=sample_annotations,
+                        sample_count=sample_count,
+                        epochs=epochs,
+                        batch_size=int(args.batch_size),
+                        teacher_annotation_time=teacher_annotation_time,
+                        learning_rate=learning_rate,
+                        optimizer_config=optimizer_config,
+                        repeat_id=repeat_id,
+                        seed=run_seed,
+                        args=args,
+                        device=device,
+                        rebuild_cache_sink=(
+                            rebuild_cache_sink
+                            if reuse_split_rebuild_cache and str(mode) == "split_rebuild"
+                            else None
+                        ),
+                    )
+                    if rebuild_cache_sink:
+                        cached_split = rebuild_cache_sink[-1]
+                        logger.info(
+                            "Captured split_rebuild boundary cache for {} repeat={} "
+                            "split_id={} samples={}; split_cached will reuse it.",
+                            choice.boundary,
+                            repeat_id,
+                            cached_split.split_id,
+                            cached_split.cached_sample_count,
+                        )
+                    rows.append(row)
+                    _append_jsonl(results_path, row)
+                    _restore_model_state(edge_detector.model, initial_state)
+                    _release_unused_memory()
+        finally:
+            del cached_split
+            del shared_runtime
+            _restore_model_state(edge_detector.model, initial_state)
+            _release_unused_memory()
 
     _assert_trainable_parameter_equivalence(rows)
 

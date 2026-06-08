@@ -118,6 +118,32 @@ def _move_boundary_to_runtime_device(runtime: Any, boundary: BoundaryPayload) ->
     return codec.to_runtime_device(boundary)
 
 
+def _clone_tensor_tree_for_training(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.contiguous().clone()
+    if isinstance(value, Mapping):
+        return {key: _clone_tensor_tree_for_training(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_clone_tensor_tree_for_training(item) for item in value)
+    if isinstance(value, list):
+        return [_clone_tensor_tree_for_training(item) for item in value]
+    return value
+
+
+def _clone_boundary_for_training(boundary: BoundaryPayload) -> BoundaryPayload:
+    tensors = getattr(boundary, "tensors", None)
+    if not isinstance(tensors, Mapping):
+        return boundary
+    return replace(
+        boundary,
+        tensors={
+            str(label): _clone_tensor_tree_for_training(tensor)
+            for label, tensor in dict(tensors).items()
+        },
+        metadata=dict(getattr(boundary, "metadata", {}) or {}),
+    )
+
+
 def train_split_suffix_batch(
     runtime: Any,
     boundary: BoundaryPayload,
@@ -134,6 +160,7 @@ def train_split_suffix_batch(
 
     runtime_obj = _runtime_from_splitter(runtime)
     boundary = _move_boundary_to_runtime_device(runtime_obj, boundary)
+    boundary = _clone_boundary_for_training(boundary)
     loss, _boundary_grads = runtime_obj.train_suffix(
         boundary,
         targets,
@@ -273,6 +300,24 @@ def _parameter_count_for_nodes(
             seen.add(key)
             total += numel
     return int(total)
+
+
+def _parameter_ids_for_nodes(
+    *,
+    graph: Any,
+    named_parameters: Mapping[str, torch.nn.Parameter],
+    node_names: Iterable[str],
+) -> set[int]:
+    selected = {str(name) for name in node_names}
+    parameter_ids: set[int] = set()
+    for node in getattr(graph, "ordered_nodes", lambda: ())():
+        if str(getattr(node, "torchlens_label", "")) not in selected:
+            continue
+        for log in _parameter_logs_for_node(node):
+            param = _parameter_from_log(log, named_parameters)
+            if param is not None:
+                parameter_ids.add(id(param))
+    return parameter_ids
 
 
 def _candidate_boundary_edges(runtime: Any, plan: Any) -> list[tuple[str, str]]:
@@ -1115,37 +1160,7 @@ def _set_suffix_training_state(runtime: Any, *, update_requires_grad: bool) -> N
             parameter.requires_grad_(False)
 
 
-def _suffix_parameters(runtime: Any) -> list[torch.nn.Parameter]:
-    runtime_obj = _runtime_from_splitter(runtime)
-    graph = getattr(runtime_obj, "trace_graph", None)
-    plan = getattr(runtime_obj, "plan", None)
-    model = _runtime_model(runtime_obj)
-    if graph is None or plan is None:
-        raise RuntimeError(
-            "TorchLens suffix optimizer requires runtime.trace_graph and runtime.plan."
-        )
-    if model is None:
-        raise RuntimeError("TorchLens suffix optimizer requires runtime.model.")
-    named_parameters = dict(model.named_parameters())
-    suffix_nodes = set(getattr(plan, "suffix_nodes", ()) or ())
-    if not suffix_nodes:
-        raise RuntimeError("TorchLens suffix optimizer found no suffix nodes.")
-    params: list[torch.nn.Parameter] = []
-    seen: set[int] = set()
-    for node in graph.ordered_nodes():
-        if str(getattr(node, "torchlens_label", "")) not in suffix_nodes:
-            continue
-        for log in _parameter_logs_for_node(node):
-            param = _parameter_from_log(log, named_parameters)
-            if param is None:
-                continue
-            if id(param) not in seen:
-                seen.add(id(param))
-                params.append(param)
-    return params
-
-
-def _suffix_parameter_names(runtime: Any) -> list[str]:
+def _suffix_parameter_entries(runtime: Any) -> list[tuple[str, torch.nn.Parameter]]:
     runtime_obj = _runtime_from_splitter(runtime)
     graph = getattr(runtime_obj, "trace_graph", None)
     plan = getattr(runtime_obj, "plan", None)
@@ -1163,21 +1178,40 @@ def _suffix_parameter_names(runtime: Any) -> list[str]:
     suffix_nodes = set(getattr(plan, "suffix_nodes", ()) or ())
     if not suffix_nodes:
         raise RuntimeError("TorchLens suffix optimizer found no suffix nodes.")
-    names: list[str] = []
+    frozen_source_nodes = set(getattr(plan, "prefix_nodes", ()) or ()) | set(
+        getattr(plan, "boundary_nodes", ()) or ()
+    )
+    frozen_source_parameter_ids = _parameter_ids_for_nodes(
+        graph=graph,
+        named_parameters=named_parameters,
+        node_names=frozen_source_nodes,
+    )
+    entries: list[tuple[str, torch.nn.Parameter]] = []
     seen: set[int] = set()
     for node in graph.ordered_nodes():
         if str(getattr(node, "torchlens_label", "")) not in suffix_nodes:
             continue
         for log in _parameter_logs_for_node(node):
             param = _parameter_from_log(log, named_parameters)
-            if param is None or id(param) in seen:
+            if param is None:
                 continue
-            name = parameter_names_by_id.get(id(param))
+            param_id = id(param)
+            if param_id in seen or param_id in frozen_source_parameter_ids:
+                continue
+            name = parameter_names_by_id.get(param_id)
             if name is None:
                 continue
-            seen.add(id(param))
-            names.append(str(name))
-    return names
+            seen.add(param_id)
+            entries.append((str(name), param))
+    return entries
+
+
+def _suffix_parameters(runtime: Any) -> list[torch.nn.Parameter]:
+    return [parameter for _name, parameter in _suffix_parameter_entries(runtime)]
+
+
+def _suffix_parameter_names(runtime: Any) -> list[str]:
+    return [name for name, _parameter in _suffix_parameter_entries(runtime)]
 
 
 def collect_suffix_trainable_parameters(

@@ -24,6 +24,7 @@ class CountingRuntime:
         self.boundary_spec = spec
         self.train_suffix_calls = 0
         self.validated = 0
+        self.boundary_tensors = []
 
     def validate_boundary(self, boundary) -> None:
         self.validated += 1
@@ -31,6 +32,7 @@ class CountingRuntime:
 
     def train_suffix(self, boundary, targets, *, loss_fn, optimizer):
         self.train_suffix_calls += 1
+        self.boundary_tensors.append(boundary.tensors["x"])
         self.validate_boundary(boundary)
         optimizer.zero_grad(set_to_none=True)
         loss = loss_fn(boundary.tensors["x"], targets)
@@ -83,3 +85,7 @@ def test_train_split_suffix_batch_calls_train_suffix_once_per_batch() -> None:
 
     assert runtime.train_suffix_calls == 3
     assert optimizer.step_calls == 3
+    source_ptr = boundary.tensors["x"].data_ptr()
+    forwarded_ptrs = [tensor.data_ptr() for tensor in runtime.boundary_tensors]
+    assert all(ptr != source_ptr for ptr in forwarded_ptrs)
+    assert len(set(forwarded_ptrs)) == len(forwarded_ptrs)
