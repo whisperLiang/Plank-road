@@ -7,14 +7,13 @@ import math
 import os
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
 from contextlib import contextmanager
-from typing import Any
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 import torch
-from mapcalc import calculate_map
+from torchmetrics.detection import MeanAveragePrecision
 from torchvision.models.detection.image_list import ImageList
 
 import model_management.model_zoo as model_zoo
@@ -23,34 +22,21 @@ from cloud.contracts import (
 )
 from cloud.feature_cache import FeatureShardRef, ShardFeatureBatchReader
 from cloud.training.proxy_metadata import (
-    class_names_from_metadata as _class_names_from_metadata,
-    coerce_positive_int as _coerce_positive_int,
-    infer_yolo_model_num_classes as _infer_yolo_model_num_classes,
-    is_cuda_oom_error as _is_cuda_oom_error,
-    is_low_quality_trigger_sample as _is_low_quality_trigger_sample,
-    label_name_from_schema as _label_name_from_schema,
-    looks_like_fused_ultralytics_state_dict as _looks_like_fused_ultralytics_state_dict,
-    normalise_class_name as _normalise_class_name,
-    normalise_label_schema as _normalise_label_schema,
-    normalise_shard_dtype as _normalise_shard_dtype,
     original_image_size_from_metadata as _original_image_size_from_metadata,
-    pool_label_metadata_from_record as _pool_label_metadata_from_record,
+)
+from cloud.training.proxy_metadata import (
     runtime_image_size_from_metadata as _runtime_image_size_from_metadata,
+)
+from cloud.training.proxy_metadata import (
     runtime_input_tensor_shape_from_metadata as _runtime_input_tensor_shape_from_metadata,
 )
-from model_management.model_zoo import (
-    get_detection_thresholds,
-    get_model_detection_thresholds,
-    invalidate_wrapper_predictor,
-    set_model_detection_thresholds,
-)
+from model_management.model_zoo import invalidate_wrapper_predictor
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_model_adapters import (
     get_split_runtime_model,
     postprocess_split_runtime_output,
 )
 from model_management.universal_model_split import UniversalModelSplitter
-
 
 _FIXED_SPLIT_DYNAMIC_BATCH = (2, 64)
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
@@ -69,30 +55,24 @@ from cloud.training.types import EarlyStopDecision, ProxyEvalResult
 @dataclass
 class ProxyEvalConfig:
     enabled: bool = True
-    eval_before_retrain: bool = True
-    eval_after_first_epoch: bool = True
     eval_final: bool = True
     interval_epochs: int = 10
     max_eval_samples: int | None = 128
+    max_dets: int = 500
     min_delta: float = 0.002
     patience: int = 2
-    skip_if_baseline_above: float = 0.98
+    validation_fraction: float = 0.2
 
 
 class ProxyEvalScheduler:
     def __init__(self, config: ProxyEvalConfig) -> None:
         self.config = config
 
-    def should_eval_before_retrain(self) -> bool:
-        return bool(self.config.enabled and self.config.eval_before_retrain)
-
     def should_eval(self, epoch: int, total_epochs: int) -> bool:
         if not self.config.enabled:
             return False
         current_epoch = max(1, int(epoch))
         final_epoch = max(1, int(total_epochs))
-        if current_epoch == 1 and self.config.eval_after_first_epoch:
-            return True
         interval = int(self.config.interval_epochs or 0)
         if interval > 0 and current_epoch % interval == 0:
             return True
@@ -118,17 +98,9 @@ class ProxyEarlyStopper:
     def __init__(
         self,
         config: ProxyEvalConfig,
-        *,
-        baseline_metric: float | None = None,
     ) -> None:
         self.config = config
         self.stale_evaluations = 0
-        if (
-            baseline_metric is not None
-            and baseline_metric >= float(config.skip_if_baseline_above)
-            and int(config.patience) > 0
-        ):
-            self.stale_evaluations = max(0, int(config.patience) - 1)
 
     def record(
         self,
@@ -197,6 +169,82 @@ def deterministic_proxy_sample_ids(
     return (prioritized + remaining)[: int(max_samples)]
 
 
+@dataclass(frozen=True)
+class ProxyValidationSplit:
+    train_sample_ids: list[str]
+    validation_sample_ids: list[str]
+    train_gt_annotations: dict[str, Mapping[str, object]]
+    validation_gt_annotations: dict[str, Mapping[str, object]]
+
+
+def build_proxy_validation_split(
+    *,
+    all_sample_ids: Iterable[object],
+    gt_annotations: Mapping[object, Mapping[str, object]],
+    validation_fraction: float = 0.2,
+    max_eval_samples: int | None = 128,
+    random_seed: object | None = None,
+    min_train_samples: int = 1,
+) -> ProxyValidationSplit:
+    ordered_ids = [str(sample_id) for sample_id in all_sample_ids]
+    ordered_id_set = set(ordered_ids)
+    gt_by_id: dict[str, Mapping[str, object]] = {
+        str(sample_id): annotation
+        for sample_id, annotation in gt_annotations.items()
+        if isinstance(annotation, Mapping)
+    }
+    eligible_gt = {
+        sample_id: annotation
+        for sample_id, annotation in gt_by_id.items()
+        if sample_id in ordered_id_set
+    }
+
+    max_validation_by_train_min = max(0, len(ordered_ids) - max(1, int(min_train_samples)))
+    if not eligible_gt or max_validation_by_train_min <= 0:
+        return ProxyValidationSplit(
+            train_sample_ids=ordered_ids,
+            validation_sample_ids=[],
+            train_gt_annotations=dict(gt_by_id),
+            validation_gt_annotations={},
+        )
+
+    raw_fraction = max(0.0, min(1.0, float(validation_fraction)))
+    validation_count = max(1, int(math.ceil(len(eligible_gt) * raw_fraction)))
+    if max_eval_samples is not None and int(max_eval_samples) > 0:
+        validation_count = min(validation_count, int(max_eval_samples))
+    validation_count = min(validation_count, max_validation_by_train_min)
+    if validation_count <= 0:
+        return ProxyValidationSplit(
+            train_sample_ids=ordered_ids,
+            validation_sample_ids=[],
+            train_gt_annotations=dict(gt_by_id),
+            validation_gt_annotations={},
+        )
+
+    validation_ids = deterministic_proxy_sample_ids(
+        eligible_gt,
+        validation_count,
+        random_fill_seed=random_seed,
+    )
+    validation_id_set = set(validation_ids)
+    train_ids = [sample_id for sample_id in ordered_ids if sample_id not in validation_id_set]
+    train_id_set = set(train_ids)
+    return ProxyValidationSplit(
+        train_sample_ids=train_ids,
+        validation_sample_ids=validation_ids,
+        train_gt_annotations={
+            sample_id: annotation
+            for sample_id, annotation in gt_by_id.items()
+            if sample_id in train_id_set
+        },
+        validation_gt_annotations={
+            sample_id: gt_by_id[sample_id]
+            for sample_id in validation_ids
+            if sample_id in gt_by_id
+        },
+    )
+
+
 def _load_proxy_eval_frame(
     frame_dir: str,
     sample_id: str,
@@ -244,48 +292,6 @@ def _lookup_preloaded_record(
     return record if isinstance(record, Mapping) else None
 
 
-def _build_tinynext_threshold_candidates(
-    *,
-    current_low: float,
-    current_high: float,
-    default_high: float,
-    configured_candidates: list[float] | None = None,
-) -> list[float]:
-    raw_candidates: list[float]
-    if configured_candidates:
-        raw_candidates = [float(candidate) for candidate in configured_candidates]
-    else:
-        deltas = (-0.02, -0.01, -0.005, -0.002, 0.0, 0.002, 0.005, 0.01, 0.02)
-        raw_candidates = [
-            float(default_high),
-            float(current_high),
-            *(float(current_high) + delta for delta in deltas),
-            *(float(default_high) + delta for delta in (-0.01, -0.005, 0.005, 0.01)),
-        ]
-    return sorted(
-        set(
-            round(max(float(current_low), float(candidate)), 3)
-            for candidate in raw_candidates
-        )
-    )
-
-
-def _proxy_prediction_cache_threshold_low(
-    current_low: float,
-    threshold_highs: list[float] | tuple[float, ...],
-) -> float:
-    finite_highs = [
-        float(threshold)
-        for threshold in threshold_highs
-        if np.isfinite(float(threshold))
-    ]
-    if not finite_highs:
-        return float(current_low)
-    # Keep a tiny margin so scores exactly at a candidate high threshold are
-    # still filtered by the final high-threshold comparison, not by cache build.
-    return max(float(current_low), min(finite_highs) - 1e-6)
-
-
 @contextmanager
 def _temporary_tinynext_score_threshold(
     model: torch.nn.Module,
@@ -309,7 +315,10 @@ def _temporary_tinynext_score_threshold(
         yield
         return
 
-    if not np.isfinite(next_threshold) or next_threshold <= original_threshold:
+    if not np.isfinite(next_threshold) or next_threshold < 0.0:
+        yield
+        return
+    if abs(next_threshold - original_threshold) <= 1e-9:
         yield
         return
 
@@ -319,15 +328,6 @@ def _temporary_tinynext_score_threshold(
         yield
     finally:
         setattr(model, "score_thresh", original_value)
-
-
-def _proxy_metrics_skipped_full_proxy(metrics: Mapping[str, object] | None) -> bool:
-    if not metrics:
-        return False
-    try:
-        return int(metrics.get("full_proxy_evaluation_skipped", 0) or 0) == 1
-    except (TypeError, ValueError):
-        return False
 
 
 def _boundary_payload_from_trigger_feature(
@@ -923,14 +923,22 @@ def _prediction_from_model_output(
     if not scores:
         return empty
 
-    low_indices = [index for index, score in enumerate(scores) if score > threshold_low]
+    low_indices = (
+        list(range(len(scores)))
+        if float(threshold_low) <= 0.0
+        else [index for index, score in enumerate(scores) if score > threshold_low]
+    )
     if not low_indices:
         return empty
     labels = [labels[index] for index in low_indices]
     boxes = [boxes[index] for index in low_indices]
     scores = [scores[index] for index in low_indices]
 
-    high_indices = [index for index, score in enumerate(scores) if score > threshold_high]
+    high_indices = (
+        list(range(len(scores)))
+        if float(threshold_high) <= 0.0
+        else [index for index, score in enumerate(scores) if score > threshold_high]
+    )
     if not high_indices:
         return empty
     return {
@@ -968,31 +976,6 @@ def _batched_predictions_from_model_output(
         )
         for item in outputs
     ]
-
-
-def _filter_prediction_by_high_threshold(
-    prediction: Mapping[str, object],
-    *,
-    threshold_high: float,
-) -> dict[str, list]:
-    empty = {"labels": [], "boxes": [], "scores": []}
-    scores = list(prediction.get("scores") or [])
-    if not scores:
-        return empty
-
-    high_indices = [
-        index for index, score in enumerate(scores) if float(score) > float(threshold_high)
-    ]
-    if not high_indices:
-        return empty
-
-    labels = list(prediction.get("labels") or [])
-    boxes = list(prediction.get("boxes") or [])
-    return {
-        "labels": [labels[index] for index in high_indices],
-        "boxes": [boxes[index] for index in high_indices],
-        "scores": [scores[index] for index in high_indices],
-    }
 
 
 def _splitter_dynamic_batch_range(
@@ -1125,9 +1108,6 @@ def _build_detection_proxy_prediction_cache(
             target = gt_annotations.get(sample_id) or {}
             gt_boxes = list(target.get("boxes") or [])
             gt_labels = list(target.get("labels") or [])
-            if not gt_boxes or not gt_labels:
-                skipped_empty_gt += 1
-                continue
 
             record = _lookup_preloaded_record(preloaded_records, sample_id)
             if record is None:
@@ -1241,9 +1221,6 @@ def _build_detection_proxy_prediction_cache(
         target = gt_annotations.get(sample_id) or {}
         gt_boxes = list(target.get("boxes") or [])
         gt_labels = list(target.get("labels") or [])
-        if not gt_boxes or not gt_labels:
-            skipped_empty_gt += 1
-            continue
 
         frame_path = os.path.join(frame_dir, f"{sample_id}.jpg")
         if not os.path.exists(frame_path):
@@ -1291,34 +1268,128 @@ def _build_detection_proxy_prediction_cache(
     }
 
 
-def _evaluate_detection_proxy_map_from_cache(
+def _as_box_tensor(values: object) -> torch.Tensor:
+    if values is None:
+        return torch.empty((0, 4), dtype=torch.float32)
+    tensor = torch.as_tensor(values, dtype=torch.float32)
+    if tensor.numel() == 0 or tensor.ndim != 2 or tensor.shape[-1] != 4:
+        return torch.empty((0, 4), dtype=torch.float32)
+    return tensor
+
+
+def _as_label_tensor(values: object, *, expected: int | None = None) -> torch.Tensor:
+    if values is None:
+        return torch.empty((0,), dtype=torch.int64)
+    tensor = torch.as_tensor(values, dtype=torch.int64).reshape(-1)
+    if tensor.numel() == 0:
+        return torch.empty((0,), dtype=torch.int64)
+    if expected is not None and int(tensor.numel()) != int(expected):
+        return torch.empty((0,), dtype=torch.int64)
+    return tensor
+
+
+def _as_score_tensor(values: object, *, expected: int | None = None) -> torch.Tensor:
+    if values is None:
+        return torch.empty((0,), dtype=torch.float32)
+    tensor = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
+    if tensor.numel() == 0:
+        return torch.empty((0,), dtype=torch.float32)
+    if expected is not None and int(tensor.numel()) != int(expected):
+        return torch.empty((0,), dtype=torch.float32)
+    return tensor
+
+
+def _finite_metric(value: object) -> float | None:
+    if torch.is_tensor(value):
+        metric = float(value.detach().cpu().item())
+    else:
+        try:
+            metric = float(value)
+        except (TypeError, ValueError):
+            return None
+    if not math.isfinite(metric) or metric < 0.0:
+        return None
+    return metric
+
+
+def _evaluate_detection_proxy_metrics_from_cache(
     prediction_cache: Mapping[str, object],
     *,
     threshold_high: float,
-) -> dict[str, float | int | None]:
-    scores: list[float] = []
+    max_dets: int = 500,
+) -> dict[str, float | int | str | None]:
+    del threshold_high
+    predictions: list[dict[str, torch.Tensor]] = []
+    targets: list[dict[str, torch.Tensor]] = []
     nonempty_predictions = 0
     total_prediction_boxes = 0
 
     for gt_boxes, gt_labels, prediction in prediction_cache.get("prediction_rows", []):
-        filtered_prediction = _filter_prediction_by_high_threshold(
-            prediction,
-            threshold_high=threshold_high,
-        )
-        predicted_boxes = list(filtered_prediction.get("boxes") or [])
-        total_prediction_boxes += len(predicted_boxes)
-        if predicted_boxes:
-            nonempty_predictions += 1
-        score = calculate_map(
-            {"labels": gt_labels, "boxes": gt_boxes},
-            filtered_prediction,
-            0.5,
-        )
-        scores.append(float(score))
+        target_boxes = _as_box_tensor(gt_boxes)
+        target_labels = _as_label_tensor(gt_labels, expected=int(target_boxes.shape[0]))
+        if target_boxes.numel() > 0 and target_labels.numel() == 0:
+            continue
 
-    return {
-        "map": float(np.mean(scores)) if scores else None,
-        "evaluated_samples": len(scores),
+        prediction_boxes = _as_box_tensor(prediction.get("boxes"))
+        prediction_labels = _as_label_tensor(
+            prediction.get("labels"),
+            expected=int(prediction_boxes.shape[0]),
+        )
+        prediction_scores = _as_score_tensor(
+            prediction.get("scores"),
+            expected=int(prediction_boxes.shape[0]),
+        )
+        if (
+            prediction_boxes.numel() == 0
+            or prediction_labels.numel() == 0
+            or prediction_scores.numel() == 0
+        ):
+            prediction_boxes = torch.empty((0, 4), dtype=torch.float32)
+            prediction_labels = torch.empty((0,), dtype=torch.int64)
+            prediction_scores = torch.empty((0,), dtype=torch.float32)
+
+        total_prediction_boxes += int(prediction_boxes.shape[0])
+        if int(prediction_boxes.shape[0]) > 0:
+            nonempty_predictions += 1
+        predictions.append(
+            {
+                "boxes": prediction_boxes,
+                "scores": prediction_scores,
+                "labels": prediction_labels,
+            }
+        )
+        targets.append({"boxes": target_boxes, "labels": target_labels})
+
+    max_detection_threshold = max(10, int(max_dets))
+    metric_values: Mapping[str, object] = {}
+    if targets:
+        metric = MeanAveragePrecision(
+            box_format="xyxy",
+            iou_type="bbox",
+            class_metrics=True,
+            max_detection_thresholds=[1, 10, max_detection_threshold],
+            backend="faster_coco_eval",
+            sync_on_compute=False,
+        )
+        metric.update(predictions, targets)
+        metric_values = metric.compute()
+        metric.reset()
+
+    map_50_95 = _finite_metric(metric_values.get("map"))
+    map_50 = _finite_metric(metric_values.get("map_50"))
+    map_75 = _finite_metric(metric_values.get("map_75"))
+    mar_key = f"mar_{max_detection_threshold}"
+    mar = _finite_metric(metric_values.get(mar_key))
+
+    metrics: dict[str, float | int | str | None] = {
+        "primary_metric": map_50_95,
+        "primary_metric_name": "proxy_mAP_50_95",
+        "map_50_95": map_50_95,
+        "map_50": map_50,
+        "map_75": map_75,
+        mar_key: mar,
+        "max_dets": max_detection_threshold,
+        "evaluated_samples": len(targets),
         "skipped_empty_gt": int(prediction_cache.get("skipped_empty_gt", 0)),
         "skipped_missing_frame": int(prediction_cache.get("skipped_missing_frame", 0)),
         "total_gt_samples": int(prediction_cache.get("total_gt_samples", 0)),
@@ -1327,9 +1398,10 @@ def _evaluate_detection_proxy_map_from_cache(
         "nonempty_predictions": nonempty_predictions,
         "total_prediction_boxes": total_prediction_boxes,
     }
+    return metrics
 
 
-def _evaluate_detection_proxy_map(
+def _evaluate_detection_proxy_metrics(
     model: torch.nn.Module,
     *,
     frame_dir: str,
@@ -1349,12 +1421,12 @@ def _evaluate_detection_proxy_map(
     preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
     priority_sample_ids: Iterable[object] | None = None,
     random_fill_seed: object | None = None,
-) -> dict[str, float | int | None]:
-    if threshold_low is None or threshold_high is None:
-        threshold_low, threshold_high = get_model_detection_thresholds(
-            model,
-            str(model_name or getattr(model, "model_name", "")),
-        )
+    max_dets: int = 500,
+) -> dict[str, float | int | str | None]:
+    if threshold_low is None:
+        threshold_low = 0.0
+    if threshold_high is None:
+        threshold_high = 0.0
 
     active_prediction_cache = prediction_cache
     if active_prediction_cache is None:
@@ -1377,41 +1449,41 @@ def _evaluate_detection_proxy_map(
             random_fill_seed=random_fill_seed,
         )
 
-    return _evaluate_detection_proxy_map_from_cache(
+    return _evaluate_detection_proxy_metrics_from_cache(
         active_prediction_cache,
         threshold_high=float(threshold_high),
+        max_dets=max_dets,
     )
 
 
-def _format_proxy_map_summary(
+def _format_proxy_metric_summary(
     metrics_before: Mapping[str, object] | None,
     metrics_after: Mapping[str, object] | None,
 ) -> str | None:
-    if metrics_before is None or metrics_after is None:
+    del metrics_before
+    if metrics_after is None:
         return None
-    before_map = metrics_before.get("map")
-    after_map = metrics_after.get("map")
-    if before_map is None or after_map is None:
+    after_map = metrics_after.get("primary_metric", metrics_after.get("map_50_95"))
+    if after_map is None:
         return None
+    auxiliary = []
+    if metrics_after.get("map_50") is not None:
+        auxiliary.append(f"mAP_50={float(metrics_after['map_50']):.4f}")
+    if metrics_after.get("map_75") is not None:
+        auxiliary.append(f"mAP_75={float(metrics_after['map_75']):.4f}")
+    max_dets = int(metrics_after.get("max_dets", 500) or 500)
+    mar_key = f"mar_{max_dets}"
+    if metrics_after.get(mar_key) is not None:
+        auxiliary.append(f"mAR_{max_dets}={float(metrics_after[mar_key]):.4f}")
+    auxiliary_text = f", {', '.join(auxiliary)}" if auxiliary else ""
     return (
-        "proxy_mAP@0.5 "
-        f"{float(before_map):.4f} -> {float(after_map):.4f} "
-        f"(delta={float(after_map) - float(before_map):+.4f}, "
+        "proxy_mAP_50_95 "
+        f"best={float(after_map):.4f}"
+        f"{auxiliary_text} "
+        "("
         f"evaluated={int(metrics_after.get('evaluated_samples', 0))}, "
         f"skipped_empty_gt={int(metrics_after.get('skipped_empty_gt', 0))}, "
         f"skipped_missing_frame={int(metrics_after.get('skipped_missing_frame', 0))})"
-    )
-
-
-def _proxy_metrics_indicate_dead_detector(metrics: Mapping[str, object] | None) -> bool:
-    if not metrics:
-        return False
-    if metrics.get("map") is None:
-        return False
-    return (
-        float(metrics.get("map", 0.0)) <= 0.0
-        and int(metrics.get("evaluated_samples", 0)) > 0
-        and int(metrics.get("nonempty_predictions", 0)) == 0
     )
 
 
@@ -1425,199 +1497,11 @@ def _snapshot_model_state(model: torch.nn.Module) -> dict[str, object]:
     return snapshot
 
 
-def _proxy_metrics_are_better(
-    candidate_metrics: Mapping[str, object] | None,
-    incumbent_metrics: Mapping[str, object] | None,
-    *,
-    tolerance: float = 1e-6,
-) -> bool:
-    if not candidate_metrics:
-        return False
-    candidate_map = candidate_metrics.get("map")
-    if candidate_map is None:
-        return False
-    if not incumbent_metrics:
-        return True
-
-    incumbent_map = incumbent_metrics.get("map")
-    if incumbent_map is None:
-        return True
-
-    candidate_value = float(candidate_map)
-    incumbent_value = float(incumbent_map)
-    if candidate_value > incumbent_value + tolerance:
-        return True
-    if abs(candidate_value - incumbent_value) > tolerance:
-        return False
-
-    candidate_boxes = int(candidate_metrics.get("total_prediction_boxes", 1 << 30))
-    incumbent_boxes = int(incumbent_metrics.get("total_prediction_boxes", 1 << 30))
-    return candidate_boxes < incumbent_boxes
-
-
-def _calibrate_tinynext_proxy_thresholds(
-    model: torch.nn.Module,
-    *,
-    frame_dir: str,
-    gt_annotations: Mapping[str, Mapping[str, object]],
-    device: torch.device,
-    model_name: str,
-    frame_cache: dict[str, np.ndarray | None] | None = None,
-    max_samples: int | None = None,
-    candidate_thresholds: list[float] | None = None,
-    inference_batch_size: int = 1,
-    split_cache_path: str | None = None,
-    splitter: UniversalModelSplitter | None = None,
-    split_candidate=None,
-    preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
-    proxy_cache_threshold_low: float | None = None,
-    priority_sample_ids: Iterable[object] | None = None,
-    random_fill_seed: object | None = None,
-) -> tuple[dict[str, float | int | None], float, float]:
-    current_low, current_high = get_model_detection_thresholds(model, model_name)
-    _, default_high = get_detection_thresholds(model_name)
-    candidate_highs = _build_tinynext_threshold_candidates(
-        current_low=float(current_low),
-        current_high=float(current_high),
-        default_high=float(default_high),
-        configured_candidates=candidate_thresholds,
-    )
-    cache_threshold_low = (
-        float(proxy_cache_threshold_low)
-        if proxy_cache_threshold_low is not None
-        else _proxy_prediction_cache_threshold_low(
-            float(current_low),
-            [float(current_high), *candidate_highs],
-        )
-    )
-
-    prediction_cache = _build_detection_proxy_prediction_cache(
-        model,
-        frame_dir=frame_dir,
-        gt_annotations=gt_annotations,
-        device=device,
-        threshold_low=cache_threshold_low,
-        model_name=model_name,
-        frame_cache=frame_cache,
-        max_samples=max_samples,
-        inference_batch_size=inference_batch_size,
-        split_cache_path=split_cache_path,
-        splitter=splitter,
-        split_candidate=split_candidate,
-        preloaded_records=preloaded_records,
-        priority_sample_ids=priority_sample_ids,
-        random_fill_seed=random_fill_seed,
-    )
-    metrics_by_threshold: dict[float, dict[str, float | int | None]] = {}
-
-    best_high = float(current_high)
-    best_metrics = _evaluate_detection_proxy_map(
-        model,
-        frame_dir=frame_dir,
-        gt_annotations=gt_annotations,
-        device=device,
-        model_name=model_name,
-        threshold_low=current_low,
-        threshold_high=current_high,
-        frame_cache=frame_cache,
-        max_samples=max_samples,
-        inference_batch_size=inference_batch_size,
-        prediction_cache=prediction_cache,
-    )
-    metrics_by_threshold[round(float(current_high), 6)] = dict(best_metrics)
-
-    for candidate_high in candidate_highs:
-        threshold_key = round(float(candidate_high), 6)
-        candidate_metrics = metrics_by_threshold.get(threshold_key)
-        if candidate_metrics is None:
-            candidate_metrics = _evaluate_detection_proxy_map(
-                model,
-                frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
-                device=device,
-                model_name=model_name,
-                threshold_low=current_low,
-                threshold_high=candidate_high,
-                frame_cache=frame_cache,
-                max_samples=max_samples,
-                inference_batch_size=inference_batch_size,
-                prediction_cache=prediction_cache,
-            )
-            metrics_by_threshold[threshold_key] = dict(candidate_metrics)
-        if _proxy_metrics_are_better(candidate_metrics, best_metrics):
-            best_metrics = candidate_metrics
-            best_high = float(candidate_high)
-            continue
-        if (
-            candidate_metrics.get("map") is not None
-            and best_metrics.get("map") is not None
-            and abs(float(candidate_metrics["map"]) - float(best_metrics["map"])) <= 1e-6
-            and int(candidate_metrics.get("total_prediction_boxes", 1 << 30))
-            == int(best_metrics.get("total_prediction_boxes", 1 << 30))
-            and abs(float(candidate_high) - float(default_high)) < abs(float(best_high) - float(default_high))
-        ):
-            best_metrics = candidate_metrics
-            best_high = float(candidate_high)
-
-    set_model_detection_thresholds(
-        model,
-        threshold_low=float(current_low),
-        threshold_high=float(best_high),
-        model_name=model_name,
-    )
-    return best_metrics, float(current_high), float(best_high)
-
-
-def _fixed_split_proxy_rejection_reason(
-    metrics_before: Mapping[str, object] | None,
-    metrics_after: Mapping[str, object] | None,
-    *,
-    tolerance: float = 1e-6,
-) -> str | None:
-    if not metrics_after:
-        return None
-    if _proxy_metrics_indicate_dead_detector(metrics_after):
-        return "updated weights produced no detections on the GT-annotated proxy set"
-
-    if not metrics_before:
-        return None
-    before_map = metrics_before.get("map")
-    after_map = metrics_after.get("map")
-    if before_map is None or after_map is None:
-        return None
-
-    before_value = float(before_map)
-    after_value = float(after_map)
-    if after_value + tolerance < before_value:
-        return (
-            "proxy_mAP@0.5 regressed "
-            f"{before_value:.4f} -> {after_value:.4f}"
-        )
-
-    before_nonempty = int(metrics_before.get("nonempty_predictions", 0))
-    after_nonempty = int(metrics_after.get("nonempty_predictions", 0))
-    if abs(after_value - before_value) <= tolerance and after_nonempty < before_nonempty:
-        return (
-            "proxy_mAP@0.5 stayed flat but non-empty detections dropped "
-            f"{before_nonempty} -> {after_nonempty}"
-        )
-
-    return None
-
-
-@dataclass(frozen=True)
-class FixedSplitProxyDecision:
-    accepted: bool
-    reason: str | None = None
-    summary: str | None = None
-
-
 class FixedSplitProxyEvaluator:
     """Public fixed-split proxy-evaluation facade.
 
-    The detailed scoring, dead-detector checks, threshold calibration, and state
-    snapshots stay private to this module. Orchestration code uses this class so
-    those internals remain in one place.
+    The detailed COCO-style scoring stays private to this module. Orchestration
+    code uses this class so those internals remain in one place.
     """
 
     def __init__(
@@ -1627,17 +1511,13 @@ class FixedSplitProxyEvaluator:
         default_batch_size: int,
         max_samples: int | None,
         frame_cache_enabled: bool = True,
-        tinynext_threshold_candidates: list[float] | None = None,
+        max_dets: int = 500,
     ) -> None:
         self.device = device
         self.default_batch_size = max(1, int(default_batch_size))
         self.max_samples = max_samples
+        self.max_dets = max(10, int(max_dets))
         self.frame_cache_enabled = bool(frame_cache_enabled)
-        self.tinynext_threshold_candidates = (
-            list(tinynext_threshold_candidates)
-            if tinynext_threshold_candidates is not None
-            else None
-        )
 
     def new_frame_cache(self) -> dict[str, np.ndarray | None] | None:
         if not self.frame_cache_enabled:
@@ -1659,20 +1539,12 @@ class FixedSplitProxyEvaluator:
         splitter: UniversalModelSplitter | None = None,
         split_candidate=None,
         preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
-        proxy_cache_threshold_low: float | None = None,
         priority_sample_ids: Iterable[object] | None = None,
         random_fill_seed: object | None = None,
-    ) -> dict[str, float | int | None]:
+    ) -> dict[str, float | int | str | None]:
         threshold_low = None
         threshold_high = None
-        if proxy_cache_threshold_low is not None:
-            current_low, current_high = get_model_detection_thresholds(model, model_name)
-            threshold_low = _proxy_prediction_cache_threshold_low(
-                float(current_low),
-                [float(proxy_cache_threshold_low), float(current_high)],
-            )
-            threshold_high = float(current_high)
-        return _evaluate_detection_proxy_map(
+        return _evaluate_detection_proxy_metrics(
             model,
             frame_dir=frame_dir,
             gt_annotations=gt_annotations,
@@ -1694,6 +1566,7 @@ class FixedSplitProxyEvaluator:
             preloaded_records=preloaded_records,
             priority_sample_ids=priority_sample_ids,
             random_fill_seed=random_fill_seed,
+            max_dets=self.max_dets,
         )
 
     def evaluate_tinynext(
@@ -1706,119 +1579,26 @@ class FixedSplitProxyEvaluator:
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None = None,
         frame_cache: dict[str, np.ndarray | None] | None = None,
         max_samples: int | None = None,
-        candidate_thresholds: list[float] | None = None,
         inference_batch_size: int | None = None,
         stage_label: str,
         split_cache_path: str | None = None,
         splitter: UniversalModelSplitter | None = None,
         split_candidate=None,
         preloaded_records: Mapping[object, Mapping[str, object]] | None = None,
-        allow_dead_baseline_fast_path: bool = False,
         logger=None,
         priority_sample_ids: Iterable[object] | None = None,
         random_fill_seed: object | None = None,
-    ) -> dict[str, float | int | None]:
-        effective_max_samples = self.max_samples if max_samples is None else max_samples
-        full_proxy_sample_count = len(
-            _normalize_proxy_sample_ids(
-                gt_annotations,
-                max_samples=effective_max_samples,
-                priority_sample_ids=priority_sample_ids,
-                random_fill_seed=random_fill_seed,
-            )
-        )
-        calibration_max_samples = self._resolve_tinynext_proxy_selection_max_samples(
-            available_samples=len(gt_annotations),
-            full_eval_max_samples=effective_max_samples,
-        )
-        use_subset_calibration = (
-            calibration_max_samples is not None
-            and calibration_max_samples < full_proxy_sample_count
-        )
-        thresholds = (
-            candidate_thresholds
-            if candidate_thresholds is not None
-            else self.tinynext_threshold_candidates
-        )
-        batch_size = (
-            self.default_batch_size
-            if inference_batch_size is None
-            else max(1, int(inference_batch_size))
-        )
-        if use_subset_calibration:
-            subset_metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
-                model,
-                frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
-                device=self.device,
-                model_name=model_name,
-                frame_cache=frame_cache,
-                max_samples=calibration_max_samples,
-                candidate_thresholds=thresholds,
-                inference_batch_size=batch_size,
-                split_cache_path=split_cache_path,
-                splitter=splitter,
-                split_candidate=split_candidate,
-                preloaded_records=preloaded_records,
-                priority_sample_ids=priority_sample_ids,
-                random_fill_seed=random_fill_seed,
-            )
-            if logger is not None and abs(calibrated_high - initial_high) > 1e-6:
-                logger.info(
-                    "[FixedSplitCL] Calibrated {} threshold_high {} -> {} on {}-sample proxy subset during {}.",
-                    model_name,
-                    initial_high,
-                    calibrated_high,
-                    calibration_max_samples,
-                    stage_label,
-                )
-            if (
-                allow_dead_baseline_fast_path
-                and _proxy_metrics_indicate_dead_detector(subset_metrics)
-            ):
-                metrics = dict(subset_metrics)
-                metrics["full_proxy_evaluation_skipped"] = 1
-                metrics["full_proxy_sample_count"] = int(full_proxy_sample_count)
-                metrics["subset_proxy_sample_count"] = int(
-                    metrics.get("evaluated_samples", 0) or 0
-                )
-                if logger is not None:
-                    logger.info(
-                        "[FixedSplitCL] Skipping full TinyNeXt baseline proxy evaluation during {}: "
-                        "{}-sample subset produced no detections; full_proxy_samples={}.",
-                        stage_label,
-                        int(metrics["subset_proxy_sample_count"]),
-                        int(full_proxy_sample_count),
-                    )
-                return metrics
-            return self.evaluate_detection(
-                model,
-                frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
-                model_name=model_name,
-                sample_metadata_by_id=sample_metadata_by_id,
-                frame_cache=frame_cache,
-                max_samples=effective_max_samples,
-                inference_batch_size=batch_size,
-                split_cache_path=split_cache_path,
-                splitter=splitter,
-                split_candidate=split_candidate,
-                preloaded_records=preloaded_records,
-                proxy_cache_threshold_low=calibrated_high,
-                priority_sample_ids=priority_sample_ids,
-                random_fill_seed=random_fill_seed,
-            )
-
-        metrics, initial_high, calibrated_high = _calibrate_tinynext_proxy_thresholds(
+    ) -> dict[str, float | int | str | None]:
+        del logger, stage_label
+        return self.evaluate_detection(
             model,
             frame_dir=frame_dir,
             gt_annotations=gt_annotations,
-            device=self.device,
             model_name=model_name,
+            sample_metadata_by_id=sample_metadata_by_id,
             frame_cache=frame_cache,
-            max_samples=effective_max_samples,
-            candidate_thresholds=thresholds,
-            inference_batch_size=batch_size,
+            max_samples=self.max_samples if max_samples is None else max_samples,
+            inference_batch_size=inference_batch_size,
             split_cache_path=split_cache_path,
             splitter=splitter,
             split_candidate=split_candidate,
@@ -1826,47 +1606,13 @@ class FixedSplitProxyEvaluator:
             priority_sample_ids=priority_sample_ids,
             random_fill_seed=random_fill_seed,
         )
-        if logger is not None and abs(calibrated_high - initial_high) > 1e-6:
-            logger.info(
-                "[FixedSplitCL] Calibrated {} threshold_high {} -> {} during {}.",
-                model_name,
-                initial_high,
-                calibrated_high,
-                stage_label,
-            )
-        return dict(metrics)
 
     def format_summary(
         self,
         metrics_before: Mapping[str, object] | None,
         metrics_after: Mapping[str, object] | None,
     ) -> str | None:
-        return _format_proxy_map_summary(metrics_before, metrics_after)
-
-    def metrics_indicate_dead_detector(
-        self,
-        metrics: Mapping[str, object] | None,
-    ) -> bool:
-        return _proxy_metrics_indicate_dead_detector(metrics)
-
-    def metrics_skipped_full_proxy(
-        self,
-        metrics: Mapping[str, object] | None,
-    ) -> bool:
-        return _proxy_metrics_skipped_full_proxy(metrics)
-
-    def rejection_reason(
-        self,
-        metrics_before: Mapping[str, object] | None,
-        metrics_after: Mapping[str, object] | None,
-        *,
-        tolerance: float = 1e-6,
-    ) -> str | None:
-        return _fixed_split_proxy_rejection_reason(
-            metrics_before,
-            metrics_after,
-            tolerance=tolerance,
-        )
+        return _format_proxy_metric_summary(metrics_before, metrics_after)
 
     def snapshot_model_state(self, model: torch.nn.Module) -> dict[str, object]:
         return _snapshot_model_state(model)
@@ -1881,31 +1627,6 @@ class FixedSplitProxyEvaluator:
 
     def set_detection_model_eval_mode(self, model: torch.nn.Module) -> None:
         _set_detection_model_eval_mode(model)
-
-    def decide(
-        self,
-        metrics_before: Mapping[str, object] | None,
-        metrics_after: Mapping[str, object] | None,
-    ) -> FixedSplitProxyDecision:
-        summary = self.format_summary(metrics_before, metrics_after)
-        reason = self.rejection_reason(metrics_before, metrics_after)
-        return FixedSplitProxyDecision(
-            accepted=reason is None,
-            reason=reason,
-            summary=summary,
-        )
-
-    def rollback_if_rejected(
-        self,
-        model: torch.nn.Module,
-        *,
-        baseline_state: Mapping[str, object],
-        decision: FixedSplitProxyDecision,
-    ) -> bool:
-        if decision.accepted:
-            return False
-        self.restore_model_state(model, baseline_state)
-        return True
 
     @staticmethod
     def _resolve_tinynext_proxy_selection_max_samples(

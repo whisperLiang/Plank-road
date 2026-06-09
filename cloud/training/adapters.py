@@ -49,7 +49,6 @@ class DetectionTrainingAdapter(Protocol):
         epoch: int | None,
         stage_label: str,
         max_samples: int | None,
-        allow_dead_baseline_fast_path: bool = False,
     ) -> ProxyEvalResult:
         ...
 
@@ -128,14 +127,12 @@ class UniversalSplitTrainingAdapter:
         epoch: int | None,
         stage_label: str,
         max_samples: int | None,
-        allow_dead_baseline_fast_path: bool = False,
     ) -> ProxyEvalResult:
         started = time.perf_counter()
         if context.plan.model_family == "tinynext" and context.tinynext_proxy_evaluator:
             metrics = context.tinynext_proxy_evaluator(
                 stage_label=stage_label,
                 max_samples=max_samples,
-                allow_dead_baseline_fast_path=allow_dead_baseline_fast_path,
             )
         elif context.fixed_proxy_evaluator:
             metrics = context.fixed_proxy_evaluator(
@@ -156,7 +153,7 @@ class UniversalSplitTrainingAdapter:
     def metric_value(self, metrics: Mapping[str, object] | None) -> float | None:
         if not metrics:
             return None
-        value = metrics.get("map")
+        value = metrics.get("primary_metric", metrics.get("map_50_95"))
         if value is None:
             return None
         return float(value)
@@ -198,6 +195,6 @@ def _normalize_proxy_metrics(metrics: Mapping[str, object] | None) -> ProxyMetri
     for key, value in metrics.items():
         if value is None:
             normalized[str(key)] = None
-        elif isinstance(value, (float, int)):
+        elif isinstance(value, (float, int, str)):
             normalized[str(key)] = value
     return normalized

@@ -45,6 +45,7 @@ from cloud.training import (
     FixedSplitTrainingContext,
     FixedSplitTrainingPlan,
     ProxyEvalConfig,
+    build_proxy_validation_split,
     get_training_adapter,
 )
 from cloud.training.proxy_metadata import (

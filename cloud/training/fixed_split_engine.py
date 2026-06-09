@@ -31,7 +31,7 @@ class FixedSplitRetrainEngine:
         epoch_results = []
         trained_epochs = 0
         early_stop_reason: str | None = None
-        can_select_by_proxy = bool(config.enabled and context.gt_annotations)
+        can_select_by_proxy = bool(config.enabled and context.validation_gt_annotations)
 
         log.info(
             "[FixedSplitCL][TrainPlan] model_name={} model_family={} total_samples={} "
@@ -46,42 +46,8 @@ class FixedSplitRetrainEngine:
         )
 
         proxy_metrics_before: ProxyMetrics = {}
-        if can_select_by_proxy and context.initial_proxy_metrics is not None:
-            proxy_metrics_before = dict(context.initial_proxy_metrics)
-            baseline_eval = ProxyEvalResult(
-                metrics=dict(proxy_metrics_before),
-                metric=adapter.metric_value(proxy_metrics_before),
-                elapsed=max(0.0, float(context.initial_proxy_eval_time)),
-                epoch=0,
-                stage_label="proxy evaluation before retrain",
-            )
-            proxy_results.append(baseline_eval)
-            proxy_eval_time += baseline_eval.elapsed
-            self._log_proxy_eval(log, plan, baseline_eval)
-        elif can_select_by_proxy and scheduler.should_eval_before_retrain():
-            baseline_eval = adapter.evaluate_proxy(
-                context,
-                epoch=0,
-                stage_label="proxy evaluation before retrain",
-                max_samples=config.max_eval_samples,
-                allow_dead_baseline_fast_path=True,
-            )
-            proxy_results.append(baseline_eval)
-            proxy_eval_time += baseline_eval.elapsed
-            proxy_metrics_before = dict(baseline_eval.metrics)
-            self._log_proxy_eval(log, plan, baseline_eval)
-
-        baseline_metric = adapter.metric_value(proxy_metrics_before)
         best_candidate: CandidateState | None = None
-        if can_select_by_proxy and baseline_metric is not None:
-            best_candidate = CandidateState(
-                epoch=0,
-                state_dict=baseline_state,
-                proxy_metrics=dict(proxy_metrics_before),
-                proxy_metric=baseline_metric,
-                is_baseline=True,
-            )
-        early_stopper = ProxyEarlyStopper(config, baseline_metric=baseline_metric)
+        early_stopper = ProxyEarlyStopper(config)
         optimizer = adapter.build_optimizer(context)
 
         for epoch in range(1, int(plan.epochs) + 1):
@@ -149,7 +115,6 @@ class FixedSplitRetrainEngine:
                     state_dict=_snapshot_model_state(context.model),
                     proxy_metrics=dict(proxy_eval.metrics),
                     proxy_metric=proxy_eval.metric,
-                    is_baseline=False,
                 )
                 log.info(
                     "[FixedSplitCL][Candidate] model_name={} model_family={} "
@@ -179,44 +144,30 @@ class FixedSplitRetrainEngine:
                 )
                 break
 
-        has_post_training_proxy_eval = any(
-            result.epoch is not None and int(result.epoch) > 0
-            for result in proxy_results
-        )
-        proxy_metrics_after = dict(proxy_metrics_before)
-        should_restore_best_candidate = (
-            can_select_by_proxy
-            and best_candidate is not None
-            and (not best_candidate.is_baseline or has_post_training_proxy_eval)
-        )
-        if should_restore_best_candidate and best_candidate is not None:
+        proxy_metrics_after: ProxyMetrics = {}
+        result_available = True
+        if can_select_by_proxy and best_candidate is not None:
             if best_candidate.state_dict is not None:
                 context.model.load_state_dict(best_candidate.state_dict, strict=False)
                 _set_eval(context.model)
             proxy_metrics_after = dict(best_candidate.proxy_metrics or {})
-        elif context.gt_annotations and config.enabled and proxy_results:
-            proxy_metrics_after = dict(proxy_results[-1].metrics)
-        elif (
-            context.gt_annotations
-            and not proxy_results
-            and scheduler.should_eval_before_retrain()
-        ):
-            final_eval = adapter.evaluate_proxy(
-                context,
-                epoch=trained_epochs,
-                stage_label="proxy evaluation after retrain",
-                max_samples=config.max_eval_samples,
+        elif can_select_by_proxy:
+            result_available = False
+            if proxy_results:
+                proxy_metrics_after = dict(proxy_results[-1].metrics)
+            context.model.load_state_dict(baseline_state, strict=False)
+            _set_eval(context.model)
+            log.warning(
+                "[FixedSplitCL][Candidate] model_name={} model_family={} "
+                "no publishable checkpoint because validation {} was unavailable.",
+                plan.model_name,
+                plan.model_family,
+                "proxy_mAP_50_95",
             )
-            proxy_results.append(final_eval)
-            proxy_eval_time += final_eval.elapsed
-            proxy_metrics_after = dict(final_eval.metrics)
+        elif context.validation_gt_annotations and config.enabled and proxy_results:
+            proxy_metrics_after = dict(proxy_results[-1].metrics)
 
-        external_proxy_eval_time = (
-            max(0.0, float(context.initial_proxy_eval_time))
-            if context.initial_proxy_metrics is not None
-            else 0.0
-        )
-        total_retraining_time = time.perf_counter() - total_started + external_proxy_eval_time
+        total_retraining_time = time.perf_counter() - total_started
         suffix_forward_backward_time = sum(
             float(result.suffix_forward_backward_time) for result in epoch_results
         )
@@ -260,6 +211,7 @@ class FixedSplitRetrainEngine:
             best_proxy_metric=best_proxy_metric,
             trained_epochs=trained_epochs,
             early_stop_reason=early_stop_reason,
+            result_available=result_available,
         )
 
     @staticmethod
@@ -270,16 +222,17 @@ class FixedSplitRetrainEngine:
     ) -> None:
         log.info(
             "[FixedSplitCL][ProxyEval] model_name={} model_family={} stage={} "
-            "epoch={} proxy_metric={} evaluated_samples={} priority_samples={} "
-            "random_fill_samples={} elapsed={:.3f}s",
+            "epoch={} metric_name={} proxy_metric={} evaluated_samples={} "
+            "nonempty_predictions={} total_prediction_boxes={} elapsed={:.3f}s",
             plan.model_name,
             plan.model_family,
             result.stage_label,
             result.epoch,
+            result.metrics.get("primary_metric_name", "proxy_mAP_50_95"),
             _format_metric(result.metric),
             int(result.metrics.get("evaluated_samples", 0) or 0),
-            int(result.metrics.get("priority_gt_samples", 0) or 0),
-            int(result.metrics.get("random_fill_gt_samples", 0) or 0),
+            int(result.metrics.get("nonempty_predictions", 0) or 0),
+            int(result.metrics.get("total_prediction_boxes", 0) or 0),
             float(result.elapsed),
         )
 

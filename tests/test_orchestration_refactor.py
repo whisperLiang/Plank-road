@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from cloud.orchestration.sample_stage import CanonicalSampleStage
@@ -59,6 +58,8 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         proxy_eval_patience=0,
         proxy_eval_min_delta=0.0,
         proxy_eval_max_samples=0,
+        proxy_eval_validation_fraction=0.2,
+        proxy_eval_max_dets=500,
         proxy_eval_frame_cache_enabled=True,
         split_learning_rate=1e-3,
         wrapper_fixed_split_learning_rate=3e-5,
@@ -201,72 +202,34 @@ def test_legacy_low_quality_bundle_manifest_is_rejected(tmp_path) -> None:
     assert "legacy bundle_manifest.json uploads are no longer supported" in message
 
 
-def test_proxy_evaluator_rejects_and_rolls_back_bad_candidate() -> None:
-    evaluator = FixedSplitProxyEvaluator(
-        device=torch.device("cpu"),
-        default_batch_size=2,
-        max_samples=8,
-    )
-    model = torch.nn.Linear(1, 1)
-    baseline_state = evaluator.snapshot_model_state(model)
-    with torch.no_grad():
-        model.weight.add_(10.0)
-
-    decision = evaluator.decide(
-        {"map": 0.5, "evaluated_samples": 4, "nonempty_predictions": 4},
-        {"map": 0.4, "evaluated_samples": 4, "nonempty_predictions": 4},
-    )
-
-    assert decision.accepted is False
-    assert "regressed" in str(decision.reason)
-    assert evaluator.rollback_if_rejected(
-        model,
-        baseline_state=baseline_state,
-        decision=decision,
-    )
-    for name, tensor in model.state_dict().items():
-        assert torch.equal(tensor.cpu(), baseline_state[name])
-
-
-def test_proxy_evaluator_dead_detector_is_rejected() -> None:
+def test_proxy_evaluator_formats_map_50_95_summary() -> None:
     evaluator = FixedSplitProxyEvaluator(
         device=torch.device("cpu"),
         default_batch_size=2,
         max_samples=8,
     )
 
-    decision = evaluator.decide(
-        {"map": 0.5, "evaluated_samples": 4, "nonempty_predictions": 4},
+    summary = evaluator.format_summary(
+        None,
         {
-            "map": 0.0,
+            "primary_metric": 0.42,
+            "map_50": 0.7,
+            "map_75": 0.5,
+            "mar_500": 0.6,
             "evaluated_samples": 4,
-            "nonempty_predictions": 0,
-            "total_prediction_boxes": 0,
+            "skipped_empty_gt": 1,
+            "skipped_missing_frame": 0,
         },
     )
 
-    assert decision.accepted is False
-    assert "no detections" in str(decision.reason)
+    assert summary is not None
+    assert "proxy_mAP_50_95 best=0.4200" in summary
+    assert "mAP_50=0.7000" in summary
 
 
-def test_proxy_evaluator_accepts_non_regressing_metrics() -> None:
-    evaluator = FixedSplitProxyEvaluator(
-        device=torch.device("cpu"),
-        default_batch_size=2,
-        max_samples=8,
-    )
-
-    decision = evaluator.decide(
-        {"map": 0.5, "evaluated_samples": 4, "nonempty_predictions": 3},
-        {"map": 0.5, "evaluated_samples": 4, "nonempty_predictions": 3},
-    )
-
-    assert decision.accepted is True
-    assert decision.reason is None
-    assert decision.summary is not None
-
-
-def test_tinynext_dead_subset_fast_path_skips_full_baseline_recheck(monkeypatch) -> None:
+def test_tinynext_evaluation_uses_detection_metric_without_threshold_calibration(
+    monkeypatch,
+) -> None:
     evaluator = FixedSplitProxyEvaluator(
         device=torch.device("cpu"),
         default_batch_size=2,
@@ -277,23 +240,18 @@ def test_tinynext_dead_subset_fast_path_skips_full_baseline_recheck(monkeypatch)
         for index in range(30)
     }
 
-    def fake_calibrate(*args, **kwargs):
-        del args, kwargs
-        return (
-            {
-                "map": 0.0,
-                "evaluated_samples": 24,
-                "nonempty_predictions": 0,
-                "total_prediction_boxes": 0,
-            },
-            0.5,
-            0.4,
-        )
+    calls = {}
 
-    monkeypatch.setattr(
-        "cloud.training.proxy_eval._calibrate_tinynext_proxy_thresholds",
-        fake_calibrate,
-    )
+    def fake_evaluate_detection(*args, **kwargs):
+        del args
+        calls["max_samples"] = kwargs["max_samples"]
+        return {
+            "primary_metric": 0.42,
+            "map_50_95": 0.42,
+            "evaluated_samples": 30,
+        }
+
+    monkeypatch.setattr(evaluator, "evaluate_detection", fake_evaluate_detection)
 
     metrics = evaluator.evaluate_tinynext(
         torch.nn.Linear(1, 1),
@@ -301,12 +259,11 @@ def test_tinynext_dead_subset_fast_path_skips_full_baseline_recheck(monkeypatch)
         gt_annotations=gt_annotations,
         model_name="tinynext",
         stage_label="baseline",
-        allow_dead_baseline_fast_path=True,
     )
 
-    assert metrics["full_proxy_evaluation_skipped"] == 1
-    assert metrics["subset_proxy_sample_count"] == 24
-    assert metrics["full_proxy_sample_count"] == 30
+    assert metrics["primary_metric"] == 0.42
+    assert calls["max_samples"] == 30
+    assert "full_proxy_evaluation_skipped" not in metrics
 
 
 def test_sample_stage_rebuild_uses_three_way_canonical_merge_order() -> None:

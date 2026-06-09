@@ -491,6 +491,37 @@ wheels = [
 ]
 
 [[package]]
+name = "faster-coco-eval"
+version = "1.7.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9f/76/1e6a6abef23d1c736124482a7e4c58579509914264dc19ee5f513f54d4b6/faster_coco_eval-1.7.2.tar.gz", hash = "sha256:7f06cad6d60a4624c1e4a479b2d612be3e98565fc0dd4c8b41dabd5bdfe45557", size = 103791, upload-time = "2026-02-22T19:48:35.361Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2c/3e/4ac3605dd3d13d615586c59557e5ea58f0ab5d83e3fbde426da3a553dc28/faster_coco_eval-1.7.2-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:4f44282b348291c91eca76edaa62eb88532efb78a317a14c4ef4c0104544a431", size = 355376, upload-time = "2026-02-22T19:47:51.37Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/a9/c49a6d9bbe17a831f698cbed3813bcd03dfd052603794f5624eb172e05b5/faster_coco_eval-1.7.2-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:5c8231e0234b733eec66bd9ea86445c52f9f0283f36a986a4c35711bc074b99b", size = 580135, upload-time = "2026-02-22T19:47:53.03Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/f7/a17d637a54d1af4b79bc04d7c61d8a9c286287561c878edb1134a112028b/faster_coco_eval-1.7.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:35a43a57d89551960ab9950f2e1a44f5040ada5becef47367a530e0cf4ab474b", size = 578187, upload-time = "2026-02-22T19:47:54.496Z" },
+    { url = "https://files.pythonhosted.org/packages/73/62/b7f322b203903ab45d3d28299d5a50bf21666565ab50846af9626347517b/faster_coco_eval-1.7.2-cp310-cp310-win_amd64.whl", hash = "sha256:d9dd0ddf59bfc215a93591fa812b97ece01f4f1514ff7e8c9b1914bce158e86d", size = 320650, upload-time = "2026-02-22T19:47:55.58Z" },
+    { url = "https://files.pythonhosted.org/packages/be/ee/256f6f2e80f0b1c7693ea6a3d58e47a8985fac8836e047ce308ca8f85869/faster_coco_eval-1.7.2-cp310-cp310-win_arm64.whl", hash = "sha256:1e286b7dbce43792f2e1204e3abd41cbed2e3795ca0286ffffd55de4f15a506b", size = 318257, upload-time = "2026-02-22T19:47:57.026Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/df/c2e12f6d3c4053032708e4009be90a6cef91c243c025888b983ec2658c03/faster_coco_eval-1.7.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:bbb61508d2695bdedb9529cad1916e24a309419214133babaee63f9ed412d468", size = 358427, upload-time = "2026-02-22T19:47:58.142Z" },
+    { url = "https://files.pythonhosted.org/packages/93/5b/5c9b2ba525fe8e9cbfeeafc67ba0f9fb7d2aac1e6f21e1f01aaf1e876681/faster_coco_eval-1.7.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:19ef06f197b40e48bfa815b4024dbbb3ed7c0579edb0e41522248343e85154a2", size = 583299, upload-time = "2026-02-22T19:47:59.563Z" },
+    { url = "https://files.pythonhosted.org/packages/54/0e/b0813e0220501805178841b49d9e2ebfe739bfd0001f5e5d0467725b993d/faster_coco_eval-1.7.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:bb056f386e636584eeba166454f928f522dbd197cd1bd583de46f765e81758d1", size = 581657, upload-time = "2026-02-22T19:48:01.199Z" },
+    { url = "https://files.pythonhosted.org/packages/48/bd/d1264568620b9b22861594aa29f0a8ce2249476a2532945930bcf5f134a0/faster_coco_eval-1.7.2-cp311-cp311-win_amd64.whl", hash = "sha256:1cfe43beafd16622845317b50233c84d8da33b5034ef1ac7d5e76a181631d875", size = 321744, upload-time = "2026-02-22T19:48:02.605Z" },
+    { url = "https://files.pythonhosted.org/packages/62/35/039ae826bd58610dc6cd2aa1aa91ab6f3835c7ab854df23ed87e4169686e/faster_coco_eval-1.7.2-cp311-cp311-win_arm64.whl", hash = "sha256:0e0bf19fdcc8dd2ea08b761ce03178fbbee1525b04296f7b90c9a0a07a104f84", size = 319572, upload-time = "2026-02-22T19:48:03.716Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/87/68e110a852b08b9580fa6b968706a8e416f0a925d580e7bce8bfd4187d9d/faster_coco_eval-1.7.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:a0c2cbe9b86b772b2bafd345f09f746f818dbf778c076044e007bbf8c01da643", size = 357387, upload-time = "2026-02-22T19:48:05.13Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/a9/f0f902f84a900bdff1768065c5aa881a49cc683b3f081b79046d4be62717/faster_coco_eval-1.7.2-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d323acfcfb70096d053bcbc38ebbb8244f8b95a660e7c2579b8f0bfc0a023c51", size = 583711, upload-time = "2026-02-22T19:48:06.857Z" },
+    { url = "https://files.pythonhosted.org/packages/29/fc/35048c6446b07df92fad6078ac9d6ff3d4a34d910e6a1ca2066024919e3e/faster_coco_eval-1.7.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6a77a5dc5615b6519791e2243beb353a7c4f7ee4e9234b813a5fc276512d9f39", size = 588058, upload-time = "2026-02-22T19:48:08.298Z" },
+    { url = "https://files.pythonhosted.org/packages/de/59/a7b8c1f45c3cac9f25dcaa3a307f8902d75edef452f197a4940a1b896592/faster_coco_eval-1.7.2-cp312-cp312-win_amd64.whl", hash = "sha256:71de34e5a56a1bd487599d943821691c5c5dc46cac1e9a5acc784fab80cc06f7", size = 323791, upload-time = "2026-02-22T19:48:09.708Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/b9/faee4d2bf28810dd11922cad137ba5de9a3dd290651886217b9a529c368a/faster_coco_eval-1.7.2-cp312-cp312-win_arm64.whl", hash = "sha256:e333c5f9b0047907ab4ecd2590ef023c92787fbfa4adb393c0122e02174abefd", size = 316936, upload-time = "2026-02-22T19:48:11.169Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/39/6a13fdd23670f28eee6a2e820b00bda120fb5594902bc6571c765a050ff1/faster_coco_eval-1.7.2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:6cc42d18ca001bca4861920f0fd3992b4f488f765da7ae0a23c6715e1ba68e31", size = 357519, upload-time = "2026-02-22T19:48:12.272Z" },
+    { url = "https://files.pythonhosted.org/packages/03/b9/6e262051931d6f17f491d6d185cc65d813cfaf6b408bb02ecd5613a995f2/faster_coco_eval-1.7.2-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:8237eadc146f8589c31f7e3f22a65a7008813516940805be44bc55085f7415ee", size = 583449, upload-time = "2026-02-22T19:48:13.339Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/d2/fed28fc682b4d0e79506e4e3671ba248e67dad2b0210c8f3009f88f9b5d9/faster_coco_eval-1.7.2-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b7b925a8e09ff02c31a9b2d60227db63d2e5641a24c98788f51238c1736b2a13", size = 587873, upload-time = "2026-02-22T19:48:14.677Z" },
+    { url = "https://files.pythonhosted.org/packages/69/75/983ad205d0f26db79e6088485f1d138c90d7432dfd410c6632edef87651e/faster_coco_eval-1.7.2-cp313-cp313-win_amd64.whl", hash = "sha256:303e84dd2f8f8d96c2f4134e74c9b3ab2a7fa25dc59d0d4773a477b561a82ceb", size = 323860, upload-time = "2026-02-22T19:48:16.906Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/94/a20d5ad59e43b7f69955c64c80e127bdc7c75eca65adb03bde1683ee2340/faster_coco_eval-1.7.2-cp313-cp313-win_arm64.whl", hash = "sha256:ff1768f6593956c882defc3a4de47130c4ca0827530ef83453136ef52b4e0357", size = 316983, upload-time = "2026-02-22T19:48:18.331Z" },
+]
+
+[[package]]
 name = "filelock"
 version = "3.29.0"
 source = { registry = "https://pypi.org/simple" }
@@ -957,6 +988,19 @@ wheels = [
 ]
 
 [[package]]
+name = "lightning-utilities"
+version = "0.15.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f1/45/7fa8f56b17dc0f0a41ec70dd307ecd6787254483549843bef4c30ab5adce/lightning_utilities-0.15.3.tar.gz", hash = "sha256:792ae0204c79f6859721ac7f386c237a33b0ed06ba775009cb894e010a842033", size = 33553, upload-time = "2026-02-22T14:48:53.348Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/25/f4/ead6e0e37209b07c9baa3e984ccdb0348ca370b77cea3aaea8ddbb097e00/lightning_utilities-0.15.3-py3-none-any.whl", hash = "sha256:6c55f1bee70084a1cbeaa41ada96e4b3a0fea5909e844dd335bd80f5a73c5f91", size = 31906, upload-time = "2026-02-22T14:48:52.488Z" },
+]
+
+[[package]]
 name = "loguru"
 version = "0.7.3"
 source = { registry = "https://pypi.org/simple" }
@@ -967,18 +1011,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/3a/05/a1dae3dffd1116099471c643b8924f5aa6524411dc6c63fdae648c4f1aca/loguru-0.7.3.tar.gz", hash = "sha256:19480589e77d47b8d85b2c827ad95d49bf31b0dcde16593892eb51dd18706eb6", size = 63559, upload-time = "2024-12-06T11:20:56.608Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/29/0348de65b8cc732daa3e33e67806420b2ae89bdce2b04af740289c5c6c8c/loguru-0.7.3-py3-none-any.whl", hash = "sha256:31a33c10c8e1e10422bfd431aeb5d351c7cf7fa671e3c4df004162264b28220c", size = 61595, upload-time = "2024-12-06T11:20:54.538Z" },
-]
-
-[[package]]
-name = "mapcalc"
-version = "0.2.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/26/7e/a44dd6d2e06250162dd9f0479cea687833d917e3cb95bd7ecdcb75c61098/mapcalc-0.2.2.tar.gz", hash = "sha256:3f9462b52ed97e41b6895023f285d209b8edb46c86544989a20b3d0658cc20c2", size = 8955, upload-time = "2021-06-28T14:26:19.263Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/c9/79/449bfb5d999cfe38bb0277390766e228d9bce449e612f926dc95827427b1/mapcalc-0.2.2-py3-none-any.whl", hash = "sha256:2629cdaadc569cbc21e6c94a40a37b577b4b02c32091e54364fe840b491fbef9", size = 9518, upload-time = "2021-06-28T14:26:17.347Z" },
 ]
 
 [[package]]
@@ -1671,12 +1703,12 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "apscheduler" },
+    { name = "faster-coco-eval" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
     { name = "huggingface-hub" },
     { name = "imutils" },
     { name = "loguru" },
-    { name = "mapcalc" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "opencv-python" },
@@ -1693,6 +1725,7 @@ dependencies = [
     { name = "timm" },
     { name = "torch" },
     { name = "torchlens" },
+    { name = "torchmetrics" },
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -1710,12 +1743,12 @@ integration = [
 [package.metadata]
 requires-dist = [
     { name = "apscheduler" },
+    { name = "faster-coco-eval", specifier = ">=1.6.0" },
     { name = "grpcio", specifier = "==1.80.0" },
     { name = "grpcio-tools", specifier = "==1.80.0" },
     { name = "huggingface-hub", specifier = "==1.5.0" },
     { name = "imutils" },
     { name = "loguru", specifier = "==0.7.3" },
-    { name = "mapcalc" },
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "numpy", specifier = "==2.2.6" },
     { name = "opencv-python", specifier = "==4.11.0.86" },
@@ -1734,6 +1767,7 @@ requires-dist = [
     { name = "timm", marker = "extra == 'integration'", specifier = ">=1.0.26" },
     { name = "torch", specifier = ">=2.11.0" },
     { name = "torchlens", path = "torchlens-2.18.0-py3-none-any.whl" },
+    { name = "torchmetrics", specifier = ">=1.8.0" },
     { name = "torchvision", specifier = ">=0.26.0" },
     { name = "torchvision", marker = "extra == 'integration'", specifier = ">=0.26.0" },
     { name = "tqdm", specifier = ">=4.66" },
@@ -2718,6 +2752,21 @@ requires-dist = [
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.16" },
 ]
 provides-extras = ["viewer", "paper", "notebook", "llm", "neuro", "viz", "tabular", "captum", "sae", "profiler", "lightning", "wandb", "hf", "gradcam", "shap", "inseq", "steering", "repeng", "dialz", "nnsight", "lit", "depyf", "compat-shims", "vision-shims", "all", "all-stretch", "dev", "io", "test"]
+
+[[package]]
+name = "torchmetrics"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "lightning-utilities" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/34/39b8b749333db56c0585d7a11fa62a283c087bb1dfc897d69fb8cedbefb1/torchmetrics-1.9.0.tar.gz", hash = "sha256:a488609948600df52d3db4fcdab02e62aab2a85ef34da67037dc3e65b8512faa", size = 581765, upload-time = "2026-03-09T17:41:22.443Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c3/a2/c7f6ebf546f8f644edf0f999aa98ece106986a77a7b922316bf6414ff825/torchmetrics-1.9.0-py3-none-any.whl", hash = "sha256:bfdcbff3dd1d96b3374bb2496eb39f23c4b28b8a845b6a18c313688e0d2d9ca1", size = 983384, upload-time = "2026-03-09T17:41:19.756Z" },
+]
 
 [[package]]
 name = "torchvision"
