@@ -170,13 +170,17 @@ def _write_e2e_config(tmp_path: Path, port: int, *, full_retrain: bool) -> Path:
             "warmup_iterations": 0,
         }
     )
-    config["client"]["sample_quality"].update({"quality_risk_threshold": 0.01})
+    config["client"]["sample_quality"].update(
+        {
+            "output_entropy": {"warmup_samples": 0},
+            "boundary_feature_entropy": {"warmup_samples": 0},
+        }
+    )
     config["client"]["window_drift"].update(
         {
             "window_size": 4,
             "min_window_size": 2,
             "low_quality_rate_threshold": 0.0,
-            "uncovered_evidence_rate_threshold": 0.0,
             "persistence_windows": 1,
         }
     )

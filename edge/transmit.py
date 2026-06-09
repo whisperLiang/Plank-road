@@ -18,7 +18,7 @@ from tools.grpc_options import grpc_message_options
 import zipfile
 import io
 
-from edge.quality_assessor import LOW_QUALITY
+from edge.sample_quality import LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
 from model_management.fixed_split import SplitPlan
 
@@ -39,10 +39,8 @@ def _format_bytes(num_bytes: int | float) -> str:
 
 
 def _quality_sort_key(record) -> tuple[float, str, str]:
-    quality = record.quality_score
     return (
         0.0 if bool(getattr(record, "in_drift_window", False)) else 1.0,
-        float("inf") if quality is None else float(quality),
         str(record.timestamp),
         str(record.sample_id),
     )

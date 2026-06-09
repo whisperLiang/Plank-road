@@ -50,7 +50,6 @@ class PendingTrainingStats:
     high_quality_count: int
     low_quality_count: int
     low_quality_rate: float
-    uncovered_evidence_rate: float
     drift_detected: bool
     high_quality_feature_bytes: int
     low_quality_feature_bytes: int
@@ -63,7 +62,6 @@ class PendingTrainingStats:
             high_quality_count=int(payload.get("high_quality_count", 0)),
             low_quality_count=int(payload.get("low_quality_count", 0)),
             low_quality_rate=float(payload.get("low_quality_rate", 0.0)),
-            uncovered_evidence_rate=float(payload.get("uncovered_evidence_rate", 0.0)),
             drift_detected=bool(payload.get("drift_detected", False)),
             high_quality_feature_bytes=int(payload.get("high_quality_feature_bytes", 0)),
             low_quality_feature_bytes=int(payload.get("low_quality_feature_bytes", 0)),
@@ -89,12 +87,12 @@ class TrainingDecision:
 
 
 class ResourceAwareCLTrigger:
-    """Lyapunov-style trigger that chooses training and low-confidence feature upload.
+    """Lyapunov-style trigger that chooses training and teacher-needed feature upload.
 
     The fixed split plan is computed separately at startup. Runtime decisions are
     limited to:
       1. whether continual learning should start now
-      2. whether low-confidence samples should also upload intermediate features
+      2. whether teacher-needed samples should also upload intermediate features
 
     Only Q_cloud and Q_bw are maintained as virtual resource queues.
     """
@@ -173,9 +171,8 @@ class ResourceAwareCLTrigger:
             )
         loss = max(
             0.0,
-            (0.45 * float(stats.low_quality_rate))
-            + (0.35 * float(stats.uncovered_evidence_rate))
-            + (0.20 * threshold_progress),
+            (0.70 * float(stats.low_quality_rate))
+            + (0.30 * threshold_progress),
         )
         if drift_detected or stats.drift_detected:
             loss += self.drift_bonus
@@ -294,12 +291,12 @@ class ResourceAwareCLTrigger:
             reason = "Skipped training because Lyapunov penalty outweighed adaptation gain."
         elif send_low_conf_features:
             reason = (
-                "Triggered training and included low-confidence features to reduce "
+                "Triggered training and included teacher-needed features to reduce "
                 "server recomputation under cloud compute pressure."
             )
         else:
             reason = (
-                "Triggered training in raw-only low-confidence mode to reduce "
+                "Triggered training in raw-only teacher-needed mode to reduce "
                 "bandwidth pressure."
             )
 
@@ -325,7 +322,6 @@ class ResourceAwareCLTrigger:
                 "send_low_conf_features": send_low_conf_features,
                 "drift_detected": bool(drift_detected),
                 "low_quality_rate": float(stats.low_quality_rate),
-                "uncovered_evidence_rate": float(stats.uncovered_evidence_rate),
                 "urgency": float(urgency),
                 "compute_pressure": float(compute_pressure),
                 "bandwidth_mbps": float(bandwidth_mbps),

@@ -12,11 +12,11 @@ The implementation combines startup-time fixed split planning, structured edge s
 
 At startup, each edge client traces the lightweight detector and selects a fixed computation-graph split plan. The selected boundary minimizes intermediate feature transfer cost while satisfying privacy constraints on feature leakage and trainability constraints that keep enough server-side tail layers available for continual learning.
 
-During online execution, video frames pass through differencing/filtering before entering the local inference queue. Edge inference produces intermediate features, detection results, and sample confidence. High-confidence samples are cached as `feature + result`; low-quality samples keep `feature + result + raw sample`; drift-related samples are marked in metadata.
+During online execution, video frames pass through differencing/filtering before entering the local inference queue. Edge inference produces intermediate features, detection results, output entropy, and boundary-feature entropy. Trusted edge pseudo-label samples are cached as `feature + result`; teacher-needed samples keep `feature + result + raw sample`; drift-related samples are marked in metadata.
 
-The continual-learning trigger combines low-confidence evidence, drift signals, cloud resource pressure, upload volume, and link bandwidth. Its Lyapunov controller decides whether to skip training, upload low-confidence raw samples only, or upload low-confidence raw samples together with intermediate features.
+The continual-learning trigger combines teacher-needed sample rate, drift signals, cloud resource pressure, upload volume, and link bandwidth. Its Lyapunov controller decides whether to skip training, upload teacher-needed raw samples only, or upload teacher-needed raw samples together with intermediate features.
 
-When training is triggered, the edge sends a versioned gRPC bundle with cached features/results, low-quality raw samples, optional low-confidence features, drift tags, and split metadata. The cloud annotates drift and low-confidence raw samples with the large model, reconstructs missing features when needed, retrains the split-tail network, optionally applies dynamic activation sparsity, and returns updated lightweight weights to the originating edge.
+When training is triggered, the edge sends a versioned gRPC bundle with cached features/results, teacher-needed raw samples, optional teacher-needed features, drift tags, and split metadata. The cloud annotates teacher-needed raw samples with the large model, reconstructs missing features when needed, retrains the split-tail network, optionally applies dynamic activation sparsity, and returns updated lightweight weights to the originating edge.
 
 ## Quick Start
 
@@ -60,13 +60,13 @@ Core areas: [model_management/fixed_split.py](./model_management/fixed_split.py)
 
 ### Edge Runtime And Sample Cache
 
-The edge runtime filters incoming frames, performs local detection, stores confidence-aware samples, and prepares feature shards for later upload. Window-level drift and evidence-quality signals decide which samples matter for continual learning.
+The edge runtime filters incoming frames, performs local detection, stores entropy-classified pseudo-label trust buckets, and prepares feature shards for later upload. Window-level drift and teacher-needed sample rate decide when samples matter for continual learning.
 
 Core areas: [edge/edge_worker.py](./edge/edge_worker.py), [edge/sample_store.py](./edge/sample_store.py), [edge/feature_shard/](./edge/feature_shard/).
 
 ### Resource-Aware Continual Learning Trigger
 
-The trigger gates continual learning with low-quality evidence, drift state, cloud utilization, and bandwidth estimates. It maintains cloud and bandwidth virtual queues and chooses whether low-confidence features should be included in the training bundle.
+The trigger gates continual learning with teacher-needed sample rate, drift state, cloud utilization, and bandwidth estimates. It maintains cloud and bandwidth virtual queues and chooses whether teacher-needed features should be included in the training bundle.
 
 Core areas: [edge/resource_aware_trigger.py](./edge/resource_aware_trigger.py), [edge/window_drift_detector.py](./edge/window_drift_detector.py), [cloud/global_resource_manager.py](./cloud/global_resource_manager.py).
 

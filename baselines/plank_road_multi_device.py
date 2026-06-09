@@ -302,7 +302,6 @@ class PlankRoadMultiDevice(BaseMethod):
                 "filtered_out_sample_ids": filtered_out_sample_ids,
                 "pending_low_quality_count": stats.low_quality_count,
                 "pending_low_quality_rate": stats.low_quality_rate,
-                "pending_uncovered_evidence_rate": stats.uncovered_evidence_rate,
             },
         )
 
@@ -458,7 +457,6 @@ class PlankRoadMultiDevice(BaseMethod):
             low_quality = [sample for sample in samples if self._is_low_quality_sample(sample)]
             high_quality_count = total - len(low_quality)
             low_quality_rate = len(low_quality) / float(total)
-            uncovered = [self._sample_uncovered_evidence(sample) for sample in samples]
             high_quality_feature_bytes = sum(
                 self._file_size(sample.feature_tensor_path)
                 for sample in samples
@@ -474,7 +472,6 @@ class PlankRoadMultiDevice(BaseMethod):
                 high_quality_count=high_quality_count,
                 low_quality_count=len(low_quality),
                 low_quality_rate=low_quality_rate,
-                uncovered_evidence_rate=sum(uncovered) / float(total),
                 drift_detected=any(sample.in_drift_window for sample in samples),
                 high_quality_feature_bytes=high_quality_feature_bytes,
                 low_quality_feature_bytes=low_quality_feature_bytes,
@@ -489,20 +486,17 @@ class PlankRoadMultiDevice(BaseMethod):
                 high_quality_count=0,
                 low_quality_count=0,
                 low_quality_rate=0.0,
-                uncovered_evidence_rate=0.0,
                 drift_detected=False,
                 high_quality_feature_bytes=0,
                 low_quality_feature_bytes=0,
                 low_quality_raw_bytes=0,
             )
         low_quality_count = sum(1 for result in results if self._is_low_quality_result(result))
-        uncovered = [self._result_uncovered_evidence(result) for result in results]
         return PendingTrainingStats(
             total_samples=total,
             high_quality_count=total - low_quality_count,
             low_quality_count=low_quality_count,
             low_quality_rate=low_quality_count / float(total),
-            uncovered_evidence_rate=sum(uncovered) / float(total),
             drift_detected=any(result.in_drift_window for result in results),
             high_quality_feature_bytes=0,
             low_quality_feature_bytes=0,
@@ -613,22 +607,6 @@ class PlankRoadMultiDevice(BaseMethod):
         if result.metric_map50 is not None:
             return float(result.metric_map50) < self._metric_trigger_threshold
         return float(result.confidence) < self._metric_trigger_threshold
-
-    def _sample_uncovered_evidence(self, sample: Any) -> float:
-        metric = sample.metric_f1 if sample.metric_f1 is not None else sample.metric_map50
-        if metric is None:
-            metric = sample.confidence
-        return self._metric_gap(float(metric))
-
-    def _result_uncovered_evidence(self, result: InferenceResult) -> float:
-        metric = result.metric_f1 if result.metric_f1 is not None else result.metric_map50
-        if metric is None:
-            metric = result.confidence
-        return self._metric_gap(float(metric))
-
-    def _metric_gap(self, value: float) -> float:
-        threshold = max(1e-6, self._metric_trigger_threshold)
-        return max(0.0, min(1.0, (threshold - float(value)) / threshold))
 
     @staticmethod
     def _file_size(path_like: str | Path | None) -> int:

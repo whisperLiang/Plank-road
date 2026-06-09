@@ -12,7 +12,7 @@ import cv2
 import torch
 
 from cloud.feature_cache import FeatureShardRef, FeatureShardStore
-from edge.quality_assessor import HIGH_QUALITY, LOW_QUALITY
+from edge.sample_quality import HIGH_QUALITY, LOW_QUALITY, QUALITY_METHOD
 from model_management.payload import BoundaryPayload
 
 
@@ -102,6 +102,29 @@ def _feature_ref_bytes(ref: Mapping[str, Any] | None) -> int:
     return int(total)
 
 
+def _normalise_quality_metadata(
+    quality: object,
+    *,
+    quality_bucket: str | None = None,
+) -> dict[str, Any]:
+    payload = dict(quality) if isinstance(quality, Mapping) else {}
+    bucket = str(
+        payload.get("quality")
+        or quality_bucket
+        or LOW_QUALITY
+    )
+    if bucket not in {HIGH_QUALITY, LOW_QUALITY}:
+        bucket = LOW_QUALITY
+    result: dict[str, Any] = {
+        "method": str(payload.get("method") or QUALITY_METHOD),
+        "quality": bucket,
+    }
+    debug = payload.get("debug")
+    if isinstance(debug, Mapping):
+        result["debug"] = dict(debug)
+    return result
+
+
 @dataclass
 class StoredSampleRecord:
     sample_id: str
@@ -113,16 +136,7 @@ class StoredSampleRecord:
     model_version: str
     front_version: str
     quality_bucket: str
-    quality_score: float
-    risk_score: float
-    risk_reasons: list[str] = field(default_factory=list)
-    evidence_count: int = 0
-    covered_evidence_count: int = 0
-    uncovered_evidence_count: int = 0
-    uncovered_evidence_rate: float = 0.0
-    candidate_uncovered_score: float = 0.0
-    motion_uncovered_score: float = 0.0
-    track_uncovered_score: float = 0.0
+    quality: dict[str, Any] = field(default_factory=dict)
     window_id: str | None = None
     in_drift_window: bool = False
     has_raw_sample: bool = False
@@ -138,6 +152,10 @@ class StoredSampleRecord:
     raw_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
+        quality_payload = _normalise_quality_metadata(
+            self.quality,
+            quality_bucket=self.quality_bucket,
+        )
         return {
             "sample_id": self.sample_id,
             "frame_index": self.frame_index,
@@ -147,17 +165,8 @@ class StoredSampleRecord:
             "model_id": self.model_id,
             "model_version": self.model_version,
             "front_version": self.front_version,
-            "quality_bucket": self.quality_bucket,
-            "quality_score": self.quality_score,
-            "risk_score": self.risk_score,
-            "risk_reasons": list(self.risk_reasons),
-            "evidence_count": self.evidence_count,
-            "covered_evidence_count": self.covered_evidence_count,
-            "uncovered_evidence_count": self.uncovered_evidence_count,
-            "uncovered_evidence_rate": self.uncovered_evidence_rate,
-            "candidate_uncovered_score": self.candidate_uncovered_score,
-            "motion_uncovered_score": self.motion_uncovered_score,
-            "track_uncovered_score": self.track_uncovered_score,
+            "quality": quality_payload,
+            "quality_bucket": str(quality_payload["quality"]),
             "window_id": self.window_id,
             "in_drift_window": self.in_drift_window,
             "has_raw_sample": self.has_raw_sample,
@@ -175,6 +184,10 @@ class StoredSampleRecord:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "StoredSampleRecord":
+        quality_payload = _normalise_quality_metadata(
+            payload.get("quality"),
+            quality_bucket=str(payload.get("quality_bucket", LOW_QUALITY)),
+        )
         return cls(
             sample_id=str(payload["sample_id"]),
             frame_index=payload.get("frame_index"),
@@ -184,17 +197,8 @@ class StoredSampleRecord:
             model_id=str(payload.get("model_id", "")),
             model_version=str(payload.get("model_version", "")),
             front_version=str(payload.get("front_version", "0") or "0"),
-            quality_bucket=str(payload.get("quality_bucket", LOW_QUALITY)),
-            quality_score=float(payload.get("quality_score", 0.0)),
-            risk_score=float(payload.get("risk_score", 0.0)),
-            risk_reasons=list(payload.get("risk_reasons") or []),
-            evidence_count=int(payload.get("evidence_count", 0)),
-            covered_evidence_count=int(payload.get("covered_evidence_count", 0)),
-            uncovered_evidence_count=int(payload.get("uncovered_evidence_count", 0)),
-            uncovered_evidence_rate=float(payload.get("uncovered_evidence_rate", 0.0)),
-            candidate_uncovered_score=float(payload.get("candidate_uncovered_score", 0.0)),
-            motion_uncovered_score=float(payload.get("motion_uncovered_score", 0.0)),
-            track_uncovered_score=float(payload.get("track_uncovered_score", 0.0)),
+            quality_bucket=str(quality_payload["quality"]),
+            quality=dict(quality_payload),
             window_id=(None if payload.get("window_id") is None else str(payload.get("window_id"))),
             in_drift_window=bool(payload.get("in_drift_window", False)),
             has_raw_sample=bool(payload.get("has_raw_sample", False)),
@@ -228,10 +232,6 @@ class _SampleStoreCounters:
     high_quality_feature_bytes: int = 0
     low_quality_feature_bytes: int = 0
     low_quality_raw_bytes: int = 0
-    uncovered_evidence_sum: float = 0.0
-    candidate_uncovered_sum: float = 0.0
-    motion_uncovered_sum: float = 0.0
-    track_uncovered_sum: float = 0.0
 
     def add(self, record: StoredSampleRecord, *, sign: int = 1) -> None:
         factor = 1 if sign >= 0 else -1
@@ -245,10 +245,6 @@ class _SampleStoreCounters:
             self.low_quality_raw_bytes += factor * int(record.raw_bytes)
         if record.in_drift_window:
             self.drift_window_sample_count += factor
-        self.uncovered_evidence_sum += factor * float(record.uncovered_evidence_rate)
-        self.candidate_uncovered_sum += factor * float(record.candidate_uncovered_score)
-        self.motion_uncovered_sum += factor * float(record.motion_uncovered_score)
-        self.track_uncovered_sum += factor * float(record.track_uncovered_score)
 
     def clamp(self) -> None:
         self.total_samples = max(0, int(self.total_samples))
@@ -258,11 +254,6 @@ class _SampleStoreCounters:
         self.high_quality_feature_bytes = max(0, int(self.high_quality_feature_bytes))
         self.low_quality_feature_bytes = max(0, int(self.low_quality_feature_bytes))
         self.low_quality_raw_bytes = max(0, int(self.low_quality_raw_bytes))
-        if self.total_samples == 0:
-            self.uncovered_evidence_sum = 0.0
-            self.candidate_uncovered_sum = 0.0
-            self.motion_uncovered_sum = 0.0
-            self.track_uncovered_sum = 0.0
 
     def to_stats(self) -> dict[str, Any]:
         total = max(0, int(self.total_samples))
@@ -272,18 +263,6 @@ class _SampleStoreCounters:
             "high_quality_count": max(0, int(self.high_quality_count)),
             "low_quality_count": low,
             "low_quality_rate": (low / float(total)) if total else 0.0,
-            "uncovered_evidence_rate": (
-                float(self.uncovered_evidence_sum) / float(total) if total else 0.0
-            ),
-            "candidate_uncovered_rate": (
-                float(self.candidate_uncovered_sum) / float(total) if total else 0.0
-            ),
-            "motion_uncovered_rate": (
-                float(self.motion_uncovered_sum) / float(total) if total else 0.0
-            ),
-            "track_uncovered_rate": (
-                float(self.track_uncovered_sum) / float(total) if total else 0.0
-            ),
             "drift_window_sample_count": max(0, int(self.drift_window_sample_count)),
             "high_quality_feature_bytes": max(0, int(self.high_quality_feature_bytes)),
             "low_quality_feature_bytes": max(0, int(self.low_quality_feature_bytes)),
@@ -378,17 +357,9 @@ class EdgeSampleStore:
         model_id: str,
         model_version: str,
         front_version: str = "0",
-        quality_bucket: str,
-        quality_score: float | None = None,
-        risk_score: float = 0.0,
-        risk_reasons: list[str] | None = None,
-        evidence_count: int = 0,
-        covered_evidence_count: int = 0,
-        uncovered_evidence_count: int = 0,
-        uncovered_evidence_rate: float = 0.0,
-        candidate_uncovered_score: float = 0.0,
-        motion_uncovered_score: float = 0.0,
-        track_uncovered_score: float = 0.0,
+        quality_bucket: str | None = None,
+        quality: Mapping[str, Any] | None = None,
+        quality_metadata: Mapping[str, Any] | None = None,
         window_id: str | None = None,
         in_drift_window: bool = False,
         inference_result: dict[str, Any],
@@ -406,15 +377,15 @@ class EdgeSampleStore:
         with self._lock:
             previous_record = self._existing_record_unlocked(sample_key)
 
+        quality_payload = _normalise_quality_metadata(
+            quality_metadata if quality_metadata is not None else quality,
+            quality_bucket=quality_bucket,
+        )
+        quality_bucket = str(quality_payload["quality"])
         if quality_bucket not in {HIGH_QUALITY, LOW_QUALITY}:
             raise ValueError(f"Unsupported quality bucket: {quality_bucket!r}")
         if quality_bucket != LOW_QUALITY:
             raw_frame = None
-        resolved_quality_score = (
-            (1.0 if quality_bucket == HIGH_QUALITY else 0.0)
-            if quality_score is None
-            else float(quality_score)
-        )
 
         ts = timestamp or datetime.now(timezone.utc).isoformat()
         result_path = os.path.join(self.results_dir, f"{sample_key}.json")
@@ -482,16 +453,7 @@ class EdgeSampleStore:
             model_version=str(model_version),
             front_version=str(front_version or "0"),
             quality_bucket=quality_bucket,
-            quality_score=resolved_quality_score,
-            risk_score=float(risk_score),
-            risk_reasons=list(risk_reasons or []),
-            evidence_count=int(evidence_count),
-            covered_evidence_count=int(covered_evidence_count),
-            uncovered_evidence_count=int(uncovered_evidence_count),
-            uncovered_evidence_rate=float(uncovered_evidence_rate),
-            candidate_uncovered_score=float(candidate_uncovered_score),
-            motion_uncovered_score=float(motion_uncovered_score),
-            track_uncovered_score=float(track_uncovered_score),
+            quality=dict(quality_payload),
             window_id=window_id,
             in_drift_window=bool(in_drift_window),
             has_raw_sample=raw_path is not None,

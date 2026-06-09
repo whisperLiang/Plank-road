@@ -6,7 +6,7 @@ import zipfile
 
 import torch
 
-from edge.quality_assessor import HIGH_QUALITY
+from edge.sample_quality import HIGH_QUALITY
 from edge.feature_shard import write_feature_label_shards
 from edge.sample_store import EdgeSampleStore
 from edge.sample_sync import pack_high_quality_sync_bundle_to_file

@@ -304,8 +304,6 @@ class FeatureCacheMaterializer:
                     "input_image_size",
                     "input_tensor_shape",
                     "input_resize_mode",
-                    "quality_score",
-                    "risk_score",
                     "sample_source",
                     "label_source",
                     "raw_path",

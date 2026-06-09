@@ -10,7 +10,7 @@ import torch
 from cloud.feature_cache import FeatureShardStore
 from cloud.feature_cache.types import SAFETENSORS_SHARD
 from cloud.ingest import materialize_low_quality_trigger_bundle
-from edge.quality_assessor import LOW_QUALITY
+from edge.sample_quality import LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
 from edge.transmit import (
     _select_low_quality_trigger_records,
@@ -100,7 +100,6 @@ def test_raw_feature_selection_counts_shared_artifacts_once(tmp_path) -> None:
         SimpleNamespace(
             sample_id="low-1",
             quality_bucket=LOW_QUALITY,
-            quality_score=0.1,
             timestamp="2026-01-01T00:00:00Z",
             raw_relpath="raw/one.jpg",
             feature_ref=feature_ref,
@@ -109,7 +108,6 @@ def test_raw_feature_selection_counts_shared_artifacts_once(tmp_path) -> None:
         SimpleNamespace(
             sample_id="low-2",
             quality_bucket=LOW_QUALITY,
-            quality_score=0.2,
             timestamp="2026-01-01T00:00:01Z",
             raw_relpath="raw/two.jpg",
             feature_ref=feature_ref,

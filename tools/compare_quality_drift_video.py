@@ -15,8 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.runtime import load_runtime_config
-from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
-from edge.quality_assessor import QualityAssessor
+from edge.sample_quality import EntropyQualityClassifier
 from edge.window_drift_detector import WindowDriftDetector
 from model_management.fixed_split import SplitConstraints, load_or_compute_fixed_split_plan
 from model_management.object_detection import Object_Detection
@@ -191,7 +190,6 @@ def _subset_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "count": len(rows),
         "fit_f1": _mean(rows, "fit_f1"),
-        "quality_score": _mean(rows, "quality_score"),
         "confidence": _mean(rows, "confidence"),
         "logit_entropy": _mean(rows, "logit_entropy"),
         "logit_margin": _mean(rows, "logit_margin"),
@@ -250,10 +248,6 @@ def _summarize_model(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "summary": _subset_summary(drift_rows),
             "non_drift_summary": _subset_summary([row for row in rows if not row["drift_detected"]]),
         },
-        "quality_score_fit_spearman": _spearman(
-            [float(row["quality_score"]) for row in rows],
-            [float(row["fit_f1"]) for row in rows],
-        ),
         "low_quality_alignment": _flag_metrics(
             rows,
             flag_key="is_low_quality",
@@ -298,65 +292,41 @@ def run_video_compare(
         client_cfg.lightweight = model_name
         detector = Object_Detection(client_cfg, "small inference")
         quality_cfg = getattr(client_cfg, "sample_quality", None)
-        candidate_builder = CandidateEvidenceBuilder(
-            score_floor=float(getattr(quality_cfg, "candidate_score_floor", 0.05)),
-            topk_per_class=int(getattr(quality_cfg, "candidate_topk_per_class", 50)),
-            nms_iou=float(getattr(quality_cfg, "candidate_nms_iou", 0.5)),
-            cluster_iou=float(getattr(quality_cfg, "candidate_cluster_iou", 0.5)),
-        )
-        motion_extractor = MotionEvidenceExtractor(
-            min_area=int(getattr(quality_cfg, "min_motion_area", 64)),
-            diff_threshold=int(getattr(quality_cfg, "motion_diff_threshold", 25)),
-        )
-        track_manager = TrackEvidenceManager()
-        quality_assessor = QualityAssessor(
-            coverage_iou_threshold=float(getattr(quality_cfg, "coverage_iou_threshold", 0.3)),
-            quality_risk_threshold=float(getattr(quality_cfg, "quality_risk_threshold", 0.45)),
-            candidate_weight=float(getattr(quality_cfg, "candidate_weight", 0.5)),
-            motion_weight=float(getattr(quality_cfg, "motion_weight", 1.0)),
-            track_weight=float(getattr(quality_cfg, "track_weight", 1.5)),
-        )
+        quality_classifier = EntropyQualityClassifier.from_config(quality_cfg)
         drift_cfg = getattr(client_cfg, "window_drift", None)
         drift_detector = WindowDriftDetector(
             window_size=int(getattr(drift_cfg, "window_size", 100)),
             min_window_size=int(getattr(drift_cfg, "min_window_size", 30)),
             low_quality_rate_threshold=float(getattr(drift_cfg, "low_quality_rate_threshold", 0.3)),
-            uncovered_evidence_rate_threshold=float(getattr(drift_cfg, "uncovered_evidence_rate_threshold", 0.35)),
             persistence_windows=int(getattr(drift_cfg, "persistence_windows", 3)),
         )
-        previous_frame = None
         plan_path = report_root / f"{model_name}_fixed_split_plan.json"
         splitter, plan = _init_splitter(detector, client_cfg, frames[0]["frame"], plan_path)
+        runtime_contract = dict(getattr(plan, "runtime_contract", {}) or {})
+        split_key = str(
+            getattr(plan, "canonical_split_key", "")
+            or runtime_contract.get("logical_split_id")
+            or plan.split_config_id
+        )
+        feature_abi_id = str(
+            runtime_contract.get("feature_abi_id")
+            or runtime_contract.get("feature_layout_id")
+            or ""
+        )
 
         rows: list[dict[str, Any]] = []
         for item in frames:
             frame_index = int(item["frame_index"])
             frame = frame_cache[frame_index]
             artifacts = detector.infer_sample(frame, splitter=splitter)
-            candidate_evidence = candidate_builder.build(
-                boxes=artifacts.low_threshold_boxes,
-                labels=artifacts.low_threshold_labels,
-                scores=artifacts.low_threshold_scores,
-                image_shape=frame.shape,
+            quality = quality_classifier.classify(
+                artifacts,
+                artifacts.intermediate,
                 model_name=model_name,
-            )
-            motion_evidence = motion_extractor.extract(previous_frame, frame)
-            track_evidence = track_manager.update_and_get_missing_evidence(
-                final_boxes=artifacts.final_detection_boxes,
-                final_labels=artifacts.final_detection_labels,
-                final_scores=artifacts.final_detection_scores,
-                image_shape=frame.shape,
-            )
-            quality = quality_assessor.assess(
-                final_boxes=artifacts.final_detection_boxes,
-                final_labels=artifacts.final_detection_labels,
-                final_scores=artifacts.final_detection_scores,
-                candidate_evidence=candidate_evidence,
-                motion_evidence=motion_evidence,
-                track_evidence=track_evidence,
+                split_key=split_key,
+                feature_abi_id=feature_abi_id,
             )
             drift_state = drift_detector.update(quality)
-            previous_frame = frame.copy()
             fit = _match_fit_metrics(
                 teacher_targets[frame_index],
                 artifacts.to_inference_result(),
@@ -376,10 +346,8 @@ def run_video_compare(
                     "logit_entropy": artifacts.logit_entropy,
                     "logit_margin": artifacts.logit_margin,
                     "logit_energy": artifacts.logit_energy,
-                    "quality_score": float(quality.quality_score),
                     "quality_bucket": str(quality.quality_bucket),
-                    "quality_reasons": list(quality.risk_reasons),
-                    "blind_spot_score": 0.0,
+                    "quality_reasons": [quality.reason],
                     "drift_detected": bool(drift_state.drift_detected),
                     "is_low_quality": str(quality.quality_bucket) == "low_quality",
                 }
@@ -434,4 +402,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

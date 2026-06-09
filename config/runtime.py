@@ -46,18 +46,31 @@ class RetrainConfig(ConfigSection):
 
 
 @dataclass
+class OutputEntropyConfig(ConfigSection):
+    window_size: int = 256
+    percentile: float = 25.0
+    warmup_samples: int = 20
+    min_detection_confidence: float = 0.85
+
+
+@dataclass
+class BoundaryFeatureEntropyConfig(ConfigSection):
+    max_elements: int = 4096
+    ema_decay: float = 0.95
+    deviation_threshold: float = 1.5
+    min_std: float = 1.0e-4
+    warmup_samples: int = 20
+
+
+@dataclass
 class SampleQualityConfig(ConfigSection):
-    coverage_iou_threshold: float = 0.3
-    quality_risk_threshold: float = 0.45
-    candidate_weight: float = 0.5
-    motion_weight: float = 1.0
-    track_weight: float = 1.5
-    candidate_score_floor: float = 0.05
-    candidate_topk_per_class: int = 50
-    candidate_nms_iou: float = 0.5
-    candidate_cluster_iou: float = 0.5
-    min_motion_area: int = 64
-    motion_diff_threshold: int = 25
+    enabled: bool = True
+    output_entropy: OutputEntropyConfig = field(default_factory=OutputEntropyConfig)
+    boundary_feature_entropy: BoundaryFeatureEntropyConfig = field(
+        default_factory=BoundaryFeatureEntropyConfig
+    )
+    eps: float = 1.0e-8
+    persist_debug_stats: bool = False
 
 
 @dataclass
@@ -65,7 +78,6 @@ class WindowDriftConfig(ConfigSection):
     window_size: int = 100
     min_window_size: int = 30
     low_quality_rate_threshold: float = 0.3
-    uncovered_evidence_rate_threshold: float = 0.35
     persistence_windows: int = 3
 
 
@@ -289,6 +301,15 @@ def _section(section_cls, value: Mapping[str, Any] | None):
 
     if section_cls is SourceConfig:
         known["rtsp"] = _section(RTSPConfig, known.get("rtsp"))
+    elif section_cls is SampleQualityConfig:
+        known["output_entropy"] = _section(
+            OutputEntropyConfig,
+            known.get("output_entropy"),
+        )
+        known["boundary_feature_entropy"] = _section(
+            BoundaryFeatureEntropyConfig,
+            known.get("boundary_feature_entropy"),
+        )
     elif section_cls is SplitLearningConfig:
         known["fixed_split"] = _section(FixedSplitConfig, known.get("fixed_split"))
     elif section_cls is ContinualLearningConfig:
@@ -552,24 +573,44 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "client.tinynext_input_size",
         int(config.client.tinynext_input_size),
     )
-    for name in (
-        "coverage_iou_threshold",
-        "quality_risk_threshold",
-        "candidate_score_floor",
-        "candidate_nms_iou",
-        "candidate_cluster_iou",
-    ):
-        value = float(getattr(config.client.sample_quality, name))
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"client.sample_quality.{name} must be within [0, 1], got {value!r}")
+    output_quality = config.client.sample_quality.output_entropy
+    boundary_quality = config.client.sample_quality.boundary_feature_entropy
     _validate_positive(
-        "client.sample_quality.candidate_topk_per_class",
-        int(config.client.sample_quality.candidate_topk_per_class),
+        "client.sample_quality.output_entropy.window_size",
+        int(output_quality.window_size),
     )
+    if not 0.0 <= float(output_quality.percentile) <= 100.0:
+        raise ValueError(
+            "client.sample_quality.output_entropy.percentile must be within [0, 100], "
+            f"got {output_quality.percentile!r}"
+        )
+    if int(output_quality.warmup_samples) < 0:
+        raise ValueError("client.sample_quality.output_entropy.warmup_samples must be >= 0")
+    if not 0.0 <= float(output_quality.min_detection_confidence) <= 1.0:
+        raise ValueError(
+            "client.sample_quality.output_entropy.min_detection_confidence must be within "
+            f"[0, 1], got {output_quality.min_detection_confidence!r}"
+        )
     _validate_positive(
-        "client.sample_quality.min_motion_area",
-        int(config.client.sample_quality.min_motion_area),
+        "client.sample_quality.boundary_feature_entropy.max_elements",
+        int(boundary_quality.max_elements),
     )
+    if not 0.0 <= float(boundary_quality.ema_decay) < 1.0:
+        raise ValueError(
+            "client.sample_quality.boundary_feature_entropy.ema_decay must be within [0, 1), "
+            f"got {boundary_quality.ema_decay!r}"
+        )
+    _validate_positive(
+        "client.sample_quality.boundary_feature_entropy.deviation_threshold",
+        float(boundary_quality.deviation_threshold),
+    )
+    if float(boundary_quality.min_std) < 0.0:
+        raise ValueError("client.sample_quality.boundary_feature_entropy.min_std must be >= 0")
+    if int(boundary_quality.warmup_samples) < 0:
+        raise ValueError(
+            "client.sample_quality.boundary_feature_entropy.warmup_samples must be >= 0"
+        )
+    _validate_positive("client.sample_quality.eps", float(config.client.sample_quality.eps))
     _validate_positive(
         "client.window_drift.window_size",
         int(config.client.window_drift.window_size),

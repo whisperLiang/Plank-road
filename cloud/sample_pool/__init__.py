@@ -1011,10 +1011,6 @@ class CloudSamplePool:
             "input_tensor_shape": [int(dim) for dim in input_tensor_shape],
             "input_resize_mode": input_resize_mode,
             "created_at": _created_at_text(sample.get("created_at")),
-            "quality_score": _to_float(
-                metadata.get("quality_score", sample.get("quality_score", 0.0))
-            ),
-            "risk_score": _to_float(metadata.get("risk_score", sample.get("risk_score", 0.0))),
             "in_drift_window": sample.get("in_drift_window"),
             "window_id": None if sample.get("window_id") is None else str(sample.get("window_id")),
             "feature_ref": feature_ref,
@@ -1236,8 +1232,6 @@ class CloudSamplePool:
                 "input_tensor_shape": entry.get("input_tensor_shape"),
                 "input_resize_mode": entry.get("input_resize_mode"),
                 "created_at": entry.get("created_at"),
-                "quality_score": entry.get("quality_score"),
-                "risk_score": entry.get("risk_score"),
                 "object_count": entry.get("object_count"),
                 "class_counts": entry.get("class_counts"),
                 "in_drift_window": entry.get("in_drift_window"),
@@ -1419,8 +1413,6 @@ class CloudSamplePool:
             input_tensor_shape=input_tensor_shape,
             input_resize_mode=input_resize_mode,
             created_at=_created_at_text(candidate.get("created_at")),
-            quality_score=_to_float(candidate.get("quality_score"), 0.0),
-            risk_score=_to_float(candidate.get("risk_score"), 0.0),
             object_count=object_count,
             class_counts=class_counts,
             in_drift_window=(
@@ -1550,7 +1542,6 @@ class CloudSamplePool:
         return (
             2.0 * is_teacher_labeled
             + 1.5 * in_drift_window
-            + 1.0 * max(0.0, min(1.0, float(record.risk_score)))
             + 0.8 * class_rarity_score
             + 0.3 * recency_score
             - 0.5 * is_edge_pseudo

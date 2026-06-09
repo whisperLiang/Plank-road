@@ -77,37 +77,39 @@ client:
   # without changing resolution.
   raw_jpeg_quality: 82
   min_low_quality_samples: 80
- # Evidence-coverage sample quality
+ # Entropy-based edge pseudo-label trust classification.
  sample_quality:
-  coverage_iou_threshold: 0.3
-  quality_risk_threshold: 0.45
-  candidate_weight: 0.5
-  motion_weight: 1.0
-  track_weight: 1.5
-  candidate_score_floor: 0.05
-  candidate_topk_per_class: 50
-  candidate_nms_iou: 0.5
-  candidate_cluster_iou: 0.5
-  min_motion_area: 64
-  motion_diff_threshold: 25
+  enabled: true
+  output_entropy:
+   window_size: 256
+   percentile: 25.0
+   warmup_samples: 20
+   min_detection_confidence: 0.85
+  boundary_feature_entropy:
+   max_elements: 4096
+   ema_decay: 0.95
+   deviation_threshold: 1.5
+   min_std: 1.0e-4
+   warmup_samples: 20
+  eps: 1.0e-8
+  persist_debug_stats: false
  # Sliding-window drift state. Drift is not stored as a sample category.
  window_drift:
   window_size: 100
   min_window_size: 30
   low_quality_rate_threshold: 0.3
-  uncovered_evidence_rate_threshold: 0.35
   persistence_windows: 3
 
  # Resource-aware CL trigger (two-queue Lyapunov scheduler)
  # Reference: RCCDA (NeurIPS 2025) — Lyapunov drift-plus-penalty
  # https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code
  #
- # When enabled, gates the low-quality/window-drift trigger with a two-queue
+ # When enabled, gates the teacher-needed/window-drift trigger with a two-queue
  # Lyapunov policy that jointly decides (1) whether to trigger CL and
- # (2) whether low-quality samples should also upload features, considering:
+ # (2) whether teacher-needed samples should also upload features, considering:
  #   - Cloud resource state (CPU / GPU / memory utilisation)
  #   - Network bandwidth to the cloud
- #   - Edge-side low-quality and uncovered-evidence rates
+ #   - Edge-side teacher-needed sample rate
  #
  # Virtual queues:
  #   Q_cloud  — bounds average cloud cost    ≤  lambda_cloud
@@ -117,7 +119,7 @@ client:
   probe_interval_sec: 5.0
   probe_timeout_sec: 3.0
   bandwidth_probe_size_bytes: 65536
-  # --- Evidence-quality urgency controller ---
+  # --- Teacher-needed sample urgency controller ---
   # Conservative profile: delay CL until enough evidence accumulates and let
   # the Q_cloud/Q_bw penalties suppress repeated training decisions.
   V: 10.0                # skip-training penalty multiplier; lower is more conservative in the current min-cost implementation
@@ -221,7 +223,7 @@ server:
   # Cloud-side teacher threshold used only for GT annotation during
   # continual learning. Lower values recover more small/far objects but
   # may introduce noisier pseudo-GT.
-  teacher_annotation_threshold: 0.5
+  teacher_annotation_threshold: 0.6
   teacher_annotation:
    async_enabled: true
    cache_enabled: true

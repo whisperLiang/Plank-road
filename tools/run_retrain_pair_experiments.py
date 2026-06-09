@@ -23,8 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from cloud_server import CloudContinualLearner
 from config import load_runtime_config
-from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
-from edge.quality_assessor import LOW_QUALITY, QualityAssessor
+from edge.sample_quality import LOW_QUALITY, EntropyQualityClassifier
 from edge.sample_store import EdgeSampleStore
 from edge.transmit import pack_low_quality_trigger_bundle
 from model_management.fixed_split import (
@@ -107,7 +106,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--send-low-conf-features",
         action="store_true",
-        help="Upload low-confidence features in addition to raw frames.",
+        help="Upload teacher-needed features in addition to raw frames.",
     )
     parser.add_argument(
         "--refresh-weights",
@@ -241,25 +240,18 @@ def _collect_edge_samples(
     model_name: str,
 ) -> dict[str, Any]:
     quality_cfg = getattr(client_cfg, "sample_quality", None)
-    candidate_builder = CandidateEvidenceBuilder(
-        score_floor=float(getattr(quality_cfg, "candidate_score_floor", 0.05)),
-        topk_per_class=int(getattr(quality_cfg, "candidate_topk_per_class", 50)),
-        nms_iou=float(getattr(quality_cfg, "candidate_nms_iou", 0.5)),
-        cluster_iou=float(getattr(quality_cfg, "candidate_cluster_iou", 0.5)),
+    quality_classifier = EntropyQualityClassifier.from_config(quality_cfg)
+    runtime_contract = dict(getattr(plan, "runtime_contract", {}) or {})
+    split_key = str(
+        getattr(plan, "canonical_split_key", "")
+        or runtime_contract.get("logical_split_id")
+        or plan.split_config_id
     )
-    motion_extractor = MotionEvidenceExtractor(
-        min_area=int(getattr(quality_cfg, "min_motion_area", 64)),
-        diff_threshold=int(getattr(quality_cfg, "motion_diff_threshold", 25)),
+    feature_abi_id = str(
+        runtime_contract.get("feature_abi_id")
+        or runtime_contract.get("feature_layout_id")
+        or ""
     )
-    track_manager = TrackEvidenceManager()
-    quality_assessor = QualityAssessor(
-        coverage_iou_threshold=float(getattr(quality_cfg, "coverage_iou_threshold", 0.3)),
-        quality_risk_threshold=float(getattr(quality_cfg, "quality_risk_threshold", 0.45)),
-        candidate_weight=float(getattr(quality_cfg, "candidate_weight", 0.5)),
-        motion_weight=float(getattr(quality_cfg, "motion_weight", 1.0)),
-        track_weight=float(getattr(quality_cfg, "track_weight", 1.5)),
-    )
-    previous_frame = None
     for frame_index, frame in zip(frame_indices, frames):
         inference = small_detector.infer_sample(frame, splitter=splitter)
         if inference.intermediate is None:
@@ -267,29 +259,13 @@ def _collect_edge_samples(
                 f"Split runtime did not produce an intermediate payload for frame {frame_index}."
             )
 
-        candidate_evidence = candidate_builder.build(
-            boxes=inference.low_threshold_boxes,
-            labels=inference.low_threshold_labels,
-            scores=inference.low_threshold_scores,
-            image_shape=frame.shape,
+        quality = quality_classifier.classify(
+            inference,
+            inference.intermediate,
             model_name=model_name,
+            split_key=split_key,
+            feature_abi_id=feature_abi_id,
         )
-        motion_evidence = motion_extractor.extract(previous_frame, frame)
-        track_evidence = track_manager.update_and_get_missing_evidence(
-            final_boxes=inference.final_detection_boxes,
-            final_labels=inference.final_detection_labels,
-            final_scores=inference.final_detection_scores,
-            image_shape=frame.shape,
-        )
-        quality = quality_assessor.assess(
-            final_boxes=inference.final_detection_boxes,
-            final_labels=inference.final_detection_labels,
-            final_scores=inference.final_detection_scores,
-            candidate_evidence=candidate_evidence,
-            motion_evidence=motion_evidence,
-            track_evidence=track_evidence,
-        )
-        previous_frame = frame.copy()
         sample_store.store_sample(
             sample_id=str(frame_index),
             frame_index=frame_index,
@@ -298,16 +274,9 @@ def _collect_edge_samples(
             model_id=model_name,
             model_version="0",
             quality_bucket=quality.quality_bucket,
-            quality_score=quality.quality_score,
-            risk_score=quality.risk_score,
-            risk_reasons=quality.risk_reasons,
-            evidence_count=quality.evidence_count,
-            covered_evidence_count=quality.covered_evidence_count,
-            uncovered_evidence_count=quality.uncovered_evidence_count,
-            uncovered_evidence_rate=quality.uncovered_evidence_rate,
-            candidate_uncovered_score=quality.candidate_uncovered_score,
-            motion_uncovered_score=quality.motion_uncovered_score,
-            track_uncovered_score=quality.track_uncovered_score,
+            quality_metadata=quality.quality_metadata(
+                persist_debug_stats=quality_classifier.persist_debug_stats
+            ),
             inference_result=inference.to_inference_result(),
             intermediate=inference.intermediate,
             in_drift_window=False,

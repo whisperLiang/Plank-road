@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-from edge.quality_assessor import LOW_QUALITY, QualityAssessment
+from edge.sample_quality import LOW_QUALITY, EntropyQualityStats
 
 
 @dataclass
@@ -13,10 +13,6 @@ class DriftWindowState:
     drift_detected: bool
     drift_score: float
     low_quality_rate: float
-    uncovered_evidence_rate: float
-    candidate_uncovered_rate: float
-    motion_uncovered_rate: float
-    track_uncovered_rate: float
     drift_reasons: list[str]
 
 
@@ -27,15 +23,13 @@ class WindowDriftDetector:
         window_size: int = 100,
         min_window_size: int = 30,
         low_quality_rate_threshold: float = 0.3,
-        uncovered_evidence_rate_threshold: float = 0.35,
         persistence_windows: int = 3,
     ) -> None:
         self.window_size = max(1, int(window_size))
         self.min_window_size = max(1, int(min_window_size))
         self.low_quality_rate_threshold = float(low_quality_rate_threshold)
-        self.uncovered_evidence_rate_threshold = float(uncovered_evidence_rate_threshold)
         self.persistence_windows = max(1, int(persistence_windows))
-        self._records: deque[QualityAssessment] = deque(maxlen=self.window_size)
+        self._records: deque[EntropyQualityStats] = deque(maxlen=self.window_size)
         self._abnormal_windows = 0
         self._step = 0
 
@@ -46,7 +40,7 @@ class WindowDriftDetector:
 
     def update(
         self,
-        quality_record: QualityAssessment,
+        quality_record: EntropyQualityStats,
         feature_stats: dict[str, Any] | None = None,
         teacher_feedback: dict[str, Any] | None = None,
     ) -> DriftWindowState:
@@ -63,22 +57,15 @@ class WindowDriftDetector:
         records = list(self._records)
         count = len(records)
         if count == 0:
-            return DriftWindowState(window_id, False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, [])
+            return DriftWindowState(window_id, False, 0.0, 0.0, [])
 
         low_quality_rate = sum(1 for item in records if item.quality_bucket == LOW_QUALITY) / float(count)
-        uncovered_evidence_rate = sum(item.uncovered_evidence_rate for item in records) / float(count)
-        candidate_rate = sum(item.candidate_uncovered_score for item in records) / float(count)
-        motion_rate = sum(item.motion_uncovered_score for item in records) / float(count)
-        track_rate = sum(item.track_uncovered_score for item in records) / float(count)
 
         reasons: list[str] = []
         abnormal = False
         if count >= self.min_window_size and low_quality_rate >= self.low_quality_rate_threshold:
             abnormal = True
             reasons.append("low_quality_rate")
-        if count >= self.min_window_size and uncovered_evidence_rate >= self.uncovered_evidence_rate_threshold:
-            abnormal = True
-            reasons.append("uncovered_evidence_rate")
 
         if abnormal:
             self._abnormal_windows += 1
@@ -86,18 +73,11 @@ class WindowDriftDetector:
             self._abnormal_windows = 0
 
         drift_detected = self._abnormal_windows >= self.persistence_windows
-        drift_score = max(
-            low_quality_rate / max(self.low_quality_rate_threshold, 1e-6),
-            uncovered_evidence_rate / max(self.uncovered_evidence_rate_threshold, 1e-6),
-        )
+        drift_score = low_quality_rate / max(self.low_quality_rate_threshold, 1e-6)
         return DriftWindowState(
             window_id=window_id,
             drift_detected=bool(drift_detected),
             drift_score=float(max(0.0, min(1.0, drift_score))),
             low_quality_rate=float(low_quality_rate),
-            uncovered_evidence_rate=float(uncovered_evidence_rate),
-            candidate_uncovered_rate=float(candidate_rate),
-            motion_uncovered_rate=float(motion_rate),
-            track_uncovered_rate=float(track_rate),
             drift_reasons=reasons if drift_detected else [],
         )

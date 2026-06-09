@@ -20,7 +20,7 @@ from loguru import logger
 
 import edge.transmit as transmit
 from edge.feature_shard import write_feature_label_shards
-from edge.quality_assessor import HIGH_QUALITY
+from edge.sample_quality import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
 from model_management.detection_box_projection import ORIGINAL_XYXY
 from model_management.payload import BoundaryPayload

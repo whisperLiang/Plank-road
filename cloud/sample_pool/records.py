@@ -35,8 +35,6 @@ CANONICAL_FEATURE_METADATA_FIELDS = {
     "input_tensor_shape",
     "input_resize_mode",
     "created_at",
-    "quality_score",
-    "risk_score",
     "object_count",
     "class_counts",
     "in_drift_window",
@@ -97,8 +95,6 @@ class CanonicalSampleRecord:
     input_tensor_shape: list[int]
     input_resize_mode: str
     created_at: str
-    quality_score: float = 0.0
-    risk_score: float = 0.0
     object_count: int = 0
     class_counts: dict[str, int] = field(default_factory=dict)
     in_drift_window: bool | None = None
@@ -176,8 +172,6 @@ class CanonicalSampleRecord:
             "class_counts_json": _stable_json(self.class_counts),
             "dominant_class": _dominant_class(self.class_counts),
             "created_at": self.created_at,
-            "quality_score": float(self.quality_score),
-            "risk_score": float(self.risk_score),
             "in_drift_window": self.in_drift_window,
             "window_id": self.window_id,
             "input_image_size": list(self.input_image_size),

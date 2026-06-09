@@ -4,7 +4,7 @@ import os
 
 import torch
 
-from edge.quality_assessor import HIGH_QUALITY
+from edge.sample_quality import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore
 from model_management.payload import boundary_payload_from_tensors
 

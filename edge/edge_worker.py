@@ -14,9 +14,7 @@ from loguru import logger
 
 from edge.box_motion import compensate_boxes_between_frames
 from edge.diff import DiffProcessor
-from edge.evidence import CandidateEvidenceBuilder, MotionEvidenceExtractor, TrackEvidenceManager
 from edge.info import TASK_STATE
-from edge.quality_assessor import LOW_QUALITY, QualityAssessor
 from edge.resource_aware_trigger import (
     CloudResourceState,
     PendingTrainingStats,
@@ -26,6 +24,7 @@ from edge.resource_aware_trigger import (
     estimate_bandwidth,
     query_cloud_resource,
 )
+from edge.sample_quality import LOW_QUALITY, EntropyQualityClassifier
 from edge.sample_store import EdgeSampleStore
 from edge.sample_sync import HighQualitySampleSyncer
 from edge.task import Task
@@ -148,30 +147,18 @@ class SampleStatsDelta:
     high_quality_count: int = 0
     low_quality_count: int = 0
     drift_window_sample_count: int = 0
-    uncovered_evidence_sum: float = 0.0
-    candidate_uncovered_sum: float = 0.0
-    motion_uncovered_sum: float = 0.0
-    track_uncovered_sum: float = 0.0
 
     @classmethod
     def from_values(
         cls,
         *,
         quality_bucket: str,
-        uncovered_evidence_rate: float = 0.0,
-        candidate_uncovered_score: float = 0.0,
-        motion_uncovered_score: float = 0.0,
-        track_uncovered_score: float = 0.0,
         in_drift_window: bool = False,
     ) -> "SampleStatsDelta":
         return cls(
             high_quality_count=1 if quality_bucket != LOW_QUALITY else 0,
             low_quality_count=1 if quality_bucket == LOW_QUALITY else 0,
             drift_window_sample_count=1 if in_drift_window else 0,
-            uncovered_evidence_sum=float(uncovered_evidence_rate),
-            candidate_uncovered_sum=float(candidate_uncovered_score),
-            motion_uncovered_sum=float(motion_uncovered_score),
-            track_uncovered_sum=float(track_uncovered_score),
         )
 
 
@@ -325,35 +312,14 @@ class EdgeWorker:
         self.edge_processor = DiffProcessor.str_to_class(config.feature)()
         self.small_object_detection = Object_Detection(config, type="small inference")
         quality_cfg = getattr(config, "sample_quality", None)
-        self.candidate_builder = CandidateEvidenceBuilder(
-            score_floor=float(getattr(quality_cfg, "candidate_score_floor", 0.05)),
-            topk_per_class=int(getattr(quality_cfg, "candidate_topk_per_class", 50)),
-            nms_iou=float(getattr(quality_cfg, "candidate_nms_iou", 0.5)),
-            cluster_iou=float(getattr(quality_cfg, "candidate_cluster_iou", 0.5)),
-        )
-        self.motion_extractor = MotionEvidenceExtractor(
-            min_area=int(getattr(quality_cfg, "min_motion_area", 64)),
-            diff_threshold=int(getattr(quality_cfg, "motion_diff_threshold", 25)),
-        )
-        self.track_manager = TrackEvidenceManager()
-        self.quality_assessor = QualityAssessor(
-            coverage_iou_threshold=float(getattr(quality_cfg, "coverage_iou_threshold", 0.3)),
-            quality_risk_threshold=float(getattr(quality_cfg, "quality_risk_threshold", 0.45)),
-            candidate_weight=float(getattr(quality_cfg, "candidate_weight", 0.5)),
-            motion_weight=float(getattr(quality_cfg, "motion_weight", 1.0)),
-            track_weight=float(getattr(quality_cfg, "track_weight", 1.5)),
-        )
+        self.quality_classifier = EntropyQualityClassifier.from_config(quality_cfg)
         drift_cfg = getattr(config, "window_drift", None)
         self.window_drift_detector = WindowDriftDetector(
             window_size=int(getattr(drift_cfg, "window_size", 100)),
             min_window_size=int(getattr(drift_cfg, "min_window_size", 30)),
             low_quality_rate_threshold=float(getattr(drift_cfg, "low_quality_rate_threshold", 0.3)),
-            uncovered_evidence_rate_threshold=float(
-                getattr(drift_cfg, "uncovered_evidence_rate_threshold", 0.35)
-            ),
             persistence_windows=int(getattr(drift_cfg, "persistence_windows", 3)),
         )
-        self.previous_quality_frame = None
 
         self.resource_trigger: ResourceAwareCLTrigger | None = None
         self._cloud_state: CloudResourceState | None = None
@@ -613,22 +579,6 @@ class EdgeWorker:
                     0,
                     current.drift_window_sample_count + factor * delta.drift_window_sample_count,
                 ),
-                uncovered_evidence_sum=max(
-                    0.0,
-                    current.uncovered_evidence_sum + factor * delta.uncovered_evidence_sum,
-                ),
-                candidate_uncovered_sum=max(
-                    0.0,
-                    current.candidate_uncovered_sum + factor * delta.candidate_uncovered_sum,
-                ),
-                motion_uncovered_sum=max(
-                    0.0,
-                    current.motion_uncovered_sum + factor * delta.motion_uncovered_sum,
-                ),
-                track_uncovered_sum=max(
-                    0.0,
-                    current.track_uncovered_sum + factor * delta.track_uncovered_sum,
-                ),
             )
 
     def _on_sample_write_done(
@@ -760,34 +710,12 @@ class EdgeWorker:
         low = int(stats.get("low_quality_count", 0) or 0) + int(pending.low_quality_count)
         high = int(stats.get("high_quality_count", 0) or 0) + int(pending.high_quality_count)
 
-        def _merged_average(key: str, pending_sum: float) -> float:
-            if total <= 0:
-                return 0.0
-            base_sum = float(stats.get(key, 0.0) or 0.0) * float(base_total)
-            return (base_sum + float(pending_sum)) / float(total)
-
         stats.update(
             {
                 "total_samples": total,
                 "high_quality_count": high,
                 "low_quality_count": low,
                 "low_quality_rate": (low / float(total)) if total else 0.0,
-                "uncovered_evidence_rate": _merged_average(
-                    "uncovered_evidence_rate",
-                    pending.uncovered_evidence_sum,
-                ),
-                "candidate_uncovered_rate": _merged_average(
-                    "candidate_uncovered_rate",
-                    pending.candidate_uncovered_sum,
-                ),
-                "motion_uncovered_rate": _merged_average(
-                    "motion_uncovered_rate",
-                    pending.motion_uncovered_sum,
-                ),
-                "track_uncovered_rate": _merged_average(
-                    "track_uncovered_rate",
-                    pending.track_uncovered_sum,
-                ),
                 "drift_window_sample_count": int(stats.get("drift_window_sample_count", 0) or 0)
                 + int(pending.drift_window_sample_count),
             }
@@ -1173,36 +1101,32 @@ class EdgeWorker:
 
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> None:
         confidence = float(inference.confidence)
-        candidate_builder = getattr(self, "candidate_builder", CandidateEvidenceBuilder())
-        motion_extractor = getattr(self, "motion_extractor", MotionEvidenceExtractor())
-        track_manager = getattr(self, "track_manager", TrackEvidenceManager())
-        quality_assessor = getattr(self, "quality_assessor", QualityAssessor())
+        quality_classifier = getattr(self, "quality_classifier", None)
+        if quality_classifier is None:
+            quality_classifier = EntropyQualityClassifier.from_config(
+                getattr(getattr(self, "config", None), "sample_quality", None)
+            )
+            self.quality_classifier = quality_classifier
         window_detector = getattr(self, "window_drift_detector", WindowDriftDetector())
-
-        candidate_evidence = candidate_builder.build(
-            boxes=inference.low_threshold_boxes,
-            labels=inference.low_threshold_labels,
-            scores=inference.low_threshold_scores,
-            image_shape=frame.shape,
-            model_name=self.model_id,
+        split_plan = self.fixed_split_plan
+        runtime_contract = dict(getattr(split_plan, "runtime_contract", {}) or {})
+        split_key = str(
+            getattr(split_plan, "canonical_split_key", "")
+            or runtime_contract.get("logical_split_id")
+            or getattr(split_plan, "split_config_id", "")
+            or ""
         )
-        motion_evidence = motion_extractor.extract(
-            getattr(self, "previous_quality_frame", None),
-            frame,
+        feature_abi_id = str(
+            runtime_contract.get("feature_abi_id")
+            or runtime_contract.get("feature_layout_id")
+            or ""
         )
-        track_evidence = track_manager.update_and_get_missing_evidence(
-            final_boxes=inference.final_detection_boxes,
-            final_labels=inference.final_detection_labels,
-            final_scores=inference.final_detection_scores,
-            image_shape=frame.shape,
-        )
-        quality = quality_assessor.assess(
-            final_boxes=inference.final_detection_boxes,
-            final_labels=inference.final_detection_labels,
-            final_scores=inference.final_detection_scores,
-            candidate_evidence=candidate_evidence,
-            motion_evidence=motion_evidence,
-            track_evidence=track_evidence,
+        quality = quality_classifier.classify(
+            inference,
+            inference.intermediate,
+            model_name=str(self.model_id),
+            split_key=split_key,
+            feature_abi_id=feature_abi_id,
         )
         drift_state = window_detector.update(
             quality,
@@ -1213,29 +1137,22 @@ class EdgeWorker:
                 "logit_energy": getattr(inference, "logit_energy", None),
             },
         )
-        self.previous_quality_frame = frame.copy()
         save_raw = quality.quality_bucket == LOW_QUALITY
         sample_id = self._next_sample_id(task)
         retrain_cfg = getattr(getattr(self, "config", None), "retrain", None)
+        persist_debug_stats = bool(getattr(quality_classifier, "persist_debug_stats", False))
         store_kwargs = {
             "sample_id": sample_id,
             "frame_index": task.frame_index,
             "confidence": confidence,
-            "split_config_id": self.fixed_split_plan.split_config_id,
+            "split_config_id": split_plan.split_config_id,
             "model_id": self.model_id,
             "model_version": self.model_version,
             "front_version": str(getattr(self, "front_version", "0") or "0"),
             "quality_bucket": quality.quality_bucket,
-            "quality_score": quality.quality_score,
-            "risk_score": quality.risk_score,
-            "risk_reasons": quality.risk_reasons,
-            "evidence_count": quality.evidence_count,
-            "covered_evidence_count": quality.covered_evidence_count,
-            "uncovered_evidence_count": quality.uncovered_evidence_count,
-            "uncovered_evidence_rate": quality.uncovered_evidence_rate,
-            "candidate_uncovered_score": quality.candidate_uncovered_score,
-            "motion_uncovered_score": quality.motion_uncovered_score,
-            "track_uncovered_score": quality.track_uncovered_score,
+            "quality_metadata": quality.quality_metadata(
+                persist_debug_stats=persist_debug_stats
+            ),
             "window_id": quality.window_id,
             "in_drift_window": quality.in_drift_window,
             "inference_result": inference.to_inference_result(),
@@ -1245,17 +1162,13 @@ class EdgeWorker:
             "input_image_size": list(frame.shape[:2]),
             "input_tensor_shape": inference.input_tensor_shape,
             "input_resize_mode": inference.input_resize_mode,
-            "runtime_contract": dict(getattr(self.fixed_split_plan, "runtime_contract", {}) or {}),
+            "runtime_contract": runtime_contract,
         }
         self._submit_sample_write(
             SampleWriteJob(
                 store_kwargs=store_kwargs,
                 stats_delta=SampleStatsDelta.from_values(
                     quality_bucket=quality.quality_bucket,
-                    uncovered_evidence_rate=quality.uncovered_evidence_rate,
-                    candidate_uncovered_score=quality.candidate_uncovered_score,
-                    motion_uncovered_score=quality.motion_uncovered_score,
-                    track_uncovered_score=quality.track_uncovered_score,
                     in_drift_window=quality.in_drift_window,
                 ),
             )
@@ -1501,8 +1414,6 @@ class EdgeWorker:
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
                     self.window_drift_detector.reset()
-                    self.track_manager.reset()
-                    self.previous_quality_frame = None
                     logger.info(
                         "Applied cloud model update for job {} "
                         "(state_keys={}, weight_keys={}, missing_keys={}, unexpected_keys={}).",
