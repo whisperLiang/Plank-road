@@ -47,7 +47,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import model_management.object_detection as object_detection_module
-from cloud.training.proxy_eval import _evaluate_detection_proxy_map
+from cloud.training.proxy_eval import _evaluate_detection_proxy_metrics
 from config import load_runtime_config
 from model_management.model_zoo import (
     ensure_local_model_artifact,
@@ -1363,7 +1363,7 @@ def _evaluate_metric_map50(
 ) -> dict[str, Any]:
     threshold_low, threshold_high = get_model_detection_thresholds(model, model_name)
     return dict(
-        _evaluate_detection_proxy_map(
+        _evaluate_detection_proxy_metrics(
             model,
             frame_dir=str(frame_dir),
             gt_annotations=annotations,
@@ -1377,7 +1377,7 @@ def _evaluate_metric_map50(
 
 
 def _metric_value(metrics: Mapping[str, Any]) -> float | None:
-    value = metrics.get("map")
+    value = metrics.get("map_50", metrics.get("map"))
     return None if value is None else float(value)
 
 

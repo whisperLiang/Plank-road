@@ -576,6 +576,8 @@ def build_real_baseline_context(
             weights_path=config.student_weights_path,
             class_names=config.class_names,
             seed=config.seed,
+            tinynext_input_size=config.tinynext_input_size,
+            tinynext_anchor_profile=config.tinynext_anchor_profile,
             fixed_split_constraints=fixed_split_constraints,
             fixed_split_cache_path=fixed_split_cache_path,
             fixed_split_validate_cached_plan=fixed_split_validate_cached_plan,
@@ -858,6 +860,8 @@ def _build_base_checkpoint(config: ExperimentConfig, root_results: Path) -> str:
         weights_path=config.student_weights_path,
         class_names=config.class_names,
         seed=config.seed,
+        tinynext_input_size=config.tinynext_input_size,
+        tinynext_anchor_profile=config.tinynext_anchor_profile,
     )
     return seed_inferencer.save_checkpoint(root_results / "checkpoints" / "initial_student.pt")
 

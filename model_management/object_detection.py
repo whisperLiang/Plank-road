@@ -58,6 +58,12 @@ class Object_Detection:
             configured_input_size = getattr(self.config, "tinynext_input_size", None)
             if configured_input_size is not None:
                 build_kwargs["tinynext_input_size"] = int(configured_input_size)
+            configured_anchor_profile = getattr(self.config, "tinynext_anchor_profile", None)
+            if configured_anchor_profile is not None:
+                build_kwargs["tinynext_anchor_profile"] = str(configured_anchor_profile)
+            configured_class_names = getattr(self.config, "class_names", None)
+            if configured_class_names:
+                build_kwargs["tinynext_num_foreground_classes"] = len(list(configured_class_names))
         self.model = build_detection_model(
             self.model_name,
             pretrained=True,

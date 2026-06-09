@@ -382,11 +382,43 @@ def get_default_model_name() -> str:
     return "yolov8s"
 
 
-def build_model_safe(model_name: str, device: torch.device) -> torch.nn.Module:
+def get_default_tinynext_build_config() -> dict[str, object]:
+    """Read TinyNeXt build defaults from runtime config when available."""
+    try:
+        config = load_runtime_config(DEFAULT_CONFIG_PATH)
+        input_size = int(getattr(config.client, "tinynext_input_size", 0))
+        anchor_profile = str(getattr(config.client, "tinynext_anchor_profile", "")).strip()
+    except Exception as exc:
+        logger.warning(f"Failed to read TinyNeXt build config: {exc}")
+        return {}
+    return {
+        "tinynext_input_size": input_size if input_size > 0 else None,
+        "tinynext_anchor_profile": anchor_profile or None,
+    }
+
+
+def build_model_safe(
+    model_name: str,
+    device: torch.device,
+    *,
+    tinynext_input_size: int | None = None,
+    tinynext_anchor_profile: str | None = None,
+) -> torch.nn.Module:
     """Build a detection model with proper error handling."""
     logger.info(f"Building model: {model_name} on {device}")
+    build_kwargs: dict[str, Any] = {}
+    if "tinynext" in normalize_model_name(model_name):
+        defaults = get_default_tinynext_build_config()
+        resolved_input_size = tinynext_input_size or defaults.get("tinynext_input_size")
+        if resolved_input_size is not None:
+            build_kwargs["tinynext_input_size"] = int(resolved_input_size)
+            logger.info(f"Using TinyNeXt input size: {resolved_input_size}")
+        resolved_anchor_profile = tinynext_anchor_profile or defaults.get("tinynext_anchor_profile")
+        if resolved_anchor_profile is not None:
+            build_kwargs["tinynext_anchor_profile"] = str(resolved_anchor_profile)
+            logger.info(f"Using TinyNeXt anchor profile: {resolved_anchor_profile}")
     try:
-        model = build_detection_model(model_name, pretrained=True)
+        model = build_detection_model(model_name, pretrained=True, **build_kwargs)
         model = model.to(device)
         model.eval()
         logger.info(f"Model built successfully: {model_name}")
@@ -974,7 +1006,12 @@ def run_single_model_experiment(
     logger.info(f"Build target: {build_model_name}")
     logger.info("-" * 70)
 
-    model = build_model_safe(build_model_name, device)
+    model = build_model_safe(
+        build_model_name,
+        device,
+        tinynext_input_size=getattr(args, "tinynext_input_size", None),
+        tinynext_anchor_profile=getattr(args, "tinynext_anchor_profile", None),
+    )
     trace_model = get_split_runtime_model(model)
     trace_model = trace_model.to(device)
     trace_model.eval()
@@ -1090,6 +1127,17 @@ def main() -> None:
         nargs=2,
         default=[1080, 1920],
         help="Input size H W (default: 1080 1920)",
+    )
+    parser.add_argument(
+        "--tinynext-input-size",
+        type=int,
+        default=None,
+        help="TinyNeXt square detector input size (default: client.tinynext_input_size)",
+    )
+    parser.add_argument(
+        "--tinynext-anchor-profile",
+        default=None,
+        help="TinyNeXt anchor profile (default: client.tinynext_anchor_profile)",
     )
     parser.add_argument(
         "--initial-input-size",

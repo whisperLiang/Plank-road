@@ -20,6 +20,8 @@ dataset:
 
 model:
   student_model: yolo26
+  tinynext_input_size: 640
+  tinynext_anchor_profile: small_objects
   teacher_label_dir: ./cache/teacher_labels/road
   initial_checkpoint: null
 

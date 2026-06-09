@@ -48,6 +48,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager
 import hashlib
+import json
 from importlib.util import find_spec
 import re
 import sys
@@ -77,7 +78,11 @@ from torchvision.models.detection import (
     FCOS_ResNet50_FPN_Weights,
 )
 from model_management.model_info import model_lib
-from model_management.tinynext import build_tinynext_detector
+from model_management.state_dict_utils import filter_state_dict_to_model_shapes
+from model_management.tinynext import (
+    build_tinynext_detector,
+    normalise_tinynext_anchor_profile,
+)
 from model_management.ultralytics_parity import (
     invalidate_predictor,
     postprocess_predictions,
@@ -1002,6 +1007,80 @@ def _load_tinynext_checkpoint(path: str | Path, *, device: str | torch.device = 
             return torch.load(checkpoint_path, map_location=device, weights_only=False)
 
 
+def _tinynext_sidecar_metadata_path(path: str | Path) -> Path:
+    return Path(path).with_suffix(".meta.json")
+
+
+_TINYNEXT_EMBEDDED_METADATA_KEYS = (
+    "tinynext_input_size",
+    "tinynext_anchor_profile",
+    "tinynext_head_num_classes",
+    "tinynext_num_foreground_classes",
+    "label_schema",
+    "model_name",
+    "class_names",
+)
+
+
+def _extract_tinynext_embedded_metadata(checkpoint: object) -> dict[str, Any]:
+    if not isinstance(checkpoint, Mapping):
+        return {}
+    metadata: dict[str, Any] = {}
+    embedded = checkpoint.get("metadata")
+    if isinstance(embedded, Mapping):
+        metadata.update(dict(embedded))
+    for key in _TINYNEXT_EMBEDDED_METADATA_KEYS:
+        if key in checkpoint and key not in metadata:
+            metadata[key] = checkpoint[key]
+    return metadata
+
+
+def _load_tinynext_checkpoint_metadata(
+    path: str | Path | None,
+    *,
+    checkpoint: object | None = None,
+) -> dict[str, Any]:
+    if path is None:
+        return {}
+    metadata_path = _tinynext_sidecar_metadata_path(path)
+    if metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except Exception as exc:
+            logger.warning(
+                "[ModelZoo] Could not read TinyNeXt metadata from {}: {}",
+                metadata_path,
+                exc,
+            )
+        else:
+            if isinstance(metadata, Mapping):
+                return dict(metadata)
+            logger.warning(
+                "[ModelZoo] Ignoring non-object TinyNeXt metadata at {}",
+                metadata_path,
+            )
+    if checkpoint is None:
+        try:
+            checkpoint = _load_tinynext_checkpoint(path, device="cpu")
+        except Exception as exc:
+            logger.warning(
+                "[ModelZoo] Could not inspect TinyNeXt checkpoint metadata from {}: {}",
+                path,
+                exc,
+            )
+            return {}
+    return _extract_tinynext_embedded_metadata(checkpoint)
+
+
+def _positive_int_or_none(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _extract_tinynext_checkpoint_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
     if isinstance(checkpoint, dict):
         state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
@@ -1215,6 +1294,8 @@ def _tinynext_forward_label_hook(module: nn.Module, _inputs: object, output: obj
 def _configure_tinynext_label_schema(model: nn.Module, *, num_classes: int) -> None:
     setattr(model, "num_classes", int(num_classes))
     setattr(model, "label_schema", "coco_91" if int(num_classes) >= 91 else "zero_based")
+    if int(num_classes) < 91:
+        setattr(model, "tinynext_num_foreground_classes", max(0, int(num_classes) - 1))
     if hasattr(model, "register_forward_hook") and not bool(getattr(model, "_plank_public_label_hook_registered", False)):
         model.register_forward_hook(_tinynext_forward_label_hook)
         setattr(model, "_plank_public_label_hook_registered", True)
@@ -1670,24 +1751,102 @@ def build_detection_model(
     if name_lower in _TINYNEXT_MODELS:
         checkpoint_state_dict: dict[str, torch.Tensor] | None = None
         backbone_weights_path = None
-        tinynext_source_num_classes = 81
-        tinynext_label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
-        tinynext_input_size = int(
-            kwargs.pop("tinynext_input_size", kwargs.pop("image_size", 320))
+        requested_foreground_classes = _positive_int_or_none(
+            kwargs.pop("tinynext_num_foreground_classes", None)
         )
+        forced_tinynext_num_classes = requested_foreground_classes is not None
+        if requested_foreground_classes is not None:
+            num_classes = int(requested_foreground_classes) + 1
+        tinynext_source_num_classes = 81
+        tinynext_label_schema = "coco_91"
+        requested_tinynext_input_size = kwargs.pop("tinynext_input_size", None)
+        if requested_tinynext_input_size is None:
+            requested_tinynext_input_size = kwargs.pop("image_size", None)
+        else:
+            kwargs.pop("image_size", None)
+        requested_anchor_profile = kwargs.pop("tinynext_anchor_profile", None)
         if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
+        checkpoint = None
         if artifact_path is not None and artifact_path.is_file():
             checkpoint = _load_tinynext_checkpoint(artifact_path, device="cpu")
             checkpoint_state_dict = _extract_tinynext_checkpoint_state_dict(checkpoint)
+        tinynext_metadata = _load_tinynext_checkpoint_metadata(
+            artifact_path,
+            checkpoint=checkpoint,
+        )
+        metadata_input_size = _positive_int_or_none(
+            tinynext_metadata.get("tinynext_input_size")
+        )
+        explicit_input_size = _positive_int_or_none(requested_tinynext_input_size)
+        if requested_tinynext_input_size is not None and explicit_input_size is None:
+            raise ValueError(
+                f"tinynext_input_size/image_size must be a positive integer, got "
+                f"{requested_tinynext_input_size!r}"
+            )
+        if (
+            explicit_input_size is not None
+            and metadata_input_size is not None
+            and explicit_input_size != metadata_input_size
+        ):
+            raise ValueError(
+                f"TinyNeXt checkpoint {artifact_path} was trained/exported for "
+                f"{metadata_input_size}x{metadata_input_size} input, but the model was "
+                f"requested with {explicit_input_size}x{explicit_input_size}. Pass the "
+                "matching tinynext_input_size or use a checkpoint with matching metadata."
+            )
+        tinynext_input_size = explicit_input_size or metadata_input_size or 320
+        if explicit_input_size is None and metadata_input_size is not None:
+            logger.info(
+                "[ModelZoo] Using TinyNeXt input size {} from metadata for {}.",
+                metadata_input_size,
+                artifact_path,
+            )
+        metadata_anchor_profile = tinynext_metadata.get("tinynext_anchor_profile")
+        explicit_anchor_profile = (
+            None
+            if requested_anchor_profile is None
+            else normalise_tinynext_anchor_profile(requested_anchor_profile)
+        )
+        checkpoint_anchor_profile = (
+            None
+            if metadata_anchor_profile is None
+            else normalise_tinynext_anchor_profile(metadata_anchor_profile)
+        )
+        if (
+            explicit_anchor_profile is not None
+            and checkpoint_anchor_profile is not None
+            and explicit_anchor_profile != checkpoint_anchor_profile
+        ):
+            raise ValueError(
+                f"TinyNeXt checkpoint {artifact_path} was trained/exported with "
+                f"anchor profile {checkpoint_anchor_profile!r}, but the model was "
+                f"requested with {explicit_anchor_profile!r}. Pass the matching "
+                "tinynext_anchor_profile or use a checkpoint with matching metadata."
+            )
+        tinynext_anchor_profile = explicit_anchor_profile or checkpoint_anchor_profile or "default"
+        if explicit_anchor_profile is None and checkpoint_anchor_profile is not None:
+            logger.info(
+                "[ModelZoo] Using TinyNeXt anchor profile {} from metadata for {}.",
+                checkpoint_anchor_profile,
+                artifact_path,
+            )
+        skip_unprofiled_detector_head = (
+            tinynext_anchor_profile != "default" and checkpoint_anchor_profile is None
+        )
+        if checkpoint_state_dict is not None:
             is_official_tinynext = _looks_like_tinynext_official_detector_state_dict(checkpoint_state_dict)
             is_internal_tinynext = _looks_like_tinynext_internal_detector_state_dict(checkpoint_state_dict)
             inferred_class_count = infer_tinynext_state_dict_num_classes(checkpoint_state_dict)
             if is_official_tinynext:
                 if inferred_class_count is not None and inferred_class_count != 81:
-                    num_classes = inferred_class_count
-                    tinynext_source_num_classes = inferred_class_count
-                    tinynext_label_schema = "zero_based"
+                    if forced_tinynext_num_classes:
+                        tinynext_source_num_classes = inferred_class_count
+                        tinynext_label_schema = "zero_based"
+                    else:
+                        num_classes = inferred_class_count
+                        tinynext_source_num_classes = inferred_class_count
+                        tinynext_label_schema = "zero_based"
                     logger.info(
                         "[ModelZoo] Inferred {} TinyNeXt MMDetection class logits from custom weights at {}; "
                         "building native zero-based TinyNeXt detector.",
@@ -1696,13 +1855,24 @@ def build_detection_model(
                     )
             elif is_internal_tinynext:
                 if inferred_class_count is not None and inferred_class_count != int(num_classes):
-                    num_classes = inferred_class_count
-                    logger.info(
-                        "[ModelZoo] Inferred {} TinyNeXt SSD class logits from weights at {}; "
-                        "building matching detector head.",
-                        inferred_class_count,
-                        artifact_path,
-                    )
+                    if forced_tinynext_num_classes:
+                        logger.info(
+                            "[ModelZoo] TinyNeXt target has {} foreground class(es), so building "
+                            "{} SSD logits including background. Checkpoint {} has {} logits; "
+                            "incompatible head tensors will be skipped.",
+                            requested_foreground_classes,
+                            num_classes,
+                            artifact_path,
+                            inferred_class_count,
+                        )
+                    else:
+                        num_classes = inferred_class_count
+                        logger.info(
+                            "[ModelZoo] Inferred {} TinyNeXt SSD class logits from weights at {}; "
+                            "building matching detector head.",
+                            inferred_class_count,
+                            artifact_path,
+                        )
                 tinynext_label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
             else:
                 backbone_weights_path = str(artifact_path)
@@ -1712,6 +1882,7 @@ def build_detection_model(
             device=device,
             backbone_weights_path=backbone_weights_path,
             image_size=tinynext_input_size,
+            anchor_profile=tinynext_anchor_profile,
         )
         _configure_tinynext_label_schema(model, num_classes=num_classes)
         ensure_detection_threshold_state(model, name_lower)
@@ -1723,6 +1894,36 @@ def build_detection_model(
                     source_num_classes=tinynext_source_num_classes,
                     label_schema=tinynext_label_schema,
                 )
+            if skip_unprofiled_detector_head:
+                head_keys = [key for key in checkpoint_state_dict if key.startswith("head.")]
+                if head_keys:
+                    checkpoint_state_dict = {
+                        key: value
+                        for key, value in checkpoint_state_dict.items()
+                        if not key.startswith("head.")
+                    }
+                    logger.warning(
+                        "[ModelZoo] Skipping {} TinyNeXt detector-head tensors from {} because "
+                        "the checkpoint has no tinynext_anchor_profile metadata and the model "
+                        "was requested with non-default anchor profile {}. The head will be "
+                        "trained for the requested anchors.",
+                        len(head_keys),
+                        artifact_path,
+                        tinynext_anchor_profile,
+                    )
+            filtered_state, skipped = filter_state_dict_to_model_shapes(
+                model,
+                checkpoint_state_dict,
+            )
+            if skipped:
+                logger.warning(
+                    "[ModelZoo] Skipping {} incompatible tensor(s) from {} due to shape "
+                    "mismatch with the requested model head (examples: {}).",
+                    len(skipped),
+                    artifact_path,
+                    ", ".join(skipped[:4]),
+                )
+            checkpoint_state_dict = filtered_state
             model.load_state_dict(checkpoint_state_dict, strict=False)
             logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
         model.eval()

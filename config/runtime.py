@@ -197,7 +197,7 @@ class ContinualLearningConfig(ConfigSection):
     wrapper_fixed_split_learning_rate: float = 3e-5
     tinynext_fixed_split_learning_rate: float = 1e-3
     rfdetr_fixed_split_learning_rate: float = 1e-4
-    tinynext_fixed_split_target_steps_per_round: int = 4
+    tinynext_fixed_split_target_steps_per_round: int = 12
     yolo_fixed_split_target_steps_per_round: int = 4
     rfdetr_fixed_split_target_steps_per_round: int = 4
     max_concurrent_jobs: int = 2
@@ -246,6 +246,7 @@ class ClientConfig(ConfigSection):
     class_names: list[str] = field(default_factory=list)
     final_detection_threshold: float = 0.5
     tinynext_input_size: int = 320
+    tinynext_anchor_profile: str = "default"
     server_ip: str = "192.168.66.205:50051"
     edge_id: int = 1
     edge_num: int = 1
@@ -267,6 +268,7 @@ class ServerConfig(ConfigSection):
     edge_model_name: str = "yolo26n"
     weights_path: str | None = None
     tinynext_input_size: int = 320
+    tinynext_anchor_profile: str = "default"
     local_queue_maxsize: int = 10
     wait_thresh: int = 10
     listen_address: str = "[::]:50051"
@@ -562,6 +564,8 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "client.tinynext_input_size",
         int(config.client.tinynext_input_size),
     )
+    if not str(config.client.tinynext_anchor_profile or "").strip():
+        raise ValueError("client.tinynext_anchor_profile must be a non-empty string")
     output_quality = config.client.sample_quality.output_entropy
     boundary_quality = config.client.sample_quality.boundary_feature_entropy
     _validate_positive(
@@ -618,6 +622,8 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.tinynext_input_size",
         int(config.server.tinynext_input_size),
     )
+    if not str(config.server.tinynext_anchor_profile or "").strip():
+        raise ValueError("server.tinynext_anchor_profile must be a non-empty string")
     _validate_positive(
         "server.continual_learning.num_epoch",
         int(config.server.continual_learning.num_epoch),

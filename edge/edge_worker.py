@@ -40,6 +40,7 @@ from model_management.fixed_split import (
     load_or_compute_fixed_split_plan,
 )
 from model_management.model_delta_payload import require_state_dict_delta_payload
+from model_management.model_zoo import get_model_family
 from model_management.object_detection import InferenceArtifacts, Object_Detection
 from model_management.split_model_adapters import (
     build_split_training_loss,
@@ -615,11 +616,27 @@ class EdgeWorker:
         detection = getattr(self, "small_object_detection", None)
         model = getattr(detection, "model", None)
         metadata: dict[str, object] = {}
+        model_id = str(getattr(self, "model_id", "") or "")
+        model_id_normalized = model_id.lower().replace("-", "_")
+        model_family = get_model_family(model_id)
         num_classes = _coerce_positive_int(getattr(model, "num_classes", None))
         if num_classes is not None:
             metadata["num_classes"] = num_classes
-            if str(getattr(self, "model_id", "")).lower().startswith("rfdetr_"):
+            if model_id_normalized.startswith("rfdetr_"):
                 metadata["rfdetr_head_num_classes"] = num_classes
+            if model_family == "tinynext":
+                metadata["tinynext_head_num_classes"] = num_classes
+                foreground = _coerce_positive_int(
+                    getattr(model, "tinynext_num_foreground_classes", None)
+                )
+                if foreground is not None:
+                    metadata["tinynext_num_foreground_classes"] = foreground
+                input_size = _coerce_positive_int(getattr(model, "tinynext_input_size", None))
+                if input_size is not None:
+                    metadata["tinynext_input_size"] = input_size
+                anchor_profile = str(getattr(model, "tinynext_anchor_profile", "") or "").strip()
+                if anchor_profile:
+                    metadata["tinynext_anchor_profile"] = anchor_profile
         label_schema = str(getattr(model, "label_schema", "") or "").strip()
         if label_schema:
             metadata["label_schema"] = label_schema

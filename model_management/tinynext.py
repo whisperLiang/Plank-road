@@ -36,6 +36,43 @@ TINYNEXT_VARIANTS: dict[str, dict[str, object]] = {
 }
 
 
+_TINYNEXT_ANCHOR_PROFILE_ALIASES = {
+    "small": "small_objects",
+    "small_object": "small_objects",
+    "small_objects": "small_objects",
+    "suwon_small": "small_objects",
+    "suwon": "small_objects",
+}
+
+
+TINYNEXT_ANCHOR_PROFILES: dict[str, dict[str, object]] = {
+    "default": {
+        "absolute_scales": (48, 100, 150, 202, 253, 304),
+        "aspect_ratios": ((2, 3),) * 6,
+    },
+    # The suwon traffic videos contain many 16-40px transformed objects at
+    # 640x640. Keeping the number of ratios unchanged preserves head shapes
+    # while giving SSD much better positive-anchor coverage.
+    "small_objects": {
+        "absolute_scales": (16, 32, 64, 112, 176, 256),
+        "aspect_ratios": ((2, 3),) * 6,
+    },
+}
+
+
+def normalise_tinynext_anchor_profile(profile: object | None) -> str:
+    if profile is None:
+        return "default"
+    normalized = str(profile).strip().lower().replace("-", "_")
+    if not normalized:
+        return "default"
+    normalized = _TINYNEXT_ANCHOR_PROFILE_ALIASES.get(normalized, normalized)
+    if normalized not in TINYNEXT_ANCHOR_PROFILES:
+        valid = ", ".join(sorted(TINYNEXT_ANCHOR_PROFILES))
+        raise ValueError(f"Unsupported TinyNeXt anchor profile {profile!r}. Valid profiles: {valid}")
+    return normalized
+
+
 class Add(nn.Module):
     def forward(self, identity: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         return identity + residual
@@ -336,6 +373,7 @@ def build_tinynext_detector(
     device: str | torch.device = "cpu",
     backbone_weights_path: str | Path | None = None,
     image_size: int | tuple[int, int] = 320,
+    anchor_profile: str = "default",
 ) -> SSD:
     name = variant.lower().replace("-", "_")
     if name not in TINYNEXT_VARIANTS:
@@ -351,6 +389,7 @@ def build_tinynext_detector(
         detector_size = int(image_size)
     if detector_size <= 0:
         raise ValueError("TinyNeXt image_size must be positive.")
+    anchor_profile = normalise_tinynext_anchor_profile(anchor_profile)
 
     variant_cfg = TINYNEXT_VARIANTS[name]
     norm_layer = partial(nn.BatchNorm2d, eps=0.001, momentum=0.03)
@@ -365,17 +404,20 @@ def build_tinynext_detector(
         norm_layer=norm_layer,
     )
 
+    anchor_config = TINYNEXT_ANCHOR_PROFILES[anchor_profile]
+    absolute_scales = [float(value) for value in anchor_config["absolute_scales"]]  # type: ignore[index]
+    aspect_ratios = [
+        [float(value) for value in ratios]
+        for ratios in anchor_config["aspect_ratios"]  # type: ignore[index]
+    ]
+    if len(absolute_scales) != 6 or len(aspect_ratios) != 6:
+        raise ValueError("TinyNeXt anchor profiles must define six scales and ratio groups.")
+    anchor_scales = [min(1.0, max(1.0 / detector_size, value / detector_size)) for value in absolute_scales]
+    anchor_scales.append(1.0)
+
     anchor_generator = DefaultBoxGenerator(
-        [[2, 3] for _ in range(6)],
-        scales=[
-            48 / detector_size,
-            100 / detector_size,
-            150 / detector_size,
-            202 / detector_size,
-            253 / detector_size,
-            304 / detector_size,
-            1.0,
-        ],
+        aspect_ratios,
+        scales=anchor_scales,
         steps=[16, 32, 64, 107, 160, 320],
     )
     head = SSDLiteHead(
@@ -399,5 +441,9 @@ def build_tinynext_detector(
         image_mean=[128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0],
         image_std=[1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0],
     )
+    setattr(model, "tinynext_input_size", detector_size)
+    setattr(model, "tinynext_anchor_profile", anchor_profile)
+    setattr(model, "tinynext_anchor_scales", list(anchor_scales))
+    setattr(model, "tinynext_anchor_aspect_ratios", [list(ratios) for ratios in aspect_ratios])
     model.to(device)
     return model

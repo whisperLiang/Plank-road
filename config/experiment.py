@@ -84,6 +84,8 @@ class ExperimentConfig:
     video_path: str = "./video_data/road.mp4"
     student_model: str = "yolo26"
     student_weights_path: str | None = None
+    tinynext_input_size: int | None = None
+    tinynext_anchor_profile: str | None = None
     class_names: list[str] = field(default_factory=list)
     teacher_label_schema: str = "coco_91"
     teacher_model: str | None = None
@@ -122,6 +124,17 @@ class ExperimentConfig:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.epochs < 1:
             raise ValueError(f"epochs must be >= 1, got {self.epochs}")
+        if self.tinynext_input_size is not None:
+            self.tinynext_input_size = int(self.tinynext_input_size)
+            if self.tinynext_input_size < 1:
+                raise ValueError(
+                    "tinynext_input_size must be a positive integer when provided, "
+                    f"got {self.tinynext_input_size!r}"
+                )
+        if self.tinynext_anchor_profile is not None:
+            self.tinynext_anchor_profile = str(self.tinynext_anchor_profile).strip()
+            if not self.tinynext_anchor_profile:
+                self.tinynext_anchor_profile = None
         if self.max_concurrent_train_jobs < 1:
             raise ValueError(
                 f"max_concurrent_train_jobs must be >= 1, got {self.max_concurrent_train_jobs}"
@@ -179,6 +192,8 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         "video_path",
         "student_model",
         "student_weights_path",
+        "tinynext_input_size",
+        "tinynext_anchor_profile",
         "class_names",
         "teacher_label_schema",
         "teacher_model",

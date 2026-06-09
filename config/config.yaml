@@ -10,7 +10,7 @@ sample_pool:
 client:
  # the source video
  source:
-  video_path: ./video_data/road.mp4
+  video_path: ./video_data/suwon#86_04_01.mp4
   max_count: 1000
   rtsp:
    flag: False
@@ -38,6 +38,7 @@ client:
  # COCO models, or fill in the exact training-class order, e.g. ["car", "bus"].
  class_names: ["unidentified", "others", "pedestrian", "micromobility", "car", "bus", "small truck", "truck"]
  tinynext_input_size: 640
+ tinynext_anchor_profile: small_objects
  # edge-side final display threshold; boxes below this score are not returned
  final_detection_threshold: 0.6
  # Supported model names (see model_management/model_zoo.py):
@@ -164,6 +165,7 @@ server:
  # Cloud-side starting point for retraining the edge model; golden uses server.golden.
  weights_path: ./model_management/models/tinynext_s.pth
  tinynext_input_size: 640
+ tinynext_anchor_profile: small_objects
  # gRPC listen address for the cloud server
  listen_address: "[::]:50051"
  # Number of gRPC worker threads; should be > max_concurrent_jobs to avoid
@@ -217,9 +219,10 @@ server:
   proxy_eval_max_samples: 128
   proxy_eval_validation_fraction: 0.2
   proxy_eval_max_dets: 500
-  # RF-DETR fixed-split jobs shrink the effective runtime batch size toward
+  # TinyNeXt/RF-DETR fixed-split jobs shrink the effective runtime batch size toward
   # this many optimizer steps per outer round so small bundles do not collapse
   # into a single heavily padded update.
+  tinynext_fixed_split_target_steps_per_round: 12
   rfdetr_fixed_split_target_steps_per_round: 4
   max_concurrent_jobs: 4
   # Cloud-side teacher threshold used only for GT annotation during

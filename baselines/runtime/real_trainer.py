@@ -14,6 +14,7 @@ import torch
 
 from baselines.runtime.detection_evaluator import DetectionEvaluator
 from baselines.runtime.sample_store import SampleRecord
+from baselines.runtime.tinynext_metadata import attach_tinynext_checkpoint_metadata
 from cloud.feature_cache.shard_store import FeatureShardStore
 from cloud.feature_cache.types import FeatureShardRef
 from model_management.fixed_split import (
@@ -781,11 +782,16 @@ class RealTrainer:
             device_id=self.device_id,
         )
         start = time.perf_counter()
-        torch.save(
-            {
-                "model_name": self.method_name,
-                "state_dict": self.model.state_dict(),
-            },
-            checkpoint_path,
-        )
+        payload: dict[str, Any] = {
+            "model_name": self.method_name,
+            "state_dict": self.model.state_dict(),
+        }
+        if self._split_model_family() == "tinynext":
+            class_names = getattr(self.model, "class_names", None)
+            attach_tinynext_checkpoint_metadata(
+                payload,
+                self.model,
+                class_names=class_names,
+            )
+        torch.save(payload, checkpoint_path)
         return checkpoint_path, time.perf_counter() - start

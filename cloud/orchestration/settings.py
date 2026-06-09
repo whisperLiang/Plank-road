@@ -375,7 +375,7 @@ class PipelineLifecycleMixin:
             float(getattr(cl_cfg, "rfdetr_fixed_split_learning_rate", 1e-4)) if cl_cfg else 1e-4
         )
         self.tinynext_fixed_split_target_steps_per_round = (
-            int(getattr(cl_cfg, "tinynext_fixed_split_target_steps_per_round", 4)) if cl_cfg else 4
+            int(getattr(cl_cfg, "tinynext_fixed_split_target_steps_per_round", 12)) if cl_cfg else 12
         )
         self.yolo_fixed_split_target_steps_per_round = (
             int(getattr(cl_cfg, "yolo_fixed_split_target_steps_per_round", 4)) if cl_cfg else 4

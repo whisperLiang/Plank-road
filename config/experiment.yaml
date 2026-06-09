@@ -7,6 +7,8 @@ experiment:
   results_dir: results/baselines_real_smoke
   video_path: ./video_data/road.mp4
   student_model: yolo26
+  tinynext_input_size: 640
+  tinynext_anchor_profile: small_objects
   # Class names in the student model's zero-based training order.
   class_names:
     - unidentified

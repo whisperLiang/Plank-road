@@ -13,6 +13,12 @@ import cv2
 import numpy as np
 import torch
 
+from baselines.runtime.tinynext_metadata import (
+    attach_tinynext_checkpoint_metadata,
+    positive_int_or_none,
+    validate_tinynext_checkpoint_anchor_profile,
+    validate_tinynext_checkpoint_input_size,
+)
 from model_management.model_zoo import build_detection_model, get_model_family
 from model_management.split_model_adapters import (
     get_split_runtime_input_resize_mode,
@@ -63,6 +69,8 @@ class StudentInferencer:
         weights_path: str | Path | None = None,
         class_names: Sequence[str] | None = None,
         seed: int = 2026,
+        tinynext_input_size: int | None = None,
+        tinynext_anchor_profile: str | None = None,
         fixed_split_constraints: SplitConstraints | None = None,
         fixed_split_cache_path: str | Path | None = None,
         fixed_split_validate_cached_plan: bool = True,
@@ -71,25 +79,38 @@ class StudentInferencer:
         normalized = self.MODEL_ALIASES.get(model_name.lower().replace("-", "_"), model_name)
         torch.manual_seed(int(seed))
         self.model_name = str(normalized).lower().replace("-", "_")
+        self.model_family = get_model_family(self.model_name)
         self.device = resolve_torch_device(device)
+        self.class_names = [str(item) for item in (class_names or [])]
+        self.tinynext_input_size = positive_int_or_none(tinynext_input_size)
+        if tinynext_input_size is not None and self.tinynext_input_size is None:
+            raise ValueError(
+                f"tinynext_input_size must be a positive integer, got {tinynext_input_size!r}"
+            )
+        build_kwargs: dict[str, Any] = {}
+        if self.model_family == "tinynext" and self.tinynext_input_size is not None:
+            build_kwargs["tinynext_input_size"] = int(self.tinynext_input_size)
+        if self.model_family == "tinynext" and tinynext_anchor_profile is not None:
+            build_kwargs["tinynext_anchor_profile"] = str(tinynext_anchor_profile)
+        if self.model_family == "tinynext" and self.class_names:
+            build_kwargs["tinynext_num_foreground_classes"] = len(self.class_names)
         try:
             self.model = build_detection_model(
                 self.model_name,
                 pretrained=bool(pretrained),
                 device=self.device,
                 weights_path=None if weights_path is None else str(weights_path),
+                **build_kwargs,
             )
         except Exception as exc:
             raise NotImplementedError(
                 f"Student model {model_name!r} could not be initialized by the real "
                 "detection adapter. Provide a supported model artifact."
             ) from exc
-        self.class_names = [str(item) for item in (class_names or [])]
         if not self.class_names:
             self.class_names = self._extract_model_class_names(self.model)
         if self.class_names:
             setattr(self.model, "class_names", list(self.class_names))
-        self.model_family = get_model_family(self.model_name)
         self.model.eval()
         self.results_dir = Path(results_dir)
         self.method_name = method_name
@@ -293,18 +314,34 @@ class StudentInferencer:
     def save_checkpoint(self, checkpoint_path: str | Path) -> str:
         out = Path(checkpoint_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model_name": self.model_name,
-                "state_dict": self.model.state_dict(),
-            },
-            out,
-        )
+        payload: dict[str, Any] = {
+            "model_name": self.model_name,
+            "state_dict": self.model.state_dict(),
+        }
+        if self.model_family == "tinynext":
+            attach_tinynext_checkpoint_metadata(
+                payload,
+                self.model,
+                model_name=self.model_name,
+                class_names=self.class_names,
+            )
+        torch.save(payload, out)
         return str(out)
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> float:
         start = time.perf_counter()
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        if self.model_family == "tinynext":
+            validate_tinynext_checkpoint_input_size(
+                checkpoint=checkpoint,
+                model=self.model,
+                checkpoint_path=str(checkpoint_path),
+            )
+            validate_tinynext_checkpoint_anchor_profile(
+                checkpoint=checkpoint,
+                model=self.model,
+                checkpoint_path=str(checkpoint_path),
+            )
         state = checkpoint.get("state_dict", checkpoint)
         self.model.load_state_dict(state, strict=False)
         self.model.to(self.device)

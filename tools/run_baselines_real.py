@@ -24,6 +24,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student-model", default="yolo26")
     parser.add_argument("--student-weights", help="Optional local student weights path.")
     parser.add_argument(
+        "--tinynext-input-size",
+        type=int,
+        help="TinyNeXt square input size. Defaults to client.tinynext_input_size from --runtime-config.",
+    )
+    parser.add_argument(
+        "--tinynext-anchor-profile",
+        help="TinyNeXt anchor profile. Defaults to client.tinynext_anchor_profile from --runtime-config.",
+    )
+    parser.add_argument(
         "--runtime-config",
         default="config/config.yaml",
         help="Runtime config used as a fallback source for client.class_names.",
@@ -68,27 +77,33 @@ def _parse_class_names(raw: str) -> list[str]:
     return [item.strip() for item in str(raw or "").split(",") if item.strip()]
 
 
-def _runtime_config_class_names(path: str | Path | None) -> list[str]:
+def _runtime_client_defaults(path: str | Path | None) -> dict[str, object]:
     if not path:
-        return []
+        return {}
     config_path = Path(path)
     if not config_path.exists():
-        return []
+        return {}
     try:
-        return [str(item) for item in load_runtime_config(config_path).client.class_names]
+        client = load_runtime_config(config_path).client
     except Exception as exc:
         print(
-            f"[run_baselines_real] Could not read client.class_names from {config_path}: {exc}",
+            f"[run_baselines_real] Could not read client defaults from {config_path}: {exc}",
             file=sys.stderr,
         )
-        return []
+        return {}
+    anchor_profile = str(getattr(client, "tinynext_anchor_profile", "") or "").strip()
+    return {
+        "class_names": [str(item) for item in getattr(client, "class_names", [])],
+        "tinynext_input_size": int(getattr(client, "tinynext_input_size", 0) or 0) or None,
+        "tinynext_anchor_profile": anchor_profile or None,
+    }
 
 
-def _resolve_class_names(args: argparse.Namespace) -> list[str]:
+def _resolve_class_names(args: argparse.Namespace, defaults: dict[str, object]) -> list[str]:
     explicit = _parse_class_names(args.class_names)
     if explicit:
         return explicit
-    return _runtime_config_class_names(args.runtime_config)
+    return [str(item) for item in defaults.get("class_names", [])]
 
 
 def main() -> None:
@@ -104,6 +119,7 @@ def main() -> None:
     if unknown:
         raise ValueError(f"Unknown baseline methods: {unknown}. Valid methods: {VALID_METHODS}")
 
+    runtime_defaults = _runtime_client_defaults(args.runtime_config)
     base_config = ExperimentConfig(
         method=method_names[0],
         num_devices=args.num_edges,
@@ -112,7 +128,17 @@ def main() -> None:
         video_path=args.video,
         student_model=args.student_model,
         student_weights_path=args.student_weights,
-        class_names=_resolve_class_names(args),
+        tinynext_input_size=(
+            args.tinynext_input_size
+            if args.tinynext_input_size is not None
+            else runtime_defaults.get("tinynext_input_size")
+        ),
+        tinynext_anchor_profile=(
+            args.tinynext_anchor_profile
+            if args.tinynext_anchor_profile is not None
+            else runtime_defaults.get("tinynext_anchor_profile")
+        ),
+        class_names=_resolve_class_names(args, runtime_defaults),
         teacher_label_schema=args.teacher_label_schema,
         teacher_model=args.teacher_model,
         initial_checkpoint=args.initial_checkpoint,

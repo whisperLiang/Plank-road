@@ -7,6 +7,7 @@ from collections.abc import Mapping
 import torch
 
 from cloud.model_update import serialize_model_update
+from model_management.state_dict_utils import filter_state_dict_to_model_shapes
 
 
 def file_sha1(path: str) -> str:
@@ -170,6 +171,18 @@ class CheckpointStageMixin:
         if model_family != "tinynext":
             return build_kwargs
 
+        foreground_classes = None
+        if model_metadata:
+            foreground_classes = _coerce_positive_int(
+                model_metadata.get("tinynext_num_foreground_classes")
+            )
+            if foreground_classes is None:
+                class_names = model_metadata.get("class_names")
+                if isinstance(class_names, (list, tuple)) and class_names:
+                    foreground_classes = len(class_names)
+        if foreground_classes is not None:
+            build_kwargs["tinynext_num_foreground_classes"] = int(foreground_classes)
+
         input_size = int(getattr(self.config, "tinynext_input_size", 320))
         shape = list(runtime_input_tensor_shape or [])
         if len(shape) >= 4:
@@ -186,6 +199,12 @@ class CheckpointStageMixin:
                 )
             input_size = height
         build_kwargs["tinynext_input_size"] = input_size
+        anchor_profile = None
+        if model_metadata:
+            anchor_profile = model_metadata.get("tinynext_anchor_profile")
+        if anchor_profile is None:
+            anchor_profile = getattr(self.config, "tinynext_anchor_profile", "default")
+        build_kwargs["tinynext_anchor_profile"] = str(anchor_profile)
         return build_kwargs
 
 
@@ -396,7 +415,11 @@ class CheckpointStageMixin:
                 )
         elif model_family == "tinynext":
             cache_num_classes = model_zoo.infer_tinynext_state_dict_num_classes(state)
-            if cache_num_classes is not None and cache_num_classes != 91:
+            if (
+                "tinynext_num_foreground_classes" not in build_kwargs
+                and cache_num_classes is not None
+                and cache_num_classes != 91
+            ):
                 build_kwargs["num_classes"] = cache_num_classes
                 logger.info(
                     "[CL] Inferred {} TinyNeXt SSD class logits from edge-scoped {} weights at {}.",
@@ -411,6 +434,17 @@ class CheckpointStageMixin:
             device=self.device,
             **build_kwargs,
         )
+        if model_family == "tinynext" and isinstance(state, Mapping):
+            filtered_state, skipped = filter_state_dict_to_model_shapes(tmp_model, state)
+            if skipped:
+                logger.warning(
+                    "[CL] Skipping {} incompatible TinyNeXt tensor(s) from edge-scoped cache "
+                    "{} (examples: {}).",
+                    len(skipped),
+                    edge_weights,
+                    ", ".join(skipped[:4]),
+                )
+            state = filtered_state
         try:
             load_result = tmp_model.load_state_dict(state, strict=False)
         except Exception as exc:
@@ -492,6 +526,14 @@ class CheckpointStageMixin:
             )
             if tinynext_num_classes is not None:
                 weights_metadata["tinynext_head_num_classes"] = int(tinynext_num_classes)
+            foreground_classes = _coerce_positive_int(
+                getattr(model, "tinynext_num_foreground_classes", None)
+            )
+            if foreground_classes is not None:
+                weights_metadata["tinynext_num_foreground_classes"] = int(foreground_classes)
+            weights_metadata["tinynext_anchor_profile"] = str(
+                getattr(model, "tinynext_anchor_profile", "default")
+            )
         return weights_metadata
 
 
