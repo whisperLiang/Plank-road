@@ -122,7 +122,6 @@ class FixedSplitPipeline(
                     bundle_model_version,
                     field_name="bundle model version",
                 )
-                baseline_source = f"native {self._native_training_source_label(current_model_name)}"
                 existing_contract = self._load_split_runtime_contract(
                     edge_id=edge_id,
                     manifest=manifest,
@@ -171,7 +170,6 @@ class FixedSplitPipeline(
                         current_model_name,
                         metadata["checkpoint_model_version"],
                     )
-                    baseline_source = "edge-scoped cache"
                     tmp_model = self._load_edge_training_model(
                         model_name=current_model_name,
                         edge_id=edge_id,
@@ -226,9 +224,6 @@ class FixedSplitPipeline(
                 gt_annotations = self._teacher_annotation_stage().ensure_low_quality(
                     teacher_requests,
                 )
-                current_low_quality_gt_sample_ids = {
-                    str(sample_id) for sample_id in gt_annotations.keys()
-                }
                 self._log_stage_duration("teacher annotation ensure", stage_started)
                 pending_high_quality = sample_pool.load_pending_high_quality_samples()
                 contract_layout_tensors = self._contract_layout_tensors_from_runtime(
@@ -326,29 +321,49 @@ class FixedSplitPipeline(
                     _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
                     _splitter_dynamic_batch_min(prepared_splitter),
                 )
-                if active_sample_count < required_dynamic_batch_min:
-                    message = (
-                        "Not enough compatible samples for dynamic batch runtime: "
-                        f"active_samples={active_sample_count}, "
-                        f"required_min={required_dynamic_batch_min}."
-                    )
-                    logger.warning("[FixedSplitCL] {}", message)
-                    self._log_stage_duration("total round time", total_round_started)
-                    return False, "", message
-                effective_batch_size = self._resolve_fixed_split_runtime_batch_size(
-                    current_model_name,
-                    num_train_samples=active_sample_count,
-                )
-                training_cache_path = str(bundle_info.get("training_view_path") or "")
                 proxy_sample_random_seed = str(
                     bundle_info.get("training_view_id")
                     or bundle_info.get("generation_id")
                     or f"{edge_id}:{current_model_name}"
                 )
+                validation_split = build_proxy_validation_split(
+                    all_sample_ids=bundle_info["all_sample_ids"],
+                    gt_annotations=gt_annotations,
+                    validation_fraction=float(self.proxy_eval_validation_fraction),
+                    max_eval_samples=self.proxy_eval_max_samples,
+                    random_seed=proxy_sample_random_seed,
+                    min_train_samples=required_dynamic_batch_min,
+                )
+                train_sample_count = len(validation_split.train_sample_ids)
+                validation_sample_count = len(validation_split.validation_sample_ids)
+                if (
+                    active_sample_count < required_dynamic_batch_min
+                    or train_sample_count < required_dynamic_batch_min
+                    or validation_sample_count <= 0
+                ):
+                    message = (
+                        "Not enough compatible samples for official mAP_50_95 validation split: "
+                        f"active_samples={active_sample_count}, "
+                        f"train_samples={train_sample_count}, "
+                        f"validation_samples={validation_sample_count}, "
+                        f"required_train_min={required_dynamic_batch_min}."
+                    )
+                    logger.warning("[FixedSplitCL] {}", message)
+                    self._log_stage_duration("total round time", total_round_started)
+                    return False, "", message
+                training_bundle_info = dict(bundle_info)
+                training_bundle_info["all_sample_ids"] = list(validation_split.train_sample_ids)
+                gt_annotations = dict(validation_split.train_gt_annotations)
+                validation_gt_annotations = dict(validation_split.validation_gt_annotations)
+                effective_batch_size = self._resolve_fixed_split_runtime_batch_size(
+                    current_model_name,
+                    num_train_samples=train_sample_count,
+                )
+                training_cache_path = str(bundle_info.get("training_view_path") or "")
                 effective_batch_size = self._negotiate_cached_split_runtime_batch_size(
                     current_model_name=current_model_name,
                     training_cache_path=training_cache_path,
-                    all_sample_ids=bundle_info["all_sample_ids"],
+                    all_sample_ids=training_bundle_info["all_sample_ids"],
                     gt_annotations=gt_annotations,
                     prepared_splitter=prepared_splitter,
                     prepared_candidate=prepared_candidate,
@@ -357,9 +372,11 @@ class FixedSplitPipeline(
                     manifest=manifest,
                 )
                 logger.info(
-                    "[FixedSplitCL] Training from {} canonical-active sample(s) via TrainingCacheView(source=canonical_active) ({} label entry/entries).",
-                    len(bundle_info["all_sample_ids"]),
+                    "[FixedSplitCL] Training from {} canonical-active sample(s) with {} validation sample(s) via TrainingCacheView(source=canonical_active) ({} train label entry/entries; {} validation label entry/entries).",
+                    len(training_bundle_info["all_sample_ids"]),
+                    len(validation_split.validation_sample_ids),
                     len(gt_annotations),
+                    len(validation_gt_annotations),
                 )
                 if self.connectivity_smoke_only:
                     stage_started = time.perf_counter()
@@ -390,73 +407,18 @@ class FixedSplitPipeline(
                 proxy_evaluator = self._fixed_split_proxy_evaluator()
                 proxy_eval_frame_cache = proxy_evaluator.new_frame_cache()
 
-                stage_started = time.perf_counter()
-                if gt_annotations and model_zoo.get_model_family(current_model_name) == "tinynext":
-                    proxy_metrics_before = self._evaluate_tinynext_proxy_map(
-                        tmp_model,
-                        frame_dir=frame_dir,
-                        gt_annotations=gt_annotations,
-                        model_name=current_model_name,
-                        sample_metadata_by_id=sample_metadata_by_id,
-                        frame_cache=proxy_eval_frame_cache,
-                        max_samples=self.proxy_eval_max_samples,
-                        candidate_thresholds=self.proxy_eval_threshold_candidates,
-                        inference_batch_size=effective_batch_size,
-                        stage_label="proxy evaluation before retrain",
-                        split_cache_path=training_cache_path,
-                        splitter=prepared_splitter,
-                        split_candidate=prepared_candidate,
-                        preloaded_records=preloaded_records,
-                        allow_dead_baseline_fast_path=True,
-                        priority_sample_ids=current_low_quality_gt_sample_ids,
-                        random_fill_seed=proxy_sample_random_seed,
-                    )
-                else:
-                    proxy_metrics_before = self._evaluate_fixed_split_proxy_map(
-                        tmp_model,
-                        frame_dir=frame_dir,
-                        gt_annotations=gt_annotations,
-                        model_name=current_model_name,
-                        sample_metadata_by_id=sample_metadata_by_id,
-                        frame_cache=proxy_eval_frame_cache,
-                        max_samples=self.proxy_eval_max_samples,
-                        inference_batch_size=effective_batch_size,
-                        split_cache_path=training_cache_path,
-                        splitter=prepared_splitter,
-                        split_candidate=prepared_candidate,
-                        preloaded_records=preloaded_records,
-                        priority_sample_ids=current_low_quality_gt_sample_ids,
-                        random_fill_seed=proxy_sample_random_seed,
-                    )
-                proxy_metrics_before_elapsed = time.perf_counter() - stage_started
-                self._log_stage_duration("proxy evaluation before retrain", stage_started)
-                is_wrapper_fixed_split = bool(model_zoo.is_wrapper_model(current_model_name))
-
-                if (
-                    gt_annotations
-                    and is_wrapper_fixed_split
-                    and proxy_evaluator.metrics_indicate_dead_detector(proxy_metrics_before)
-                    and bool(bundle_info.get("from_sample_pool", False))
-                ):
-                    logger.warning(
-                        "[FixedSplitCL] Cached {} weights produced no detections on {} pool label sample(s), "
-                        "but keeping the cached model because resetting would invalidate active cloud sample-pool features.",
-                        current_model_name,
-                        len(gt_annotations),
-                    )
-
-                proxy_metrics_after, baseline_state = self._run_fixed_split_retrain(
+                training_result = self._run_fixed_split_retrain(
                     tmp_model,
                     current_model_name=current_model_name,
-                    bundle_info=bundle_info,
+                    bundle_info=training_bundle_info,
                     manifest=manifest,
                     bundle_cache_path=bundle_cache_path,
                     training_cache_path=training_cache_path,
                     frame_dir=frame_dir,
                     gt_annotations=gt_annotations,
+                    validation_gt_annotations=validation_gt_annotations,
+                    validation_sample_ids=list(validation_split.validation_sample_ids),
                     num_epoch=effective_num_epoch,
-                    proxy_metrics_before=proxy_metrics_before,
-                    proxy_metrics_before_elapsed=proxy_metrics_before_elapsed,
                     prepared_trace_sample_input=prepared_trace_sample_input,
                     prepared_splitter=prepared_splitter,
                     prepared_candidate=prepared_candidate,
@@ -464,26 +426,17 @@ class FixedSplitPipeline(
                     sample_metadata_by_id=sample_metadata_by_id,
                     proxy_eval_frame_cache=proxy_eval_frame_cache,
                     preloaded_records=preloaded_records,
-                    proxy_priority_sample_ids=current_low_quality_gt_sample_ids,
-                    proxy_sample_random_seed=proxy_sample_random_seed,
                 )
+                proxy_metrics_after = dict(training_result.proxy_metrics_after)
                 proxy_summary = proxy_evaluator.format_summary(
-                    proxy_metrics_before,
+                    None,
                     proxy_metrics_after,
                 )
-                if proxy_evaluator.metrics_skipped_full_proxy(proxy_metrics_before):
-                    logger.info(
-                        "[FixedSplitCL] Initial TinyNeXt baseline proxy_mAP@0.5 used "
-                        "{}-sample dead-baseline subset fast path; final candidate was "
-                        "evaluated on {} sample(s).",
-                        int(proxy_metrics_before.get("subset_proxy_sample_count", 0) or 0),
-                        int(proxy_metrics_after.get("evaluated_samples", 0) or 0),
-                    )
                 if proxy_summary is not None:
                     logger.info("[FixedSplitCL] {}", proxy_summary)
                 else:
                     logger.info(
-                        "[FixedSplitCL] Proxy mAP skipped "
+                        "[FixedSplitCL] Proxy mAP_50_95 skipped "
                         "(gt_samples={}, evaluated={}, empty_gt={}, missing_frame={}).",
                         int(proxy_metrics_after.get("total_gt_samples", 0)),
                         int(proxy_metrics_after.get("evaluated_samples", 0)),
@@ -491,71 +444,16 @@ class FixedSplitPipeline(
                         int(proxy_metrics_after.get("skipped_missing_frame", 0)),
                     )
 
-                if proxy_evaluator.metrics_skipped_full_proxy(proxy_metrics_before):
-                    logger.info(
-                        "[FixedSplitCL] Rechecking full TinyNeXt baseline proxy before final "
-                        "candidate decision because the initial baseline used the subset fast path."
-                    )
-                    candidate_state = proxy_evaluator.snapshot_model_state(tmp_model)
-                    proxy_evaluator.restore_model_state(tmp_model, baseline_state)
-                    full_baseline_metrics = self._evaluate_tinynext_proxy_map(
-                        tmp_model,
-                        frame_dir=frame_dir,
-                        gt_annotations=gt_annotations,
-                        model_name=current_model_name,
-                        sample_metadata_by_id=sample_metadata_by_id,
-                        frame_cache=proxy_eval_frame_cache,
-                        max_samples=self.proxy_eval_max_samples,
-                        candidate_thresholds=self.proxy_eval_threshold_candidates,
-                        inference_batch_size=effective_batch_size,
-                        stage_label="full baseline proxy recheck",
-                        split_cache_path=training_cache_path,
-                        splitter=prepared_splitter,
-                        split_candidate=prepared_candidate,
-                        preloaded_records=preloaded_records,
-                        priority_sample_ids=current_low_quality_gt_sample_ids,
-                        random_fill_seed=proxy_sample_random_seed,
-                    )
-                    proxy_evaluator.restore_model_state(tmp_model, candidate_state)
-                    proxy_metrics_before = full_baseline_metrics
-                    proxy_summary = proxy_evaluator.format_summary(
-                        proxy_metrics_before,
-                        proxy_metrics_after,
-                    )
-                    if proxy_summary is not None:
-                        logger.info("[FixedSplitCL] {}", proxy_summary)
-
-                rejection_reason = proxy_evaluator.rejection_reason(
-                    proxy_metrics_before,
-                    proxy_metrics_after,
-                )
-                if rejection_reason is not None:
-                    logger.warning(
-                        "[FixedSplitCL] Rejecting retrained {} weights for edge {}: {}",
-                        current_model_name,
-                        edge_id,
-                        rejection_reason,
-                    )
-                    proxy_evaluator.restore_model_state(tmp_model, baseline_state)
-                    stage_started = time.perf_counter()
-                    encoded = base64.b64encode(
-                        self._serialise_model_bytes(
-                            tmp_model,
-                            model_name=current_model_name,
-                            edge_id=edge_id,
-                            weights_metadata=weights_metadata,
-                        )
-                    ).decode("utf-8")
-                    self._log_stage_duration("serialization / encoding", stage_started)
+                if not training_result.result_available:
                     self._log_stage_duration("total round time", total_round_started)
-                    fallback_message = (
-                        f"Kept {baseline_source} weights; rejected retrained weights because {rejection_reason}"
+                    message = (
+                        "Fixed split retraining completed without a publishable checkpoint; "
+                        "validation proxy_mAP_50_95 was unavailable"
                     )
                     if proxy_summary is not None:
-                        fallback_message = f"{fallback_message}; {proxy_summary}"
-                    else:
-                        fallback_message = f"{fallback_message}; proxy_mAP@0.5 skipped"
-                    return True, encoded, fallback_message
+                        message = f"{message}; {proxy_summary}"
+                    logger.warning("[FixedSplitCL] {}", message)
+                    return True, "", message
 
                 stage_started = time.perf_counter()
                 encoded = base64.b64encode(
@@ -571,14 +469,14 @@ class FixedSplitPipeline(
                 success_message = (
                     f"Fixed split retraining successful; {proxy_summary}"
                     if proxy_summary is not None
-                    else "Fixed split retraining successful; proxy_mAP@0.5 skipped"
+                    else "Fixed split retraining successful; proxy_mAP_50_95 skipped"
                 )
                 logger.success(
-                    "[FixedSplitCL] {} done for edge {} with {} samples ({} GT-annotated).",
+                    "[FixedSplitCL] {} done for edge {} with {} train samples and {} validation samples.",
                     "Retraining",
                     edge_id,
-                    len(bundle_info["all_sample_ids"]),
-                    len(gt_annotations),
+                    len(training_bundle_info["all_sample_ids"]),
+                    len(validation_split.validation_sample_ids),
                 )
                 return True, encoded, success_message
             except Exception as exc:

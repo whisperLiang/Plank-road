@@ -215,6 +215,8 @@ server:
   proxy_eval_patience: 2
   proxy_eval_min_delta: 0.002
   proxy_eval_max_samples: 128
+  proxy_eval_validation_fraction: 0.2
+  proxy_eval_max_dets: 500
   # RF-DETR fixed-split jobs shrink the effective runtime batch size toward
   # this many optimizer steps per outer round so small bundles do not collapse
   # into a single heavily padded update.

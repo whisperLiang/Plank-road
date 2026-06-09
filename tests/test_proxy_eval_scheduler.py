@@ -4,20 +4,21 @@ from cloud.training.proxy_eval import (
     ProxyEarlyStopper,
     ProxyEvalConfig,
     ProxyEvalScheduler,
+    build_proxy_validation_split,
     deterministic_proxy_sample_ids,
 )
 from cloud.training.types import ProxyEvalResult
 
 
-def test_proxy_scheduler_evaluates_epoch_one_by_default() -> None:
+def test_proxy_scheduler_does_not_evaluate_epoch_one_by_default() -> None:
     scheduler = ProxyEvalScheduler(ProxyEvalConfig(interval_epochs=10))
 
-    assert scheduler.should_eval(1, 50)
+    assert not scheduler.should_eval(1, 50)
 
 
 def test_proxy_scheduler_evaluates_interval_epochs_only_when_not_final() -> None:
     scheduler = ProxyEvalScheduler(
-        ProxyEvalConfig(eval_after_first_epoch=False, eval_final=False, interval_epochs=10)
+        ProxyEvalConfig(eval_final=False, interval_epochs=10)
     )
 
     evaluated = [epoch for epoch in range(1, 36) if scheduler.should_eval(epoch, 35)]
@@ -27,10 +28,10 @@ def test_proxy_scheduler_evaluates_interval_epochs_only_when_not_final() -> None
 
 def test_proxy_scheduler_final_epoch_is_configurable() -> None:
     enabled = ProxyEvalScheduler(
-        ProxyEvalConfig(eval_after_first_epoch=False, eval_final=True, interval_epochs=10)
+        ProxyEvalConfig(eval_final=True, interval_epochs=10)
     )
     disabled = ProxyEvalScheduler(
-        ProxyEvalConfig(eval_after_first_epoch=False, eval_final=False, interval_epochs=10)
+        ProxyEvalConfig(eval_final=False, interval_epochs=10)
     )
 
     assert enabled.should_eval(35, 35)
@@ -79,15 +80,15 @@ def test_proxy_sample_ids_prioritize_relabels_then_stable_random_fill() -> None:
 
 def test_proxy_early_stopper_uses_patience_and_min_delta() -> None:
     config = ProxyEvalConfig(min_delta=0.002, patience=2)
-    stopper = ProxyEarlyStopper(config, baseline_metric=0.5)
+    stopper = ProxyEarlyStopper(config)
 
     first = stopper.record(
-        ProxyEvalResult({"map": 0.501}, 0.501, 0.0, epoch=1),
+        ProxyEvalResult({"primary_metric": 0.501}, 0.501, 0.0, epoch=1),
         improved=False,
         best_metric=0.5,
     )
     second = stopper.record(
-        ProxyEvalResult({"map": 0.5015}, 0.5015, 0.0, epoch=10),
+        ProxyEvalResult({"primary_metric": 0.5015}, 0.5015, 0.0, epoch=10),
         improved=False,
         best_metric=0.5,
     )
@@ -96,14 +97,69 @@ def test_proxy_early_stopper_uses_patience_and_min_delta() -> None:
     assert second.should_stop
 
 
-def test_proxy_early_stopper_high_baseline_stops_faster() -> None:
-    config = ProxyEvalConfig(min_delta=0.002, patience=2, skip_if_baseline_above=0.98)
-    stopper = ProxyEarlyStopper(config, baseline_metric=0.99)
+def test_proxy_validation_split_is_deterministic_and_excludes_validation_from_train() -> None:
+    annotations = {
+        f"sample-{index:02d}": {"boxes": [[0, 0, 1, 1]], "labels": [1]}
+        for index in range(10)
+    }
 
-    decision = stopper.record(
-        ProxyEvalResult({"map": 0.9905}, 0.9905, 0.0, epoch=1),
-        improved=False,
-        best_metric=0.99,
+    split = build_proxy_validation_split(
+        all_sample_ids=list(annotations.keys()),
+        gt_annotations=annotations,
+        validation_fraction=0.2,
+        max_eval_samples=128,
+        random_seed="view-a",
+        min_train_samples=2,
+    )
+    split_again = build_proxy_validation_split(
+        all_sample_ids=list(reversed(annotations.keys())),
+        gt_annotations=annotations,
+        validation_fraction=0.2,
+        max_eval_samples=128,
+        random_seed="view-a",
+        min_train_samples=2,
     )
 
-    assert decision.should_stop
+    assert split.validation_sample_ids == split_again.validation_sample_ids
+    assert len(split.validation_sample_ids) == 2
+    assert set(split.validation_sample_ids).isdisjoint(split.train_sample_ids)
+    assert set(split.validation_gt_annotations).isdisjoint(split.train_gt_annotations)
+
+
+def test_proxy_validation_split_keeps_empty_gt_samples_eligible() -> None:
+    annotations = {
+        "empty": {"boxes": [], "labels": []},
+        "positive": {"boxes": [[0, 0, 1, 1]], "labels": [1]},
+    }
+
+    split = build_proxy_validation_split(
+        all_sample_ids=["empty", "positive"],
+        gt_annotations=annotations,
+        validation_fraction=1.0,
+        max_eval_samples=128,
+        random_seed="view-a",
+        min_train_samples=1,
+    )
+
+    assert len(split.validation_sample_ids) == 1
+    assert set(split.validation_sample_ids).issubset(annotations)
+    assert set(split.validation_sample_ids).isdisjoint(split.train_sample_ids)
+
+
+def test_proxy_validation_split_returns_empty_validation_when_train_min_cannot_be_met() -> None:
+    annotations = {
+        "a": {"boxes": [[0, 0, 1, 1]], "labels": [1]},
+        "b": {"boxes": [[0, 0, 1, 1]], "labels": [1]},
+    }
+
+    split = build_proxy_validation_split(
+        all_sample_ids=["a", "b"],
+        gt_annotations=annotations,
+        validation_fraction=0.2,
+        max_eval_samples=128,
+        random_seed="view-a",
+        min_train_samples=2,
+    )
+
+    assert split.validation_sample_ids == []
+    assert split.train_sample_ids == ["a", "b"]

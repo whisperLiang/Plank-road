@@ -389,15 +389,12 @@ class PipelineLifecycleMixin:
         self.proxy_eval_max_samples = (
             128 if raw_proxy_eval_max_samples in (None, "") else int(raw_proxy_eval_max_samples)
         )
-        raw_threshold_candidates = (
-            getattr(cl_cfg, "proxy_eval_threshold_candidates", None) if cl_cfg else None
+        self.proxy_eval_validation_fraction = (
+            float(getattr(cl_cfg, "proxy_eval_validation_fraction", 0.2)) if cl_cfg else 0.2
         )
-        if isinstance(raw_threshold_candidates, (list, tuple)):
-            self.proxy_eval_threshold_candidates = [
-                float(candidate) for candidate in raw_threshold_candidates
-            ]
-        else:
-            self.proxy_eval_threshold_candidates = None
+        self.proxy_eval_max_dets = (
+            int(getattr(cl_cfg, "proxy_eval_max_dets", 500)) if cl_cfg else 500
+        )
         self.proxy_eval_frame_cache_enabled = (
             bool(getattr(cl_cfg, "proxy_eval_frame_cache_enabled", True)) if cl_cfg else True
         )

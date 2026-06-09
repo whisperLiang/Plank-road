@@ -3,8 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-
-ProxyMetricValue = float | int | None
+ProxyMetricValue = float | int | str | None
 ProxyMetrics = dict[str, ProxyMetricValue]
 
 
@@ -47,7 +46,6 @@ class CandidateState:
     state_dict: dict[str, object] | None
     proxy_metrics: ProxyMetrics | None = None
     proxy_metric: float | None = None
-    is_baseline: bool = False
 
 
 @dataclass
@@ -72,6 +70,7 @@ class FixedSplitTrainingResult:
     best_proxy_metric: float | None = None
     trained_epochs: int = 0
     early_stop_reason: str | None = None
+    result_available: bool = True
 
 
 @dataclass
@@ -81,8 +80,8 @@ class FixedSplitTrainingContext:
     adapter: Any
     training_kwargs: dict[str, Any] = field(default_factory=dict)
     gt_annotations: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
-    initial_proxy_metrics: ProxyMetrics | None = None
-    initial_proxy_eval_time: float = 0.0
+    validation_gt_annotations: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    validation_sample_ids: list[str] = field(default_factory=list)
     fixed_proxy_evaluator: Callable[..., Mapping[str, object]] | None = None
     tinynext_proxy_evaluator: Callable[..., Mapping[str, object]] | None = None
     retrain_profile: Any = None

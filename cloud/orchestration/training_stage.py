@@ -1,9 +1,40 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import math
+from collections.abc import Mapping, Sequence
 
-from cloud.training import FixedSplitRetrainEngine, FixedSplitTrainingContext
+import numpy as np
+import torch
+from loguru import logger
+
+import model_management.model_zoo as model_zoo
+from cloud.orchestration.runtime_stage import (
+    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+)
+from cloud.orchestration.runtime_stage import (
+    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
+)
+from cloud.orchestration.runtime_stage import (
+    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
+)
+from cloud.training import (
+    FixedSplitRetrainEngine,
+    FixedSplitTrainingContext,
+    FixedSplitTrainingPlan,
+    ProxyEvalConfig,
+    get_training_adapter,
+)
+from cloud.training.proxy_metadata import is_cuda_oom_error as _is_cuda_oom_error
 from cloud.training.types import FixedSplitTrainingResult
+from model_management.split_model_adapters import (
+    build_split_training_loss,
+    get_split_runtime_model,
+)
+from model_management.universal_model_split import (
+    SplitRetrainProfile,
+    UniversalModelSplitter,
+    collect_suffix_trainable_parameters,
+)
 
 
 class FixedSplitTrainingStage:
@@ -12,23 +43,6 @@ class FixedSplitTrainingStage:
 
     def run(self, context: FixedSplitTrainingContext) -> FixedSplitTrainingResult:
         return self.engine.run(context)
-
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
-from cloud.orchestration.runtime_stage import (
-    FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
-    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
-    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
-    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
-    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
-    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
-    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
-    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
-    fixed_split_validation_batches as _fixed_split_validation_batches,
-    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
-    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
-    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
-)
 
 
 class TrainingStageMixin:
@@ -171,9 +185,9 @@ class TrainingStageMixin:
         training_cache_path: str,
         frame_dir: str,
         gt_annotations: dict[str, dict],
+        validation_gt_annotations: dict[str, dict],
+        validation_sample_ids: list[str],
         num_epoch: int,
-        proxy_metrics_before: dict[str, float | int | None],
-        proxy_metrics_before_elapsed: float,
         prepared_trace_sample_input: object | None,
         prepared_splitter: UniversalModelSplitter | None,
         prepared_candidate,
@@ -181,9 +195,7 @@ class TrainingStageMixin:
         sample_metadata_by_id: Mapping[str, Mapping[str, object]] | None,
         proxy_eval_frame_cache: dict[str, np.ndarray | None] | None = None,
         preloaded_records: Mapping[str, Mapping[str, object]] | None = None,
-        proxy_priority_sample_ids: Iterable[object] | None = None,
-        proxy_sample_random_seed: object | None = None,
-    ) -> tuple[dict[str, float | int | None], dict[str, torch.Tensor]]:
+    ) -> FixedSplitTrainingResult:
         split_runtime_model = get_split_runtime_model(model)
         if prepared_splitter is not None:
             suffix_params = collect_suffix_trainable_parameters(
@@ -228,7 +240,8 @@ class TrainingStageMixin:
         )
         if target_steps_per_round is not None:
             logger.info(
-                "[FixedSplitCL] {} effective batch size {} resolved from configured batch size {} with target_steps_per_round={} and samples={}.",
+                "[FixedSplitCL] {} effective batch size {} resolved from configured "
+                "batch size {} with target_steps_per_round={} and samples={}.",
                 training_label,
                 bs,
                 int(self.batch_size),
@@ -237,7 +250,8 @@ class TrainingStageMixin:
             )
         if prepared_trace_sample_input is None and prepared_splitter is not None:
             logger.info(
-                "[FixedSplitCL] Split retrain will reuse the bound runtime template and skip retracing inside universal_split_retrain."
+                "[FixedSplitCL] Split retrain will reuse the bound runtime template "
+                "and skip retracing inside universal_split_retrain."
             )
 
         retrain_profile = SplitRetrainProfile()
@@ -267,12 +281,12 @@ class TrainingStageMixin:
             *,
             stage_label: str,
             max_samples: int | None,
-        ) -> dict[str, float | int | None]:
+        ) -> dict[str, float | int | str | None]:
             del stage_label
-            return self._evaluate_fixed_split_proxy_map(
+            return self._evaluate_fixed_split_proxy_metrics(
                 model,
                 frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
+                gt_annotations=validation_gt_annotations,
                 model_name=current_model_name,
                 sample_metadata_by_id=sample_metadata_by_id,
                 frame_cache=proxy_eval_frame_cache,
@@ -282,45 +296,38 @@ class TrainingStageMixin:
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
-                priority_sample_ids=proxy_priority_sample_ids,
-                random_fill_seed=proxy_sample_random_seed,
             )
 
         def _tinynext_proxy_evaluator(
             *,
             stage_label: str,
             max_samples: int | None,
-            allow_dead_baseline_fast_path: bool = False,
-        ) -> dict[str, float | int | None]:
-            return self._evaluate_tinynext_proxy_map(
+        ) -> dict[str, float | int | str | None]:
+            return self._evaluate_tinynext_proxy_metrics(
                 model,
                 frame_dir=frame_dir,
-                gt_annotations=gt_annotations,
+                gt_annotations=validation_gt_annotations,
                 model_name=current_model_name,
                 sample_metadata_by_id=sample_metadata_by_id,
                 frame_cache=proxy_eval_frame_cache,
                 max_samples=max_samples,
-                candidate_thresholds=self.proxy_eval_threshold_candidates,
                 inference_batch_size=int(split_retrain_kwargs["batch_size"]),
                 stage_label=stage_label,
                 split_cache_path=training_cache_path,
                 splitter=prepared_splitter,
                 split_candidate=prepared_candidate,
                 preloaded_records=preloaded_records,
-                allow_dead_baseline_fast_path=allow_dead_baseline_fast_path,
-                priority_sample_ids=proxy_priority_sample_ids,
-                random_fill_seed=proxy_sample_random_seed,
             )
 
         proxy_config = ProxyEvalConfig(
-            enabled=bool(gt_annotations),
-            eval_before_retrain=True,
-            eval_after_first_epoch=True,
+            enabled=bool(validation_gt_annotations),
             eval_final=True,
             interval_epochs=max(1, int(getattr(self, "proxy_eval_interval_epochs", 10))),
             max_eval_samples=self.proxy_eval_max_samples,
+            max_dets=max(10, int(getattr(self, "proxy_eval_max_dets", 500))),
             min_delta=max(0.0, float(self.proxy_eval_min_delta)),
             patience=max(0, int(self.proxy_eval_patience)),
+            validation_fraction=float(getattr(self, "proxy_eval_validation_fraction", 0.2)),
         )
         plan = FixedSplitTrainingPlan(
             model_name=current_model_name,
@@ -344,10 +351,8 @@ class TrainingStageMixin:
                 adapter=adapter,
                 training_kwargs=split_retrain_kwargs,
                 gt_annotations=gt_annotations,
-                initial_proxy_metrics=(
-                    dict(proxy_metrics_before) if proxy_metrics_before else None
-                ),
-                initial_proxy_eval_time=proxy_metrics_before_elapsed,
+                validation_gt_annotations=validation_gt_annotations,
+                validation_sample_ids=validation_sample_ids,
                 fixed_proxy_evaluator=_fixed_proxy_evaluator,
                 tinynext_proxy_evaluator=_tinynext_proxy_evaluator,
                 retrain_profile=retrain_profile,
@@ -356,7 +361,7 @@ class TrainingStageMixin:
             )
         )
         self._fixed_split_proxy_evaluator().set_detection_model_eval_mode(model)
-        return dict(result.proxy_metrics_after), result.baseline_state
+        return result
 
     # ------------------------------------------------------------------
     # Public API

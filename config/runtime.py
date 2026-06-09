@@ -187,10 +187,11 @@ class ContinualLearningConfig(ConfigSection):
     teacher_batch_size: int | None = None
     teacher_annotation_threshold: float = 0.5
     proxy_eval_max_samples: int = 0
+    proxy_eval_validation_fraction: float = 0.2
+    proxy_eval_max_dets: int = 500
     proxy_eval_interval_rounds: int = 1
     proxy_eval_patience: int = 0
     proxy_eval_min_delta: float = 0.0
-    proxy_eval_threshold_candidates: list[float] | None = None
     proxy_eval_frame_cache_enabled: bool = True
     split_learning_rate: float = 1e-3
     wrapper_fixed_split_learning_rate: float = 3e-5
@@ -400,18 +401,6 @@ def _validate_positive(name: str, value: int | float, *, allow_zero: bool = Fals
         return
     if value <= 0:
         raise ValueError(f"{name} must be > 0, got {value!r}")
-
-
-def _validate_threshold_candidates(name: str, value: object) -> None:
-    if value is None:
-        return
-    if not isinstance(value, (list, tuple)) or not value:
-        raise ValueError(f"{name} must be a non-empty sequence of thresholds")
-    for index, candidate in enumerate(value):
-        if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
-            raise ValueError(f"{name}[{index}] must be a numeric threshold, got {candidate!r}")
-        if not 0.0 <= float(candidate) <= 1.0:
-            raise ValueError(f"{name}[{index}] must be within [0, 1], got {candidate!r}")
 
 
 def _validate_sample_pool_config(name: str, value: SamplePoolConfig) -> None:
@@ -677,6 +666,16 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         int(config.server.continual_learning.proxy_eval_max_samples),
         allow_zero=True,
     )
+    fraction = float(config.server.continual_learning.proxy_eval_validation_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(
+            "server.continual_learning.proxy_eval_validation_fraction must be in (0, 1), "
+            f"got {config.server.continual_learning.proxy_eval_validation_fraction!r}"
+        )
+    _validate_positive(
+        "server.continual_learning.proxy_eval_max_dets",
+        int(config.server.continual_learning.proxy_eval_max_dets),
+    )
     _validate_positive(
         "server.continual_learning.proxy_eval_interval_rounds",
         int(config.server.continual_learning.proxy_eval_interval_rounds),
@@ -691,10 +690,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "server.continual_learning.proxy_eval_min_delta must be >= 0, "
             f"got {config.server.continual_learning.proxy_eval_min_delta!r}"
         )
-    _validate_threshold_candidates(
-        "server.continual_learning.proxy_eval_threshold_candidates",
-        config.server.continual_learning.proxy_eval_threshold_candidates,
-    )
     if not isinstance(
         config.server.continual_learning.proxy_eval_frame_cache_enabled,
         bool,

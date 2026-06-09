@@ -23,7 +23,7 @@ class FakeModel(nn.Module):
 
 @dataclass
 class FakeAdapter:
-    metrics: list[float]
+    metrics: list[float | None]
     train_suffix_time: float = 0.25
 
     def __post_init__(self) -> None:
@@ -53,13 +53,17 @@ class FakeAdapter:
         epoch,
         stage_label,
         max_samples,
-        allow_dead_baseline_fast_path=False,
     ):
-        del context, max_samples, allow_dead_baseline_fast_path
+        del context, max_samples
         self.eval_calls.append((epoch, stage_label))
         value = self.metrics.pop(0)
         return ProxyEvalResult(
-            metrics={"map": value, "evaluated_samples": 4},
+            metrics={
+                "primary_metric": value,
+                "primary_metric_name": "proxy_mAP_50_95",
+                "map_50_95": value,
+                "evaluated_samples": 4,
+            },
             metric=value,
             elapsed=0.125,
             epoch=epoch,
@@ -67,9 +71,9 @@ class FakeAdapter:
         )
 
     def metric_value(self, metrics):
-        if not metrics or metrics.get("map") is None:
+        if not metrics or metrics.get("primary_metric") is None:
             return None
-        return float(metrics["map"])
+        return float(metrics["primary_metric"])
 
     def metrics_are_better(self, candidate_metrics, incumbent_metrics, *, min_delta: float):
         candidate = self.metric_value(candidate_metrics)
@@ -92,8 +96,6 @@ def _context(adapter: FakeAdapter, *, model_family: str = "surprise") -> FixedSp
             effective_batch_size=2,
             learning_rate=0.1,
             proxy_eval_config=ProxyEvalConfig(
-                eval_before_retrain=True,
-                eval_after_first_epoch=True,
                 eval_final=True,
                 interval_epochs=2,
                 min_delta=0.05,
@@ -103,11 +105,13 @@ def _context(adapter: FakeAdapter, *, model_family: str = "surprise") -> FixedSp
         ),
         adapter=adapter,
         gt_annotations={"a": {"boxes": [[0, 0, 1, 1]], "labels": [1]}},
+        validation_gt_annotations={"v": {"boxes": [[0, 0, 1, 1]], "labels": [1]}},
+        validation_sample_ids=["v"],
     )
 
 
 def test_engine_flow_is_decoupled_from_model_family() -> None:
-    adapter = FakeAdapter(metrics=[0.1, 0.2, 0.25, 0.3, 0.28])
+    adapter = FakeAdapter(metrics=[0.2, 0.3, 0.28])
     context = _context(adapter, model_family="not-a-special-family")
 
     result = FixedSplitRetrainEngine().run(context)
@@ -118,7 +122,7 @@ def test_engine_flow_is_decoupled_from_model_family() -> None:
 
 
 def test_engine_saves_and_restores_best_candidate_on_metric_improvement() -> None:
-    adapter = FakeAdapter(metrics=[0.1, 0.2, 0.6, 0.55, 0.5])
+    adapter = FakeAdapter(metrics=[0.6, 0.55, 0.5])
     context = _context(adapter)
 
     result = FixedSplitRetrainEngine().run(context)
@@ -131,31 +135,30 @@ def test_engine_saves_and_restores_best_candidate_on_metric_improvement() -> Non
 def test_engine_early_stop_reduces_training_epochs() -> None:
     adapter = FakeAdapter(metrics=[0.9, 0.91, 0.91])
     context = _context(adapter)
+    context.plan.proxy_eval_config.interval_epochs = 1
     context.plan.proxy_eval_config.patience = 2
     context.plan.proxy_eval_config.min_delta = 0.05
 
     result = FixedSplitRetrainEngine().run(context)
 
-    assert result.trained_epochs == 2
-    assert adapter.trained_epochs == [1, 2]
+    assert result.trained_epochs == 3
+    assert adapter.trained_epochs == [1, 2, 3]
     assert result.early_stop_reason is not None
 
 
 def test_engine_tracks_proxy_and_suffix_times_separately() -> None:
-    adapter = FakeAdapter(metrics=[0.1, 0.2, 0.3, 0.4, 0.35], train_suffix_time=0.75)
+    adapter = FakeAdapter(metrics=[0.2, 0.3, 0.35], train_suffix_time=0.75)
     context = _context(adapter)
 
     result = FixedSplitRetrainEngine().run(context)
 
     assert result.suffix_forward_backward_time == 5 * 0.75
-    assert result.proxy_eval_time == 5 * 0.125
+    assert result.proxy_eval_time == 3 * 0.125
 
 
-def test_engine_does_not_restore_baseline_without_proxy_candidate_eval() -> None:
+def test_engine_restores_baseline_without_proxy_candidate_eval() -> None:
     adapter = FakeAdapter(metrics=[])
     context = _context(adapter)
-    context.plan.proxy_eval_config.eval_before_retrain = False
-    context.plan.proxy_eval_config.eval_after_first_epoch = False
     context.plan.proxy_eval_config.eval_final = False
     context.plan.proxy_eval_config.interval_epochs = 100
 
@@ -163,20 +166,32 @@ def test_engine_does_not_restore_baseline_without_proxy_candidate_eval() -> None
 
     assert adapter.eval_calls == []
     assert result.best_candidate is None
-    assert context.model.weight.item() == 5.0
+    assert result.result_available is False
+    assert context.model.weight.item() == 0.0
 
 
-def test_engine_total_time_includes_external_baseline_proxy_time() -> None:
+def test_engine_restores_baseline_when_validation_metric_is_unavailable() -> None:
+    adapter = FakeAdapter(metrics=[None, None, None])
+    context = _context(adapter)
+
+    result = FixedSplitRetrainEngine().run(context)
+
+    assert result.best_candidate is None
+    assert result.best_proxy_metric is None
+    assert result.result_available is False
+    assert result.proxy_metrics_after["primary_metric"] is None
+    assert context.model.weight.item() == 0.0
+
+
+def test_engine_ignores_external_baseline_proxy_metrics() -> None:
     adapter = FakeAdapter(metrics=[])
     context = _context(adapter)
-    context.initial_proxy_metrics = {"map": 0.1, "evaluated_samples": 4}
-    context.initial_proxy_eval_time = 3.0
-    context.plan.proxy_eval_config.eval_after_first_epoch = False
     context.plan.proxy_eval_config.eval_final = False
     context.plan.proxy_eval_config.interval_epochs = 100
 
     result = FixedSplitRetrainEngine().run(context)
 
-    assert result.proxy_eval_time == 3.0
-    assert result.total_retraining_time >= result.proxy_eval_time
-    assert context.model.weight.item() == 5.0
+    assert result.proxy_eval_time == 0.0
+    assert result.proxy_metrics_before == {}
+    assert result.result_available is False
+    assert context.model.weight.item() == 0.0
