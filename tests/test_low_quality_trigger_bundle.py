@@ -161,10 +161,17 @@ def test_raw_feature_low_quality_bundle_imports_current_feature_ref(tmp_path) ->
         split_plan=split_plan,
         model_id="yolo26n",
         model_version="1",
+        model_metadata={
+            "class_names": ["unidentified", "others", "pedestrian"],
+            "tinynext_head_num_classes": 4,
+            "tinynext_num_foreground_classes": 3,
+            "tinynext_anchor_profile": "small_objects",
+        },
         output_dir=str(tmp_path),
     )
 
     assert manifest["upload_mode"] == "raw+feature"
+    assert manifest["model"]["tinynext_num_foreground_classes"] == 3
     assert stats["feature_shard_count"] == 1
     assert manifest["feature_shards"]
 
@@ -180,6 +187,10 @@ def test_raw_feature_low_quality_bundle_imports_current_feature_ref(tmp_path) ->
     )
 
     assert materialized is not None
+    assert materialized["model"]["class_names"] == ["unidentified", "others", "pedestrian"]
+    assert materialized["model"]["tinynext_head_num_classes"] == 4
+    assert materialized["model"]["tinynext_num_foreground_classes"] == 3
+    assert materialized["model"]["tinynext_anchor_profile"] == "small_objects"
     sample = materialized["samples"][0]
     assert sample["raw_relpath"].startswith("low_quality_staging/raw/")
     assert sample["feature_layout_id"] == runtime_contract["feature_layout_id"]

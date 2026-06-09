@@ -259,6 +259,31 @@ def test_tinynext_model_zoo_uses_foreground_class_count_and_skips_unprofiled_hea
     assert all(not key.startswith("head.") for key in model.loaded_state)
 
 
+def test_tinynext_cloud_build_kwargs_derives_foreground_from_head_classes():
+    from cloud.orchestration.checkpoint_stage import CheckpointStageMixin
+
+    stage = SimpleNamespace(
+        config=SimpleNamespace(
+            tinynext_input_size=320,
+            tinynext_anchor_profile="default",
+        )
+    )
+
+    kwargs = CheckpointStageMixin._detection_model_build_kwargs(
+        stage,
+        "tinynext_s",
+        runtime_input_tensor_shape=[1, 3, 640, 640],
+        model_metadata={
+            "tinynext_head_num_classes": 9,
+            "tinynext_anchor_profile": "small_objects",
+        },
+    )
+
+    assert kwargs["tinynext_num_foreground_classes"] == 8
+    assert kwargs["tinynext_input_size"] == 640
+    assert kwargs["tinynext_anchor_profile"] == "small_objects"
+
+
 def test_tinynext_model_zoo_uses_embedded_checkpoint_metadata(monkeypatch, tmp_path):
     from model_management import model_zoo
 

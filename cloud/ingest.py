@@ -162,6 +162,15 @@ def materialize_low_quality_trigger_bundle(
             sample["runtime_identity_id"] = str(feature_ref.get("runtime_identity_id") or "")
             sample["runtime_contract"] = runtime_contract_payload
     normalized_manifest = dict(trigger_manifest)
+    trigger_model_meta = (
+        dict(trigger_manifest.get("model"))
+        if isinstance(trigger_manifest.get("model"), Mapping)
+        else {}
+    )
+    trigger_model_meta["model_id"] = str(trigger_manifest.get("model_id", "") or "")
+    trigger_model_meta["model_version"] = str(
+        trigger_manifest.get("model_version", "") or "0"
+    )
     normalized_manifest.update(
         {
             "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
@@ -179,10 +188,7 @@ def materialize_low_quality_trigger_bundle(
             "input_resize_mode": str(
                 trigger_manifest.get("input_resize_mode", "") or "direct_resize"
             ),
-            "model": {
-                "model_id": str(trigger_manifest.get("model_id", "") or ""),
-                "model_version": str(trigger_manifest.get("model_version", "") or "0"),
-            },
+            "model": trigger_model_meta,
             "runtime_contract": runtime_contract_payload,
             "split_plan": split_plan_payload,
             "training_mode": {

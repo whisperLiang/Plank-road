@@ -18,6 +18,26 @@ def file_sha1(path: str) -> str:
     return digest.hexdigest()
 
 
+def _tinynext_foreground_classes_from_metadata(
+    metadata: Mapping[str, object] | None,
+) -> int | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    foreground_classes = _coerce_positive_int(
+        metadata.get("tinynext_num_foreground_classes")
+    )
+    if foreground_classes is not None:
+        return foreground_classes
+    class_names = metadata.get("class_names")
+    if isinstance(class_names, (list, tuple)) and class_names:
+        return len(class_names)
+    for key in ("tinynext_head_num_classes", "num_classes", "head_num_classes"):
+        head_classes = _coerce_positive_int(metadata.get(key))
+        if head_classes is not None and head_classes > 1:
+            return head_classes - 1
+    return None
+
+
 class CheckpointStage:
     def serialize_encoded_update(
         self,
@@ -171,15 +191,7 @@ class CheckpointStageMixin:
         if model_family != "tinynext":
             return build_kwargs
 
-        foreground_classes = None
-        if model_metadata:
-            foreground_classes = _coerce_positive_int(
-                model_metadata.get("tinynext_num_foreground_classes")
-            )
-            if foreground_classes is None:
-                class_names = model_metadata.get("class_names")
-                if isinstance(class_names, (list, tuple)) and class_names:
-                    foreground_classes = len(class_names)
+        foreground_classes = _tinynext_foreground_classes_from_metadata(model_metadata)
         if foreground_classes is not None:
             build_kwargs["tinynext_num_foreground_classes"] = int(foreground_classes)
 
