@@ -1014,6 +1014,18 @@ wheels = [
 ]
 
 [[package]]
+name = "mapcalc"
+version = "0.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/26/7e/a44dd6d2e06250162dd9f0479cea687833d917e3cb95bd7ecdcb75c61098/mapcalc-0.2.2.tar.gz", hash = "sha256:3f9462b52ed97e41b6895023f285d209b8edb46c86544989a20b3d0658cc20c2", size = 8955, upload-time = "2021-06-28T14:26:19.263Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c9/79/449bfb5d999cfe38bb0277390766e228d9bce449e612f926dc95827427b1/mapcalc-0.2.2-py3-none-any.whl", hash = "sha256:2629cdaadc569cbc21e6c94a40a37b577b4b02c32091e54364fe840b491fbef9", size = 9518, upload-time = "2021-06-28T14:26:17.347Z" },
+]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1709,6 +1721,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "imutils" },
     { name = "loguru" },
+    { name = "mapcalc" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "opencv-python" },
@@ -1754,6 +1767,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = "==1.5.0" },
     { name = "imutils" },
     { name = "loguru", specifier = "==0.7.3" },
+    { name = "mapcalc", specifier = "==0.2.2" },
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "numpy", specifier = "==2.2.6" },
     { name = "opencv-python", specifier = "==4.11.0.86" },
