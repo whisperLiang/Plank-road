@@ -302,10 +302,7 @@ class TrainingJobManager:
                     prepare_request_workspace(
                         workspace_root,
                         edge_id=edge_id,
-                        request_kind=(
-                            request_kind
-                            or self._request_kind_for_job_type(job_type)
-                        ),
+                        request_kind=(request_kind or self._request_kind_for_job_type(job_type)),
                         payload_zip=payload_zip,
                         client_cache_path=workspace,
                     )
@@ -372,7 +369,8 @@ class TrainingJobManager:
                 )
 
             logger.info(
-                "Async training job {} completed: edge_id={} status={} model_data_len={} message={}",
+                "Async training job {} completed: edge_id={} status={} "
+                "model_data_len={} message={}",
                 job_id,
                 job.edge_id,
                 job.status,

@@ -13,7 +13,6 @@ import pytest
 import torch
 import yaml
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUN_E2E_ENV = "PLANK_ROAD_RUN_YOLO26N_E2E"
 RUN_FULL_RETRAIN_ENV = "PLANK_ROAD_RUN_YOLO26N_E2E_FULL_RETRAIN"
@@ -107,8 +106,7 @@ def _wait_for_patterns(
         for process in processes:
             if process.process.poll() is not None:
                 pytest.fail(
-                    f"{process.name} exited before E2E smoke completed:\n"
-                    f"{combined[-12000:]}"
+                    f"{process.name} exited before E2E smoke completed:\n{combined[-12000:]}"
                 )
         time.sleep(1.0)
     combined = "\n".join(process.text for process in processes)

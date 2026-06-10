@@ -6,7 +6,6 @@ import shutil
 import tarfile
 import time
 from collections.abc import Mapping
-from typing import Any
 
 import cv2
 from loguru import logger
@@ -114,8 +113,7 @@ def materialize_low_quality_trigger_bundle(
                             trigger_manifest.get("input_tensor_shape", []) or []
                         ),
                         "input_resize_mode": str(
-                            trigger_manifest.get("input_resize_mode", "")
-                            or "direct_resize"
+                            trigger_manifest.get("input_resize_mode", "") or "direct_resize"
                         ),
                     }
                 )
@@ -169,13 +167,9 @@ def materialize_low_quality_trigger_bundle(
             "model_id": str(trigger_manifest.get("model_id", "") or ""),
             "front_version": str(trigger_manifest.get("front_version", "0") or "0"),
             "split_config_id": str(trigger_manifest.get("split_config_id", "") or ""),
-            "canonical_split_key": str(
-                trigger_manifest.get("canonical_split_key", "") or ""
-            ),
+            "canonical_split_key": str(trigger_manifest.get("canonical_split_key", "") or ""),
             "edge_split_id": str(trigger_manifest.get("edge_split_id", "") or ""),
-            "input_tensor_shape": list(
-                trigger_manifest.get("input_tensor_shape", []) or []
-            ),
+            "input_tensor_shape": list(trigger_manifest.get("input_tensor_shape", []) or []),
             "input_resize_mode": str(
                 trigger_manifest.get("input_resize_mode", "") or "direct_resize"
             ),
@@ -252,10 +246,7 @@ def load_high_quality_shard_candidates(
                     if not line:
                         continue
                     label_payload = json.loads(line)
-                    if (
-                        isinstance(label_payload, Mapping)
-                        and label_payload.get("sample_id")
-                    ):
+                    if isinstance(label_payload, Mapping) and label_payload.get("sample_id"):
                         labels_by_id[str(label_payload["sample_id"])] = dict(label_payload)
         except Exception:
             unreadable_ids.append(str(shard.get("shard_id") or label_file))
@@ -284,14 +275,10 @@ def load_high_quality_shard_candidates(
         label_payload = dict(labels_by_id[sample_key])
         sample_input_image_size = label_payload.get("input_image_size")
         sample_input_tensor_shape = list(
-            label_payload.get("input_tensor_shape")
-            or manifest_input_tensor_shape
-            or []
+            label_payload.get("input_tensor_shape") or manifest_input_tensor_shape or []
         )
         sample_resize_mode = str(
-            label_payload.get("input_resize_mode")
-            or manifest_resize_mode
-            or ""
+            label_payload.get("input_resize_mode") or manifest_resize_mode or ""
         )
         candidates.append(
             {
@@ -305,8 +292,7 @@ def load_high_quality_shard_candidates(
                         else {}
                     ),
                     "label_coordinate_space": str(
-                        label_payload.get("label_coordinate_space")
-                        or label_coordinate_space
+                        label_payload.get("label_coordinate_space") or label_coordinate_space
                     ),
                     **(
                         {"label_image_size": list(label_payload.get("label_image_size") or [])}
@@ -319,8 +305,7 @@ def load_high_quality_shard_candidates(
                         else {}
                     ),
                     "label_resize_mode": str(
-                        label_payload.get("label_resize_mode")
-                        or sample_resize_mode
+                        label_payload.get("label_resize_mode") or sample_resize_mode
                     ),
                 },
                 "sample_source": "high_quality",
@@ -330,7 +315,9 @@ def load_high_quality_shard_candidates(
                 "split_config_id": manifest_split_config_id,
                 "front_version": manifest_front_version,
                 "runtime_contract": manifest_runtime_contract,
-                "feature_layout_id": str(manifest_feature_layout_id or feature_ref.feature_layout_id),
+                "feature_layout_id": str(
+                    manifest_feature_layout_id or feature_ref.feature_layout_id
+                ),
                 "feature_abi_id": str(
                     feature_ref.feature_abi_id
                     or manifest_runtime_contract.get("feature_abi_id")

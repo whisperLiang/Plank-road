@@ -12,7 +12,6 @@ from cloud.contracts import (
 from model_management.detection_box_projection import ORIGINAL_XYXY
 from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES
 
-
 POOL_LABEL_COORDINATE_SPACE = ORIGINAL_XYXY
 
 
@@ -70,11 +69,7 @@ def class_names_from_metadata(metadata: Mapping[str, object] | None) -> list[str
     value = metadata.get("class_names")
     if isinstance(value, Mapping):
         ordered = sorted(
-            (
-                (int(key), item)
-                for key, item in value.items()
-                if str(key).lstrip("-").isdigit()
-            ),
+            ((int(key), item) for key, item in value.items() if str(key).lstrip("-").isdigit()),
             key=lambda item: item[0],
         )
         return [str(item) for _key, item in ordered]

@@ -2,8 +2,9 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 from mapcalc import calculate_map
-from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES
 from ultralytics.utils.plotting import Annotator, colors
+
+from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES
 
 
 def cal_iou(a, b):
@@ -79,10 +80,14 @@ def get_offloading_image(offloading_region, image):
     hight = image.shape[0]
     cached_image = image
     for i in range(len(offloading_region)):
-        x1 = int(offloading_region[i][0])-1 if int(offloading_region[i][0])-1 >= 0 else 0
-        y1 = int(offloading_region[i][1])-1 if int(offloading_region[i][1])-1 >= 0 else 0
-        x2 = int(offloading_region[i][2])+1 if int(offloading_region[i][2])+1 <= width else width
-        y2 = int(offloading_region[i][3])+1 if int(offloading_region[i][3])+1 <= hight else hight
+        x1 = int(offloading_region[i][0]) - 1 if int(offloading_region[i][0]) - 1 >= 0 else 0
+        y1 = int(offloading_region[i][1]) - 1 if int(offloading_region[i][1]) - 1 >= 0 else 0
+        x2 = (
+            int(offloading_region[i][2]) + 1 if int(offloading_region[i][2]) + 1 <= width else width
+        )
+        y2 = (
+            int(offloading_region[i][3]) + 1 if int(offloading_region[i][3]) + 1 <= hight else hight
+        )
         cropped_image[y1:y2, x1:x2, :] = cached_image[y1:y2, x1:x2, :]
     return cropped_image
 
@@ -206,5 +211,6 @@ def cal_mAP(ground_truth, result_dict):
     # calculates the mAP for an IOU threshold of 0.5
     return calculate_map(ground_truth, result_dict, 0.5)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     pass

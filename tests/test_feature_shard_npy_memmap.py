@@ -46,7 +46,9 @@ def test_npy_memmap_shard_writes_npy_arrays_and_reads_rows(tmp_path, monkeypatch
     batch = store.read_batch([refs[3], refs[1]])
     second = store.read_batch([refs[2], refs[0]])
     assert tuple(batch.tensors["boundary"].shape) == (2, 2, 3)
-    assert torch.equal(second.tensors["skip"][:, 0, 0], torch.tensor([12.0, 10.0], dtype=torch.float16))
+    assert torch.equal(
+        second.tensors["skip"][:, 0, 0], torch.tensor([12.0, 10.0], dtype=torch.float16)
+    )
     assert calls == ["r", "r"]
 
 
@@ -79,7 +81,9 @@ def test_npy_memmap_folded_batch_reads_with_symbolic_multiplier(tmp_path) -> Non
 
 
 def test_npy_memmap_reader_does_not_call_torch_load(tmp_path, monkeypatch) -> None:
-    store = FeatureShardStore(str(tmp_path), storage_format="npy_memmap_shard", shard_dtype="float16")
+    store = FeatureShardStore(
+        str(tmp_path), storage_format="npy_memmap_shard", shard_dtype="float16"
+    )
     refs = [
         entry["feature_ref"]
         for entry in store.write_entries(

@@ -1,9 +1,11 @@
 import os
 import shutil
+
 from loguru import logger
 
+
 def creat_folder(folder_path):
-    frames_path = os.path.join(folder_path, 'frames')
+    frames_path = os.path.join(folder_path, "frames")
     logger.debug("creat {}".format(frames_path))
     if not os.path.exists(frames_path):
         os.makedirs(frames_path)
@@ -28,11 +30,10 @@ def clear_folder(folder_path, preserve=None):
             logger.debug(f"Failed to delete path: {file_path}. Reason: {e}")
 
 
-
-def sample_files(root,indexs):
+def sample_files(root, indexs):
     logger.debug("clear index {}".format(indexs))
     for filename in os.listdir(root):
-        if int(filename.split('.')[0]) not in indexs:
+        if int(filename.split(".")[0]) not in indexs:
             file_path = os.path.join(root, filename)
             try:
                 os.remove(file_path)

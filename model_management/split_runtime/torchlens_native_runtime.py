@@ -28,8 +28,7 @@ def require_torchlens_native_split_api() -> None:
     missing = [name for name in required if not hasattr(tl, name)]
     if missing:
         raise RuntimeError(
-            "Installed torchlens wheel does not expose native split API: "
-            + ", ".join(missing)
+            "Installed torchlens wheel does not expose native split API: " + ", ".join(missing)
         )
 
 
@@ -95,9 +94,7 @@ def make_split_spec(
             batch_symbol=batch_symbol,
             dynamic_batch=config.dynamic_batch,
             trainable=bool(config.trainable),
-            trace_batch_mode=(
-                "batch_gt1" if int(config.trace_batch_size) > 1 else "batch_1"
-            ),
+            trace_batch_mode=("batch_gt1" if int(config.trace_batch_size) > 1 else "batch_1"),
             device_policy="runtime",
             mode=_normalize_mode(config.mode),
         )

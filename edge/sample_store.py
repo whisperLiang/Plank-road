@@ -15,7 +15,6 @@ from cloud.feature_cache import FeatureShardRef, FeatureShardStore
 from edge.sample_quality import HIGH_QUALITY, LOW_QUALITY, QUALITY_METHOD
 from model_management.payload import BoundaryPayload
 
-
 SAMPLE_STORE_VERSION = "edge-sample-store.v2"
 
 
@@ -108,11 +107,7 @@ def _normalise_quality_metadata(
     quality_bucket: str | None = None,
 ) -> dict[str, Any]:
     payload = dict(quality) if isinstance(quality, Mapping) else {}
-    bucket = str(
-        payload.get("quality")
-        or quality_bucket
-        or LOW_QUALITY
-    )
+    bucket = str(payload.get("quality") or quality_bucket or LOW_QUALITY)
     if bucket not in {HIGH_QUALITY, LOW_QUALITY}:
         bucket = LOW_QUALITY
     result: dict[str, Any] = {
@@ -174,7 +169,9 @@ class StoredSampleRecord:
             "input_image_size": self.input_image_size,
             "input_tensor_shape": self.input_tensor_shape,
             "input_resize_mode": self.input_resize_mode,
-            "feature_ref": dict(self.feature_ref) if isinstance(self.feature_ref, Mapping) else None,
+            "feature_ref": dict(self.feature_ref)
+            if isinstance(self.feature_ref, Mapping)
+            else None,
             "result_relpath": self.result_relpath,
             "metadata_relpath": self.metadata_relpath,
             "raw_relpath": self.raw_relpath,
@@ -203,8 +200,12 @@ class StoredSampleRecord:
             in_drift_window=bool(payload.get("in_drift_window", False)),
             has_raw_sample=bool(payload.get("has_raw_sample", False)),
             has_feature=isinstance(payload.get("feature_ref"), Mapping),
-            input_image_size=list(payload["input_image_size"]) if payload.get("input_image_size") is not None else None,
-            input_tensor_shape=list(payload["input_tensor_shape"]) if payload.get("input_tensor_shape") is not None else None,
+            input_image_size=list(payload["input_image_size"])
+            if payload.get("input_image_size") is not None
+            else None,
+            input_tensor_shape=list(payload["input_tensor_shape"])
+            if payload.get("input_tensor_shape") is not None
+            else None,
             input_resize_mode=(
                 str(payload["input_resize_mode"])
                 if payload.get("input_resize_mode") is not None
@@ -391,9 +392,7 @@ class EdgeSampleStore:
         result_path = os.path.join(self.results_dir, f"{sample_key}.json")
         metadata_path = os.path.join(self.metadata_dir, f"{sample_key}.json")
         raw_path = (
-            os.path.join(self.raw_dir, f"{sample_key}.jpg")
-            if raw_frame is not None
-            else None
+            os.path.join(self.raw_dir, f"{sample_key}.jpg") if raw_frame is not None else None
         )
 
         runtime_contract_payload = dict(runtime_contract or {})
@@ -419,9 +418,7 @@ class EdgeSampleStore:
                     if runtime_contract_payload.get("contract_id") in (None, "")
                     else str(runtime_contract_payload.get("contract_id"))
                 ),
-                "feature_layout_id": str(
-                    runtime_contract_payload.get("feature_layout_id") or ""
-                ),
+                "feature_layout_id": str(runtime_contract_payload.get("feature_layout_id") or ""),
                 "boundary_id": str(
                     runtime_contract_payload.get("logical_split_id")
                     or getattr(intermediate, "split_id", "")
@@ -520,7 +517,9 @@ class EdgeSampleStore:
                 for filename in sorted(os.listdir(self.metadata_dir)):
                     if not filename.endswith(".json"):
                         continue
-                    with open(os.path.join(self.metadata_dir, filename), "r", encoding="utf-8") as handle:
+                    with open(
+                        os.path.join(self.metadata_dir, filename), "r", encoding="utf-8"
+                    ) as handle:
                         record = StoredSampleRecord.from_dict(json.load(handle))
                     records_by_id[record.sample_id] = record
 

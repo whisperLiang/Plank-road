@@ -8,7 +8,6 @@ from typing import Any
 from model_management.fixed_split import FIXED_SPLIT_PLAN_VERSION
 from model_management.split_contract import FIXED_SPLIT_RUNTIME_CONTRACT_VERSION
 
-
 LOW_QUALITY_TRIGGER_PROTOCOL_VERSION = "low-quality-trigger-shard.v1"
 HIGH_QUALITY_SYNC_PROTOCOL_VERSION = "high-quality-feature-label-shard.v2"
 POOL_LABEL_RUNTIME_VERSION = "fixed-split-pool-labels.v1"
@@ -68,9 +67,7 @@ def validate_runtime_contract(runtime_contract: Mapping[str, object]) -> dict[st
     require_int_list(contract, "input_tensor_shape")
     labels = contract.get("boundary_tensor_labels")
     if not isinstance(labels, (list, tuple)) or not labels:
-        raise RuntimeError(
-            "Fixed split runtime_contract is missing boundary_tensor_labels."
-        )
+        raise RuntimeError("Fixed split runtime_contract is missing boundary_tensor_labels.")
     return contract
 
 

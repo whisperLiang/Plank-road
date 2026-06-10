@@ -248,9 +248,7 @@ def _collect_edge_samples(
         or plan.split_config_id
     )
     feature_abi_id = str(
-        runtime_contract.get("feature_abi_id")
-        or runtime_contract.get("feature_layout_id")
-        or ""
+        runtime_contract.get("feature_abi_id") or runtime_contract.get("feature_layout_id") or ""
     )
     for frame_index, frame in zip(frame_indices, frames):
         inference = small_detector.infer_sample(frame, splitter=splitter)

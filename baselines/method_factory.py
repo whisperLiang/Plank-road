@@ -1,36 +1,30 @@
-"""Factory that constructs the correct baseline method from config."""
-
 from __future__ import annotations
 
-from baselines.base_method import BaseMethod
-from baselines.accuracy_trigger_cloud_retraining import AccuracyTriggerCloudRetraining
-from baselines.ekya_style_centralized_scheduling import EkyaStyleCentralizedScheduling
-from baselines.plank_road_multi_device import PlankRoadMultiDevice
-from baselines.pure_edge_local_updating import PureEdgeLocalUpdating
-from config.experiment import ExperimentConfig
+from baselines.policies import (
+    AccuracyTriggerCloudRetrainingPolicy,
+    BaseBaselinePolicy,
+    EkyaStyleCentralizedSchedulingPolicy,
+    PureEdgeLocalUpdatingPolicy,
+)
+from config.baseline import ALLOWED_BASELINE_METHODS, validate_baseline_method
 
-
-_REGISTRY: dict[str, type[BaseMethod]] = {
-    "plank_road_multi_device": PlankRoadMultiDevice,
-    "ekya_style_centralized_scheduling": EkyaStyleCentralizedScheduling,
-    "accuracy_trigger_cloud_retraining": AccuracyTriggerCloudRetraining,
-    "pure_edge_local_updating": PureEdgeLocalUpdating,
+_REGISTRY: dict[str, type[BaseBaselinePolicy]] = {
+    "pure_edge_local_updating": PureEdgeLocalUpdatingPolicy,
+    "accuracy_trigger_cloud_retraining": AccuracyTriggerCloudRetrainingPolicy,
+    "ekya_style_centralized_scheduling": EkyaStyleCentralizedSchedulingPolicy,
 }
 
 
-def create_method(experiment_config: ExperimentConfig) -> BaseMethod:
-    """Instantiate the baseline method specified in *experiment_config*.
+def create_policy(method: str, config: object | None = None) -> BaseBaselinePolicy:
+    method_name = validate_baseline_method(method)
+    return _REGISTRY[method_name](config)
 
-    Raises ``ValueError`` for unknown method names.
-    """
-    method_name = experiment_config.method
-    if method_name not in _REGISTRY:
-        raise ValueError(
-            f"Unknown method {method_name!r}. "
-            f"Registered methods: {sorted(_REGISTRY.keys())}"
-        )
-    cls = _REGISTRY[method_name]
-    return cls(
-        experiment_config=experiment_config,
-        num_devices=experiment_config.num_devices,
-    )
+
+def create_method(config_or_method: object, config: object | None = None) -> BaseBaselinePolicy:
+    method_name = str(getattr(config_or_method, "method", config_or_method))
+    section = getattr(config_or_method, method_name, config)
+    return create_policy(method_name, section)
+
+
+def registered_methods() -> tuple[str, ...]:
+    return ALLOWED_BASELINE_METHODS

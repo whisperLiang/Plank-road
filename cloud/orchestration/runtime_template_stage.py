@@ -1,21 +1,78 @@
 from __future__ import annotations
 
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
+import copy
+import os
+import time
+from collections.abc import Mapping
+from dataclasses import replace
+
+import cv2
+import numpy as np
+import torch
+from loguru import logger
+
+import model_management.model_zoo as model_zoo
+from cloud.orchestration.fixed_split_dependencies import (
+    _iter_tensors,
+    _json_fingerprint,
+)
 from cloud.orchestration.runtime_stage import (
     FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
-    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
-    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
-    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
-    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
-    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
-    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
-    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
-    fixed_split_validation_batches as _fixed_split_validation_batches,
-    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
-    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
-    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
 )
+from cloud.orchestration.runtime_stage import (
+    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+)
+from cloud.orchestration.runtime_stage import (
+    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
+)
+from cloud.orchestration.runtime_stage import (
+    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
+)
+from cloud.orchestration.runtime_stage import (
+    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
+)
+from cloud.orchestration.runtime_stage import (
+    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
+)
+from cloud.orchestration.runtime_stage import (
+    fixed_split_manifest_has_rebuildable_raw_samples,
+)
+from cloud.orchestration.runtime_stage import (
+    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
+)
+from cloud.orchestration.runtime_stage import (
+    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
+)
+from cloud.orchestration.runtime_stage import (
+    fixed_split_validation_batches as _fixed_split_validation_batches,
+)
+from model_management.fixed_split_runtime_template import (
+    FixedSplitRuntimeTemplate,
+    FixedSplitRuntimeTemplateKey,
+    FixedSplitRuntimeTemplateLookup,
+    bind_request_splitter_from_template,
+    describe_split_candidate,
+    fixed_split_runtime_template_key,
+)
+from model_management.payload import BoundaryPayload
+from model_management.split_contract import (
+    classify_feature_layout_compatibility,
+    resolve_cloud_runtime_contract,
+)
+from model_management.split_model_adapters import (
+    build_split_runtime_sample_input,
+    get_split_runtime_model,
+)
+from model_management.split_runtime import (
+    BoundaryPayloadCacheCodec,
+    compare_outputs,
+    make_split_spec,
+)
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
+    prepare_exact_split_runtime,
+)
+
 
 class FixedSplitRuntimeTemplateMixin:
     def _infer_bundle_trace_image_size(
@@ -30,7 +87,8 @@ class FixedSplitRuntimeTemplateMixin:
             if runtime_image_size is not None:
                 return runtime_image_size
         raise RuntimeError(
-            "Missing input_tensor_shape/input_image_size metadata required to build cloud split-runtime trace input."
+            "Missing input_tensor_shape/input_image_size metadata required to build "
+            "cloud split-runtime trace input."
         )
 
     def _normalize_bundle_runtime_tensor(
@@ -41,17 +99,20 @@ class FixedSplitRuntimeTemplateMixin:
     ) -> torch.Tensor:
         if not isinstance(runtime_input, torch.Tensor):
             raise TypeError(
-                f"{context} requires tensor split-runtime inputs, got {type(runtime_input).__name__}."
+                f"{context} requires tensor split-runtime inputs, got "
+                f"{type(runtime_input).__name__}."
             )
         if runtime_input.ndim == 3:
             runtime_input = runtime_input.unsqueeze(0)
         if runtime_input.ndim < 4:
             raise RuntimeError(
-                f"{context} expected a batched image tensor, got shape {tuple(runtime_input.shape)}."
+                f"{context} expected a batched image tensor, got shape "
+                f"{tuple(runtime_input.shape)}."
             )
         if runtime_input.shape[0] != 1:
             raise RuntimeError(
-                f"{context} expected a single-sample runtime tensor before batching, got shape {tuple(runtime_input.shape)}."
+                f"{context} expected a single-sample runtime tensor before batching, "
+                f"got shape {tuple(runtime_input.shape)}."
             )
         return runtime_input
 
@@ -227,7 +288,12 @@ class FixedSplitRuntimeTemplateMixin:
                 bundle_root=bundle_root,
                 runtime_batch_size=runtime_batch_size,
             )
-        def _batch_provider(raw_paths: list[str], samples: list[dict[str, object]], manifest_payload: dict[str, object]):
+
+        def _batch_provider(
+            raw_paths: list[str],
+            samples: list[dict[str, object]],
+            manifest_payload: dict[str, object],
+        ):
             if not raw_paths:
                 return []
             if len(raw_paths) != len(samples):
@@ -239,20 +305,11 @@ class FixedSplitRuntimeTemplateMixin:
                 if isinstance(value, torch.Tensor):
                     return value.detach().cpu()
                 if isinstance(value, Mapping):
-                    return {
-                        key: _detach_payload_value(item)
-                        for key, item in value.items()
-                    }
+                    return {key: _detach_payload_value(item) for key, item in value.items()}
                 if isinstance(value, tuple):
-                    return tuple(
-                        _detach_payload_value(item)
-                        for item in value
-                    )
+                    return tuple(_detach_payload_value(item) for item in value)
                 if isinstance(value, list):
-                    return [
-                        _detach_payload_value(item)
-                        for item in value
-                    ]
+                    return [_detach_payload_value(item) for item in value]
                 return value
 
             def _detach_payload(payload: BoundaryPayload) -> BoundaryPayload:
@@ -277,8 +334,8 @@ class FixedSplitRuntimeTemplateMixin:
             )
             chunk_size = min(chunk_size, _FIXED_SPLIT_DYNAMIC_BATCH_MAX)
             for offset in range(0, len(raw_paths), chunk_size):
-                chunk_paths = raw_paths[offset:offset + chunk_size]
-                chunk_samples = samples[offset:offset + chunk_size]
+                chunk_paths = raw_paths[offset : offset + chunk_size]
+                chunk_samples = samples[offset : offset + chunk_size]
                 prepared_inputs: list[np.ndarray] = []
                 for raw_path, sample in zip(chunk_paths, chunk_samples):
                     frame = cv2.imread(raw_path)
@@ -327,7 +384,7 @@ class FixedSplitRuntimeTemplateMixin:
         model_name: str,
         manifest: Mapping[str, object],
         runtime_batch_size: int | None = None,
-        ) -> FixedSplitRuntimeTemplateKey:
+    ) -> FixedSplitRuntimeTemplateKey:
         split_plan = dict(manifest.get("split_plan", {}))
         runtime_contract = _fixed_split_plan_runtime_contract(split_plan)
         trace_image_size = self._infer_bundle_trace_image_size(dict(manifest))
@@ -516,9 +573,7 @@ class FixedSplitRuntimeTemplateMixin:
                     modes[index + 1],
                 )
 
-        error_summary = ", ".join(
-            f"{mode}_error={error}" for mode, error in errors.items()
-        )
+        error_summary = ", ".join(f"{mode}_error={error}" for mode, error in errors.items())
         raise RuntimeError(
             "TorchLens fixed split runtime is not replayable in any supported mode "
             f"({error_summary})."
@@ -632,9 +687,7 @@ class FixedSplitRuntimeTemplateMixin:
                 device=runtime_device,
             )
             try:
-                boundary_payload = runtime.run_prefix(
-                    *self._runtime_example_args(sample_input)
-                )
+                boundary_payload = runtime.run_prefix(*self._runtime_example_args(sample_input))
                 runtime.train_suffix(
                     boundary_payload,
                     None,
@@ -644,7 +697,8 @@ class FixedSplitRuntimeTemplateMixin:
             except Exception as exc:
                 raise RuntimeError(
                     "TorchLens fixed split runtime failed dynamic-batch trainability "
-                    f"validation (model_family={model_family}, split_id={getattr(runtime, 'split_id', None)}, "
+                    f"validation (model_family={model_family}, "
+                    f"split_id={getattr(runtime, 'split_id', None)}, "
                     f"batch_size={batch_size}, trace_batch_size={trace_batch_size}): {exc}"
                 ) from exc
             if isinstance(suffix_segment, torch.nn.Module):
@@ -752,7 +806,7 @@ class FixedSplitRuntimeTemplateMixin:
         manifest["_cloud_runtime_contract"] = cloud_runtime_contract
         manifest["_feature_layout_compatibility"] = compatibility
         if not bool(compatibility.get("compatible")):
-            if not _fixed_split_manifest_has_rebuildable_raw_samples(manifest):
+            if not fixed_split_manifest_has_rebuildable_raw_samples(manifest):
                 raise RuntimeError(
                     "Fixed split feature layout mismatch and raw rebuild is unavailable: "
                     f"{compatibility}."
@@ -804,8 +858,7 @@ class FixedSplitRuntimeTemplateMixin:
         )
         self._log_stage_elapsed("TorchLens prepare_split", time.perf_counter() - trace_started)
         trace_signature = str(
-            getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "")
-            or ""
+            getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "") or ""
         )
         verifier = UniversalModelSplitter(device=self.device).bind_runtime(
             training_runtime,
@@ -813,8 +866,7 @@ class FixedSplitRuntimeTemplateMixin:
             split_spec=split_spec,
         )
         current_candidate_id = str(
-            getattr(getattr(verifier, "current_candidate", None), "candidate_id", "")
-            or ""
+            getattr(getattr(verifier, "current_candidate", None), "candidate_id", "") or ""
         )
         if boundary != "auto" and current_candidate_id and current_candidate_id != boundary:
             raise RuntimeError(
@@ -852,8 +904,7 @@ class FixedSplitRuntimeTemplateMixin:
             boundary_tensor_labels=tuple(
                 str(label)
                 for label in list(
-                    getattr(getattr(runtime, "plan", None), "boundary_nodes", ())
-                    or ()
+                    getattr(getattr(runtime, "plan", None), "boundary_nodes", ()) or ()
                 )
             ),
             boundary_schema=dict(
@@ -975,4 +1026,3 @@ class FixedSplitRuntimeTemplateMixin:
             trace_sample_input=trace_sample_input,
             runtime_batch_size=runtime_batch_size,
         )
-

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from model_management.detectors import legacy_model_zoo as _legacy
-from model_management.detectors.detr import DETRDetectionModel, _DETR_MODELS
+from model_management.detectors.detr import DETRDetectionModel
 from model_management.detectors.registry import (
     get_backend_by_name,
     get_backend_for_model,
@@ -21,30 +21,16 @@ from model_management.detectors.registry import (
 )
 from model_management.detectors.rfdetr import (
     RFDETRDetectionModel,
-    _RFDETR_CACHE_FORMAT_VERSION,
-    _RFDETR_CACHE_VERSION_BUFFER,
-    _RFDETR_MODELS,
-    _RFDETR_NMS_IOU_THRESHOLD,
-    _postprocess_rfdetr_predictions,
     ensure_rfdetr_serialization_state,
     has_compatible_rfdetr_cache_state,
     infer_rfdetr_state_dict_num_classes,
 )
-from model_management.detectors.rtdetr import RTDETRDetectionModel, _RTDETR_MODELS
+from model_management.detectors.rtdetr import RTDETRDetectionModel
 from model_management.detectors.tinynext import (
-    _TINYNEXT_MODELS,
-    _TINYNEXT_REPO_MODELS,
-    _configure_tinynext_label_schema,
-    _remap_tinynext_public_detections,
     infer_tinynext_state_dict_num_classes,
-)
-from model_management.detectors.torchvision_anchor import (
-    _TORCHVISION_BUILTIN,
-    _TORCHVISION_WEIGHT_DEFAULTS,
 )
 from model_management.detectors.yolo import (
     YOLODetectionModel,
-    _YOLO_MODELS,
     infer_ultralytics_state_dict_num_classes,
 )
 
@@ -86,8 +72,7 @@ def build_detection_model(
         backend = get_backend_by_name(name)
     except KeyError as exc:
         raise ValueError(
-            f"Unknown detection model: '{name}'.  "
-            f"Available: {list_available_models()}"
+            f"Unknown detection model: '{name}'.  Available: {list_available_models()}"
         ) from exc
     return backend.build(
         name,

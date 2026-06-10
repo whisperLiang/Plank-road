@@ -37,7 +37,9 @@ class FeatureCacheGC:
     ) -> None:
         self.store_root_dir = os.path.abspath(str(store_root_dir))
         self.version_root = os.path.join(self.store_root_dir, SHARD_FORMAT_VERSION)
-        self.view_root_dir = None if view_root_dir in (None, "") else os.path.abspath(str(view_root_dir))
+        self.view_root_dir = (
+            None if view_root_dir in (None, "") else os.path.abspath(str(view_root_dir))
+        )
         self.sample_pool_root_dir = (
             None
             if sample_pool_root_dir in (None, "")
@@ -99,7 +101,10 @@ class FeatureCacheGC:
             live.update(collect_refs_from_pending_feature_rebuild(self.staging_root_dir))
         result = FeatureCacheGCResult(dry_run=effective_dry_run)
         if not os.path.isdir(self.version_root):
-            logger.info("[FeatureCache][GC] dry_run={} scanned=0 retained=0 deleted=0 deleted_bytes=0", effective_dry_run)
+            logger.info(
+                "[FeatureCache][GC] dry_run={} scanned=0 retained=0 deleted=0 deleted_bytes=0",
+                effective_dry_run,
+            )
             return result
         candidates: list[str] = []
         for root, dirs, files in os.walk(self.version_root):
@@ -111,7 +116,11 @@ class FeatureCacheGC:
                     candidates.append(os.path.abspath(os.path.join(root, dirname)))
         for path in sorted(candidates):
             result.scanned_files += 1
-            if path in live or any(os.path.commonpath([live_path, path]) == live_path for live_path in live if os.path.isdir(live_path)):
+            if path in live or any(
+                os.path.commonpath([live_path, path]) == live_path
+                for live_path in live
+                if os.path.isdir(live_path)
+            ):
                 result.retained_files += 1
                 if len(result.retained_files_preview) < 10:
                     result.retained_files_preview.append(path)
@@ -130,7 +139,8 @@ class FeatureCacheGC:
             except OSError as exc:
                 result.errors[path] = str(exc)
         logger.info(
-            "[FeatureCache][GC] dry_run={} scanned={} retained={} orphan={} deleted={} deleted_bytes={} errors={}",
+            "[FeatureCache][GC] dry_run={} scanned={} retained={} orphan={} "
+            "deleted={} deleted_bytes={} errors={}",
             effective_dry_run,
             result.scanned_files,
             result.retained_files,

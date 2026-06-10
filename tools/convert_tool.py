@@ -1,5 +1,6 @@
-import cv2
 import base64
+
+import cv2
 import numpy as np
 
 
@@ -10,7 +11,7 @@ def cv2_to_base64(frame, qp=90):
     :param qp:
     :return:
     """
-    encode = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, qp])[1]
+    encode = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, qp])[1]
     encode_str = encode.tobytes()
     base64_str = base64.b64encode(encode_str)
     return base64_str
@@ -28,5 +29,5 @@ def base64_to_cv2(string):
     return image
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     pass

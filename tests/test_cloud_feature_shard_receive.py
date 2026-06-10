@@ -33,4 +33,8 @@ def test_cloud_receive_registers_uploaded_npy_shard_without_pt(tmp_path) -> None
     assert len(refs) == 2
     assert all(isinstance(ref, FeatureShardRef) for ref in refs)
     assert store.read_batch(refs).batch_size == 2
-    assert not any(filename.endswith(".pt") for _root, _dirs, files in os.walk(tmp_path / "cloud") for filename in files)
+    assert not any(
+        filename.endswith(".pt")
+        for _root, _dirs, files in os.walk(tmp_path / "cloud")
+        for filename in files
+    )

@@ -3,12 +3,11 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any
 
 from loguru import logger
 
-from cloud.feature_cache.shard_validator import ShardFeatureRefValidator
 from cloud.feature_cache.shard_store import FeatureShardStore
+from cloud.feature_cache.shard_validator import ShardFeatureRefValidator
 from cloud.feature_cache.types import (
     FeatureCacheKey,
     FeatureCachePreparePlan,
@@ -91,7 +90,9 @@ def _key_for_sample(
     front_version = str(_runtime_value(runtime_context, "front_version", "0"))
     preprocessing = {
         "input_tensor_shape": list(_runtime_value(runtime_context, "input_tensor_shape", []) or []),
-        "input_resize_mode": str(_runtime_value(runtime_context, "input_resize_mode", "direct_resize")),
+        "input_resize_mode": str(
+            _runtime_value(runtime_context, "input_resize_mode", "direct_resize")
+        ),
     }
     if sample.get("input_image_size") is not None:
         preprocessing["input_image_size"] = list(sample.get("input_image_size") or [])
@@ -99,9 +100,7 @@ def _key_for_sample(
         cache_version=str(_runtime_value(runtime_context, "cache_version", "feature-shard-key.v1")),
         sample_id=sample_key,
         image_sha1=(
-            None
-            if sample.get("image_sha1") in (None, "")
-            else str(sample.get("image_sha1"))
+            None if sample.get("image_sha1") in (None, "") else str(sample.get("image_sha1"))
         ),
         source=source,
         model_id=str(_runtime_value(runtime_context, "model_id", "")),
@@ -112,7 +111,9 @@ def _key_for_sample(
             if _runtime_value(runtime_context, "contract_id", None) in (None, "")
             else str(_runtime_value(runtime_context, "contract_id", None))
         ),
-        feature_layout_id=str(feature_layout_id or _runtime_value(runtime_context, "feature_layout_id", "")),
+        feature_layout_id=str(
+            feature_layout_id or _runtime_value(runtime_context, "feature_layout_id", "")
+        ),
         feature_abi_id=str(_runtime_value(runtime_context, "feature_abi_id", "")),
         boundary_id=str(_runtime_value(runtime_context, "boundary_id", "")),
         boundary_payload_schema_hash=str(
@@ -122,7 +123,9 @@ def _key_for_sample(
             _runtime_value(runtime_context, "prefix_weights_fingerprint", f"front:{front_version}")
         ),
         preprocessing_fingerprint=str(
-            _runtime_value(runtime_context, "preprocessing_fingerprint", stable_digest(preprocessing))
+            _runtime_value(
+                runtime_context, "preprocessing_fingerprint", stable_digest(preprocessing)
+            )
         ),
         dtype=None if sample.get("dtype") in (None, "") else str(sample.get("dtype")),
         tensor_shapes_fingerprint=(
@@ -235,7 +238,10 @@ class FeatureCachePlanner:
         resolved_lq = list(resolved_low_quality_samples or [])
         unresolved_lq = list(unresolved_low_quality_samples or [])
         stats = FeatureCacheStats(
-            requested_samples=len(existing) + len(pending_hq) + len(resolved_lq) + len(unresolved_lq)
+            requested_samples=len(existing)
+            + len(pending_hq)
+            + len(resolved_lq)
+            + len(unresolved_lq)
         )
         plan = FeatureCachePreparePlan(
             view_id=str(view_id),
@@ -250,16 +256,25 @@ class FeatureCachePlanner:
         )
 
         for sample in existing:
-            entry = self._ref_entry(sample, runtime_context, stats, source=str(sample.get("feature_source") or "canonical_active"))
+            entry = self._ref_entry(
+                sample,
+                runtime_context,
+                stats,
+                source=str(sample.get("feature_source") or "canonical_active"),
+            )
             if entry is None:
                 if _candidate_raw_path(sample):
                     stats.existing_rebuild_required += 1
                 else:
                     stats.invalid_dropped += 1
                     stats.existing_dropped_incompatible += 1
-                    plan.drop_invalid_samples.append({"sample": dict(sample), "reason": "missing_or_invalid_shard_ref"})
+                    plan.drop_invalid_samples.append(
+                        {"sample": dict(sample), "reason": "missing_or_invalid_shard_ref"}
+                    )
                 continue
-            source_contract = str(sample.get("source_contract_id") or sample.get("contract_id") or "")
+            source_contract = str(
+                sample.get("source_contract_id") or sample.get("contract_id") or ""
+            )
             current_contract = str(runtime_context.get("contract_id") or "")
             is_rebound = bool(sample.get("rebinding_reason")) or bool(
                 source_contract and current_contract and source_contract != current_contract
@@ -275,12 +290,21 @@ class FeatureCachePlanner:
         for sample in pending_hq:
             if not _label_valid(sample, low_quality=False):
                 stats.invalid_dropped += 1
-                plan.drop_invalid_samples.append({"sample": dict(sample), "reason": "invalid_label"})
+                plan.drop_invalid_samples.append(
+                    {"sample": dict(sample), "reason": "invalid_label"}
+                )
                 continue
-            entry = self._ref_entry(sample, runtime_context, stats, source=str(sample.get("feature_source") or "edge_uploaded"))
+            entry = self._ref_entry(
+                sample,
+                runtime_context,
+                stats,
+                source=str(sample.get("feature_source") or "edge_uploaded"),
+            )
             if entry is None:
                 stats.invalid_dropped += 1
-                plan.drop_invalid_samples.append({"sample": dict(sample), "reason": "missing_or_invalid_uploaded_shard_ref"})
+                plan.drop_invalid_samples.append(
+                    {"sample": dict(sample), "reason": "missing_or_invalid_uploaded_shard_ref"}
+                )
                 continue
             stats.high_quality_registered += 1
             plan.register_uploaded_feature_refs.append(entry)
@@ -289,9 +313,16 @@ class FeatureCachePlanner:
         for sample in resolved_lq:
             if not _label_valid(sample, low_quality=True):
                 stats.invalid_dropped += 1
-                plan.drop_invalid_samples.append({"sample": dict(sample), "reason": "invalid_teacher_label"})
+                plan.drop_invalid_samples.append(
+                    {"sample": dict(sample), "reason": "invalid_teacher_label"}
+                )
                 continue
-            entry = self._ref_entry(sample, runtime_context, stats, source=str(sample.get("feature_source") or "cloud_rebuilt"))
+            entry = self._ref_entry(
+                sample,
+                runtime_context,
+                stats,
+                source=str(sample.get("feature_source") or "cloud_rebuilt"),
+            )
             if entry is not None:
                 stats.low_quality_reused += 1
                 plan.register_uploaded_feature_refs.append(entry)
@@ -300,7 +331,9 @@ class FeatureCachePlanner:
             raw_path = _candidate_raw_path(sample)
             if not raw_path or not os.path.exists(raw_path):
                 stats.invalid_dropped += 1
-                plan.drop_invalid_samples.append({"sample": dict(sample), "reason": "missing_raw_for_rebuild"})
+                plan.drop_invalid_samples.append(
+                    {"sample": dict(sample), "reason": "missing_raw_for_rebuild"}
+                )
                 continue
             key = _key_for_sample(
                 sample,
@@ -309,14 +342,22 @@ class FeatureCachePlanner:
                 feature_layout_id=str(runtime_context.get("feature_layout_id") or ""),
             )
             stats.cache_misses += 1
-            plan.rebuild_low_quality_from_raw.append({"sample": dict(sample), "raw_path": raw_path, "cache_key": key})
+            plan.rebuild_low_quality_from_raw.append(
+                {"sample": dict(sample), "raw_path": raw_path, "cache_key": key}
+            )
 
         for sample in unresolved_lq:
             stats.low_quality_deferred += 1
-            plan.defer_unresolved_low_quality.append({"sample": dict(sample), "reason": "unresolved_teacher_label"})
+            plan.defer_unresolved_low_quality.append(
+                {"sample": dict(sample), "reason": "unresolved_teacher_label"}
+            )
 
         logger.info(
-            "[FeatureCache][Plan] requested={} existing_reused={} existing_rebound={} existing_rebuild_required={} existing_dropped_incompatible={} high_quality_registered={} low_quality_reused={} low_quality_rebuild_required={} low_quality_deferred={} invalid_dropped={} mode=shard_ref",
+            "[FeatureCache][Plan] requested={} existing_reused={} "
+            "existing_rebound={} existing_rebuild_required={} "
+            "existing_dropped_incompatible={} high_quality_registered={} "
+            "low_quality_reused={} low_quality_rebuild_required={} "
+            "low_quality_deferred={} invalid_dropped={} mode=shard_ref",
             stats.requested_samples,
             stats.existing_reused,
             stats.existing_rebound,

@@ -60,7 +60,7 @@ def _batch_dimension_multiplier(value: Any, *, batch_symbol: str = "B") -> int |
         prefix = f"{batch_symbol}*"
         if value.startswith(prefix):
             try:
-                multiplier = int(value[len(prefix):])
+                multiplier = int(value[len(prefix) :])
             except ValueError:
                 return None
             return multiplier if multiplier > 0 else None
@@ -371,9 +371,7 @@ def _candidate_from_plan(runtime: SplitRuntime, split_spec: SplitSpec, plan: Any
         if total_parameter_count > 0
         else 0.0
     )
-    privacy_risk = (
-        1.0 / float(edge_parameter_count) if edge_parameter_count > 0 else float("inf")
-    )
+    privacy_risk = 1.0 / float(edge_parameter_count) if edge_parameter_count > 0 else float("inf")
     split_id = _normalise_after_id(
         getattr(plan, "split_label", None) or getattr(plan, "split_id", None)
     )
@@ -587,8 +585,7 @@ class UniversalModelSplitter:
             )
         else:
             logger.info(
-                "[FixedSplit] TorchLens prepare_split_runtime completed in {:.3f}s "
-                "(split_id={}).",
+                "[FixedSplit] TorchLens prepare_split_runtime completed in {:.3f}s (split_id={}).",
                 time.perf_counter() - prepare_started,
                 getattr(self.runtime, "split_id", None),
             )
@@ -646,9 +643,7 @@ class UniversalModelSplitter:
                 f"TorchLens split candidate {candidate_id!r} is not available for rebinding."
             )
         base_spec = (
-            self.split_spec
-            or getattr(runtime, "split_spec", None)
-            or make_split_spec(candidate_id)
+            self.split_spec or getattr(runtime, "split_spec", None) or make_split_spec(candidate_id)
         )
         exact_spec = replace(base_spec, boundary=_normalise_after_key(candidate_id))
         self.runtime = prepare_split_runtime(
@@ -706,9 +701,7 @@ class UniversalModelSplitter:
         max_payload_bytes = kwargs.get("max_payload_bytes")
         max_candidates = kwargs.get("max_candidates")
         base_spec = (
-            self.split_spec
-            or getattr(runtime, "split_spec", None)
-            or make_split_spec("50%")
+            self.split_spec or getattr(runtime, "split_spec", None) or make_split_spec("50%")
         )
         candidates: list[SplitCandidate] = []
         # Metadata-only candidate enumeration. Final selected runtime construction
@@ -716,9 +709,7 @@ class UniversalModelSplitter:
         from torchlens.split.planner import plan_split
 
         for node in graph.ordered_nodes():
-            if bool(getattr(node, "is_input", False)) or bool(
-                getattr(node, "is_output", False)
-            ):
+            if bool(getattr(node, "is_input", False)) or bool(getattr(node, "is_output", False)):
                 continue
             boundary = f"after:{node.torchlens_label}"
             try:
@@ -727,14 +718,12 @@ class UniversalModelSplitter:
             except Exception:
                 continue
             candidate = _candidate_from_plan(runtime, spec, plan)
-            if (
-                max_boundary_count is not None
-                and candidate.boundary_count > int(max_boundary_count)
+            if max_boundary_count is not None and candidate.boundary_count > int(
+                max_boundary_count
             ):
                 continue
-            if (
-                max_payload_bytes is not None
-                and candidate.estimated_payload_bytes > int(max_payload_bytes)
+            if max_payload_bytes is not None and candidate.estimated_payload_bytes > int(
+                max_payload_bytes
             ):
                 continue
             candidates.append(candidate)
@@ -906,28 +895,20 @@ class UniversalModelSplitter:
                 if not bool(batch_report.get("success", False)):
                     report = {
                         **batch_report,
-                        "validation_batches": [
-                            item.get("batch_size") for item in batch_reports
-                        ],
+                        "validation_batches": [item.get("batch_size") for item in batch_reports],
                         "batch_reports": batch_reports,
                     }
                     break
             else:
-                max_diff = max(
-                    float(item.get("max_diff", 0.0) or 0.0)
-                    for item in batch_reports
-                )
+                max_diff = max(float(item.get("max_diff", 0.0) or 0.0) for item in batch_reports)
                 report = {
                     "success": True,
                     "tail_trainability": all(
-                        bool(item.get("tail_trainability", False))
-                        for item in batch_reports
+                        bool(item.get("tail_trainability", False)) for item in batch_reports
                     ),
                     "max_diff": max_diff,
                     "error": None,
-                    "validation_batches": [
-                        item.get("batch_size") for item in batch_reports
-                    ],
+                    "validation_batches": [item.get("batch_size") for item in batch_reports],
                     "batch_reports": batch_reports,
                 }
             self._last_replay_validation = report
@@ -1085,8 +1066,7 @@ def load_cached_split_batches(
         prepare_started = time.perf_counter()
         records = [_record_for_index(index) for index in batch_indices]
         refs = [
-            FeatureShardRef.from_dict(dict(record.get("feature_ref") or {}))
-            for record in records
+            FeatureShardRef.from_dict(dict(record.get("feature_ref") or {})) for record in records
         ]
         targets = []
         for index, record in zip(batch_indices, records, strict=True):
@@ -1172,9 +1152,7 @@ def _suffix_parameter_entries(runtime: Any) -> list[tuple[str, torch.nn.Paramete
     if model is None:
         raise RuntimeError("TorchLens suffix optimizer requires runtime.model.")
     named_parameters = dict(model.named_parameters())
-    parameter_names_by_id = {
-        id(parameter): name for name, parameter in named_parameters.items()
-    }
+    parameter_names_by_id = {id(parameter): name for name, parameter in named_parameters.items()}
     suffix_nodes = set(getattr(plan, "suffix_nodes", ()) or ())
     if not suffix_nodes:
         raise RuntimeError("TorchLens suffix optimizer found no suffix nodes.")
@@ -1225,9 +1203,7 @@ def collect_suffix_trainable_parameters(
         for parameter in params:
             parameter.requires_grad_(True)
     if not params:
-        raise RuntimeError(
-            "TorchLens suffix optimizer found no trainable suffix parameters."
-        )
+        raise RuntimeError("TorchLens suffix optimizer found no trainable suffix parameters.")
     return params
 
 

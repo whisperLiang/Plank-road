@@ -3,7 +3,6 @@ from __future__ import annotations
 from cloud.feature_cache.gc import FeatureCacheGC
 from cloud.feature_cache.materializer import FeatureCacheMaterializer
 from cloud.feature_cache.planner import FeatureCachePlanner
-from cloud.feature_cache.shard_reader import FeatureShardPayloadCache, ShardFeatureBatchReader
 from cloud.feature_cache.shard_reachability import (
     collect_refs_from_active_generations,
     collect_refs_from_pending_annotation,
@@ -12,6 +11,7 @@ from cloud.feature_cache.shard_reachability import (
     collect_refs_from_training_views,
     is_shard_reachable,
 )
+from cloud.feature_cache.shard_reader import FeatureShardPayloadCache, ShardFeatureBatchReader
 from cloud.feature_cache.shard_store import FeatureShardStore
 from cloud.feature_cache.shard_validator import (
     ShardFeatureRefValidator,

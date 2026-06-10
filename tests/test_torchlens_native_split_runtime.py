@@ -76,9 +76,7 @@ def _fixed_runtime_template(
         model_family="tiny",
         split_spec=runtime.split_spec,
         example_inputs=example,
-        graph_signature=str(
-            getattr(runtime.trace_graph, "graph_shape_hash", "") or "tiny"
-        ),
+        graph_signature=str(getattr(runtime.trace_graph, "graph_shape_hash", "") or "tiny"),
         split_plan_hash="tiny-plan",
         mode=getattr(runtime.split_spec, "mode", "generated_eager"),
     )
@@ -88,9 +86,7 @@ def _fixed_runtime_template(
         split_spec=runtime.split_spec,
         model_name="tiny",
         model_family="tiny",
-        graph_signature=str(
-            getattr(runtime.trace_graph, "graph_shape_hash", "") or "tiny"
-        ),
+        graph_signature=str(getattr(runtime.trace_graph, "graph_shape_hash", "") or "tiny"),
         symbolic_input_schema_hash=key.symbolic_input_schema_hash,
         split_plan_hash=str(key.split_plan_hash),
         mode=getattr(runtime.split_spec, "mode", "generated_eager"),
@@ -211,8 +207,7 @@ def test_native_split_replays_and_enumerates_compute_boundaries() -> None:
     candidates = splitter.enumerate_candidates()
     assert all(candidate.candidate_id.startswith("after:") for candidate in candidates)
     assert all(
-        candidate.metadata.get("runtime_backend") == "torchlens_native"
-        for candidate in candidates
+        candidate.metadata.get("runtime_backend") == "torchlens_native" for candidate in candidates
     )
 
     boundary = splitter.edge_forward(example)

@@ -6,7 +6,7 @@
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
-| 多边缘并发推理 | ✅ 已实现 | 通过 `launch_multi_edge.py` 启动 N 个进程 |
+| 多边缘并发推理 | ✅ 已实现 | 真实部署时每台边缘设备分别启动 `edge_client.py` 并连接同一个云端 gRPC 地址 |
 | 多边缘并发训练提交 | ✅ 已实现 | 异步 `submit_training_job` + 轮询 |
 | 每 edge 串行 / 全局并发 | ✅ 已实现 | `_active_edges` + `max_concurrent_jobs` |
 | 公平调度 | ✅ 已实现 | Round-robin across edges |

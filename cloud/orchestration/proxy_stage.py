@@ -16,7 +16,6 @@ class ProxyStageMixin:
     def _proxy_eval_frame_cache(self) -> dict[str, np.ndarray | None] | None:
         return self._fixed_split_proxy_evaluator().new_frame_cache()
 
-
     def _fixed_split_proxy_evaluator(self) -> FixedSplitProxyEvaluator:
         return FixedSplitProxyEvaluator(
             device=self.device,
@@ -25,7 +24,6 @@ class ProxyStageMixin:
             frame_cache_enabled=self.proxy_eval_frame_cache_enabled,
             max_dets=self.proxy_eval_max_dets,
         )
-
 
     def _evaluate_fixed_split_proxy_metrics(
         self,
@@ -61,7 +59,6 @@ class ProxyStageMixin:
             priority_sample_ids=priority_sample_ids,
             random_fill_seed=random_fill_seed,
         )
-
 
     def _evaluate_tinynext_proxy_metrics(
         self,

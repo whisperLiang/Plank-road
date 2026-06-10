@@ -146,9 +146,7 @@ class PlankDetectionSplitAdapter:
         from model_management.split_model_adapters import prepare_split_runtime_input
 
         prepared = [
-            _ensure_batched_tensor(
-                prepare_split_runtime_input(self.model, frame, device=device)
-            )
+            _ensure_batched_tensor(prepare_split_runtime_input(self.model, frame, device=device))
             for frame in frames
         ]
         if not prepared:

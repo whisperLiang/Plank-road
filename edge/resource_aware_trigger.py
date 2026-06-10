@@ -171,8 +171,7 @@ class ResourceAwareCLTrigger:
             )
         loss = max(
             0.0,
-            (0.70 * float(stats.low_quality_rate))
-            + (0.30 * threshold_progress),
+            (0.70 * float(stats.low_quality_rate)) + (0.30 * threshold_progress),
         )
         if drift_detected or stats.drift_detected:
             loss += self.drift_bonus
@@ -180,9 +179,7 @@ class ResourceAwareCLTrigger:
         derivative = max(0.0, loss - self.loss_prev)
         urgency = max(
             0.0,
-            (self.K_p * (loss - self.loss_best))
-            + (self.K_d * derivative)
-            + loss,
+            (self.K_p * (loss - self.loss_best)) + (self.K_d * derivative) + loss,
         )
         self.loss_prev = loss
         return urgency
@@ -198,12 +195,7 @@ class ResourceAwareCLTrigger:
     def effective_bundle_cap_bytes(self, bandwidth_mbps: float) -> int:
         if bandwidth_mbps <= 0:
             return int(self.bundle_max_bytes)
-        bandwidth_cap = (
-            float(bandwidth_mbps)
-            * self.bundle_target_upload_sec
-            / 8.0
-            * 1_000_000.0
-        )
+        bandwidth_cap = float(bandwidth_mbps) * self.bundle_target_upload_sec / 8.0 * 1_000_000.0
         return int(
             min(
                 self.bundle_max_bytes,
@@ -228,32 +220,24 @@ class ResourceAwareCLTrigger:
         compute_pressure = cloud_state.compute_pressure
 
         raw_only_payload_bytes = stats.always_sent_bytes
-        raw_plus_feature_payload_bytes = (
-            stats.always_sent_bytes + stats.low_quality_feature_bytes
-        )
-        raw_only_bw_pressure = self._bandwidth_pressure(
-            bandwidth_mbps, raw_only_payload_bytes
-        )
+        raw_plus_feature_payload_bytes = stats.always_sent_bytes + stats.low_quality_feature_bytes
+        raw_only_bw_pressure = self._bandwidth_pressure(bandwidth_mbps, raw_only_payload_bytes)
         raw_plus_feature_bw_pressure = self._bandwidth_pressure(
             bandwidth_mbps, raw_plus_feature_payload_bytes
         )
         training_disabled = stats.total_samples < max(1, self.min_training_samples)
-        low_conf_feature_ratio = (
-            stats.low_quality_feature_bytes
-            / float(max(raw_plus_feature_payload_bytes, 1))
+        low_conf_feature_ratio = stats.low_quality_feature_bytes / float(
+            max(raw_plus_feature_payload_bytes, 1)
         )
 
         no_train_score = self.V * urgency
         raw_only_score = (
             self.w_cloud * (self.Q_cloud + compute_pressure) * (1.0 + compute_pressure)
             + self.w_bw * (self.Q_bw + raw_only_bw_pressure) * (1.0 + raw_only_bw_pressure)
-            + compute_pressure
-            * low_conf_feature_ratio
+            + compute_pressure * low_conf_feature_ratio
         )
         raw_plus_feature_score = (
-            self.w_cloud
-            * (self.Q_cloud + compute_pressure)
-            * (1.0 + 0.5 * compute_pressure)
+            self.w_cloud * (self.Q_cloud + compute_pressure) * (1.0 + 0.5 * compute_pressure)
             + self.w_bw
             * (self.Q_bw + raw_plus_feature_bw_pressure)
             * (1.0 + raw_plus_feature_bw_pressure)
@@ -277,9 +261,7 @@ class ResourceAwareCLTrigger:
         if train_now:
             selected_cloud_cost = compute_pressure
             selected_bw_cost = (
-                raw_plus_feature_bw_pressure
-                if send_low_conf_features
-                else raw_only_bw_pressure
+                raw_plus_feature_bw_pressure if send_low_conf_features else raw_only_bw_pressure
             )
             self.trigger_count += 1
 
@@ -296,8 +278,7 @@ class ResourceAwareCLTrigger:
             )
         else:
             reason = (
-                "Triggered training in raw-only teacher-needed mode to reduce "
-                "bandwidth pressure."
+                "Triggered training in raw-only teacher-needed mode to reduce bandwidth pressure."
             )
 
         decision = TrainingDecision(
@@ -306,9 +287,7 @@ class ResourceAwareCLTrigger:
             urgency=float(urgency),
             compute_pressure=float(compute_pressure),
             bandwidth_pressure=float(
-                raw_plus_feature_bw_pressure
-                if send_low_conf_features
-                else raw_only_bw_pressure
+                raw_plus_feature_bw_pressure if send_low_conf_features else raw_only_bw_pressure
             ),
             bandwidth_mbps=float(bandwidth_mbps),
             bundle_cap_bytes=self.effective_bundle_cap_bytes(float(bandwidth_mbps)),
@@ -332,7 +311,9 @@ class ResourceAwareCLTrigger:
         return decision
 
 
-def query_cloud_resource(server_ip: str, *, edge_id: int = 0, timeout_sec: float = 3.0) -> CloudResourceState:
+def query_cloud_resource(
+    server_ip: str, *, edge_id: int = 0, timeout_sec: float = 3.0
+) -> CloudResourceState:
     with grpc.insecure_channel(server_ip, options=grpc_message_options()) as channel:
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         reply = stub.query_resource(
@@ -391,7 +372,9 @@ def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
         lambda_bw=float(_get("lambda_bw", 0.5, ra)),
         w_cloud=float(_get("w_cloud", 1.0, ra)),
         w_bw=float(_get("w_bw", 1.0, ra)),
-        min_training_samples=int(_get("min_training_samples", getattr(retrain, "collect_num", 1), ra)),
+        min_training_samples=int(
+            _get("min_training_samples", getattr(retrain, "collect_num", 1), ra)
+        ),
         drift_bonus=float(_get("drift_bonus", 0.35, ra)),
         upload_time_budget_sec=float(_get("upload_time_budget_sec", 5.0, ra)),
         bundle_max_bytes=int(_get("bundle_max_bytes", 33554432, ra)),

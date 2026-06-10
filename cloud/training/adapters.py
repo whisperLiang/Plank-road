@@ -29,8 +29,7 @@ def train_split_suffix_batch(
 
 
 class DetectionTrainingAdapter(Protocol):
-    def build_optimizer(self, context: FixedSplitTrainingContext) -> Any:
-        ...
+    def build_optimizer(self, context: FixedSplitTrainingContext) -> Any: ...
 
     def train_one_epoch(
         self,
@@ -39,8 +38,7 @@ class DetectionTrainingAdapter(Protocol):
         epoch: int,
         total_epochs: int,
         optimizer: Any,
-    ) -> EpochTrainResult:
-        ...
+    ) -> EpochTrainResult: ...
 
     def evaluate_proxy(
         self,
@@ -49,11 +47,9 @@ class DetectionTrainingAdapter(Protocol):
         epoch: int | None,
         stage_label: str,
         max_samples: int | None,
-    ) -> ProxyEvalResult:
-        ...
+    ) -> ProxyEvalResult: ...
 
-    def metric_value(self, metrics: Mapping[str, object] | None) -> float | None:
-        ...
+    def metric_value(self, metrics: Mapping[str, object] | None) -> float | None: ...
 
     def metrics_are_better(
         self,
@@ -61,8 +57,7 @@ class DetectionTrainingAdapter(Protocol):
         incumbent_metrics: Mapping[str, object] | None,
         *,
         min_delta: float,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
 
 class UniversalSplitTrainingAdapter:

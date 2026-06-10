@@ -6,7 +6,9 @@ from collections.abc import Mapping, Sequence
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 
 
-def _candidate_boundary_shape_summary(runtime, candidate: SplitCandidate) -> list[tuple[str, object]]:
+def _candidate_boundary_shape_summary(
+    runtime, candidate: SplitCandidate
+) -> list[tuple[str, object]]:
     schema = dict(getattr(candidate, "metadata", {}) or {}).get("boundary_schema")
     if isinstance(schema, Sequence) and not isinstance(schema, (str, bytes)):
         summary: list[tuple[str, object]] = []
@@ -61,7 +63,9 @@ def profile_candidates(
                 cloud_latency += float(report.get("cloud_latency", 0.0))
                 successes += int(report.get("success", False))
                 stability += float(report.get("stability_score", 0.0))
-                trainable = trainable and bool(report.get("tail_trainability", candidate.is_trainable_tail))
+                trainable = trainable and bool(
+                    report.get("tail_trainability", candidate.is_trainable_tail)
+                )
                 error = report.get("error", error)
             runs = float(max(1, validation_runs))
             replay_success_rate = successes / runs

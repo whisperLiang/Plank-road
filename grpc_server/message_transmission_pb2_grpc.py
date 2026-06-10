@@ -5,7 +5,7 @@ import warnings
 
 from grpc_server import message_transmission_pb2 as message__transmission__pb2
 
-GRPC_GENERATED_VERSION = '1.78.1'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -79,6 +79,61 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.BandwidthProbeReply.FromString,
                 _registered_method=True)
+        self.RegisterEdge = channel.unary_unary(
+                '/MessageTransmission/RegisterEdge',
+                request_serializer=message__transmission__pb2.BaselineRegisterEdgeRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
+                _registered_method=True)
+        self.Heartbeat = channel.unary_unary(
+                '/MessageTransmission/Heartbeat',
+                request_serializer=message__transmission__pb2.BaselineHeartbeatRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
+                _registered_method=True)
+        self.UploadFrame = channel.unary_unary(
+                '/MessageTransmission/UploadFrame',
+                request_serializer=message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
+                _registered_method=True)
+        self.UploadKeyFrame = channel.unary_unary(
+                '/MessageTransmission/UploadKeyFrame',
+                request_serializer=message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
+                _registered_method=True)
+        self.UploadPrediction = channel.unary_unary(
+                '/MessageTransmission/UploadPrediction',
+                request_serializer=message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
+                _registered_method=True)
+        self.RequestCloudInference = channel.unary_unary(
+                '/MessageTransmission/RequestCloudInference',
+                request_serializer=message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineInferenceReply.FromString,
+                _registered_method=True)
+        self.PollCommand = channel.unary_unary(
+                '/MessageTransmission/PollCommand',
+                request_serializer=message__transmission__pb2.BaselineCommandRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineCommandReply.FromString,
+                _registered_method=True)
+        self.DownloadInferenceResult = channel.unary_unary(
+                '/MessageTransmission/DownloadInferenceResult',
+                request_serializer=message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineInferenceReply.FromString,
+                _registered_method=True)
+        self.RequestTraining = channel.unary_unary(
+                '/MessageTransmission/RequestTraining',
+                request_serializer=message__transmission__pb2.BaselineTrainingRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineTrainingReply.FromString,
+                _registered_method=True)
+        self.PollTrainingJob = channel.unary_unary(
+                '/MessageTransmission/PollTrainingJob',
+                request_serializer=message__transmission__pb2.BaselineTrainingStatusRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineTrainingStatusReply.FromString,
+                _registered_method=True)
+        self.DownloadModelUpdate = channel.unary_unary(
+                '/MessageTransmission/DownloadModelUpdate',
+                request_serializer=message__transmission__pb2.BaselineModelUpdateRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineModelUpdateReply.FromString,
+                _registered_method=True)
 
 
 class MessageTransmissionServicer(object):
@@ -148,6 +203,73 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RegisterEdge(self, request, context):
+        """Distributed baseline deployment RPCs.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Heartbeat(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UploadFrame(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UploadKeyFrame(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UploadPrediction(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RequestCloudInference(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PollCommand(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DownloadInferenceResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RequestTraining(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PollTrainingJob(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DownloadModelUpdate(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -195,6 +317,61 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.bandwidth_probe,
                     request_deserializer=message__transmission__pb2.BandwidthProbeRequest.FromString,
                     response_serializer=message__transmission__pb2.BandwidthProbeReply.SerializeToString,
+            ),
+            'RegisterEdge': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterEdge,
+                    request_deserializer=message__transmission__pb2.BaselineRegisterEdgeRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
+            ),
+            'Heartbeat': grpc.unary_unary_rpc_method_handler(
+                    servicer.Heartbeat,
+                    request_deserializer=message__transmission__pb2.BaselineHeartbeatRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
+            ),
+            'UploadFrame': grpc.unary_unary_rpc_method_handler(
+                    servicer.UploadFrame,
+                    request_deserializer=message__transmission__pb2.BaselineFrameRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
+            ),
+            'UploadKeyFrame': grpc.unary_unary_rpc_method_handler(
+                    servicer.UploadKeyFrame,
+                    request_deserializer=message__transmission__pb2.BaselineFrameRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
+            ),
+            'UploadPrediction': grpc.unary_unary_rpc_method_handler(
+                    servicer.UploadPrediction,
+                    request_deserializer=message__transmission__pb2.BaselineFrameRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
+            ),
+            'RequestCloudInference': grpc.unary_unary_rpc_method_handler(
+                    servicer.RequestCloudInference,
+                    request_deserializer=message__transmission__pb2.BaselineInferenceRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineInferenceReply.SerializeToString,
+            ),
+            'PollCommand': grpc.unary_unary_rpc_method_handler(
+                    servicer.PollCommand,
+                    request_deserializer=message__transmission__pb2.BaselineCommandRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineCommandReply.SerializeToString,
+            ),
+            'DownloadInferenceResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.DownloadInferenceResult,
+                    request_deserializer=message__transmission__pb2.BaselineInferenceRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineInferenceReply.SerializeToString,
+            ),
+            'RequestTraining': grpc.unary_unary_rpc_method_handler(
+                    servicer.RequestTraining,
+                    request_deserializer=message__transmission__pb2.BaselineTrainingRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineTrainingReply.SerializeToString,
+            ),
+            'PollTrainingJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.PollTrainingJob,
+                    request_deserializer=message__transmission__pb2.BaselineTrainingStatusRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineTrainingStatusReply.SerializeToString,
+            ),
+            'DownloadModelUpdate': grpc.unary_unary_rpc_method_handler(
+                    servicer.DownloadModelUpdate,
+                    request_deserializer=message__transmission__pb2.BaselineModelUpdateRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineModelUpdateReply.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -440,6 +617,303 @@ class MessageTransmission(object):
             '/MessageTransmission/bandwidth_probe',
             message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
             message__transmission__pb2.BandwidthProbeReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RegisterEdge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/RegisterEdge',
+            message__transmission__pb2.BaselineRegisterEdgeRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Heartbeat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/Heartbeat',
+            message__transmission__pb2.BaselineHeartbeatRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UploadFrame(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/UploadFrame',
+            message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UploadKeyFrame(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/UploadKeyFrame',
+            message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UploadPrediction(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/UploadPrediction',
+            message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RequestCloudInference(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/RequestCloudInference',
+            message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
+            message__transmission__pb2.BaselineInferenceReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PollCommand(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/PollCommand',
+            message__transmission__pb2.BaselineCommandRequest.SerializeToString,
+            message__transmission__pb2.BaselineCommandReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DownloadInferenceResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/DownloadInferenceResult',
+            message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
+            message__transmission__pb2.BaselineInferenceReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RequestTraining(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/RequestTraining',
+            message__transmission__pb2.BaselineTrainingRequest.SerializeToString,
+            message__transmission__pb2.BaselineTrainingReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PollTrainingJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/PollTrainingJob',
+            message__transmission__pb2.BaselineTrainingStatusRequest.SerializeToString,
+            message__transmission__pb2.BaselineTrainingStatusReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DownloadModelUpdate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/DownloadModelUpdate',
+            message__transmission__pb2.BaselineModelUpdateRequest.SerializeToString,
+            message__transmission__pb2.BaselineModelUpdateReply.FromString,
             options,
             channel_credentials,
             insecure,

@@ -13,7 +13,6 @@ from typing import Any, Literal
 
 import torch
 
-
 Mode = Literal["raw-only", "raw+feature"]
 
 
@@ -29,7 +28,9 @@ def _payload(size: int, seed: int) -> bytes:
     return bytes((seed + index) % 251 for index in range(size))
 
 
-def _make_samples(count: int, *, prefix: str, raw_size: int, seed_offset: int) -> list[SyntheticSample]:
+def _make_samples(
+    count: int, *, prefix: str, raw_size: int, seed_offset: int
+) -> list[SyntheticSample]:
     samples = []
     for index in range(count):
         class_id = index % 6
@@ -57,7 +58,7 @@ def _torch_bytes(payload: object) -> bytes:
 
 def _chunks(items: list[SyntheticSample], size: int) -> list[list[SyntheticSample]]:
     shard_size = max(1, int(size))
-    return [items[index:index + shard_size] for index in range(0, len(items), shard_size)]
+    return [items[index : index + shard_size] for index in range(0, len(items), shard_size)]
 
 
 def _simulated_upload_time(payload_bytes: int, *, bandwidth_mbps: float) -> float:
@@ -81,9 +82,16 @@ def _pack_legacy_one_shot(
             label_path = f"labels/{sample.sample_id}.json"
             archive.writestr(
                 feature_path,
-                _torch_bytes({"schema_version": 1, "samples": {sample.sample_id: {"tensors": sample.feature_tensors}}}),
+                _torch_bytes(
+                    {
+                        "schema_version": 1,
+                        "samples": {sample.sample_id: {"tensors": sample.feature_tensors}},
+                    }
+                ),
             )
-            archive.writestr(label_path, json.dumps({"sample_id": sample.sample_id, **sample.label}))
+            archive.writestr(
+                label_path, json.dumps({"sample_id": sample.sample_id, **sample.label})
+            )
             manifest["samples"].append(
                 {
                     "sample_id": sample.sample_id,
@@ -104,12 +112,19 @@ def _pack_legacy_one_shot(
                 feature_path = f"features/{sample.sample_id}.pt"
                 archive.writestr(
                     feature_path,
-                    _torch_bytes({"schema_version": 1, "samples": {sample.sample_id: {"tensors": sample.feature_tensors}}}),
+                    _torch_bytes(
+                        {
+                            "schema_version": 1,
+                            "samples": {sample.sample_id: {"tensors": sample.feature_tensors}},
+                        }
+                    ),
                 )
                 entry["feature_relpath"] = feature_path
             manifest["samples"].append(entry)
         archive.writestr("bundle_manifest.json", json.dumps(manifest, sort_keys=True))
-    return buffer.getvalue(), {"legacy_high_quality_packaging_time_sec": time.perf_counter() - started}
+    return buffer.getvalue(), {
+        "legacy_high_quality_packaging_time_sec": time.perf_counter() - started
+    }
 
 
 def _legacy_cloud_prepare(payload_zip: bytes) -> dict[str, float]:
@@ -149,7 +164,9 @@ def _legacy_cloud_prepare(payload_zip: bytes) -> dict[str, float]:
     }
 
 
-def _pack_high_quality_sync(high_quality: list[SyntheticSample], *, shard_size: int) -> tuple[bytes, float]:
+def _pack_high_quality_sync(
+    high_quality: list[SyntheticSample], *, shard_size: int
+) -> tuple[bytes, float]:
     started = time.perf_counter()
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
@@ -182,7 +199,8 @@ def _pack_high_quality_sync(high_quality: list[SyntheticSample], *, shard_size: 
             archive.writestr(
                 label_file,
                 "".join(
-                    json.dumps({"sample_id": sample.sample_id, **sample.label}, sort_keys=True) + "\n"
+                    json.dumps({"sample_id": sample.sample_id, **sample.label}, sort_keys=True)
+                    + "\n"
                     for sample in shard
                 ),
             )
@@ -207,7 +225,9 @@ def _raw_shard_bytes(shard: list[SyntheticSample]) -> bytes:
             info = tarfile.TarInfo(raw_file)
             info.size = len(sample.raw_bytes)
             archive.addfile(info, io.BytesIO(sample.raw_bytes))
-            manifest_lines.append(json.dumps({"sample_id": sample.sample_id, "raw_file": raw_file}) + "\n")
+            manifest_lines.append(
+                json.dumps({"sample_id": sample.sample_id, "raw_file": raw_file}) + "\n"
+            )
         manifest_payload = "".join(manifest_lines).encode("utf-8")
         info = tarfile.TarInfo("manifest.jsonl")
         info.size = len(manifest_payload)
@@ -341,20 +361,18 @@ def _shard_cloud_prepare(
             {
                 "schema_version": 1,
                 "samples": {
-                    sample.sample_id: {"tensors": sample.feature_tensors}
-                    for sample in shard
+                    sample.sample_id: {"tensors": sample.feature_tensors} for sample in shard
                 },
             }
         )
-        "".join(json.dumps({"sample_id": sample.sample_id, **sample.label}) + "\n" for sample in shard)
+        "".join(
+            json.dumps({"sample_id": sample.sample_id, **sample.label}) + "\n" for sample in shard
+        )
     commit_elapsed = time.perf_counter() - commit_started
 
     active_pool_sample_count = int(background_active_samples) + len(raw_samples)
     dataset_started = time.perf_counter()
-    _ = [
-        f"active_pool_sample_{index:06d}"
-        for index in range(active_pool_sample_count)
-    ]
+    _ = [f"active_pool_sample_{index:06d}" for index in range(active_pool_sample_count)]
     dataset_elapsed = time.perf_counter() - dataset_started
     first_batch_elapsed = min(
         dataset_elapsed + commit_elapsed,
@@ -417,7 +435,9 @@ def run_benchmark(
         + legacy_cloud["total_prepare_time_sec"]
     )
 
-    background_payload, high_pack_time = _pack_high_quality_sync(high_quality, shard_size=shard_size)
+    background_payload, high_pack_time = _pack_high_quality_sync(
+        high_quality, shard_size=shard_size
+    )
     trigger_payload, low_pack_time = _pack_low_quality_trigger(
         low_quality,
         mode=mode,
@@ -436,11 +456,11 @@ def run_benchmark(
     legacy_cloud_prepare = float(legacy_cloud["total_prepare_time_sec"])
     shard_cloud_prepare = float(shard_cloud["total_prepare_time_sec"])
     cloud_prepare_speedup = (
-        legacy_cloud_prepare / shard_cloud_prepare
-        if shard_cloud_prepare > 0.0
-        else None
+        legacy_cloud_prepare / shard_cloud_prepare if shard_cloud_prepare > 0.0 else None
     )
-    payload_reduction = 1.0 - (len(trigger_payload) / len(legacy_payload)) if legacy_payload else 0.0
+    payload_reduction = (
+        1.0 - (len(trigger_payload) / len(legacy_payload)) if legacy_payload else 0.0
+    )
     bottleneck = None
     if speedup is None or speedup <= 1.0:
         bottleneck = max(
@@ -488,11 +508,16 @@ def run_benchmark(
         "cloud_prepare_bottleneck": cloud_prepare_bottleneck,
         "legacy": {
             "edge": {
-                "high_quality_sample_packaging_time_sec": legacy_edge["legacy_high_quality_packaging_time_sec"],
+                "high_quality_sample_packaging_time_sec": legacy_edge[
+                    "legacy_high_quality_packaging_time_sec"
+                ],
                 "low_quality_trigger_packaging_time_sec": 0.0,
                 "total_upload_payload_bytes": len(legacy_payload),
                 "upload_elapsed_time_sec": legacy_upload,
-                "trigger_to_job_submission_time_sec": legacy_edge["legacy_high_quality_packaging_time_sec"] + legacy_upload,
+                "trigger_to_job_submission_time_sec": legacy_edge[
+                    "legacy_high_quality_packaging_time_sec"
+                ]
+                + legacy_upload,
             },
             "cloud": legacy_cloud,
         },

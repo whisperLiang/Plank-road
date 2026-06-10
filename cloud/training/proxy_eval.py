@@ -49,6 +49,7 @@ def _read_json_file(path: str) -> dict[str, object]:
         payload = json.load(handle)
     return payload if isinstance(payload, dict) else {}
 
+
 from cloud.training.types import EarlyStopDecision, ProxyEvalResult
 
 
@@ -116,16 +117,8 @@ class ProxyEarlyStopper:
         self.stale_evaluations += 1
         patience = max(0, int(self.config.patience))
         if patience and self.stale_evaluations >= patience:
-            metric_text = (
-                "unknown"
-                if result.metric is None
-                else f"{float(result.metric):.4f}"
-            )
-            best_text = (
-                "unknown"
-                if best_metric is None
-                else f"{float(best_metric):.4f}"
-            )
+            metric_text = "unknown" if result.metric is None else f"{float(result.metric):.4f}"
+            best_text = "unknown" if best_metric is None else f"{float(best_metric):.4f}"
             reason = (
                 f"{self.stale_evaluations} consecutive proxy evaluation(s) "
                 f"without >= {float(self.config.min_delta):.6f} improvement "
@@ -238,9 +231,7 @@ def build_proxy_validation_split(
             if sample_id in train_id_set
         },
         validation_gt_annotations={
-            sample_id: gt_by_id[sample_id]
-            for sample_id in validation_ids
-            if sample_id in gt_by_id
+            sample_id: gt_by_id[sample_id] for sample_id in validation_ids if sample_id in gt_by_id
         },
     )
 
@@ -403,19 +394,13 @@ def _trigger_feature_cache_record(
             else manifest.get("model_version", "")
         ),
         "split_config_id": str(
-            manifest.get("split_config_id")
-            or split_plan.get("split_config_id")
-            or ""
+            manifest.get("split_config_id") or split_plan.get("split_config_id") or ""
         ),
         "front_version": str(
-            manifest.get("front_version")
-            or split_plan.get("front_version")
-            or "0"
+            manifest.get("front_version") or split_plan.get("front_version") or "0"
         ),
         "input_tensor_shape": list(
-            manifest.get("input_tensor_shape")
-            or split_plan.get("input_tensor_shape", [])
-            or []
+            manifest.get("input_tensor_shape") or split_plan.get("input_tensor_shape", []) or []
         ),
         "input_resize_mode": str(
             manifest.get("input_resize_mode")
@@ -536,9 +521,7 @@ def _extract_anchor_replay_outputs(outputs: object) -> dict[str, torch.Tensor] |
         bbox_regression = outputs.get("bbox_regression")
         if isinstance(cls_logits, torch.Tensor) and isinstance(bbox_regression, torch.Tensor):
             extracted = {
-                str(key): value
-                for key, value in outputs.items()
-                if isinstance(value, torch.Tensor)
+                str(key): value for key, value in outputs.items() if isinstance(value, torch.Tensor)
             }
             if extracted:
                 return extracted
@@ -673,10 +656,7 @@ def _postprocess_cached_tinynext_outputs(
     if head_outputs is None:
         return None
 
-    model_input_sizes = [
-        _runtime_image_size_from_metadata(metadata)
-        for metadata in batch_metadata
-    ]
+    model_input_sizes = [_runtime_image_size_from_metadata(metadata) for metadata in batch_metadata]
     if any(size is None for size in model_input_sizes):
         return None
 
@@ -1079,9 +1059,7 @@ def _build_detection_proxy_prediction_cache(
     priority_id_set = {str(sample_id) for sample_id in priority_sample_ids or []}
     priority_gt_samples = sum(1 for sample_id in sample_ids if sample_id in priority_id_set)
     random_fill_gt_samples = (
-        int(len(sample_ids) - priority_gt_samples)
-        if random_fill_seed is not None
-        else 0
+        int(len(sample_ids) - priority_gt_samples) if random_fill_seed is not None else 0
     )
     skipped_empty_gt = 0
     skipped_missing_frame = 0
@@ -1095,9 +1073,7 @@ def _build_detection_proxy_prediction_cache(
     ):
         metadata_index_path = os.path.join(split_cache_path, "metadata_index.json")
         metadata_index = (
-            _read_json_file(metadata_index_path)
-            if os.path.exists(metadata_index_path)
-            else {}
+            _read_json_file(metadata_index_path) if os.path.exists(metadata_index_path) else {}
         )
         metadata_samples = dict(metadata_index.get("samples") or {})
         shard_reader = ShardFeatureBatchReader()
@@ -1185,10 +1161,7 @@ def _build_detection_proxy_prediction_cache(
                     model,
                     raw_outputs,
                     model_name=model_name,
-                    batch_metadata=[
-                        metadata
-                        for _, _, _, metadata in execution_batch
-                    ],
+                    batch_metadata=[metadata for _, _, _, metadata in execution_batch],
                     threshold_low=threshold_low,
                     device=device,
                 )
@@ -1245,8 +1218,7 @@ def _build_detection_proxy_prediction_cache(
         for start in range(0, len(pending_samples), batch_size):
             batch = pending_samples[start : start + batch_size]
             batch_inputs = [
-                _prepare_eval_image_tensor(frame, device=device)
-                for _, _, frame in batch
+                _prepare_eval_image_tensor(frame, device=device) for _, _, frame in batch
             ]
             low_threshold_predictions = _batched_predictions_from_model_output(
                 model(batch_inputs),

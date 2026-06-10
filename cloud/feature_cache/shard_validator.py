@@ -13,7 +13,6 @@ from cloud.feature_cache.types import (
     FeatureShardRef,
 )
 
-
 _VALIDATION_FIELDS = (
     "valid",
     "missing_shard_file",
@@ -32,9 +31,7 @@ ABI_REASON_FEATURE_ABI_ID = "feature_abi_id"
 ABI_REASON_FEATURE_ABI_SPEC = "feature_abi_spec"
 ABI_REASON_FEATURE_LAYOUT = "feature_layout"
 ABI_REASON_FEATURE_LAYOUT_ID = "feature_layout_id"
-ABI_REASON_LAYOUT_EQUIVALENT_REBIND = (
-    "feature_abi_id_mismatch_but_boundary_layout_equivalent"
-)
+ABI_REASON_LAYOUT_EQUIVALENT_REBIND = "feature_abi_id_mismatch_but_boundary_layout_equivalent"
 
 
 @dataclass(frozen=True)
@@ -215,9 +212,8 @@ def _expected_mapping(expected_abi: object) -> dict[str, Any]:
             if key not in source and hasattr(contract, key):
                 source[key] = getattr(contract, key)
         if "boundary_id" not in source:
-            source["boundary_id"] = (
-                getattr(contract, "cloud_batch_split_id", None)
-                or getattr(contract, "canonical_split_key", None)
+            source["boundary_id"] = getattr(contract, "cloud_batch_split_id", None) or getattr(
+                contract, "canonical_split_key", None
             )
     return source
 
@@ -240,7 +236,9 @@ def _shard_file_exists(ref: FeatureShardRef, metadata: FeatureShardMetadata) -> 
         if not shard_dir or not os.path.isdir(str(shard_dir)):
             return False
         leaf_keys = list(ref.leaf_keys or metadata.leaf_specs.keys())
-        return all(os.path.exists(os.path.join(str(shard_dir), f"{leaf}.npy")) for leaf in leaf_keys)
+        return all(
+            os.path.exists(os.path.join(str(shard_dir), f"{leaf}.npy")) for leaf in leaf_keys
+        )
     return False
 
 
@@ -283,18 +281,28 @@ def _abi_status(
         return AbiCompatibilityResult(False, "boundary_id")
 
     expected_payload_kind = str(expected.get("payload_kind") or "boundary_payload")
-    if expected_payload_kind and metadata.payload_kind and metadata.payload_kind != expected_payload_kind:
+    if (
+        expected_payload_kind
+        and metadata.payload_kind
+        and metadata.payload_kind != expected_payload_kind
+    ):
         return AbiCompatibilityResult(False, "payload_kind")
 
     expected_passthrough = expected.get("passthrough_schema_hash") or expected.get(
         "passthrough_schema_fingerprint"
     )
-    if expected_passthrough not in (None, "") and metadata.passthrough_schema_hash not in (None, ""):
+    if expected_passthrough not in (None, "") and metadata.passthrough_schema_hash not in (
+        None,
+        "",
+    ):
         if str(expected_passthrough) != str(metadata.passthrough_schema_hash):
             return AbiCompatibilityResult(False, "passthrough_schema")
 
     expected_preprocessing = expected.get("preprocessing_fingerprint")
-    if expected_preprocessing not in (None, "") and metadata.preprocessing_fingerprint not in (None, ""):
+    if expected_preprocessing not in (None, "") and metadata.preprocessing_fingerprint not in (
+        None,
+        "",
+    ):
         if str(expected_preprocessing) != str(metadata.preprocessing_fingerprint):
             return AbiCompatibilityResult(False, "preprocessing")
 
@@ -336,7 +344,11 @@ def _abi_status(
         )
 
     expected_abi_spec = expected.get("feature_abi_spec")
-    metadata_abi_spec = metadata.metadata.get("feature_abi_spec") if isinstance(metadata.metadata, Mapping) else None
+    metadata_abi_spec = (
+        metadata.metadata.get("feature_abi_spec")
+        if isinstance(metadata.metadata, Mapping)
+        else None
+    )
     if (
         isinstance(expected_abi_spec, Mapping)
         and expected_abi_spec
@@ -345,7 +357,9 @@ def _abi_status(
     ):
         import json
 
-        compatible = json.dumps(dict(expected_abi_spec), sort_keys=True, separators=(",", ":")) == json.dumps(
+        compatible = json.dumps(
+            dict(expected_abi_spec), sort_keys=True, separators=(",", ":")
+        ) == json.dumps(
             dict(metadata_abi_spec),
             sort_keys=True,
             separators=(",", ":"),
@@ -359,7 +373,10 @@ def _abi_status(
 
     expected_layout_id = str(expected.get("feature_layout_id") or "")
     if expected_layout_id:
-        compatible = ref.feature_layout_id == expected_layout_id or metadata.feature_layout_id == expected_layout_id
+        compatible = (
+            ref.feature_layout_id == expected_layout_id
+            or metadata.feature_layout_id == expected_layout_id
+        )
         return AbiCompatibilityResult(
             compatible,
             ABI_REASON_FEATURE_LAYOUT_ID,

@@ -1,7 +1,8 @@
-"""Abstract base class for all baseline methods.
+"""Compatibility dataclasses for legacy imports.
 
-All four methods implement the same interface so the real experiment
-runner can drive them uniformly over video object detection streams.
+Distributed baselines now use ``baselines.policies``.  The dataclasses in
+this module remain only for small helper modules that still type frame-level
+results; they do not register or run baseline methods.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ class UpdatePlan:
 
 
 class BaseMethod(abc.ABC):
-    """Unified interface for all four experiment methods."""
+    """Legacy abstract interface kept for import compatibility."""
 
     def __init__(self, method_name: str, experiment_config: Any, num_devices: int = 1) -> None:
         self.method_name = method_name

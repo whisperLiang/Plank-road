@@ -9,11 +9,12 @@ import torch
 
 from cloud.sample_pool.labels import (
     POOL_LABEL_METADATA_FIELDS,
+)
+from cloud.sample_pool.labels import (
     dominant_class as _dominant_class,
 )
 from model_management.payload import BoundaryPayload
 from model_management.split_contract import feature_layout_from_tensors
-
 
 CANONICAL_RECORD_VERSION = "canonical-sample-record.v1"
 GENERATION_MANIFEST_VERSION = "canonical-cloud-sample-pool.v1"
@@ -175,11 +176,7 @@ class CanonicalSampleRecord:
             "in_drift_window": self.in_drift_window,
             "window_id": self.window_id,
             "input_image_size": list(self.input_image_size),
-            **(
-                {"feature_ref": dict(self.feature_ref)}
-                if self.feature_ref is not None
-                else {}
-            ),
+            **({"feature_ref": dict(self.feature_ref)} if self.feature_ref is not None else {}),
             **(
                 {
                     "label_ref": dict(

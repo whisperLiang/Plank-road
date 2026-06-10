@@ -3,7 +3,6 @@ import imutils
 
 
 class DiffProcessor:
-
     def get_frame_feature(self, frame):
         """Extract feature of frame."""
         raise NotImplementedError()
@@ -15,16 +14,16 @@ class DiffProcessor:
     @staticmethod
     def str_to_class(feature):
         feature_dict = {
-            'edge': EdgeDiff,
-            'pixel': PixelDiff,
-            'area': AreaDiff,
-            'corner': CornerDiff,
+            "edge": EdgeDiff,
+            "pixel": PixelDiff,
+            "area": AreaDiff,
+            "corner": CornerDiff,
         }
         return feature_dict[feature]
 
 
 class EdgeDiff(DiffProcessor):
-    feature = 'edge'
+    feature = "edge"
 
     def get_frame_feature(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -42,8 +41,7 @@ class EdgeDiff(DiffProcessor):
 
 
 class PixelDiff(DiffProcessor):
-
-    feature = 'pixel'
+    feature = "pixel"
 
     def get_frame_feature(self, frame):
         return frame
@@ -59,8 +57,7 @@ class PixelDiff(DiffProcessor):
 
 
 class AreaDiff(DiffProcessor):
-
-    feature = 'area'
+    feature = "area"
 
     def get_frame_feature(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -80,7 +77,8 @@ class AreaDiff(DiffProcessor):
 
 
 class CornerDiff(DiffProcessor):
-    feature = 'corner'
+    feature = "corner"
+
     def get_frame_feature(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corner = cv2.cornerHarris(gray, 5, 3, 0.05)

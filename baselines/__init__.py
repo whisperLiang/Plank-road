@@ -1,12 +1,15 @@
-"""Real-execution baseline framework for video continual learning."""
+"""Distributed baseline framework for real edge-cloud deployments."""
 
-from baselines.base_method import BaseMethod
-from baselines.method_factory import create_method
+from baselines.method_factory import create_method, create_policy, registered_methods
 from baselines.metrics import DeviceMetrics, MetricsCollector, OverallMetrics
+from baselines.policies import BaseBaselinePolicy, BaselineFrameDecision
 
 __all__ = [
-    "BaseMethod",
+    "BaseBaselinePolicy",
+    "BaselineFrameDecision",
     "create_method",
+    "create_policy",
+    "registered_methods",
     "MetricsCollector",
     "DeviceMetrics",
     "OverallMetrics",

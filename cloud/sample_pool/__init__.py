@@ -13,6 +13,10 @@ from typing import Any
 
 import torch
 
+from cloud.feature_cache.shard_reachability import (
+    collect_refs_from_active_generations,
+    collect_refs_from_pending_high_quality,
+)
 from cloud.feature_cache.shard_validator import (
     ABI_REASON_LAYOUT_EQUIVALENT_REBIND,
     ShardFeatureRefValidator,
@@ -20,24 +24,32 @@ from cloud.feature_cache.shard_validator import (
     feature_layouts_abi_compatible,
     validation_count_fields,
 )
-from cloud.feature_cache.shard_reachability import (
-    collect_refs_from_active_generations,
-    collect_refs_from_pending_high_quality,
-)
 from cloud.feature_cache.types import SUPPORTED_STORAGE_FORMATS
 from cloud.sample_pool.labels import (
     POOL_LABEL_COORDINATE_SPACE,
     POOL_LABEL_METADATA_FIELDS,
     POOL_LABEL_RUNTIME_VERSION,
+    labels_from_result,
+)
+from cloud.sample_pool.labels import (
     class_counts as _class_counts,
-    labels_from_result as _labels_from_result,
+)
+from cloud.sample_pool.labels import (
     labels_with_default_metadata as _labels_with_default_metadata,
+)
+from cloud.sample_pool.labels import (
     object_count as _object_count,
 )
 from cloud.sample_pool.records import (
     CANONICAL_FEATURE_METADATA_FIELDS as _CANONICAL_FEATURE_METADATA_FIELDS,
+)
+from cloud.sample_pool.records import (
     CANONICAL_RECORD_VERSION as _CANONICAL_RECORD_VERSION,
+)
+from cloud.sample_pool.records import (
     GENERATION_MANIFEST_VERSION as _GENERATION_MANIFEST_VERSION,
+)
+from cloud.sample_pool.records import (
     CanonicalSampleRecord,
 )
 from model_management.detection_box_projection import validate_box_coordinate_space
@@ -48,9 +60,7 @@ from model_management.split_contract import (
     normalise_feature_tensors,
 )
 
-_REBIND_REASON_FEATURE_ABI_COMPATIBLE = (
-    "runtime_identity_changed_but_feature_abi_compatible"
-)
+_REBIND_REASON_FEATURE_ABI_COMPATIBLE = "runtime_identity_changed_but_feature_abi_compatible"
 _REBIND_REASON_LAYOUT_EQUIVALENT = ABI_REASON_LAYOUT_EQUIVALENT_REBIND
 
 
@@ -160,7 +170,10 @@ def _detach_boundary_payload(payload: BoundaryPayload) -> BoundaryPayload:
         for label, tensor in dict(payload.tensors or {}).items()
         if isinstance(tensor, torch.Tensor)
     }
-    metadata = {str(label): _detach_cpu_value(value) for label, value in dict(payload.metadata or {}).items()}
+    metadata = {
+        str(label): _detach_cpu_value(value)
+        for label, value in dict(payload.metadata or {}).items()
+    }
     return boundary_payload_from_tensors(
         tensors,
         split_id=str(payload.split_id),
@@ -250,11 +263,9 @@ def _layout_spec_matches(
 ) -> bool:
     if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
         return False
-    return (
-        str(actual.get("dtype")) == str(expected.get("dtype"))
-        and [int(dim) for dim in list(actual.get("shape_without_batch") or [])]
-        == [int(dim) for dim in list(expected.get("shape_without_batch") or [])]
-    )
+    return str(actual.get("dtype")) == str(expected.get("dtype")) and [
+        int(dim) for dim in list(actual.get("shape_without_batch") or [])
+    ] == [int(dim) for dim in list(expected.get("shape_without_batch") or [])]
 
 
 def _contract_boundary_order(split_contract: SplitRuntimeContract) -> list[str]:
@@ -392,7 +403,15 @@ def _feature_metadata_from_candidate(candidate: Mapping[str, Any]) -> dict[str, 
         {
             key: value
             for key, value in dict(candidate).items()
-            if key not in {"feature", "tensors", "feature_record", "labels", "intermediate", "boundary_payload"}
+            if key
+            not in {
+                "feature",
+                "tensors",
+                "feature_record",
+                "labels",
+                "intermediate",
+                "boundary_payload",
+            }
         }
     )
     return {
@@ -435,9 +454,7 @@ def _candidate_contract_ref(
 ) -> dict[str, str]:
     runtime_contract_value = candidate.get("runtime_contract")
     runtime_contract = (
-        dict(runtime_contract_value)
-        if isinstance(runtime_contract_value, Mapping)
-        else {}
+        dict(runtime_contract_value) if isinstance(runtime_contract_value, Mapping) else {}
     )
     ref = dict(feature_ref or _feature_ref_from_candidate(candidate) or {})
     if isinstance(metadata, Mapping):
@@ -588,25 +605,16 @@ def _candidate_with_validated_shard_layout(
     ):
         updated["rebinding_reason"] = _REBIND_REASON_LAYOUT_EQUIVALENT
     if (
-        (
-            (
-                source_contract_id
-                and source_contract_id != split_contract.contract_id
-            )
-            or (
-                source_feature_layout_id
-                and source_feature_layout_id != split_contract.feature_layout_id
-            )
+        (source_contract_id and source_contract_id != split_contract.contract_id)
+        or (
+            source_feature_layout_id
+            and source_feature_layout_id != split_contract.feature_layout_id
         )
-        and not updated.get("rebinding_reason")
-    ):
+    ) and not updated.get("rebinding_reason"):
         updated["rebinding_reason"] = _REBIND_REASON_FEATURE_ABI_COMPATIBLE
     if feature_ref is not None:
         updated_ref = dict(feature_ref)
-        if (
-            source_feature_abi_id
-            and source_feature_abi_id != str(split_contract.feature_abi_id)
-        ):
+        if source_feature_abi_id and source_feature_abi_id != str(split_contract.feature_abi_id):
             ref_metadata = dict(updated_ref.get("metadata") or {})
             ref_metadata.setdefault("source_feature_abi_id", source_feature_abi_id)
             updated_ref["metadata"] = ref_metadata
@@ -656,14 +664,10 @@ def _label_ref_payload(
         "teacher_labeled": str(label_source) == "teacher",
         "pseudo_labeled": str(label_source) == "edge_pseudo",
         "size_bytes": (
-            os.path.getsize(label_path)
-            if label_path and os.path.exists(label_path)
-            else 0
+            os.path.getsize(label_path) if label_path and os.path.exists(label_path) else 0
         ),
         "metadata": {
-            key: labels[key]
-            for key in POOL_LABEL_METADATA_FIELDS
-            if labels.get(key) is not None
+            key: labels[key] for key in POOL_LABEL_METADATA_FIELDS if labels.get(key) is not None
         },
         "labels": dict(labels),
     }
@@ -895,9 +899,7 @@ class CloudSamplePool:
         self.boundary_tensor_labels = [str(label) for label in list(boundary_tensor_labels or [])]
         resolved_max_active = max_active_samples if max_active_samples is not None else max_samples
         self.max_active_samples = (
-            None
-            if resolved_max_active in (None, "", 0)
-            else max(1, int(resolved_max_active))
+            None if resolved_max_active in (None, "", 0) else max(1, int(resolved_max_active))
         )
         self.shard_size = max(1, int(shard_size))
         self.current_path = os.path.join(self.root_dir, "current.json")
@@ -949,19 +951,12 @@ class CloudSamplePool:
         if not sample_id:
             raise ValueError("Staged sample is missing sample_id.")
         feature_record = dict(sample.get("feature_record") or {})
-        input_image_size = (
-            feature_record.get("input_image_size")
-            or sample.get("input_image_size")
-        )
+        input_image_size = feature_record.get("input_image_size") or sample.get("input_image_size")
         input_tensor_shape = list(
-            feature_record.get("input_tensor_shape")
-            or sample.get("input_tensor_shape")
-            or []
+            feature_record.get("input_tensor_shape") or sample.get("input_tensor_shape") or []
         )
         input_resize_mode = str(
-            feature_record.get("input_resize_mode")
-            or sample.get("input_resize_mode")
-            or ""
+            feature_record.get("input_resize_mode") or sample.get("input_resize_mode") or ""
         )
         labels = _labels_with_default_metadata(
             sample.get("labels") or sample.get("label") or sample.get("target") or {},
@@ -1002,8 +997,7 @@ class CloudSamplePool:
             "runtime_identity_id": contract_ref["runtime_identity_id"],
             "source_contract_id": sample.get("source_contract_id"),
             "source_feature_abi_id": (
-                sample.get("source_feature_abi_id")
-                or contract_ref["source_feature_abi_id"]
+                sample.get("source_feature_abi_id") or contract_ref["source_feature_abi_id"]
             ),
             "source_feature_layout_id": sample.get("source_feature_layout_id"),
             "rebinding_reason": sample.get("rebinding_reason"),
@@ -1058,7 +1052,9 @@ class CloudSamplePool:
             _atomic_json_dump(path, record)
             accepted += 1
         return {
-            "accepted_to_pending" if sample_source == "high_quality" else "accepted_to_staging": accepted,
+            "accepted_to_pending"
+            if sample_source == "high_quality"
+            else "accepted_to_staging": accepted,
             "skipped_invalid": len(invalid_ids),
             "duplicate": len(duplicate_ids),
             "skipped_invalid_preview": invalid_ids[:10],
@@ -1259,9 +1255,8 @@ class CloudSamplePool:
             label_ref = entry.get("label_ref")
             labels_from_ref = _labels_from_label_ref(label_ref)
             feature_ref_payload = dict(feature_ref) if isinstance(feature_ref, Mapping) else {}
-            if (
-                feature_ref_payload.get("path")
-                and not os.path.isabs(str(feature_ref_payload["path"]))
+            if feature_ref_payload.get("path") and not os.path.isabs(
+                str(feature_ref_payload["path"])
             ):
                 feature_ref_payload["path"] = _resolve_relpath(
                     str(entry.get("__generation_dir") or self.root_dir),
@@ -1273,7 +1268,11 @@ class CloudSamplePool:
                     str(entry.get("__generation_dir") or self.root_dir),
                     str(label_ref_payload["path"]),
                 )
-            if isinstance(feature_ref, Mapping) and isinstance(label_ref, Mapping) and labels_from_ref:
+            if (
+                isinstance(feature_ref, Mapping)
+                and isinstance(label_ref, Mapping)
+                and labels_from_ref
+            ):
                 sample.update(
                     {
                         "labels": labels_from_ref,
@@ -1306,28 +1305,20 @@ class CloudSamplePool:
         is_canonical_active = bool(candidate.get("__canonical_active"))
         feature_ref = _feature_ref_from_candidate(candidate)
         label_ref = _label_ref_from_candidate(candidate)
-        can_use_ref_without_payload = (
-            feature_ref is not None
-            and (
-                bool(candidate.get("__allow_shard_ref_without_payload"))
-                or (
-                    str(split_contract.feature_abi_id)
-                    and _candidate_contract_ref(candidate)["feature_abi_id"]
-                    == str(split_contract.feature_abi_id)
-                )
-                or str(candidate.get("feature_layout_id") or "")
-                == str(split_contract.feature_layout_id)
+        can_use_ref_without_payload = feature_ref is not None and (
+            bool(candidate.get("__allow_shard_ref_without_payload"))
+            or (
+                str(split_contract.feature_abi_id)
+                and _candidate_contract_ref(candidate)["feature_abi_id"]
+                == str(split_contract.feature_abi_id)
             )
+            or str(candidate.get("feature_layout_id") or "")
+            == str(split_contract.feature_layout_id)
         )
-        feature = (
-            {}
-            if can_use_ref_without_payload
-            else _feature_tensors_from_candidate(candidate)
-        )
+        feature = {} if can_use_ref_without_payload else _feature_tensors_from_candidate(candidate)
         feature_record = dict(candidate.get("feature_record") or {})
-        input_image_size = (
-            candidate.get("input_image_size")
-            or feature_record.get("input_image_size")
+        input_image_size = candidate.get("input_image_size") or feature_record.get(
+            "input_image_size"
         )
         input_tensor_shape = [
             int(dim)
@@ -1338,9 +1329,7 @@ class CloudSamplePool:
             )
         ]
         input_resize_mode = str(
-            candidate.get("input_resize_mode")
-            or feature_record.get("input_resize_mode")
-            or ""
+            candidate.get("input_resize_mode") or feature_record.get("input_resize_mode") or ""
         )
         if not input_image_size:
             raise ValueError("Canonical sample is missing input_image_size.")
@@ -1352,7 +1341,9 @@ class CloudSamplePool:
             labels = dict(candidate.get("labels") or {})
             class_counts = {
                 str(label): int(count)
-                for label, count in dict(candidate.get("class_counts") or _class_counts(labels)).items()
+                for label, count in dict(
+                    candidate.get("class_counts") or _class_counts(labels)
+                ).items()
             }
             object_count = int(candidate.get("object_count") or _object_count(labels))
         else:
@@ -1374,7 +1365,11 @@ class CloudSamplePool:
         source_contract_id = contract_ref["source_contract_id"]
         if source_contract_id == split_contract.contract_id:
             source_contract_id = ""
-        if not source_contract_id and raw_contract_id and raw_contract_id != split_contract.contract_id:
+        if (
+            not source_contract_id
+            and raw_contract_id
+            and raw_contract_id != split_contract.contract_id
+        ):
             source_contract_id = raw_contract_id
         source_feature_abi_id = contract_ref["source_feature_abi_id"]
         if source_feature_abi_id == split_contract.feature_abi_id:
@@ -1395,16 +1390,18 @@ class CloudSamplePool:
             if candidate.get("rebinding_reason") in (None, "")
             else str(candidate.get("rebinding_reason"))
         )
-        if source_contract_id and source_contract_id != split_contract.contract_id and not rebinding_reason:
+        if (
+            source_contract_id
+            and source_contract_id != split_contract.contract_id
+            and not rebinding_reason
+        ):
             rebinding_reason = _REBIND_REASON_FEATURE_ABI_COMPATIBLE
         return CanonicalSampleRecord(
             sample_id=sample_id,
             contract_id=split_contract.contract_id,
             split_config_id=str(candidate.get("split_config_id") or split_contract.split_config_id),
             front_version=str(candidate.get("front_version") or split_contract.front_version),
-            feature_layout_id=str(
-                split_contract.feature_layout_id
-            ),
+            feature_layout_id=str(split_contract.feature_layout_id),
             sample_source=sample_source,
             label_source=label_source,
             feature=feature,
@@ -1421,14 +1418,10 @@ class CloudSamplePool:
                 else bool(candidate.get("in_drift_window"))
             ),
             window_id=(
-                None
-                if candidate.get("window_id") is None
-                else str(candidate.get("window_id"))
+                None if candidate.get("window_id") is None else str(candidate.get("window_id"))
             ),
             boundary_payload=(
-                None
-                if can_use_ref_without_payload
-                else _boundary_payload_from_candidate(candidate)
+                None if can_use_ref_without_payload else _boundary_payload_from_candidate(candidate)
             ),
             feature_ref=feature_ref,
             label_ref=label_ref,
@@ -1502,9 +1495,10 @@ class CloudSamplePool:
             int(dim) for dim in split_contract.input_tensor_shape
         ]:
             return "skipped_label_metadata"
-        if str(record.input_resize_mode).strip().lower() != str(
-            split_contract.input_resize_mode
-        ).strip().lower():
+        if (
+            str(record.input_resize_mode).strip().lower()
+            != str(split_contract.input_resize_mode).strip().lower()
+        ):
             return "skipped_label_metadata"
         metadata = {
             "input_image_size": list(record.input_image_size),
@@ -1534,8 +1528,7 @@ class CloudSamplePool:
         class_rarity_score = 0.0
         if record.class_counts:
             class_rarity_score = max(
-                float(rarity_by_class.get(str(label), 0.0))
-                for label in record.class_counts
+                float(rarity_by_class.get(str(label), 0.0)) for label in record.class_counts
             )
         created_at = _created_at_sort_value(record.created_at)
         recency_score = 0.0 if newest_created_at <= 0 else min(1.0, created_at / newest_created_at)
@@ -1560,8 +1553,7 @@ class CloudSamplePool:
             for label, count in record.class_counts.items():
                 aggregate_counts[str(label)] = aggregate_counts.get(str(label), 0) + int(count)
         rarity_by_class = {
-            label: 1.0 / float(max(1, count))
-            for label, count in aggregate_counts.items()
+            label: 1.0 / float(max(1, count)) for label, count in aggregate_counts.items()
         }
         newest_created_at = max(_created_at_sort_value(record.created_at) for record in records)
 
@@ -1587,16 +1579,12 @@ class CloudSamplePool:
                 item[1].sample_id,
             ),
         )
-        limit = (
-            max_samples
-            if max_samples is not None
-            else self.max_active_samples
-        )
+        limit = max_samples if max_samples is not None else self.max_active_samples
         if limit in (None, "", 0):
             kept = [record for _score, record in scored]
             return kept, []
         kept_pairs = scored[: int(limit)]
-        dropped_pairs = scored[int(limit):]
+        dropped_pairs = scored[int(limit) :]
         kept_ids = {record.sample_id for _score, record in kept_pairs}
         dropped = [record for _score, record in dropped_pairs]
         for _score, record in scored:
@@ -1724,9 +1712,7 @@ class CloudSamplePool:
     def _delete_staging_records(self, records: list[CanonicalSampleRecord]) -> int:
         deleted = 0
         seen_paths = {
-            record.source_staging_path
-            for record in records
-            if record.source_staging_path
+            record.source_staging_path for record in records if record.source_staging_path
         }
         for path in seen_paths:
             try:
@@ -1814,12 +1800,18 @@ class CloudSamplePool:
             invalid_records: list[CanonicalSampleRecord] = []
             unreadable_staging_paths: list[str] = []
             all_inputs = (
-                [("existing_active", candidate) for candidate in list(existing_active_samples or [])]
+                [
+                    ("existing_active", candidate)
+                    for candidate in list(existing_active_samples or [])
+                ]
                 + [
                     ("pending_high_quality", candidate)
                     for candidate in list(pending_high_quality_samples or [])
                 ]
-                + [("new_low_quality", candidate) for candidate in list(new_low_quality_samples or [])]
+                + [
+                    ("new_low_quality", candidate)
+                    for candidate in list(new_low_quality_samples or [])
+                ]
             )
             for input_source, raw_candidate in all_inputs:
                 candidate = dict(raw_candidate)
@@ -1870,9 +1862,10 @@ class CloudSamplePool:
                     validation_previews["skipped_feature_layout"].append(sample_id)
                     if input_source == "existing_active":
                         shard_carry_forward["dropped_incompatible"] += 1
-                    elif input_source == "new_low_quality" or str(
-                        candidate.get("sample_source") or ""
-                    ) == "low_quality":
+                    elif (
+                        input_source == "new_low_quality"
+                        or str(candidate.get("sample_source") or "") == "low_quality"
+                    ):
                         validation_counts["invalid_low_quality"] += 1
                     else:
                         validation_counts["invalid_high_quality"] += 1
@@ -1882,9 +1875,10 @@ class CloudSamplePool:
                     validation_previews["skipped_label_metadata"].append(sample_id)
                     if input_source == "pending_high_quality":
                         shard_high_quality["deferred_contract"] += 1
-                    elif input_source == "new_low_quality" or str(
-                        candidate.get("sample_source") or ""
-                    ) == "low_quality":
+                    elif (
+                        input_source == "new_low_quality"
+                        or str(candidate.get("sample_source") or "") == "low_quality"
+                    ):
                         validation_counts["invalid_low_quality"] += 1
                     else:
                         validation_counts["invalid_high_quality"] += 1
@@ -2004,10 +1998,7 @@ class CloudSamplePool:
             stats = {
                 "validation": {
                     **validation_counts,
-                    **{
-                        f"{key}_preview": value[:10]
-                        for key, value in validation_previews.items()
-                    },
+                    **{f"{key}_preview": value[:10] for key, value in validation_previews.items()},
                 },
                 "selection": selection_stats,
                 "shard_validation": dict(shard_validation_counts),
@@ -2024,9 +2015,11 @@ class CloudSamplePool:
                 for record in kept
                 if record.sample_source == "high_quality" and record.source_staging_path
             }
-            processed_records = kept + dropped + [
-                record for record in invalid_records if record.sample_source == "low_quality"
-            ]
+            processed_records = (
+                kept
+                + dropped
+                + [record for record in invalid_records if record.sample_source == "low_quality"]
+            )
             processed_count = self._delete_staging_records(processed_records)
             shard_high_quality["deleted_from_pending"] = sum(
                 1 for path in pending_kept_paths if path and not os.path.exists(str(path))
@@ -2056,6 +2049,9 @@ class CloudSamplePool:
 __all__ = [
     "CanonicalSampleRecord",
     "CloudSamplePool",
+    "POOL_LABEL_COORDINATE_SPACE",
+    "POOL_LABEL_RUNTIME_VERSION",
     "SampleFeatureContractAlignment",
     "align_sample_feature_contract",
+    "labels_from_result",
 ]

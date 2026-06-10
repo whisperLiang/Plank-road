@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from config.baseline import validate_baseline_method
+
 
 @dataclass
 class ConfigSection:
@@ -223,6 +225,53 @@ class SamplePoolConfig(ConfigSection):
 
 
 @dataclass
+class PureEdgeBaselineConfig(ConfigSection):
+    label_source: str = "pseudo_label"
+    local_metrics: bool = True
+    upload_metrics_to_cloud: bool = False
+    upload_frames_to_cloud: bool = False
+    use_cloud_teacher: bool = False
+    local_gt_dir: str = ""
+
+
+@dataclass
+class AccuracyTriggerBaselineConfig(ConfigSection):
+    reuse_plank_road_frame_filter: bool = True
+    upload_keyframes_only: bool = True
+    trigger_on_cloud_comparison: bool = True
+    training_strategy: str = "frozen_training"
+    return_model_update: bool = True
+
+
+@dataclass
+class EkyaStyleBaselineConfig(ConfigSection):
+    upload_raw_frames: bool = True
+    use_frame_filter: bool = False
+    cloud_inference: bool = True
+    return_cloud_inference_to_edge: bool = True
+    training_strategy: str = "ekya_style"
+    enable_micro_profiling: bool = True
+
+
+@dataclass
+class BaselineConfig(ConfigSection):
+    enabled: bool = False
+    method: str = "accuracy_trigger_cloud_retraining"
+    run_id: str | None = None
+    results_root: str = "results/baselines_distributed"
+    pure_edge_local_updating: PureEdgeBaselineConfig = field(default_factory=PureEdgeBaselineConfig)
+    accuracy_trigger_cloud_retraining: AccuracyTriggerBaselineConfig = field(
+        default_factory=AccuracyTriggerBaselineConfig
+    )
+    ekya_style_centralized_scheduling: EkyaStyleBaselineConfig = field(
+        default_factory=EkyaStyleBaselineConfig
+    )
+
+    def __post_init__(self) -> None:
+        self.method = validate_baseline_method(self.method)
+
+
+@dataclass
 class DASConfig(ConfigSection):
     enabled: bool = False
     bn_only: bool = False
@@ -281,6 +330,7 @@ class RuntimeConfig(ConfigSection):
     client: ClientConfig = field(default_factory=ClientConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
+    baseline: BaselineConfig = field(default_factory=BaselineConfig)
 
     def __post_init__(self) -> None:
         self.client.sample_pool = self.sample_pool
@@ -353,6 +403,19 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             known.get("continual_learning"),
         )
         known["das"] = _section(DASConfig, known.get("das"))
+    elif section_cls is BaselineConfig:
+        known["pure_edge_local_updating"] = _section(
+            PureEdgeBaselineConfig,
+            known.get("pure_edge_local_updating"),
+        )
+        known["accuracy_trigger_cloud_retraining"] = _section(
+            AccuracyTriggerBaselineConfig,
+            known.get("accuracy_trigger_cloud_retraining"),
+        )
+        known["ekya_style_centralized_scheduling"] = _section(
+            EkyaStyleBaselineConfig,
+            known.get("ekya_style_centralized_scheduling"),
+        )
     elif section_cls is RuntimeConfig:
         sample_pool = _section(SamplePoolConfig, known.get("sample_pool"))
         client_data = dict(known.get("client") or {})
@@ -362,6 +425,7 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["sample_pool"] = sample_pool
         known["client"] = _section(ClientConfig, client_data)
         known["server"] = _section(ServerConfig, server_data)
+        known["baseline"] = _section(BaselineConfig, known.get("baseline"))
 
     return section_cls(**known, _extras=extras)
 
@@ -477,6 +541,19 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             raise ValueError(message)
 
     _validate_sample_pool_config("sample_pool", config.sample_pool)
+    validate_baseline_method(config.baseline.method)
+    if not isinstance(config.baseline.enabled, bool):
+        raise ValueError("baseline.enabled must be a boolean")
+    if not str(config.baseline.results_root or "").strip():
+        raise ValueError("baseline.results_root must be non-empty")
+    pure_edge = config.baseline.pure_edge_local_updating
+    if str(pure_edge.label_source) not in {"pseudo_label", "local_gt_dir", "none"}:
+        raise ValueError(
+            "baseline.pure_edge_local_updating.label_source must be one of "
+            "pseudo_label, local_gt_dir, none"
+        )
+    if bool(pure_edge.use_cloud_teacher):
+        raise ValueError("baseline.pure_edge_local_updating.use_cloud_teacher must remain false")
     feature_upload = config.client.feature_upload
     if str(feature_upload.storage_format).strip().lower() not in {
         "safetensors_shard",

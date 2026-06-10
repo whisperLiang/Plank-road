@@ -62,4 +62,8 @@ def test_canonical_pool_commits_shard_refs_without_feature_pt(tmp_path) -> None:
     generation_dir = pool.current_generation_dir()
     assert generation_dir
     assert not os.path.exists(os.path.join(generation_dir, "features"))
-    assert not any(filename.endswith(".pt") for _root, _dirs, files in os.walk(generation_dir) for filename in files)
+    assert not any(
+        filename.endswith(".pt")
+        for _root, _dirs, files in os.walk(generation_dir)
+        for filename in files
+    )

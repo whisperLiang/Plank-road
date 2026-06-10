@@ -9,6 +9,5 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from benchmarks.benchmark_shard_sample_pool import main
 
-
 if __name__ == "__main__":
     raise SystemExit(main())

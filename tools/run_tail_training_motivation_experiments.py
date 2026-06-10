@@ -153,7 +153,6 @@ def _default_num_threads() -> int:
         return 0
 
 
-
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -261,11 +260,7 @@ def _write_summary_csv(path: Path, rows: list[Mapping[str, Any]]) -> None:
 
 
 def _mean_std(values: list[Any]) -> tuple[float | None, float | None]:
-    numeric = [
-        float(value)
-        for value in values
-        if value is not None and np.isfinite(float(value))
-    ]
+    numeric = [float(value) for value in values if value is not None and np.isfinite(float(value))]
     if not numeric:
         return None, None
     if len(numeric) == 1:
@@ -328,11 +323,7 @@ def _set_random_seed(seed: int) -> None:
 
 
 def _set_training_step_seed(seed: int, epoch_index: int, batch_index: int) -> None:
-    step_seed = (
-        int(seed) * 1_000_003
-        + int(epoch_index) * 10_007
-        + int(batch_index)
-    ) % (2**63 - 1)
+    step_seed = (int(seed) * 1_000_003 + int(epoch_index) * 10_007 + int(batch_index)) % (2**63 - 1)
     _set_random_seed(step_seed)
 
 
@@ -354,9 +345,7 @@ def _release_unused_memory() -> None:
 def _configure_process_threading(num_threads: int) -> None:
     threads = int(num_threads)
     if threads <= 0:
-        logger.info(
-            "Using library default CPU threading; experiments still run serially."
-        )
+        logger.info("Using library default CPU threading; experiments still run serially.")
         return
     for key in (
         "OMP_NUM_THREADS",
@@ -375,13 +364,11 @@ def _configure_process_threading(num_threads: int) -> None:
     if hasattr(cv2, "setNumThreads"):
         cv2.setNumThreads(threads)
     torch_interop_threads = (
-        torch.get_num_interop_threads()
-        if hasattr(torch, "get_num_interop_threads")
-        else None
+        torch.get_num_interop_threads() if hasattr(torch, "get_num_interop_threads") else None
     )
     opencv_threads = cv2.getNumThreads() if hasattr(cv2, "getNumThreads") else None
     logger.info(
-        "Configured single-process threading: torch_threads={} torch_interop_threads={} "
+        "Configured local threading: torch_threads={} torch_interop_threads={} "
         "opencv_threads={} native_thread_env={}",
         torch.get_num_threads(),
         torch_interop_threads,
@@ -431,8 +418,7 @@ def _force_cuda_math_sdp(device: torch.device) -> None:
     if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
         torch.backends.cuda.enable_cudnn_sdp(False)
     logger.info(
-        "Forced CUDA SDPA backend to math mode: "
-        "flash_sdp={}, mem_efficient_sdp={}, math_sdp={}",
+        "Forced CUDA SDPA backend to math mode: flash_sdp={}, mem_efficient_sdp={}, math_sdp={}",
         torch.backends.cuda.flash_sdp_enabled(),
         torch.backends.cuda.mem_efficient_sdp_enabled(),
         torch.backends.cuda.math_sdp_enabled(),
@@ -663,13 +649,11 @@ def _combine_runtime_inputs(inputs: list[Any]) -> Any:
         return torch.stack(tensors, dim=0)
     if isinstance(first, tuple):
         return tuple(
-            _combine_runtime_inputs([item[index] for item in inputs])
-            for index in range(len(first))
+            _combine_runtime_inputs([item[index] for item in inputs]) for index in range(len(first))
         )
     if isinstance(first, list):
         return [
-            _combine_runtime_inputs([item[index] for item in inputs])
-            for index in range(len(first))
+            _combine_runtime_inputs([item[index] for item in inputs]) for index in range(len(first))
         ]
     if isinstance(first, Mapping):
         keys = list(first.keys())
@@ -854,7 +838,6 @@ def _build_optimizer_for_parameters(
     return optimizer
 
 
-
 # ---------------------------------------------------------------------------
 # TorchLens runtime helpers
 # ---------------------------------------------------------------------------
@@ -890,10 +873,7 @@ def _require_boundary_graph_signature(boundary: Any) -> str:
     if not graph_signature:
         metadata = getattr(boundary, "metadata", None)
         if isinstance(metadata, Mapping):
-            graph_signature = (
-                metadata.get("graph_shape_hash")
-                or metadata.get("graph_signature")
-            )
+            graph_signature = metadata.get("graph_shape_hash") or metadata.get("graph_signature")
     if not graph_signature:
         raise RuntimeError("Cached TorchLens boundary payload did not expose graph_signature.")
     return str(graph_signature)
@@ -915,10 +895,7 @@ def _contiguous_boundary_payload(boundary: Any) -> Any:
     tensors = getattr(boundary, "tensors", None)
     if not isinstance(tensors, Mapping):
         return boundary
-    contiguous_tensors = {
-        key: _contiguous_tensor_tree(value)
-        for key, value in tensors.items()
-    }
+    contiguous_tensors = {key: _contiguous_tensor_tree(value) for key, value in tensors.items()}
     return replace(boundary, tensors=contiguous_tensors)
 
 
@@ -1109,8 +1086,7 @@ def _configure_raw_freeze_eval_forward_training(
     missing = sorted(suffix_name_set - set(dict(split_model.named_parameters()).keys()))
     if missing:
         raise RuntimeError(
-            "raw_freeze suffix parameters missing from split model: "
-            + ", ".join(missing)
+            "raw_freeze suffix parameters missing from split model: " + ", ".join(missing)
         )
     module_lookup = dict(split_model.named_modules())
     for module_name in modules_with_suffix:
@@ -1118,6 +1094,7 @@ def _configure_raw_freeze_eval_forward_training(
         if module is not None:
             module.train()
     return suffix_names, suffix_params
+
 
 # ---------------------------------------------------------------------------
 # Trainable-suffix loop (shared by freeze / split_rebuild / split_cached)
@@ -1243,6 +1220,7 @@ def _prepared_batches_from_cache(
         )
         for batch in cached_batches
     ]
+
 
 # ---------------------------------------------------------------------------
 # Runtime construction / boundary resolution
@@ -1662,8 +1640,7 @@ def plot_split_time_accuracy_subplots(
     ax_acc.set_ylabel("mAP (%)", fontsize=9)
 
     legend_handles = [
-        Patch(facecolor=mode_faces[mode], edgecolor=mode_edges[mode], label=mode)
-        for mode in modes
+        Patch(facecolor=mode_faces[mode], edgecolor=mode_edges[mode], label=mode) for mode in modes
     ]
     ax_time.legend(
         handles=legend_handles,
@@ -1682,7 +1659,6 @@ def plot_split_time_accuracy_subplots(
     fig.savefig(plots_dir / f"{stem}.png", dpi=220, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved subplot figure to {}", plots_dir / f"{stem}.pdf")
-
 
 
 # ---------------------------------------------------------------------------
@@ -1720,10 +1696,12 @@ def _run_raw_freeze_mode(
     training_started = time.perf_counter()
     for epoch_index in range(int(epochs)):
         epoch_started = time.perf_counter()
-        for batch_index, batch_ids in enumerate(_ordered_epoch_batches(
-            sample_ids,
-            batch_size=max(2, int(batch_size)),
-        )):
+        for batch_index, batch_ids in enumerate(
+            _ordered_epoch_batches(
+                sample_ids,
+                batch_size=max(2, int(batch_size)),
+            )
+        ):
             _synchronize(device)
             batch_started = time.perf_counter()
             inputs, targets = _prepare_raw_batch(
@@ -1791,10 +1769,12 @@ def _run_freeze_mode(
     training_started = time.perf_counter()
     for epoch_index in range(int(epochs)):
         epoch_started = time.perf_counter()
-        for batch_index, batch_ids in enumerate(_ordered_epoch_batches(
-            sample_ids,
-            batch_size=max(2, int(batch_size)),
-        )):
+        for batch_index, batch_ids in enumerate(
+            _ordered_epoch_batches(
+                sample_ids,
+                batch_size=max(2, int(batch_size)),
+            )
+        ):
             _synchronize(device)
             batch_started = time.perf_counter()
             inputs, targets = _prepare_raw_batch(
@@ -1819,9 +1799,7 @@ def _run_freeze_mode(
                 optimizer,
             )
             if not isinstance(loss, torch.Tensor):
-                raise RuntimeError(
-                    f"Freeze train_suffix returned {type(loss)!r}, not a tensor."
-                )
+                raise RuntimeError(f"Freeze train_suffix returned {type(loss)!r}, not a tensor.")
             _synchronize(device)
             batch_times.append(time.perf_counter() - batch_started)
             losses.append(float(loss.detach().cpu().item()))
@@ -1984,7 +1962,6 @@ def _build_cached_split_runtime_for_choice(
     )
 
 
-
 # ---------------------------------------------------------------------------
 # Per-repeat experiment driver
 # ---------------------------------------------------------------------------
@@ -1998,10 +1975,7 @@ def _assert_trainable_parameter_equivalence(rows: list[Mapping[str, Any]]) -> No
         mode = str(row.get("mode"))
         if mode not in aligned_suffix_modes:
             continue
-        if (
-            mode == "raw_freeze"
-            and row.get("raw_freeze_suffix_source") != "torchlens_runtime"
-        ):
+        if mode == "raw_freeze" and row.get("raw_freeze_suffix_source") != "torchlens_runtime":
             continue
         names = tuple(row.get("trainable_parameter_names") or ())
         count = int(row.get("trainable_parameter_count") or 0)
@@ -2161,20 +2135,14 @@ def _run_one_experiment(
     if optimizer is None:
         raise RuntimeError("No trainable suffix parameters were available for this run.")
     optimizer_param_ids = {
-        id(parameter)
-        for group in optimizer.param_groups
-        for parameter in group["params"]
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
     }
     suffix_name_set = set(suffix_param_names)
     suffix_param_ids = {
-        id(param)
-        for name, param in split_model.named_parameters()
-        if name in suffix_name_set
+        id(param) for name, param in split_model.named_parameters() if name in suffix_name_set
     }
     if optimizer_param_ids != suffix_param_ids:
-        raise RuntimeError(
-            "Optimizer parameter set does not match suffix trainable parameters."
-        )
+        raise RuntimeError("Optimizer parameter set does not match suffix trainable parameters.")
 
     before_metrics = _evaluate_metric_map50(
         model=edge_model,

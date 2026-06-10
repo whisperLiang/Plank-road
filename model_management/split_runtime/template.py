@@ -57,16 +57,12 @@ def fixed_split_runtime_template_key(
     )
     return FixedSplitRuntimeTemplateKey(
         **key.__dict__,
-        trace_batch_size=(
-            None if trace_batch_size is None else max(1, int(trace_batch_size))
-        ),
+        trace_batch_size=(None if trace_batch_size is None else max(1, int(trace_batch_size))),
         validated_batch_max=(
             None if validated_batch_max is None else max(1, int(validated_batch_max))
         ),
         runtime_batch_validation_signature=(
-            str(runtime_batch_validation_signature)
-            if runtime_batch_validation_signature
-            else None
+            str(runtime_batch_validation_signature) if runtime_batch_validation_signature else None
         ),
     )
 

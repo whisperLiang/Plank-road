@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import io
 import hashlib
 import json
 import os
@@ -29,6 +28,7 @@ from model_management.split_contract import (
     feature_abi_id,
     feature_layout_from_tensors,
 )
+
 HIGH_QUALITY_SYNC_PROTOCOL_VERSION = "high-quality-feature-label-shard.v2"
 UPLOAD_LEDGER_VERSION = "edge-sample-upload-ledger.v1"
 UPLOAD_LEDGER_FILENAME = "upload_ledger.json"
@@ -64,7 +64,9 @@ def _normalise_shard_dtype(value: object) -> str | None:
 
 
 def _stable_json(payload: object) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str
+    )
 
 
 def _hash_payload(payload: object) -> str:
@@ -221,25 +223,19 @@ def pack_high_quality_sync_bundle_to_file(
     first_record = selected[0] if selected else None
     model_id = str(context.get("model_id") or getattr(first_record, "model_id", "") or "")
     model_version = str(
-        context.get("model_version")
-        or getattr(first_record, "model_version", "")
-        or ""
+        context.get("model_version") or getattr(first_record, "model_version", "") or ""
     )
     edge_session_id = str(context.get("edge_session_id") or "").strip()
     front_version = str(
         context.get("front_version") or getattr(first_record, "front_version", "") or "0"
     )
     split_config_id = str(
-        context.get("split_config_id")
-        or getattr(first_record, "split_config_id", "")
-        or ""
+        context.get("split_config_id") or getattr(first_record, "split_config_id", "") or ""
     )
     canonical_split_key = str(context.get("canonical_split_key") or "").strip()
     edge_split_id = str(context.get("edge_split_id") or canonical_split_key or "").strip()
     input_tensor_shape = list(
-        context.get("input_tensor_shape")
-        or getattr(first_record, "input_tensor_shape", [])
-        or []
+        context.get("input_tensor_shape") or getattr(first_record, "input_tensor_shape", []) or []
     )
     input_resize_mode = str(
         context.get("input_resize_mode")
@@ -296,8 +292,12 @@ def pack_high_quality_sync_bundle_to_file(
             intermediate = sample_store.load_intermediate(record)
             result = sample_store.load_inference_result(record)
             feature_layout_meta = _feature_layout_metadata(intermediate)
-            inferred_layout_id = inferred_layout_id or str(feature_layout_meta.get("feature_layout_id") or "")
-            if not inferred_feature_layout and isinstance(feature_layout_meta.get("feature_layout"), Mapping):
+            inferred_layout_id = inferred_layout_id or str(
+                feature_layout_meta.get("feature_layout_id") or ""
+            )
+            if not inferred_feature_layout and isinstance(
+                feature_layout_meta.get("feature_layout"), Mapping
+            ):
                 inferred_feature_layout = {
                     str(label): dict(spec)
                     for label, spec in dict(feature_layout_meta.get("feature_layout") or {}).items()
@@ -363,7 +363,9 @@ def pack_high_quality_sync_bundle_to_file(
             )
             feature_abi_spec = build_feature_abi_spec(
                 model_id=model_id,
-                model_family=str(context.get("model_family") or runtime_contract.get("model_family") or ""),
+                model_family=str(
+                    context.get("model_family") or runtime_contract.get("model_family") or ""
+                ),
                 canonical_split_key=str(
                     canonical_split_key
                     or runtime_contract.get("logical_split_id")
@@ -392,7 +394,9 @@ def pack_high_quality_sync_bundle_to_file(
             "model_id": model_id,
             "model_family": str(context.get("model_family") or ""),
             "split_config_id": split_config_id,
-            "contract_id": None if runtime_contract.get("contract_id") in (None, "") else str(runtime_contract.get("contract_id")),
+            "contract_id": None
+            if runtime_contract.get("contract_id") in (None, "")
+            else str(runtime_contract.get("contract_id")),
             "feature_layout_id": inferred_layout_id,
             "feature_abi_id": feature_abi_value,
             "feature_abi_spec": dict(feature_abi_spec),
@@ -545,9 +549,7 @@ class HighQualitySampleSyncer:
         if not self._acquire_flush_lock(deadline):
             return False
         try:
-            record_groups = self._select_retryable_record_groups(
-                include_partial=include_partial
-            )
+            record_groups = self._select_retryable_record_groups(include_partial=include_partial)
             if not record_groups:
                 return True
             all_ok = True
@@ -761,9 +763,7 @@ class HighQualitySampleSyncer:
                 provider_context.get("input_tensor_shape", []) or []
             )
             context["input_resize_mode"] = provider_context.get("input_resize_mode")
-            context["runtime_contract"] = dict(
-                provider_context.get("runtime_contract") or {}
-            )
+            context["runtime_contract"] = dict(provider_context.get("runtime_contract") or {})
         return context
 
     def _mark_samples(

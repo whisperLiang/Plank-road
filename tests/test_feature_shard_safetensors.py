@@ -10,7 +10,6 @@ from cloud.feature_cache import FeatureShardRef, FeatureShardStore
 from model_management.payload import boundary_payload_from_tensors
 from tests.test_feature_shard_common import make_entries, make_folded_entries, runtime_context
 
-
 pytest.importorskip("safetensors")
 
 
@@ -49,7 +48,9 @@ def test_safetensors_shard_writes_stacked_leaves_and_reads_batch(tmp_path) -> No
     batch = store.read_batch([refs[2], refs[0]])
     assert list(batch.tensors) == ["boundary", "skip"]
     assert tuple(batch.tensors["boundary"].shape) == (2, 2, 3)
-    assert torch.equal(batch.tensors["boundary"][:, 0, 0], torch.tensor([2.0, 0.0], dtype=torch.float16))
+    assert torch.equal(
+        batch.tensors["boundary"][:, 0, 0], torch.tensor([2.0, 0.0], dtype=torch.float16)
+    )
 
 
 def test_safetensors_folded_batch_reads_with_symbolic_multiplier(tmp_path) -> None:
@@ -96,6 +97,10 @@ def test_safetensors_shape_bucket_split(tmp_path) -> None:
             },
         }
     )
-    store = FeatureShardStore(str(tmp_path), storage_format="safetensors_shard", shard_max_samples=8)
-    written = store.write_entries(entries, runtime_context=runtime_context(), generation="gen", source="test")
+    store = FeatureShardStore(
+        str(tmp_path), storage_format="safetensors_shard", shard_max_samples=8
+    )
+    written = store.write_entries(
+        entries, runtime_context=runtime_context(), generation="gen", source="test"
+    )
     assert len({entry["feature_ref"].shard_id for entry in written}) == 2

@@ -18,11 +18,9 @@ from cloud.feature_cache.types import (
     LabelRef,
     SampleTrainingRef,
     TrainingCacheView,
-    stable_digest,
 )
 from model_management.payload import BoundaryPayload
 from model_management.split_runtime.boundary_cache import BOUNDARY_CACHE_PROTOCOL
-
 
 RebuildProvider = Callable[..., Sequence[Mapping[str, Any] | BoundaryPayload | None]]
 
@@ -57,7 +55,10 @@ def _label_mapping(sample: Mapping[str, Any]) -> dict[str, Any]:
 
 def _label_ref(sample: Mapping[str, Any], *, label_path: str | None = None) -> LabelRef:
     labels = _label_mapping(sample)
-    label_source = str(sample.get("label_source") or ("teacher" if sample.get("sample_source") == "low_quality" else "edge_pseudo"))
+    label_source = str(
+        sample.get("label_source")
+        or ("teacher" if sample.get("sample_source") == "low_quality" else "edge_pseudo")
+    )
     return LabelRef(
         sample_id=str(sample.get("sample_id") or ""),
         path=label_path,
@@ -109,9 +110,19 @@ def _record_from_payload(
             "model_id": str(runtime_context.get("model_id") or ""),
             "split_config_id": str(runtime_context.get("split_config_id") or ""),
             "front_version": str(runtime_context.get("front_version") or "0"),
-            "input_tensor_shape": list(sample.get("input_tensor_shape") or runtime_context.get("input_tensor_shape") or []),
-            "input_resize_mode": str(sample.get("input_resize_mode") or runtime_context.get("input_resize_mode") or "direct_resize"),
-            **({"input_image_size": list(sample.get("input_image_size") or [])} if sample.get("input_image_size") is not None else {}),
+            "input_tensor_shape": list(
+                sample.get("input_tensor_shape") or runtime_context.get("input_tensor_shape") or []
+            ),
+            "input_resize_mode": str(
+                sample.get("input_resize_mode")
+                or runtime_context.get("input_resize_mode")
+                or "direct_resize"
+            ),
+            **(
+                {"input_image_size": list(sample.get("input_image_size") or [])}
+                if sample.get("input_image_size") is not None
+                else {}
+            ),
             "has_raw_sample": bool(sample.get("has_raw_sample", True)),
         }
     return dict(payload)
@@ -167,19 +178,27 @@ class FeatureCacheMaterializer:
             size = min(size, max(1, int(maximum)))
         return size
 
-    def _rebuild_features(self, plan: FeatureCachePreparePlan, stats: FeatureCacheStats) -> list[dict[str, object]]:
+    def _rebuild_features(
+        self, plan: FeatureCachePreparePlan, stats: FeatureCacheStats
+    ) -> list[dict[str, object]]:
         if not plan.rebuild_low_quality_from_raw:
             logger.info(
-                "[FeatureShard][Build] requested_samples=0 rebuilt_samples=0 storage_format={} shards_written=0 write_time=0.000s",
+                "[FeatureShard][Build] requested_samples=0 rebuilt_samples=0 "
+                "storage_format={} shards_written=0 write_time=0.000s",
                 self.store.storage_format,
             )
             return []
         if self.rebuild_provider is None:
-            raise RuntimeError("FeatureCacheMaterializer requires a rebuild_provider for raw rebuild entries.")
+            raise RuntimeError(
+                "FeatureCacheMaterializer requires a rebuild_provider for raw rebuild entries."
+            )
 
         pending = list(plan.rebuild_low_quality_from_raw)
         batch_size = self._effective_batch_size(
-            int(plan.runtime_context.get("feature_rebuild_batch_size") or self.feature_rebuild_batch_size)
+            int(
+                plan.runtime_context.get("feature_rebuild_batch_size")
+                or self.feature_rebuild_batch_size
+            )
         )
         stats.rebuild_batch_size = batch_size
         rebuilt_entries: list[dict[str, object]] = []
@@ -203,7 +222,8 @@ class FeatureCacheMaterializer:
                     batch_size = max(1, current_batch_size // 2)
                     stats.rebuild_batch_size = batch_size
                     logger.warning(
-                        "[FeatureShard][Build] OOM rebuilding batch_size={}; retrying with batch_size={}",
+                        "[FeatureShard][Build] OOM rebuilding batch_size={}; "
+                        "retrying with batch_size={}",
                         current_batch_size,
                         batch_size,
                     )
@@ -211,7 +231,9 @@ class FeatureCacheMaterializer:
                 if current_batch_size == 1:
                     sample_id = str(samples[0].get("sample_id") or "")
                     stats.rebuild_failures += 1
-                    logger.warning("[FeatureShard][Build] sample_id={} failed error={}", sample_id, exc)
+                    logger.warning(
+                        "[FeatureShard][Build] sample_id={} failed error={}", sample_id, exc
+                    )
                     offset += 1
                     continue
                 raise
@@ -227,7 +249,9 @@ class FeatureCacheMaterializer:
                 if payload is None:
                     stats.rebuild_failures += 1
                     continue
-                record = _record_from_payload(payload, sample=sample, runtime_context=plan.runtime_context)
+                record = _record_from_payload(
+                    payload, sample=sample, runtime_context=plan.runtime_context
+                )
                 write_entries.append(
                     {
                         "sample": sample,
@@ -246,9 +270,17 @@ class FeatureCacheMaterializer:
             stats.low_quality_rebuilt += len(written)
             rebuilt_entries.extend(written)
             offset += current_batch_size
-        stats.shards_written = len({str(dict(entry.get("feature_ref").to_dict()).get("shard_id")) for entry in rebuilt_entries if isinstance(entry.get("feature_ref"), FeatureShardRef)})
+        stats.shards_written = len(
+            {
+                str(dict(entry.get("feature_ref").to_dict()).get("shard_id"))
+                for entry in rebuilt_entries
+                if isinstance(entry.get("feature_ref"), FeatureShardRef)
+            }
+        )
         logger.info(
-            "[FeatureShard][Build] requested_samples={} rebuilt_samples={} storage_format={} shards_written={} shard_max_samples={} write_time={:.3f}s",
+            "[FeatureShard][Build] requested_samples={} rebuilt_samples={} "
+            "storage_format={} shards_written={} shard_max_samples={} "
+            "write_time={:.3f}s",
             len(plan.rebuild_low_quality_from_raw),
             stats.low_quality_rebuilt,
             self.store.storage_format,
@@ -258,7 +290,9 @@ class FeatureCacheMaterializer:
         )
         return rebuilt_entries
 
-    def rebuild_low_quality_features_only(self, plan: FeatureCachePreparePlan) -> list[dict[str, object]]:
+    def rebuild_low_quality_features_only(
+        self, plan: FeatureCachePreparePlan
+    ) -> list[dict[str, object]]:
         return self._rebuild_features(plan, plan.stats)
 
     def _view_dir(self, view_id: str) -> str:
@@ -347,12 +381,21 @@ class FeatureCacheMaterializer:
         for key, value in sample_ref.metadata.items():
             record.setdefault(str(key), value)
         record.setdefault("model_id", sample_ref.feature_ref.metadata.get("model_id", ""))
-        record.setdefault("split_config_id", sample_ref.feature_ref.metadata.get("split_config_id", ""))
+        record.setdefault(
+            "split_config_id", sample_ref.feature_ref.metadata.get("split_config_id", "")
+        )
         record.setdefault("front_version", sample_ref.metadata.get("front_version") or "")
         record.setdefault("input_tensor_shape", sample_ref.metadata.get("input_tensor_shape") or [])
         record.setdefault("input_resize_mode", sample_ref.metadata.get("input_resize_mode") or "")
-        record.setdefault("feature_abi_id", sample_ref.metadata.get("feature_abi_id") or sample_ref.feature_ref.feature_abi_id)
-        record.setdefault("runtime_identity_id", sample_ref.metadata.get("runtime_identity_id") or sample_ref.feature_ref.runtime_identity_id)
+        record.setdefault(
+            "feature_abi_id",
+            sample_ref.metadata.get("feature_abi_id") or sample_ref.feature_ref.feature_abi_id,
+        )
+        record.setdefault(
+            "runtime_identity_id",
+            sample_ref.metadata.get("runtime_identity_id")
+            or sample_ref.feature_ref.runtime_identity_id,
+        )
         return record
 
     def write_training_view(
@@ -397,8 +440,12 @@ class FeatureCacheMaterializer:
                 "model_id": str(record.get("model_id") or ""),
                 "split_config_id": str(record.get("split_config_id") or ""),
                 "front_version": str(record.get("front_version") or ""),
-                "feature_abi_id": str(record.get("feature_abi_id") or view_contract["feature_abi_id"]),
-                "runtime_identity_id": str(record.get("runtime_identity_id") or view_contract["runtime_identity_id"]),
+                "feature_abi_id": str(
+                    record.get("feature_abi_id") or view_contract["feature_abi_id"]
+                ),
+                "runtime_identity_id": str(
+                    record.get("runtime_identity_id") or view_contract["runtime_identity_id"]
+                ),
                 "contract_id": view_contract["contract_id"],
                 "source_contract_id": str(record.get("source_contract_id") or ""),
                 "source_feature_abi_id": str(record.get("source_feature_abi_id") or ""),
@@ -411,7 +458,11 @@ class FeatureCacheMaterializer:
                 "label_source": sample_ref.label_ref.label_source,
                 "pseudo_boxes": list(record.get("pseudo_boxes") or []),
                 "pseudo_labels": list(record.get("pseudo_labels") or []),
-                **({"pseudo_scores": list(record.get("pseudo_scores") or [])} if record.get("pseudo_scores") is not None else {}),
+                **(
+                    {"pseudo_scores": list(record.get("pseudo_scores") or [])}
+                    if record.get("pseudo_scores") is not None
+                    else {}
+                ),
             }
         stats.direct_refs_created = len(sample_refs)
         manifest_path = os.path.join(view_dir, "view_manifest.json")
@@ -463,7 +514,9 @@ class FeatureCacheMaterializer:
         stats.metadata_index_time += time.perf_counter() - metadata_started
         stats.total_prepare_time = base_prepare_time + (time.perf_counter() - write_started)
         logger.info(
-            "[FeatureCache][View] view_id={} generation={} samples={} feature_layout_id={} contract_id={} mode=shard_ref manifest_write_time={:.3f}s metadata_index_time={:.3f}s",
+            "[FeatureCache][View] view_id={} generation={} samples={} "
+            "feature_layout_id={} contract_id={} mode=shard_ref "
+            "manifest_write_time={:.3f}s metadata_index_time={:.3f}s",
             view_id,
             generation,
             len(sample_refs),
@@ -473,7 +526,9 @@ class FeatureCacheMaterializer:
             stats.metadata_index_time,
         )
         logger.info(
-            "[FeatureCache][Materialize] view_id={} direct_refs={} rebuilt={} files_copied={} bytes_copied={} rebuild_time={:.3f}s manifest_write_time={:.3f}s total_prepare_time={:.3f}s",
+            "[FeatureCache][Materialize] view_id={} direct_refs={} rebuilt={} "
+            "files_copied={} bytes_copied={} rebuild_time={:.3f}s "
+            "manifest_write_time={:.3f}s total_prepare_time={:.3f}s",
             view_id,
             stats.direct_refs_created,
             stats.low_quality_rebuilt,
@@ -496,7 +551,9 @@ class FeatureCacheMaterializer:
         return FeatureCachePrepareResult(
             plan=result_plan,
             view=view,
-            feature_refs={sample.feature_ref.sample_id: sample.feature_ref for sample in sample_refs},
+            feature_refs={
+                sample.feature_ref.sample_id: sample.feature_ref for sample in sample_refs
+            },
             records=metadata_samples,
             metadata_by_id=metadata_samples,
             bundle_info={
@@ -522,7 +579,9 @@ class FeatureCacheMaterializer:
         rebuilt_entries = self._rebuild_features(plan, stats)
         entries.extend(rebuilt_entries)
         record_overrides = {
-            str(dict(entry.get("sample") or {}).get("sample_id") or ""): dict(entry.get("record") or {})
+            str(dict(entry.get("sample") or {}).get("sample_id") or ""): dict(
+                entry.get("record") or {}
+            )
             for entry in rebuilt_entries
             if isinstance(entry.get("record"), Mapping)
         }

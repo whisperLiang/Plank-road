@@ -15,7 +15,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from edge.sample_quality import HIGH_QUALITY, LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
 
-
 TEACHER_VERIFIED_HIGH = "teacher_verified_high_quality"
 TEACHER_VERIFIED_LOW = "teacher_verified_low_quality"
 
@@ -132,7 +131,9 @@ def evaluate_agreement(
         LOW_QUALITY: {TEACHER_VERIFIED_HIGH: 0, TEACHER_VERIFIED_LOW: 0},
     }
     for sample in samples:
-        predicted_quality = str(sample.get("predicted_quality") or sample.get("quality") or LOW_QUALITY)
+        predicted_quality = str(
+            sample.get("predicted_quality") or sample.get("quality") or LOW_QUALITY
+        )
         if predicted_quality not in {HIGH_QUALITY, LOW_QUALITY}:
             predicted_quality = LOW_QUALITY
         verified_quality, match_stats = teacher_verified_quality(
@@ -151,10 +152,20 @@ def evaluate_agreement(
         )
 
     total = len(rows)
-    predicted_high = confusion[HIGH_QUALITY][TEACHER_VERIFIED_HIGH] + confusion[HIGH_QUALITY][TEACHER_VERIFIED_LOW]
-    predicted_low = confusion[LOW_QUALITY][TEACHER_VERIFIED_HIGH] + confusion[LOW_QUALITY][TEACHER_VERIFIED_LOW]
-    teacher_high = confusion[HIGH_QUALITY][TEACHER_VERIFIED_HIGH] + confusion[LOW_QUALITY][TEACHER_VERIFIED_HIGH]
-    teacher_low = confusion[HIGH_QUALITY][TEACHER_VERIFIED_LOW] + confusion[LOW_QUALITY][TEACHER_VERIFIED_LOW]
+    predicted_high = (
+        confusion[HIGH_QUALITY][TEACHER_VERIFIED_HIGH]
+        + confusion[HIGH_QUALITY][TEACHER_VERIFIED_LOW]
+    )
+    predicted_low = (
+        confusion[LOW_QUALITY][TEACHER_VERIFIED_HIGH] + confusion[LOW_QUALITY][TEACHER_VERIFIED_LOW]
+    )
+    teacher_high = (
+        confusion[HIGH_QUALITY][TEACHER_VERIFIED_HIGH]
+        + confusion[LOW_QUALITY][TEACHER_VERIFIED_HIGH]
+    )
+    teacher_low = (
+        confusion[HIGH_QUALITY][TEACHER_VERIFIED_LOW] + confusion[LOW_QUALITY][TEACHER_VERIFIED_LOW]
+    )
     true_high = confusion[HIGH_QUALITY][TEACHER_VERIFIED_HIGH]
     false_trusted = confusion[HIGH_QUALITY][TEACHER_VERIFIED_LOW]
     true_low = confusion[LOW_QUALITY][TEACHER_VERIFIED_LOW]

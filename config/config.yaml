@@ -7,6 +7,31 @@ sample_pool:
  compact_threshold: 0.3
  enable_timing_logs: false
 
+baseline:
+ enabled: false
+ method: accuracy_trigger_cloud_retraining
+ run_id: null
+ results_root: results/baselines_distributed
+ pure_edge_local_updating:
+  label_source: pseudo_label
+  local_metrics: true
+  upload_metrics_to_cloud: false
+  upload_frames_to_cloud: false
+  use_cloud_teacher: false
+ accuracy_trigger_cloud_retraining:
+  reuse_plank_road_frame_filter: true
+  upload_keyframes_only: true
+  trigger_on_cloud_comparison: true
+  training_strategy: frozen_training
+  return_model_update: true
+ ekya_style_centralized_scheduling:
+  upload_raw_frames: true
+  use_frame_filter: false
+  cloud_inference: true
+  return_cloud_inference_to_edge: true
+  training_strategy: ekya_style
+  enable_micro_profiling: true
+
 client:
  # the source video
  source:

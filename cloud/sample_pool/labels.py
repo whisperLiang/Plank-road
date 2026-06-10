@@ -8,7 +8,6 @@ from model_management.detection_box_projection import (
     canonicalize_labels_to_original_xyxy,
 )
 
-
 POOL_LABEL_COORDINATE_SPACE = ORIGINAL_XYXY
 POOL_LABEL_RUNTIME_VERSION = "fixed-split-pool-labels.v1"
 POOL_LABEL_METADATA_FIELDS = (

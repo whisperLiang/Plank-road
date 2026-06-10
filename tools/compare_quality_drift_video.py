@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -32,8 +32,12 @@ def _boxes_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     inter = inter_w * inter_h
     if inter <= 0.0:
         return 0.0
-    area_a = max(0.0, float(box_a[2]) - float(box_a[0])) * max(0.0, float(box_a[3]) - float(box_a[1]))
-    area_b = max(0.0, float(box_b[2]) - float(box_b[0])) * max(0.0, float(box_b[3]) - float(box_b[1]))
+    area_a = max(0.0, float(box_a[2]) - float(box_a[0])) * max(
+        0.0, float(box_a[3]) - float(box_a[1])
+    )
+    area_b = max(0.0, float(box_b[2]) - float(box_b[0])) * max(
+        0.0, float(box_b[3]) - float(box_b[1])
+    )
     union = area_a + area_b - inter
     if union <= 0.0:
         return 0.0
@@ -173,7 +177,9 @@ def _init_splitter(detector: Object_Detection, cfg, first_frame: np.ndarray, pla
         cache_path=str(plan_path),
         splitter=splitter,
     )
-    splitter.split(candidate_id=plan.candidate_id, boundary_tensor_labels=plan.boundary_tensor_labels)
+    splitter.split(
+        candidate_id=plan.candidate_id, boundary_tensor_labels=plan.boundary_tensor_labels
+    )
     return splitter, plan
 
 
@@ -212,9 +218,15 @@ def _flag_metrics(
 ) -> dict[str, Any]:
     positives = [row for row in rows if bool(row[flag_key])]
     poor_fit = [row for row in rows if float(row["fit_f1"]) <= poor_fit_threshold]
-    tp = sum(1 for row in rows if bool(row[flag_key]) and float(row["fit_f1"]) <= poor_fit_threshold)
+    tp = sum(
+        1 for row in rows if bool(row[flag_key]) and float(row["fit_f1"]) <= poor_fit_threshold
+    )
     fp = sum(1 for row in rows if bool(row[flag_key]) and float(row["fit_f1"]) > poor_fit_threshold)
-    fn = sum(1 for row in rows if (not bool(row[flag_key])) and float(row["fit_f1"]) <= poor_fit_threshold)
+    fn = sum(
+        1
+        for row in rows
+        if (not bool(row[flag_key])) and float(row["fit_f1"]) <= poor_fit_threshold
+    )
     precision = tp / float(max(1, tp + fp))
     recall = tp / float(max(1, tp + fn))
     return {
@@ -246,7 +258,9 @@ def _summarize_model(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "count": len(drift_rows),
             "frames": [int(row["frame_index"]) for row in drift_rows],
             "summary": _subset_summary(drift_rows),
-            "non_drift_summary": _subset_summary([row for row in rows if not row["drift_detected"]]),
+            "non_drift_summary": _subset_summary(
+                [row for row in rows if not row["drift_detected"]]
+            ),
         },
         "low_quality_alignment": _flag_metrics(
             rows,
@@ -365,7 +379,9 @@ def run_video_compare(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare quality/drift triggers across edge models on a real video.")
+    parser = argparse.ArgumentParser(
+        description="Compare quality/drift triggers across edge models on a real video."
+    )
     parser.add_argument("--config", type=Path, default=Path("config/config.yaml"))
     parser.add_argument("--video", type=Path, default=Path("video_data/road.mp4"))
     parser.add_argument("--max-frames", type=int, default=90)

@@ -2,7 +2,6 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-
 from lyapunov_plot_common import (
     ACTION_LEGEND_LABELS,
     ACTION_TICK_LABELS,
@@ -13,7 +12,6 @@ from lyapunov_plot_common import (
     raw_plus_feature_pressure,
     representative_payloads,
 )
-
 
 plt.rcParams.update(
     {
@@ -188,11 +186,17 @@ def plot_action_and_queue_evolution(data, stem="virtual_queue_evolution_fixed"):
     ax1.set_yticks([0, 1, 2])
     ax1.set_yticklabels(ACTION_TICK_LABELS)
     ax1.set_ylabel("Action")
-    
+
     # Create legend with action descriptions using patches
     from matplotlib.patches import Patch
-    legend_labels = ["Selected action"] + [f"{ACTION_TICK_LABELS[i]}: {ACTION_LEGEND_LABELS[i]}" for i in range(len(ACTION_TICK_LABELS))]
-    legend_handles = [Patch(facecolor='#1f77b4', label=legend_labels[0])] + [Patch(facecolor='none', edgecolor='none', label=lbl) for lbl in legend_labels[1:]]
+
+    legend_labels = ["Selected action"] + [
+        f"{ACTION_TICK_LABELS[i]}: {ACTION_LEGEND_LABELS[i]}"
+        for i in range(len(ACTION_TICK_LABELS))
+    ]
+    legend_handles = [Patch(facecolor="#1f77b4", label=legend_labels[0])] + [
+        Patch(facecolor="none", edgecolor="none", label=lbl) for lbl in legend_labels[1:]
+    ]
     ax1.legend(
         handles=legend_handles,
         loc="upper left",

@@ -3,7 +3,6 @@ import sys
 
 from loguru import logger
 
-
 _CONFIGURED = False
 
 

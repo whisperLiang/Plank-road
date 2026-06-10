@@ -3,8 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, Mapping
-
+from typing import Mapping
 
 SAFETENSORS_SHARD = "safetensors_shard"
 NPY_MEMMAP_SHARD = "npy_memmap_shard"
@@ -207,9 +206,7 @@ class FeatureShardRef:
             dtype=str(payload.get("dtype") or ""),
             shape_bucket=str(payload.get("shape_bucket") or ""),
             leaf_keys=[str(key) for key in list(payload.get("leaf_keys") or [])],
-            passthrough_keys=[
-                str(key) for key in list(payload.get("passthrough_keys") or [])
-            ],
+            passthrough_keys=[str(key) for key in list(payload.get("passthrough_keys") or [])],
             metadata=dict(payload.get("metadata") or {}),
             feature_abi_id=str(payload.get("feature_abi_id") or ""),
             runtime_identity_id=str(payload.get("runtime_identity_id") or ""),

@@ -32,9 +32,7 @@ def _ensure_within_root(path: Path, root: Path) -> Path:
     try:
         resolved_path.relative_to(resolved_root)
     except ValueError as exc:
-        raise ValueError(
-            f"cache path escapes the server workspace: {resolved_path}"
-        ) from exc
+        raise ValueError(f"cache path escapes the server workspace: {resolved_path}") from exc
     return resolved_path
 
 
@@ -82,10 +80,12 @@ def _uploaded_workspace_dir(
     edge_id: int | str,
     request_kind: str,
 ) -> Path:
-    safe_edge_id = "".join(
-        character if str(character).isalnum() else "_"
-        for character in str(edge_id).strip()
-    ) or "unknown"
+    safe_edge_id = (
+        "".join(
+            character if str(character).isalnum() else "_" for character in str(edge_id).strip()
+        )
+        or "unknown"
+    )
     request_id = uuid.uuid4().hex
     return workspace_root / request_kind / f"edge_{safe_edge_id}" / request_id
 

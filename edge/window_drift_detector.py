@@ -59,7 +59,9 @@ class WindowDriftDetector:
         if count == 0:
             return DriftWindowState(window_id, False, 0.0, 0.0, [])
 
-        low_quality_rate = sum(1 for item in records if item.quality_bucket == LOW_QUALITY) / float(count)
+        low_quality_rate = sum(1 for item in records if item.quality_bucket == LOW_QUALITY) / float(
+            count
+        )
 
         reasons: list[str] = []
         abnormal = False

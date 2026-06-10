@@ -35,7 +35,6 @@ class Task:
         self.detection_class = []
         self.detection_score = []
 
-
     def add_result(self, detection_boxes, detection_class, detection_score):
         if detection_boxes is not None:
             assert len(detection_boxes) == len(detection_class) == len(detection_score)

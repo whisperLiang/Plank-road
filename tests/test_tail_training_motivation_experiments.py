@@ -191,9 +191,7 @@ def test_freeze_rebuilds_prefix_each_batch_without_cached_boundaries(monkeypatch
         exp,
         "train_split_suffix_batch",
         lambda runtime_arg, batch_boundary, batch_targets, loss_fn, optimizer_arg: (
-            train_calls.append(
-                (runtime_arg, batch_boundary, batch_targets, loss_fn, optimizer_arg)
-            )
+            train_calls.append((runtime_arg, batch_boundary, batch_targets, loss_fn, optimizer_arg))
             or torch.tensor(0.25)
         ),
     )

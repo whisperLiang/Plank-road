@@ -8,7 +8,9 @@ import numpy as np
 from model_management.split_candidate import CandidateProfile, SplitCandidate
 
 
-def _profile_by_id(candidates: Sequence[SplitCandidate], profiles: Sequence[CandidateProfile]) -> dict[str, CandidateProfile]:
+def _profile_by_id(
+    candidates: Sequence[SplitCandidate], profiles: Sequence[CandidateProfile]
+) -> dict[str, CandidateProfile]:
     profile_map = {profile.candidate_id: profile for profile in profiles}
     for candidate in candidates:
         profile_map.setdefault(
@@ -180,4 +182,3 @@ class SplitCandidateSelector:
 
     def cache_profile(self, profile: CandidateProfile) -> None:
         self.profiles[profile.candidate_id] = profile
-

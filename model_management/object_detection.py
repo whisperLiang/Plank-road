@@ -1,9 +1,9 @@
 import threading
 
 import cv2
-import torch
 import numpy as np
-from loguru import logger
+import torch
+
 from model_management.inference.artifacts import InferenceArtifacts
 from model_management.inference.confidence import summarize_detection_confidence
 from model_management.inference.prediction_filter import (
@@ -34,13 +34,14 @@ def bgr_image_to_tensor(img, *, target_device=None):
     tensor = tensor.permute(2, 0, 1).float().div_(255.0)
     return tensor.to(target_device or device)
 
+
 class Object_Detection:
     def __init__(self, config, type):
         self.type = type
         self.config = config
         self.model_lock = threading.Lock()
 
-        if type == 'small inference':
+        if type == "small inference":
             self.model_name = config.lightweight
         else:
             self.model_name = config.golden
@@ -49,9 +50,7 @@ class Object_Detection:
 
     def load_model(self):
         explicit_weights_path = (
-            getattr(self.config, "weights_path", None)
-            if self.type == 'small inference'
-            else None
+            getattr(self.config, "weights_path", None) if self.type == "small inference" else None
         )
         build_kwargs = {}
         if get_model_family(self.model_name) == "tinynext":
@@ -107,7 +106,8 @@ class Object_Detection:
                     ):
                         input_tensor_shape = [int(dim) for dim in splitter_input[0].shape]
                     replayed, split_payload = splitter.replay_inference(
-                        splitter_input, return_split_output=True,
+                        splitter_input,
+                        return_split_output=True,
                     )
                     observables = summarize_split_runtime_observables(
                         self.model,
@@ -122,7 +122,8 @@ class Object_Detection:
                         orig_image=img,
                     )
                     pred_boxes, pred_class, pred_score = self._parse_prediction_output(
-                        replayed, self.threshold_low,
+                        replayed,
+                        self.threshold_low,
                     )
                 else:
                     pred_boxes, pred_class, pred_score = self.get_model_prediction(
@@ -156,8 +157,7 @@ class Object_Detection:
         low_threshold_scores = list(pred_score)
         final_detection_threshold = self._resolve_final_detection_threshold()
         high_keep_indices = [
-            index for index, score in enumerate(pred_score)
-            if score > final_detection_threshold
+            index for index, score in enumerate(pred_score) if score > final_detection_threshold
         ]
         if not high_keep_indices:
             detection_boxes = []
@@ -210,7 +210,6 @@ class Object_Detection:
             artifacts.final_detection_scores or None,
         )
 
-
     def large_inference(self, img, threshold=None):
         if threshold is None:
             threshold = self.threshold_high
@@ -250,7 +249,7 @@ class Object_Detection:
 
     def get_model_prediction(self, img, threshold, model=None):
         img = self._prepare_image_tensor(img)
-        #get the inference result
+        # get the inference result
         with torch.inference_mode():
             if model is None:
                 res = self.model([img])
@@ -275,7 +274,9 @@ class Object_Detection:
         configured_floor = 0.5
         config_obj = getattr(self, "config", None)
         if config_obj is not None:
-            configured_floor = float(getattr(config_obj, "final_detection_threshold", configured_floor))
+            configured_floor = float(
+                getattr(config_obj, "final_detection_threshold", configured_floor)
+            )
         threshold_high = float(getattr(self, "threshold_high", configured_floor))
         return max(threshold_high, configured_floor)
 
@@ -326,9 +327,9 @@ class Object_Detection:
         if not isinstance(first, dict):
             return None, None, None
 
-        labels_t = first.get('labels')
-        boxes_t = first.get('boxes')
-        scores_t = first.get('scores')
+        labels_t = first.get("labels")
+        boxes_t = first.get("boxes")
+        scores_t = first.get("scores")
         if labels_t is None or boxes_t is None or scores_t is None:
             return None, None, None
 

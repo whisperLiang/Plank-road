@@ -48,17 +48,17 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
 from torch.utils.checkpoint import (
     check_backward_validity,
     get_device_states,
     set_device_states,
 )
-from loguru import logger
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1.  Activation Clipper — sparse activation storage for backpropagation
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 class ActivationClipper:
     """Prunes activation tensors by keeping only the top-k elements by
@@ -130,7 +130,9 @@ def _retained_element_count(numel: int, clip_ratio: float) -> int:
     return max(0, min(int(numel), int(retained)))
 
 
-def _spectral_entropy_1d(x: torch.Tensor, *, max_samples: int = 2048, eps: float = 1e-12) -> float | None:
+def _spectral_entropy_1d(
+    x: torch.Tensor, *, max_samples: int = 2048, eps: float = 1e-12
+) -> float | None:
     """Compute normalised spectral entropy of a 1D signal.
 
     Returns a value in [0, 1] (higher => more complex spectrum).
@@ -158,6 +160,7 @@ def _spectral_entropy_1d(x: torch.Tensor, *, max_samples: int = 2048, eps: float
 # ═══════════════════════════════════════════════════════════════════════════
 # 2.  AutoFreezeConv2d — Conv2d with Dynamic Activation Sparsity
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 class AutoFreezeConv2d(nn.Conv2d):
     """Drop-in replacement for ``nn.Conv2d`` that supports per-layer
@@ -316,6 +319,7 @@ class _AutoFreezeConv2dFn(torch.autograd.Function):
 # 3.  DASBatchNorm2d — BatchNorm2d with DAS metadata tracking
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 class DASBatchNorm2d(nn.BatchNorm2d):
     """Drop-in replacement for ``nn.BatchNorm2d`` with Dynamic Activation
     Sparsity metadata tracking.
@@ -339,8 +343,13 @@ class DASBatchNorm2d(nn.BatchNorm2d):
         num: int = 0,
         bn_only: bool = False,
     ):
-        super().__init__(num_features, eps=eps, momentum=momentum, affine=affine,
-                         track_running_stats=track_running_stats)
+        super().__init__(
+            num_features,
+            eps=eps,
+            momentum=momentum,
+            affine=affine,
+            track_running_stats=track_running_stats,
+        )
         self.name = name
         self.num = num
         self.clip_ratio: float = 0.0
@@ -384,8 +393,9 @@ class DASBatchNorm2d(nn.BatchNorm2d):
         weight_hat = weight * weight_hat
         bias_hat = weight * bias_hat + bias
 
-        return F.batch_norm(x, None, None, weight_hat, bias_hat,
-                            training=True, momentum=0.0, eps=self.eps)
+        return F.batch_norm(
+            x, None, None, weight_hat, bias_hat, training=True, momentum=0.0, eps=self.eps
+        )
 
 
 class _DASBatchNorm2dFn(torch.autograd.Function):
@@ -393,8 +403,9 @@ class _DASBatchNorm2dFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, module: DASBatchNorm2d, x, weight, bias):
-        check_backward_validity([x] + ([weight] if weight is not None else [])
-                                + ([bias] if bias is not None else []))
+        check_backward_validity(
+            [x] + ([weight] if weight is not None else []) + ([bias] if bias is not None else [])
+        )
         ctx.module = module
 
         # RNG state
@@ -410,9 +421,16 @@ class _DASBatchNorm2dFn(torch.autograd.Function):
             running_var = module.running_var.clone()
 
             # Standard BN forward
-            y = F.batch_norm(x, module.running_mean, module.running_var,
-                             weight, bias, module.training,
-                             module.momentum, module.eps)
+            y = F.batch_norm(
+                x,
+                module.running_mean,
+                module.running_var,
+                weight,
+                bias,
+                module.training,
+                module.momentum,
+                module.eps,
+            )
 
             module.activation_size = int(x.numel())
 
@@ -423,8 +441,7 @@ class _DASBatchNorm2dFn(torch.autograd.Function):
             clipped_x = clipper.clip(x, ctx)
             clipped_x.requires_grad = x.requires_grad
 
-            ctx.save_for_backward(clipped_x, batch_mean, batch_var,
-                                  running_mean, running_var)
+            ctx.save_for_backward(clipped_x, batch_mean, batch_var, running_mean, running_var)
         return y
 
     @staticmethod
@@ -453,8 +470,13 @@ class _DASBatchNorm2dFn(torch.autograd.Function):
 
             with torch.enable_grad():
                 y = module._bn_forward_for_backward(
-                    detached_x, weight, bias,
-                    running_mean, running_var, batch_mean, batch_var,
+                    detached_x,
+                    weight,
+                    bias,
+                    running_mean,
+                    running_var,
+                    batch_mean,
+                    batch_var,
                 )
 
             with torch.no_grad():
@@ -473,6 +495,7 @@ class _DASBatchNorm2dFn(torch.autograd.Function):
 # ═══════════════════════════════════════════════════════════════════════════
 # 4.  AutoFreezeFC — Linear with Dynamic Activation Sparsity
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 class DASGroupNorm(nn.GroupNorm):
     """Drop-in replacement for ``nn.GroupNorm`` with sparse activation caching."""
@@ -526,8 +549,9 @@ class _DASGroupNormFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, module: DASGroupNorm, x, weight, bias):
-        check_backward_validity([x] + ([weight] if weight is not None else [])
-                                + ([bias] if bias is not None else []))
+        check_backward_validity(
+            [x] + ([weight] if weight is not None else []) + ([bias] if bias is not None else [])
+        )
         ctx.module = module
         ctx.fwd_cpu_state = torch.get_rng_state()
         ctx.had_cuda_in_fwd = torch.cuda._initialized
@@ -647,8 +671,9 @@ class _DASLayerNormFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, module: DASLayerNorm, x, weight, bias):
-        check_backward_validity([x] + ([weight] if weight is not None else [])
-                                + ([bias] if bias is not None else []))
+        check_backward_validity(
+            [x] + ([weight] if weight is not None else []) + ([bias] if bias is not None else [])
+        )
         ctx.module = module
         ctx.fwd_cpu_state = torch.get_rng_state()
         ctx.had_cuda_in_fwd = torch.cuda._initialized
@@ -684,7 +709,11 @@ class _DASLayerNormFn(torch.autograd.Function):
             detached_x.requires_grad = clipped_x.requires_grad
             if module.elementwise_affine:
                 weight = module.weight.detach().requires_grad_(module.weight.requires_grad)
-                bias = None if module.bias is None else module.bias.detach().requires_grad_(module.bias.requires_grad)
+                bias = (
+                    None
+                    if module.bias is None
+                    else module.bias.detach().requires_grad_(module.bias.requires_grad)
+                )
             else:
                 weight = bias = None
 
@@ -859,6 +888,7 @@ def compute_tgi(
 # 6.  DASTrainer — high-level API for DAS-enabled training
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 class DASTrainer:
     """Manages Dynamic Activation Sparsity for any ``nn.Module``.
 
@@ -924,8 +954,13 @@ class DASTrainer:
         self._n_ln = self._replace_layer_norm(model, model.__class__.__name__)
         self._n_fc = self._replace_fc(model, model.__class__.__name__)
         logger.info(
-            "[DAS] Replaced {} Conv + {} BN + {} GN + {} LN + {} FC layers with AutoFreeze versions.",
-            self._n_conv, self._n_bn, self._n_gn, self._n_ln, self._n_fc,
+            "[DAS] Replaced {} Conv + {} BN + {} GN + {} LN + {} FC layers "
+            "with AutoFreeze versions.",
+            self._n_conv,
+            self._n_bn,
+            self._n_gn,
+            self._n_ln,
+            self._n_fc,
         )
         if self.use_spectral_entropy:
             self.enable_spectral_entropy_tracking(True)
@@ -994,7 +1029,9 @@ class DASTrainer:
     def _replace_bn(self, model: nn.Module, name: str, count: int = 0) -> int:
         copy_keys = ["eps", "momentum", "affine", "track_running_stats"]
         for mod_name, target_mod in model.named_children():
-            if isinstance(target_mod, nn.BatchNorm2d) and not isinstance(target_mod, DASBatchNorm2d):
+            if isinstance(target_mod, nn.BatchNorm2d) and not isinstance(
+                target_mod, DASBatchNorm2d
+            ):
                 count += 1
                 new_mod = DASBatchNorm2d(
                     target_mod.num_features,
@@ -1038,7 +1075,9 @@ class DASTrainer:
                 new_mod = DASLayerNorm(
                     target_mod.normalized_shape,
                     **{k: getattr(target_mod, k) for k in copy_keys},
-                    bias=(target_mod.bias is not None) if getattr(target_mod, "elementwise_affine", False) else False,
+                    bias=(target_mod.bias is not None)
+                    if getattr(target_mod, "elementwise_affine", False)
+                    else False,
                     name=f"{name}.{mod_name}",
                     num=count,
                     bn_only=self.bn_only,
@@ -1107,9 +1146,7 @@ class DASTrainer:
             self._pruning_ratios = {}
             return {}
         finite_scores = {
-            key: float(value)
-            for key, value in scores.items()
-            if math.isfinite(float(value))
+            key: float(value) for key, value in scores.items() if math.isfinite(float(value))
         }
         if not finite_scores:
             self._pruning_ratios = {}
@@ -1120,8 +1157,7 @@ class DASTrainer:
             self._pruning_ratios = pruning_ratios
             return pruning_ratios
         pruning_ratios = {
-            key: min(1.0, max(0.0, 1.0 - value / max_score))
-            for key, value in finite_scores.items()
+            key: min(1.0, max(0.0, 1.0 - value / max_score)) for key, value in finite_scores.items()
         }
         self._pruning_ratios = pruning_ratios
         return pruning_ratios
@@ -1129,7 +1165,9 @@ class DASTrainer:
     def refresh_pruning_ratios_from_entropy(self) -> dict[str, float]:
         """Compute pruning ratios from entropy-based importance (no gradients)."""
         pruning_ratios = self._importance_scores_to_pruning_ratios(self._spectral_entropy_scores())
-        logger.debug("[DAS] Computed pruning ratios from entropy for {} layers.", len(pruning_ratios))
+        logger.debug(
+            "[DAS] Computed pruning ratios from entropy for {} layers.", len(pruning_ratios)
+        )
         return pruning_ratios
 
     def refresh_pruning_ratios_from_spectral_entropy(self) -> dict[str, float]:
@@ -1301,8 +1339,9 @@ class DASTrainer:
         pruning_ratios = self._importance_scores_to_pruning_ratios(tgi)
 
         self.model.zero_grad()
-        logger.debug("[DAS] Computed pruning ratios (probe_with_targets) for {} layers.",
-                     len(pruning_ratios))
+        logger.debug(
+            "[DAS] Computed pruning ratios (probe_with_targets) for {} layers.", len(pruning_ratios)
+        )
         return pruning_ratios
 
     # ------------------------------------------------------------------
@@ -1328,8 +1367,10 @@ class DASTrainer:
         """
         # Phase 1: Probe
         if probe_loss_fn is None:
+
             def _entropy(logits):
                 return -(logits.softmax(1) * logits.log_softmax(1)).sum(1).mean()
+
             probe_loss_fn = _entropy
 
         try:
@@ -1369,8 +1410,11 @@ class DASTrainer:
             if isinstance(mod, _DAS_MODULE_TYPES):
                 act = getattr(mod, "activation_size", 0)
                 bc = getattr(mod, "back_cache_size", 0)
-                per_layer[name] = {"activation_size": act, "back_cache_size": bc,
-                                   "clip_ratio": getattr(mod, "clip_ratio", 0.0)}
+                per_layer[name] = {
+                    "activation_size": act,
+                    "back_cache_size": bc,
+                    "clip_ratio": getattr(mod, "clip_ratio", 0.0),
+                }
                 total += act
                 cached += bc
         return {
@@ -1384,6 +1428,7 @@ class DASTrainer:
 # ═══════════════════════════════════════════════════════════════════════════
 # 7.  Integration helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def apply_das_to_model(
     model: nn.Module,
@@ -1471,7 +1516,12 @@ def apply_das_to_tail(
     trainer._n_fc = n_fc
     logger.info(
         "[DAS] Applied to tail modules {}: {} Conv + {} BN + {} GN + {} LN + {} FC replaced.",
-        tail_module_names, n_conv, n_bn, n_gn, n_ln, n_fc,
+        tail_module_names,
+        n_conv,
+        n_bn,
+        n_gn,
+        n_ln,
+        n_fc,
     )
     if trainer.use_spectral_entropy:
         trainer.enable_spectral_entropy_tracking(True)

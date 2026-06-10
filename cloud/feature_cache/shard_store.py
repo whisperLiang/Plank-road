@@ -14,8 +14,8 @@ from cloud.feature_cache.shard_writer import SHARD_FORMAT_VERSION, FeatureShardW
 from cloud.feature_cache.types import (
     NPY_MEMMAP_SHARD,
     SAFETENSORS_SHARD,
-    FeatureShardRef,
     SUPPORTED_STORAGE_FORMATS,
+    FeatureShardRef,
 )
 
 
@@ -158,16 +158,24 @@ class FeatureShardStore:
         )
         os.makedirs(target_dir, exist_ok=True)
         for shard in list(shard_entries or []):
-            storage_format = str(shard.get("storage_format") or manifest.get("storage_format") or "")
+            storage_format = str(
+                shard.get("storage_format") or manifest.get("storage_format") or ""
+            )
             if storage_format not in self.accepted_storage_formats:
                 raise ValueError(f"Rejected uploaded shard storage_format={storage_format!r}.")
             shard_id = str(shard.get("shard_id") or "")
             if not shard_id:
                 raise ValueError("Uploaded feature shard is missing shard_id.")
             if storage_format == SAFETENSORS_SHARD:
-                source_file = os.path.join(bundle_root, str(shard.get("shard_file") or "").replace("/", os.sep))
-                source_index = os.path.join(bundle_root, str(shard.get("index_file") or "").replace("/", os.sep))
-                source_meta = os.path.join(bundle_root, str(shard.get("meta_file") or "").replace("/", os.sep))
+                source_file = os.path.join(
+                    bundle_root, str(shard.get("shard_file") or "").replace("/", os.sep)
+                )
+                source_index = os.path.join(
+                    bundle_root, str(shard.get("index_file") or "").replace("/", os.sep)
+                )
+                source_meta = os.path.join(
+                    bundle_root, str(shard.get("meta_file") or "").replace("/", os.sep)
+                )
                 for path in (source_file, source_index, source_meta):
                     if not os.path.exists(path):
                         raise FileNotFoundError(path)
@@ -187,15 +195,21 @@ class FeatureShardStore:
                 _atomic_json_dump(meta_path, meta_payload)
                 shard_dir = None
             elif storage_format == NPY_MEMMAP_SHARD:
-                source_dir = os.path.join(bundle_root, str(shard.get("shard_dir") or "").replace("/", os.sep))
+                source_dir = os.path.join(
+                    bundle_root, str(shard.get("shard_dir") or "").replace("/", os.sep)
+                )
                 if not os.path.isdir(source_dir):
                     raise FileNotFoundError(source_dir)
                 shard_dir = os.path.join(target_dir, os.path.basename(source_dir.rstrip(os.sep)))
                 if os.path.exists(shard_dir):
                     shutil.rmtree(shard_dir)
                 shutil.copytree(source_dir, shard_dir)
-                index_path = os.path.join(shard_dir, str(shard.get("index_file_name") or f"{shard_id}.index.json"))
-                meta_path = os.path.join(shard_dir, str(shard.get("meta_file_name") or f"{shard_id}.meta.json"))
+                index_path = os.path.join(
+                    shard_dir, str(shard.get("index_file_name") or f"{shard_id}.index.json")
+                )
+                meta_path = os.path.join(
+                    shard_dir, str(shard.get("meta_file_name") or f"{shard_id}.meta.json")
+                )
                 for path in (index_path, meta_path):
                     if not os.path.exists(path):
                         raise FileNotFoundError(path)
@@ -223,7 +237,9 @@ class FeatureShardStore:
                     index_path=index_path,
                     row_id=int(row_id),
                     sample_id=str(sample_id),
-                    feature_layout_id=str(index_payload.get("feature_layout_id") or feature_layout_id),
+                    feature_layout_id=str(
+                        index_payload.get("feature_layout_id") or feature_layout_id
+                    ),
                     contract_id=(
                         None
                         if index_payload.get("contract_id") in (None, "")
@@ -241,11 +257,14 @@ class FeatureShardStore:
                         "leaf_specs": dict(index_payload.get("leaf_specs") or {}),
                     },
                     feature_abi_id=str(index_payload.get("feature_abi_id") or feature_abi_id),
-                    runtime_identity_id=str(index_payload.get("runtime_identity_id") or runtime_identity_id),
+                    runtime_identity_id=str(
+                        index_payload.get("runtime_identity_id") or runtime_identity_id
+                    ),
                 )
                 registered.append({"sample_id": str(sample_id), "feature_ref": ref})
             logger.info(
-                "[FeatureShard][Register] storage_format={} shard_id={} samples={} feature_layout_id={} dtype={}",
+                "[FeatureShard][Register] storage_format={} shard_id={} samples={} "
+                "feature_layout_id={} dtype={}",
                 storage_format,
                 shard_id,
                 len(sample_to_row),
@@ -253,7 +272,8 @@ class FeatureShardStore:
                 index_payload.get("dtype") or "",
             )
         logger.info(
-            "[FeatureShard][Receive] storage_format={} shards={} registered_samples={} register_time={:.3f}s",
+            "[FeatureShard][Receive] storage_format={} shards={} "
+            "registered_samples={} register_time={:.3f}s",
             ",".join(sorted({str(item.get("storage_format") or "") for item in shard_entries})),
             len(list(shard_entries or [])),
             len(registered),

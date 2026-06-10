@@ -10,7 +10,6 @@ import torch
 
 from model_management.payload import BoundaryPayload
 
-
 HIGH_QUALITY = "high_quality"
 LOW_QUALITY = "low_quality"
 QUALITY_METHOD = "output_boundary_entropy"
@@ -260,12 +259,9 @@ class EntropyQualityClassifier:
             output_entropy,
         )
         output_confidence = self._compute_output_confidence(predictions)
-        output_confident = (
-            self.output_min_detection_confidence <= 0.0
-            or (
-                output_confidence is not None
-                and float(output_confidence) >= self.output_min_detection_confidence
-            )
+        output_confident = self.output_min_detection_confidence <= 0.0 or (
+            output_confidence is not None
+            and float(output_confidence) >= self.output_min_detection_confidence
         )
         output_reliable = bool(output_entropy_reliable and output_confident)
         feature_entropy = self._compute_feature_entropy(boundary_payload)
@@ -390,7 +386,13 @@ class EntropyQualityClassifier:
             mean=float(new_mean),
             variance=float(max(0.0, new_variance)),
         )
-        return float(state.mean), float(prior_std), float(deviation), bool(feature_normal), not warmed
+        return (
+            float(state.mean),
+            float(prior_std),
+            float(deviation),
+            bool(feature_normal),
+            not warmed,
+        )
 
     def _compute_output_entropy(self, predictions: object) -> float | None:
         direct = _finite_float(_read_prediction_value(predictions, "output_entropy"))
@@ -481,12 +483,17 @@ class EntropyQualityClassifier:
             return None, 0
         flat = tensor.detach().float().abs().flatten().cpu()
         if flat.numel() > self.feature_max_elements:
-            indices = torch.linspace(
-                0,
-                flat.numel() - 1,
-                steps=self.feature_max_elements,
-                dtype=torch.float64,
-            ).round().long().unique(sorted=True)
+            indices = (
+                torch.linspace(
+                    0,
+                    flat.numel() - 1,
+                    steps=self.feature_max_elements,
+                    dtype=torch.float64,
+                )
+                .round()
+                .long()
+                .unique(sorted=True)
+            )
             flat = flat.index_select(0, indices)
         sample_count = int(flat.numel())
         if sample_count <= 1:
@@ -537,11 +544,7 @@ def _payload_tensors(boundary_payload: object) -> list[torch.Tensor]:
         source = boundary_payload.get("tensors", boundary_payload)
     else:
         return []
-    return [
-        tensor
-        for tensor in dict(source or {}).values()
-        if isinstance(tensor, torch.Tensor)
-    ]
+    return [tensor for tensor in dict(source or {}).values() if isinstance(tensor, torch.Tensor)]
 
 
 __all__ = [

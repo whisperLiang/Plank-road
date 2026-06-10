@@ -32,10 +32,13 @@ class TeacherAnnotationService:
     ) -> TeacherAnnotationSubmitResult:
         requested = list(requests or [])
         results, cache_read_time = self.label_cache.lookup_many(requested)
-        cache_hits = sum(1 for result in results if result.status == TeacherAnnotationStatus.CACHE_HIT)
+        cache_hits = sum(
+            1 for result in results if result.status == TeacherAnnotationStatus.CACHE_HIT
+        )
         cache_misses = len(results) - cache_hits
         logger.info(
-            "[TeacherAnnotation][CacheHit] requested_samples={} cache_hits={} cache_misses={} cache_read_time={:.3f}s",
+            "[TeacherAnnotation][CacheHit] requested_samples={} cache_hits={} "
+            "cache_misses={} cache_read_time={:.3f}s",
             len(requested),
             cache_hits,
             cache_misses,

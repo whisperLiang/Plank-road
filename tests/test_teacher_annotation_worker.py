@@ -13,7 +13,9 @@ def _image(tmp_path, name: str) -> str:
     return str(path)
 
 
-def _request(tmp_path, sample_id: str, *, image_sha1: str | None = None) -> TeacherAnnotationRequest:
+def _request(
+    tmp_path, sample_id: str, *, image_sha1: str | None = None
+) -> TeacherAnnotationRequest:
     return TeacherAnnotationRequest(
         sample_id=sample_id,
         edge_id=1,

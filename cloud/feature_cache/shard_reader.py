@@ -19,7 +19,6 @@ from cloud.feature_cache.types import (
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_runtime import BoundaryPayloadCacheCodec
 
-
 SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis_v2"
 
 
@@ -63,7 +62,7 @@ def _batch_dimension_multiplier(value: Any, *, batch_symbol: str = "B") -> int |
         prefix = f"{batch_symbol}*"
         if value.startswith(prefix):
             try:
-                multiplier = int(value[len(prefix):])
+                multiplier = int(value[len(prefix) :])
             except ValueError:
                 return None
             return multiplier if multiplier > 0 else None
@@ -128,7 +127,9 @@ def _is_sample_axis_leaf(leaf_spec: Mapping[str, Any]) -> bool:
 
 
 class FeatureShardPayloadCache:
-    def __init__(self, *, enabled: bool = True, max_cpu_bytes: int = 4 * 1024 * 1024 * 1024) -> None:
+    def __init__(
+        self, *, enabled: bool = True, max_cpu_bytes: int = 4 * 1024 * 1024 * 1024
+    ) -> None:
         self.enabled = bool(enabled)
         self.max_cpu_bytes = max(0, int(max_cpu_bytes))
         self._payloads: dict[tuple[tuple[str, str, int], ...], BoundaryPayload] = {}
@@ -174,10 +175,7 @@ class FeatureShardPayloadCache:
 
     @staticmethod
     def _key(refs: Sequence[FeatureShardRef]) -> tuple[tuple[str, str, int], ...]:
-        return tuple(
-            (str(ref.shard_id), str(ref.index_path), int(ref.row_id))
-            for ref in refs
-        )
+        return tuple((str(ref.shard_id), str(ref.index_path), int(ref.row_id)) for ref in refs)
 
 
 class NpyMemmapShardReader:
@@ -328,7 +326,9 @@ class ShardFeatureBatchReader:
         sample_payloads: list[BoundaryPayload] = []
         for sample_tensors, metadata in zip(per_sample_tensors, per_sample_metadata, strict=True):
             if sample_tensors is None or metadata is None:
-                raise RuntimeError("Feature shard reader did not reconstruct every requested sample.")
+                raise RuntimeError(
+                    "Feature shard reader did not reconstruct every requested sample."
+                )
             sample_payloads.append(
                 boundary_payload_from_tensors(
                     sample_tensors,

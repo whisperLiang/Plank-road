@@ -17,7 +17,6 @@ from cloud.annotation.types import (
     TeacherLabelCacheKey,
 )
 
-
 _CACHE_VERSION = "teacher-label-cache.v1"
 
 

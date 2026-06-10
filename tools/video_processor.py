@@ -1,6 +1,7 @@
 import cv2
 from loguru import logger
 
+
 class VideoProcessor:
     def __init__(self, source):
         self.video_path = source.video_path
@@ -13,7 +14,7 @@ class VideoProcessor:
     def __enter__(self):
         if self.video_path and self.rtsp.flag is False:
             self.cap = cv2.VideoCapture(self.video_path)
-            #self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            # self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             if not self.cap:
                 logger.error("can not open the video")
             self.frame_count = self.cap.get(int(cv2.CAP_PROP_FRAME_COUNT))
@@ -25,8 +26,12 @@ class VideoProcessor:
             password = self.rtsp.password
             ip_address = self.rtsp.ip_address
             channel = int(self.rtsp.channel)
-            camera = "rtsp://%s:%s@%s/cam/realmonitor?channel=%d&subtype=0" \
-                                % (account, password, ip_address, channel)
+            camera = "rtsp://%s:%s@%s/cam/realmonitor?channel=%d&subtype=0" % (
+                account,
+                password,
+                ip_address,
+                channel,
+            )
             self.cap = cv2.VideoCapture(camera)
         else:
             logger.error("source video stream error")

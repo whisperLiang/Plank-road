@@ -4,7 +4,6 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
 
 import cv2
 from loguru import logger
@@ -137,7 +136,8 @@ class FeatureReadinessService:
                 continue
             if not os.path.exists(raw_path):
                 logger.warning(
-                    "[FeatureCache][Plan] low-quality sample_id={} missing raw_path={} and cannot be rebuilt.",
+                    "[FeatureCache][Plan] low-quality sample_id={} "
+                    "missing raw_path={} and cannot be rebuilt.",
                     sample_id,
                     raw_path,
                 )
@@ -162,14 +162,10 @@ class FeatureReadinessService:
                     "model_id": str(model_meta.get("model_id") or manifest.get("model_id") or ""),
                     "model_version": str(model_meta.get("model_version") or ""),
                     "split_config_id": str(
-                        manifest.get("split_config_id")
-                        or split_plan.get("split_config_id")
-                        or ""
+                        manifest.get("split_config_id") or split_plan.get("split_config_id") or ""
                     ),
                     "front_version": str(
-                        manifest.get("front_version")
-                        or split_plan.get("front_version")
-                        or "0"
+                        manifest.get("front_version") or split_plan.get("front_version") or "0"
                     ),
                     "input_image_size": input_image_size,
                     "input_tensor_shape": list(
@@ -296,7 +292,8 @@ class FeatureReadinessService:
                 f"bytes_copied={result.stats.bytes_copied}."
             )
         logger.info(
-            "[FeatureCache][CanonicalActive] generation={} active={} view_id={} source=canonical_active",
+            "[FeatureCache][CanonicalActive] generation={} active={} view_id={} "
+            "source=canonical_active",
             generation_id,
             len(active_ids),
             view_id,
@@ -306,12 +303,12 @@ class FeatureReadinessService:
             for sample in result.view.samples
         }
         sample_metadata_by_id = {
-            sample_id: dict(record)
-            for sample_id, record in result.records.items()
+            sample_id: dict(record) for sample_id, record in result.records.items()
         }
         return (
             result.bundle_info,
-            result.frame_dir or os.path.join(
+            result.frame_dir
+            or os.path.join(
                 cfg.view_root_dir,
                 view_id,
                 "frames",

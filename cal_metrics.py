@@ -116,9 +116,11 @@ class CalMetrics:
         return {"map": avg_map, "delay": avg_delay, "frames": evaluated}
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="configuration description")
-    parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
+    parser.add_argument(
+        "--yaml_path", default="./config/config.yaml", help="input the path of *.yaml"
+    )
     parser.add_argument(
         "--result_path",
         default="./log/client/latest_inference_results.jsonl",

@@ -25,7 +25,6 @@ from cloud.feature_cache.types import (
 )
 from model_management.payload import BoundaryPayload
 
-
 SHARD_FORMAT_VERSION = "feature-shard.v2"
 SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis_v2"
 
@@ -83,7 +82,9 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def _payload_tensors(payload: Mapping[str, Any] | BoundaryPayload) -> tuple[OrderedDict[str, torch.Tensor], dict[str, Any]]:
+def _payload_tensors(
+    payload: Mapping[str, Any] | BoundaryPayload,
+) -> tuple[OrderedDict[str, torch.Tensor], dict[str, Any]]:
     if isinstance(payload, BoundaryPayload):
         tensors = OrderedDict(
             (str(label), tensor.detach().cpu())
@@ -92,7 +93,9 @@ def _payload_tensors(payload: Mapping[str, Any] | BoundaryPayload) -> tuple[Orde
         )
         metadata = {
             "payload_kind": "boundary_payload",
-            "split_id": str(getattr(payload, "split_id", "") or payload.metadata.get("split_id", "")),
+            "split_id": str(
+                getattr(payload, "split_id", "") or payload.metadata.get("split_id", "")
+            ),
             "graph_signature": str(
                 payload.metadata.get("graph_shape_hash")
                 or payload.metadata.get("graph_signature")
@@ -158,7 +161,7 @@ def _batch_dimension_multiplier(value: Any, *, batch_symbol: str = "B") -> int |
         prefix = f"{batch_symbol}*"
         if value.startswith(prefix):
             try:
-                multiplier = int(value[len(prefix):])
+                multiplier = int(value[len(prefix) :])
             except ValueError:
                 return None
             return multiplier if multiplier > 0 else None
@@ -231,16 +234,11 @@ def _shape_bucket(
         "leaves": [
             {
                 "label": label,
-                "sample_shape": [
-                    int(dim) for dim in list(layout.get("sample_shape") or [])
-                ],
+                "sample_shape": [int(dim) for dim in list(layout.get("sample_shape") or [])],
                 "feature_shape_without_batch": [
-                    int(dim)
-                    for dim in list(layout.get("feature_shape_without_batch") or [])
+                    int(dim) for dim in list(layout.get("feature_shape_without_batch") or [])
                 ],
-                "symbolic_shape": [
-                    str(dim) for dim in list(layout.get("symbolic_shape") or [])
-                ],
+                "symbolic_shape": [str(dim) for dim in list(layout.get("symbolic_shape") or [])],
                 "batch_axis": layout.get("batch_axis"),
                 "batch_multiplier": int(layout.get("batch_multiplier") or 1),
             }
@@ -298,7 +296,9 @@ class FeatureShardWriter:
             dtype = _dtype_name(tensors, self.shard_dtype)
             target_dtype = _torch_dtype(self.shard_dtype)
             if target_dtype is not None:
-                tensors = OrderedDict((label, tensor.to(dtype=target_dtype)) for label, tensor in tensors.items())
+                tensors = OrderedDict(
+                    (label, tensor.to(dtype=target_dtype)) for label, tensor in tensors.items()
+                )
             schema = dict(payload_meta.get("schema") or {})
             leaf_layouts = _leaf_layouts(tensors, schema)
             bucket = _shape_bucket(leaf_layouts, dtype=dtype)
@@ -335,7 +335,9 @@ class FeatureShardWriter:
     ) -> list[dict[str, Any]]:
         if not entries:
             return []
-        sample_ids = [str(dict(entry.get("sample") or {}).get("sample_id") or "") for entry in entries]
+        sample_ids = [
+            str(dict(entry.get("sample") or {}).get("sample_id") or "") for entry in entries
+        ]
         first = entries[0]
         tensors: OrderedDict[str, torch.Tensor] = first["_feature_tensors"]
         dtype = str(first["_dtype"])
@@ -380,14 +382,12 @@ class FeatureShardWriter:
                 "original_label": label,
                 "shape": [int(dim) for dim in source_tensor.shape],
                 "sample_shape": [
-                    int(dim)
-                    for dim in list(layout.get("sample_shape") or source_tensor.shape)
+                    int(dim) for dim in list(layout.get("sample_shape") or source_tensor.shape)
                 ],
                 "feature_shape_without_batch": [
                     int(dim)
                     for dim in list(
-                        layout.get("feature_shape_without_batch")
-                        or source_tensor.shape[1:]
+                        layout.get("feature_shape_without_batch") or source_tensor.shape[1:]
                     )
                 ],
                 "storage_layout": SAMPLE_AXIS_STORAGE_LAYOUT,
@@ -395,9 +395,7 @@ class FeatureShardWriter:
                 "storage_shape": [int(dim) for dim in stacked[leaf_key].shape],
                 "batch_axis": layout.get("batch_axis"),
                 "batch_multiplier": int(layout.get("batch_multiplier") or 1),
-                "symbolic_shape": [
-                    str(dim) for dim in list(layout.get("symbolic_shape") or [])
-                ],
+                "symbolic_shape": [str(dim) for dim in list(layout.get("symbolic_shape") or [])],
                 "dtype": str(source_tensor.dtype),
                 "schema": spec,
             }
@@ -413,8 +411,12 @@ class FeatureShardWriter:
                 if runtime_context.get("contract_id") in (None, "")
                 else str(runtime_context.get("contract_id"))
             ),
-            boundary_id=str(runtime_context.get("boundary_id") or payload_meta.get("split_id") or ""),
-            boundary_schema_hash=str(runtime_context.get("boundary_payload_schema_hash") or stable_digest(schema)),
+            boundary_id=str(
+                runtime_context.get("boundary_id") or payload_meta.get("split_id") or ""
+            ),
+            boundary_schema_hash=str(
+                runtime_context.get("boundary_payload_schema_hash") or stable_digest(schema)
+            ),
             passthrough_schema_hash=(
                 None
                 if runtime_context.get("passthrough_schema_fingerprint") in (None, "")

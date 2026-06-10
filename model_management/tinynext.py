@@ -13,7 +13,6 @@ from torchvision.models.detection.ssd import SSD
 from torchvision.models.detection.ssdlite import SSDLiteHead
 from torchvision.ops.misc import Conv2dNormActivation
 
-
 TINYNEXT_VARIANTS: dict[str, dict[str, object]] = {
     "tinynext_s": {
         "cfg": [
@@ -52,10 +51,19 @@ class MatMul(nn.Module):
 
 
 class ConvBNReLU(nn.Sequential):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1, groups: int = 1):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        groups: int = 1,
+    ):
         padding = (kernel_size - 1) // 2
         super().__init__(
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, groups=groups, bias=False),
+            nn.Conv2d(
+                in_channels, out_channels, kernel_size, stride, padding, groups=groups, bias=False
+            ),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
@@ -95,7 +103,7 @@ class Embed(nn.Sequential):
 class Attention(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.scale = dim ** -0.5
+        self.scale = dim**-0.5
         self.linear1 = nn.Linear(dim, dim, bias=False)
         self.linear2 = nn.Linear(dim, dim, bias=False)
         self.matmul1 = MatMul()
@@ -176,7 +184,9 @@ class SeBlock(nn.Module):
 def _gen_block(name: str, channels: int, ratio: float) -> nn.Module:
     expand_channel = int(ratio * channels)
     if name == "mv2":
-        return MV2Block(in_channel=channels, out_channel=channels, stride=1, expand_channel=expand_channel)
+        return MV2Block(
+            in_channel=channels, out_channel=channels, stride=1, expand_channel=expand_channel
+        )
     if name == "former":
         return FormerBlock(dim=channels, mlp_ratio=ratio)
     if name == "se":
@@ -192,7 +202,9 @@ def _normal_init(module: nn.Module) -> None:
                 nn.init.constant_(layer.bias, 0.0)
 
 
-def _extra_block(in_channels: int, out_channels: int, norm_layer: Callable[..., nn.Module]) -> nn.Sequential:
+def _extra_block(
+    in_channels: int, out_channels: int, norm_layer: Callable[..., nn.Module]
+) -> nn.Sequential:
     activation = nn.ReLU6
     intermediate_channels = out_channels // 2
     return nn.Sequential(

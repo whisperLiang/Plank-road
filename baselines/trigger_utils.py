@@ -1,4 +1,4 @@
-﻿"""Shared trigger utilities for baseline methods.
+"""Shared trigger utilities for baseline methods.
 
 Provides a sliding-window statistics tracker used by the
 accuracy_trigger and pure_edge baselines.
@@ -19,6 +19,7 @@ class SlidingWindowStats:
         confidences: Recent confidence values.
         in_drift_windows: Recent drift flags (bool).
     """
+
     window_size: int = 32
     confidences: deque = field(default_factory=lambda: deque(maxlen=32), repr=False)
     in_drift_windows: deque = field(default_factory=lambda: deque(maxlen=32), repr=False)
@@ -73,4 +74,3 @@ class SlidingWindowStats:
         self.confidences.clear()
         self.in_drift_windows.clear()
         self._baseline_confidence = None
-

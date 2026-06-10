@@ -12,10 +12,7 @@ from ultralytics.utils.checks import check_imgsz
 def _parameter_grad_state(module: Any) -> dict[str, bool]:
     if not isinstance(module, torch.nn.Module):
         return {}
-    return {
-        name: parameter.requires_grad
-        for name, parameter in module.named_parameters()
-    }
+    return {name: parameter.requires_grad for name, parameter in module.named_parameters()}
 
 
 def _restore_parameter_grad_state(module: Any, grad_state: dict[str, bool]) -> None:
@@ -56,7 +53,9 @@ def ensure_predictor(
 
     if predictor is None or current_device != requested_device:
         predictor = engine._smart_load("predictor")(overrides=args, _callbacks=engine.callbacks)
-        model_for_predictor = deepcopy(engine.model) if isinstance(engine.model, torch.nn.Module) else engine.model
+        model_for_predictor = (
+            deepcopy(engine.model) if isinstance(engine.model, torch.nn.Module) else engine.model
+        )
         predictor.setup_model(model=model_for_predictor, verbose=False)
         engine.predictor = predictor
     else:

@@ -4,9 +4,21 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+from loguru import logger
+
+from cloud.orchestration.fixed_split_dependencies import (
+    _json_fingerprint,
+    _normalize_model_version,
+    _sanitize_cache_segment,
+    _stable_json_dumps,
+)
+from cloud.sample_pool import CloudSamplePool
+from model_management.split_contract import contract_path
 
 
 def stable_json_dumps(payload: object) -> str:
@@ -61,9 +73,7 @@ def sample_pool_manifest_context(manifest: Mapping[str, object]) -> dict[str, ob
     return {
         "model_id": str(manifest.get("model_id") or model_meta.get("model_id", "") or ""),
         "front_version": str(
-            manifest.get("front_version")
-            or split_plan.get("front_version")
-            or "0"
+            manifest.get("front_version") or split_plan.get("front_version") or "0"
         ),
         "split_config_id": str(
             manifest.get("split_config_id") or split_plan.get("split_config_id", "") or ""
@@ -115,10 +125,7 @@ def manifest_model_version(
     model_meta = manifest.get("model")
     model_meta = dict(model_meta) if isinstance(model_meta, Mapping) else {}
     return str(
-        manifest.get("model_version")
-        or model_meta.get("model_version")
-        or fallback
-        or ""
+        manifest.get("model_version") or model_meta.get("model_version") or fallback or ""
     ).strip()
 
 
@@ -149,23 +156,6 @@ class RequestContext:
     manifest_metadata: dict[str, object]
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
-from cloud.orchestration.runtime_stage import (
-    FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
-    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
-    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
-    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
-    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
-    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
-    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
-    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
-    fixed_split_validation_batches as _fixed_split_validation_batches,
-    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
-    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
-    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
-)
-
 
 class RequestContextMixin:
     @staticmethod
@@ -184,17 +174,14 @@ class RequestContextMixin:
         return {
             "model_id": str(manifest.get("model_id") or model_meta.get("model_id", "") or ""),
             "front_version": str(
-                manifest.get("front_version")
-                or split_plan.get("front_version")
-                or "0"
+                manifest.get("front_version") or split_plan.get("front_version") or "0"
             ),
             "split_config_id": str(
                 manifest.get("split_config_id") or split_plan.get("split_config_id", "") or ""
             ),
             "feature_layout_id": str(runtime_contract.get("feature_layout_id") or ""),
             "boundary_tensor_labels": list(
-                runtime_contract.get("boundary_tensor_labels", [])
-                or []
+                runtime_contract.get("boundary_tensor_labels", []) or []
             ),
             "canonical_split_key": str(
                 manifest.get("canonical_split_key")
@@ -223,7 +210,6 @@ class RequestContextMixin:
             "runtime_contract": runtime_contract,
         }
 
-
     def _cloud_sample_pool_path(
         self,
         *,
@@ -241,9 +227,7 @@ class RequestContextMixin:
             split_key = _json_fingerprint(
                 {
                     "canonical_split_key": context.get("canonical_split_key"),
-                    "boundary_tensor_labels": list(
-                        context.get("boundary_tensor_labels", []) or []
-                    ),
+                    "boundary_tensor_labels": list(context.get("boundary_tensor_labels", []) or []),
                 }
             )[:16]
         return os.path.join(
@@ -253,7 +237,6 @@ class RequestContextMixin:
             f"front_version_{_sanitize_cache_segment(context.get('front_version') or '0')}",
             _sanitize_cache_segment(split_key),
         )
-
 
     def _cloud_sample_staging_path(
         self,
@@ -272,9 +255,7 @@ class RequestContextMixin:
             split_key = _json_fingerprint(
                 {
                     "canonical_split_key": context.get("canonical_split_key"),
-                    "boundary_tensor_labels": list(
-                        context.get("boundary_tensor_labels", []) or []
-                    ),
+                    "boundary_tensor_labels": list(context.get("boundary_tensor_labels", []) or []),
                 }
             )[:16]
         return os.path.join(
@@ -283,7 +264,6 @@ class RequestContextMixin:
             _sanitize_cache_segment(context.get("model_id") or "unknown_model"),
             _sanitize_cache_segment(split_key),
         )
-
 
     def _cloud_sample_pool_for_manifest(
         self,
@@ -299,13 +279,10 @@ class RequestContextMixin:
             split_config_id=str(context.get("split_config_id", "") or ""),
             edge_id=edge_id,
             staging_root=self._cloud_sample_staging_path(edge_id=edge_id, manifest=manifest),
-            boundary_tensor_labels=list(
-                context.get("boundary_tensor_labels", []) or []
-            ),
+            boundary_tensor_labels=list(context.get("boundary_tensor_labels", []) or []),
             max_active_samples=self.sample_pool_max_active_samples,
             shard_size=self.sample_pool_shard_size,
         )
-
 
     @staticmethod
     def _manifest_edge_session_id(manifest: Mapping[str, object]) -> str:
@@ -316,7 +293,6 @@ class RequestContextMixin:
             or ""
         ).strip()
 
-
     @staticmethod
     def _manifest_model_version(
         manifest: Mapping[str, object],
@@ -326,12 +302,8 @@ class RequestContextMixin:
         model_meta = manifest.get("model")
         model_meta = dict(model_meta) if isinstance(model_meta, Mapping) else {}
         return str(
-            manifest.get("model_version")
-            or model_meta.get("model_version")
-            or fallback
-            or ""
+            manifest.get("model_version") or model_meta.get("model_version") or fallback or ""
         ).strip()
-
 
     @staticmethod
     def _remove_reset_path_if_safe(
@@ -359,7 +331,6 @@ class RequestContextMixin:
         else:
             os.remove(abs_path)
         return True
-
 
     def _reset_initial_cloud_state_if_needed(
         self,

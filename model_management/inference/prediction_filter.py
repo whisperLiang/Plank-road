@@ -26,10 +26,7 @@ def resolve_final_dedup_thresholds(
         return None
     if float(threshold) < float(threshold_high) - 1e-6:
         return None
-    return {
-        str(key): (float(value[0]), float(value[1]))
-        for key, value in thresholds.items()
-    }
+    return {str(key): (float(value[0]), float(value[1])) for key, value in thresholds.items()}
 
 
 def compute_intersection_over_min_area(
@@ -47,14 +44,12 @@ def compute_intersection_over_min_area(
     inter_h = (inter_y2 - inter_y1).clamp_min(0.0)
     intersection = inter_w * inter_h
 
-    candidate_area = (
-        (candidate_box[2] - candidate_box[0]).clamp_min(0.0)
-        * (candidate_box[3] - candidate_box[1]).clamp_min(0.0)
-    )
-    reference_areas = (
-        (reference_boxes[:, 2] - reference_boxes[:, 0]).clamp_min(0.0)
-        * (reference_boxes[:, 3] - reference_boxes[:, 1]).clamp_min(0.0)
-    )
+    candidate_area = (candidate_box[2] - candidate_box[0]).clamp_min(0.0) * (
+        candidate_box[3] - candidate_box[1]
+    ).clamp_min(0.0)
+    reference_areas = (reference_boxes[:, 2] - reference_boxes[:, 0]).clamp_min(0.0) * (
+        reference_boxes[:, 3] - reference_boxes[:, 1]
+    ).clamp_min(0.0)
     min_area = torch.minimum(
         reference_areas,
         reference_areas.new_full(reference_areas.shape, float(candidate_area.item())),
@@ -78,9 +73,8 @@ def deduplicate_final_predictions(
     labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
     scores_tensor = torch.as_tensor(scores, dtype=torch.float32)
 
-    valid_geometry = (
-        (boxes_tensor[:, 2] > boxes_tensor[:, 0])
-        & (boxes_tensor[:, 3] > boxes_tensor[:, 1])
+    valid_geometry = (boxes_tensor[:, 2] > boxes_tensor[:, 0]) & (
+        boxes_tensor[:, 3] > boxes_tensor[:, 1]
     )
     if not torch.any(valid_geometry):
         return [], [], []

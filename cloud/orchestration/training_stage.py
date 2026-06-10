@@ -60,7 +60,6 @@ class TrainingStageMixin:
 
         return float(learning_rate)
 
-
     def _resolve_fixed_split_target_steps_per_round(
         self,
         model_name: str,
@@ -74,7 +73,6 @@ class TrainingStageMixin:
             return max(1, int(self.yolo_fixed_split_target_steps_per_round))
         return None
 
-
     @staticmethod
     def _resolve_fixed_split_training_label(
         model_name: str,
@@ -87,7 +85,6 @@ class TrainingStageMixin:
         if model_family == "yolo":
             return str(model_name)
         return str(model_name)
-
 
     @staticmethod
     def _fixed_split_optimizer_overrides(
@@ -103,7 +100,6 @@ class TrainingStageMixin:
             }
         return {}
 
-
     @staticmethod
     def _count_manifest_training_samples(manifest: Mapping[str, object]) -> int:
         count = 0
@@ -113,7 +109,6 @@ class TrainingStageMixin:
             if str(sample.get("sample_id", "")).strip():
                 count += 1
         return count
-
 
     def _resolve_fixed_split_runtime_batch_size(
         self,
@@ -136,7 +131,6 @@ class TrainingStageMixin:
             ),
         )
         return int(effective_batch_size)
-
 
     def _negotiate_cached_split_runtime_batch_size(
         self,
@@ -172,7 +166,6 @@ class TrainingStageMixin:
             trace_batch_size=int(trace_batch_size),
             preloaded_records=preloaded_records,
         )
-
 
     def _run_fixed_split_retrain(
         self,

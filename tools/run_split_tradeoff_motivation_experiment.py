@@ -38,6 +38,7 @@ import numpy as np
 try:
     from loguru import logger
 except ModuleNotFoundError:
+
     class _FallbackLogger:
         def _log(self, level: str, message: str) -> None:
             print(f"{level}: {message}", file=sys.stderr)
@@ -103,6 +104,7 @@ except Exception as exc:
     class SplitRuntime:
         pass
 
+
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -116,16 +118,20 @@ except Exception as exc:
     def load_runtime_config(*args, **kwargs):
         raise RuntimeError("config runtime dependencies are required") from _CONFIG_IMPORT_ERROR
 
+
 try:
     from model_management.model_zoo import build_detection_model, list_available_models
 except Exception as exc:
     _MODEL_ZOO_IMPORT_ERROR = exc
 
     def build_detection_model(*args, **kwargs):
-        raise RuntimeError("model_management.model_zoo is required to build models") from _MODEL_ZOO_IMPORT_ERROR
+        raise RuntimeError(
+            "model_management.model_zoo is required to build models"
+        ) from _MODEL_ZOO_IMPORT_ERROR
 
     def list_available_models() -> list[str]:
         return []
+
 
 try:
     from model_management.split_candidate import SplitCandidate
@@ -155,6 +161,7 @@ except Exception as exc:
         edge_parameter_ratio: float
         metadata: dict[str, Any] = field(default_factory=dict)
 
+
 try:
     from model_management.universal_model_split import UniversalModelSplitter
 except Exception as exc:
@@ -165,6 +172,7 @@ except Exception as exc:
             raise RuntimeError(
                 "model_management.universal_model_split is required to trace models"
             ) from _UNIVERSAL_SPLITTER_IMPORT_ERROR
+
 
 try:
     from model_management.split_model_adapters import (
@@ -318,7 +326,7 @@ def create_deterministic_sample_input(
     device: torch.device,
 ) -> Any:
     """Create a deterministic sample input compatible with the model.
-    
+
     Returns batched tensor [1,3,H,W] as default format.
     """
     logger.info(f"Creating sample input for {model_name} ({input_height}x{input_width})")
@@ -330,9 +338,7 @@ def create_deterministic_sample_input(
         return sample_input
     except Exception as e:
         logger.error(f"Failed to create input: {e}")
-        raise RuntimeError(
-            f"Cannot create deterministic sample input for {model_name}"
-        ) from e
+        raise RuntimeError(f"Cannot create deterministic sample input for {model_name}") from e
 
 
 def create_split_runtime_sample_input(
@@ -344,8 +350,7 @@ def create_split_runtime_sample_input(
 ) -> Any:
     """Create a sample input for the model object actually used by split runtime."""
     logger.info(
-        f"Creating split runtime sample input for {model_name} "
-        f"({input_height}x{input_width})"
+        f"Creating split runtime sample input for {model_name} ({input_height}x{input_width})"
     )
     try:
         sample_input = build_split_runtime_sample_input(
@@ -377,7 +382,7 @@ def get_default_model_name() -> str:
             return model_name
     except Exception as e:
         logger.warning(f"Failed to read config: {e}")
-    
+
     logger.info("Using fallback default model: yolov8s")
     return "yolov8s"
 
@@ -411,9 +416,9 @@ def trace_model_with_splitter(
 ) -> tuple[UniversalModelSplitter, SplitRuntime]:
     """Trace model using UniversalModelSplitter with fallback input formats."""
     logger.info("Tracing model with UniversalModelSplitter...")
-    
+
     splitter = UniversalModelSplitter(device=device)
-    
+
     # Try primary input format (batched tensor)
     try:
         logger.debug("Attempting trace with batched tensor [1,3,H,W]...")
@@ -422,13 +427,15 @@ def trace_model_with_splitter(
         if runtime is None:
             raise RuntimeError("UniversalModelSplitter.trace() did not produce a runtime")
         plan = getattr(runtime, "plan", None)
-        logger.info(f"Trace successful with batched tensor format. "
-                   f"Prefix nodes: {len(getattr(plan, 'prefix_nodes', ()) or ())}, "
-                   f"Suffix nodes: {len(getattr(plan, 'suffix_nodes', ()) or ())}")
+        logger.info(
+            f"Trace successful with batched tensor format. "
+            f"Prefix nodes: {len(getattr(plan, 'prefix_nodes', ()) or ())}, "
+            f"Suffix nodes: {len(getattr(plan, 'suffix_nodes', ()) or ())}"
+        )
         return splitter, runtime
     except Exception as e:
         logger.warning(f"Trace failed with batched tensor: {e}")
-    
+
     # Try fallback format (list of single tensors)
     try:
         logger.debug("Attempting trace with list[Tensor[3,H,W]]...")
@@ -438,13 +445,15 @@ def trace_model_with_splitter(
         if runtime is None:
             raise RuntimeError("UniversalModelSplitter.trace() did not produce a runtime")
         plan = getattr(runtime, "plan", None)
-        logger.info(f"Trace successful with list format. "
-                   f"Prefix nodes: {len(getattr(plan, 'prefix_nodes', ()) or ())}, "
-                   f"Suffix nodes: {len(getattr(plan, 'suffix_nodes', ()) or ())}")
+        logger.info(
+            f"Trace successful with list format. "
+            f"Prefix nodes: {len(getattr(plan, 'prefix_nodes', ()) or ())}, "
+            f"Suffix nodes: {len(getattr(plan, 'suffix_nodes', ()) or ())}"
+        )
         return splitter, runtime
     except Exception as e:
         logger.warning(f"Trace failed with list format: {e}")
-    
+
     # Both formats failed
     logger.error("Trace failed with both input formats")
     raise RuntimeError(
@@ -465,7 +474,7 @@ def enumerate_candidates(
     logger.info(
         f"Enumerating split candidates (max={format_candidate_limit(max_candidates)}, "
         f"max_boundary={max_boundary_count}, "
-        f"max_payload={max_payload_bytes / (1024*1024):.1f} MB)..."
+        f"max_payload={max_payload_bytes / (1024 * 1024):.1f} MB)..."
     )
 
     try:
@@ -499,12 +508,12 @@ def profile_candidates(
 ) -> list[CandidateRecord]:
     """Profile all candidates and create records."""
     logger.info(f"Profiling {len(candidates)} candidates...")
-    
+
     records: list[CandidateRecord] = []
-    
+
     for idx, candidate in enumerate(candidates):
         logger.debug(f"Profiling candidate {idx + 1}/{len(candidates)}: {candidate.candidate_id}")
-        
+
         try:
             record = _profile_single_candidate(
                 candidate,
@@ -523,7 +532,7 @@ def profile_candidates(
             # Still create a record with error information
             record = _create_error_record(candidate, str(e), input_size_bytes)
             records.append(record)
-    
+
     if records and not any(record.legacy_layer_index == 0 for record in records):
         records.insert(
             0,
@@ -534,7 +543,7 @@ def profile_candidates(
                 initial_input_shape=initial_input_shape,
             ),
         )
-    
+
     logger.info(f"Profiled {len(records)} candidates")
     return records
 
@@ -551,7 +560,7 @@ def _profile_single_candidate(
     initial_input_shape: Sequence[int] | None = None,
 ) -> CandidateRecord:
     """Profile a single candidate."""
-    
+
     # Compute privacy metrics
     privacy_leakage_official = safe_estimate_privacy_leakage(
         candidate.edge_parameter_count,
@@ -559,26 +568,22 @@ def _profile_single_candidate(
     )
     privacy_leakage_score = 1.0 - candidate.edge_parameter_ratio
     privacy_leakage_score = max(0.0, min(1.0, privacy_leakage_score))
-    
+
     # Compute payload metrics
     payload_bytes = _display_payload_bytes(candidate, input_size_bytes)
     payload_mb = payload_bytes / (1024 * 1024)
-    payload_ratio = (
-        float(payload_bytes) / float(input_size_bytes)
-        if input_size_bytes > 0
-        else 0.0
-    )
-    
+    payload_ratio = float(payload_bytes) / float(input_size_bytes) if input_size_bytes > 0 else 0.0
+
     # Boundary tensor summary
     boundary_labels_json = json.dumps(candidate.boundary_tensor_labels)
-    
+
     # Boundary shape summary
     if candidate.legacy_layer_index == 0 and initial_input_shape is not None:
         boundary_shape_json = json.dumps(_initial_input_shape_summary(initial_input_shape))
     else:
         boundary_shape = _get_boundary_shape_summary(candidate, runtime)
         boundary_shape_json = json.dumps(boundary_shape)
-    
+
     # Validation
     validation_passed = True
     validation_error = None
@@ -588,10 +593,10 @@ def _profile_single_candidate(
         except Exception as e:
             validation_passed = False
             validation_error = str(e)
-    
+
     # Canonical split key
     canonical_split_key = candidate.metadata.get("canonical_split_key", candidate.candidate_id)
-    
+
     return CandidateRecord(
         candidate_id=candidate.candidate_id,
         legacy_layer_index=candidate.legacy_layer_index,
@@ -692,7 +697,7 @@ def _create_initial_input_record(
 def _get_boundary_shape_summary(candidate: SplitCandidate, runtime: SplitRuntime) -> list:
     """Extract boundary tensor shape information."""
     shapes = []
-    
+
     # Try to get from metadata first
     if "boundary_shape_summary" in candidate.metadata:
         return candidate.metadata["boundary_shape_summary"]
@@ -706,7 +711,7 @@ def _get_boundary_shape_summary(candidate: SplitCandidate, runtime: SplitRuntime
             for item in schema
             if isinstance(item, Mapping)
         ]
-    
+
     # Try to get from TraceGraph if available.
     try:
         graph = getattr(runtime, "trace_graph", None)
@@ -717,7 +722,7 @@ def _get_boundary_shape_summary(candidate: SplitCandidate, runtime: SplitRuntime
                 shapes.append([label, list(shape) if shape is not None else None])
     except Exception as e:
         logger.debug(f"Failed to extract boundary shape: {e}")
-    
+
     return shapes
 
 
@@ -730,7 +735,7 @@ def _validate_candidate(
     del sample_input
     if not hasattr(splitter, "validate_candidate"):
         return True
-    
+
     try:
         result = splitter.validate_candidate(candidate)
         if isinstance(result, Mapping):
@@ -750,7 +755,7 @@ def _create_error_record(
     privacy_score = 1.0 - candidate.edge_parameter_ratio
     privacy_score = max(0.0, min(1.0, privacy_score))
     payload_bytes = _display_payload_bytes(candidate, input_size_bytes)
-    
+
     return CandidateRecord(
         candidate_id=candidate.candidate_id,
         legacy_layer_index=candidate.legacy_layer_index,
@@ -762,9 +767,7 @@ def _create_error_record(
         payload_mb=payload_bytes / (1024 * 1024),
         input_tensor_bytes=input_size_bytes,
         payload_ratio_to_input=(
-            float(payload_bytes) / float(input_size_bytes)
-            if input_size_bytes > 0
-            else 0.0
+            float(payload_bytes) / float(input_size_bytes) if input_size_bytes > 0 else 0.0
         ),
         edge_parameter_count=candidate.edge_parameter_count,
         total_parameter_count=candidate.total_parameter_count,
@@ -803,18 +806,19 @@ def plot_payload_privacy_by_depth(
     """Create payload and privacy leakage plot by split depth."""
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         logger.warning("matplotlib not available, skipping plotting")
         return
-    
+
     if not records:
         logger.warning("No records to plot")
         return
-    
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     def layer_index(record: CandidateRecord, fallback: int) -> int:
         if record.legacy_layer_index is not None:
             return int(record.legacy_layer_index)
@@ -838,27 +842,24 @@ def plot_payload_privacy_by_depth(
     privacy_score = [r.privacy_leakage_score for r in sorted_records]
     max_split_combination_count = split_combination_index
     initial_indices = [
-        idx for idx, record in enumerate(sorted_records)
-        if _is_initial_input_record(record)
+        idx for idx, record in enumerate(sorted_records) if _is_initial_input_record(record)
     ]
-    
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    
+
     # Top plot: Payload
     bar_colors = [
-        "#c2410c" if _is_initial_input_record(record) else "steelblue"
-        for record in sorted_records
+        "#c2410c" if _is_initial_input_record(record) else "steelblue" for record in sorted_records
     ]
     bar_edges = [
-        "#7c2d12" if _is_initial_input_record(record) else "navy"
-        for record in sorted_records
+        "#7c2d12" if _is_initial_input_record(record) else "navy" for record in sorted_records
     ]
     ax1.bar(x, payload_mb, color=bar_colors, alpha=0.7, edgecolor=bar_edges, linewidth=0.5)
     ax1.set_ylabel("Payload (MB)", fontsize=11)
     ax1.set_title("Intermediate Feature Size", fontsize=12, fontweight="bold")
     ax1.grid(axis="y", alpha=0.3, linestyle="--")
     ax1.set_ylim([0, max(payload_mb) * 1.2 if payload_mb else 1])
-    
+
     # Bottom plot: Privacy leakage score
     ax2.plot(x, privacy_score, marker="o", color="darkred", linewidth=1.5, markersize=4, alpha=0.8)
     ax2.fill_between(x, privacy_score, alpha=0.2, color="darkred")
@@ -867,7 +868,7 @@ def plot_payload_privacy_by_depth(
     ax2.set_title("Privacy Leakage Score", fontsize=12, fontweight="bold")
     ax2.set_ylim([0, 1.05])
     ax2.grid(axis="y", alpha=0.3, linestyle="--")
-    
+
     for idx in initial_indices:
         record = sorted_records[idx]
         layer_x = x[idx]
@@ -914,11 +915,7 @@ def plot_payload_privacy_by_depth(
         if max_split_combination_count > 0:
             max_tick = int(max_split_combination_count)
             min_gap_to_max = max(2, int(math.ceil(max_tick * 0.025)))
-            ticks = {
-                int(round(tick))
-                for tick in ax2.get_xticks()
-                if min_x <= float(tick) <= max_x
-            }
+            ticks = {int(round(tick)) for tick in ax2.get_xticks() if min_x <= float(tick) <= max_x}
             ticks = {
                 tick
                 for tick in ticks
@@ -926,16 +923,16 @@ def plot_payload_privacy_by_depth(
             }
             ticks.update({0, max_tick})
             ax2.set_xticks(sorted(ticks))
-    
+
     plt.tight_layout()
-    
+
     # Save
     pdf_path = output_dir / "split_payload_privacy_by_depth.pdf"
     png_path = output_dir / "split_payload_privacy_by_depth.png"
     plt.savefig(pdf_path, dpi=150, bbox_inches="tight")
     plt.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close()
-    
+
     logger.info(f"Saved payload/privacy plot to {pdf_path} and {png_path}")
 
 
@@ -1068,7 +1065,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate split_payload_privacy_by_depth for one model"
     )
-    
+
     # Model and device
     parser.add_argument(
         "--model",
@@ -1082,7 +1079,7 @@ def main() -> None:
         default="cpu",
         help="Device (default: cpu)",
     )
-    
+
     # Input
     parser.add_argument(
         "--input-size",
@@ -1101,7 +1098,7 @@ def main() -> None:
             "(default: same as --input-size)"
         ),
     )
-    
+
     # Candidate enumeration
     parser.add_argument(
         "--max-candidates",
@@ -1124,7 +1121,7 @@ def main() -> None:
         default=128,
         help="Maximum payload size in MB (default: 128)",
     )
-    
+
     # Privacy
     parser.add_argument(
         "--privacy-epsilon",
@@ -1132,7 +1129,7 @@ def main() -> None:
         default=PRIVACY_LEAKAGE_EPSILON,
         help=f"Privacy leakage epsilon (default: {PRIVACY_LEAKAGE_EPSILON})",
     )
-    
+
     # Validation and output
     parser.add_argument(
         "--validate-candidates",
@@ -1144,10 +1141,7 @@ def main() -> None:
         "--output-dir",
         type=str,
         default=None,
-        help=(
-            "Output directory "
-            "(default: results/split_tradeoff/{model_name})"
-        ),
+        help=("Output directory (default: results/split_tradeoff/{model_name})"),
     )
     parser.add_argument(
         "--seed",
@@ -1155,7 +1149,7 @@ def main() -> None:
         default=42,
         help="Random seed (default: 42)",
     )
-    
+
     args = parser.parse_args()
 
     args.model = args.model or get_default_model_name()
@@ -1163,7 +1157,7 @@ def main() -> None:
     # Set default output dir if not provided
     if args.output_dir is None:
         args.output_dir = f"results/split_tradeoff/{safe_model_dir_name(args.model)}"
-    
+
     # Run experiment
     try:
         run_experiment(args)

@@ -1,10 +1,19 @@
+from config.baseline import (
+    ALLOWED_BASELINE_METHODS,
+    PLANK_ROAD_BASELINE_ERROR,
+    BaselineIdentity,
+    default_run_id,
+    validate_baseline_method,
+)
 from config.runtime import RuntimeConfig, TeacherAnnotationConfig, load_runtime_config
-from config.experiment import ExperimentConfig, load_experiment_config
 
 __all__ = [
+    "ALLOWED_BASELINE_METHODS",
+    "PLANK_ROAD_BASELINE_ERROR",
+    "BaselineIdentity",
     "RuntimeConfig",
     "TeacherAnnotationConfig",
+    "default_run_id",
     "load_runtime_config",
-    "ExperimentConfig",
-    "load_experiment_config",
+    "validate_baseline_method",
 ]

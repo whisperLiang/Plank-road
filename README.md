@@ -86,11 +86,9 @@ Core areas: [grpc_server/training_jobs.py](./grpc_server/training_jobs.py), [grp
 
 ```text
 Plank-road/
-|-- edge_client.py              # Single edge client entry point
+|-- edge_client.py              # Real edge-device client entry point
 |-- cloud_server.py             # Cloud gRPC server entry point
-|-- launch_multi_edge.py        # Process launcher for real multi-edge runs
-|-- multi_edge_runner.py        # Multi-device experiment runner
-|-- config/                     # Runtime and experiment YAML/config loaders
+|-- config/                     # Runtime YAML/config loaders
 |-- edge/                       # Edge runtime, quality/drift logic, trigger, feature shards
 |   `-- feature_shard/          # Edge-side safetensors/npy feature shard writers
 |-- cloud/                      # Cloud ingest, orchestration, resource state, model updates
@@ -104,7 +102,9 @@ Plank-road/
 |   |-- detectors/
 |   |-- inference/
 |   `-- split_runtime/
-|-- baselines/                  # Baseline methods and real-execution runtime utilities
+|-- baselines/                  # Distributed baseline policies and edge/cloud runtime
+|   |-- policies/               # Comparison-method decisions only
+|   `-- distributed/            # Physical edge/cloud baseline transport and state
 |-- tools/                      # Experiment, plotting, benchmark, and preprocessing scripts
 |-- scripts/                    # Figure/plot helpers
 |-- tests/                      # Unit, integration, and pipeline tests
@@ -199,104 +199,167 @@ Useful edge overrides:
 | `--max_count` | Override `client.source.max_count` |
 | `--headless` | Run without OpenCV display windows |
 
-### Multi-Edge Deployment
+### Real Multi-Device Deployment
 
-Use [launch_multi_edge.py](./launch_multi_edge.py) to start multiple edge processes against the same cloud server:
+A real multi-device deployment starts the cloud server once and starts one edge client on each physical edge device. All edge devices connect to the same cloud gRPC address, and every edge device must use a unique `edge_id`. Reusing an `edge_id` across physical devices is an invalid deployment configuration because the cloud identifies edge state, jobs, and model updates by `edge_id`.
 
-```bash
-uv run python launch_multi_edge.py --num_edges 3
+The cloud `server.listen_address` must listen on an external interface, such as `[::]:50051` or `0.0.0.0:50051`; do not bind only to `127.0.0.1:50051` for real devices. Make sure the machine firewall or cloud security group allows inbound traffic on port `50051`.
 
-uv run python launch_multi_edge.py --num_edges 3 \
-    --video_paths video_data/road.mp4 video_data/cam1-rin.mp4 video_data/suwon#86_04_01.mp4
+Each real edge device has its own filesystem, so each device may use `./cache` locally. For clearer logs and debugging, prefer explicit per-edge paths such as `./cache/edge_1` and `./cache/edge_2`. Multiple edges may use different video files, camera sources, or the same configuration file, but their `edge_id` values must not repeat.
 
-uv run python launch_multi_edge.py --num_edges 4 --start_edge_id 10
-
-uv run python launch_multi_edge.py --num_edges 4 --server_ip 10.0.0.5:50051
-```
-
-The launcher assigns unique `edge_id` values, creates isolated cache directories under `./cache/edge_{id}/`, and writes per-edge logs under `log/client/`.
-
-### Multi-Edge Experiment Runner
-
-Use [multi_edge_runner.py](./multi_edge_runner.py) for simulation-style multi-device baseline experiments:
+Cloud machine:
 
 ```bash
-uv run python multi_edge_runner.py --config config/experiment.yaml
-
-uv run python multi_edge_runner.py --config config/experiment.yaml \
-    --experiment scaling --num_devices 1 2 4 8
-
-uv run python multi_edge_runner.py --config config/experiment.yaml \
-    --experiment drift_burst --num_devices 4
-
-uv run python multi_edge_runner.py --config config/experiment.yaml \
-    --experiment heterogeneous --num_devices 4
-
-uv run python multi_edge_runner.py --config config/experiment.yaml \
-    --experiment ablation --num_devices 4
+uv run python cloud_server.py --yaml_path ./config/config.yaml
 ```
 
-Supported experiment modes cover device-count scaling, concurrent drift bursts, heterogeneous resource profiles, and Plank-Road ablations such as raw-only versus raw+feature upload behavior.
-
-## Experiments
-
-### Real Baseline Smoke Run
-
-Real baseline experiments use real video streams, student inference, teacher label directories, upload metering, cloud queue behavior, and metric logging. They preserve each baseline method's trigger, scheduling, and update strategy.
-
-Smoke and paper runs require a real teacher or ground-truth label directory through `--teacher-model`; quick smoke mode reduces runtime budget but does not generate synthetic labels.
+Optional cloud listen-address override:
 
 ```bash
-uv run python tools/run_baselines_real.py \
-    --video ./video_data/road.mp4 \
-    --methods pure_edge_local_updating,accuracy_trigger_cloud_retraining,ekya_style_centralized_scheduling,plank_road_multi_device \
-    --student-model yolo26 \
-    --teacher-model ./cache/teacher_labels/road \
-    --window-seconds 10 \
-    --total-frames 128 \
-    --epochs 1 \
-    --batch-size 2 \
-    --device cpu \
-    --results-dir results/baselines_real_smoke \
-    --reuse-teacher-cache \
-    --quick-smoke
-
-uv run python tools/plot_baselines_real_results.py \
-    --results-dir results/baselines_real_smoke
+uv run python cloud_server.py --listen_address "[::]:50051"
 ```
 
-The runner writes `summary.json`, `per_device_metrics.csv`, `per_frame_metrics.csv`, `update_events.csv`, `upload_events.csv`, and `training_breakdown.csv`.
-
-### Advantage Experiment Matrix
-
-Use the YAML-driven matrix runner for repeated multi-method advantage experiments:
+Edge device 1:
 
 ```bash
-uv run python tools/run_baselines_advantage_experiments.py \
-    --config config/baselines_real_advantage.yaml
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --edge_id 1 \
+  --server_ip 192.168.66.205:50051 \
+  --cache_path ./cache/edge_1 \
+  --video_path ./video_data/road.mp4 \
+  --headless
 ```
 
-The default matrix compares Plank-Road with Ekya-style scheduling, accuracy-triggered cloud retraining, and pure edge-local updating across device counts, bandwidth levels, and Plank-Road ablations.
-
-### Motivation Experiments
-
-Tail-training motivation experiments evaluate split-tail retraining behavior and dynamic batch/training choices:
+Edge device 2:
 
 ```bash
-uv run python tools/run_tail_training_motivation_experiments.py \
-    --yaml-path ./config/config.yaml \
-    --video-path ./video_data/road.mp4 \
-    --output-root ./results/tail_training_motivation
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --edge_id 2 \
+  --server_ip 192.168.66.205:50051 \
+  --cache_path ./cache/edge_2 \
+  --video_path ./video_data/cam1-rin.mp4 \
+  --headless
 ```
 
-Split tradeoff experiments profile candidate boundaries and privacy/trainability/transfer-cost tradeoffs:
+Edge device 3:
 
 ```bash
-uv run python tools/run_split_tradeoff_motivation_experiment.py \
-    --model rfdetr_nano \
-    --device cpu \
-    --output-dir ./results/split_tradeoff/rfdetr_nano
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --edge_id 3 \
+  --server_ip 192.168.66.205:50051 \
+  --cache_path ./cache/edge_3 \
+  --video_path ./video_data/suwon#86_04_01.mp4 \
+  --headless
 ```
+
+```text
+Real deployment checklist:
+1. Cloud server is reachable from every edge device.
+2. server.listen_address is not loopback-only.
+3. Every edge uses a unique edge_id.
+4. Every edge points to the same server_ip.
+5. Each edge has a valid local video/camera source.
+6. Edge cache directories are not shared through NFS unless intentionally configured.
+7. Cloud workspace_root has enough disk space for uploaded bundles and feature caches.
+8. Cloud grpc_max_workers and continual_learning.max_concurrent_jobs are configured for the expected number of devices.
+```
+
+### Distributed Baseline Deployment
+
+Baselines are deployed using the same physical edge-cloud topology as Plank-Road, but they are separate comparison methods. Plank-Road itself is not registered as a `baseline_method`. For cloud-backed baselines, the cloud and every edge device must use the same explicit `run_id`.
+
+The only supported baseline methods are:
+
+```text
+pure_edge_local_updating
+accuracy_trigger_cloud_retraining
+ekya_style_centralized_scheduling
+```
+
+Accuracy-Trigger Cloud Retraining cloud:
+
+```bash
+uv run python cloud_server.py \
+  --yaml_path ./config/config.yaml \
+  --mode baseline \
+  --baseline_method accuracy_trigger_cloud_retraining \
+  --listen_address "[::]:50051" \
+  --run_id baseline_acc_trigger_001
+```
+
+Accuracy-Trigger edge device 1:
+
+```bash
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --mode baseline \
+  --baseline_method accuracy_trigger_cloud_retraining \
+  --run_id baseline_acc_trigger_001 \
+  --edge_id 1 \
+  --server_ip 192.168.66.205:50051 \
+  --cache_path ./cache/edge_1 \
+  --video_path ./video_data/road.mp4 \
+  --headless
+```
+
+Accuracy-Trigger edge device 2:
+
+```bash
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --mode baseline \
+  --baseline_method accuracy_trigger_cloud_retraining \
+  --run_id baseline_acc_trigger_001 \
+  --edge_id 2 \
+  --server_ip 192.168.66.205:50051 \
+  --cache_path ./cache/edge_2 \
+  --video_path ./video_data/cam1-rin.mp4 \
+  --headless
+```
+
+Pure Edge Local Updating:
+
+```bash
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --mode baseline \
+  --baseline_method pure_edge_local_updating \
+  --edge_id 1 \
+  --cache_path ./cache/edge_1 \
+  --video_path ./video_data/road.mp4 \
+  --headless
+```
+
+Ekya-Style Centralized Scheduling cloud:
+
+```bash
+uv run python cloud_server.py \
+  --yaml_path ./config/config.yaml \
+  --mode baseline \
+  --baseline_method ekya_style_centralized_scheduling \
+  --listen_address "[::]:50051" \
+  --run_id baseline_ekya_001
+```
+
+Ekya edge:
+
+```bash
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --mode baseline \
+  --baseline_method ekya_style_centralized_scheduling \
+  --run_id baseline_ekya_001 \
+  --edge_id 1 \
+  --server_ip 192.168.66.205:50051 \
+  --cache_path ./cache/edge_1 \
+  --video_path ./video_data/road.mp4 \
+  --headless
+```
+
+Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud. Accuracy-Trigger uploads only edge-selected keyframes and uses cloud-side `frozen_training`. Ekya disables frame filtering, uploads raw frames, receives cloud inference results for visualization, and uses `ekya_style` training.
 
 ## Testing
 

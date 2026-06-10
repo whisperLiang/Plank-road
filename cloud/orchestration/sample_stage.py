@@ -1,11 +1,38 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+import os
+import time
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+import torch
+from loguru import logger
+
+from cloud.contracts import validate_high_quality_sync_manifest
+from cloud.feature_cache import FeatureShardRef
+from cloud.feature_readiness import FeatureReadinessConfig, FeatureReadinessService
+from cloud.ingest import load_high_quality_shard_candidates
+from cloud.orchestration.fixed_split_dependencies import (
+    POOL_LABEL_COORDINATE_SPACE,
+    POOL_LABEL_METADATA_FIELDS,
+    _read_json_file,
+)
 from cloud.orchestration.results import SampleRebuildResult
 from cloud.sample_pool import CloudSamplePool
+from cloud.training.proxy_metadata import (
+    original_image_size_from_metadata as _original_image_size_from_metadata,
+)
+from cloud.training.proxy_metadata import (
+    pool_label_metadata_from_record as _pool_label_metadata_from_record,
+)
+from cloud.training.proxy_metadata import (
+    runtime_input_tensor_shape_from_metadata as _runtime_input_tensor_shape_from_metadata,
+)
+from grpc_server.workspace import prepare_request_workspace
+from model_management.payload import BoundaryPayload
 from model_management.split_contract import SplitRuntimeContract
+from model_management.universal_model_split import UniversalModelSplitter
 
 
 class CanonicalSampleStage:
@@ -34,23 +61,6 @@ class CanonicalSampleStage:
             staging_low_quality=[dict(sample) for sample in new_low_quality],
         )
 
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
-from cloud.orchestration.runtime_stage import (
-    FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
-    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
-    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
-    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
-    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
-    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
-    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
-    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
-    fixed_split_validation_batches as _fixed_split_validation_batches,
-    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
-    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
-    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
-)
-
 
 class SampleStageMixin:
     @staticmethod
@@ -67,7 +77,6 @@ class SampleStageMixin:
             if labels.get(field_name) is not None:
                 annotations[field_name] = labels[field_name]
         return annotations
-
 
     @staticmethod
     def _model_input_size_from_record(
@@ -89,7 +98,6 @@ class SampleStageMixin:
             if candidate_sizes:
                 return max(candidate_sizes, key=lambda item: item[0] * item[1])
         return None
-
 
     def _build_low_quality_staging_candidates(
         self,
@@ -117,29 +125,30 @@ class SampleStageMixin:
                     feature_ref = FeatureShardRef.from_dict(feature_ref)
                 else:
                     logger.warning(
-                        "[FeatureCache][Rebuild] low-quality sample_id={} has no feature_ref after readiness planning; skipping staging.",
+                        "[FeatureCache][Rebuild] low-quality sample_id={} has no "
+                        "feature_ref after readiness planning; skipping staging.",
                         sample_id,
                     )
                     continue
             original_size = _original_image_size_from_metadata(record)
             if original_size is None and sample.get("input_image_size") is not None:
-                original_size = tuple(int(dim) for dim in list(sample.get("input_image_size") or [])[:2])
-            resolved_model_input_size = (
-                model_input_size or self._model_input_size_from_record(record)
+                original_size = tuple(
+                    int(dim) for dim in list(sample.get("input_image_size") or [])[:2]
+                )
+            resolved_model_input_size = model_input_size or self._model_input_size_from_record(
+                record
             )
             if resolved_model_input_size is None:
-                tensor_shape = sample.get("input_tensor_shape") or record.get("input_tensor_shape") or []
+                tensor_shape = (
+                    sample.get("input_tensor_shape") or record.get("input_tensor_shape") or []
+                )
                 if len(tensor_shape) >= 4:
                     resolved_model_input_size = (int(tensor_shape[-2]), int(tensor_shape[-1]))
             input_tensor_shape = (
-                record.get("input_tensor_shape")
-                or sample.get("input_tensor_shape")
-                or []
+                record.get("input_tensor_shape") or sample.get("input_tensor_shape") or []
             )
             metadata_resize_mode = str(
-                record.get("input_resize_mode")
-                or sample.get("input_resize_mode")
-                or ""
+                record.get("input_resize_mode") or sample.get("input_resize_mode") or ""
             )
             resolved_resize_mode = str(resize_mode or metadata_resize_mode or "")
             if (
@@ -149,7 +158,8 @@ class SampleStageMixin:
                 or not resolved_resize_mode
             ):
                 logger.warning(
-                    "[FixedSplitCL] Skipping low-quality sample {} with incomplete coordinate metadata "
+                    "[FixedSplitCL] Skipping low-quality sample {} with incomplete "
+                    "coordinate metadata "
                     "(input_image_size={}, input_tensor_shape={}, input_resize_mode={}).",
                     sample_id,
                     original_size,
@@ -210,7 +220,6 @@ class SampleStageMixin:
             )
         return processed_samples
 
-
     def _feature_readiness_service(self) -> FeatureReadinessService:
         return FeatureReadinessService(
             FeatureReadinessConfig(
@@ -227,11 +236,12 @@ class SampleStageMixin:
                 materialization_mode=self.feature_cache_materialization_mode,
                 feature_rebuild_batch_size=int(self.feature_cache_feature_rebuild_batch_size),
                 validate_refs=bool(self.feature_cache_validate_refs),
-                deep_validate_feature_payload=bool(self.feature_cache_deep_validate_feature_payload),
+                deep_validate_feature_payload=bool(
+                    self.feature_cache_deep_validate_feature_payload
+                ),
                 deep_validate_sample_rate=float(self.feature_cache_deep_validate_sample_rate),
             )
         )
-
 
     def _prepare_low_quality_feature_entries(
         self,
@@ -263,7 +273,6 @@ class SampleStageMixin:
             rebuild_provider=provider,
         )
 
-
     def _build_training_cache_view_from_canonical_active(
         self,
         sample_pool: CloudSamplePool,
@@ -279,7 +288,6 @@ class SampleStageMixin:
             edge_id=edge_id,
             pool_annotations_from_labels=self._pool_annotations_from_labels,
         )
-
 
     def _log_sample_rebuild_summary(
         self,
@@ -341,7 +349,6 @@ class SampleStageMixin:
             dict(staging_stats or {}),
         )
 
-
     def sync_samples(
         self,
         edge_id: int,
@@ -362,9 +369,7 @@ class SampleStageMixin:
         """
         try:
             if str(sync_type or "") != "HIGH_QUALITY_FEATURE_LABEL_SHARD":
-                raise RuntimeError(
-                    f"Unsupported sample sync type: {sync_type!r}"
-                )
+                raise RuntimeError(f"Unsupported sample sync type: {sync_type!r}")
             workspace = prepare_request_workspace(
                 self.workspace_root,
                 edge_id=edge_id,
@@ -423,9 +428,9 @@ class SampleStageMixin:
             )
             if unreadable_ids:
                 stage_stats = dict(stage_stats)
-                stage_stats["skipped_unreadable"] = (
-                    int(stage_stats.get("skipped_unreadable", 0)) + len(unreadable_ids)
-                )
+                stage_stats["skipped_unreadable"] = int(
+                    stage_stats.get("skipped_unreadable", 0)
+                ) + len(unreadable_ids)
                 stage_stats["skipped_unreadable_preview"] = self._preview_ids(unreadable_ids)
             logger.info(
                 "[ShardCL][SamplePoolCommit] {} edge_id={} pending_dir={} stats={}",

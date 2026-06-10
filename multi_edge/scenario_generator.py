@@ -1,4 +1,4 @@
-﻿"""Scenario generator for multi-device experiments.
+"""Scenario generator for multi-device experiments.
 
 Generates per-device profiles and synthetic inference streams that
 simulate varying drift severity, bandwidth constraints, and local
@@ -13,8 +13,7 @@ from typing import Any
 
 from baselines.base_method import InferenceResult
 
-
-# 鈹€鈹€ Profile value tables 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# Profile value tables
 
 # Maps profile names to numeric parameters used by the simulation.
 # These are intentionally simple approximations, not realistic models.
@@ -56,6 +55,7 @@ LOCAL_TRAIN_BUDGET_PROFILES = {
 @dataclass
 class DeviceProfile:
     """Assigned profile for one simulated device."""
+
     device_id: int
     drift_profile: str = "medium"
     bandwidth_profile: str = "medium"
@@ -200,7 +200,9 @@ class ScenarioGenerator:
             # Simulate confidence + drift
             in_drift_window = self.rng.random() < eff_drift_prob
             noise = self.rng.gauss(0.0, eff_noise)
-            confidence = max(0.0, min(1.0, eff_conf + noise - (eff_drop if in_drift_window else 0.0)))
+            confidence = max(
+                0.0, min(1.0, eff_conf + noise - (eff_drop if in_drift_window else 0.0))
+            )
 
             # Proxy mAP correlates loosely with confidence
             proxy_map = max(0.0, min(1.0, confidence * 0.9 + self.rng.gauss(0.0, 0.05)))
@@ -208,14 +210,16 @@ class ScenarioGenerator:
             # Base inference latency + bandwidth overhead + noise
             latency_ms = 10.0 + latency_overhead + abs(self.rng.gauss(0.0, 3.0))
 
-            results.append(InferenceResult(
-                device_id=profile.device_id,
-                frame_index=frame_idx,
-                confidence=confidence,
-                proxy_map=proxy_map,
-                latency_ms=latency_ms,
-                in_drift_window=in_drift_window,
-                num_detections=max(0, int(5 + self.rng.gauss(0, 2))),
-            ))
+            results.append(
+                InferenceResult(
+                    device_id=profile.device_id,
+                    frame_index=frame_idx,
+                    confidence=confidence,
+                    proxy_map=proxy_map,
+                    latency_ms=latency_ms,
+                    in_drift_window=in_drift_window,
+                    num_detections=max(0, int(5 + self.rng.gauss(0, 2))),
+                )
+            )
 
         return results

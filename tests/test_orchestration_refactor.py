@@ -236,8 +236,7 @@ def test_tinynext_evaluation_uses_detection_metric_without_threshold_calibration
         max_samples=30,
     )
     gt_annotations = {
-        f"sample-{index:02d}": {"boxes": [[1, 2, 3, 4]], "labels": [1]}
-        for index in range(30)
+        f"sample-{index:02d}": {"boxes": [[1, 2, 3, 4]], "labels": [1]} for index in range(30)
     }
 
     calls = {}

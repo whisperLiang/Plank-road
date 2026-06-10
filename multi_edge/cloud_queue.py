@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 @dataclass
 class UpdateRequest:
     """One pending update in the cloud queue."""
+
     device_id: int
     trigger_reason: str
     num_samples: int

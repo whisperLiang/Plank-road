@@ -185,6 +185,7 @@ class OrchestrationSettings:
             ),
         )
 
+
 class PipelineLifecycleMixin:
     def __init__(self, config, large_object_detection: Object_Detection):
         self.config = config

@@ -6,7 +6,6 @@ from typing import Any
 
 import torch
 
-
 ORIGINAL_XYXY = "original_xyxy"
 MODEL_INPUT_XYXY = "model_input_xyxy"
 SUPPORTED_RESIZE_MODES = {"direct_resize", "letterbox"}
@@ -91,8 +90,7 @@ def require_coordinate_metadata(
         missing.append("input_resize_mode")
     if missing:
         raise RuntimeError(
-            "Missing coordinate metadata required for split retraining: "
-            + ", ".join(missing)
+            "Missing coordinate metadata required for split retraining: " + ", ".join(missing)
         )
     return original_size, model_input_size, resize_mode
 

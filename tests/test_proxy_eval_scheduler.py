@@ -17,9 +17,7 @@ def test_proxy_scheduler_does_not_evaluate_epoch_one_by_default() -> None:
 
 
 def test_proxy_scheduler_evaluates_interval_epochs_only_when_not_final() -> None:
-    scheduler = ProxyEvalScheduler(
-        ProxyEvalConfig(eval_final=False, interval_epochs=10)
-    )
+    scheduler = ProxyEvalScheduler(ProxyEvalConfig(eval_final=False, interval_epochs=10))
 
     evaluated = [epoch for epoch in range(1, 36) if scheduler.should_eval(epoch, 35)]
 
@@ -27,12 +25,8 @@ def test_proxy_scheduler_evaluates_interval_epochs_only_when_not_final() -> None
 
 
 def test_proxy_scheduler_final_epoch_is_configurable() -> None:
-    enabled = ProxyEvalScheduler(
-        ProxyEvalConfig(eval_final=True, interval_epochs=10)
-    )
-    disabled = ProxyEvalScheduler(
-        ProxyEvalConfig(eval_final=False, interval_epochs=10)
-    )
+    enabled = ProxyEvalScheduler(ProxyEvalConfig(eval_final=True, interval_epochs=10))
+    disabled = ProxyEvalScheduler(ProxyEvalConfig(eval_final=False, interval_epochs=10))
 
     assert enabled.should_eval(35, 35)
     assert not disabled.should_eval(35, 35)
@@ -99,8 +93,7 @@ def test_proxy_early_stopper_uses_patience_and_min_delta() -> None:
 
 def test_proxy_validation_split_is_deterministic_and_excludes_validation_from_train() -> None:
     annotations = {
-        f"sample-{index:02d}": {"boxes": [[0, 0, 1, 1]], "labels": [1]}
-        for index in range(10)
+        f"sample-{index:02d}": {"boxes": [[0, 0, 1, 1]], "labels": [1]} for index in range(10)
     }
 
     split = build_proxy_validation_split(

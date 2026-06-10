@@ -1,13 +1,28 @@
 from __future__ import annotations
 
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
+import base64
+import time
+
+from loguru import logger
+
+from cloud.contracts import LOW_QUALITY_TRIGGER_PROTOCOL_VERSION
+from cloud.ingest import materialize_low_quality_trigger_bundle
 from cloud.orchestration.checkpoint_stage import CheckpointStageMixin
+from cloud.orchestration.fixed_split_dependencies import (
+    _increment_model_version,
+    _manifest_model_metadata,
+    _normalize_model_version,
+)
 from cloud.orchestration.logging_utils import StageLoggingMixin
 from cloud.orchestration.proxy_stage import ProxyStageMixin
 from cloud.orchestration.request_context import RequestContextMixin
 from cloud.orchestration.runtime_stage import (
     FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
+)
+from cloud.orchestration.runtime_stage import (
     FixedSplitRuntimeContractMixin,
+)
+from cloud.orchestration.runtime_stage import (
     splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
 )
 from cloud.orchestration.runtime_template_stage import FixedSplitRuntimeTemplateMixin
@@ -15,11 +30,19 @@ from cloud.orchestration.sample_stage import CanonicalSampleStage, SampleStageMi
 from cloud.orchestration.settings import PipelineLifecycleMixin
 from cloud.orchestration.teacher_stage import TeacherAnnotationMixin
 from cloud.orchestration.training_stage import TrainingStageMixin
-
+from cloud.training import build_proxy_validation_split
+from cloud.training.proxy_metadata import (
+    runtime_input_tensor_shape_from_metadata as _runtime_input_tensor_shape_from_metadata,
+)
+from model_management.split_model_adapters import (
+    get_split_runtime_input_resize_mode,
+    get_split_runtime_model,
+)
 
 # ---------------------------------------------------------------------------
 # Cloud-side Continual Learning
 # ---------------------------------------------------------------------------
+
 
 class FixedSplitPipeline(
     PipelineLifecycleMixin,
@@ -76,7 +99,8 @@ class FixedSplitPipeline(
                 if materialized_manifest is None:
                     raise RuntimeError(
                         "Shard-based continual-learning trigger payload must contain "
-                        "trigger_manifest.json; legacy bundle_manifest.json uploads are no longer supported."
+                        "trigger_manifest.json; legacy bundle_manifest.json uploads "
+                        "are no longer supported."
                     )
                 manifest = materialized_manifest
                 self._log_stage_duration("loading bundle manifest", stage_started)
@@ -86,9 +110,7 @@ class FixedSplitPipeline(
                     )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
                 manifest_model_metadata = _manifest_model_metadata(manifest)
-                manifest_runtime_input_shape = _runtime_input_tensor_shape_from_metadata(
-                    manifest
-                )
+                manifest_runtime_input_shape = _runtime_input_tensor_shape_from_metadata(manifest)
                 early_teacher_requests = self._build_low_quality_raw_teacher_annotation_requests(
                     bundle_cache_path=bundle_cache_path,
                     manifest=manifest,
@@ -146,7 +168,9 @@ class FixedSplitPipeline(
 
                 if bundle_model_version == "0":
                     logger.info(
-                        "[FixedSplitCL] Bundle model_version=0 for edge {}; ignoring any cached {} weights and starting from native {} weights.",
+                        "[FixedSplitCL] Bundle model_version=0 for edge {}; "
+                        "ignoring any cached {} weights and starting from native "
+                        "{} weights.",
                         edge_id,
                         current_model_name,
                         self._native_training_source_label(current_model_name),
@@ -165,7 +189,8 @@ class FixedSplitPipeline(
                         bundle_model_version=bundle_model_version,
                     )
                     logger.info(
-                        "[FixedSplitCL] Resuming edge {} {} training from persisted checkpoint version {}.",
+                        "[FixedSplitCL] Resuming edge {} {} training from persisted "
+                        "checkpoint version {}.",
                         edge_id,
                         current_model_name,
                         metadata["checkpoint_model_version"],
@@ -288,8 +313,9 @@ class FixedSplitPipeline(
                     new_low_quality=staging_low_quality,
                 )
                 rebuild_stats = rebuild_result.rebuild_stats
-                kept_records = rebuild_result.kept_records
-                self._log_stage_duration("feature readiness + canonical sample-pool rebuild", stage_started)
+                self._log_stage_duration(
+                    "feature readiness + canonical sample-pool rebuild", stage_started
+                )
                 self._log_sample_rebuild_summary(
                     split_contract=split_contract,
                     existing_active=existing_active,
@@ -372,7 +398,9 @@ class FixedSplitPipeline(
                     manifest=manifest,
                 )
                 logger.info(
-                    "[FixedSplitCL] Training from {} canonical-active sample(s) with {} validation sample(s) via TrainingCacheView(source=canonical_active) ({} train label entry/entries; {} validation label entry/entries).",
+                    "[FixedSplitCL] Training from {} canonical-active sample(s) with "
+                    "{} validation sample(s) via TrainingCacheView(source=canonical_active) "
+                    "({} train label entry/entries; {} validation label entry/entries).",
                     len(training_bundle_info["all_sample_ids"]),
                     len(validation_split.validation_sample_ids),
                     len(gt_annotations),
@@ -472,7 +500,8 @@ class FixedSplitPipeline(
                     else "Fixed split retraining successful; proxy_mAP_50_95 skipped"
                 )
                 logger.success(
-                    "[FixedSplitCL] {} done for edge {} with {} train samples and {} validation samples.",
+                    "[FixedSplitCL] {} done for edge {} with {} train samples and "
+                    "{} validation samples.",
                     "Retraining",
                     edge_id,
                     len(training_bundle_info["all_sample_ids"]),

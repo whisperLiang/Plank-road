@@ -6,11 +6,11 @@ import numpy as np
 import torch
 
 from cloud.feature_cache import (
+    NPY_MEMMAP_SHARD,
     FeatureShardMetadata,
     FeatureShardPayloadCache,
     FeatureShardRef,
     FeatureShardStore,
-    NPY_MEMMAP_SHARD,
     ShardFeatureBatchReader,
 )
 from tests.test_feature_shard_common import make_entries, runtime_context

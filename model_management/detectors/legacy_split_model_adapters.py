@@ -11,32 +11,32 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from ultralytics.models.utils.loss import RTDETRDetectionLoss
 from torchvision.models.detection.fcos import FCOS
 from torchvision.models.detection.image_list import ImageList
 from torchvision.models.detection.retinanet import RetinaNet
 from torchvision.models.detection.ssd import SSD
 from torchvision.ops import boxes as box_ops
+from ultralytics.models.utils.loss import RTDETRDetectionLoss
 
+from model_management.detection_box_projection import (
+    ORIGINAL_XYXY,
+    project_original_xyxy_to_model_input_xyxy,
+    require_coordinate_metadata,
+)
 from model_management.detectors.legacy_model_zoo import (
     COCO_80_TO_91,
     DETRDetectionModel,
     RFDETRDetectionModel,
     RTDETRDetectionModel,
     YOLODetectionModel,
-    _remap_tinynext_public_detections,
     _postprocess_rfdetr_predictions,
+    _remap_tinynext_public_detections,
 )
-from model_management.detection_box_projection import (
-    ORIGINAL_XYXY,
-    project_original_xyxy_to_model_input_xyxy,
-    require_coordinate_metadata,
-)
+from model_management.payload import BoundaryPayload
 from model_management.ultralytics_parity import (
     postprocess_predictions,
     preprocess_bgr_images,
 )
-from model_management.payload import BoundaryPayload
 
 try:
     from rfdetr.models.lwdetr import build_criterion_and_postprocessors
@@ -102,9 +102,7 @@ class TorchvisionAnchorDetectorReplay(torch.nn.Module):
         outputs = self.head(feature_list)
         if isinstance(outputs, dict):
             return {
-                str(key): value
-                for key, value in outputs.items()
-                if isinstance(value, torch.Tensor)
+                str(key): value for key, value in outputs.items() if isinstance(value, torch.Tensor)
             }
         if isinstance(outputs, (list, tuple)):
             extracted = {}
@@ -256,16 +254,13 @@ def _rfdetr_decoder_forward_post_polymorphic(
 
 
 def _is_anchor_detector(model: torch.nn.Module) -> bool:
-    return (
-        isinstance(model, SSD)
-        or (
-            hasattr(model, "transform")
-            and hasattr(model, "backbone")
-            and hasattr(model, "head")
-            and hasattr(model, "anchor_generator")
-            and hasattr(model, "postprocess_detections")
-            and hasattr(model, "compute_loss")
-        )
+    return isinstance(model, SSD) or (
+        hasattr(model, "transform")
+        and hasattr(model, "backbone")
+        and hasattr(model, "head")
+        and hasattr(model, "anchor_generator")
+        and hasattr(model, "postprocess_detections")
+        and hasattr(model, "compute_loss")
     )
 
 
@@ -531,7 +526,9 @@ def build_split_training_loss(model: torch.nn.Module):
                 "batch_idx": batch["batch_idx"].to(device=device, dtype=torch.long).view(-1),
                 "gt_groups": [int(batch["batch_idx"].numel())],
             }
-            dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = _extract_rtdetr_loss_outputs(outputs)
+            dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = _extract_rtdetr_loss_outputs(
+                outputs
+            )
             if dn_meta is None:
                 dn_bboxes, dn_scores = None, None
             else:
@@ -556,22 +553,26 @@ def build_split_training_loss(model: torch.nn.Module):
 
         def _loss_fn(outputs: Any, targets: Any) -> torch.Tensor:
             logits, pred_boxes = _extract_detr_outputs(outputs)
-            
+
             if isinstance(targets, list):
                 labels = []
                 for target_item in targets:
-                    labels.extend(_build_detr_training_labels(
-                        target_item,
-                        device=logits.device,
-                        num_labels=int(getattr(core_model.config, "num_labels", logits.shape[-1])),
-                    ))
+                    labels.extend(
+                        _build_detr_training_labels(
+                            target_item,
+                            device=logits.device,
+                            num_labels=int(
+                                getattr(core_model.config, "num_labels", logits.shape[-1])
+                            ),
+                        )
+                    )
             else:
                 labels = _build_detr_training_labels(
                     targets,
                     device=logits.device,
                     num_labels=int(getattr(core_model.config, "num_labels", logits.shape[-1])),
                 )
-                
+
             loss, _, _ = core_model.loss_function(
                 logits,
                 labels,
@@ -597,16 +598,18 @@ def build_split_training_loss(model: torch.nn.Module):
             predictions = _extract_rfdetr_outputs(outputs)
             device = _first_tensor_device(predictions, fallback=next(model.parameters()).device)
             criterion.to(device)
-            
+
             if isinstance(targets, list):
                 labels = []
                 for target_item in targets:
-                    labels.extend(_build_rfdetr_training_labels(
-                        target_item,
-                        device=device,
-                        num_classes=int(getattr(model, "num_classes", 0)),
-                        label_schema=getattr(model, "label_schema", "coco_91"),
-                    ))
+                    labels.extend(
+                        _build_rfdetr_training_labels(
+                            target_item,
+                            device=device,
+                            num_classes=int(getattr(model, "num_classes", 0)),
+                            label_schema=getattr(model, "label_schema", "coco_91"),
+                        )
+                    )
             else:
                 labels = _build_rfdetr_training_labels(
                     targets,
@@ -614,7 +617,7 @@ def build_split_training_loss(model: torch.nn.Module):
                     num_classes=int(getattr(model, "num_classes", 0)),
                     label_schema=getattr(model, "label_schema", "coco_91"),
                 )
-                
+
             loss_dict = criterion(predictions, labels)
             return sum(loss_dict.values())
 
@@ -624,6 +627,7 @@ def build_split_training_loss(model: torch.nn.Module):
         return build_anchor_detector_training_loss(model)
 
     if hasattr(model, "roi_heads"):
+
         def _loss_fn(
             outputs: Any,
             targets: Any,
@@ -675,8 +679,7 @@ def build_anchor_detector_training_loss(model: torch.nn.Module):
             )
         elif isinstance(model, FCOS):
             num_anchors_per_level = [
-                int(feature.shape[-2] * feature.shape[-1])
-                for feature in feature_list
+                int(feature.shape[-2] * feature.shape[-1]) for feature in feature_list
             ]
             loss_dict = model.compute_loss(
                 image_targets,
@@ -705,11 +708,7 @@ def _sum_anchor_loss_dict(
     loss_dict: Mapping[str, torch.Tensor],
     head_outputs: Mapping[str, torch.Tensor],
 ) -> torch.Tensor:
-    losses = [
-        loss
-        for loss in loss_dict.values()
-        if isinstance(loss, torch.Tensor)
-    ]
+    losses = [loss for loss in loss_dict.values() if isinstance(loss, torch.Tensor)]
     if losses:
         total = losses[0]
         for loss in losses[1:]:
@@ -730,7 +729,9 @@ def _anchor_head_output_anchor_count(head_outputs: Mapping[str, torch.Tensor]) -
     bbox_regression = head_outputs.get("bbox_regression")
     cls_logits = head_outputs.get("cls_logits")
     if not isinstance(bbox_regression, torch.Tensor) or bbox_regression.ndim < 2:
-        raise RuntimeError("Anchor-detector bbox_regression output must have shape [N, anchors, 4].")
+        raise RuntimeError(
+            "Anchor-detector bbox_regression output must have shape [N, anchors, 4]."
+        )
     if isinstance(cls_logits, torch.Tensor) and cls_logits.ndim >= 2:
         if int(cls_logits.shape[1]) != int(bbox_regression.shape[1]):
             raise RuntimeError(
@@ -791,13 +792,17 @@ def _infer_anchor_feature_shapes_from_head_outputs(
         ]
         expected = sum(
             int(level_height * level_width * anchors)
-            for (level_height, level_width), anchors in zip(shapes, anchors_per_location, strict=True)
+            for (level_height, level_width), anchors in zip(
+                shapes, anchors_per_location, strict=True
+            )
         )
         if expected == total_anchors:
             return shapes
 
     out_channels = getattr(getattr(model, "backbone", None), "out_channels", None)
-    level_count = len(out_channels) if isinstance(out_channels, (list, tuple)) else len(anchors_per_location)
+    level_count = (
+        len(out_channels) if isinstance(out_channels, (list, tuple)) else len(anchors_per_location)
+    )
     if level_count != len(anchors_per_location):
         level_count = len(anchors_per_location)
     if level_count <= 0:
@@ -824,7 +829,9 @@ def _infer_anchor_feature_shapes_from_head_outputs(
             )
         expected = sum(
             int(level_height * level_width * anchors)
-            for (level_height, level_width), anchors in zip(shapes, anchors_per_location, strict=True)
+            for (level_height, level_width), anchors in zip(
+                shapes, anchors_per_location, strict=True
+            )
         )
         if expected == total_anchors:
             return shapes
@@ -927,7 +934,9 @@ def _anchor_target_sizes(
 ) -> tuple[tuple[int, int], tuple[int, int], str]:
     if isinstance(target_item, Mapping):
         try:
-            original_image_size, model_input_size = _infer_original_and_model_input_image_sizes(target_item)
+            original_image_size, model_input_size = _infer_original_and_model_input_image_sizes(
+                target_item
+            )
             resize_mode = _resolve_anchor_resize_mode(model, target_item)
             return original_image_size, model_input_size, resize_mode
         except RuntimeError:
@@ -970,12 +979,15 @@ def _build_transformed_targets_for_anchor_loss(
     model_input_size: tuple[int, int] | None = None
 
     for target_item in target_list:
-        original_size, sample_model_input_size, resize_mode = _anchor_target_sizes(model, target_item)
+        original_size, sample_model_input_size, resize_mode = _anchor_target_sizes(
+            model, target_item
+        )
         if model_input_size is None:
             model_input_size = sample_model_input_size
         elif model_input_size != sample_model_input_size:
             raise RuntimeError(
-                "Anchor-detector split retraining expects a consistent model input size within a batch. "
+                "Anchor-detector split retraining expects a consistent model input "
+                "size within a batch. "
                 f"Got {model_input_size} and {sample_model_input_size}."
             )
         target_dict = dict(target_item) if isinstance(target_item, Mapping) else {}
@@ -1036,8 +1048,7 @@ def _num_anchors_per_level_for_split(
     feature_list: list[torch.Tensor],
 ) -> list[int]:
     num_locations_per_level = [
-        int(feature.shape[-2] * feature.shape[-1])
-        for feature in feature_list
+        int(feature.shape[-2] * feature.shape[-1]) for feature in feature_list
     ]
     if isinstance(model, FCOS):
         return num_locations_per_level
@@ -1048,11 +1059,13 @@ def _num_anchors_per_level_for_split(
 
 
 def _empty_detection_result(device: torch.device) -> list[dict[str, torch.Tensor]]:
-    return [{
-        "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
-        "labels": torch.zeros((0,), dtype=torch.int64, device=device),
-        "scores": torch.zeros((0,), dtype=torch.float32, device=device),
-    }]
+    return [
+        {
+            "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
+            "labels": torch.zeros((0,), dtype=torch.int64, device=device),
+            "scores": torch.zeros((0,), dtype=torch.float32, device=device),
+        }
+    ]
 
 
 def _map_wrapper_labels(model: torch.nn.Module, cls_ids: torch.Tensor) -> torch.Tensor:
@@ -1084,7 +1097,9 @@ def _postprocess_yolo_output(
     orig_image: np.ndarray | None,
 ) -> list[dict[str, torch.Tensor]]:
     if not isinstance(model_input, torch.Tensor) or orig_image is None:
-        raise RuntimeError("YOLO split postprocess requires the model input tensor and original frame.")
+        raise RuntimeError(
+            "YOLO split postprocess requires the model input tensor and original frame."
+        )
 
     results = postprocess_predictions(
         model.yolo,
@@ -1114,7 +1129,9 @@ def _postprocess_rtdetr_output(
     orig_image: np.ndarray | None,
 ) -> list[dict[str, torch.Tensor]]:
     if not isinstance(model_input, torch.Tensor) or orig_image is None:
-        raise RuntimeError("RT-DETR split postprocess requires the model input tensor and original frame.")
+        raise RuntimeError(
+            "RT-DETR split postprocess requires the model input tensor and original frame."
+        )
 
     results = postprocess_predictions(
         model.rtdetr,
@@ -1151,11 +1168,13 @@ def _postprocess_detr_output(
         target_sizes=target_sizes,
         threshold=threshold,
     )[0]
-    return [{
-        "boxes": post["boxes"].float(),
-        "labels": post["labels"].long(),
-        "scores": post["scores"].float(),
-    }]
+    return [
+        {
+            "boxes": post["boxes"].float(),
+            "labels": post["labels"].long(),
+            "scores": post["scores"].float(),
+        }
+    ]
 
 
 def _postprocess_rfdetr_output(
@@ -1173,14 +1192,18 @@ def _postprocess_rfdetr_output(
         threshold=float(threshold),
         num_classes=getattr(model, "num_classes", 91),
         label_schema=getattr(model, "label_schema", "coco_91"),
-        num_select=getattr(model.rfdetr.model.postprocess, "num_select", predictions["pred_logits"].shape[1]),
+        num_select=getattr(
+            model.rfdetr.model.postprocess, "num_select", predictions["pred_logits"].shape[1]
+        ),
         device=model._device,
     )[0]
-    return [{
-        "boxes": decoded["boxes"].detach().to(model._device).float(),
-        "labels": decoded["labels"].detach().to(model._device).long(),
-        "scores": decoded["scores"].detach().to(model._device).float(),
-    }]
+    return [
+        {
+            "boxes": decoded["boxes"].detach().to(model._device).float(),
+            "labels": decoded["labels"].detach().to(model._device).long(),
+            "scores": decoded["scores"].detach().to(model._device).float(),
+        }
+    ]
 
 
 def _postprocess_anchor_detector_output(
@@ -1297,7 +1320,11 @@ def _feature_matrix_from_tensor(
     max_spatial_size: int = 16,
     max_feature_dims: int = 128,
 ) -> torch.Tensor | None:
-    if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point() or tensor.numel() == 0:
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or not tensor.is_floating_point()
+        or tensor.numel() == 0
+    ):
         return None
 
     x = tensor.detach().float()
@@ -1319,7 +1346,11 @@ def _feature_matrix_from_tensor(
     elif x.ndim == 1:
         matrix = x.unsqueeze(0)
     else:
-        flattened = x.reshape(x.shape[0], -1) if x.shape[0] <= 64 else x.reshape(-1, x.shape[-1]).transpose(0, 1)
+        flattened = (
+            x.reshape(x.shape[0], -1)
+            if x.shape[0] <= 64
+            else x.reshape(-1, x.shape[-1]).transpose(0, 1)
+        )
         matrix = flattened
 
     if matrix is None or matrix.numel() == 0:
@@ -1570,7 +1601,9 @@ def _extract_detr_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
             return logits, pred_boxes
     tensors = list(_iter_tensors(outputs))
     logits = next((tensor for tensor in tensors if tensor.ndim == 3 and tensor.shape[-1] > 4), None)
-    pred_boxes = next((tensor for tensor in tensors if tensor.ndim == 3 and tensor.shape[-1] == 4), None)
+    pred_boxes = next(
+        (tensor for tensor in tensors if tensor.ndim == 3 and tensor.shape[-1] == 4), None
+    )
     if logits is None or pred_boxes is None:
         raise RuntimeError("Unable to extract DETR logits/pred_boxes from split replay output.")
     return logits, pred_boxes
@@ -1586,9 +1619,7 @@ def _extract_rfdetr_outputs(outputs: Any) -> dict[str, Any]:
                 "pred_boxes": _contiguous_tensor_tree(pred_boxes),
             }
             if isinstance(outputs.get("aux_outputs"), (list, tuple, dict)):
-                extracted["aux_outputs"] = _unpack_rfdetr_aux_outputs(
-                    outputs["aux_outputs"]
-                )
+                extracted["aux_outputs"] = _unpack_rfdetr_aux_outputs(outputs["aux_outputs"])
             if isinstance(outputs.get("enc_outputs"), dict):
                 extracted["enc_outputs"] = _contiguous_tensor_tree(outputs["enc_outputs"])
             return extracted
@@ -1625,10 +1656,7 @@ def _pack_rfdetr_aux_outputs(value: Any) -> Any:
         ):
             continue
         packed[key] = torch.stack(
-            [
-                tensor if tensor.is_contiguous() else tensor.contiguous()
-                for tensor in tensors
-            ],
+            [tensor if tensor.is_contiguous() else tensor.contiguous() for tensor in tensors],
             dim=0,
         )
     if not packed:
@@ -1675,10 +1703,7 @@ def _unpack_rfdetr_aux_outputs(value: Any) -> Any:
     if layer_count <= 0:
         return []
     return [
-        {
-            key: _contiguous_tensor_tree(tensor[layer_index])
-            for key, tensor in tensor_items.items()
-        }
+        {key: _contiguous_tensor_tree(tensor[layer_index]) for key, tensor in tensor_items.items()}
         for layer_index in range(layer_count)
     ]
 
@@ -1686,9 +1711,7 @@ def _unpack_rfdetr_aux_outputs(value: Any) -> Any:
 def _extract_anchor_detector_outputs(outputs: Any) -> dict[str, torch.Tensor]:
     if isinstance(outputs, dict):
         extracted = {
-            str(key): value
-            for key, value in outputs.items()
-            if isinstance(value, torch.Tensor)
+            str(key): value for key, value in outputs.items() if isinstance(value, torch.Tensor)
         }
         cls_logits = extracted.get("cls_logits")
         bbox_regression = extracted.get("bbox_regression")
@@ -1705,16 +1728,22 @@ def _extract_anchor_detector_outputs(outputs: Any) -> dict[str, torch.Tensor]:
             if len(outputs) >= 3 and isinstance(outputs[2], torch.Tensor):
                 extracted["bbox_ctrness"] = outputs[2]
             return extracted
-    raise RuntimeError("Unable to extract anchor-detector cls_logits/bbox_regression from split replay output.")
+    raise RuntimeError(
+        "Unable to extract anchor-detector cls_logits/bbox_regression from split replay output."
+    )
 
 
-def _extract_rtdetr_loss_outputs(outputs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+def _extract_rtdetr_loss_outputs(
+    outputs: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any]:
     if isinstance(outputs, (list, tuple)):
         if len(outputs) >= 2 and isinstance(outputs[1], (list, tuple)) and len(outputs[1]) == 5:
             candidate = outputs[1]
             if all(isinstance(item, (torch.Tensor, dict, type(None))) for item in candidate):
                 return tuple(candidate)
-        if len(outputs) == 5 and all(isinstance(item, (torch.Tensor, dict, type(None))) for item in outputs):
+        if len(outputs) == 5 and all(
+            isinstance(item, (torch.Tensor, dict, type(None))) for item in outputs
+        ):
             return tuple(outputs)
         for item in outputs:
             if isinstance(item, (list, tuple)):
@@ -1746,10 +1775,7 @@ def _contiguous_tensor_tree(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value if value.is_contiguous() else value.contiguous()
     if isinstance(value, dict):
-        return {
-            key: _contiguous_tensor_tree(item)
-            for key, item in value.items()
-        }
+        return {key: _contiguous_tensor_tree(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return tuple(_contiguous_tensor_tree(item) for item in value)
     if isinstance(value, list):
@@ -1764,9 +1790,7 @@ def _first_tensor_device(value: Any, *, fallback: torch.device) -> torch.device:
 
 def _loss_has_signal(loss: Any) -> bool:
     return (
-        isinstance(loss, torch.Tensor)
-        and loss.requires_grad
-        and bool(torch.isfinite(loss).item())
+        isinstance(loss, torch.Tensor) and loss.requires_grad and bool(torch.isfinite(loss).item())
     )
 
 
@@ -1781,7 +1805,12 @@ def _tail_activation_probe_loss(runtime, candidate) -> torch.Tensor | None:
     trace_graph = getattr(runtime, "trace_graph", None)
     runtime_state = getattr(runtime, "runtime_state", None)
     state_values = getattr(runtime_state, "values", None)
-    if runtime is None or candidate is None or trace_graph is None or not isinstance(state_values, Mapping):
+    if (
+        runtime is None
+        or candidate is None
+        or trace_graph is None
+        or not isinstance(state_values, Mapping)
+    ):
         return None
 
     selected_labels: list[str] = []
@@ -1835,7 +1864,9 @@ def _ensure_ultralytics_loss_args(core_model: torch.nn.Module) -> None:
 
 def _infer_input_image_size(targets: Any) -> tuple[int, int]:
     if not isinstance(targets, dict):
-        raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
+        raise RuntimeError(
+            "Split training targets must be a dict for wrapper-model loss computation."
+        )
     split_meta = targets.get("_split_meta", {})
     input_tensor_shape = split_meta.get("input_tensor_shape")
     if isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) >= 3:
@@ -1843,12 +1874,18 @@ def _infer_input_image_size(targets: Any) -> tuple[int, int]:
         width = int(input_tensor_shape[-1])
         if height > 0 and width > 0:
             return height, width
-    raise RuntimeError("Missing input_tensor_shape metadata required for wrapper-model split retraining.")
+    raise RuntimeError(
+        "Missing input_tensor_shape metadata required for wrapper-model split retraining."
+    )
 
 
-def _infer_original_and_model_input_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:
+def _infer_original_and_model_input_image_sizes(
+    targets: Any,
+) -> tuple[tuple[int, int], tuple[int, int]]:
     if not isinstance(targets, dict):
-        raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
+        raise RuntimeError(
+            "Split training targets must be a dict for wrapper-model loss computation."
+        )
     split_meta = targets.get("_split_meta", {})
     original_image_size, model_input_size, _resize_mode = require_coordinate_metadata(split_meta)
     return original_image_size, model_input_size
@@ -1856,7 +1893,9 @@ def _infer_original_and_model_input_image_sizes(targets: Any) -> tuple[tuple[int
 
 def _infer_split_resize_mode(targets: Any) -> str:
     if not isinstance(targets, dict):
-        raise RuntimeError("Split training targets must be a dict for wrapper-model loss computation.")
+        raise RuntimeError(
+            "Split training targets must be a dict for wrapper-model loss computation."
+        )
     _original_image_size, _model_input_size, resize_mode = require_coordinate_metadata(
         targets.get("_split_meta", {})
     )
@@ -1868,7 +1907,8 @@ def _assert_original_xyxy_targets(targets: dict[str, Any]) -> None:
     has_targets = bool(targets.get("boxes") or targets.get("labels"))
     if coordinate_space != ORIGINAL_XYXY and (coordinate_space or has_targets):
         raise RuntimeError(
-            "Split training targets must use original_xyxy canonical labels before model-specific loss conversion."
+            "Split training targets must use original_xyxy canonical labels before "
+            "model-specific loss conversion."
         )
 
 
@@ -2088,7 +2128,11 @@ def _build_ultralytics_training_batch(
             "bboxes": normalized_boxes.to(dtype=torch.float32),
         }
 
-    if isinstance(targets, (list, tuple)) and targets and all(isinstance(item, dict) for item in targets):
+    if (
+        isinstance(targets, (list, tuple))
+        and targets
+        and all(isinstance(item, dict) for item in targets)
+    ):
         box_pieces: list[torch.Tensor] = []
         label_pieces: list[torch.Tensor] = []
         batch_idx_pieces: list[torch.Tensor] = []
@@ -2104,7 +2148,8 @@ def _build_ultralytics_training_batch(
                 image_size = sample_image_size
             elif image_size != sample_image_size:
                 raise RuntimeError(
-                    "Wrapper-model split retraining expects a consistent model input size within each batch. "
+                    "Wrapper-model split retraining expects a consistent model input "
+                    "size within each batch. "
                     f"Got {image_size} and {sample_image_size}."
                 )
             normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=sample_image_size)
@@ -2113,27 +2158,44 @@ def _build_ultralytics_training_batch(
             if labels.numel() == 0:
                 batch_idx_pieces.append(torch.zeros((0,), dtype=torch.long, device=device))
             else:
-                batch_idx_pieces.append(torch.full((labels.shape[0],), int(batch_index), dtype=torch.long, device=device))
+                batch_idx_pieces.append(
+                    torch.full(
+                        (labels.shape[0],), int(batch_index), dtype=torch.long, device=device
+                    )
+                )
 
         if image_size is None:
-            raise RuntimeError("Missing model input size metadata for wrapper-model split retraining batch.")
+            raise RuntimeError(
+                "Missing model input size metadata for wrapper-model split retraining batch."
+            )
         height, width = image_size
-        bboxes = torch.cat(box_pieces, dim=0) if box_pieces else torch.zeros((0, 4), dtype=torch.float32, device=device)
-        cls = torch.cat(label_pieces, dim=0) if label_pieces else torch.zeros((0, 1), dtype=torch.float32, device=device)
+        bboxes = (
+            torch.cat(box_pieces, dim=0)
+            if box_pieces
+            else torch.zeros((0, 4), dtype=torch.float32, device=device)
+        )
+        cls = (
+            torch.cat(label_pieces, dim=0)
+            if label_pieces
+            else torch.zeros((0, 1), dtype=torch.float32, device=device)
+        )
         batch_idx = (
             torch.cat(batch_idx_pieces, dim=0)
             if batch_idx_pieces
             else torch.zeros((0,), dtype=torch.long, device=device)
         )
         return {
-            "img": torch.zeros((len(targets), 3, height, width), dtype=torch.float32, device=device),
+            "img": torch.zeros(
+                (len(targets), 3, height, width), dtype=torch.float32, device=device
+            ),
             "batch_idx": batch_idx,
             "cls": cls,
             "bboxes": bboxes,
         }
 
     raise RuntimeError(
-        "Split training targets must be a dict or a non-empty list of dicts for wrapper-model loss computation."
+        "Split training targets must be a dict or a non-empty list of dicts for "
+        "wrapper-model loss computation."
     )
 
 
@@ -2170,10 +2232,12 @@ def _build_detr_training_labels(
     boxes = boxes[valid]
     labels = labels[valid]
     normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=image_size)
-    return [{
-        "class_labels": labels.to(dtype=torch.int64),
-        "boxes": normalized_boxes.to(dtype=torch.float32),
-    }]
+    return [
+        {
+            "class_labels": labels.to(dtype=torch.int64),
+            "boxes": normalized_boxes.to(dtype=torch.float32),
+        }
+    ]
 
 
 def _build_rfdetr_training_labels(
@@ -2215,7 +2279,9 @@ def _build_rfdetr_training_labels(
     boxes = boxes[valid]
     labels = labels[valid]
     normalized_boxes = _xyxy_to_normalized_cxcywh(boxes, image_size=image_size)
-    return [{
-        "labels": labels.to(dtype=torch.int64),
-        "boxes": normalized_boxes.to(dtype=torch.float32),
-    }]
+    return [
+        {
+            "labels": labels.to(dtype=torch.int64),
+            "boxes": normalized_boxes.to(dtype=torch.float32),
+        }
+    ]

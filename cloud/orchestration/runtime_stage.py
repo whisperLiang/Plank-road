@@ -279,24 +279,30 @@ __all__ = [
     "splitter_dynamic_batch_range",
 ]
 
+import os
+import shutil
+from datetime import datetime, timezone
+
+import model_management.model_zoo as model_zoo
+from cloud.feature_cache import ShardFeatureRefValidator
 from cloud.orchestration.fixed_split_dependencies import (
-    BoundaryPayload,
-    BoundaryPayloadCacheCodec,
-    ShardFeatureRefValidator,
-    SplitRuntimeContract,
-    UniversalModelSplitter,
     _sanitize_cache_segment,
     _stable_json_dumps,
-    align_sample_feature_contract,
+)
+from cloud.sample_pool import align_sample_feature_contract
+from model_management.payload import BoundaryPayload
+from model_management.split_contract import (
+    SplitRuntimeContract,
     classify_contract_compatibility,
     contract_path,
-    datetime,
     feature_layout_from_tensors,
-    make_feature_layout_id,
-    model_zoo,
-    os,
-    shutil,
-    timezone,
+)
+from model_management.split_contract import (
+    feature_layout_id as make_feature_layout_id,
+)
+from model_management.split_runtime import BoundaryPayloadCacheCodec
+from model_management.universal_model_split import (
+    UniversalModelSplitter,
 )
 
 

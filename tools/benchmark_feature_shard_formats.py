@@ -22,7 +22,6 @@ from cloud.feature_cache import FeatureShardRef, FeatureShardStore
 from cloud.sample_pool import CloudSamplePool
 from model_management.payload import boundary_payload_from_tensors
 
-
 SUMMARY_FIELDS = [
     "format",
     "scenario",
@@ -268,9 +267,13 @@ def _run_format(
         "raw_tensor_bytes": raw_tensor_bytes,
         "storage_bytes": storage_bytes,
         "metadata_bytes": metadata_bytes,
-        "storage_overhead_ratio": 0.0 if raw_tensor_bytes <= 0 else storage_bytes / raw_tensor_bytes,
+        "storage_overhead_ratio": 0.0
+        if raw_tensor_bytes <= 0
+        else storage_bytes / raw_tensor_bytes,
         "write_time_sec": write_time,
-        "write_mb_per_sec": 0.0 if write_time <= 0 else (raw_tensor_bytes / (1024 * 1024)) / write_time,
+        "write_mb_per_sec": 0.0
+        if write_time <= 0
+        else (raw_tensor_bytes / (1024 * 1024)) / write_time,
         "cold_epoch_read_time_sec": cold,
         "warm_epoch_read_time_sec": warm,
         "random_batch_read_ms": random_ms,
@@ -300,14 +303,24 @@ def _write_outputs(output_dir: Path, rows: list[dict[str, Any]], raw: dict[str, 
         json.dumps(raw, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    with open(output_dir / "feature_shard_benchmark_summary.csv", "w", newline="", encoding="utf-8") as handle:
+    with open(
+        output_dir / "feature_shard_benchmark_summary.csv", "w", newline="", encoding="utf-8"
+    ) as handle:
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field) for field in SUMMARY_FIELDS})
-    best_storage = min(rows, key=lambda item: float(item["storage_bytes"]))["format"] if rows else "n/a"
-    best_write = min(rows, key=lambda item: float(item["write_time_sec"]))["format"] if rows else "n/a"
-    best_read = min(rows, key=lambda item: float(item["warm_epoch_read_time_sec"]))["format"] if rows else "n/a"
+    best_storage = (
+        min(rows, key=lambda item: float(item["storage_bytes"]))["format"] if rows else "n/a"
+    )
+    best_write = (
+        min(rows, key=lambda item: float(item["write_time_sec"]))["format"] if rows else "n/a"
+    )
+    best_read = (
+        min(rows, key=lambda item: float(item["warm_epoch_read_time_sec"]))["format"]
+        if rows
+        else "n/a"
+    )
     summary = "\n".join(
         [
             "# Feature Shard Benchmark Summary",

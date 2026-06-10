@@ -71,3 +71,8 @@ extend-exclude = [
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 ignore = ["E402"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.16",
+]

@@ -14,6 +14,7 @@ from typing import Any
 @dataclass
 class DeviceState:
     """Runtime state of one simulated device."""
+
     device_id: int
     stream_id: str = ""
     scene_id: str = ""

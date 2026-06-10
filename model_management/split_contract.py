@@ -9,7 +9,6 @@ from typing import Any, Mapping
 
 import torch
 
-
 SPLIT_RUNTIME_CONTRACT_VERSION = "split-runtime-contract.v2"
 FIXED_SPLIT_RUNTIME_CONTRACT_VERSION = "fixed-split-runtime-contract.v2"
 
@@ -214,9 +213,13 @@ def build_feature_abi_spec(
     runtime_contract = dict(identity.get("runtime_contract") or {})
     labels = [str(label) for label in list(boundary_tensor_labels or [])]
     if not labels:
-        labels = [str(label) for label in list(runtime_contract.get("boundary_tensor_labels") or [])]
+        labels = [
+            str(label) for label in list(runtime_contract.get("boundary_tensor_labels") or [])
+        ]
     resolved_boundary_schema = boundary_schema
-    if resolved_boundary_schema is None and isinstance(runtime_contract.get("boundary_schema"), Mapping):
+    if resolved_boundary_schema is None and isinstance(
+        runtime_contract.get("boundary_schema"), Mapping
+    ):
         resolved_boundary_schema = runtime_contract.get("boundary_schema")  # type: ignore[assignment]
     resolved_model_family = (
         str(model_family or "")
@@ -229,7 +232,12 @@ def build_feature_abi_spec(
         or str(identity.get("graph_signature") or "")
         or str(runtime_contract.get("trace_signature") or "")
     )
-    preprocessing_shape = input_tensor_shape or identity.get("input_tensor_shape") or runtime_contract.get("input_tensor_shape") or []
+    preprocessing_shape = (
+        input_tensor_shape
+        or identity.get("input_tensor_shape")
+        or runtime_contract.get("input_tensor_shape")
+        or []
+    )
     spec = FeatureAbiSpec(
         version="feature-abi.v1",
         model_family=resolved_model_family,
@@ -253,7 +261,9 @@ def build_feature_abi_spec(
                 or identity.get("input_resize_mode")
                 or runtime_contract.get("input_resize_mode")
                 or "direct_resize"
-            ).strip().lower(),
+            )
+            .strip()
+            .lower(),
         },
         passthrough_specs=dict(
             passthrough_specs
@@ -288,9 +298,7 @@ def _normalise_boundary_schema(
             device_policy = spec.get("device_policy") or "runtime"
         else:
             symbolic_shape = (
-                getattr(spec, "shape", None)
-                or getattr(spec, "symbolic_shape", None)
-                or ()
+                getattr(spec, "shape", None) or getattr(spec, "symbolic_shape", None) or ()
             )
             dtype = getattr(spec, "dtype", "")
             requires_grad = getattr(spec, "requires_grad", False)
@@ -336,9 +344,7 @@ def compute_feature_layout_id(
         "trace_signature": str(trace_signature or ""),
         "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
         "input_resize_mode": str(input_resize_mode or ""),
-        "boundary_tensor_labels": [
-            str(label) for label in list(boundary_tensor_labels or [])
-        ],
+        "boundary_tensor_labels": [str(label) for label in list(boundary_tensor_labels or [])],
         "boundary_schema": _normalise_boundary_schema(boundary_schema),
         "feature_layout": {
             str(label): dict(spec)
@@ -511,15 +517,12 @@ def classify_contract_compatibility(
             compatible = _stable_json(edge_spec) == _stable_json(cloud_spec)
             reason = "compatible" if compatible else "feature_abi_spec"
         else:
-            compatible = bool(edge_layout_id and cloud_layout_id and edge_layout_id == cloud_layout_id)
+            compatible = bool(
+                edge_layout_id and cloud_layout_id and edge_layout_id == cloud_layout_id
+            )
             reason = "legacy_feature_layout_id_compatible" if compatible else "feature_layout_id"
 
-    if (
-        compatible
-        and edge_runtime_id
-        and cloud_runtime_id
-        and edge_runtime_id != cloud_runtime_id
-    ):
+    if compatible and edge_runtime_id and cloud_runtime_id and edge_runtime_id != cloud_runtime_id:
         reason = "runtime_identity_changed_but_feature_abi_compatible"
 
     return {
@@ -603,8 +606,7 @@ def resolve_cloud_runtime_contract(
     return build_runtime_contract(
         logical_split_id=str(logical_split_id),
         trace_signature=str(
-            getattr(getattr(runtime_obj, "trace_graph", None), "graph_shape_hash", "")
-            or ""
+            getattr(getattr(runtime_obj, "trace_graph", None), "graph_shape_hash", "") or ""
         ),
         trace_device_type=trace_device_type,
         runtime_backend=resolved_backend,
@@ -731,9 +733,7 @@ class SplitRuntimeContract:
         runtime_identity: Mapping[str, Any] | None = None,
     ) -> "SplitRuntimeContract":
         layout = feature_layout_from_tensors(feature_tensors)
-        runtime_contract = dict(
-            dict(runtime_identity or {}).get("runtime_contract") or {}
-        )
+        runtime_contract = dict(dict(runtime_identity or {}).get("runtime_contract") or {})
         boundary_schema = (
             runtime_contract.get("boundary_schema")
             if isinstance(runtime_contract.get("boundary_schema"), Mapping)
@@ -744,19 +744,13 @@ class SplitRuntimeContract:
             layout_id = compute_feature_layout_id(
                 model_id=str(model_id),
                 model_version=str(
-                    dict(runtime_identity or {}).get("model_version")
-                    or tail_version
-                    or ""
+                    dict(runtime_identity or {}).get("model_version") or tail_version or ""
                 ),
                 logical_split_id=str(cloud_batch_split_id or canonical_split_key),
-                trace_signature=str(
-                    dict(runtime_identity or {}).get("graph_signature") or ""
-                ),
+                trace_signature=str(dict(runtime_identity or {}).get("graph_signature") or ""),
                 input_tensor_shape=[int(dim) for dim in input_tensor_shape],
                 input_resize_mode=str(input_resize_mode or "direct_resize"),
-                boundary_tensor_labels=[
-                    str(label) for label in list(boundary_tensor_labels or [])
-                ],
+                boundary_tensor_labels=[str(label) for label in list(boundary_tensor_labels or [])],
                 boundary_schema=boundary_schema,
                 feature_layout=layout,
             )
@@ -814,11 +808,7 @@ class SplitRuntimeContract:
         }
         layout_id = str(
             payload.get("feature_layout_id")
-            or (
-                feature_layout_id(feature_layout_payload)
-                if feature_layout_payload
-                else ""
-            )
+            or (feature_layout_id(feature_layout_payload) if feature_layout_payload else "")
         )
         identity = dict(payload.get("runtime_identity") or {})
         if not identity:
@@ -828,17 +818,14 @@ class SplitRuntimeContract:
                 split_config_id=str(payload["split_config_id"]),
                 canonical_split_key=str(payload["canonical_split_key"]),
                 cloud_batch_split_id=str(payload["cloud_batch_split_id"]),
-                input_tensor_shape=[
-                    int(dim) for dim in payload.get("input_tensor_shape", [])
-                ],
+                input_tensor_shape=[int(dim) for dim in payload.get("input_tensor_shape", [])],
                 input_resize_mode=str(payload.get("input_resize_mode") or "direct_resize"),
                 feature_layout_id_value=layout_id,
                 runtime_identity=None,
             )
         identity_id = str(payload.get("runtime_identity_id") or runtime_identity_id(identity))
         abi_spec = {
-            str(key): value
-            for key, value in dict(payload.get("feature_abi_spec") or {}).items()
+            str(key): value for key, value in dict(payload.get("feature_abi_spec") or {}).items()
         }
         if not abi_spec:
             abi_spec = build_feature_abi_spec(
@@ -859,9 +846,7 @@ class SplitRuntimeContract:
             if isinstance(item, Mapping)
         ]
         return cls(
-            contract_version=str(
-                payload.get("contract_version") or SPLIT_RUNTIME_CONTRACT_VERSION
-            ),
+            contract_version=str(payload.get("contract_version") or SPLIT_RUNTIME_CONTRACT_VERSION),
             contract_id=str(payload.get("contract_id") or identity_id),
             edge_id=str(payload["edge_id"]),
             model_id=str(payload["model_id"]),

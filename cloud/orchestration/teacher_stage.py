@@ -1,10 +1,47 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
+import time
+from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 
+import torch
 from loguru import logger
 
 from cloud.annotation import TeacherAnnotationRequest, TeacherAnnotationService
+from cloud.contracts import POOL_LABEL_RUNTIME_VERSION
+from cloud.orchestration.fixed_split_dependencies import (
+    POOL_LABEL_COORDINATE_SPACE,
+    _file_sha1,
+    _json_fingerprint,
+)
+from cloud.training.proxy_metadata import (
+    class_names_from_metadata as _class_names_from_metadata,
+)
+from cloud.training.proxy_metadata import (
+    coerce_positive_int as _coerce_positive_int,
+)
+from cloud.training.proxy_metadata import (
+    is_low_quality_trigger_sample as _is_low_quality_trigger_sample,
+)
+from cloud.training.proxy_metadata import (
+    label_name_from_schema as _label_name_from_schema,
+)
+from cloud.training.proxy_metadata import (
+    normalise_class_name as _normalise_class_name,
+)
+from cloud.training.proxy_metadata import (
+    normalise_label_schema as _normalise_label_schema,
+)
+from cloud.training.proxy_metadata import (
+    runtime_image_size_from_metadata as _runtime_image_size_from_metadata,
+)
+from cloud.training.proxy_metadata import (
+    runtime_input_tensor_shape_from_metadata as _runtime_input_tensor_shape_from_metadata,
+)
+from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES, model_lib
+from model_management.split_model_adapters import prepare_split_runtime_input
+from model_management.split_runtime.torchlens_forward_guard import torchlens_forward_guard
 
 
 class TeacherAnnotationStage:
@@ -28,7 +65,8 @@ class TeacherAnnotationStage:
         )
         if ensure_result.unresolved_count:
             logger.info(
-                "[TeacherAnnotation][Ensure] deferring unresolved low-quality samples before canonical staging: "
+                "[TeacherAnnotation][Ensure] deferring unresolved low-quality "
+                "samples before canonical staging: "
                 "unresolved_count={} sample_ids_preview={}",
                 ensure_result.unresolved_count,
                 [str(sample_id) for sample_id in ensure_result.unresolved_sample_ids[:5]],
@@ -37,23 +75,6 @@ class TeacherAnnotationStage:
             str(sample_id): dict(labels)
             for sample_id, labels in ensure_result.labels_by_sample_id.items()
         }
-
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
-from cloud.orchestration.runtime_stage import (
-    FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
-    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
-    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
-    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
-    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
-    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
-    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
-    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
-    fixed_split_validation_batches as _fixed_split_validation_batches,
-    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
-    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
-    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
-)
 
 
 class TeacherAnnotationMixin:
@@ -65,13 +86,11 @@ class TeacherAnnotationMixin:
             queue_state.ticket_states[ticket] = "reserved"
             return ticket
 
-
     def _advance_teacher_queue_locked(self) -> None:
         queue_state = self._teacher_queue_state
         while queue_state.ticket_states.get(int(queue_state.serving_ticket)) in {"done", "skipped"}:
             queue_state.ticket_states.pop(int(queue_state.serving_ticket), None)
             queue_state.serving_ticket = int(queue_state.serving_ticket) + 1
-
 
     def _set_current_teacher_ticket(self, ticket: int | None) -> None:
         queue_state = self._teacher_queue_state
@@ -80,7 +99,6 @@ class TeacherAnnotationMixin:
                 delattr(queue_state.ticket_local, "ticket")
             return
         queue_state.ticket_local.ticket = int(ticket)
-
 
     def _current_teacher_ticket(self) -> int:
         queue_state = self._teacher_queue_state
@@ -98,7 +116,6 @@ class TeacherAnnotationMixin:
             ticket,
         )
         return int(ticket)
-
 
     @contextmanager
     def _teacher_annotation_scope(
@@ -148,18 +165,17 @@ class TeacherAnnotationMixin:
                 self._advance_teacher_queue_locked()
                 queue_state.condition.notify_all()
             logger.info(
-                "[FixedSplitCL] released teacher slot (ticket={}, stage={}, wait_time={:.3f}s, execution_time={:.3f}s).",
+                "[FixedSplitCL] released teacher slot (ticket={}, stage={}, "
+                "wait_time={:.3f}s, execution_time={:.3f}s).",
                 ticket,
                 stage_label,
                 wait_elapsed,
                 execution_elapsed,
             )
 
-
     def _teacher_label_schema(self) -> str:
         teacher_model = getattr(getattr(self, "large_od", None), "model", None)
         return _normalise_label_schema(getattr(teacher_model, "label_schema", "coco_91"))
-
 
     def _teacher_model_name(self) -> str:
         return str(
@@ -167,7 +183,6 @@ class TeacherAnnotationMixin:
             or getattr(self.config, "golden", "")
             or "unknown"
         )
-
 
     def _teacher_weights_fingerprint(self) -> str:
         if self._teacher_weights_fingerprint_cache:
@@ -201,7 +216,6 @@ class TeacherAnnotationMixin:
         )
         return self._teacher_weights_fingerprint_cache
 
-
     def _teacher_class_names(self) -> list[str]:
         teacher_model = getattr(getattr(self, "large_od", None), "model", None)
         class_names = getattr(teacher_model, "class_names", None)
@@ -210,7 +224,6 @@ class TeacherAnnotationMixin:
         if isinstance(class_names, (list, tuple)):
             return [str(item) for item in class_names]
         return []
-
 
     def _teacher_num_classes(self) -> int:
         teacher_model = getattr(getattr(self, "large_od", None), "model", None)
@@ -222,7 +235,6 @@ class TeacherAnnotationMixin:
         if class_names:
             return len(class_names)
         return len(COCO_INSTANCE_CATEGORY_NAMES)
-
 
     def _map_teacher_label_for_target(
         self,
@@ -261,11 +273,9 @@ class TeacherAnnotationMixin:
             return None
 
         target_lookup = {
-            _normalise_class_name(name): index
-            for index, name in enumerate(target_class_names)
+            _normalise_class_name(name): index for index, name in enumerate(target_class_names)
         }
         return target_lookup.get(_normalise_class_name(teacher_name))
-
 
     def _build_teacher_targets_from_prediction(
         self,
@@ -337,13 +347,11 @@ class TeacherAnnotationMixin:
             targets["scores"] = target_scores
         return targets
 
-
     @staticmethod
     def _runtime_image_size_from_metadata(
         metadata: Mapping[str, object] | None,
     ) -> tuple[int, int] | None:
         return _runtime_image_size_from_metadata(metadata)
-
 
     def _prepare_split_runtime_input(
         self,
@@ -360,13 +368,8 @@ class TeacherAnnotationMixin:
             input_tensor_shape=_runtime_input_tensor_shape_from_metadata(sample_metadata),
         )
 
-
     def _teacher_inference(self, frame, threshold: float | None = None):
-        threshold = (
-            self.teacher_annotation_threshold
-            if threshold is None
-            else float(threshold)
-        )
+        threshold = self.teacher_annotation_threshold if threshold is None else float(threshold)
         try:
             return self.large_od.large_inference(
                 frame,
@@ -374,7 +377,6 @@ class TeacherAnnotationMixin:
             )
         except TypeError:
             return self.large_od.large_inference(frame)
-
 
     def _teacher_labels_from_request_prediction(
         self,
@@ -398,12 +400,9 @@ class TeacherAnnotationMixin:
             pred_score,
             image_size=tuple(int(value) for value in frame.shape[:2]),
             target_model_metadata=(
-                target_model_metadata
-                if isinstance(target_model_metadata, Mapping)
-                else None
+                target_model_metadata if isinstance(target_model_metadata, Mapping) else None
             ),
         )
-
 
     def _build_teacher_targets(
         self,
@@ -419,7 +418,6 @@ class TeacherAnnotationMixin:
             image_size=tuple(int(value) for value in frame.shape[:2]),
             target_model_metadata=target_model_metadata,
         )
-
 
     def _build_teacher_annotation_request(
         self,
@@ -437,7 +435,8 @@ class TeacherAnnotationMixin:
             image_sha1 = _file_sha1(image_path)
         except Exception as exc:
             logger.warning(
-                "[TeacherAnnotation][Submit] skipped sample_id={} with unreadable image hash path={} error={}",
+                "[TeacherAnnotation][Submit] skipped sample_id={} with unreadable "
+                "image hash path={} error={}",
                 sample_id,
                 image_path,
                 exc,
@@ -461,7 +460,6 @@ class TeacherAnnotationMixin:
                 "include_empty": bool(include_empty),
             },
         )
-
 
     def _build_teacher_annotation_requests_from_frame_dir(
         self,
@@ -492,7 +490,6 @@ class TeacherAnnotationMixin:
             if request is not None:
                 requests.append(request)
         return requests
-
 
     def _build_low_quality_raw_teacher_annotation_requests(
         self,
@@ -529,7 +526,6 @@ class TeacherAnnotationMixin:
                 requests.append(request)
         return requests
 
-
     def _submit_low_quality_teacher_annotations(
         self,
         requests: Sequence[TeacherAnnotationRequest],
@@ -552,13 +548,11 @@ class TeacherAnnotationMixin:
             result.failed_count,
         )
 
-
     def _teacher_annotation_stage(self) -> TeacherAnnotationStage:
         return TeacherAnnotationStage(
             self.teacher_annotation_service,
             wait_timeout_sec=self.teacher_annotation_wait_timeout_sec,
         )
-
 
     def _collect_teacher_annotations(
         self,

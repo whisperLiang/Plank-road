@@ -20,6 +20,18 @@ service MessageTransmission {
   rpc query_resource (ResourceRequest) returns (ResourceReply) {}
   // Bandwidth estimation: edge sends a small payload, cloud echoes it.
   rpc bandwidth_probe (BandwidthProbeRequest) returns (BandwidthProbeReply) {}
+  // Distributed baseline deployment RPCs.
+  rpc RegisterEdge (BaselineRegisterEdgeRequest) returns (BaselineAck) {}
+  rpc Heartbeat (BaselineHeartbeatRequest) returns (BaselineAck) {}
+  rpc UploadFrame (BaselineFrameRequest) returns (BaselineAck) {}
+  rpc UploadKeyFrame (BaselineFrameRequest) returns (BaselineAck) {}
+  rpc UploadPrediction (BaselineFrameRequest) returns (BaselineAck) {}
+  rpc RequestCloudInference (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
+  rpc PollCommand (BaselineCommandRequest) returns (BaselineCommandReply) {}
+  rpc DownloadInferenceResult (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
+  rpc RequestTraining (BaselineTrainingRequest) returns (BaselineTrainingReply) {}
+  rpc PollTrainingJob (BaselineTrainingStatusRequest) returns (BaselineTrainingStatusReply) {}
+  rpc DownloadModelUpdate (BaselineModelUpdateRequest) returns (BaselineModelUpdateReply) {}
 }
 
 enum TrainingJobType {
@@ -170,4 +182,132 @@ message BandwidthProbeRequest {
 
 message BandwidthProbeReply {
   string payload = 1;
+}
+
+message BaselineAck {
+  bool success = 1;
+  string message = 2;
+}
+
+message BaselineRegisterEdgeRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  string model_name = 4;
+  string model_version = 5;
+  string video_source = 6;
+  int64 timestamp_ms = 7;
+}
+
+message BaselineHeartbeatRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  int64 timestamp_ms = 4;
+  string metrics_ref = 5;
+  string metrics_json = 6;
+}
+
+message BaselineFrameRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  int64 frame_id = 4;
+  int64 timestamp_ms = 5;
+  string model_name = 6;
+  string model_version = 7;
+  string video_source = 8;
+  string upload_mode = 9;
+  bool is_keyframe = 10;
+  string edge_prediction_json = 11;
+  string cloud_prediction_json = 12;
+  string teacher_prediction_json = 13;
+  double confidence = 14;
+  double entropy = 15;
+  string quality_metadata_json = 16;
+  bytes raw_frame = 17;
+  string raw_frame_ref = 18;
+  string feature_ref_json = 19;
+  string metrics_ref = 20;
+  string job_id = 21;
+}
+
+message BaselineInferenceRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  int64 frame_id = 4;
+}
+
+message BaselineInferenceReply {
+  bool success = 1;
+  string message = 2;
+  string run_id = 3;
+  string baseline_method = 4;
+  int64 edge_id = 5;
+  int64 frame_id = 6;
+  string cloud_prediction_json = 7;
+  double confidence = 8;
+  int64 timestamp_ms = 9;
+}
+
+message BaselineCommandRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  int64 timestamp_ms = 4;
+}
+
+message BaselineCommandReply {
+  bool success = 1;
+  string message = 2;
+  repeated string command_json = 3;
+}
+
+message BaselineTrainingRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  string training_strategy = 4;
+  repeated int64 frame_ids = 5;
+  string payload_json = 6;
+}
+
+message BaselineTrainingReply {
+  bool accepted = 1;
+  string job_id = 2;
+  string status = 3;
+  string message = 4;
+  string training_strategy = 5;
+}
+
+message BaselineTrainingStatusRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  string job_id = 4;
+}
+
+message BaselineTrainingStatusReply {
+  bool found = 1;
+  string job_id = 2;
+  string status = 3;
+  string message = 4;
+  bool result_available = 5;
+}
+
+message BaselineModelUpdateRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  string job_id = 4;
+}
+
+message BaselineModelUpdateReply {
+  bool success = 1;
+  string job_id = 2;
+  string status = 3;
+  string model_data = 4;
+  string message = 5;
+  string model_version = 6;
 }

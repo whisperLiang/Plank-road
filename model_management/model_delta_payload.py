@@ -5,7 +5,6 @@ from typing import Any
 
 import torch
 
-
 MODEL_DELTA_PAYLOAD_FORMAT = "state_dict_delta.v1"
 _THRESHOLD_STATE_NAMES = frozenset(
     {
@@ -52,10 +51,7 @@ def _state_key_for_parameter_name(
         if stripped in state_keys:
             return stripped
 
-    suffix_matches = [
-        key for key in state_keys
-        if key.endswith(f".{parameter_name}")
-    ]
+    suffix_matches = [key for key in state_keys if key.endswith(f".{parameter_name}")]
     if len(suffix_matches) == 1:
         return suffix_matches[0]
     return None

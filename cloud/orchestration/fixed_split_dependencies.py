@@ -1,113 +1,19 @@
 from __future__ import annotations
 
-import base64
-import copy
 import hashlib
 import json
-import math
 import os
 import re
-import shutil
 import threading
-import time
-from collections.abc import Mapping, Sequence
-from contextlib import contextmanager
-from dataclasses import replace
-from datetime import datetime, timezone
+from collections.abc import Mapping
 
-import cv2
-import numpy as np
 import torch
-from loguru import logger
-
-from grpc_server.workspace import prepare_request_workspace
-from cloud.annotation import (
-    TeacherAnnotationRequest,
-    TeacherAnnotationService,
-    TeacherAnnotationWorker,
-    TeacherLabelCache,
-)
-from cloud.contracts import (
-    LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
-    POOL_LABEL_RUNTIME_VERSION,
-    validate_high_quality_sync_manifest,
-)
-from cloud.feature_cache import FeatureShardRef, ShardFeatureRefValidator
-from cloud.feature_readiness import FeatureReadinessConfig, FeatureReadinessService
-from cloud.ingest import (
-    load_high_quality_shard_candidates,
-    materialize_low_quality_trigger_bundle,
-)
-from cloud.model_update import serialize_model_update
-from cloud.sample_pool import CloudSamplePool, align_sample_feature_contract
-from cloud.training import (
-    FixedSplitProxyEvaluator,
-    FixedSplitTrainingContext,
-    FixedSplitTrainingPlan,
-    ProxyEvalConfig,
-    build_proxy_validation_split,
-    get_training_adapter,
-)
-from cloud.training.proxy_metadata import (
-    class_names_from_metadata as _class_names_from_metadata,
-    coerce_positive_int as _coerce_positive_int,
-    infer_yolo_model_num_classes as _infer_yolo_model_num_classes,
-    is_cuda_oom_error as _is_cuda_oom_error,
-    is_low_quality_trigger_sample as _is_low_quality_trigger_sample,
-    label_name_from_schema as _label_name_from_schema,
-    looks_like_fused_ultralytics_state_dict as _looks_like_fused_ultralytics_state_dict,
-    normalise_class_name as _normalise_class_name,
-    normalise_label_schema as _normalise_label_schema,
-    normalise_shard_dtype as _normalise_shard_dtype,
-    original_image_size_from_metadata as _original_image_size_from_metadata,
-    pool_label_metadata_from_record as _pool_label_metadata_from_record,
-    runtime_image_size_from_metadata as _runtime_image_size_from_metadata,
-    runtime_input_tensor_shape_from_metadata as _runtime_input_tensor_shape_from_metadata,
-)
 
 import model_management.model_zoo as model_zoo
+from cloud.training.proxy_metadata import (
+    coerce_positive_int as _coerce_positive_int,
+)
 from model_management.detection_box_projection import ORIGINAL_XYXY
-from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES, model_lib
-from model_management.object_detection import Object_Detection
-from model_management.payload import BoundaryPayload
-from model_management.split_contract import (
-    SplitRuntimeContract,
-    classify_contract_compatibility,
-    classify_feature_layout_compatibility,
-    contract_path,
-    feature_layout_from_tensors,
-    feature_layout_id as make_feature_layout_id,
-    resolve_cloud_runtime_contract,
-)
-from model_management.split_model_adapters import (
-    build_split_runtime_sample_input,
-    build_split_training_loss,
-    get_split_runtime_input_resize_mode,
-    get_split_runtime_model,
-    prepare_split_runtime_input,
-)
-from model_management.split_runtime import (
-    BoundaryPayloadCacheCodec,
-    compare_outputs,
-    make_split_spec,
-)
-from model_management.split_runtime.torchlens_forward_guard import torchlens_forward_guard
-from model_management.universal_model_split import (
-    SplitRetrainProfile,
-    UniversalModelSplitter,
-    collect_suffix_trainable_parameters,
-    prepare_exact_split_runtime,
-)
-from model_management.fixed_split_runtime_template import (
-    FixedSplitRuntimeTemplate,
-    FixedSplitRuntimeTemplateKey,
-    FixedSplitRuntimeTemplateLookup,
-    bind_request_splitter_from_template,
-    describe_split_candidate,
-    fixed_split_runtime_template_key,
-    get_fixed_split_runtime_template_cache,
-)
-
 
 POOL_LABEL_COORDINATE_SPACE = ORIGINAL_XYXY
 POOL_LABEL_METADATA_FIELDS = (

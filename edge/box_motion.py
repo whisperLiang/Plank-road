@@ -74,10 +74,9 @@ def estimate_frame_translation(
     if len(original_shape) < 2:
         return None
     original_height, original_width = int(original_shape[0]), int(original_shape[1])
-    if (
-        abs(dx) > float(original_width) * float(max_shift_fraction)
-        or abs(dy) > float(original_height) * float(max_shift_fraction)
-    ):
+    if abs(dx) > float(original_width) * float(max_shift_fraction) or abs(dy) > float(
+        original_height
+    ) * float(max_shift_fraction):
         return None
     return dx, dy
 

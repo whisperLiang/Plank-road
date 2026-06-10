@@ -1150,9 +1150,7 @@ class EdgeWorker:
             "model_version": self.model_version,
             "front_version": str(getattr(self, "front_version", "0") or "0"),
             "quality_bucket": quality.quality_bucket,
-            "quality_metadata": quality.quality_metadata(
-                persist_debug_stats=persist_debug_stats
-            ),
+            "quality_metadata": quality.quality_metadata(persist_debug_stats=persist_debug_stats),
             "window_id": quality.window_id,
             "in_drift_window": quality.in_drift_window,
             "inference_result": inference.to_inference_result(),

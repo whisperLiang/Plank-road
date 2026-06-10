@@ -341,7 +341,7 @@ class BoundaryPayloadCacheCodec:
             prefix = f"{self.batch_symbol}*"
             if value.startswith(prefix):
                 try:
-                    multiplier = int(value[len(prefix):])
+                    multiplier = int(value[len(prefix) :])
                 except ValueError:
                     return None
                 return multiplier if multiplier > 0 else None
@@ -367,9 +367,7 @@ class BoundaryPayloadCacheCodec:
         batch_size: int,
     ) -> tuple[int, int] | None:
         symbolic_shape = tuple(
-            getattr(spec, "shape", None)
-            or getattr(spec, "symbolic_shape", None)
-            or ()
+            getattr(spec, "shape", None) or getattr(spec, "symbolic_shape", None) or ()
         )
         if tensor.ndim == 0 or not symbolic_shape:
             return None

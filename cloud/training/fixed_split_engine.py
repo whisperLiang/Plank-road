@@ -101,9 +101,7 @@ class FixedSplitRetrainEngine:
             proxy_eval_time += proxy_eval.elapsed
             self._log_proxy_eval(log, plan, proxy_eval)
 
-            incumbent_metrics = (
-                best_candidate.proxy_metrics if best_candidate is not None else None
-            )
+            incumbent_metrics = best_candidate.proxy_metrics if best_candidate is not None else None
             improved = adapter.metrics_are_better(
                 proxy_eval.metrics,
                 incumbent_metrics,
@@ -128,9 +126,7 @@ class FixedSplitRetrainEngine:
             decision = early_stopper.record(
                 proxy_eval,
                 improved=improved,
-                best_metric=(
-                    best_candidate.proxy_metric if best_candidate is not None else None
-                ),
+                best_metric=(best_candidate.proxy_metric if best_candidate is not None else None),
             )
             if decision.should_stop:
                 early_stop_reason = decision.reason
@@ -172,9 +168,7 @@ class FixedSplitRetrainEngine:
             float(result.suffix_forward_backward_time) for result in epoch_results
         )
         best_epoch = best_candidate.epoch if best_candidate is not None else None
-        best_proxy_metric = (
-            best_candidate.proxy_metric if best_candidate is not None else None
-        )
+        best_proxy_metric = best_candidate.proxy_metric if best_candidate is not None else None
         log.info(
             "[FixedSplitCL][RetrainProfile] model_name={} model_family={} "
             "total_samples={} epochs={} effective_batch_size={} eval_interval={} "

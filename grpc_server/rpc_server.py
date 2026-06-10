@@ -3,19 +3,18 @@ import json
 import zipfile
 from pathlib import Path
 
+import psutil
+import torch as _torch
 from loguru import logger
 
+from baselines.distributed.messages import BaselineFramePayload, json_dumps, json_loads
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
+from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED
 from grpc_server.workspace import (
     normalize_client_cache_path,
     prepare_request_workspace,
     reset_workspace_dir,
 )
-from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED
-
-
-import psutil
-import torch as _torch
 
 # ── Resource monitoring helpers ──────────────────
 _HAS_PSUTIL = True
@@ -43,10 +42,12 @@ def _get_gpu_utilization() -> float:
     try:
         # Try nvidia-smi via pynvml (bundled with recent PyTorch)
         import subprocess
+
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode == 0:
             vals = [float(v.strip()) for v in result.stdout.strip().split("\n") if v.strip()]
@@ -82,12 +83,14 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         workspace_root=None,
         training_job_manager=None,
         edge_registry=None,
+        baseline_controller=None,
     ):
         self.id = id
         self.continual_learner = continual_learner
         self.workspace_root = workspace_root or "./cache/server_workspace"
         self.training_job_manager = training_job_manager
         self.edge_registry = edge_registry
+        self.baseline_controller = baseline_controller
 
     @staticmethod
     def _request_kind_for_job_type(job_type: int) -> str:
@@ -105,7 +108,8 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             logger.info("Normalized train cache_path from {} to {}", request.cache_path, cache_path)
         logger.info(
             "train_model_request from edge_id={} client_cache_path={}",
-            request.edge_id, cache_path or "<uploaded-bundle>",
+            request.edge_id,
+            cache_path or "<uploaded-bundle>",
         )
         if self.continual_learner is None:
             logger.error("train_model_request: continual_learner not configured")
@@ -136,9 +140,14 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
     def continual_learning_request(self, request, context):
         cache_path = _normalize_cache_path(request.cache_path)
         if cache_path and cache_path != request.cache_path:
-            logger.info("Normalized continual-learning cache_path from {} to {}", request.cache_path, cache_path)
+            logger.info(
+                "Normalized continual-learning cache_path from {} to {}",
+                request.cache_path,
+                cache_path,
+            )
         logger.info(
-            "continual_learning_request from edge_id={} client_cache_path={} send_low_conf_features={}",
+            "continual_learning_request from edge_id={} client_cache_path={} "
+            "send_low_conf_features={}",
             request.edge_id,
             cache_path or "<uploaded-bundle>",
             request.send_low_conf_features,
@@ -167,7 +176,8 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 )
             )
             logger.info(
-                "continual_learning_request finished for edge_id={} success={} workspace={} message={}",
+                "continual_learning_request finished for edge_id={} success={} "
+                "workspace={} message={}",
                 request.edge_id,
                 success,
                 workspace,
@@ -186,7 +196,8 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
     def sync_samples(self, request, context):
         logger.info(
-            "sync_samples edge_id={} sync_type={} payload_zip={} model_id={} model_version={} split_config_id={}",
+            "sync_samples edge_id={} sync_type={} payload_zip={} model_id={} "
+            "model_version={} split_config_id={}",
             request.edge_id,
             request.sync_type,
             len(getattr(request, "payload_zip", b"") or b""),
@@ -320,7 +331,8 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         queue_position = self.training_job_manager.queue_position(job.job_id)
         message = (
             "Training job accepted."
-            if created else "Training job already exists for this request_id."
+            if created
+            else "Training job already exists for this request_id."
         )
         logger.info(
             "Accepted {} training request request_id={} job_id={} "
@@ -364,7 +376,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 request_kind,
                 len(getattr(request, "payload_zip", b"")),
             )
-            
+
             return self._submit_training_job_from_workspace(
                 request,
                 workspace=request.cache_path,
@@ -416,9 +428,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             message=job.message,
             request_id=job.request_id,
             job_type=job.job_type,
-            result_available=(
-                job.status == JOB_STATUS_SUCCEEDED and bool(job.model_data)
-            ),
+            result_available=(job.status == JOB_STATUS_SUCCEEDED and bool(job.model_data)),
             submitted_at_ms=job.submitted_at_ms,
             started_at_ms=job.started_at_ms,
             finished_at_ms=job.finished_at_ms,
@@ -514,3 +524,294 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         return message_transmission_pb2.BandwidthProbeReply(
             payload=request.payload,
         )
+
+    def _baseline_not_configured(self, message: str = "baseline controller is not configured"):
+        return message_transmission_pb2.BaselineAck(success=False, message=message)
+
+    def RegisterEdge(self, request, context):
+        if self.baseline_controller is None:
+            return self._baseline_not_configured()
+        try:
+            self.baseline_controller.register_edge(
+                run_id=request.run_id,
+                baseline_method=request.baseline_method,
+                edge_id=int(request.edge_id),
+                model_name=request.model_name,
+                model_version=request.model_version,
+                video_source=request.video_source,
+            )
+            return message_transmission_pb2.BaselineAck(
+                success=True,
+                message="edge registered",
+            )
+        except Exception as exc:
+            logger.exception("RegisterEdge failed: {}", exc)
+            return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
+
+    def Heartbeat(self, request, context):
+        if self.baseline_controller is None:
+            return self._baseline_not_configured()
+        try:
+            self.baseline_controller.heartbeat(
+                run_id=request.run_id,
+                baseline_method=request.baseline_method,
+                edge_id=int(request.edge_id),
+            )
+            return message_transmission_pb2.BaselineAck(success=True, message="heartbeat recorded")
+        except Exception as exc:
+            logger.exception("Heartbeat failed: {}", exc)
+            return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
+
+    def UploadFrame(self, request, context):
+        return self._upload_baseline_frame(request, expected_keyframe=None)
+
+    def UploadKeyFrame(self, request, context):
+        return self._upload_baseline_frame(request, expected_keyframe=True)
+
+    def UploadPrediction(self, request, context):
+        if self.baseline_controller is None:
+            return self._baseline_not_configured()
+        try:
+            self.baseline_controller.upload_prediction(_baseline_frame_from_request(request))
+            return message_transmission_pb2.BaselineAck(
+                success=True,
+                message="prediction accepted",
+            )
+        except Exception as exc:
+            logger.exception("UploadPrediction failed: {}", exc)
+            return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
+
+    def _upload_baseline_frame(self, request, *, expected_keyframe: bool | None):
+        if self.baseline_controller is None:
+            return self._baseline_not_configured()
+        try:
+            if expected_keyframe is True and not bool(request.is_keyframe):
+                return message_transmission_pb2.BaselineAck(
+                    success=False,
+                    message="non-keyframe rejected by keyframe upload endpoint",
+                )
+            result = self.baseline_controller.upload_frame(_baseline_frame_from_request(request))
+            return message_transmission_pb2.BaselineAck(
+                success=bool(result.get("accepted", True)),
+                message=str(result.get("message", "frame accepted")),
+            )
+        except Exception as exc:
+            logger.exception("UploadFrame failed: {}", exc)
+            return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
+
+    def RequestCloudInference(self, request, context):
+        if self.baseline_controller is None:
+            return _baseline_inference_reply(
+                request,
+                success=False,
+                message="baseline controller is not configured",
+            )
+        try:
+            result = self.baseline_controller.request_cloud_inference(
+                run_id=request.run_id,
+                baseline_method=request.baseline_method,
+                edge_id=int(request.edge_id),
+                frame_id=int(request.frame_id),
+            )
+            return _baseline_inference_reply(
+                request,
+                success=True,
+                message="cloud inference completed",
+                cloud_prediction_json=json_dumps(result.get("cloud_prediction", {})),
+                confidence=float(result.get("confidence", 0.0) or 0.0),
+                timestamp_ms=int(result.get("timestamp_ms", 0) or 0),
+            )
+        except Exception as exc:
+            logger.exception("RequestCloudInference failed: {}", exc)
+            return _baseline_inference_reply(request, success=False, message=str(exc))
+
+    def PollCommand(self, request, context):
+        del context
+        return message_transmission_pb2.BaselineCommandReply(
+            success=True,
+            message="no command",
+            command_json=[],
+        )
+
+    def DownloadInferenceResult(self, request, context):
+        if self.baseline_controller is None:
+            return _baseline_inference_reply(
+                request,
+                success=False,
+                message="baseline controller is not configured",
+            )
+        try:
+            result = self.baseline_controller.download_inference_result(
+                run_id=request.run_id,
+                baseline_method=request.baseline_method,
+                edge_id=int(request.edge_id),
+                frame_id=int(request.frame_id),
+            )
+            if result is None:
+                return _baseline_inference_reply(
+                    request,
+                    success=False,
+                    message="inference result not found",
+                )
+            return _baseline_inference_reply(
+                request,
+                success=True,
+                message="inference result found",
+                cloud_prediction_json=json_dumps(result.get("cloud_prediction", {})),
+                confidence=float(result.get("confidence", 0.0) or 0.0),
+                timestamp_ms=int(result.get("timestamp_ms", 0) or 0),
+            )
+        except Exception as exc:
+            logger.exception("DownloadInferenceResult failed: {}", exc)
+            return _baseline_inference_reply(request, success=False, message=str(exc))
+
+    def RequestTraining(self, request, context):
+        if self.baseline_controller is None:
+            return message_transmission_pb2.BaselineTrainingReply(
+                accepted=False,
+                job_id="",
+                status="",
+                message="baseline controller is not configured",
+                training_strategy=request.training_strategy,
+            )
+        try:
+            job = self.baseline_controller.request_training(
+                run_id=request.run_id,
+                baseline_method=request.baseline_method,
+                edge_id=int(request.edge_id),
+                training_strategy=request.training_strategy,
+                payload=json_loads(request.payload_json),
+            )
+            return message_transmission_pb2.BaselineTrainingReply(
+                accepted=True,
+                job_id=str(job["job_id"]),
+                status=str(job["status"]),
+                message="training job accepted",
+                training_strategy=str(job["training_strategy"]),
+            )
+        except Exception as exc:
+            logger.exception("RequestTraining failed: {}", exc)
+            return message_transmission_pb2.BaselineTrainingReply(
+                accepted=False,
+                job_id="",
+                status="",
+                message=str(exc),
+                training_strategy=request.training_strategy,
+            )
+
+    def PollTrainingJob(self, request, context):
+        if self.baseline_controller is None:
+            return message_transmission_pb2.BaselineTrainingStatusReply(
+                found=False,
+                job_id=request.job_id,
+                status="",
+                message="baseline controller is not configured",
+                result_available=False,
+            )
+        try:
+            job = self.baseline_controller.poll_training_job(
+                run_id=request.run_id,
+                baseline_method=request.baseline_method,
+                edge_id=int(request.edge_id),
+                job_id=request.job_id,
+            )
+            return message_transmission_pb2.BaselineTrainingStatusReply(
+                found=job is not None,
+                job_id=request.job_id,
+                status=str(job.get("status", "")) if job is not None else "",
+                message="training job found" if job is not None else "training job not found",
+                result_available=job is not None and str(job.get("status")) == "SUCCEEDED",
+            )
+        except Exception as exc:
+            logger.exception("PollTrainingJob failed: {}", exc)
+            return message_transmission_pb2.BaselineTrainingStatusReply(
+                found=False,
+                job_id=request.job_id,
+                status="",
+                message=str(exc),
+                result_available=False,
+            )
+
+    def DownloadModelUpdate(self, request, context):
+        if self.baseline_controller is None:
+            return message_transmission_pb2.BaselineModelUpdateReply(
+                success=False,
+                job_id=request.job_id,
+                status="",
+                model_data="",
+                message="baseline controller is not configured",
+                model_version="",
+            )
+        try:
+            update = self.baseline_controller.download_model_update(
+                run_id=request.run_id,
+                baseline_method=request.baseline_method,
+                edge_id=int(request.edge_id),
+                job_id=request.job_id,
+            )
+            return message_transmission_pb2.BaselineModelUpdateReply(
+                success=update is not None,
+                job_id=request.job_id,
+                status=str(update.get("status", "")) if update is not None else "",
+                model_data=str(update.get("model_data", "")) if update is not None else "",
+                message="model update found" if update is not None else "model update not found",
+                model_version=str(update.get("model_version", "")) if update is not None else "",
+            )
+        except Exception as exc:
+            logger.exception("DownloadModelUpdate failed: {}", exc)
+            return message_transmission_pb2.BaselineModelUpdateReply(
+                success=False,
+                job_id=request.job_id,
+                status="",
+                model_data="",
+                message=str(exc),
+                model_version="",
+            )
+
+
+def _baseline_frame_from_request(request) -> BaselineFramePayload:
+    return BaselineFramePayload(
+        run_id=request.run_id,
+        baseline_method=request.baseline_method,
+        edge_id=int(request.edge_id),
+        frame_id=int(request.frame_id),
+        timestamp_ms=int(request.timestamp_ms),
+        model_name=request.model_name,
+        model_version=request.model_version,
+        video_source=request.video_source,
+        upload_mode=request.upload_mode,
+        is_keyframe=bool(request.is_keyframe),
+        edge_prediction=json_loads(request.edge_prediction_json),
+        cloud_prediction=json_loads(request.cloud_prediction_json),
+        teacher_prediction=json_loads(request.teacher_prediction_json),
+        confidence=float(request.confidence),
+        entropy=float(request.entropy),
+        quality_metadata=json_loads(request.quality_metadata_json),
+        raw_frame=bytes(request.raw_frame or b""),
+        raw_frame_ref=request.raw_frame_ref,
+        feature_ref=json_loads(request.feature_ref_json),
+        metrics_ref=request.metrics_ref,
+        job_id=request.job_id,
+    )
+
+
+def _baseline_inference_reply(
+    request,
+    *,
+    success: bool,
+    message: str,
+    cloud_prediction_json: str = "",
+    confidence: float = 0.0,
+    timestamp_ms: int = 0,
+):
+    return message_transmission_pb2.BaselineInferenceReply(
+        success=success,
+        message=message,
+        run_id=request.run_id,
+        baseline_method=request.baseline_method,
+        edge_id=int(request.edge_id),
+        frame_id=int(request.frame_id),
+        cloud_prediction_json=cloud_prediction_json,
+        confidence=confidence,
+        timestamp_ms=timestamp_ms,
+    )

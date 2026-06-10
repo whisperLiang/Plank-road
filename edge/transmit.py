@@ -1,9 +1,11 @@
+import io
 import json
 import os
 import tarfile
 import tempfile
 import time
 import uuid
+import zipfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -13,14 +15,11 @@ import grpc
 from loguru import logger
 
 from cloud.feature_cache.types import NPY_MEMMAP_SHARD, SAFETENSORS_SHARD
-from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
-from tools.grpc_options import grpc_message_options
-import zipfile
-import io
-
 from edge.sample_quality import LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
+from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from model_management.fixed_split import SplitPlan
+from tools.grpc_options import grpc_message_options
 
 LOW_QUALITY_TRIGGER_PROTOCOL_VERSION = "low-quality-trigger-shard.v1"
 
@@ -52,8 +51,7 @@ def _utc_now() -> str:
 
 def _safe_sample_filename(sample_id: str, suffix: str) -> str:
     safe = "".join(
-        char if char.isalnum() or char in {"-", "_", "."} else "_"
-        for char in str(sample_id)
+        char if char.isalnum() or char in {"-", "_", "."} else "_" for char in str(sample_id)
     ).strip("._")
     return f"{safe or uuid.uuid4().hex}{suffix}"
 
@@ -160,9 +158,7 @@ def _select_low_quality_trigger_records(
             if send_low_conf_features
             else []
         )
-        new_feature_paths = [
-            path for path in feature_paths if path not in selected_feature_paths
-        ]
+        new_feature_paths = [path for path in feature_paths if path not in selected_feature_paths]
         source_bytes = os.path.getsize(raw_path) + sum(
             os.path.getsize(path) for path in new_feature_paths
         )
@@ -508,7 +504,7 @@ def pack_low_quality_trigger_bundle_to_file(
 
 def pack_training_payload(cache_path, frame_indices):
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for idx in frame_indices:
             frame_path = os.path.join(cache_path, "frames", f"{idx}.jpg")
             if os.path.exists(frame_path):
@@ -518,8 +514,9 @@ def pack_training_payload(cache_path, frame_indices):
 
 import socket
 
+
 def is_network_connected(address):
-    ip, port = address.split(':')[0], int(address.split(':')[1])
+    ip, port = address.split(":")[0], int(address.split(":")[1])
     try:
         socket.create_connection((ip, port), timeout=1)
         return True
@@ -585,8 +582,7 @@ def submit_training_job(
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         payload_size = len(payload_zip or b"")
         logger.info(
-            "Submitting training job request_id={} edge_id={} job_type={} "
-            "payload_zip={} server={}",
+            "Submitting training job request_id={} edge_id={} job_type={} payload_zip={} server={}",
             request_id,
             edge_id,
             job_type,
@@ -637,13 +633,7 @@ def _build_proto_or_namespace(
         descriptor = getattr(message_cls, "DESCRIPTOR", None)
         if descriptor is not None:
             allowed = set(descriptor.fields_by_name.keys())
-            return message_cls(
-                **{
-                    key: value
-                    for key, value in fields.items()
-                    if key in allowed
-                }
-            )
+            return message_cls(**{key: value for key, value in fields.items() if key in allowed})
         return message_cls(**dict(fields))
     return SimpleNamespace(**dict(fields))
 
@@ -802,9 +792,7 @@ def submit_continual_learning_job(
         selection_policy = dict(manifest.get("selection_policy", {}) or {})
         estimated_upload_sec = None
         if bandwidth_mbps > 0.0 and zip_payload_bytes > 0:
-            estimated_upload_sec = (
-                zip_payload_bytes * 8.0 / (float(bandwidth_mbps) * 1_000_000.0)
-            )
+            estimated_upload_sec = zip_payload_bytes * 8.0 / (float(bandwidth_mbps) * 1_000_000.0)
         logger.info(
             "Packed low-quality trigger bundle for edge {} "
             "(total_pack_time={:.3f}s, "
@@ -819,11 +807,7 @@ def submit_continual_learning_job(
             _format_bytes(int(selection_policy.get("source_total_bytes", 0))),
             _format_bytes(int(selection_policy.get("bundle_cap_bytes", 0))),
             _format_bytes(zip_payload_bytes),
-            (
-                f"{estimated_upload_sec:.3f}s"
-                if estimated_upload_sec is not None
-                else "unknown"
-            ),
+            (f"{estimated_upload_sec:.3f}s" if estimated_upload_sec is not None else "unknown"),
         )
         upload_started = time.perf_counter()
         reply = submit_training_job(

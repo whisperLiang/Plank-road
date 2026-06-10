@@ -2,9 +2,6 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import BoundaryNorm
-from matplotlib.patches import Patch
-
 from lyapunov_plot_common import (
     ACTION_LEGEND_LABELS,
     FIGURES_DIR,
@@ -12,7 +9,8 @@ from lyapunov_plot_common import (
     decision_region,
     representative_payloads,
 )
-
+from matplotlib.colors import BoundaryNorm
+from matplotlib.patches import Patch
 
 plt.rcParams.update(
     {

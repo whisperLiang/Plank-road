@@ -4,13 +4,15 @@ import time
 from pathlib import Path
 
 import cv2
-
 from loguru import logger
+
+from baselines.distributed.edge_runtime import BaselineEdgeRuntime
 from config import load_runtime_config
+from config.baseline import validate_baseline_method
+from edge.box_motion import compensate_boxes_between_frames
 from edge.edge_worker import EdgeWorker
 from edge.info import TASK_STATE
 from edge.task import Task
-from edge.box_motion import compensate_boxes_between_frames
 from model_management.utils import draw_detection
 from tools.file_op import clear_folder
 from tools.video_processor import VideoProcessor
@@ -116,6 +118,110 @@ def _build_display_frame(
     return rendered
 
 
+def _valid_host_port(value: str) -> bool:
+    server_ip = str(value or "").strip()
+    if not server_ip:
+        return False
+
+    if server_ip.startswith("["):
+        closing_index = server_ip.find("]")
+        if closing_index <= 1:
+            return False
+        if closing_index + 1 >= len(server_ip) or server_ip[closing_index + 1] != ":":
+            return False
+        port = server_ip[closing_index + 2 :]
+        return _valid_port(port)
+
+    host, separator, port = server_ip.rpartition(":")
+    return bool(separator and host.strip() and _valid_port(port))
+
+
+def _valid_port(value: str) -> bool:
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return False
+    return 0 < port <= 65535
+
+
+def _is_uri_or_camera_source(value: str) -> bool:
+    source = str(value or "").strip()
+    if not source:
+        return False
+    if source.isdigit():
+        return True
+    return "://" in source
+
+
+def _rtsp_enabled(config) -> bool:
+    return bool(getattr(getattr(config.source, "rtsp", None), "flag", False))
+
+
+def _validate_startup_config(config, *, require_server_ip: bool = True) -> None:
+    edge_id = int(getattr(config, "edge_id", 0) or 0)
+    if edge_id <= 0:
+        raise ValueError("edge_id must be a positive integer")
+
+    server_ip = str(getattr(config, "server_ip", "") or "").strip()
+    if require_server_ip and not _valid_host_port(server_ip):
+        raise ValueError("server_ip must be a non-empty host:port value")
+
+    cache_path = str(getattr(config.retrain, "cache_path", "") or "").strip()
+    if not cache_path:
+        raise ValueError("cache_path must be non-empty")
+
+    video_path = str(getattr(config.source, "video_path", "") or "").strip()
+    if _rtsp_enabled(config):
+        return
+    if not video_path:
+        raise ValueError("client.source.video_path is required unless RTSP is enabled")
+    if _is_uri_or_camera_source(video_path):
+        return
+    if not Path(video_path).expanduser().exists():
+        raise FileNotFoundError(f"video_path does not exist: {video_path}")
+
+
+def _effective_video_source(config) -> str:
+    if _rtsp_enabled(config):
+        rtsp = config.source.rtsp
+        return f"rtsp://{getattr(rtsp, 'ip_address', '')}/channel/{getattr(rtsp, 'channel', '')}"
+    return str(getattr(config.source, "video_path", "") or "").strip()
+
+
+def _split_learning_status(config) -> str:
+    return (
+        "enabled"
+        if bool(getattr(getattr(config, "split_learning", None), "enabled", False))
+        else "disabled"
+    )
+
+
+def _baseline_requires_cloud(baseline_method: str) -> bool:
+    return validate_baseline_method(baseline_method) != "pure_edge_local_updating"
+
+
+def _resolve_baseline_run_id(baseline_method: str, run_id: str | None) -> str | None:
+    value = str(run_id or "").strip()
+    if _baseline_requires_cloud(baseline_method) and not value:
+        raise ValueError(
+            "--run_id is required for cloud-backed baseline mode so every edge "
+            "joins the same cloud run"
+        )
+    return value or None
+
+
+def _log_startup_config(config) -> None:
+    logger.info(
+        "edge client effective startup config: edge_id={}, server_ip={}, "
+        "cache_path={}, video_source={}, split_learning={}",
+        config.edge_id,
+        config.server_ip,
+        config.retrain.cache_path,
+        _effective_video_source(config),
+        _split_learning_status(config),
+    )
+
+
 def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None:
     result_path = Path("log") / "client" / "latest_inference_results.jsonl"
     result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,7 +256,10 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
             video_fps = float(video.fps or 0.0)
             if video_fps <= 0:
                 video_fps = 25.0
-                logger.warning("Video FPS unavailable, falling back to {} FPS for display.", video_fps)
+                logger.warning(
+                    "Video FPS unavailable, falling back to {} FPS for display.",
+                    video_fps,
+                )
             logger.info("the video fps is {}", video_fps)
 
             if config.interval == 0:
@@ -285,22 +394,54 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
     logger.info("Saved local inference results to {}", result_path)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     from tools.logging_config import configure_logging
 
     configure_logging()
 
     parser = argparse.ArgumentParser(description="configuration description")
-    parser.add_argument("--yaml_path", default="./config/config.yaml", help="input the path of *.yaml")
-    parser.add_argument("--edge_id", type=int, default=None, help="override client.edge_id for multi-edge deployment")
-    parser.add_argument("--cache_path", type=str, default=None, help="override client.retrain.cache_path (must be unique per edge)")
-    parser.add_argument("--video_path", type=str, default=None, help="override client.source.video_path")
+    parser.add_argument(
+        "--yaml_path",
+        default="./config/config.yaml",
+        help="input the path of *.yaml",
+    )
+    parser.add_argument(
+        "--edge_id",
+        type=int,
+        default=None,
+        help="override client.edge_id for multi-edge deployment",
+    )
+    parser.add_argument(
+        "--cache_path",
+        type=str,
+        default=None,
+        help="override client.retrain.cache_path (must be unique per edge)",
+    )
+    parser.add_argument(
+        "--video_path",
+        type=str,
+        default=None,
+        help="override client.source.video_path",
+    )
     parser.add_argument("--server_ip", type=str, default=None, help="override client.server_ip")
-    parser.add_argument("--max_count", type=int, default=None, help="override client.source.max_count")
-    parser.add_argument("--headless", action="store_true", help="run without OpenCV display windows")
+    parser.add_argument(
+        "--max_count",
+        type=int,
+        default=None,
+        help="override client.source.max_count",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="run without OpenCV display windows",
+    )
+    parser.add_argument("--mode", choices=("main", "baseline"), default="main")
+    parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
+    parser.add_argument("--run_id", default=None, help="baseline run id")
     args = parser.parse_args()
 
-    config = load_runtime_config(args.yaml_path).client
+    runtime_config = load_runtime_config(args.yaml_path)
+    config = runtime_config.client
 
     # Apply per-edge CLI overrides for multi-edge deployment
     if args.edge_id is not None:
@@ -317,6 +458,68 @@ if __name__ == '__main__':
     if args.server_ip is not None:
         config.server_ip = args.server_ip
 
+    baseline_method = None
+    if args.mode == "baseline":
+        baseline_method = args.baseline_method or runtime_config.baseline.method
+        try:
+            baseline_method = validate_baseline_method(baseline_method)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    baseline_run_id = None
+    if args.mode == "baseline":
+        try:
+            baseline_run_id = _resolve_baseline_run_id(
+                baseline_method,
+                args.run_id or runtime_config.baseline.run_id,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    require_server_ip = args.mode == "main" or _baseline_requires_cloud(baseline_method)
+    try:
+        _validate_startup_config(config, require_server_ip=require_server_ip)
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
+
+    if args.mode == "baseline":
+        runtime_config.baseline.enabled = True
+        runtime_config.baseline.method = baseline_method
+        runtime_config.baseline.run_id = baseline_run_id
+        config.baseline = runtime_config.baseline
+        logger.add(
+            f"log/client/baseline_{baseline_method}_edge_{config.edge_id}_{{time}}.log",
+            level="INFO",
+            rotation="500 MB",
+        )
+        logger.info(
+            "baseline edge effective startup config: run_id={}, baseline_method={}, "
+            "edge_id={}, server_ip={}, cache_path={}, video_source={}, split_learning={}",
+            runtime_config.baseline.run_id or "<auto-local>",
+            baseline_method,
+            config.edge_id,
+            config.server_ip,
+            config.retrain.cache_path,
+            _effective_video_source(config),
+            _split_learning_status(config),
+        )
+        runtime = BaselineEdgeRuntime(
+            config=config,
+            baseline_method=baseline_method,
+            run_id=runtime_config.baseline.run_id,
+            edge_id=int(config.edge_id),
+            server_ip=str(config.server_ip),
+            cache_path=str(config.retrain.cache_path),
+            video_path=_effective_video_source(config),
+        )
+        try:
+            runtime.run()
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user.")
+        finally:
+            runtime.close()
+        raise SystemExit(0)
+
     logger.add(
         f"log/client/edge_{config.edge_id}_{{time}}.log",
         level="INFO",
@@ -326,6 +529,7 @@ if __name__ == '__main__':
     preserve_cache_entries = {"pytest_tmp"}
     if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
         preserve_cache_entries.add("fixed_split_plan.json")
+    _log_startup_config(config)
     clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
     edge = EdgeWorker(config)
 

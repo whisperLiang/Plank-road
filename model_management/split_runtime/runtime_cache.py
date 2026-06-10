@@ -79,9 +79,7 @@ def split_spec_payload(split_spec: SplitSpec) -> dict[str, Any]:
         "boundary": split_spec.boundary,
         "batch_symbol": split_spec.batch_symbol,
         "dynamic_batch": (
-            list(split_spec.dynamic_batch)
-            if split_spec.dynamic_batch is not None
-            else None
+            list(split_spec.dynamic_batch) if split_spec.dynamic_batch is not None else None
         ),
         "trainable": bool(split_spec.trainable),
         "trace_batch_mode": str(split_spec.trace_batch_mode),

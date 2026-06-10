@@ -2,11 +2,33 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from collections.abc import Mapping
+import os
+import re
+import time
+from collections.abc import Mapping, Sequence
 
 import torch
+from loguru import logger
 
+import model_management.model_zoo as model_zoo
 from cloud.model_update import serialize_model_update
+from cloud.orchestration.fixed_split_dependencies import (
+    _normalize_model_version,
+    _read_json_file,
+    _rfdetr_num_classes_from_metadata,
+    _validate_rfdetr_weights_match_metadata,
+)
+from cloud.training.proxy_metadata import (
+    coerce_positive_int as _coerce_positive_int,
+)
+from cloud.training.proxy_metadata import (
+    infer_yolo_model_num_classes as _infer_yolo_model_num_classes,
+)
+from cloud.training.proxy_metadata import (
+    looks_like_fused_ultralytics_state_dict as _looks_like_fused_ultralytics_state_dict,
+)
+from model_management.model_info import model_lib
+from model_management.split_model_adapters import get_split_runtime_model
 
 
 def file_sha1(path: str) -> str:
@@ -37,23 +59,6 @@ class CheckpointStage:
             )
         ).decode("utf-8")
 
-from cloud.orchestration.fixed_split_dependencies import *  # noqa: F403
-from cloud.orchestration.runtime_stage import (
-    FIXED_SPLIT_DYNAMIC_BATCH_MAX as _FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-    FIXED_SPLIT_DYNAMIC_BATCH_MIN as _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
-    cloud_fixed_split_dynamic_batch as _cloud_fixed_split_dynamic_batch,
-    cloud_fixed_split_trace_batch_mode as _cloud_fixed_split_trace_batch_mode,
-    cloud_fixed_split_trace_batch_size as _cloud_fixed_split_trace_batch_size,
-    fixed_split_boundary_from_plan as _fixed_split_boundary_from_plan,
-    fixed_split_manifest_has_rebuildable_raw_samples as _fixed_split_manifest_has_rebuildable_raw_samples,
-    fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
-    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
-    fixed_split_validation_batches as _fixed_split_validation_batches,
-    negotiate_cached_split_runtime_batch_size as _negotiate_cached_split_runtime_batch_size,
-    splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
-    splitter_dynamic_batch_range as _splitter_dynamic_batch_range,
-)
-
 
 class CheckpointStageMixin:
     def _edge_weights_path(self, model_name: str, *, edge_id: int | str | None = None) -> str:
@@ -66,11 +71,9 @@ class CheckpointStageMixin:
             f"tmp_edge_model_{safe_name}_edge_{safe_edge}.pth",
         )
 
-
     @staticmethod
     def _normalize_model_name_for_lookup(model_name: str) -> str:
         return str(model_name).strip().lower().replace("-", "_")
-
 
     @classmethod
     def _known_model_name_for_weights_path(cls, weights_path: str) -> str | None:
@@ -78,13 +81,10 @@ class CheckpointStageMixin:
         if not artifact_name:
             return None
         for model_name, model_info in model_lib.items():
-            known_artifact = os.path.basename(
-                str(model_info.get("model_path", ""))
-            ).strip().lower()
+            known_artifact = os.path.basename(str(model_info.get("model_path", ""))).strip().lower()
             if artifact_name == known_artifact:
                 return cls._normalize_model_name_for_lookup(model_name)
         return None
-
 
     def _configured_weights_path_for_model(
         self,
@@ -111,7 +111,6 @@ class CheckpointStageMixin:
             return ""
         return configured_weights
 
-
     def _edge_weights_metadata_path(
         self,
         model_name: str,
@@ -121,7 +120,6 @@ class CheckpointStageMixin:
         weights_path = self._edge_weights_path(model_name, edge_id=edge_id)
         return f"{os.path.splitext(weights_path)[0]}.meta.json"
 
-
     def _resolve_fixed_split_model_name(self, manifest: Mapping[str, object]) -> str:
         model_meta = dict(manifest.get("model", {}) or {})
         bundle_model_id = str(
@@ -129,13 +127,13 @@ class CheckpointStageMixin:
         ).strip()
         if bundle_model_id and bundle_model_id != self.edge_model_name:
             logger.warning(
-                "[FixedSplitCL] Using bundle model {} instead of configured server.edge_model_name {} for this retrain round.",
+                "[FixedSplitCL] Using bundle model {} instead of configured "
+                "server.edge_model_name {} for this retrain round.",
                 bundle_model_id,
                 self.edge_model_name,
             )
             return bundle_model_id
         return bundle_model_id or self.edge_model_name
-
 
     def _native_training_source_label(self, model_name: str) -> str:
         configured_weights = self._configured_weights_path_for_model(
@@ -145,7 +143,6 @@ class CheckpointStageMixin:
         if configured_weights:
             return "configured"
         return "pretrained" if model_name in model_lib else "randomly initialised"
-
 
     def _detection_model_build_kwargs(
         self,
@@ -187,7 +184,6 @@ class CheckpointStageMixin:
             input_size = height
         build_kwargs["tinynext_input_size"] = input_size
         return build_kwargs
-
 
     def _build_native_training_model(
         self,
@@ -250,17 +246,13 @@ class CheckpointStageMixin:
                     build_kwargs["weights_path"] = str(artifact_path)
         return model_zoo.build_detection_model(model_name, **build_kwargs)
 
-
     def _read_edge_weights_metadata(
         self,
         model_name: str,
         *,
         edge_id: int | str | None = None,
     ) -> dict[str, object]:
-        return _read_json_file(
-            self._edge_weights_metadata_path(model_name, edge_id=edge_id)
-        )
-
+        return _read_json_file(self._edge_weights_metadata_path(model_name, edge_id=edge_id))
 
     def _require_matching_edge_weights_metadata(
         self,
@@ -301,7 +293,6 @@ class CheckpointStageMixin:
             )
         return metadata
 
-
     def _load_edge_training_model(
         self,
         *,
@@ -329,8 +320,7 @@ class CheckpointStageMixin:
 
         if not os.path.exists(edge_weights):
             raise RuntimeError(
-                "[CL] Required edge-scoped cache for "
-                f"{model_name} is missing at {edge_weights}."
+                f"[CL] Required edge-scoped cache for {model_name} is missing at {edge_weights}."
             )
 
         try:
@@ -341,12 +331,16 @@ class CheckpointStageMixin:
                 f"{model_name} from {edge_weights}: {exc}"
             ) from exc
 
-        if str(model_name).lower().startswith("rfdetr_") and not model_zoo.has_compatible_rfdetr_cache_state(state):
+        if str(model_name).lower().startswith(
+            "rfdetr_"
+        ) and not model_zoo.has_compatible_rfdetr_cache_state(state):
             raise RuntimeError(
                 "[CL] Required edge-scoped RF-DETR weights use an unsupported cache format "
                 f"at {edge_weights}."
             )
-        if model_zoo.is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(state):
+        if model_zoo.is_wrapper_model(model_name) and _looks_like_fused_ultralytics_state_dict(
+            state
+        ):
             raise RuntimeError(
                 "[CL] Required edge-scoped wrapper weights look like a fused Ultralytics "
                 f"state_dict at {edge_weights}."
@@ -431,7 +425,6 @@ class CheckpointStageMixin:
         get_split_runtime_model(tmp_model).eval()
         return tmp_model
 
-
     def _build_checkpoint_weights_metadata(
         self,
         *,
@@ -461,13 +454,9 @@ class CheckpointStageMixin:
                 if model_family == "yolo":
                     weights_metadata["yolo_head_num_classes"] = int(yolo_num_classes)
         if model_family == "rfdetr":
-            rfdetr_num_classes = model_zoo.infer_rfdetr_state_dict_num_classes(
-                model.state_dict()
-            )
+            rfdetr_num_classes = model_zoo.infer_rfdetr_state_dict_num_classes(model.state_dict())
             if rfdetr_num_classes is None:
-                rfdetr_num_classes = _coerce_positive_int(
-                    getattr(model, "num_classes", None)
-                )
+                rfdetr_num_classes = _coerce_positive_int(getattr(model, "num_classes", None))
             if rfdetr_num_classes is not None:
                 weights_metadata["rfdetr_head_num_classes"] = int(rfdetr_num_classes)
                 weights_metadata["num_classes"] = int(rfdetr_num_classes)
@@ -493,7 +482,6 @@ class CheckpointStageMixin:
             if tinynext_num_classes is not None:
                 weights_metadata["tinynext_head_num_classes"] = int(tinynext_num_classes)
         return weights_metadata
-
 
     def _serialise_model_bytes(
         self,

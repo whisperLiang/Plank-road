@@ -6,8 +6,8 @@ import zipfile
 
 import torch
 
-from edge.sample_quality import HIGH_QUALITY
 from edge.feature_shard import write_feature_label_shards
+from edge.sample_quality import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore
 from edge.sample_sync import pack_high_quality_sync_bundle_to_file
 from model_management.payload import boundary_payload_from_tensors
@@ -32,7 +32,9 @@ def test_edge_feature_shard_writer_outputs_manifest_labels_and_no_pt(tmp_path) -
         assert os.path.exists(os.path.join(root, shard["label_file"]))
         assert "shard_dir" in shard
         assert shard["sample_ids"]
-    assert not any(filename.endswith(".pt") for _root, _dirs, files in os.walk(root) for filename in files)
+    assert not any(
+        filename.endswith(".pt") for _root, _dirs, files in os.walk(root) for filename in files
+    )
 
 
 def test_edge_feature_shard_writer_preserves_dtype_when_unset(tmp_path) -> None:
@@ -52,10 +54,7 @@ def test_edge_feature_shard_writer_preserves_dtype_when_unset(tmp_path) -> None:
         metadata = json.load(handle)
 
     assert metadata["dtype"] == "float32"
-    assert {
-        leaf["dtype"]
-        for leaf in metadata["leaf_specs"].values()
-    } == {"torch.float32"}
+    assert {leaf["dtype"] for leaf in metadata["leaf_specs"].values()} == {"torch.float32"}
 
 
 def test_high_quality_feature_label_shard_writes_runtime_contract_feature_abi(tmp_path) -> None:

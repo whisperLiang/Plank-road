@@ -21,7 +21,6 @@ from cloud.annotation.types import (
     TeacherAnnotationSubmitResult,
 )
 
-
 BatchInference = Callable[[Sequence[np.ndarray], float], Sequence[object]]
 SingleInference = Callable[[np.ndarray, float], object]
 LabelBuilder = Callable[[TeacherAnnotationRequest, np.ndarray, object], Mapping[str, Any] | None]
@@ -218,7 +217,8 @@ class TeacherAnnotationWorker:
                 )
             self._condition.notify_all()
         logger.info(
-            "[TeacherAnnotation][Submit] requested_samples={} submitted={} duplicate={} failed_count={}",
+            "[TeacherAnnotation][Submit] requested_samples={} submitted={} "
+            "duplicate={} failed_count={}",
             len(requested),
             submitted,
             duplicates,
@@ -238,10 +238,7 @@ class TeacherAnnotationWorker:
         *,
         timeout_sec: float | None,
     ) -> float:
-        requests_by_key = {
-            request.cache_key().digest: request
-            for request in list(requests or [])
-        }
+        requests_by_key = {request.cache_key().digest: request for request in list(requests or [])}
         pending_keys = set(requests_by_key)
         started = time.perf_counter()
         deadline = None if timeout_sec is None else started + max(0.0, float(timeout_sec))
@@ -312,7 +309,8 @@ class TeacherAnnotationWorker:
                             int(attempt_batch_size // 2),
                         )
                         logger.warning(
-                            "[TeacherAnnotation][OOMRetry] teacher_batch_size={} next_batch_size={} samples={} error={}",
+                            "[TeacherAnnotation][OOMRetry] teacher_batch_size={} "
+                            "next_batch_size={} samples={} error={}",
                             actual_size,
                             next_size,
                             len(chunk),
@@ -321,7 +319,8 @@ class TeacherAnnotationWorker:
                         attempt_batch_size = next_size
                         continue
                     logger.warning(
-                        "[TeacherAnnotation][OOMRetry] batch_size=1 still failed; marking sample(s) failed. error={}",
+                        "[TeacherAnnotation][OOMRetry] batch_size=1 still failed; "
+                        "marking sample(s) failed. error={}",
                         exc,
                     )
                 self._handle_chunk_failure(chunk, exc)
@@ -369,8 +368,9 @@ class TeacherAnnotationWorker:
         with self._condition:
             self._stats["teacher_batches"] += 1
         logger.info(
-            "[TeacherAnnotation][Batch] teacher_batch_size={} teacher_batches=1 batch_fallback_count=0 "
-            "oom_retry_count=0 failed_count=0 cache_write_time={:.3f}s",
+            "[TeacherAnnotation][Batch] teacher_batch_size={} teacher_batches=1 "
+            "batch_fallback_count=0 oom_retry_count=0 failed_count=0 "
+            "cache_write_time={:.3f}s",
             len(readable_requests),
             cache_write_time,
         )
@@ -385,7 +385,8 @@ class TeacherAnnotationWorker:
                 predictions = self._call_batch_inference(frames, threshold)
             except _BatchUnsupported as exc:
                 logger.warning(
-                    "[TeacherAnnotation][Batch] batch inference unavailable; falling back to per-sample inference. error={}",
+                    "[TeacherAnnotation][Batch] batch inference unavailable; "
+                    "falling back to per-sample inference. error={}",
                     exc,
                 )
             else:
@@ -396,7 +397,8 @@ class TeacherAnnotationWorker:
             self._stats["batch_fallback_count"] += 1
         predictions = [self._call_single_inference(frame, threshold) for frame in frames]
         logger.info(
-            "[TeacherAnnotation][Batch] teacher_batch_size={} teacher_batches=1 batch_fallback_count=1",
+            "[TeacherAnnotation][Batch] teacher_batch_size={} teacher_batches=1 "
+            "batch_fallback_count=1",
             len(frames),
         )
         return predictions

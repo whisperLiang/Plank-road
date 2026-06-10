@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 _UNIVERSAL_EXPORTS = {
     "UniversalModelSplitter",
     "extract_split_features",

@@ -40,9 +40,8 @@ def representative_payloads() -> dict[str, float]:
 
 
 def low_conf_feature_ratio(payloads: dict[str, float]) -> float:
-    raw_plus_feature = (
-        float(payloads["always_sent_bytes"])
-        + float(payloads["low_quality_feature_bytes"])
+    raw_plus_feature = float(payloads["always_sent_bytes"]) + float(
+        payloads["low_quality_feature_bytes"]
     )
     return float(payloads["low_quality_feature_bytes"]) / max(raw_plus_feature, 1.0)
 
@@ -52,9 +51,7 @@ def raw_plus_feature_pressure(
     payloads: dict[str, float],
 ) -> Any:
     raw_only_payload = max(float(payloads["always_sent_bytes"]), 1.0)
-    raw_plus_feature_payload = raw_only_payload + float(
-        payloads["low_quality_feature_bytes"]
-    )
+    raw_plus_feature_payload = raw_only_payload + float(payloads["low_quality_feature_bytes"])
     return np.minimum(1.0, (raw_plus_feature_payload / raw_only_payload) * raw_only_pressure)
 
 
@@ -72,18 +69,12 @@ def compute_action_scores(
 ) -> dict[str, Any]:
     skip_score = trigger.V * urgency
     raw_only_score = (
-        trigger.w_cloud
-        * (q_cloud + compute_pressure)
-        * (1.0 + compute_pressure)
-        + trigger.w_bw
-        * (q_bw + raw_only_bw_pressure)
-        * (1.0 + raw_only_bw_pressure)
+        trigger.w_cloud * (q_cloud + compute_pressure) * (1.0 + compute_pressure)
+        + trigger.w_bw * (q_bw + raw_only_bw_pressure) * (1.0 + raw_only_bw_pressure)
         + compute_pressure * feature_ratio
     )
     raw_plus_feature_score = (
-        trigger.w_cloud
-        * (q_cloud + compute_pressure)
-        * (1.0 + 0.5 * compute_pressure)
+        trigger.w_cloud * (q_cloud + compute_pressure) * (1.0 + 0.5 * compute_pressure)
         + trigger.w_bw
         * (q_bw + raw_plus_feature_bw_pressure)
         * (1.0 + raw_plus_feature_bw_pressure)
@@ -131,9 +122,12 @@ def decision_region(
 
 
 def figure_note(trigger, payloads: dict[str, float]) -> str:
+    payload_scale = (
+        payloads["always_sent_bytes"] + payloads["low_quality_feature_bytes"]
+    ) / payloads["always_sent_bytes"]
     return (
         f"$V={trigger.V:g}$, $\\lambda_c={trigger.lambda_cloud:g}$, "
         f"$\\lambda_b={trigger.lambda_bw:g}$, feature ratio="
         f"{low_conf_feature_ratio(payloads):.2f}, payload scale="
-        f"{(payloads['always_sent_bytes'] + payloads['low_quality_feature_bytes']) / payloads['always_sent_bytes']:.2f}"
+        f"{payload_scale:.2f}"
     )

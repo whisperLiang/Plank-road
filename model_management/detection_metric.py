@@ -3,43 +3,43 @@ import time
 from numpy import average as avg
 from tqdm import tqdm
 
+
 class RetrainMetric:
     DEFAULT_LOSS_KEYS = (
-        'loss_classifier',
-        'loss_box_reg',
-        'loss_objectness',
-        'loss_rpn_box_reg',
+        "loss_classifier",
+        "loss_box_reg",
+        "loss_objectness",
+        "loss_rpn_box_reg",
     )
 
     def __init__(self):
         self.metrics = {}
 
     def reset_metrics(self):
-        self.metrics = {
-            key: [] for key in self.DEFAULT_LOSS_KEYS
-        }
-        self.metrics.update({
-            'total_loss': [],
-        })
+        self.metrics = {key: [] for key in self.DEFAULT_LOSS_KEYS}
+        self.metrics.update(
+            {
+                "total_loss": [],
+            }
+        )
 
     def update(self, loss_dict, total_loss):
         for loss_name, loss_value in loss_dict.items():
             self.metrics.setdefault(loss_name, [])
             self.metrics[loss_name].append(loss_value.detach().cpu().item())
-        self.metrics['total_loss'].append(total_loss.detach().cpu().item())
+        self.metrics["total_loss"].append(total_loss.detach().cpu().item())
 
     def compute(self):
-        return {
-            key: avg(values)
-            for key, values in self.metrics.items()
-            if values
-        }
+        return {key: avg(values) for key, values in self.metrics.items() if values}
 
     def log_iter(self, epoch, num_epoch, data_loader):
         batch_size = getattr(data_loader, "batch_size", "unknown")
         total_samples = len(data_loader.dataset) if hasattr(data_loader, "dataset") else "unknown"
-        loop = tqdm(enumerate(data_loader, 1), total=len(data_loader),
-                    desc=f'Epoch [{epoch}/{num_epoch}] (BS={batch_size}, total={total_samples})')
+        loop = tqdm(
+            enumerate(data_loader, 1),
+            total=len(data_loader),
+            desc=f"Epoch [{epoch}/{num_epoch}] (BS={batch_size}, total={total_samples})",
+        )
 
         self.reset_metrics()
         data_load_time = []

@@ -57,7 +57,11 @@ def write_feature_label_shards(
                 "sample_id": ref.sample_id,
                 "boxes": list(labels.get("boxes") or []),
                 "labels": list(labels.get("labels") or []),
-                **({"scores": list(labels.get("scores") or [])} if labels.get("scores") is not None else {}),
+                **(
+                    {"scores": list(labels.get("scores") or [])}
+                    if labels.get("scores") is not None
+                    else {}
+                ),
                 **{
                     key: value
                     for key, value in labels.items()
@@ -88,6 +92,8 @@ def write_feature_label_shards(
         if first.shard_dir:
             entry["shard_dir"] = os.path.relpath(first.shard_dir, root_dir).replace("\\", "/")
             entry["index_file_name"] = os.path.basename(first.index_path)
-            entry["meta_file_name"] = os.path.basename(first.index_path).replace(".index.json", ".meta.json")
+            entry["meta_file_name"] = os.path.basename(first.index_path).replace(
+                ".index.json", ".meta.json"
+            )
         manifest_entries.append(entry)
     return root_dir, manifest_entries, labels_by_shard

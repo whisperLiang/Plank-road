@@ -114,16 +114,18 @@ class EdgeRegistry:
         with self._lock:
             edges = []
             for record in self._edges.values():
-                edges.append({
-                    "edge_id": record.edge_id,
-                    "model_id": record.model_id,
-                    "model_version": record.model_version,
-                    "last_seen_ms": record.last_seen_ms,
-                    "active_job_id": record.active_job_id,
-                    "total_jobs_submitted": record.total_jobs_submitted,
-                    "total_jobs_completed": record.total_jobs_completed,
-                    "total_jobs_failed": record.total_jobs_failed,
-                })
+                edges.append(
+                    {
+                        "edge_id": record.edge_id,
+                        "model_id": record.model_id,
+                        "model_version": record.model_version,
+                        "last_seen_ms": record.last_seen_ms,
+                        "active_job_id": record.active_job_id,
+                        "total_jobs_submitted": record.total_jobs_submitted,
+                        "total_jobs_completed": record.total_jobs_completed,
+                        "total_jobs_failed": record.total_jobs_failed,
+                    }
+                )
             return {
                 "total_edges": len(self._edges),
                 "edges": edges,

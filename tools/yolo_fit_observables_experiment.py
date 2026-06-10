@@ -130,8 +130,12 @@ def _boxes_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     inter = inter_w * inter_h
     if inter <= 0.0:
         return 0.0
-    area_a = max(0.0, float(box_a[2]) - float(box_a[0])) * max(0.0, float(box_a[3]) - float(box_a[1]))
-    area_b = max(0.0, float(box_b[2]) - float(box_b[0])) * max(0.0, float(box_b[3]) - float(box_b[1]))
+    area_a = max(0.0, float(box_a[2]) - float(box_a[0])) * max(
+        0.0, float(box_a[3]) - float(box_a[1])
+    )
+    area_b = max(0.0, float(box_b[2]) - float(box_b[0])) * max(
+        0.0, float(box_b[3]) - float(box_b[1])
+    )
     union = area_a + area_b - inter
     if union <= 0.0:
         return 0.0
@@ -328,7 +332,11 @@ def _summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     summary: dict[str, Any] = {}
     for subset_name in ("all", "train_bundle", "holdout"):
-        subset_records = records if subset_name == "all" else [row for row in records if row["subset"] == subset_name]
+        subset_records = (
+            records
+            if subset_name == "all"
+            else [row for row in records if row["subset"] == subset_name]
+        )
         if not subset_records:
             continue
         subset_summary: dict[str, Any] = {"count": len(subset_records)}
@@ -349,7 +357,11 @@ def _cross_sample_correlations(records: list[dict[str, Any]]) -> dict[str, dict[
     ]
     correlations: dict[str, dict[str, float | None]] = {}
     for subset_name in ("all", "train_bundle", "holdout"):
-        subset_records = records if subset_name == "all" else [row for row in records if row["subset"] == subset_name]
+        subset_records = (
+            records
+            if subset_name == "all"
+            else [row for row in records if row["subset"] == subset_name]
+        )
         fit_scores = [float(row["fit_f1"]) for row in subset_records]
         subset_corr: dict[str, float | None] = {}
         for observable in observables:
@@ -500,7 +512,9 @@ def run_experiment(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate yolo26n fit observables across weight regimes.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate yolo26n fit observables across weight regimes."
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -528,15 +542,17 @@ def main() -> None:
         holdout_dir=args.holdout_dir,
         report_root=args.report_root,
     )
-    print(json.dumps(
-        {
-            "cloud_train_message": report["cloud_train_message"],
-            "sample_count": report["sample_count"],
-            "report_path": str((args.report_root / "report.json").resolve()),
-        },
-        indent=2,
-        ensure_ascii=False,
-    ))
+    print(
+        json.dumps(
+            {
+                "cloud_train_message": report["cloud_train_message"],
+                "sample_count": report["sample_count"],
+                "report_path": str((args.report_root / "report.json").resolve()),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

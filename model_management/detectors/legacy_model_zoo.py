@@ -45,37 +45,38 @@ Usage
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from contextlib import contextmanager
 import hashlib
-from importlib.util import find_spec
 import re
 import sys
 import types
+from collections import OrderedDict
+from contextlib import contextmanager
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import numpy as np
 import requests
 import torch
 import torch.nn as nn
 import torchvision.transforms.functional as F
-import numpy as np
 from huggingface_hub import hf_hub_download, snapshot_download
 from loguru import logger
 from torch.hub import download_url_to_file
 from torchvision import transforms
+from torchvision.models.detection import (
+    FCOS_ResNet50_FPN_Weights,
+    RetinaNet_ResNet50_FPN_Weights,
+    fcos_resnet50_fpn,
+    retinanet_resnet50_fpn,
+)
 from torchvision.ops import batched_nms
 
 # ---------------------------------------------------------------------------
 # Required dependencies
 # ---------------------------------------------------------------------------
 from transformers import DetrConfig, DetrForObjectDetection, DetrImageProcessor
-from torchvision.models.detection import (
-    retinanet_resnet50_fpn,
-    fcos_resnet50_fpn,
-    RetinaNet_ResNet50_FPN_Weights,
-    FCOS_ResNet50_FPN_Weights,
-)
+
 from model_management.model_info import model_lib
 from model_management.tinynext import build_tinynext_detector
 from model_management.ultralytics_parity import (
@@ -107,17 +108,93 @@ _HAS_TV_DETECTION = True
 # use the original COCO IDs (1-indexed).  This LUT maps yolo_cls →
 # torchvision label.
 COCO_80_TO_91 = [
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19,
-    20, 21, 22, 23, 24, 25, 27, 28, 31, 32, 33, 34, 35, 36, 37, 38,
-    39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
-    56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 67, 70, 72, 73, 74, 75,
-    76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    27,
+    28,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    65,
+    67,
+    70,
+    72,
+    73,
+    74,
+    75,
+    76,
+    77,
+    78,
+    79,
+    80,
+    81,
+    82,
+    84,
+    85,
+    86,
+    87,
+    88,
+    89,
+    90,
 ]
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  1. YOLO Wrapper  (ultralytics)
 # ═══════════════════════════════════════════════════════════════════════
+
 
 class YOLODetectionModel(nn.Module):
     """Wraps an Ultralytics YOLO model to produce torchvision-compatible output.
@@ -145,10 +222,10 @@ class YOLODetectionModel(nn.Module):
         super().__init__()
         if not _HAS_ULTRALYTICS:
             raise ImportError(
-                "ultralytics is required for YOLO models.  "
-                "Install: pip install ultralytics"
+                "ultralytics is required for YOLO models.  Install: pip install ultralytics"
             )
         from ultralytics import YOLO
+
         self.yolo = YOLO(model_name)
         internal_num_classes = max(int(num_classes), 1)
         if internal_num_classes == 91:
@@ -184,9 +261,7 @@ class YOLODetectionModel(nn.Module):
         # If COCO 80-class, use the mapping; otherwise use native class IDs.
         self._map_labels = num_classes >= 91
 
-    def forward(
-        self, images: List[torch.Tensor], targets=None
-    ) -> List[Dict[str, torch.Tensor]]:
+    def forward(self, images: List[torch.Tensor], targets=None) -> List[Dict[str, torch.Tensor]]:
         """
         Parameters
         ----------
@@ -216,11 +291,13 @@ class YOLODetectionModel(nn.Module):
         detections: List[Dict[str, torch.Tensor]] = []
         for result in results:
             if result.boxes is None or result.boxes.data.numel() == 0:
-                detections.append({
-                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
-                    "labels": torch.zeros((0,), dtype=torch.int64),
-                    "scores": torch.zeros((0,), dtype=torch.float32),
-                })
+                detections.append(
+                    {
+                        "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                        "labels": torch.zeros((0,), dtype=torch.int64),
+                        "scores": torch.zeros((0,), dtype=torch.float32),
+                    }
+                )
                 continue
 
             boxes_xyxy = result.boxes.xyxy.detach().cpu().float()
@@ -235,11 +312,13 @@ class YOLODetectionModel(nn.Module):
             else:
                 labels = cls_ids
 
-            detections.append({
-                "boxes": boxes_xyxy,
-                "labels": labels,
-                "scores": scores,
-            })
+            detections.append(
+                {
+                    "boxes": boxes_xyxy,
+                    "labels": labels,
+                    "scores": scores,
+                }
+            )
         return detections
 
     def train(self, mode: bool = True):
@@ -271,6 +350,7 @@ class YOLODetectionModel(nn.Module):
 #  2. DETR Wrapper  (HuggingFace transformers)
 # ═══════════════════════════════════════════════════════════════════════
 
+
 class DETRDetectionModel(nn.Module):
     """Wraps a HuggingFace DETR model to produce torchvision-compatible output.
 
@@ -296,8 +376,7 @@ class DETRDetectionModel(nn.Module):
         super().__init__()
         if not _HAS_HF_DETR:
             raise ImportError(
-                "transformers is required for DETR models.  "
-                "Install: pip install transformers"
+                "transformers is required for DETR models.  Install: pip install transformers"
             )
         if pretrained:
             self.processor = DetrImageProcessor.from_pretrained(model_name_or_path)
@@ -323,9 +402,7 @@ class DETRDetectionModel(nn.Module):
         self._device = device
         self.num_classes = num_classes
 
-    def forward(
-        self, images: List[torch.Tensor], targets=None
-    ) -> List[Dict[str, torch.Tensor]]:
+    def forward(self, images: List[torch.Tensor], targets=None) -> List[Dict[str, torch.Tensor]]:
         results: List[Dict[str, torch.Tensor]] = []
         for img_tensor in images:
             # Convert tensor → PIL for the processor
@@ -340,18 +417,20 @@ class DETRDetectionModel(nn.Module):
                     outputs = self.detr(**inputs)
 
             # Post-process: convert logits → boxes in image coords
-            target_sizes = torch.tensor(
-                [pil_img.size[::-1]], device=self._device
-            )  # (H, W)
+            target_sizes = torch.tensor([pil_img.size[::-1]], device=self._device)  # (H, W)
             post = self.processor.post_process_object_detection(
-                outputs, target_sizes=target_sizes, threshold=self.confidence,
+                outputs,
+                target_sizes=target_sizes,
+                threshold=self.confidence,
             )[0]
 
-            results.append({
-                "boxes": post["boxes"].cpu().float(),
-                "labels": post["labels"].cpu().long(),
-                "scores": post["scores"].cpu().float(),
-            })
+            results.append(
+                {
+                    "boxes": post["boxes"].cpu().float(),
+                    "labels": post["labels"].cpu().long(),
+                    "scores": post["scores"].cpu().float(),
+                }
+            )
         return results
 
     def train(self, mode: bool = True):
@@ -397,10 +476,7 @@ class RFDETRDetectionModel(nn.Module):
     ):
         super().__init__()
         if not _HAS_RFDETR:
-            raise ImportError(
-                "rfdetr is required for RF-DETR models. "
-                "Install: pip install rfdetr"
-            )
+            raise ImportError("rfdetr is required for RF-DETR models. Install: pip install rfdetr")
 
         model_name = _normalise_model_name(model_name)
         variant_cls = self._VARIANTS.get(model_name)
@@ -438,7 +514,9 @@ class RFDETRDetectionModel(nn.Module):
     def num_windows(self) -> int:
         return int(self.rfdetr.model_config.num_windows)
 
-    def _prepare_batch(self, images: List[torch.Tensor]) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+    def _prepare_batch(
+        self, images: List[torch.Tensor]
+    ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
         processed: list[torch.Tensor] = []
         original_sizes: list[tuple[int, int]] = []
         resize_shape = [self.resolution, self.resolution]
@@ -476,7 +554,9 @@ class RFDETRDetectionModel(nn.Module):
             threshold=float(self.confidence),
             num_classes=self.num_classes,
             label_schema=getattr(self, "label_schema", "coco_91"),
-            num_select=getattr(self.rfdetr.model.postprocess, "num_select", predictions["pred_logits"].shape[1]),
+            num_select=getattr(
+                self.rfdetr.model.postprocess, "num_select", predictions["pred_logits"].shape[1]
+            ),
             device=self._device,
         )
 
@@ -521,6 +601,7 @@ class RFDETRDetectionModel(nn.Module):
 #  3. RT-DETR Wrapper  (ultralytics)
 # ═══════════════════════════════════════════════════════════════════════
 
+
 class RTDETRDetectionModel(nn.Module):
     """Wraps an Ultralytics RT-DETR model (real-time DETR) to produce
     torchvision-compatible output.
@@ -544,10 +625,10 @@ class RTDETRDetectionModel(nn.Module):
         super().__init__()
         if not _HAS_ULTRALYTICS:
             raise ImportError(
-                "ultralytics is required for RT-DETR models.  "
-                "Install: pip install ultralytics"
+                "ultralytics is required for RT-DETR models.  Install: pip install ultralytics"
             )
         from ultralytics import RTDETR
+
         self.rtdetr = RTDETR(model_name)
         self.rtdetr.to(device)
         self.confidence = confidence
@@ -556,9 +637,7 @@ class RTDETRDetectionModel(nn.Module):
         self.label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
         self._map_labels = num_classes >= 91
 
-    def forward(
-        self, images: List[torch.Tensor], targets=None
-    ) -> List[Dict[str, torch.Tensor]]:
+    def forward(self, images: List[torch.Tensor], targets=None) -> List[Dict[str, torch.Tensor]]:
         images_bgr = [rgb_tensor_to_bgr_uint8(image) for image in images]
         _, model_input = preprocess_bgr_images(
             self.rtdetr,
@@ -577,11 +656,13 @@ class RTDETRDetectionModel(nn.Module):
         detections: List[Dict[str, torch.Tensor]] = []
         for result in results:
             if result.boxes is None or result.boxes.data.numel() == 0:
-                detections.append({
-                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
-                    "labels": torch.zeros((0,), dtype=torch.int64),
-                    "scores": torch.zeros((0,), dtype=torch.float32),
-                })
+                detections.append(
+                    {
+                        "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                        "labels": torch.zeros((0,), dtype=torch.int64),
+                        "scores": torch.zeros((0,), dtype=torch.float32),
+                    }
+                )
                 continue
 
             boxes_xyxy = result.boxes.xyxy.detach().cpu().float()
@@ -596,11 +677,13 @@ class RTDETRDetectionModel(nn.Module):
             else:
                 labels = cls_ids
 
-            detections.append({
-                "boxes": boxes_xyxy,
-                "labels": labels,
-                "scores": scores,
-            })
+            detections.append(
+                {
+                    "boxes": boxes_xyxy,
+                    "labels": labels,
+                    "scores": scores,
+                }
+            )
         return detections
 
     def train(self, mode: bool = True):
@@ -633,12 +716,16 @@ class RTDETRDetectionModel(nn.Module):
 # These already output the standard torchvision detection format, so we
 # just need a factory function to instantiate them.
 
-_TORCHVISION_BUILTIN = {
-    # RetinaNet
-    "retinanet_resnet50_fpn":                  lambda **kw: retinanet_resnet50_fpn(**kw),
-    # FCOS
-    "fcos_resnet50_fpn":                       lambda **kw: fcos_resnet50_fpn(**kw),
-} if _HAS_TV_DETECTION else {}
+_TORCHVISION_BUILTIN = (
+    {
+        # RetinaNet
+        "retinanet_resnet50_fpn": lambda **kw: retinanet_resnet50_fpn(**kw),
+        # FCOS
+        "fcos_resnet50_fpn": lambda **kw: fcos_resnet50_fpn(**kw),
+    }
+    if _HAS_TV_DETECTION
+    else {}
+)
 
 _TORCHVISION_WEIGHT_DEFAULTS = {
     "retinanet_resnet50_fpn": RetinaNet_ResNet50_FPN_Weights.DEFAULT,
@@ -691,14 +778,14 @@ _YOLO_MODELS: Dict[str, str] = {
 }
 
 _DETR_MODELS: Dict[str, str] = {
-    "detr_resnet50":         "facebook/detr-resnet-50",
-    "detr_resnet101":        "facebook/detr-resnet-101",
+    "detr_resnet50": "facebook/detr-resnet-50",
+    "detr_resnet101": "facebook/detr-resnet-101",
     "conditional_detr_resnet50": "microsoft/conditional-detr-resnet-50",
 }
 
 _RTDETR_MODELS: Dict[str, str] = {
-    "rtdetr_l":  "rtdetr-l.pt",
-    "rtdetr_x":  "rtdetr-x.pt",
+    "rtdetr_l": "rtdetr-l.pt",
+    "rtdetr_x": "rtdetr-x.pt",
 }
 
 _RFDETR_MODELS: Dict[str, str] = {
@@ -851,8 +938,7 @@ def _has_hf_snapshot(local_dir: Path) -> bool:
         return False
     has_config = (local_dir / "config.json").exists()
     has_weights = any(
-        (local_dir / filename).exists()
-        for filename in ("model.safetensors", "pytorch_model.bin")
+        (local_dir / filename).exists() for filename in ("model.safetensors", "pytorch_model.bin")
     )
     has_processor = (local_dir / "preprocessor_config.json").exists()
     return has_config and has_weights and has_processor
@@ -911,7 +997,8 @@ def _ensure_tinynext_artifact(name: str) -> Path:
             )
         except Exception as exc:
             logger.warning(
-                "Failed to inspect TinyNeXt artifact {} ({}); refreshing from detector checkpoint {}.",
+                "Failed to inspect TinyNeXt artifact {} ({}); refreshing from "
+                "detector checkpoint {}.",
                 artifact_path,
                 exc,
                 repo_filename,
@@ -991,10 +1078,9 @@ def _load_tinynext_checkpoint(path: str | Path, *, device: str | torch.device = 
         return torch.load(checkpoint_path, map_location=device, weights_only=False)
     except (ModuleNotFoundError, AttributeError) as exc:
         message = str(exc)
-        missing_mmengine = (
-            isinstance(exc, ModuleNotFoundError)
-            and str(getattr(exc, "name", "")).startswith("mmengine")
-        )
+        missing_mmengine = isinstance(exc, ModuleNotFoundError) and str(
+            getattr(exc, "name", "")
+        ).startswith("mmengine")
         needs_history_buffer_shim = "HistoryBuffer" in message or "mmengine" in message
         if not missing_mmengine and not needs_history_buffer_shim:
             raise
@@ -1054,10 +1140,9 @@ def infer_tinynext_state_dict_num_classes(state_dict: object) -> int | None:
 def _tinynext_checkpoint_has_detector_weights(path: str | Path) -> bool:
     checkpoint = _load_tinynext_checkpoint(path, device="cpu")
     state_dict = _extract_tinynext_checkpoint_state_dict(checkpoint)
-    return (
-        _looks_like_tinynext_official_detector_state_dict(state_dict)
-        or _looks_like_tinynext_internal_detector_state_dict(state_dict)
-    )
+    return _looks_like_tinynext_official_detector_state_dict(
+        state_dict
+    ) or _looks_like_tinynext_internal_detector_state_dict(state_dict)
 
 
 def _convert_tinynext_classifier_tensor(
@@ -1215,7 +1300,9 @@ def _tinynext_forward_label_hook(module: nn.Module, _inputs: object, output: obj
 def _configure_tinynext_label_schema(model: nn.Module, *, num_classes: int) -> None:
     setattr(model, "num_classes", int(num_classes))
     setattr(model, "label_schema", "coco_91" if int(num_classes) >= 91 else "zero_based")
-    if hasattr(model, "register_forward_hook") and not bool(getattr(model, "_plank_public_label_hook_registered", False)):
+    if hasattr(model, "register_forward_hook") and not bool(
+        getattr(model, "_plank_public_label_hook_registered", False)
+    ):
         model.register_forward_hook(_tinynext_forward_label_hook)
         setattr(model, "_plank_public_label_hook_registered", True)
 
@@ -1224,7 +1311,9 @@ def _load_rfdetr_checkpoint(artifact_path: Path, *, device: str | torch.device =
     return torch.load(artifact_path, map_location=device, weights_only=False)
 
 
-def _load_ultralytics_checkpoint(artifact_path: Path, *, device: str | torch.device = "cpu") -> object:
+def _load_ultralytics_checkpoint(
+    artifact_path: Path, *, device: str | torch.device = "cpu"
+) -> object:
     return torch.load(artifact_path, map_location=device, weights_only=False)
 
 
@@ -1351,10 +1440,7 @@ def _normalise_rfdetr_state_dict_keys(
     model_prefix = "model."
     prefixed_count = sum(1 for key in tensor_items if key.startswith(model_prefix))
     if prefixed_count and prefixed_count == len(tensor_items):
-        return {
-            key[len(model_prefix):]: value
-            for key, value in tensor_items.items()
-        }
+        return {key[len(model_prefix) :]: value for key, value in tensor_items.items()}
     return dict(tensor_items)
 
 
@@ -1447,12 +1533,10 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
     artifact_path = get_model_artifact_path(name_lower)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     if not _HAS_RFDETR:
-        raise ImportError(
-            "rfdetr is required for RF-DETR models. "
-            "Install: pip install rfdetr"
-        )
+        raise ImportError("rfdetr is required for RF-DETR models. Install: pip install rfdetr")
 
     from rfdetr.assets.model_weights import ModelWeights
+
     asset = ModelWeights.from_filename(artifact_path.name)
     if asset is None:
         raise RuntimeError(f"No upstream RF-DETR asset metadata found for {artifact_path.name}")
@@ -1467,14 +1551,9 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
             )
             class_count = _rfdetr_checkpoint_class_count(state)
             logger.info(
-                "Reusing readable RF-DETR weights at {} despite MD5 mismatch"
-                "{}.",
+                "Reusing readable RF-DETR weights at {} despite MD5 mismatch{}.",
                 artifact_path,
-                (
-                    f" (class head logits={class_count})"
-                    if class_count is not None
-                    else ""
-                ),
+                (f" (class head logits={class_count})" if class_count is not None else ""),
             )
             return artifact_path
         except Exception as exc:
@@ -1512,6 +1591,7 @@ def ensure_local_model_artifact(name: str) -> Path:
 # ═══════════════════════════════════════════════════════════════════════
 #  6. Unified factory
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def build_detection_model(
     name: str,
@@ -1628,10 +1708,7 @@ def build_detection_model(
             rfdetr_checkpoint = _load_rfdetr_checkpoint(artifact_path, device=device)
             rfdetr_state = _extract_rfdetr_checkpoint_state_dict(rfdetr_checkpoint)
             inferred_class_count = _rfdetr_checkpoint_class_count(rfdetr_state)
-            if (
-                inferred_class_count is not None
-                and inferred_class_count != int(num_classes)
-            ):
+            if inferred_class_count is not None and inferred_class_count != int(num_classes):
                 logger.info(
                     "[ModelZoo] Inferred {} RF-DETR logits from weights at {}; "
                     "building {} with {} foreground class(es).",
@@ -1672,16 +1749,18 @@ def build_detection_model(
         backbone_weights_path = None
         tinynext_source_num_classes = 81
         tinynext_label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
-        tinynext_input_size = int(
-            kwargs.pop("tinynext_input_size", kwargs.pop("image_size", 320))
-        )
+        tinynext_input_size = int(kwargs.pop("tinynext_input_size", kwargs.pop("image_size", 320)))
         if artifact_path is None and pretrained:
             artifact_path = ensure_local_model_artifact(name_lower)
         if artifact_path is not None and artifact_path.is_file():
             checkpoint = _load_tinynext_checkpoint(artifact_path, device="cpu")
             checkpoint_state_dict = _extract_tinynext_checkpoint_state_dict(checkpoint)
-            is_official_tinynext = _looks_like_tinynext_official_detector_state_dict(checkpoint_state_dict)
-            is_internal_tinynext = _looks_like_tinynext_internal_detector_state_dict(checkpoint_state_dict)
+            is_official_tinynext = _looks_like_tinynext_official_detector_state_dict(
+                checkpoint_state_dict
+            )
+            is_internal_tinynext = _looks_like_tinynext_internal_detector_state_dict(
+                checkpoint_state_dict
+            )
             inferred_class_count = infer_tinynext_state_dict_num_classes(checkpoint_state_dict)
             if is_official_tinynext:
                 if inferred_class_count is not None and inferred_class_count != 81:
@@ -1689,7 +1768,8 @@ def build_detection_model(
                     tinynext_source_num_classes = inferred_class_count
                     tinynext_label_schema = "zero_based"
                     logger.info(
-                        "[ModelZoo] Inferred {} TinyNeXt MMDetection class logits from custom weights at {}; "
+                        "[ModelZoo] Inferred {} TinyNeXt MMDetection class logits "
+                        "from custom weights at {}; "
                         "building native zero-based TinyNeXt detector.",
                         inferred_class_count,
                         artifact_path,
@@ -1749,10 +1829,7 @@ def build_detection_model(
         return model
 
     # ── 5. Fallback: try torchvision eval ──
-    raise ValueError(
-        f"Unknown detection model: '{name}'.  "
-        f"Available: {list_available_models()}"
-    )
+    raise ValueError(f"Unknown detection model: '{name}'.  Available: {list_available_models()}")
 
 
 def invalidate_wrapper_predictor(model: nn.Module) -> None:
@@ -1765,6 +1842,7 @@ def invalidate_wrapper_predictor(model: nn.Module) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 #  7. Helpers
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def list_available_models() -> List[str]:
     """Return sorted list of all available model names."""
@@ -1812,7 +1890,10 @@ def is_wrapper_model(model_or_name) -> bool:
     """
     if isinstance(model_or_name, str):
         return get_model_family(model_or_name) in ("yolo", "detr", "rtdetr", "rfdetr")
-    return isinstance(model_or_name, (YOLODetectionModel, DETRDetectionModel, RFDETRDetectionModel, RTDETRDetectionModel))
+    return isinstance(
+        model_or_name,
+        (YOLODetectionModel, DETRDetectionModel, RFDETRDetectionModel, RTDETRDetectionModel),
+    )
 
 
 def model_has_roi_heads(model_or_name) -> bool:
@@ -1993,11 +2074,13 @@ def _postprocess_rfdetr_predictions(
 
         keep = scores > float(threshold)
         if not torch.any(keep):
-            detections.append({
-                "boxes": boxes.new_zeros((0, 4), dtype=torch.float32).cpu(),
-                "labels": labels.new_zeros((0,), dtype=torch.int64).cpu(),
-                "scores": scores.new_zeros((0,), dtype=torch.float32).cpu(),
-            })
+            detections.append(
+                {
+                    "boxes": boxes.new_zeros((0, 4), dtype=torch.float32).cpu(),
+                    "labels": labels.new_zeros((0,), dtype=torch.int64).cpu(),
+                    "scores": scores.new_zeros((0,), dtype=torch.float32).cpu(),
+                }
+            )
             continue
 
         boxes = boxes[keep]
@@ -2026,11 +2109,13 @@ def _postprocess_rfdetr_predictions(
         if label_offset:
             labels = labels + int(label_offset)
 
-        detections.append({
-            "boxes": boxes.detach().to(device="cpu", dtype=torch.float32),
-            "labels": labels.detach().to(device="cpu", dtype=torch.int64),
-            "scores": scores.detach().to(device="cpu", dtype=torch.float32),
-        })
+        detections.append(
+            {
+                "boxes": boxes.detach().to(device="cpu", dtype=torch.float32),
+                "labels": labels.detach().to(device="cpu", dtype=torch.int64),
+                "scores": scores.detach().to(device="cpu", dtype=torch.float32),
+            }
+        )
 
     return detections
 
