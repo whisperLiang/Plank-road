@@ -62,6 +62,38 @@ def test_prepare_split_runtime_replays_batch_one_and_two() -> None:
     assert metadata["actual_split_id"]
 
 
+def test_batch_one_trace_collates_batch_boundaries_for_suffix_training() -> None:
+    torch.manual_seed(19)
+    model = TinyRuntimeModel().train()
+    runtime = prepare_split_runtime(
+        model,
+        torch.randn(1, 4),
+        make_split_spec(
+            "percent:50",
+            dynamic_batch=(1, 4),
+            trainable=True,
+            trace_batch_mode="batch_1",
+        ),
+    )
+    parts = [runtime.run_prefix(torch.randn(1, 4)) for _index in range(3)]
+    collated = tl.ReplayBoundary.collate(parts)
+
+    runtime.validate_boundary(collated)
+    replayed = runtime.run_suffix(collated)
+    optimizer = torch.optim.SGD(model.head.parameters(), lr=0.01)
+    loss, grads = runtime.train_suffix(
+        collated,
+        torch.zeros(3, 2),
+        loss_fn=lambda outputs, targets: torch.nn.functional.mse_loss(outputs, targets),
+        optimizer=optimizer,
+    )
+
+    assert int(collated.batch_size) == 3
+    assert tuple(replayed.shape) == (3, 2)
+    assert not loss.requires_grad
+    assert set(grads)
+
+
 def test_universal_splitter_suffix_fast_path_preserves_validation(monkeypatch) -> None:
     torch.manual_seed(13)
     model = TinyRuntimeModel().eval()

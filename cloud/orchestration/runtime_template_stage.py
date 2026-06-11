@@ -41,9 +41,6 @@ from cloud.orchestration.runtime_stage import (
     fixed_split_plan_runtime_contract as _fixed_split_plan_runtime_contract,
 )
 from cloud.orchestration.runtime_stage import (
-    fixed_split_runtime_validation_signature as _fixed_split_runtime_validation_signature,
-)
-from cloud.orchestration.runtime_stage import (
     fixed_split_validation_batches as _fixed_split_validation_batches,
 )
 from model_management.fixed_split_runtime_template import (
@@ -190,10 +187,12 @@ class FixedSplitRuntimeTemplateMixin:
             prepared_inputs,
             target_batch_size=batch_target,
         )
-        logger.info(
-            "[FixedSplitCL] Tracing split runtime with batch input (input_tensor_shape={}).",
-            tuple(batch_input.shape),
-        )
+        if self._fixed_split_runtime_diagnostics_enabled():
+            logger.debug(
+                "[FixedSplitCL][diagnostics] tracing split runtime with batch input "
+                "(input_tensor_shape={}).",
+                tuple(batch_input.shape),
+            )
         return batch_input
 
     @staticmethod
@@ -404,12 +403,6 @@ class FixedSplitRuntimeTemplateMixin:
             model_family=model_family,
             default=self.trace_batch_size,
         )
-        validation_batches = _fixed_split_validation_batches(
-            model_family=model_family,
-            trace_batch_size=trace_batch_size,
-            runtime_batch_size=runtime_batch_size,
-            dynamic_batch=dynamic_batch,
-        )
         split_spec = make_split_spec(
             boundary,
             dynamic_batch=dynamic_batch,
@@ -426,15 +419,54 @@ class FixedSplitRuntimeTemplateMixin:
             split_spec=split_spec,
             example_inputs=symbolic_example,
             graph_signature=str(runtime_contract.get("trace_signature") or "") or None,
-            split_plan_hash=_json_fingerprint(split_plan),
-            trace_batch_size=trace_batch_size,
-            validated_batch_max=max(validation_batches) if validation_batches else None,
-            runtime_batch_validation_signature=_fixed_split_runtime_validation_signature(
-                model_family=model_family,
-                batch_sizes=validation_batches,
-            ),
-            mode=self._preferred_fixed_split_runtime_mode(model_family),
+            split_plan_hash=self._fixed_split_template_structural_plan_hash(split_plan),
+            canonical_split_key=self._fixed_split_template_split_key(split_plan),
         )
+
+    @staticmethod
+    def _fixed_split_template_split_key(split_plan: Mapping[str, object]) -> str:
+        runtime_contract = _fixed_split_plan_runtime_contract(split_plan)
+        return str(
+            split_plan.get("canonical_split_key")
+            or split_plan.get("edge_split_id")
+            or runtime_contract.get("logical_split_id")
+            or _fixed_split_boundary_from_plan(split_plan)
+        )
+
+    @staticmethod
+    def _fixed_split_template_structural_plan_hash(
+        split_plan: Mapping[str, object],
+    ) -> str:
+        runtime_contract = _fixed_split_plan_runtime_contract(split_plan)
+        canonical_split_key = (
+            FixedSplitRuntimeTemplateMixin._fixed_split_template_split_key(split_plan)
+        )
+        return _json_fingerprint(
+            {
+                "plan_version": str(split_plan.get("plan_version") or ""),
+                "canonical_split_key": canonical_split_key,
+                "logical_split_id": str(runtime_contract.get("logical_split_id") or ""),
+                "boundary_tensor_labels": [
+                    str(label)
+                    for label in list(runtime_contract.get("boundary_tensor_labels") or [])
+                ],
+                "boundary_schema": dict(runtime_contract.get("boundary_schema") or {}),
+                "split_granularity": str(split_plan.get("split_granularity") or ""),
+            }
+        )
+
+    def _fixed_split_runtime_diagnostics_enabled(self) -> bool:
+        return bool(getattr(self, "fixed_split_runtime_diagnostics", False))
+
+    def _fixed_split_runtime_smoke_validate_enabled(self) -> bool:
+        return bool(getattr(self, "fixed_split_runtime_smoke_validate", False))
+
+    @staticmethod
+    def _fixed_split_runtime_template_log_label(
+        model_name: str,
+        split_key: str,
+    ) -> str:
+        return f"model={model_name} split={split_key}"
 
     @staticmethod
     def _runtime_example_args(sample_input):
@@ -522,11 +554,13 @@ class FixedSplitRuntimeTemplateMixin:
             return False, str(exc)
         if not ok:
             return False, f"split replay output mismatch (max_diff={max_diff})"
-        logger.info(
-            "[FixedSplitCL] TorchLens {} runtime replay validation passed (split_id={}).",
-            mode,
-            getattr(runtime, "split_id", None),
-        )
+        if self._fixed_split_runtime_diagnostics_enabled():
+            logger.debug(
+                "[FixedSplitCL][diagnostics] TorchLens runtime replay validation passed "
+                "(mode={}, split_id={}).",
+                mode,
+                getattr(runtime, "split_id", None),
+            )
         return True, None
 
     def _prepare_replayable_split_runtime(
@@ -765,7 +799,6 @@ class FixedSplitRuntimeTemplateMixin:
             trace_batch_mode=trace_batch_mode,
             model_family=model_family,
         )
-        trace_started = time.perf_counter()
         runtime, runtime_mode = self._prepare_replayable_split_runtime(
             trace_model,
             sample_input,
@@ -840,23 +873,30 @@ class FixedSplitRuntimeTemplateMixin:
             )
             if training_runtime_mode != runtime_mode:
                 logger.warning(
-                    "[FixedSplitCL] request-local TorchLens runtime prepared with "
-                    "mode={} while template trace artifact used mode={}.",
-                    training_runtime_mode,
-                    runtime_mode,
+                    "[FixedSplitCL] request-local TorchLens runtime mode differed "
+                    "from the template trace artifact; continuing with request-local runtime."
                 )
-        self._validate_dynamic_batch_trainability(
-            training_runtime,
-            model,
-            manifest,
-            bundle_root=bundle_root,
-            model_family=model_family,
-            trace_batch_size=trace_batch_size,
-            runtime_batch_size=runtime_batch_size,
-            dynamic_batch=dynamic_batch,
-            runtime_device=self.device,
-        )
-        self._log_stage_elapsed("TorchLens prepare_split", time.perf_counter() - trace_started)
+                if self._fixed_split_runtime_diagnostics_enabled():
+                    logger.debug(
+                        "[FixedSplitCL][diagnostics] request-local runtime mode mismatch "
+                        "details={}",
+                        {
+                            "request_mode": training_runtime_mode,
+                            "template_mode": runtime_mode,
+                        },
+                    )
+        if self._fixed_split_runtime_smoke_validate_enabled():
+            self._validate_dynamic_batch_trainability(
+                training_runtime,
+                model,
+                manifest,
+                bundle_root=bundle_root,
+                model_family=model_family,
+                trace_batch_size=trace_batch_size,
+                runtime_batch_size=runtime_batch_size,
+                dynamic_batch=dynamic_batch,
+                runtime_device=self.device,
+            )
         trace_signature = str(
             getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "") or ""
         )
@@ -873,17 +913,19 @@ class FixedSplitRuntimeTemplateMixin:
                 "TorchLens fixed split runtime resolved a different split candidate "
                 f"(requested={boundary!r}, actual={current_candidate_id!r})."
             )
-        logger.info(
-            "[FixedSplitCL] runtime template prepared TorchLens split "
-            "(model_name={}, model_family={}, split_id={}, trace_signature={}, "
-            "mode={}, key={}).",
-            model_name,
-            model_family,
-            getattr(runtime, "split_id", None),
-            trace_signature,
-            runtime_mode,
-            template_key.to_log_payload(),
-        )
+        if self._fixed_split_runtime_diagnostics_enabled():
+            logger.debug(
+                "[FixedSplitCL][diagnostics] runtime template prepared TorchLens split "
+                "details={}",
+                {
+                    "model_name": model_name,
+                    "model_family": model_family,
+                    "split_id": getattr(runtime, "split_id", None),
+                    "trace_signature": trace_signature,
+                    "mode": runtime_mode,
+                    "key": template_key.as_dict(),
+                },
+            )
         return FixedSplitRuntimeTemplate(
             cache_key=template_key,
             runtime=runtime,
@@ -927,10 +969,6 @@ class FixedSplitRuntimeTemplateMixin:
             manifest=manifest,
             runtime_batch_size=runtime_batch_size,
         )
-        logger.info(
-            "[FixedSplitCL] runtime template cache key={}.",
-            template_key.to_log_payload(),
-        )
         return self._fixed_split_runtime_template_cache.get_or_create_lookup(
             template_key,
             lambda: self._build_fixed_split_runtime_template(
@@ -941,6 +979,11 @@ class FixedSplitRuntimeTemplateMixin:
                 trace_sample_input=trace_sample_input,
                 runtime_batch_size=runtime_batch_size,
             ),
+            log_label=self._fixed_split_runtime_template_log_label(
+                model_name,
+                template_key.canonical_split_key,
+            ),
+            diagnostics=self._fixed_split_runtime_diagnostics_enabled(),
         )
 
     def _bind_bundle_splitter_from_template(
@@ -957,14 +1000,10 @@ class FixedSplitRuntimeTemplateMixin:
         split_model = get_split_runtime_model(model)
         split_plan_payload = dict(manifest.get("split_plan", {}) or {})
         model_family = model_zoo.get_model_family(str(template.model_name))
-        trace_batch_size = (
-            int(template.cache_key.trace_batch_size)
-            if template.cache_key.trace_batch_size is not None
-            else _cloud_fixed_split_trace_batch_size(
-                split_plan_payload,
-                model_family=model_family,
-                default=self.trace_batch_size,
-            )
+        trace_batch_size = _cloud_fixed_split_trace_batch_size(
+            split_plan_payload,
+            model_family=model_family,
+            default=self.trace_batch_size,
         )
         if trace_sample_input is not None:
             request_sample_input = self._move_runtime_input_to_device(
@@ -987,12 +1026,18 @@ class FixedSplitRuntimeTemplateMixin:
         )
         bind_elapsed = time.perf_counter() - bind_started
         logger.info(
-            "[FixedSplitCL] request-local TorchLens runtime prepare/bind took {:.3f}s "
-            "(split_id={}, key={}).",
+            "[FixedSplitCL] Runtime bound: split={} elapsed={:.2f}s.",
+            template.cache_key.canonical_split_key or getattr(splitter.runtime, "split_id", None),
             bind_elapsed,
-            getattr(splitter.runtime, "split_id", None),
-            template.cache_key.to_log_payload(),
         )
+        if self._fixed_split_runtime_diagnostics_enabled():
+            logger.debug(
+                "[FixedSplitCL][diagnostics] request-local TorchLens runtime bind details={}",
+                {
+                    "split_id": getattr(splitter.runtime, "split_id", None),
+                    "key": template.cache_key.as_dict(),
+                },
+            )
         return splitter, candidate
 
     def _build_bundle_splitter(
@@ -1011,12 +1056,16 @@ class FixedSplitRuntimeTemplateMixin:
             trace_sample_input=trace_sample_input,
             runtime_batch_size=runtime_batch_size,
         )
-        if template_lookup.cache_status in {"hit", "wait"}:
-            logger.info(
-                "[FixedSplitCL] hot path skipped trace input build / graph build / "
-                "candidate recovery (cache_status={}, key={}).",
-                template_lookup.cache_status,
-                template_lookup.template.cache_key.to_log_payload(),
+        if (
+            template_lookup.cache_status in {"hit", "wait"}
+            and self._fixed_split_runtime_diagnostics_enabled()
+        ):
+            logger.debug(
+                "[FixedSplitCL][diagnostics] runtime template reused details={}",
+                {
+                    "cache_status": template_lookup.cache_status,
+                    "key": template_lookup.template.cache_key.as_dict(),
+                },
             )
         return self._bind_bundle_splitter_from_template(
             model,

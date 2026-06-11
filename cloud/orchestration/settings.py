@@ -64,6 +64,8 @@ class OrchestrationSettings:
     max_concurrent_jobs: int
     batch_size: int
     trace_batch_size: int
+    fixed_split_runtime_smoke_validate: bool
+    fixed_split_runtime_diagnostics: bool
     feature_cache: FeatureCacheSettings
     teacher_annotation: TeacherAnnotationSettings
     sample_pool: SamplePoolSettings
@@ -100,6 +102,16 @@ class OrchestrationSettings:
             max_concurrent_jobs=int(getattr(cl_cfg, "max_concurrent_jobs", 2)) if cl_cfg else 2,
             batch_size=int(getattr(cl_cfg, "batch_size", 2)) if cl_cfg else 2,
             trace_batch_size=int(getattr(cl_cfg, "trace_batch_size", 1)) if cl_cfg else 1,
+            fixed_split_runtime_smoke_validate=bool(
+                getattr(cl_cfg, "fixed_split_runtime_smoke_validate", False)
+            )
+            if cl_cfg
+            else False,
+            fixed_split_runtime_diagnostics=bool(
+                getattr(cl_cfg, "fixed_split_runtime_diagnostics", False)
+            )
+            if cl_cfg
+            else False,
             feature_cache=FeatureCacheSettings(
                 store_root_dir=os.path.abspath(
                     str(
@@ -251,6 +263,8 @@ class PipelineLifecycleMixin:
         self.max_concurrent_jobs = settings.max_concurrent_jobs
         self.batch_size = settings.batch_size
         self.trace_batch_size = settings.trace_batch_size
+        self.fixed_split_runtime_smoke_validate = settings.fixed_split_runtime_smoke_validate
+        self.fixed_split_runtime_diagnostics = settings.fixed_split_runtime_diagnostics
         self.feature_cache_mode = (
             (str(getattr(cl_cfg, "feature_cache_mode", "auto")) if cl_cfg else "auto")
             .strip()

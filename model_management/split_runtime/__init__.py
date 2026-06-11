@@ -26,7 +26,6 @@ from .errors import (
 )
 from .runtime_cache import RuntimeCache, RuntimeCacheKey, make_runtime_cache_key
 from .template import (
-    FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION,
     FixedSplitRuntimeTemplate,
     FixedSplitRuntimeTemplateCache,
     FixedSplitRuntimeTemplateKey,
@@ -124,7 +123,6 @@ __all__ = [
     "BoundaryPayload",
     "BoundaryPayloadCacheCodec",
     "DetectionSplitAdapter",
-    "FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION",
     "FixedSplitRuntimeTemplate",
     "FixedSplitRuntimeTemplateCache",
     "FixedSplitRuntimeTemplateKey",

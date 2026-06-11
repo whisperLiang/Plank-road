@@ -187,6 +187,8 @@ class ContinualLearningConfig(ConfigSection):
     num_epoch: int = 5
     trace_batch_size: int = 1
     batch_size: int = 2
+    fixed_split_runtime_smoke_validate: bool = False
+    fixed_split_runtime_diagnostics: bool = False
     feature_cache_mode: str = "auto"
     teacher_batch_size: int | None = None
     teacher_annotation_threshold: float = 0.5

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import inspect
 import threading
 import warnings
 from dataclasses import replace
@@ -78,7 +79,6 @@ def _fixed_runtime_template(
         example_inputs=example,
         graph_signature=str(getattr(runtime.trace_graph, "graph_shape_hash", "") or "tiny"),
         split_plan_hash="tiny-plan",
-        mode=getattr(runtime.split_spec, "mode", "generated_eager"),
     )
     return FixedSplitRuntimeTemplate(
         cache_key=key,
@@ -94,9 +94,24 @@ def _fixed_runtime_template(
     )
 
 
-def test_template_cache_key_includes_validation_identity_fields() -> None:
+def test_template_cache_key_excludes_validation_version_and_dynamic_batch_fields() -> None:
     spec = make_split_spec("after:head", dynamic_batch=(1, 8), trainable=True)
+    dynamic_spec = make_split_spec("after:head", dynamic_batch=(1, 64), trainable=True)
     example = torch.randn(1, 4)
+    old_identity_fields = {
+        "trace_batch_size",
+        "validated_batch_max",
+        "runtime_batch_validation_signature",
+        "runtime_version",
+        "adapter_version",
+        "dynamic_batch",
+        "version",
+        "mode",
+    }
+
+    key_parameters = inspect.signature(fixed_split_runtime_template_key).parameters
+    assert old_identity_fields.isdisjoint(key_parameters)
+
     key_a = fixed_split_runtime_template_key(
         model_name="tiny",
         model_family="tiny",
@@ -104,26 +119,34 @@ def test_template_cache_key_includes_validation_identity_fields() -> None:
         example_inputs=example,
         graph_signature="graph",
         split_plan_hash="plan",
-        trace_batch_size=1,
-        validated_batch_max=2,
-        runtime_batch_validation_signature="sig-a",
+        canonical_split_key="after:head",
     )
     key_b = fixed_split_runtime_template_key(
         model_name="tiny",
         model_family="tiny",
-        split_spec=spec,
+        split_spec=dynamic_spec,
         example_inputs=example,
         graph_signature="graph",
         split_plan_hash="plan",
-        trace_batch_size=1,
-        validated_batch_max=4,
-        runtime_batch_validation_signature="sig-b",
+        canonical_split_key="after:head",
     )
 
-    assert key_a != key_b
-    assert key_a.as_dict()["trace_batch_size"] == 1
-    assert key_a.as_dict()["validated_batch_max"] == 2
-    assert key_a.as_dict()["runtime_batch_validation_signature"] == "sig-a"
+    assert key_a == key_b
+    assert key_a.as_dict() == {
+        "model_name": "tiny",
+        "model_family": "tiny",
+        "graph_signature": "graph",
+        "split_plan_hash": "plan",
+        "symbolic_input_schema_hash": key_b.symbolic_input_schema_hash,
+        "canonical_split_key": "after:head",
+    }
+    assert "runtime_version" not in key_a.as_dict()
+    assert "adapter_version" not in key_a.as_dict()
+    assert "dynamic_batch" not in key_a.as_dict()
+    assert "mode" not in key_a.as_dict()
+    assert "trace_batch_size" not in key_a.as_dict()
+    assert "validated_batch_max" not in key_a.as_dict()
+    assert "runtime_batch_validation_signature" not in key_a.as_dict()
 
 
 def _poison_trace_graph_deepcopy(runtime) -> None:

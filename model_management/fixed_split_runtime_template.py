@@ -4,7 +4,6 @@ from typing import Any, Mapping
 
 from model_management.split_candidate import SplitCandidate
 from model_management.split_runtime.template import (
-    FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION,
     FixedSplitRuntimeTemplate,
     FixedSplitRuntimeTemplateCache,
     FixedSplitRuntimeTemplateKey,
@@ -65,7 +64,6 @@ def bind_request_splitter_from_template(
 
 
 __all__ = [
-    "FIXED_SPLIT_RUNTIME_TEMPLATE_CACHE_VERSION",
     "FixedSplitRuntimeTemplate",
     "FixedSplitRuntimeTemplateCache",
     "FixedSplitRuntimeTemplateKey",

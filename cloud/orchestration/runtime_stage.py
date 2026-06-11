@@ -126,23 +126,6 @@ def fixed_split_manifest_has_rebuildable_raw_samples(
     return all(sample.get("raw_relpath") is not None for sample in samples)
 
 
-def fixed_split_runtime_validation_signature(
-    *,
-    model_family: str | None,
-    batch_sizes: list[int],
-) -> str | None:
-    if not batch_sizes:
-        return None
-    return _json_fingerprint(
-        {
-            "kind": "fixed-split-train-smoke",
-            "version": 1,
-            "model_family": str(model_family or ""),
-            "batch_sizes": [int(batch_size) for batch_size in batch_sizes],
-        }
-    )
-
-
 def splitter_dynamic_batch_range(
     splitter: object | None,
 ) -> tuple[int, int] | None:
@@ -269,7 +252,6 @@ __all__ = [
     "fixed_split_dynamic_batch_from_plan",
     "fixed_split_manifest_has_rebuildable_raw_samples",
     "fixed_split_plan_runtime_contract",
-    "fixed_split_runtime_validation_signature",
     "fixed_split_trace_batch_mode_from_plan",
     "fixed_split_trace_batch_size_from_plan",
     "fixed_split_validation_batches",
