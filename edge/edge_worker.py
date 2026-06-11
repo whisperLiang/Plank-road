@@ -70,6 +70,64 @@ def _coerce_positive_int(value: object) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _suffix_thread_candidates(
+    value: object,
+    *,
+    current_threads: int,
+    cpu_count: int | None = None,
+) -> tuple[str, list[int]]:
+    if isinstance(value, bool):
+        if not value:
+            return "off", []
+        text = "auto"
+    elif value is None:
+        text = "auto"
+    else:
+        text = str(value).strip().lower()
+    if text in {"", "auto"}:
+        limit = max(1, int(cpu_count or current_threads or 1))
+        auto_limit = min(12, limit)
+        candidates = [
+            min(int(current_threads), auto_limit),
+            min(8, auto_limit),
+            min(12, auto_limit),
+            min(max(1, int(current_threads) // 2), auto_limit),
+            4,
+            2,
+            1,
+        ]
+        seen: set[int] = set()
+        resolved: list[int] = []
+        for threads in candidates:
+            if threads <= 0 or threads > limit or threads in seen:
+                continue
+            seen.add(threads)
+            resolved.append(threads)
+        return "auto", resolved
+    if text in {"0", "off", "false", "none", "default", "disabled"}:
+        return "off", []
+    parsed = _coerce_positive_int(value)
+    if parsed is not None:
+        return "fixed", [parsed]
+    return "invalid", []
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(float(value) for value in values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * max(0.0, min(100.0, float(percentile))) / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    if lower == upper:
+        return sorted_values[lower]
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (
+        position - lower
+    )
+
+
 def _first_tensor_batch_size(value: object) -> int | None:
     if isinstance(value, torch.Tensor) and value.ndim > 0:
         return int(value.shape[0])
@@ -594,6 +652,7 @@ class EdgeWorker:
             )
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
+            self._configure_suffix_replay_threads(sample_input)
             logger.info("Warming up fixed split runtime.")
             self._warmup_fixed_split_runtime(sample_input)
             logger.info(
@@ -633,6 +692,101 @@ class EdgeWorker:
             "Fixed split warmup completed (iterations={}, elapsed={:.3f}s).",
             warmup_iterations,
             time.perf_counter() - warmup_started,
+        )
+
+    def _configure_suffix_replay_threads(self, sample_input) -> None:
+        if torch.cuda.is_available() or self.universal_splitter is None:
+            return
+        sl_cfg = getattr(self.config, "split_learning", None)
+        fixed_split_cfg = getattr(sl_cfg, "fixed_split", None) if sl_cfg else None
+        current_threads = int(torch.get_num_threads())
+        mode, candidates = _suffix_thread_candidates(
+            getattr(fixed_split_cfg, "suffix_num_threads", "auto"),
+            current_threads=current_threads,
+            cpu_count=os.cpu_count(),
+        )
+        if mode == "off":
+            logger.info(
+                "CPU suffix replay thread tuning disabled; using torch_num_threads={}.",
+                current_threads,
+            )
+            return
+        if mode == "invalid" or not candidates:
+            logger.warning(
+                "Invalid fixed_split.suffix_num_threads={!r}; using torch_num_threads={}.",
+                getattr(fixed_split_cfg, "suffix_num_threads", None),
+                current_threads,
+            )
+            return
+        if mode == "fixed":
+            torch.set_num_threads(int(candidates[0]))
+            logger.info(
+                "Configured CPU suffix replay torch_num_threads={} (previous={}).",
+                int(candidates[0]),
+                current_threads,
+            )
+            return
+
+        iterations = max(
+            1,
+            int(getattr(fixed_split_cfg, "suffix_thread_tuning_iterations", 4) or 4),
+        )
+        try:
+            with torch.inference_mode():
+                results: list[tuple[float, float, int]] = []
+                for threads in candidates:
+                    torch.set_num_threads(int(threads))
+                    self.universal_splitter.replay_inference(sample_input)
+                    timings: list[float] = []
+                    for _ in range(iterations):
+                        started = time.perf_counter()
+                        self.universal_splitter.replay_inference(sample_input)
+                        timings.append((time.perf_counter() - started) * 1000.0)
+                    median = _percentile(timings, 50)
+                    tail = _percentile(timings, 95)
+                    results.append((float(tail), float(median), int(threads)))
+        except Exception as exc:
+            torch.set_num_threads(current_threads)
+            logger.warning(
+                "CPU suffix replay thread tuning failed; restored torch_num_threads={}: {}",
+                current_threads,
+                exc,
+            )
+            return
+
+        if not results:
+            torch.set_num_threads(current_threads)
+            return
+        best_tail = min(tail_ms for tail_ms, _median_ms, _threads in results)
+        near_best = [
+            item
+            for item in results
+            if item[0] <= best_tail * 1.10 + 1.0
+        ]
+        best_tail, best_median, best_threads = min(
+            near_best,
+            key=lambda item: (item[2], item[0], item[1]),
+        )
+        torch.set_num_threads(best_threads)
+        median_summary = {
+            str(threads): round(median_ms, 2)
+            for _tail_ms, median_ms, threads in results
+        }
+        tail_summary = {
+            str(threads): round(tail_ms, 2)
+            for tail_ms, _median_ms, threads in results
+        }
+        logger.info(
+            "CPU suffix replay thread tuning selected torch_num_threads={} "
+            "(previous={}, iterations={}, best_p95_ms={}, best_median_ms={}, "
+            "p95_ms_by_threads={}, median_ms_by_threads={}).",
+            best_threads,
+            current_threads,
+            iterations,
+            round(best_tail, 2),
+            round(best_median, 2),
+            tail_summary,
+            median_summary,
         )
 
     def ensure_fixed_split_runtime(

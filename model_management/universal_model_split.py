@@ -114,8 +114,33 @@ def _normalise_boundary_batch_metadata(
 
 
 def _move_boundary_to_runtime_device(runtime: Any, boundary: BoundaryPayload) -> BoundaryPayload:
-    codec = BoundaryPayloadCacheCodec(runtime)
+    codec = getattr(runtime, "_plank_boundary_payload_codec", None)
+    if codec is None:
+        codec = BoundaryPayloadCacheCodec(runtime)
+        try:
+            setattr(runtime, "_plank_boundary_payload_codec", codec)
+        except Exception:
+            pass
     return codec.to_runtime_device(boundary)
+
+
+def _run_suffix_segment(
+    runtime: Any,
+    boundary: BoundaryPayload,
+    *,
+    trusted: bool = False,
+) -> Any:
+    segments = getattr(runtime, "segments", None)
+    suffix = getattr(segments, "suffix", None)
+    if trusted and callable(suffix):
+        return suffix(boundary)
+    if not trusted:
+        boundary = _move_boundary_to_runtime_device(runtime, boundary)
+        validate_boundary = getattr(runtime, "validate_boundary", None)
+        if callable(validate_boundary) and callable(suffix):
+            validate_boundary(boundary)
+            return suffix(boundary)
+    return runtime.run_suffix(boundary)
 
 
 def _clone_tensor_tree_for_training(value: Any) -> Any:
@@ -777,7 +802,7 @@ class UniversalModelSplitter:
     ) -> Any:
         del args, candidate, kwargs
         runtime = self._ensure_runtime()
-        return runtime.run_suffix(_move_boundary_to_runtime_device(runtime, payload))
+        return _run_suffix_segment(runtime, payload)
 
     run_suffix = cloud_forward
 
@@ -843,8 +868,9 @@ class UniversalModelSplitter:
                 time.perf_counter() - started
             ) * 1000.0
 
+        runtime = self._ensure_runtime()
         started = time.perf_counter()
-        outputs = self.cloud_forward(payload)
+        outputs = _run_suffix_segment(runtime, payload, trusted=True)
         if profile is not None:
             profile["split_suffix"] = profile.get("split_suffix", 0.0) + (
                 time.perf_counter() - started

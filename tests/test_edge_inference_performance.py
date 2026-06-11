@@ -10,7 +10,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from edge.edge_worker import AsyncSampleCollector, EdgeWorker, SampleCollectionJob
+from edge.edge_worker import (
+    AsyncSampleCollector,
+    EdgeWorker,
+    SampleCollectionJob,
+    _suffix_thread_candidates,
+)
 from edge.info import TASK_STATE
 from edge.task import Task
 from edge_client import _write_task_result
@@ -64,6 +69,36 @@ def test_write_task_result_includes_latency_and_timing() -> None:
         "boxes": [[1, 2, 3, 4]],
         "scores": [0.9],
     }
+
+
+def test_suffix_thread_candidate_resolution() -> None:
+    mode, candidates = _suffix_thread_candidates(
+        "auto",
+        current_threads=16,
+        cpu_count=16,
+    )
+    assert mode == "auto"
+    assert max(candidates) <= 12
+    assert 16 not in candidates
+    assert 8 in candidates
+    assert 12 in candidates
+    assert len(candidates) == len(set(candidates))
+
+    true_mode, true_candidates = _suffix_thread_candidates(
+        True,
+        current_threads=16,
+        cpu_count=16,
+    )
+    assert true_mode == "auto"
+    assert true_candidates == candidates
+
+    assert _suffix_thread_candidates(6, current_threads=16, cpu_count=16) == ("fixed", [6])
+    assert _suffix_thread_candidates(False, current_threads=16, cpu_count=16) == ("off", [])
+    assert _suffix_thread_candidates("off", current_threads=16, cpu_count=16) == ("off", [])
+    assert _suffix_thread_candidates("nope", current_threads=16, cpu_count=16) == (
+        "invalid",
+        [],
+    )
 
 
 def test_split_observables_can_skip_feature_spectral_entropy(monkeypatch) -> None:

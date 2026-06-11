@@ -120,6 +120,8 @@ class FixedSplitConfig(ConfigSection):
     validate_candidates: bool = True
     configured_training_batch: int | None = None
     validation_batches: list[int] | None = None
+    suffix_num_threads: int | str | None = "auto"
+    suffix_thread_tuning_iterations: int = 4
     # Deprecated compatibility field; fixed split planning validates all candidates.
     max_candidates: int = 0
     max_boundary_count: int = 8
