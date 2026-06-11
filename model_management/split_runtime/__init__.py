@@ -4,7 +4,12 @@ from typing import Any
 
 import torch
 
-from .boundary_cache import BOUNDARY_CACHE_PROTOCOL, BoundaryPayloadCacheCodec
+from .boundary_cache import (
+    BOUNDARY_CACHE_PROTOCOL,
+    BoundaryPayloadCacheCodec,
+    get_runtime_boundary_codec,
+    prepare_boundary_for_runtime,
+)
 from .detection_adapters import (
     DetectionSplitAdapter,
     PlankDetectionSplitAdapter,
@@ -144,9 +149,11 @@ __all__ = [
     "fixed_split_runtime_template_key",
     "get_fixed_split_runtime_template_cache",
     "get_split_runtime_metadata",
+    "get_runtime_boundary_codec",
     "make_runtime_cache_key",
     "make_split_spec",
     "prepare_split_runtime",
+    "prepare_boundary_for_runtime",
     "prepare_split_replay_runtime",
     "reduce_output_to_loss",
     "resolve_split_candidate_metadata",

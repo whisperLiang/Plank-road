@@ -127,6 +127,31 @@ def _same_tensor(left: torch.Tensor, right: torch.Tensor) -> bool:
         return False
 
 
+def get_runtime_boundary_codec(runtime: Any) -> "BoundaryPayloadCacheCodec":
+    runtime_obj = _runtime_from(runtime)
+    if runtime_obj is None:
+        return BoundaryPayloadCacheCodec(None)
+    codec = getattr(runtime_obj, "_plank_boundary_payload_codec", None)
+    if not isinstance(codec, BoundaryPayloadCacheCodec):
+        codec = BoundaryPayloadCacheCodec(runtime_obj)
+        try:
+            setattr(runtime_obj, "_plank_boundary_payload_codec", codec)
+        except Exception:
+            pass
+    return codec
+
+
+def prepare_boundary_for_runtime(
+    runtime: Any,
+    boundary: BoundaryPayload,
+    *,
+    validate: bool,
+) -> BoundaryPayload:
+    codec = get_runtime_boundary_codec(runtime)
+    prepared = codec.to_runtime_device(boundary)
+    return codec.validate(prepared) if validate else prepared
+
+
 class BoundaryPayloadCacheCodec:
     def __init__(self, runtime: Any) -> None:
         self.runtime = _runtime_from(runtime)
@@ -395,4 +420,9 @@ class BoundaryPayloadCacheCodec:
         return axis, multiplier
 
 
-__all__ = ["BOUNDARY_CACHE_PROTOCOL", "BoundaryPayloadCacheCodec"]
+__all__ = [
+    "BOUNDARY_CACHE_PROTOCOL",
+    "BoundaryPayloadCacheCodec",
+    "get_runtime_boundary_codec",
+    "prepare_boundary_for_runtime",
+]

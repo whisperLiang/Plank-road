@@ -18,7 +18,7 @@ from cloud.feature_cache.types import (
     FeatureShardRef,
 )
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
-from model_management.split_runtime import BoundaryPayloadCacheCodec
+from model_management.split_runtime import BoundaryPayloadCacheCodec, prepare_boundary_for_runtime
 
 SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis_v2"
 
@@ -367,9 +367,7 @@ class ShardFeatureBatchReader:
         runtime: Any | None,
     ) -> BoundaryPayload:
         if runtime is not None:
-            codec = BoundaryPayloadCacheCodec(runtime)
-            prepared = codec.to_runtime_device(payload)
-            return codec.validate(prepared)
+            return prepare_boundary_for_runtime(runtime, payload, validate=True)
         return self._move_to_device(payload, device=device)
 
     def _move_to_device(

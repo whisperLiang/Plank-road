@@ -24,8 +24,17 @@ def train_split_suffix_batch(
     targets: Any,
     loss_fn: Any,
     optimizer: Any,
+    *,
+    trusted_runtime_boundary: bool = False,
 ) -> Any:
-    return _train_split_suffix_batch(runtime, boundary, targets, loss_fn, optimizer)
+    return _train_split_suffix_batch(
+        runtime,
+        boundary,
+        targets,
+        loss_fn,
+        optimizer,
+        trusted_runtime_boundary=trusted_runtime_boundary,
+    )
 
 
 class DetectionTrainingAdapter(Protocol):

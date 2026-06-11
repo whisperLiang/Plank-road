@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from loguru import logger
 
 from cloud.feature_cache.shard_reader import ShardFeatureBatchReader
@@ -25,6 +26,7 @@ from model_management.split_runtime import (
     SplitSpec,
     compare_outputs,
     make_split_spec,
+    prepare_boundary_for_runtime,
     prepare_split_runtime,
 )
 
@@ -113,17 +115,6 @@ def _normalise_boundary_batch_metadata(
     return replace(payload, metadata=metadata)
 
 
-def _move_boundary_to_runtime_device(runtime: Any, boundary: BoundaryPayload) -> BoundaryPayload:
-    codec = getattr(runtime, "_plank_boundary_payload_codec", None)
-    if codec is None:
-        codec = BoundaryPayloadCacheCodec(runtime)
-        try:
-            setattr(runtime, "_plank_boundary_payload_codec", codec)
-        except Exception:
-            pass
-    return codec.to_runtime_device(boundary)
-
-
 def _run_suffix_segment(
     runtime: Any,
     boundary: BoundaryPayload,
@@ -135,11 +126,10 @@ def _run_suffix_segment(
     if trusted and callable(suffix):
         return suffix(boundary)
     if not trusted:
-        boundary = _move_boundary_to_runtime_device(runtime, boundary)
-        validate_boundary = getattr(runtime, "validate_boundary", None)
-        if callable(validate_boundary) and callable(suffix):
-            validate_boundary(boundary)
+        if callable(suffix):
+            boundary = prepare_boundary_for_runtime(runtime, boundary, validate=True)
             return suffix(boundary)
+        boundary = prepare_boundary_for_runtime(runtime, boundary, validate=False)
     return runtime.run_suffix(boundary)
 
 
@@ -169,22 +159,88 @@ def _clone_boundary_for_training(boundary: BoundaryPayload) -> BoundaryPayload:
     )
 
 
-def train_split_suffix_batch(
+def _default_split_suffix_loss(outputs: Any, targets: Any) -> torch.Tensor:
+    if isinstance(outputs, torch.Tensor) and isinstance(targets, torch.Tensor):
+        if targets.dtype == torch.long and outputs.ndim >= 2:
+            return F.cross_entropy(outputs, targets)
+        return F.mse_loss(outputs, targets)
+    raise TypeError("A loss_fn is required for non-tensor outputs or targets.")
+
+
+def _trusted_train_suffix_batch(
     runtime: Any,
     boundary: BoundaryPayload,
     targets: Any,
     loss_fn: Any,
     optimizer: torch.optim.Optimizer | None,
 ) -> torch.Tensor:
+    segments = getattr(runtime, "segments", None)
+    suffix = getattr(segments, "suffix", None)
+    if not callable(suffix):
+        raise RuntimeError("Trusted split suffix training requires runtime.segments.suffix.")
+
+    tensors = getattr(boundary, "tensors", None)
+    if not isinstance(tensors, Mapping):
+        raise TypeError("Trusted split suffix training requires mapping boundary tensors.")
+    detached_tensors: dict[str, torch.Tensor] = {}
+    for key, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"Trusted split suffix training expected tensor boundary {key!r}, "
+                f"got {type(tensor).__name__}."
+            )
+        root = tensor.detach().clone(memory_format=torch.contiguous_format)
+        detached_tensors[str(key)] = root.requires_grad_(
+            root.is_floating_point() or root.is_complex()
+        )
+
+    split_spec = getattr(runtime, "split_spec", None)
+    metadata = dict(getattr(boundary, "metadata", {}) or {})
+    metadata["use_live_param_sources"] = getattr(
+        split_spec,
+        "effective_use_live_param_sources",
+        metadata.get("use_live_param_sources"),
+    )
+    detached_boundary = replace(
+        boundary,
+        tensors=detached_tensors,
+        metadata=metadata,
+    )
+
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
+    outputs = suffix(detached_boundary)
+    loss = _default_split_suffix_loss(outputs, targets) if loss_fn is None else loss_fn(
+        outputs,
+        targets,
+    )
+    loss.backward()
+    _boundary_grads = {key: tensor.grad for key, tensor in detached_tensors.items()}
+    if optimizer is not None:
+        optimizer.step()
+    return loss.detach()
+
+
+def train_split_suffix_batch(
+    runtime: Any,
+    boundary: BoundaryPayload,
+    targets: Any,
+    loss_fn: Any,
+    optimizer: torch.optim.Optimizer | None,
+    *,
+    trusted_runtime_boundary: bool = False,
+) -> torch.Tensor:
     """Train one split-suffix batch through TorchLens.
 
-    TorchLens SplitRuntime.train_suffix owns zero_grad, backward, and
-    optimizer.step. This helper only adapts Plank-road boundaries to the runtime
-    device and returns the detached loss.
+    The default path delegates to SplitRuntime.train_suffix after adapting the
+    boundary to the runtime device. The trusted path is only for boundaries that
+    were already prepared and validated for the same runtime.
     """
 
     runtime_obj = _runtime_from_splitter(runtime)
-    boundary = _move_boundary_to_runtime_device(runtime_obj, boundary)
+    if trusted_runtime_boundary:
+        return _trusted_train_suffix_batch(runtime_obj, boundary, targets, loss_fn, optimizer)
+    boundary = prepare_boundary_for_runtime(runtime_obj, boundary, validate=False)
     boundary = _clone_boundary_for_training(boundary)
     loss, _boundary_grads = runtime_obj.train_suffix(
         boundary,
@@ -819,7 +875,7 @@ class UniversalModelSplitter:
         del candidate
         runtime = self._ensure_runtime()
         loss, _grads = runtime.train_suffix(
-            _move_boundary_to_runtime_device(runtime, payload),
+            prepare_boundary_for_runtime(runtime, payload, validate=False),
             targets,
             loss_fn=loss_fn or self.trainability_loss_fn,
             optimizer=optimizer,
@@ -836,7 +892,7 @@ class UniversalModelSplitter:
     ):
         runtime = self._ensure_runtime()
         return runtime.train_suffix(
-            _move_boundary_to_runtime_device(runtime, boundary),
+            prepare_boundary_for_runtime(runtime, boundary, validate=False),
             targets,
             loss_fn=loss_fn or self.trainability_loss_fn,
             optimizer=optimizer,
@@ -1378,10 +1434,11 @@ def universal_split_retrain(
     losses: list[float] = []
     try:
         for epoch in range(int(num_epoch)):
-            epoch_batches = list(prepared_batches)
+            epoch_batches = list(prepared_batches) if shuffle_samples else prepared_batches
             if shuffle_samples and len(epoch_batches) > 1:
                 random.shuffle(epoch_batches)
-            epoch_losses: list[float] = []
+            epoch_loss_total: torch.Tensor | None = None
+            epoch_loss_count = 0
             for _batch_indices, boundary, targets in epoch_batches:
                 started = time.perf_counter()
                 loss = train_split_suffix_batch(
@@ -1390,16 +1447,26 @@ def universal_split_retrain(
                     targets,
                     loss_fn,
                     optimizer,
+                    trusted_runtime_boundary=True,
                 )
                 if retrain_profile is not None:
                     retrain_profile.add(
                         "suffix_forward_backward_time",
                         time.perf_counter() - started,
                     )
-                epoch_losses.append(float(loss.detach().cpu().item()))
-            if not epoch_losses:
+                batch_loss = loss.detach()
+                if batch_loss.is_floating_point() and batch_loss.dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                ):
+                    batch_loss = batch_loss.float()
+                epoch_loss_total = (
+                    batch_loss if epoch_loss_total is None else epoch_loss_total + batch_loss
+                )
+                epoch_loss_count += 1
+            if epoch_loss_total is None or epoch_loss_count <= 0:
                 raise RuntimeError("Split retraining did not produce any finite batch loss.")
-            losses.append(sum(epoch_losses) / len(epoch_losses))
+            losses.append(float((epoch_loss_total / epoch_loss_count).detach().cpu().item()))
             if epoch_log_context:
                 logger.info(
                     "[FixedSplitCL] {} epoch {}/{} avg_loss={:.6f}.",
