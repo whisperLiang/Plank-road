@@ -28,10 +28,19 @@ def _task_state_name(task: Task) -> str:
 
 def _write_task_result(handle, task: Task) -> None:
     detection_boxes, detection_class, detection_score = task.get_result()
+    latency_ms = None
+    if task.end_time is not None:
+        latency_ms = max(0.0, (float(task.end_time) - float(task.start_time)) * 1000.0)
+    timing_ms = {
+        str(name): float(value)
+        for name, value in dict(getattr(task, "timing_ms", {}) or {}).items()
+    }
     payload = {
         "frame_index": int(task.frame_index),
         "start_time": float(task.start_time),
         "end_time": float(task.end_time) if task.end_time is not None else None,
+        "latency_ms": latency_ms,
+        "timing_ms": timing_ms,
         "state": _task_state_name(task),
         "result_source": task.result_source,
         "ref": int(task.ref) if task.ref is not None else None,

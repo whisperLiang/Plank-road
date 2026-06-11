@@ -18,6 +18,7 @@ import torch
 from loguru import logger
 
 import edge.transmit as transmit
+from cloud.feature_cache.path_utils import fs_path
 from edge.feature_shard import write_feature_label_shards
 from edge.sample_quality import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
@@ -428,7 +429,7 @@ def pack_high_quality_sync_bundle_to_file(
                 for filename in files:
                     path = os.path.join(root, filename)
                     relpath = os.path.relpath(path, shard_tmp_root).replace("\\", "/")
-                    zf.write(path, relpath, compress_type=zipfile.ZIP_STORED)
+                    zf.write(fs_path(path), relpath, compress_type=zipfile.ZIP_STORED)
             zf.writestr(
                 "bundle_manifest.json",
                 json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),

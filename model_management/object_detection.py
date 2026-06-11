@@ -1,4 +1,5 @@
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -46,6 +47,7 @@ class Object_Detection:
         else:
             self.model_name = config.golden
         self.model = None
+        self._split_input_resize_mode = None
         self.load_model()
 
     def load_model(self):
@@ -68,6 +70,7 @@ class Object_Detection:
         self.model.to(device)
         self.model.eval()
         get_split_runtime_model(self.model).eval()
+        self._split_input_resize_mode = get_split_runtime_input_resize_mode(self.model)
         self.refresh_thresholds_from_model()
 
     def refresh_thresholds_from_model(self):
@@ -88,6 +91,12 @@ class Object_Detection:
         return get_split_runtime_model(self.model)
 
     def infer_sample(self, img, splitter=None) -> InferenceArtifacts:
+        timing_ms: dict[str, float] = {}
+
+        def add_timing(name: str, started: float) -> None:
+            elapsed = (time.perf_counter() - started) * 1000.0
+            timing_ms[name] = timing_ms.get(name, 0.0) + max(0.0, float(elapsed))
+
         split_payload = None
         input_tensor_shape = None
         input_resize_mode = None
@@ -95,8 +104,9 @@ class Object_Detection:
         with self.model_lock:
             with torch.inference_mode():
                 if splitter is not None:
+                    started = time.perf_counter()
                     splitter_input = prepare_split_runtime_input(self.model, img, device=device)
-                    input_resize_mode = get_split_runtime_input_resize_mode(self.model)
+                    input_resize_mode = self._split_input_resize_mode
                     if isinstance(splitter_input, torch.Tensor):
                         input_tensor_shape = [int(dim) for dim in splitter_input.shape]
                     elif (
@@ -105,15 +115,30 @@ class Object_Detection:
                         and isinstance(splitter_input[0], torch.Tensor)
                     ):
                         input_tensor_shape = [int(dim) for dim in splitter_input[0].shape]
+                    add_timing("preprocess", started)
+
+                    replay_profile: dict[str, float] = {}
                     replayed, split_payload = splitter.replay_inference(
                         splitter_input,
                         return_split_output=True,
+                        profile=replay_profile,
                     )
+                    for name in ("split_prefix", "split_suffix"):
+                        if name in replay_profile:
+                            timing_ms[name] = timing_ms.get(name, 0.0) + float(
+                                replay_profile[name]
+                            )
+
+                    started = time.perf_counter()
                     observables = summarize_split_runtime_observables(
                         self.model,
                         replayed,
                         split_payload,
+                        include_feature_spectral_entropy=False,
                     )
+                    add_timing("observables", started)
+
+                    started = time.perf_counter()
                     replayed = postprocess_split_runtime_output(
                         self.model,
                         replayed,
@@ -121,10 +146,14 @@ class Object_Detection:
                         model_input=splitter_input,
                         orig_image=img,
                     )
+                    add_timing("postprocess", started)
+
+                    started = time.perf_counter()
                     pred_boxes, pred_class, pred_score = self._parse_prediction_output(
                         replayed,
                         self.threshold_low,
                     )
+                    add_timing("parse_filter", started)
                 else:
                     pred_boxes, pred_class, pred_score = self.get_model_prediction(
                         img,
@@ -149,8 +178,10 @@ class Object_Detection:
                 logit_entropy=observables.get("logit_entropy"),
                 logit_margin=observables.get("logit_margin"),
                 logit_energy=observables.get("logit_energy"),
+                timing_ms=timing_ms,
             )
 
+        started = time.perf_counter()
         confidence = self._summarize_detection_confidence(pred_score)
         low_threshold_boxes = list(pred_boxes)
         low_threshold_labels = list(pred_class)
@@ -173,6 +204,7 @@ class Object_Detection:
                 detection_score,
                 threshold=float(final_detection_threshold),
             )
+        add_timing("parse_filter", started)
 
         return InferenceArtifacts(
             intermediate=split_payload,
@@ -191,6 +223,7 @@ class Object_Detection:
             logit_entropy=observables.get("logit_entropy"),
             logit_margin=observables.get("logit_margin"),
             logit_energy=observables.get("logit_energy"),
+            timing_ms=timing_ms,
         )
 
     def small_inference(self, img, splitter=None, return_split_payload=False):

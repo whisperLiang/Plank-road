@@ -98,6 +98,8 @@ class DetectionBackend(ABC):
         model: torch.nn.Module,
         outputs: Any,
         split_payload: Any | None = None,
+        *,
+        include_feature_spectral_entropy: bool = True,
     ) -> dict[str, float | None]:
         """Summarize split-runtime observables used by inference artifacts."""
 

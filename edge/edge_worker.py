@@ -49,6 +49,15 @@ from model_management.universal_model_split import UniversalModelSplitter
 from tools.grpc_options import grpc_message_options
 
 _QUEUE_STOP = object()
+_QUEUE_POLL_TIMEOUT_SECONDS = 0.05
+
+
+def _timeout_deadline(timeout: float | None) -> float | None:
+    return None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+
+
+def _remaining_timeout(deadline: float | None) -> float | None:
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
 
 
 def _coerce_positive_int(value: object) -> int | None:
@@ -168,6 +177,90 @@ class SampleWriteJob:
     stats_delta: SampleStatsDelta
 
 
+@dataclass(frozen=True)
+class SampleCollectionJob:
+    sample_id: str
+    frame_index: int | None
+    frame: Any
+    inference: InferenceArtifacts
+    split_config_id: str
+    model_id: str
+    model_version: str
+    front_version: str
+    split_key: str
+    feature_abi_id: str
+    runtime_contract: dict[str, Any]
+
+
+class AsyncSampleCollector:
+    def __init__(
+        self,
+        handler: Callable[[SampleCollectionJob], None],
+        *,
+        maxsize: int = 0,
+    ) -> None:
+        self._handler = handler
+        self._queue: Queue = Queue(maxsize=max(0, int(maxsize)))
+        self._closed = False
+        self._errors: list[BaseException] = []
+        self._thread = threading.Thread(
+            target=self._run,
+            name="edge-sample-collector",
+            daemon=False,
+        )
+        self._thread.start()
+
+    @property
+    def errors(self) -> list[BaseException]:
+        return list(self._errors)
+
+    def submit_nowait(self, job: SampleCollectionJob) -> None:
+        if self._closed:
+            raise RuntimeError("sample collector is closed")
+        self._queue.put_nowait(job)
+
+    def flush(self, *, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                if deadline is None:
+                    self._queue.all_tasks_done.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._queue.all_tasks_done.wait(timeout=remaining)
+        return True
+
+    def close(self, *, timeout: float | None = None) -> bool:
+        deadline = _timeout_deadline(timeout)
+        flushed = True
+        if not self._closed:
+            flushed = self.flush(timeout=_remaining_timeout(deadline))
+            self._closed = True
+        self._thread.join(timeout=_remaining_timeout(deadline))
+        return flushed and not self._thread.is_alive()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                item = self._queue.get(block=True, timeout=_QUEUE_POLL_TIMEOUT_SECONDS)
+            except Empty:
+                if self._closed:
+                    return
+                continue
+            try:
+                if item is _QUEUE_STOP:
+                    return
+                try:
+                    self._handler(item)
+                except BaseException as exc:  # noqa: BLE001 - preserve worker thread.
+                    self._errors.append(exc)
+                    logger.exception("Async sample collection failed: {}", exc)
+            finally:
+                self._queue.task_done()
+
+
 class AsyncSampleWriter:
     def __init__(
         self,
@@ -218,19 +311,23 @@ class AsyncSampleWriter:
         return True
 
     def close(self, *, timeout: float | None = None) -> bool:
-        if self._closed:
-            return not any(thread.is_alive() for thread in self._threads)
-        flushed = self.flush(timeout=timeout)
-        self._closed = True
-        for _thread in self._threads:
-            self._queue.put(_QUEUE_STOP, block=True)
+        deadline = _timeout_deadline(timeout)
+        flushed = True
+        if not self._closed:
+            flushed = self.flush(timeout=_remaining_timeout(deadline))
+            self._closed = True
         for thread in self._threads:
-            thread.join(timeout=timeout)
+            thread.join(timeout=_remaining_timeout(deadline))
         return flushed and not any(thread.is_alive() for thread in self._threads)
 
     def _run(self) -> None:
         while True:
-            item = self._queue.get(block=True)
+            try:
+                item = self._queue.get(block=True, timeout=_QUEUE_POLL_TIMEOUT_SECONDS)
+            except Empty:
+                if self._closed:
+                    return
+                continue
             try:
                 if item is _QUEUE_STOP:
                     return
@@ -367,6 +464,10 @@ class EdgeWorker:
         self.sample_writer = AsyncSampleWriter(
             self.sample_store,
             on_done=self._on_sample_write_done,
+        )
+        self.sample_collector = AsyncSampleCollector(
+            self._collect_data_from_job,
+            maxsize=int(getattr(config, "local_queue_maxsize", 0) or 0),
         )
         self.model_id = getattr(self.small_object_detection, "model_name", "edge-model")
         self.model_version = "0"
@@ -740,6 +841,39 @@ class EdgeWorker:
             record = self.sample_store.store_sample(**job.store_kwargs)
             self._notify_sample_syncer(record)
 
+    def _submit_sample_collection(self, job: SampleCollectionJob) -> bool:
+        collector = getattr(self, "sample_collector", None)
+        if collector is None:
+            self._collect_data_from_job(job)
+            return False
+        try:
+            collector.submit_nowait(job)
+            return True
+        except Full:
+            logger.warning(
+                "Async sample collector is full; collecting sample {} synchronously.",
+                job.sample_id,
+            )
+            self._collect_data_from_job(job)
+            return False
+        except Exception:
+            logger.exception(
+                "Async sample collector unavailable; collecting sample {} synchronously.",
+                job.sample_id,
+            )
+            self._collect_data_from_job(job)
+            return False
+
+    def _flush_sample_collector(self, *, timeout: float = 10.0) -> bool:
+        collector = getattr(self, "sample_collector", None)
+        if collector is None:
+            return True
+        try:
+            return bool(collector.flush(timeout=timeout))
+        except Exception as exc:
+            logger.error("Failed to flush async sample collector: {}", exc)
+            return False
+
     def _flush_sample_writer(self, *, timeout: float = 10.0) -> bool:
         writer = getattr(self, "sample_writer", None)
         if writer is None:
@@ -841,6 +975,8 @@ class EdgeWorker:
         *,
         result_source: str,
     ) -> None:
+        if hasattr(task, "set_timing") and hasattr(task, "created_perf"):
+            task.set_timing("total", (time.perf_counter() - task.created_perf) * 1000.0)
         task.end_time = time.time()
         task.state = state
         task.result_source = result_source
@@ -1100,15 +1236,9 @@ class EdgeWorker:
         )
 
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> None:
-        confidence = float(inference.confidence)
-        quality_classifier = getattr(self, "quality_classifier", None)
-        if quality_classifier is None:
-            quality_classifier = EntropyQualityClassifier.from_config(
-                getattr(getattr(self, "config", None), "sample_quality", None)
-            )
-            self.quality_classifier = quality_classifier
-        window_detector = getattr(self, "window_drift_detector", WindowDriftDetector())
         split_plan = self.fixed_split_plan
+        if split_plan is None:
+            return
         runtime_contract = dict(getattr(split_plan, "runtime_contract", {}) or {})
         split_key = str(
             getattr(split_plan, "canonical_split_key", "")
@@ -1121,12 +1251,38 @@ class EdgeWorker:
             or runtime_contract.get("feature_layout_id")
             or ""
         )
+        job = SampleCollectionJob(
+            sample_id=self._next_sample_id(task),
+            frame_index=task.frame_index,
+            frame=frame,
+            inference=inference,
+            split_config_id=str(split_plan.split_config_id),
+            model_id=str(self.model_id),
+            model_version=str(self.model_version),
+            front_version=str(getattr(self, "front_version", "0") or "0"),
+            split_key=split_key,
+            feature_abi_id=feature_abi_id,
+            runtime_contract=runtime_contract,
+        )
+        self._submit_sample_collection(job)
+
+    def _collect_data_from_job(self, job: SampleCollectionJob) -> None:
+        inference = job.inference
+        frame = job.frame
+        confidence = float(inference.confidence)
+        quality_classifier = getattr(self, "quality_classifier", None)
+        if quality_classifier is None:
+            quality_classifier = EntropyQualityClassifier.from_config(
+                getattr(getattr(self, "config", None), "sample_quality", None)
+            )
+            self.quality_classifier = quality_classifier
+        window_detector = getattr(self, "window_drift_detector", WindowDriftDetector())
         quality = quality_classifier.classify(
             inference,
             inference.intermediate,
-            model_name=str(self.model_id),
-            split_key=split_key,
-            feature_abi_id=feature_abi_id,
+            model_name=job.model_id,
+            split_key=job.split_key,
+            feature_abi_id=job.feature_abi_id,
         )
         drift_state = window_detector.update(
             quality,
@@ -1138,17 +1294,16 @@ class EdgeWorker:
             },
         )
         save_raw = quality.quality_bucket == LOW_QUALITY
-        sample_id = self._next_sample_id(task)
         retrain_cfg = getattr(getattr(self, "config", None), "retrain", None)
         persist_debug_stats = bool(getattr(quality_classifier, "persist_debug_stats", False))
         store_kwargs = {
-            "sample_id": sample_id,
-            "frame_index": task.frame_index,
+            "sample_id": job.sample_id,
+            "frame_index": job.frame_index,
             "confidence": confidence,
-            "split_config_id": split_plan.split_config_id,
-            "model_id": self.model_id,
-            "model_version": self.model_version,
-            "front_version": str(getattr(self, "front_version", "0") or "0"),
+            "split_config_id": job.split_config_id,
+            "model_id": job.model_id,
+            "model_version": job.model_version,
+            "front_version": job.front_version,
             "quality_bucket": quality.quality_bucket,
             "quality_metadata": quality.quality_metadata(persist_debug_stats=persist_debug_stats),
             "window_id": quality.window_id,
@@ -1160,7 +1315,7 @@ class EdgeWorker:
             "input_image_size": list(frame.shape[:2]),
             "input_tensor_shape": inference.input_tensor_shape,
             "input_resize_mode": inference.input_resize_mode,
-            "runtime_contract": runtime_contract,
+            "runtime_contract": job.runtime_contract,
         }
         self._submit_sample_write(
             SampleWriteJob(
@@ -1232,6 +1387,11 @@ class EdgeWorker:
                 options=grpc_message_options(),
             )
             try:
+                if not self._flush_sample_collector(timeout=30.0):
+                    logger.warning(
+                        "Timed out while flushing pending sample collection before "
+                        "continual learning upload."
+                    )
                 if not self._flush_sample_writer(timeout=30.0):
                     logger.warning(
                         "Timed out while flushing pending sample writes before "
@@ -1451,6 +1611,7 @@ class EdgeWorker:
             )
             return
         task.edge_process = True
+        task.local_queue_enqueued_perf = time.perf_counter()
         self.local_queue.put(task, block=True)
 
     def close(self, *, timeout: float = 5.0) -> None:
@@ -1483,6 +1644,10 @@ class EdgeWorker:
         ):
             if thread is not None and thread.is_alive():
                 thread.join(timeout=timeout)
+        collector = getattr(self, "sample_collector", None)
+        if collector is not None:
+            if not collector.close(timeout=timeout):
+                logger.warning("Timed out while closing async sample collector.")
         writer = getattr(self, "sample_writer", None)
         if writer is not None:
             if not writer.close(timeout=timeout):
@@ -1498,6 +1663,11 @@ class EdgeWorker:
                 task = self.frame_cache.get(block=True)
                 if task is _QUEUE_STOP:
                     return
+                task.set_timing(
+                    "frame_queue_wait",
+                    (time.perf_counter() - task.created_perf) * 1000.0,
+                )
+                task.set_timing("diff", 0.0)
                 self.decision_worker(task)
             return
 
@@ -1505,7 +1675,13 @@ class EdgeWorker:
         if task is _QUEUE_STOP:
             return
         frame = task.frame_edge
+        task.set_timing(
+            "frame_queue_wait",
+            (time.perf_counter() - task.created_perf) * 1000.0,
+        )
+        diff_started = time.perf_counter()
         self.pre_frame_feature = self.edge_processor.get_frame_feature(frame)
+        task.record_timing("diff", (time.perf_counter() - diff_started) * 1000.0)
         self.key_task = task
         self.decision_worker(task)
 
@@ -1514,12 +1690,18 @@ class EdgeWorker:
             if task is _QUEUE_STOP:
                 return
             frame = task.frame_edge
+            task.set_timing(
+                "frame_queue_wait",
+                (time.perf_counter() - task.created_perf) * 1000.0,
+            )
+            diff_started = time.perf_counter()
             self.frame_feature = self.edge_processor.get_frame_feature(frame)
             self.diff += self.edge_processor.cal_frame_diff(
                 self.frame_feature,
                 self.pre_frame_feature,
             )
             self.pre_frame_feature = self.frame_feature
+            task.record_timing("diff", (time.perf_counter() - diff_started) * 1000.0)
             if self.diff >= self.config.diff_thresh:
                 self.diff = 0.0
                 self.key_task = task
@@ -1545,14 +1727,25 @@ class EdgeWorker:
                 )
                 continue
 
+            local_enqueued = float(
+                getattr(task, "local_queue_enqueued_perf", time.perf_counter())
+            )
+            task.set_timing("local_queue_wait", (time.perf_counter() - local_enqueued) * 1000.0)
             self.queue_info[f"{self.edge_id}"] = self.local_queue.qsize()
             current_frame = task.frame_edge
             frame_image_size = tuple(int(value) for value in current_frame.shape[:2])
+            split_resolve_started = time.perf_counter()
             active_splitter = self._resolve_active_splitter(current_frame, frame_image_size)
+            task.set_timing(
+                "split_resolve",
+                (time.perf_counter() - split_resolve_started) * 1000.0,
+            )
             inference = self.small_object_detection.infer_sample(
                 current_frame,
                 splitter=active_splitter,
             )
+            for name, value in dict(getattr(inference, "timing_ms", {}) or {}).items():
+                task.record_timing(name, value)
 
             task.add_result(
                 inference.final_detection_boxes or None,
@@ -1566,7 +1759,14 @@ class EdgeWorker:
                 and inference.intermediate is not None
                 and self.fixed_split_plan is not None
             ):
+                collection_started = time.perf_counter()
                 self.collect_data(task, current_frame, inference)
+                task.set_timing(
+                    "collection_enqueue",
+                    (time.perf_counter() - collection_started) * 1000.0,
+                )
+            else:
+                task.set_timing("collection_enqueue", 0.0)
 
             self._set_task_terminal_state(
                 task,

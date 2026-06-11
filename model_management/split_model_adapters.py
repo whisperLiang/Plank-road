@@ -116,11 +116,23 @@ def summarize_split_runtime_observables(
     model: torch.nn.Module,
     outputs: Any,
     split_payload: Any | None = None,
+    *,
+    include_feature_spectral_entropy: bool = True,
 ) -> dict[str, float | None]:
     backend = _backend_or_none(model)
     if backend is not None:
-        return backend.summarize_split_runtime_observables(model, outputs, split_payload)
-    return _legacy.summarize_split_runtime_observables(model, outputs, split_payload)
+        return backend.summarize_split_runtime_observables(
+            model,
+            outputs,
+            split_payload,
+            include_feature_spectral_entropy=include_feature_spectral_entropy,
+        )
+    return _legacy.summarize_split_runtime_observables(
+        model,
+        outputs,
+        split_payload,
+        include_feature_spectral_entropy=include_feature_spectral_entropy,
+    )
 
 
 def build_split_training_loss(model: torch.nn.Module):

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from cloud.feature_cache import FeatureShardStore
+from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.types import SAFETENSORS_SHARD
 from cloud.ingest import materialize_low_quality_trigger_bundle
 from edge.sample_quality import LOW_QUALITY
@@ -184,5 +185,5 @@ def test_raw_feature_low_quality_bundle_imports_current_feature_ref(tmp_path) ->
     assert sample["raw_relpath"].startswith("low_quality_staging/raw/")
     assert sample["feature_layout_id"] == runtime_contract["feature_layout_id"]
     feature_ref = sample["feature_ref"]
-    assert os.path.exists(feature_ref["index_path"])
+    assert os.path.exists(fs_path(feature_ref["index_path"]))
     assert str(feature_ref["index_path"]).startswith(str(tmp_path / "cloud_features"))

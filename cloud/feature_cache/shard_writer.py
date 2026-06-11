@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.types import (
     NPY_MEMMAP_SHARD,
     SAFETENSORS_SHARD,
@@ -36,16 +37,16 @@ def _sanitize_segment(value: object) -> str:
 
 def _atomic_json_dump(path: str, payload: Mapping[str, Any]) -> None:
     directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(fs_path(directory), exist_ok=True)
     fd: int | None = None
     tmp_path = ""
     try:
-        fd, tmp_path = tempfile.mkstemp(prefix=".json-", suffix=".tmp", dir=directory)
+        fd, tmp_path = tempfile.mkstemp(prefix=".json-", suffix=".tmp", dir=fs_path(directory))
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = None
             json.dump(dict(payload), handle, indent=2, sort_keys=True)
             handle.write("\n")
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, fs_path(path))
     except Exception:
         if fd is not None:
             try:
@@ -369,7 +370,7 @@ class FeatureShardWriter:
             }
         )[:24]
         base_dir = self._base_dir(runtime_context, generation)
-        os.makedirs(base_dir, exist_ok=True)
+        os.makedirs(fs_path(base_dir), exist_ok=True)
         sample_to_row = {sample_id: row for row, sample_id in enumerate(sample_ids)}
         leaf_specs = {}
         payload_meta = dict(first.get("_payload_meta") or {})
@@ -532,9 +533,10 @@ class FeatureShardWriter:
         shard_path = os.path.join(base_dir, f"{shard_id}.safetensors")
         index_path = os.path.join(base_dir, f"{shard_id}.index.json")
         meta_path = os.path.join(base_dir, f"{shard_id}.meta.json")
+        os.makedirs(fs_path(base_dir), exist_ok=True)
         tmp_path = f"{shard_path}.tmp-{threading.get_ident()}-{int(time.time() * 1000000)}"
-        save_file(dict(tensors), tmp_path)
-        os.replace(tmp_path, shard_path)
+        save_file(dict(tensors), fs_path(tmp_path))
+        os.replace(fs_path(tmp_path), fs_path(shard_path))
         payload = metadata.to_dict()
         payload["shard_path"] = shard_path
         payload["index_path"] = index_path
@@ -549,14 +551,15 @@ class FeatureShardWriter:
         tensors: Mapping[str, torch.Tensor],
         metadata: FeatureShardMetadata,
     ) -> tuple[str, str, str]:
+        os.makedirs(fs_path(base_dir), exist_ok=True)
         shard_dir = os.path.join(base_dir, shard_id)
-        tmp_dir = tempfile.mkdtemp(prefix=".npy-", dir=base_dir)
+        tmp_dir = tempfile.mkdtemp(prefix=".npy-", dir=fs_path(base_dir))
         try:
             for key, tensor in tensors.items():
                 array = tensor.detach().cpu().numpy()
                 target = os.path.join(tmp_dir, f"{key}.npy")
                 memmap = np.lib.format.open_memmap(
-                    target,
+                    fs_path(target),
                     mode="w+",
                     dtype=array.dtype,
                     shape=array.shape,
@@ -573,7 +576,7 @@ class FeatureShardWriter:
             payload["index_path"] = index_path
             _atomic_json_dump(tmp_meta_path, payload)
             _atomic_json_dump(tmp_index_path, {"metadata_path": meta_path, **payload})
-            os.replace(tmp_dir, shard_dir)
+            os.replace(tmp_dir, fs_path(shard_dir))
             return shard_dir, index_path, meta_path
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)

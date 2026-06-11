@@ -1,4 +1,5 @@
 import threading
+import time
 
 import numpy as np
 
@@ -19,6 +20,7 @@ class Task:
         self.frame_index = frame_index
         self.frame_edge = frame
         self.start_time = start_time
+        self.created_perf = time.perf_counter()
         self.raw_shape = raw_shape
         self.state = None
         self.ref = None
@@ -30,10 +32,18 @@ class Task:
 
         self.done_event = threading.Event()
         self.result_source = "pending"
+        self.timing_ms = {}
 
         self.detection_boxes = []
         self.detection_class = []
         self.detection_score = []
+
+    def record_timing(self, name, elapsed_ms):
+        value = max(0.0, float(elapsed_ms))
+        self.timing_ms[str(name)] = float(self.timing_ms.get(str(name), 0.0)) + value
+
+    def set_timing(self, name, elapsed_ms):
+        self.timing_ms[str(name)] = max(0.0, float(elapsed_ms))
 
     def add_result(self, detection_boxes, detection_class, detection_score):
         if detection_boxes is not None:

@@ -6,13 +6,18 @@ import os
 import pytest
 import torch
 
+import cloud.feature_cache.shard_validator as shard_validator
 from cloud.feature_cache import (
+    NPY_MEMMAP_SHARD,
     FeatureCacheMaterializer,
     FeatureCachePlanner,
+    FeatureShardMetadata,
+    FeatureShardRef,
     FeatureShardStore,
     ShardFeatureRefValidator,
     collect_refs_from_active_generations,
 )
+from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.shard_validator import ABI_REASON_LAYOUT_EQUIVALENT_REBIND
 from cloud.sample_pool import CloudSamplePool, align_sample_feature_contract
 from model_management.payload import boundary_payload_from_tensors
@@ -1041,6 +1046,65 @@ def test_shard_ref_validation_does_not_torch_load(tmp_path, monkeypatch) -> None
     assert result.abi_compatible
 
 
+def test_npy_shard_file_validation_uses_fs_path_for_shard_dir(monkeypatch) -> None:
+    raw_dir = r"C:\very\long\feature\shard"
+    leaf_path = os.path.join(raw_dir, "boundary.npy")
+    metadata = FeatureShardMetadata(
+        format_version="feature-shard.v1",
+        storage_format=NPY_MEMMAP_SHARD,
+        model_id="model-a",
+        model_family="test",
+        split_config_id="split-a",
+        feature_layout_id="layout-a",
+        contract_id=None,
+        boundary_id="boundary-a",
+        boundary_schema_hash="schema-a",
+        passthrough_schema_hash=None,
+        preprocessing_fingerprint=None,
+        dtype="float16",
+        shape_bucket="shape-a",
+        num_samples=1,
+        leaf_specs={"boundary": {"dtype": "float16", "shape": [1, 2]}},
+        sample_to_row={"sample-a": 0},
+        shard_dir=raw_dir,
+        index_path=os.path.join(raw_dir, "shard.index.json"),
+    )
+    ref = FeatureShardRef(
+        storage_format=NPY_MEMMAP_SHARD,
+        shard_id="shard-a",
+        shard_path=None,
+        shard_dir=raw_dir,
+        index_path=metadata.index_path,
+        row_id=0,
+        sample_id="sample-a",
+        feature_layout_id="layout-a",
+        contract_id=None,
+        boundary_id="boundary-a",
+        payload_kind="boundary_payload",
+        dtype="float16",
+        shape_bucket="shape-a",
+        leaf_keys=["boundary"],
+    )
+    fs_calls: list[str] = []
+
+    def fake_fs_path(path: str) -> str:
+        fs_calls.append(path)
+        return f"fs::{path}"
+
+    def fake_isdir(path: str) -> bool:
+        return path == f"fs::{raw_dir}"
+
+    def fake_exists(path: str) -> bool:
+        return path == f"fs::{leaf_path}"
+
+    monkeypatch.setattr(shard_validator, "fs_path", fake_fs_path)
+    monkeypatch.setattr(shard_validator.os.path, "isdir", fake_isdir)
+    monkeypatch.setattr(shard_validator.os.path, "exists", fake_exists)
+
+    assert shard_validator._shard_file_exists(ref, metadata)
+    assert fs_calls == [raw_dir, leaf_path]
+
+
 def test_generation_cleanup_preserves_reachable_shards(tmp_path) -> None:
     contract = _contract_with_labels()
     pool = CloudSamplePool(
@@ -1194,7 +1258,7 @@ def test_feature_cache_planner_validate_refs_false_skips_shard_file_validation(t
         label_source="edge_pseudo",
     )
     sample = dict(samples[0])
-    os.remove(str(sample["feature_ref"]["index_path"]))
+    os.remove(fs_path(str(sample["feature_ref"]["index_path"])))
     planner = FeatureCachePlanner(
         FeatureShardStore(str(tmp_path / "planner-store"), storage_format="npy_memmap_shard"),
         validate_refs=False,

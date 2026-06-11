@@ -471,14 +471,20 @@ def summarize_split_runtime_observables(
     model: torch.nn.Module,
     outputs: Any,
     split_payload: BoundaryPayload | torch.Tensor | dict[str, torch.Tensor] | None = None,
+    *,
+    include_feature_spectral_entropy: bool = True,
 ) -> dict[str, float | None]:
     observables: dict[str, float | None] = {
-        "feature_spectral_entropy": _summarize_payload_spectral_entropy(split_payload),
+        "feature_spectral_entropy": None,
         "logit_entropy": None,
         "logit_margin": None,
         "logit_energy": None,
     }
-    if observables["feature_spectral_entropy"] is None:
+    if include_feature_spectral_entropy:
+        observables["feature_spectral_entropy"] = _summarize_payload_spectral_entropy(
+            split_payload
+        )
+    if include_feature_spectral_entropy and observables["feature_spectral_entropy"] is None:
         observables["feature_spectral_entropy"] = _summarize_runtime_output_spectral_entropy(
             model,
             outputs,

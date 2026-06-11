@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.types import (
     NPY_MEMMAP_SHARD,
     SAFETENSORS_SHARD,
@@ -23,7 +24,7 @@ SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis_v2"
 
 
 def _read_json(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(fs_path(path), "r", encoding="utf-8") as handle:
         payload = json.load(handle)
     return dict(payload) if isinstance(payload, Mapping) else {}
 
@@ -39,7 +40,7 @@ def _contiguous_slice(rows: list[int]) -> slice | None:
 
 
 def _metadata_for_ref(ref: FeatureShardRef) -> FeatureShardMetadata:
-    if not ref.index_path or not os.path.exists(ref.index_path):
+    if not ref.index_path or not os.path.exists(fs_path(ref.index_path)):
         raise FileNotFoundError(ref.index_path)
     payload = _read_json(ref.index_path)
     return FeatureShardMetadata.from_dict(payload)
@@ -200,7 +201,7 @@ class NpyMemmapShardReader:
             cache_key = (shard_dir, leaf_key)
             array = self._arrays.get(cache_key)
             if array is None:
-                array = np.load(path, mmap_mode="r")
+                array = np.load(fs_path(path), mmap_mode="r")
                 self._arrays[cache_key] = array
                 self.files_opened += 1
             leaf_spec = _leaf_spec(metadata, leaf_key)
@@ -239,7 +240,7 @@ class SafetensorsShardReader:
         shard_path = refs[0].shard_path
         if not shard_path:
             raise ValueError("safetensors_shard ref is missing shard_path.")
-        with safe_open(shard_path, framework="pt", device="cpu") as handle:
+        with safe_open(fs_path(shard_path), framework="pt", device="cpu") as handle:
             for leaf_key in refs[0].leaf_keys:
                 leaf_spec = _leaf_spec(metadata, leaf_key)
                 if _is_sample_axis_leaf(leaf_spec):

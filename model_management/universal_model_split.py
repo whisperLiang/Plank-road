@@ -829,9 +829,26 @@ class UniversalModelSplitter:
         del profile
         return self.train_suffix(boundary, targets, loss_fn=loss_fn, optimizer=optimizer)
 
-    def replay_inference(self, sample_input: Any, *, return_split_output: bool = False):
+    def replay_inference(
+        self,
+        sample_input: Any,
+        *,
+        return_split_output: bool = False,
+        profile: dict[str, float] | None = None,
+    ):
+        started = time.perf_counter()
         payload = self.edge_forward(sample_input)
+        if profile is not None:
+            profile["split_prefix"] = profile.get("split_prefix", 0.0) + (
+                time.perf_counter() - started
+            ) * 1000.0
+
+        started = time.perf_counter()
         outputs = self.cloud_forward(payload)
+        if profile is not None:
+            profile["split_suffix"] = profile.get("split_suffix", 0.0) + (
+                time.perf_counter() - started
+            ) * 1000.0
         return (outputs, payload) if return_split_output else outputs
 
     def full_forward(self, *args: Any, **kwargs: Any) -> Any:

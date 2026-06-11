@@ -105,8 +105,15 @@ class DETRBackend(DetectionBackend):
         model: torch.nn.Module,
         outputs: Any,
         split_payload: Any | None = None,
+        *,
+        include_feature_spectral_entropy: bool = True,
     ) -> dict[str, float | None]:
-        return _split.summarize_split_runtime_observables(model, outputs, split_payload)
+        return _split.summarize_split_runtime_observables(
+            model,
+            outputs,
+            split_payload,
+            include_feature_spectral_entropy=include_feature_spectral_entropy,
+        )
 
     def get_detection_thresholds(self, model_name: str) -> tuple[float, float]:
         return _zoo.get_detection_thresholds(model_name)

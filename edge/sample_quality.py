@@ -481,7 +481,7 @@ class EntropyQualityClassifier:
     def _tensor_activation_entropy(self, tensor: torch.Tensor) -> tuple[float | None, int]:
         if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
             return None, 0
-        flat = tensor.detach().float().abs().flatten().cpu()
+        flat = tensor.detach().float().abs().flatten()
         if flat.numel() > self.feature_max_elements:
             indices = (
                 torch.linspace(
@@ -489,6 +489,7 @@ class EntropyQualityClassifier:
                     flat.numel() - 1,
                     steps=self.feature_max_elements,
                     dtype=torch.float64,
+                    device=flat.device,
                 )
                 .round()
                 .long()

@@ -21,6 +21,7 @@ class InferenceArtifacts:
     logit_entropy: float | None = None
     logit_margin: float | None = None
     logit_energy: float | None = None
+    timing_ms: dict[str, float] | None = None
 
     def to_inference_result(self) -> dict[str, list]:
         return {

@@ -9,6 +9,7 @@ from typing import Any
 
 from loguru import logger
 
+from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.shard_reader import FeatureShardPayloadCache, ShardFeatureBatchReader
 from cloud.feature_cache.shard_writer import SHARD_FORMAT_VERSION, FeatureShardWriter
 from cloud.feature_cache.types import (
@@ -20,7 +21,7 @@ from cloud.feature_cache.types import (
 
 
 def _read_json(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(fs_path(path), "r", encoding="utf-8") as handle:
         payload = json.load(handle)
     return dict(payload) if isinstance(payload, Mapping) else {}
 
@@ -28,12 +29,12 @@ def _read_json(path: str) -> dict[str, Any]:
 def _atomic_json_dump(path: str, payload: Mapping[str, Any]) -> None:
     import threading
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(fs_path(os.path.dirname(path)), exist_ok=True)
     tmp_path = f"{path}.tmp-{threading.get_ident()}-{int(time.time() * 1000000)}"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
+    with open(fs_path(tmp_path), "w", encoding="utf-8") as handle:
         json.dump(dict(payload), handle, indent=2, sort_keys=True)
         handle.write("\n")
-    os.replace(tmp_path, path)
+    os.replace(fs_path(tmp_path), fs_path(path))
 
 
 class FeatureShardStore:
@@ -73,7 +74,7 @@ class FeatureShardStore:
             pin_memory=pin_memory,
             non_blocking_transfer=non_blocking_transfer,
         )
-        os.makedirs(self.root_dir, exist_ok=True)
+        os.makedirs(fs_path(self.root_dir), exist_ok=True)
 
     def writer(self, *, storage_format: str | None = None) -> FeatureShardWriter:
         return FeatureShardWriter(
@@ -112,13 +113,13 @@ class FeatureShardStore:
         parsed = ref if isinstance(ref, FeatureShardRef) else FeatureShardRef.from_dict(ref)
         if parsed.storage_format not in self.accepted_storage_formats:
             raise ValueError(f"Rejected feature shard storage_format={parsed.storage_format!r}.")
-        if not parsed.index_path or not os.path.exists(parsed.index_path):
+        if not parsed.index_path or not os.path.exists(fs_path(parsed.index_path)):
             raise FileNotFoundError(parsed.index_path)
         if parsed.storage_format == SAFETENSORS_SHARD:
-            if not parsed.shard_path or not os.path.exists(parsed.shard_path):
+            if not parsed.shard_path or not os.path.exists(fs_path(parsed.shard_path)):
                 raise FileNotFoundError(parsed.shard_path or "")
         if parsed.storage_format == NPY_MEMMAP_SHARD:
-            if not parsed.shard_dir or not os.path.isdir(parsed.shard_dir):
+            if not parsed.shard_dir or not os.path.isdir(fs_path(parsed.shard_dir)):
                 raise FileNotFoundError(parsed.shard_dir or "")
         return parsed
 
@@ -156,7 +157,7 @@ class FeatureShardStore:
             feature_layout_id or "unknown",
             generation,
         )
-        os.makedirs(target_dir, exist_ok=True)
+        os.makedirs(fs_path(target_dir), exist_ok=True)
         for shard in list(shard_entries or []):
             storage_format = str(
                 shard.get("storage_format") or manifest.get("storage_format") or ""
@@ -177,13 +178,13 @@ class FeatureShardStore:
                     bundle_root, str(shard.get("meta_file") or "").replace("/", os.sep)
                 )
                 for path in (source_file, source_index, source_meta):
-                    if not os.path.exists(path):
+                    if not os.path.exists(fs_path(path)):
                         raise FileNotFoundError(path)
                 shard_path = os.path.join(target_dir, os.path.basename(source_file))
                 index_path = os.path.join(target_dir, os.path.basename(source_index))
                 meta_path = os.path.join(target_dir, os.path.basename(source_meta))
-                shutil.copyfile(source_file, shard_path)
-                shutil.copyfile(source_meta, meta_path)
+                shutil.copyfile(fs_path(source_file), fs_path(shard_path))
+                shutil.copyfile(fs_path(source_meta), fs_path(meta_path))
                 index_payload = _read_json(source_index)
                 index_payload["shard_path"] = shard_path
                 index_payload["index_path"] = index_path
@@ -198,12 +199,12 @@ class FeatureShardStore:
                 source_dir = os.path.join(
                     bundle_root, str(shard.get("shard_dir") or "").replace("/", os.sep)
                 )
-                if not os.path.isdir(source_dir):
+                if not os.path.isdir(fs_path(source_dir)):
                     raise FileNotFoundError(source_dir)
                 shard_dir = os.path.join(target_dir, os.path.basename(source_dir.rstrip(os.sep)))
-                if os.path.exists(shard_dir):
-                    shutil.rmtree(shard_dir)
-                shutil.copytree(source_dir, shard_dir)
+                if os.path.exists(fs_path(shard_dir)):
+                    shutil.rmtree(fs_path(shard_dir))
+                shutil.copytree(fs_path(source_dir), fs_path(shard_dir))
                 index_path = os.path.join(
                     shard_dir, str(shard.get("index_file_name") or f"{shard_id}.index.json")
                 )
@@ -211,7 +212,7 @@ class FeatureShardStore:
                     shard_dir, str(shard.get("meta_file_name") or f"{shard_id}.meta.json")
                 )
                 for path in (index_path, meta_path):
-                    if not os.path.exists(path):
+                    if not os.path.exists(fs_path(path)):
                         raise FileNotFoundError(path)
                 index_payload = _read_json(index_path)
                 index_payload["shard_dir"] = shard_dir

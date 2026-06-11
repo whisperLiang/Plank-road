@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.shard_reader import ShardFeatureBatchReader
 from cloud.feature_cache.types import (
     NPY_MEMMAP_SHARD,
@@ -120,7 +121,7 @@ def shard_feature_layout_from_metadata(
 def _read_json(path: str) -> dict[str, Any]:
     import json
 
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(fs_path(path), "r", encoding="utf-8") as handle:
         payload = json.load(handle)
     return dict(payload) if isinstance(payload, Mapping) else {}
 
@@ -230,14 +231,15 @@ def _metadata_path_from_index(ref: FeatureShardRef, index_payload: Mapping[str, 
 def _shard_file_exists(ref: FeatureShardRef, metadata: FeatureShardMetadata) -> bool:
     if ref.storage_format == SAFETENSORS_SHARD:
         shard_path = ref.shard_path or metadata.shard_path
-        return bool(shard_path and os.path.exists(str(shard_path)))
+        return bool(shard_path and os.path.exists(fs_path(str(shard_path))))
     if ref.storage_format == NPY_MEMMAP_SHARD:
         shard_dir = ref.shard_dir or metadata.shard_dir
-        if not shard_dir or not os.path.isdir(str(shard_dir)):
+        if not shard_dir or not os.path.isdir(fs_path(str(shard_dir))):
             return False
         leaf_keys = list(ref.leaf_keys or metadata.leaf_specs.keys())
         return all(
-            os.path.exists(os.path.join(str(shard_dir), f"{leaf}.npy")) for leaf in leaf_keys
+            os.path.exists(fs_path(os.path.join(str(shard_dir), f"{leaf}.npy")))
+            for leaf in leaf_keys
         )
     return False
 
@@ -413,7 +415,7 @@ class ShardFeatureRefValidator:
         except Exception as exc:
             return ValidationResult(unreadable_shard=True, reason=str(exc) or type(exc).__name__)
 
-        if not ref.index_path or not os.path.exists(ref.index_path):
+        if not ref.index_path or not os.path.exists(fs_path(ref.index_path)):
             return ValidationResult(
                 missing_index=True,
                 reason="missing_index",
@@ -429,7 +431,7 @@ class ShardFeatureRefValidator:
             )
 
         metadata_path = _metadata_path_from_index(ref, index_payload)
-        if not metadata_path or not os.path.exists(metadata_path):
+        if not metadata_path or not os.path.exists(fs_path(metadata_path)):
             return ValidationResult(
                 missing_meta=True,
                 reason="missing_meta",

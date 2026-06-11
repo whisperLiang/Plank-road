@@ -14,6 +14,7 @@ from typing import Any
 import grpc
 from loguru import logger
 
+from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.types import NPY_MEMMAP_SHARD, SAFETENSORS_SHARD
 from edge.sample_quality import LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
@@ -232,7 +233,7 @@ def _build_low_quality_feature_shard_uploads(
     artifacts_by_arcname: dict[str, str] = {}
 
     def add_artifact(path: str, arcname: str) -> None:
-        if os.path.exists(path):
+        if os.path.exists(fs_path(path)):
             artifacts_by_arcname.setdefault(arcname.replace("\\", "/"), path)
 
     for record in records:
@@ -251,7 +252,9 @@ def _build_low_quality_feature_shard_uploads(
             meta_path = _metadata_path_from_feature_ref(ref)
             if not shard_path or not index_path or not meta_path:
                 continue
-            if not all(os.path.exists(path) for path in (shard_path, index_path, meta_path)):
+            if not all(
+                os.path.exists(fs_path(path)) for path in (shard_path, index_path, meta_path)
+            ):
                 continue
             key = (storage_format, shard_id, index_path)
             base = f"feature_shards/{safe_shard_id}"
@@ -272,7 +275,7 @@ def _build_low_quality_feature_shard_uploads(
         elif storage_format == NPY_MEMMAP_SHARD:
             shard_dir = str(ref.get("shard_dir") or "")
             index_path = str(ref.get("index_path") or "")
-            if not shard_dir or not index_path or not os.path.isdir(shard_dir):
+            if not shard_dir or not index_path or not os.path.isdir(fs_path(shard_dir)):
                 continue
             key = (storage_format, shard_id, shard_dir)
             base = f"feature_shards/{safe_shard_id}/{os.path.basename(shard_dir.rstrip(os.sep))}"
@@ -290,10 +293,11 @@ def _build_low_quality_feature_shard_uploads(
                     "sample_ids": [],
                 },
             )
-            for root, _dirs, files in os.walk(shard_dir):
+            walk_root = fs_path(shard_dir)
+            for root, _dirs, files in os.walk(walk_root):
                 for filename in files:
                     path = os.path.join(root, filename)
-                    relpath = os.path.relpath(path, shard_dir).replace("\\", "/")
+                    relpath = os.path.relpath(path, walk_root).replace("\\", "/")
                     add_artifact(path, f"{base}/{relpath}")
         else:
             continue
@@ -466,7 +470,7 @@ def pack_low_quality_trigger_bundle_to_file(
                 for name, payload, _sample_ids in raw_shard_payloads:
                     zf.writestr(name, payload, compress_type=zipfile.ZIP_STORED)
                 for source_path, arcname in feature_artifacts:
-                    zf.write(source_path, arcname, compress_type=zipfile.ZIP_STORED)
+                    zf.write(fs_path(source_path), arcname, compress_type=zipfile.ZIP_STORED)
                 zf.writestr(
                     "trigger_manifest.json",
                     json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
