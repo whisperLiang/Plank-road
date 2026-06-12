@@ -10,6 +10,8 @@ from pathlib import Path, PurePosixPath
 
 from loguru import logger
 
+from common.logging_sanitizer import log_diagnostic_debug
+
 
 def normalize_client_cache_path(path: str) -> str:
     if not path:
@@ -97,6 +99,7 @@ def prepare_request_workspace(
     request_kind: str,
     payload_zip: bytes | None,
     client_cache_path: str = "",
+    log_internal_ids: bool = False,
 ) -> Path:
     root = Path(workspace_root or "./cache/server_workspace").resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -109,11 +112,25 @@ def prepare_request_workspace(
         )
         reset_workspace_dir(workspace_dir)
         _safe_extract_zip_bytes(payload_zip, workspace_dir)
-        logger.info(
-            "Saved and unpacked the gRPC ZIP payload for edge_{} into workspace: {}",
-            edge_id,
-            workspace_dir,
+        logger.info("Prepared request payload: edge={} kind={}.", edge_id, request_kind)
+        log_diagnostic_debug(
+            log_internal_ids,
+            "prepared uploaded request workspace",
+            lambda: {
+                "workspace": str(workspace_dir),
+                "payload_zip_bytes": len(payload_zip or b""),
+            },
         )
         return workspace_dir
 
-    return _resolve_requested_cache_path(root, client_cache_path)
+    resolved = _resolve_requested_cache_path(root, client_cache_path)
+    logger.info("Prepared request payload: edge={} kind={}.", edge_id, request_kind)
+    log_diagnostic_debug(
+        log_internal_ids,
+        "resolved client request workspace",
+        lambda: {
+            "workspace": str(resolved),
+            "client_cache_path": client_cache_path,
+        },
+    )
+    return resolved

@@ -175,7 +175,7 @@ def test_full_image_retrain_remains_rejected_public_stub(tmp_path) -> None:
 
     assert success is False
     assert model_data == ""
-    assert "legacy full-image retrain has been removed" in message
+    assert "full-frame retrain is unavailable" in message
 
 
 def test_legacy_low_quality_bundle_manifest_is_rejected(tmp_path) -> None:
@@ -199,7 +199,7 @@ def test_legacy_low_quality_bundle_manifest_is_rejected(tmp_path) -> None:
     assert success is False
     assert model_data == ""
     assert "trigger_manifest.json" in message
-    assert "legacy bundle_manifest.json uploads are no longer supported" in message
+    assert "bundle_manifest.json uploads are not supported" in message
 
 
 def test_proxy_evaluator_formats_map_50_95_summary() -> None:

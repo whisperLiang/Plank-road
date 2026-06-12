@@ -16,6 +16,7 @@ from cloud.feature_cache.types import (
     LabelRef,
     stable_digest,
 )
+from common.logging_sanitizer import log_diagnostic_debug
 
 
 def _runtime_value(context: Mapping[str, object], key: str, default: object = "") -> object:
@@ -150,6 +151,7 @@ class FeatureCachePlanner:
         validate_refs: bool = True,
         deep_validate_feature_payload: bool = False,
         deep_validate_sample_rate: float = 0.0,
+        log_internal_ids: bool = False,
     ) -> None:
         del deep_validate_feature_payload, deep_validate_sample_rate
         self.store = store
@@ -157,6 +159,7 @@ class FeatureCachePlanner:
         if self.materialization_mode != "direct_ref":
             raise ValueError("Feature shard views only support materialization_mode='direct_ref'.")
         self.validate_refs = bool(validate_refs)
+        self.log_internal_ids = bool(log_internal_ids)
         self._shard_validator = ShardFeatureRefValidator()
 
     def _validate_feature_ref(
@@ -204,9 +207,19 @@ class FeatureCachePlanner:
         valid, reason = self._validate_feature_ref(ref, runtime_context, stats)
         if not valid:
             logger.warning(
-                "[FeatureShard][Validate] sample_id={} invalid_ref reason={}",
-                _sample_id(sample),
+                "[FeatureShard][Validate] invalid feature reference: reason={}.",
                 reason,
+            )
+            log_diagnostic_debug(
+                self,
+                "[FeatureShard][Validate] diagnostics",
+                lambda: {
+                    "sample_id": _sample_id(sample),
+                    "shard_id": ref.shard_id,
+                    "shard_path": ref.shard_path,
+                    "feature_layout_id": ref.feature_layout_id,
+                    "contract_id": ref.contract_id,
+                },
             )
             return None
         if not _label_ref_valid(sample, label_ref):

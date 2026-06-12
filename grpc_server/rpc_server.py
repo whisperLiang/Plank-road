@@ -8,12 +8,12 @@ import torch as _torch
 from loguru import logger
 
 from baselines.distributed.messages import BaselineFramePayload, json_dumps, json_loads
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED
 from grpc_server.workspace import (
     normalize_client_cache_path,
     prepare_request_workspace,
-    reset_workspace_dir,
 )
 
 # ── Resource monitoring helpers ──────────────────
@@ -66,15 +66,6 @@ def _get_gpu_utilization() -> float:
     return 0.0
 
 
-def _normalize_cache_path(path: str) -> str:
-    """Normalize cache paths from remote clients across OS-specific separators."""
-    return normalize_client_cache_path(path)
-
-
-def _reset_cache_dir(cache_path: str) -> None:
-    reset_workspace_dir(cache_path)
-
-
 class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmissionServicer):
     def __init__(
         self,
@@ -84,6 +75,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         training_job_manager=None,
         edge_registry=None,
         baseline_controller=None,
+        log_internal_ids: bool = False,
     ):
         self.id = id
         self.continual_learner = continual_learner
@@ -91,6 +83,15 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         self.training_job_manager = training_job_manager
         self.edge_registry = edge_registry
         self.baseline_controller = baseline_controller
+        self.log_internal_ids = bool(log_internal_ids)
+
+    def _log_failure(self, label: str, exc: BaseException) -> None:
+        logger.error("{} failed: {}", label, safe_error_summary(exc))
+        log_diagnostic_debug(
+            self,
+            f"{label} failure",
+            lambda error=exc: {"error": repr(error)},
+        )
 
     @staticmethod
     def _request_kind_for_job_type(job_type: int) -> str:
@@ -101,57 +102,44 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         raise ValueError(f"Unsupported training job type: {job_type!r}")
 
     def train_model_request(self, request, context):
-        """Cloud-side continual learning: label frames with the large model then
-        fine-tune the lightweight edge model and return the updated weights."""
-        cache_path = _normalize_cache_path(request.cache_path)
-        if cache_path and cache_path != request.cache_path:
-            logger.info("Normalized train cache_path from {} to {}", request.cache_path, cache_path)
-        logger.info(
-            "train_model_request from edge_id={} client_cache_path={}",
-            request.edge_id,
-            cache_path or "<uploaded-bundle>",
-        )
+        """Compatibility endpoint for retired full-frame retraining requests."""
+        logger.warning("Rejected full-frame training request: edge={}.", request.edge_id)
         if self.continual_learner is None:
             logger.error("train_model_request: continual_learner not configured")
             return message_transmission_pb2.TrainReply(
                 success=False, model_data="", message="continual_learner not configured"
             )
-        try:
-            workspace = prepare_request_workspace(
-                self.workspace_root,
-                edge_id=request.edge_id,
-                request_kind="train_model",
-                payload_zip=getattr(request, "payload_zip", b""),
-                client_cache_path=request.cache_path,
-            )
-            success, model_data, message = self.continual_learner.get_ground_truth_and_retrain(
-                request.edge_id,
-                [int(index) for index in request.frame_indices],
-                str(workspace),
-            )
-        except Exception as exc:
-            logger.exception("train_model_request error: {}", exc)
-            success, model_data, message = False, "", str(exc)
-
+        success, model_data, message = self.continual_learner.get_ground_truth_and_retrain(
+            request.edge_id,
+            [],
+            "",
+        )
         return message_transmission_pb2.TrainReply(
             success=success, model_data=model_data, message=message
         )
 
     def continual_learning_request(self, request, context):
-        cache_path = _normalize_cache_path(request.cache_path)
-        if cache_path and cache_path != request.cache_path:
-            logger.info(
-                "Normalized continual-learning cache_path from {} to {}",
-                request.cache_path,
-                cache_path,
-            )
+        cache_path = normalize_client_cache_path(request.cache_path)
         logger.info(
-            "continual_learning_request from edge_id={} client_cache_path={} "
-            "send_low_conf_features={}",
+            "Received continual-learning request: edge={} send_low_conf_features={}.",
             request.edge_id,
-            cache_path or "<uploaded-bundle>",
             request.send_low_conf_features,
         )
+        if cache_path and cache_path != request.cache_path:
+            log_diagnostic_debug(
+                self,
+                "normalized continual-learning cache path",
+                lambda: {
+                    "original_cache_path": request.cache_path,
+                    "normalized_cache_path": cache_path,
+                },
+            )
+        else:
+            log_diagnostic_debug(
+                self,
+                "continual-learning workspace hint",
+                lambda: {"cache_path": cache_path or "<uploaded-bundle>"},
+            )
         if self.continual_learner is None:
             logger.error("continual_learning_request: continual_learner not configured")
             return message_transmission_pb2.ContinualLearningReply(
@@ -167,6 +155,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 request_kind="continual_learning",
                 payload_zip=request.payload_zip,
                 client_cache_path=request.cache_path,
+                log_internal_ids=self.log_internal_ids,
             )
 
             success, model_data, message = (
@@ -176,15 +165,23 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 )
             )
             logger.info(
-                "continual_learning_request finished for edge_id={} success={} "
-                "workspace={} message={}",
+                "Continual-learning request finished: edge={} success={} reason={}.",
                 request.edge_id,
                 success,
-                workspace,
                 message,
             )
+            log_diagnostic_debug(
+                self,
+                "continual-learning request workspace",
+                lambda: {"workspace": str(workspace)},
+            )
         except Exception as exc:
-            logger.exception("continual_learning_request error: {}", exc)
+            logger.error("continual_learning_request failed: {}", safe_error_summary(exc))
+            log_diagnostic_debug(
+                self,
+                "continual_learning_request failure",
+                lambda error=exc: {"error": repr(error)},
+            )
             success, model_data, message = False, "", str(exc)
 
         return message_transmission_pb2.ContinualLearningReply(
@@ -196,14 +193,19 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
     def sync_samples(self, request, context):
         logger.info(
-            "sync_samples edge_id={} sync_type={} payload_zip={} model_id={} "
-            "model_version={} split_config_id={}",
+            "Received sample shard: edge={} model={} version={} quality={}.",
             request.edge_id,
-            request.sync_type,
-            len(getattr(request, "payload_zip", b"") or b""),
             request.model_id,
             request.model_version,
-            request.split_config_id,
+            request.sync_type,
+        )
+        log_diagnostic_debug(
+            self,
+            "sample sync request details",
+            lambda: {
+                "split_config_id": request.split_config_id,
+                "payload_zip_bytes": len(getattr(request, "payload_zip", b"") or b""),
+            },
         )
         if self.edge_registry is not None:
             self.edge_registry.touch(int(request.edge_id))
@@ -253,7 +255,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 message="sample sync completed",
             )
         except Exception as exc:
-            logger.exception("sync_samples error: {}", exc)
+            logger.error("sync_samples failed: {}", safe_error_summary(exc))
+            log_diagnostic_debug(
+                self,
+                "sync_samples failure",
+                lambda error=exc: {"error": repr(error)},
+            )
             return message_transmission_pb2.SampleSyncReply(
                 success=False,
                 message=str(exc),
@@ -329,20 +336,23 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             )
 
         queue_position = self.training_job_manager.queue_position(job.job_id)
-        message = (
-            "Training job accepted."
-            if created
-            else "Training job already exists for this request_id."
-        )
+        message = "Training job accepted." if created else "Training job already exists."
         logger.info(
-            "Accepted {} training request request_id={} job_id={} "
-            "created={} queue_position={} workspace={}",
+            "Accepted continual-learning job: edge={} type={} queue_position={} created={}.",
+            request.edge_id,
             request_kind,
-            request.request_id,
-            job.job_id,
-            created,
             queue_position,
-            workspace,
+            created,
+        )
+        log_diagnostic_debug(
+            self,
+            "accepted training request details",
+            lambda: {
+                "request_id": request.request_id,
+                "job_id": job.job_id,
+                "workspace": workspace,
+                "payload_zip_bytes": len(payload_zip or b""),
+            },
         )
         return message_transmission_pb2.SubmitTrainingJobReply(
             accepted=True,
@@ -354,10 +364,18 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
     def submit_training_job(self, request, context):
         logger.info(
-            "submit_training_job edge_id={} request_id={} job_type={}",
+            "Received training request: edge={} type={}.",
             request.edge_id,
-            request.request_id,
             request.job_type,
+        )
+        log_diagnostic_debug(
+            self,
+            "submit_training_job request details",
+            lambda: {
+                "request_id": request.request_id,
+                "cache_path": request.cache_path,
+                "payload_zip_bytes": len(getattr(request, "payload_zip", b"") or b""),
+            },
         )
 
         if self.edge_registry is not None:
@@ -368,13 +386,24 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             return not_configured
 
         try:
+            if int(request.job_type) == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
+                success, _model_data, message = self.continual_learner.get_ground_truth_and_retrain(
+                    request.edge_id,
+                    [],
+                    "",
+                )
+                return message_transmission_pb2.SubmitTrainingJobReply(
+                    accepted=bool(success),
+                    job_id="",
+                    status="",
+                    queue_position=-1,
+                    message=message,
+                )
             request_kind = self._request_kind_for_job_type(int(request.job_type))
             logger.info(
-                "Cloud gRPC received a new training request (request_id={}, job_type={}); "
-                "unpacking/processing {} bytes of ZIP payload.",
-                request.request_id,
+                "Training request queued for unpacking: edge={} type={}.",
+                request.edge_id,
                 request_kind,
-                len(getattr(request, "payload_zip", b"")),
             )
 
             return self._submit_training_job_from_workspace(
@@ -384,7 +413,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 payload_zip=getattr(request, "payload_zip", b""),
             )
         except Exception as exc:
-            logger.exception("submit_training_job error: {}", exc)
+            logger.error("submit_training_job failed: {}", safe_error_summary(exc))
+            log_diagnostic_debug(
+                self,
+                "submit_training_job failure",
+                lambda error=exc: {"error": repr(error)},
+            )
             return message_transmission_pb2.SubmitTrainingJobReply(
                 accepted=False,
                 job_id="",
@@ -472,11 +506,15 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             job_id=str(request.job_id or ""),
         )
         logger.info(
-            "cancel_training_job edge_id={} job_id={} cancelled={} message={}",
+            "Training job cancellation requested: edge={} cancelled={} reason={}.",
             request.edge_id,
-            request.job_id,
             cancelled,
             message,
+        )
+        log_diagnostic_debug(
+            self,
+            "cancel_training_job details",
+            lambda: {"job_id": request.job_id},
         )
         return message_transmission_pb2.CancelTrainingJobReply(
             cancelled=cancelled,
@@ -545,7 +583,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 message="edge registered",
             )
         except Exception as exc:
-            logger.exception("RegisterEdge failed: {}", exc)
+            self._log_failure("RegisterEdge", exc)
             return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
 
     def Heartbeat(self, request, context):
@@ -559,7 +597,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             )
             return message_transmission_pb2.BaselineAck(success=True, message="heartbeat recorded")
         except Exception as exc:
-            logger.exception("Heartbeat failed: {}", exc)
+            self._log_failure("Heartbeat", exc)
             return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
 
     def UploadFrame(self, request, context):
@@ -578,7 +616,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 message="prediction accepted",
             )
         except Exception as exc:
-            logger.exception("UploadPrediction failed: {}", exc)
+            self._log_failure("UploadPrediction", exc)
             return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
 
     def _upload_baseline_frame(self, request, *, expected_keyframe: bool | None):
@@ -596,7 +634,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 message=str(result.get("message", "frame accepted")),
             )
         except Exception as exc:
-            logger.exception("UploadFrame failed: {}", exc)
+            self._log_failure("UploadFrame", exc)
             return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
 
     def RequestCloudInference(self, request, context):
@@ -622,7 +660,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 timestamp_ms=int(result.get("timestamp_ms", 0) or 0),
             )
         except Exception as exc:
-            logger.exception("RequestCloudInference failed: {}", exc)
+            self._log_failure("RequestCloudInference", exc)
             return _baseline_inference_reply(request, success=False, message=str(exc))
 
     def PollCommand(self, request, context):
@@ -662,7 +700,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 timestamp_ms=int(result.get("timestamp_ms", 0) or 0),
             )
         except Exception as exc:
-            logger.exception("DownloadInferenceResult failed: {}", exc)
+            self._log_failure("DownloadInferenceResult", exc)
             return _baseline_inference_reply(request, success=False, message=str(exc))
 
     def RequestTraining(self, request, context):
@@ -690,7 +728,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 training_strategy=str(job["training_strategy"]),
             )
         except Exception as exc:
-            logger.exception("RequestTraining failed: {}", exc)
+            self._log_failure("RequestTraining", exc)
             return message_transmission_pb2.BaselineTrainingReply(
                 accepted=False,
                 job_id="",
@@ -723,7 +761,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 result_available=job is not None and str(job.get("status")) == "SUCCEEDED",
             )
         except Exception as exc:
-            logger.exception("PollTrainingJob failed: {}", exc)
+            self._log_failure("PollTrainingJob", exc)
             return message_transmission_pb2.BaselineTrainingStatusReply(
                 found=False,
                 job_id=request.job_id,
@@ -758,7 +796,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 model_version=str(update.get("model_version", "")) if update is not None else "",
             )
         except Exception as exc:
-            logger.exception("DownloadModelUpdate failed: {}", exc)
+            self._log_failure("DownloadModelUpdate", exc)
             return message_transmission_pb2.BaselineModelUpdateReply(
                 success=False,
                 job_id=request.job_id,

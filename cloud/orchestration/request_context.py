@@ -18,6 +18,7 @@ from cloud.orchestration.fixed_split_dependencies import (
     _stable_json_dumps,
 )
 from cloud.sample_pool import CloudSamplePool
+from common.logging_sanitizer import log_diagnostic_debug
 from model_management.split_contract import contract_path
 
 
@@ -305,8 +306,8 @@ class RequestContextMixin:
             manifest.get("model_version") or model_meta.get("model_version") or fallback or ""
         ).strip()
 
-    @staticmethod
     def _remove_reset_path_if_safe(
+        self,
         *,
         path: str,
         root: str,
@@ -318,10 +319,13 @@ class RequestContextMixin:
             return False
         if abs_path == abs_root or not abs_path.startswith(abs_root + os.sep):
             logger.warning(
-                "[FixedSplitCL][InitialReset] Skipping unsafe {} path outside {}: {}",
+                "[FixedSplitCL][InitialReset] Skipping unsafe reset target: kind={}.",
                 label,
-                abs_root,
-                abs_path,
+            )
+            log_diagnostic_debug(
+                self,
+                "[FixedSplitCL][InitialReset] unsafe reset diagnostics",
+                lambda: {"root_path": abs_root, "target_path": abs_path},
             )
             return False
         if not os.path.exists(abs_path):
@@ -432,13 +436,21 @@ class RequestContextMixin:
                 self._initial_state_reset_sessions.add(reset_key)
 
         logger.info(
-            "[FixedSplitCL][InitialReset] edge_id={} model_id={} split_config_id={} "
-            "front_version={} session_id={} cleared={}.",
+            "[FixedSplitCL][InitialReset] edge={} model={} front_version={} cleared={}.",
             edge_id,
             model_id,
-            split_config_id or "<none>",
             front_version,
-            edge_session_id or "<legacy-no-session>",
             deleted_labels,
+        )
+        log_diagnostic_debug(
+            self,
+            "[FixedSplitCL][InitialReset] diagnostics",
+            lambda: {
+                "split_config_id": split_config_id,
+                "session_id": edge_session_id,
+                "pool_front_dir": pool_front_dir,
+                "staging_model_dir": staging_model_dir,
+                "stale_contract_dir": stale_contract_dir,
+            },
         )
         return self._cloud_sample_pool_for_manifest(edge_id=edge_id, manifest=manifest)

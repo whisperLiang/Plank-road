@@ -20,6 +20,7 @@ from cloud.annotation.types import (
     TeacherAnnotationStatus,
     TeacherAnnotationSubmitResult,
 )
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 
 BatchInference = Callable[[Sequence[np.ndarray], float], Sequence[object]]
 SingleInference = Callable[[np.ndarray, float], object]
@@ -98,6 +99,7 @@ class TeacherAnnotationWorker:
         oom_retry_enabled: bool = True,
         min_worker_batch_size: int = 1,
         auto_start: bool = True,
+        log_internal_ids: bool = False,
     ) -> None:
         self.label_cache = label_cache
         self.batch_inference = batch_inference
@@ -110,6 +112,7 @@ class TeacherAnnotationWorker:
         self.oom_retry_enabled = bool(oom_retry_enabled)
         self.min_worker_batch_size = max(1, int(min_worker_batch_size))
         self.min_worker_batch_size = min(self.min_worker_batch_size, self.worker_batch_size)
+        self.log_internal_ids = bool(log_internal_ids)
 
         self._condition = threading.Condition()
         self._queue: deque[_QueueEntry] = deque()
@@ -314,14 +317,14 @@ class TeacherAnnotationWorker:
                             actual_size,
                             next_size,
                             len(chunk),
-                            exc,
+                            safe_error_summary(exc),
                         )
                         attempt_batch_size = next_size
                         continue
                     logger.warning(
                         "[TeacherAnnotation][OOMRetry] batch_size=1 still failed; "
                         "marking sample(s) failed. error={}",
-                        exc,
+                        safe_error_summary(exc),
                     )
                 self._handle_chunk_failure(chunk, exc)
             index += actual_size
@@ -387,7 +390,7 @@ class TeacherAnnotationWorker:
                 logger.warning(
                     "[TeacherAnnotation][Batch] batch inference unavailable; "
                     "falling back to per-sample inference. error={}",
-                    exc,
+                    safe_error_summary(exc),
                 )
             else:
                 return list(predictions)
@@ -458,8 +461,15 @@ class TeacherAnnotationWorker:
             self._stats["failed_count"] += 1
             self._condition.notify_all()
         logger.warning(
-            "[TeacherAnnotation][Worker] failed sample_id={} cache_key={} error={}",
-            request.sample_id,
-            cache_key,
-            error,
+            "[TeacherAnnotation][Worker] annotation failed: reason={}.",
+            safe_error_summary(error),
+        )
+        log_diagnostic_debug(
+            self,
+            "[TeacherAnnotation][Worker] failure diagnostics",
+            lambda: {
+                "sample_id": request.sample_id,
+                "cache_key": cache_key,
+                "error": error,
+            },
         )

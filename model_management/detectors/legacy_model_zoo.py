@@ -77,6 +77,7 @@ from torchvision.ops import batched_nms
 # ---------------------------------------------------------------------------
 from transformers import DetrConfig, DetrForObjectDetection, DetrImageProcessor
 
+from common.logging_sanitizer import safe_error_summary
 from model_management.model_info import model_lib
 from model_management.tinynext import build_tinynext_detector
 from model_management.ultralytics_parity import (
@@ -894,8 +895,7 @@ def _download_http_file_with_resume(
 
             if not _matches_md5(tmp_path, expected_md5):
                 logger.warning(
-                    "Downloaded file {} failed MD5 validation on attempt {}/{}.",
-                    tmp_path,
+                    "Downloaded model artifact failed MD5 validation on attempt {}/{}.",
                     attempt,
                     max_attempts,
                 )
@@ -910,7 +910,7 @@ def _download_http_file_with_resume(
                 attempt,
                 max_attempts,
                 destination.name,
-                exc,
+                safe_error_summary(exc),
             )
             if attempt == max_attempts:
                 break
@@ -926,10 +926,10 @@ def _ensure_torchvision_artifact(name: str) -> Path:
     if artifact_path.is_file() and _matches_expected_hash(artifact_path, hash_prefix):
         return artifact_path
     if artifact_path.exists():
-        logger.warning("Existing weights {} failed validation; redownloading.", artifact_path)
+        logger.warning("Existing {} weights failed validation; redownloading.", name_lower)
         artifact_path.unlink()
     weights_enum = _TORCHVISION_WEIGHT_DEFAULTS[name_lower]
-    logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+    logger.info("Downloading {} weights.", name_lower)
     return _download_file(weights_enum.url, artifact_path, hash_prefix=hash_prefix)
 
 
@@ -950,7 +950,7 @@ def _ensure_detr_artifact(name: str) -> Path:
     if _has_hf_snapshot(artifact_path):
         return artifact_path
     artifact_path.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+    logger.info("Downloading {} weights.", name_lower)
     snapshot_download(
         repo_id=_DETR_MODELS[name_lower],
         local_dir=artifact_path,
@@ -966,7 +966,7 @@ def _ensure_ultralytics_artifact(name: str) -> Path:
     if artifact_path.is_file():
         return artifact_path
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+    logger.info("Downloading {} weights.", name_lower)
     from ultralytics.utils.downloads import attempt_download_asset
 
     # Let Ultralytics choose the correct release tag for newer families such as
@@ -991,20 +991,17 @@ def _ensure_tinynext_artifact(name: str) -> Path:
             if _tinynext_checkpoint_has_detector_weights(artifact_path):
                 return artifact_path
             logger.info(
-                "Replacing TinyNeXt backbone-only weights at {} with detector checkpoint {}.",
-                artifact_path,
-                repo_filename,
+                "Replacing {} backbone-only weights with detector checkpoint.",
+                name_lower,
             )
         except Exception as exc:
             logger.warning(
-                "Failed to inspect TinyNeXt artifact {} ({}); refreshing from "
-                "detector checkpoint {}.",
-                artifact_path,
-                exc,
-                repo_filename,
+                "Failed to inspect {} weights; refreshing detector checkpoint: {}.",
+                name_lower,
+                safe_error_summary(exc),
             )
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading {} detector weights to {}", name_lower, artifact_path)
+    logger.info("Downloading {} detector weights.", name_lower)
     downloaded = hf_hub_download(
         repo_id="yuffeenn/TinyNeXt",
         filename=repo_filename,
@@ -1407,19 +1404,17 @@ def _maybe_infer_ultralytics_num_classes(
         )
     except Exception as exc:
         logger.warning(
-            "[ModelZoo] Failed to inspect {} weights at {}: {}",
+            "[ModelZoo] Failed to inspect {} weights: {}",
             model_label,
-            artifact_path,
-            exc,
+            safe_error_summary(exc),
         )
         return int(current_num_classes)
     if inferred_class_count is None or inferred_class_count == 80:
         return int(current_num_classes)
     logger.info(
-        "[ModelZoo] Inferred {} {} class(es) from weights at {}; using native zero-based labels.",
+        "[ModelZoo] Inferred {} {} class(es); using native zero-based labels.",
         inferred_class_count,
         model_label,
-        artifact_path,
     )
     return int(inferred_class_count)
 
@@ -1551,20 +1546,20 @@ def _ensure_rfdetr_artifact(name: str) -> Path:
             )
             class_count = _rfdetr_checkpoint_class_count(state)
             logger.info(
-                "Reusing readable RF-DETR weights at {} despite MD5 mismatch{}.",
-                artifact_path,
+                "Reusing readable {} weights despite MD5 mismatch{}.",
+                name_lower,
                 (f" (class head logits={class_count})" if class_count is not None else ""),
             )
             return artifact_path
         except Exception as exc:
             logger.warning(
-                "Existing RF-DETR weights {} are unreadable ({}); re-downloading.",
-                artifact_path,
-                exc,
+                "Existing {} weights are unreadable; re-downloading: {}.",
+                name_lower,
+                safe_error_summary(exc),
             )
             artifact_path.unlink(missing_ok=True)
 
-    logger.info("Downloading {} weights to {}", name_lower, artifact_path)
+    logger.info("Downloading {} weights.", name_lower)
     _download_http_file_with_resume(
         asset.url,
         artifact_path,
@@ -1654,7 +1649,7 @@ def build_detection_model(
         if artifact_path is not None and artifact_path.is_file():
             state = torch.load(artifact_path, map_location=device, weights_only=False)
             model.load_state_dict(state, strict=False)
-            logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
+            logger.info("[ModelZoo] Loaded weights for {}.", name)
 
         model.to(device)
         model.eval()
@@ -1678,7 +1673,7 @@ def build_detection_model(
             device=device,
             num_classes=num_classes,
         )
-        logger.info("[ModelZoo] Built YOLO model: {} ({})", name, model_source)
+        logger.info("[ModelZoo] Built YOLO model: {}.", name)
         return model
 
     # ── 3. DETR (HuggingFace) ──
@@ -1694,7 +1689,7 @@ def build_detection_model(
             num_classes=num_classes,
             pretrained=pretrained,
         )
-        logger.info("[ModelZoo] Built DETR model: {} ({})", name, model_source)
+        logger.info("[ModelZoo] Built DETR model: {}.", name)
         return model
 
     # ── 4. RT-DETR (ultralytics) ──
@@ -1710,10 +1705,9 @@ def build_detection_model(
             inferred_class_count = _rfdetr_checkpoint_class_count(rfdetr_state)
             if inferred_class_count is not None and inferred_class_count != int(num_classes):
                 logger.info(
-                    "[ModelZoo] Inferred {} RF-DETR logits from weights at {}; "
-                    "building {} with {} foreground class(es).",
+                    "[ModelZoo] Inferred {} RF-DETR logits; building {} with {} "
+                    "foreground class(es).",
                     inferred_class_count,
-                    artifact_path,
                     name,
                     max(1, inferred_class_count - 1),
                 )
@@ -1740,7 +1734,7 @@ def build_detection_model(
                 artifact_path=artifact_path,
             )
             model.load_state_dict(state, strict=False)
-            logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
+            logger.info("[ModelZoo] Loaded weights for {}.", name)
         logger.info("[ModelZoo] Built RF-DETR model: {}", name)
         return model
 
@@ -1769,19 +1763,16 @@ def build_detection_model(
                     tinynext_label_schema = "zero_based"
                     logger.info(
                         "[ModelZoo] Inferred {} TinyNeXt MMDetection class logits "
-                        "from custom weights at {}; "
                         "building native zero-based TinyNeXt detector.",
                         inferred_class_count,
-                        artifact_path,
                     )
             elif is_internal_tinynext:
                 if inferred_class_count is not None and inferred_class_count != int(num_classes):
                     num_classes = inferred_class_count
                     logger.info(
-                        "[ModelZoo] Inferred {} TinyNeXt SSD class logits from weights at {}; "
-                        "building matching detector head.",
+                        "[ModelZoo] Inferred {} TinyNeXt SSD class logits; building "
+                        "matching detector head.",
                         inferred_class_count,
-                        artifact_path,
                     )
                 tinynext_label_schema = "coco_91" if int(num_classes) >= 91 else "zero_based"
             else:
@@ -1804,7 +1795,7 @@ def build_detection_model(
                     label_schema=tinynext_label_schema,
                 )
             model.load_state_dict(checkpoint_state_dict, strict=False)
-            logger.info("[ModelZoo] Loaded weights from {}", artifact_path)
+            logger.info("[ModelZoo] Loaded weights for {}.", name)
         model.eval()
         logger.info("[ModelZoo] Built TinyNeXt detector: {}", name)
         return model
@@ -1825,7 +1816,7 @@ def build_detection_model(
             device=device,
             num_classes=num_classes,
         )
-        logger.info("[ModelZoo] Built RT-DETR model: {} ({})", name, pt_name)
+        logger.info("[ModelZoo] Built RT-DETR model: {}.", name)
         return model
 
     # ── 5. Fallback: try torchvision eval ──

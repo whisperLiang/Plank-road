@@ -14,6 +14,7 @@ from cloud.annotation.types import (
     TeacherAnnotationStatus,
     TeacherAnnotationSubmitResult,
 )
+from common.logging_sanitizer import log_diagnostic_debug
 
 
 class TeacherAnnotationService:
@@ -22,9 +23,11 @@ class TeacherAnnotationService:
         *,
         label_cache: TeacherLabelCache,
         worker: TeacherAnnotationWorker | None = None,
+        log_internal_ids: bool = False,
     ) -> None:
         self.label_cache = label_cache
         self.worker = worker
+        self.log_internal_ids = bool(log_internal_ids)
 
     def lookup_many(
         self,
@@ -239,8 +242,12 @@ class TeacherAnnotationService:
         )
         if ensure_result.unresolved_count:
             logger.warning(
-                "[TeacherAnnotation][Ensure] unresolved_count={} sample_ids_preview={}",
+                "[TeacherAnnotation][Ensure] unresolved_count={}.",
                 ensure_result.unresolved_count,
-                ensure_result.unresolved_sample_ids[:10],
+            )
+            log_diagnostic_debug(
+                self,
+                "[TeacherAnnotation][Ensure] unresolved diagnostics",
+                lambda: {"sample_ids_preview": ensure_result.unresolved_sample_ids[:10]},
             )
         return ensure_result

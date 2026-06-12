@@ -16,6 +16,7 @@ from cloud.contracts import (
     validate_low_quality_manifest,
 )
 from cloud.feature_cache import FeatureShardRef, FeatureShardStore
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 
 
 def read_json_file(path: str) -> dict[str, object]:
@@ -140,8 +141,16 @@ def materialize_low_quality_trigger_bundle(
         except Exception as exc:
             logger.warning(
                 "[ShardCL][CloudUnpack] uploaded low-quality feature shard import failed; "
-                "raw samples will be rebuilt where available: {}",
-                exc,
+                "raw samples will be rebuilt where available: {}.",
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                feature_store,
+                "[ShardCL][CloudUnpack] feature shard import diagnostics",
+                lambda error=exc: {
+                    "bundle_path": bundle_cache_path,
+                    "error": repr(error),
+                },
             )
     if feature_refs_by_sample_id:
         for sample in samples:
@@ -261,7 +270,19 @@ def load_high_quality_shard_candidates(
             ],
         )
     except Exception as exc:
-        logger.warning("[FeatureShard][Register] high-quality upload failed: {}", exc)
+        logger.warning(
+            "[FeatureShard][Register] high-quality upload failed: {}.",
+            safe_error_summary(exc),
+        )
+        log_diagnostic_debug(
+            feature_store,
+            "[FeatureShard][Register] upload diagnostics",
+            lambda error=exc: {
+                "bundle_path": bundle_cache_path,
+                "request_id": manifest.get("request_id"),
+                "error": repr(error),
+            },
+        )
         return [], [str(manifest.get("request_id") or "uploaded_feature_shards")]
     for registered_entry in registered:
         sample_key = str(registered_entry.get("sample_id") or "")

@@ -19,6 +19,7 @@ from cloud.feature_cache.types import (
     SampleTrainingRef,
     TrainingCacheView,
 )
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from model_management.payload import BoundaryPayload
 from model_management.split_runtime.boundary_cache import BOUNDARY_CACHE_PROTOCOL
 
@@ -159,6 +160,7 @@ class FeatureCacheMaterializer:
         rebuild_provider: RebuildProvider | None = None,
         deep_validate_feature_payload: bool = False,
         deep_validate_sample_rate: float = 0.0,
+        log_internal_ids: bool = False,
     ) -> None:
         del deep_validate_feature_payload, deep_validate_sample_rate
         self.store = store
@@ -168,6 +170,7 @@ class FeatureCacheMaterializer:
             raise ValueError("Feature shard views only support materialization_mode='direct_ref'.")
         self.feature_rebuild_batch_size = max(1, int(feature_rebuild_batch_size or 16))
         self.dynamic_batch_range = dynamic_batch_range
+        self.log_internal_ids = bool(log_internal_ids)
         self.rebuild_provider = rebuild_provider
         os.makedirs(self.view_root_dir, exist_ok=True)
 
@@ -232,7 +235,16 @@ class FeatureCacheMaterializer:
                     sample_id = str(samples[0].get("sample_id") or "")
                     stats.rebuild_failures += 1
                     logger.warning(
-                        "[FeatureShard][Build] sample_id={} failed error={}", sample_id, exc
+                        "[FeatureShard][Build] sample rebuild failed: reason={}.",
+                        safe_error_summary(exc),
+                    )
+                    log_diagnostic_debug(
+                        self,
+                        "[FeatureShard][Build] failure diagnostics",
+                        lambda error=exc: {
+                            "sample_id": sample_id,
+                            "error": repr(error),
+                        },
                     )
                     offset += 1
                     continue
@@ -514,22 +526,18 @@ class FeatureCacheMaterializer:
         stats.metadata_index_time += time.perf_counter() - metadata_started
         stats.total_prepare_time = base_prepare_time + (time.perf_counter() - write_started)
         logger.info(
-            "[FeatureCache][View] view_id={} generation={} samples={} "
-            "feature_layout_id={} contract_id={} mode=shard_ref "
-            "manifest_write_time={:.3f}s metadata_index_time={:.3f}s",
-            view_id,
+            "[FeatureCache][View] generation={} samples={} storage=shard_ref "
+            "manifest_time={:.3f}s metadata_time={:.3f}s.",
             generation,
             len(sample_refs),
-            feature_layout_id,
-            contract_id,
             stats.manifest_write_time,
             stats.metadata_index_time,
         )
         logger.info(
-            "[FeatureCache][Materialize] view_id={} direct_refs={} rebuilt={} "
-            "files_copied={} bytes_copied={} rebuild_time={:.3f}s "
-            "manifest_write_time={:.3f}s total_prepare_time={:.3f}s",
-            view_id,
+            "[FeatureCache][Materialize] samples={} direct_refs={} rebuilt={} "
+            "copied={} bytes_copied={} rebuild_time={:.3f}s "
+            "manifest_time={:.3f}s total={:.3f}s.",
+            len(sample_refs),
             stats.direct_refs_created,
             stats.low_quality_rebuilt,
             stats.files_copied,
@@ -537,6 +545,18 @@ class FeatureCacheMaterializer:
             stats.rebuild_time,
             stats.manifest_write_time,
             stats.total_prepare_time,
+        )
+        log_diagnostic_debug(
+            self,
+            "[FeatureCache][View] diagnostics",
+            lambda: {
+                "view_id": view_id,
+                "feature_layout_id": feature_layout_id,
+                "contract_id": contract_id,
+                "feature_abi_id": view_contract["feature_abi_id"],
+                "manifest_path": manifest_path,
+                "metadata_index_path": metadata_index_path,
+            },
         )
         result_plan = FeatureCachePreparePlan(
             view_id=view_id,

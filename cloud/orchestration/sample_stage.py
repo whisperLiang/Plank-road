@@ -29,6 +29,7 @@ from cloud.training.proxy_metadata import (
 from cloud.training.proxy_metadata import (
     runtime_input_tensor_shape_from_metadata as _runtime_input_tensor_shape_from_metadata,
 )
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from grpc_server.workspace import prepare_request_workspace
 from model_management.payload import BoundaryPayload
 from model_management.split_contract import SplitRuntimeContract
@@ -125,9 +126,13 @@ class SampleStageMixin:
                     feature_ref = FeatureShardRef.from_dict(feature_ref)
                 else:
                     logger.warning(
-                        "[FeatureCache][Rebuild] low-quality sample_id={} has no "
-                        "feature_ref after readiness planning; skipping staging.",
-                        sample_id,
+                        "[FeatureCache][Rebuild] low-quality sample has no rebuilt "
+                        "feature reference after readiness planning; skipping staging."
+                    )
+                    log_diagnostic_debug(
+                        self,
+                        "low-quality staging candidate missing feature reference",
+                        lambda: {"sample_id": sample_id},
                     )
                     continue
             original_size = _original_image_size_from_metadata(record)
@@ -240,6 +245,7 @@ class SampleStageMixin:
                     self.feature_cache_deep_validate_feature_payload
                 ),
                 deep_validate_sample_rate=float(self.feature_cache_deep_validate_sample_rate),
+                log_internal_ids=bool(getattr(self, "log_internal_ids", False)),
             )
         )
 
@@ -303,15 +309,16 @@ class SampleStageMixin:
         validation_stats = dict(rebuild_stats.get("validation", {}) or {})
         selection_stats = dict(rebuild_stats.get("selection", {}) or {})
         commit_stats = dict(rebuild_stats.get("generation_commit", {}) or {})
+        skipped_total = (
+            int(validation_stats.get("skipped_stale_contract", 0) or 0)
+            + int(validation_stats.get("skipped_feature_layout", 0) or 0)
+            + int(validation_stats.get("skipped_label_metadata", 0) or 0)
+            + int(validation_stats.get("skipped_unreadable", 0) or 0)
+        )
         logger.info(
-            "[SamplePool] canonical rebuild summary: "
-            "existing_active={} pending_high_quality={} new_low_quality={} "
-            "active={} kept={} accepted_high_quality={} accepted_low_quality={} "
-            "rebound_existing_active={} deferred_feature_layout={} "
-            "skipped_stale_contract={} skipped_feature_layout={} "
-            "skipped_label_metadata={} skipped_unreadable={} "
-            "contract_id={} feature_layout_id={} feature_abi_id={} "
-            "low_quality_staging_accepted={} low_quality_candidates={}.",
+            "[SamplePool] canonical rebuild: existing={} pending_hq={} new_lq={} "
+            "active={} kept={} accepted_hq={} accepted_lq={} rebound={} "
+            "deferred={} skipped={} staging_lq={} candidates_lq={}.",
             len(existing_active),
             len(pending_high_quality),
             len(staging_low_quality),
@@ -321,32 +328,40 @@ class SampleStageMixin:
             validation_stats.get("accepted_low_quality", 0),
             validation_stats.get("rebound_existing_active", 0),
             validation_stats.get("deferred_feature_layout", 0),
-            validation_stats.get("skipped_stale_contract", 0),
-            validation_stats.get("skipped_feature_layout", 0),
-            validation_stats.get("skipped_label_metadata", 0),
-            validation_stats.get("skipped_unreadable", 0),
-            split_contract.contract_id,
-            split_contract.feature_layout_id,
-            split_contract.feature_abi_id,
+            skipped_total,
             staging_stats.get("accepted_to_staging", 0),
             int(low_quality_candidate_count),
         )
+        log_diagnostic_debug(
+            self,
+            "[SamplePool] canonical rebuild diagnostics",
+            lambda: {
+                "contract_id": split_contract.contract_id,
+                "feature_layout_id": split_contract.feature_layout_id,
+                "feature_abi_id": split_contract.feature_abi_id,
+                "validation": validation_stats,
+            },
+        )
         deferred_preview = validation_stats.get("deferred_feature_layout_preview")
         if deferred_preview:
-            logger.debug(
-                "[SamplePool] deferred pending high-quality feature-only samples "
-                "kept out of training due to runtime layout mismatch: preview={}",
-                self._preview_ids(list(deferred_preview), limit=5),
+            log_diagnostic_debug(
+                self,
+                "[SamplePool] deferred feature-layout preview",
+                lambda: {"sample_ids": self._preview_ids(list(deferred_preview), limit=5)},
             )
-        logger.debug(
-            "[SamplePool] canonical rebuild detail: selection={} shard_validation={} "
-            "shard_carry_forward={} shard_high_quality={} shard_cleanup={} staging={}.",
-            selection_stats,
-            dict(rebuild_stats.get("shard_validation", {}) or {}),
-            dict(rebuild_stats.get("shard_carry_forward", {}) or {}),
-            dict(rebuild_stats.get("shard_high_quality", {}) or {}),
-            dict(rebuild_stats.get("shard_cleanup", {}) or {}),
-            dict(staging_stats or {}),
+        log_diagnostic_debug(
+            self,
+            "[SamplePool] canonical rebuild detail",
+            lambda: {
+                "selection": selection_stats,
+                "shard_validation": dict(rebuild_stats.get("shard_validation", {}) or {}),
+                "shard_carry_forward": dict(
+                    rebuild_stats.get("shard_carry_forward", {}) or {}
+                ),
+                "shard_high_quality": dict(rebuild_stats.get("shard_high_quality", {}) or {}),
+                "shard_cleanup": dict(rebuild_stats.get("shard_cleanup", {}) or {}),
+                "staging": dict(staging_stats or {}),
+            },
         )
 
     def sync_samples(
@@ -376,6 +391,7 @@ class SampleStageMixin:
                 request_kind="sample_sync",
                 payload_zip=bytes(payload_zip or b""),
                 client_cache_path="",
+                log_internal_ids=bool(getattr(self, "log_internal_ids", False)),
             )
             bundle_cache_path = str(workspace)
             manifest = _read_json_file(os.path.join(bundle_cache_path, "bundle_manifest.json"))
@@ -431,15 +447,32 @@ class SampleStageMixin:
                 stage_stats["skipped_unreadable"] = int(
                     stage_stats.get("skipped_unreadable", 0)
                 ) + len(unreadable_ids)
-                stage_stats["skipped_unreadable_preview"] = self._preview_ids(unreadable_ids)
             logger.info(
-                "[ShardCL][SamplePoolCommit] {} edge_id={} pending_dir={} stats={}",
-                message,
+                "[ShardCL][SamplePoolCommit] high_quality staged: edge={} accepted={} "
+                "skipped_unreadable={}.",
                 edge_id,
-                sample_pool.pending_high_quality_dir,
-                stage_stats,
+                accepted,
+                int(stage_stats.get("skipped_unreadable", 0) or 0),
+            )
+            log_diagnostic_debug(
+                self,
+                "[ShardCL][SamplePoolCommit] diagnostics",
+                lambda: {
+                    "pending_dir": sample_pool.pending_high_quality_dir,
+                    "stats": stage_stats,
+                    "skipped_unreadable_preview": self._preview_ids(unreadable_ids),
+                },
             )
             return True, message, accepted
         except Exception as exc:
-            logger.exception("[FixedSplitCL] Sample sync failed for edge {}: {}", edge_id, exc)
+            logger.error(
+                "[FixedSplitCL] Sample sync failed: edge={} reason={}.",
+                edge_id,
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "[FixedSplitCL] sample sync failure",
+                lambda error=exc: {"error": repr(error)},
+            )
             return False, str(exc), 0

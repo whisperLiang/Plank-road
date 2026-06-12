@@ -43,6 +43,11 @@ from cloud.orchestration.runtime_stage import (
 from cloud.orchestration.runtime_stage import (
     fixed_split_validation_batches as _fixed_split_validation_batches,
 )
+from common.logging_sanitizer import (
+    log_diagnostic_debug,
+    safe_error_summary,
+    should_log_runtime_diagnostics,
+)
 from model_management.fixed_split_runtime_template import (
     FixedSplitRuntimeTemplate,
     FixedSplitRuntimeTemplateKey,
@@ -456,7 +461,7 @@ class FixedSplitRuntimeTemplateMixin:
         )
 
     def _fixed_split_runtime_diagnostics_enabled(self) -> bool:
-        return bool(getattr(self, "fixed_split_runtime_diagnostics", False))
+        return should_log_runtime_diagnostics(self)
 
     def _fixed_split_runtime_smoke_validate_enabled(self) -> bool:
         return bool(getattr(self, "fixed_split_runtime_smoke_validate", False))
@@ -599,11 +604,11 @@ class FixedSplitRuntimeTemplateMixin:
             if index + 1 < len(modes):
                 logger.warning(
                     "[FixedSplitCL] TorchLens {} runtime failed replay validation "
-                    "(model_name={}, split_id={}, error={}); retrying with {}.",
+                    "(model={}, split={}, reason={}); retrying with {}.",
                     mode,
                     model_name,
                     getattr(runtime, "split_id", None),
-                    error,
+                    safe_error_summary(error),
                     modes[index + 1],
                 )
 
@@ -846,11 +851,16 @@ class FixedSplitRuntimeTemplateMixin:
                 )
             logger.info(
                 "[FixedSplitCL] Edge/cloud feature layout differs; rebuilding "
-                "low-quality trigger features from raw frames with the cloud runtime. "
-                "model_name={} boundary={} compatibility={}",
+                "low-quality trigger features from raw frames with the cloud runtime: "
+                "model={} split={}.",
                 model_name,
                 boundary,
-                compatibility,
+            )
+            log_diagnostic_debug(
+                self,
+                "[FixedSplitCL] feature layout mismatch diagnostics",
+                lambda: {"compatibility": compatibility},
+                runtime=True,
             )
             manifest["_cloud_rebuild_features_for_runtime_contract_mismatch"] = True
         if trace_model is split_model:

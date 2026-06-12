@@ -7,6 +7,7 @@ import cv2
 from loguru import logger
 
 from baselines.distributed.edge_runtime import BaselineEdgeRuntime
+from common.logging_sanitizer import log_diagnostic_debug, summarize_path
 from config import load_runtime_config
 from config.baseline import validate_baseline_method
 from edge.box_motion import compensate_boxes_between_frames
@@ -222,12 +223,21 @@ def _resolve_baseline_run_id(baseline_method: str, run_id: str | None) -> str | 
 def _log_startup_config(config) -> None:
     logger.info(
         "edge client effective startup config: edge_id={}, server_ip={}, "
-        "cache_path={}, video_source={}, split_learning={}",
+        "model={}, video_source={}, split_learning={}",
         config.edge_id,
         config.server_ip,
-        config.retrain.cache_path,
-        _effective_video_source(config),
+        config.lightweight,
+        summarize_path(_effective_video_source(config)),
         _split_learning_status(config),
+    )
+    log_diagnostic_debug(
+        config,
+        "edge client startup paths",
+        lambda: {
+            "cache_path": config.retrain.cache_path,
+            "video_path": _effective_video_source(config),
+            "weights_path": getattr(config, "weights_path", None),
+        },
     )
 
 
@@ -312,7 +322,12 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
                         task.end_time = time.time()
                         task.state = TASK_STATE.TIMEOUT
                         task.result_source = "timeout"
-                        logger.warning("Inference timeout for frame {}", index)
+                        logger.warning("[EdgeVideo] inference timeout.")
+                        log_diagnostic_debug(
+                            config,
+                            "[EdgeVideo] inference timeout diagnostics",
+                            lambda: {"frame_id": index},
+                        )
 
                     detection_boxes, detection_class, detection_score = task.get_result()
                     latency_ms = None
@@ -400,7 +415,12 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
                         logger.info("Video display stopped by user.")
                         break
 
-    logger.info("Saved local inference results to {}", result_path)
+    logger.info("Saved local inference results: records_file={}.", result_path.name)
+    log_diagnostic_debug(
+        config,
+        "edge inference result path",
+        lambda: {"result_path": str(result_path)},
+    )
 
 
 if __name__ == "__main__":
@@ -503,14 +523,21 @@ if __name__ == "__main__":
         )
         logger.info(
             "baseline edge effective startup config: run_id={}, baseline_method={}, "
-            "edge_id={}, server_ip={}, cache_path={}, video_source={}, split_learning={}",
+            "edge_id={}, server_ip={}, video_source={}, split_learning={}",
             runtime_config.baseline.run_id or "<auto-local>",
             baseline_method,
             config.edge_id,
             config.server_ip,
-            config.retrain.cache_path,
-            _effective_video_source(config),
+            summarize_path(_effective_video_source(config)),
             _split_learning_status(config),
+        )
+        log_diagnostic_debug(
+            config,
+            "baseline edge startup paths",
+            lambda: {
+                "cache_path": config.retrain.cache_path,
+                "video_path": _effective_video_source(config),
+            },
         )
         runtime = BaselineEdgeRuntime(
             config=config,

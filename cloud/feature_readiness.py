@@ -18,6 +18,7 @@ from cloud.sample_pool import CloudSamplePool
 from cloud.training.proxy_metadata import (
     is_low_quality_trigger_sample as _is_low_quality_trigger_sample,
 )
+from common.logging_sanitizer import log_diagnostic_debug
 from model_management.split_contract import SplitRuntimeContract
 
 
@@ -44,6 +45,7 @@ class FeatureReadinessConfig:
     validate_refs: bool
     deep_validate_feature_payload: bool
     deep_validate_sample_rate: float
+    log_internal_ids: bool = False
 
 
 class FeatureReadinessService:
@@ -62,6 +64,7 @@ class FeatureReadinessService:
             payload_cache_max_cpu_bytes=cfg.payload_cache_max_cpu_bytes,
             pin_memory=cfg.pin_memory,
             non_blocking_transfer=cfg.non_blocking_transfer,
+            log_internal_ids=cfg.log_internal_ids,
         )
 
     def materializer(
@@ -79,6 +82,7 @@ class FeatureReadinessService:
             rebuild_provider=rebuild_provider,
             deep_validate_feature_payload=cfg.deep_validate_feature_payload,
             deep_validate_sample_rate=cfg.deep_validate_sample_rate,
+            log_internal_ids=cfg.log_internal_ids,
         )
 
     def runtime_context(
@@ -136,10 +140,13 @@ class FeatureReadinessService:
                 continue
             if not os.path.exists(raw_path):
                 logger.warning(
-                    "[FeatureCache][Plan] low-quality sample_id={} "
-                    "missing raw_path={} and cannot be rebuilt.",
-                    sample_id,
-                    raw_path,
+                    "[FeatureCache][Plan] low-quality sample cannot be rebuilt: "
+                    "reason=missing_raw_image."
+                )
+                log_diagnostic_debug(
+                    self.config,
+                    "[FeatureCache][Plan] missing raw image diagnostics",
+                    lambda: {"sample_id": sample_id, "raw_path": raw_path},
                 )
                 unresolved.append({**dict(sample), "sample_id": sample_id, "raw_path": raw_path})
                 continue
@@ -212,6 +219,7 @@ class FeatureReadinessService:
             validate_refs=cfg.validate_refs,
             deep_validate_feature_payload=cfg.deep_validate_feature_payload,
             deep_validate_sample_rate=cfg.deep_validate_sample_rate,
+            log_internal_ids=cfg.log_internal_ids,
         )
         plan = planner.build_plan(
             resolved_low_quality_samples=resolved_lq,
@@ -255,6 +263,7 @@ class FeatureReadinessService:
             validate_refs=cfg.validate_refs,
             deep_validate_feature_payload=cfg.deep_validate_feature_payload,
             deep_validate_sample_rate=cfg.deep_validate_sample_rate,
+            log_internal_ids=cfg.log_internal_ids,
         )
         plan = planner.build_plan(
             existing_active_samples=active_samples,
@@ -271,9 +280,14 @@ class FeatureReadinessService:
                 for item in plan.drop_invalid_samples[:10]
                 if isinstance(item, Mapping)
             ]
+            log_diagnostic_debug(
+                self.config,
+                "[FeatureCache][CanonicalActive] dropped sample diagnostics",
+                lambda: {"sample_ids_preview": dropped_ids},
+            )
             raise RuntimeError(
                 "Canonical active samples could not all be direct-referenced into "
-                f"the training view: dropped_preview={dropped_ids}."
+                f"the training view: dropped={len(plan.drop_invalid_samples)}."
             )
         result = self.materializer(store).prepare(plan)
         if result.view is None:
@@ -281,9 +295,17 @@ class FeatureReadinessService:
         active_ids = {str(sample.get("sample_id") or "") for sample in active_samples}
         view_ids = {sample.sample_id for sample in result.view.samples}
         if active_ids != view_ids:
+            log_diagnostic_debug(
+                self.config,
+                "[FeatureCache][CanonicalActive] mismatch diagnostics",
+                lambda: {
+                    "missing_from_view": sorted(active_ids - view_ids),
+                    "unexpected_in_view": sorted(view_ids - active_ids),
+                },
+            )
             raise RuntimeError(
                 "TrainingCacheView(source=canonical_active) sample mismatch: "
-                f"active={sorted(active_ids)} view={sorted(view_ids)}."
+                f"active={len(active_ids)} view={len(view_ids)}."
             )
         if int(result.stats.files_copied) != 0 or int(result.stats.bytes_copied) != 0:
             raise RuntimeError(
@@ -292,11 +314,14 @@ class FeatureReadinessService:
                 f"bytes_copied={result.stats.bytes_copied}."
             )
         logger.info(
-            "[FeatureCache][CanonicalActive] generation={} active={} view_id={} "
-            "source=canonical_active",
+            "[FeatureCache][CanonicalActive] generation={} active={} source=canonical_active.",
             generation_id,
             len(active_ids),
-            view_id,
+        )
+        log_diagnostic_debug(
+            self.config,
+            "[FeatureCache][CanonicalActive] diagnostics",
+            lambda: {"view_id": view_id},
         )
         gt_annotations = {
             sample.sample_id: pool_annotations_from_labels(sample.label_ref.labels or {})

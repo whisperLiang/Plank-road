@@ -137,6 +137,11 @@ class SplitLearningConfig(ConfigSection):
 
 
 @dataclass
+class ClientContinualLearningConfig(ConfigSection):
+    log_internal_ids: bool = False
+
+
+@dataclass
 class TeacherAnnotationConfig(ConfigSection):
     async_enabled: bool = True
     cache_enabled: bool = True
@@ -189,6 +194,7 @@ class ContinualLearningConfig(ConfigSection):
     batch_size: int = 2
     fixed_split_runtime_smoke_validate: bool = False
     fixed_split_runtime_diagnostics: bool = False
+    log_internal_ids: bool = False
     feature_cache_mode: str = "auto"
     teacher_batch_size: int | None = None
     teacher_annotation_threshold: float = 0.5
@@ -311,6 +317,9 @@ class ClientConfig(ConfigSection):
     feature_upload: FeatureUploadConfig = field(default_factory=FeatureUploadConfig)
     split_learning: SplitLearningConfig = field(default_factory=SplitLearningConfig)
     sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
+    continual_learning: ClientContinualLearningConfig = field(
+        default_factory=ClientContinualLearningConfig
+    )
 
 
 @dataclass
@@ -378,6 +387,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         )
     elif section_cls is ClientConfig:
         known["sample_pool"] = _section(SamplePoolConfig, known.get("sample_pool"))
+        known["continual_learning"] = _section(
+            ClientContinualLearningConfig,
+            known.get("continual_learning"),
+        )
         known["source"] = _section(SourceConfig, known.get("source"))
         known["retrain"] = _section(RetrainConfig, known.get("retrain"))
         known["sample_quality"] = _section(
@@ -581,6 +594,16 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "client.feature_upload.include_meta_json must be a boolean, "
             f"got {feature_upload.include_meta_json!r}"
+        )
+    if not isinstance(config.client.continual_learning.log_internal_ids, bool):
+        raise ValueError(
+            "client.continual_learning.log_internal_ids must be a boolean, "
+            f"got {config.client.continual_learning.log_internal_ids!r}"
+        )
+    if not isinstance(config.server.continual_learning.log_internal_ids, bool):
+        raise ValueError(
+            "server.continual_learning.log_internal_ids must be a boolean, "
+            f"got {config.server.continual_learning.log_internal_ids!r}"
         )
     _validate_positive("client.interval", int(config.client.interval))
     _validate_positive("client.local_queue_maxsize", int(config.client.local_queue_maxsize))

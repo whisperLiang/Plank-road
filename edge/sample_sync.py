@@ -19,6 +19,7 @@ from loguru import logger
 
 import edge.transmit as transmit
 from cloud.feature_cache.path_utils import fs_path
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from edge.feature_shard import write_feature_label_shards
 from edge.sample_quality import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
@@ -466,6 +467,7 @@ class HighQualitySampleSyncer:
         sync_interval_sec: float | None = None,
         enabled: bool = True,
         context_provider: Callable[[], Mapping[str, Any]] | None = None,
+        log_internal_ids: bool = False,
     ) -> None:
         self.sample_store = sample_store
         self.server_ip = str(server_ip)
@@ -508,6 +510,7 @@ class HighQualitySampleSyncer:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._context_provider = context_provider
+        self.log_internal_ids = bool(log_internal_ids)
 
     def start(self) -> None:
         if not self.enabled:
@@ -609,6 +612,7 @@ class HighQualitySampleSyncer:
                 model_version=str(manifest.get("model_version", "")),
                 split_config_id=str(manifest.get("split_config_id", "")),
                 payload_zip=payload_zip,
+                log_internal_ids=self.log_internal_ids,
             )
             if not _reply_succeeded(reply):
                 self._mark_samples(sample_ids, UPLOAD_FAILED, error=_reply_message(reply))
@@ -628,19 +632,42 @@ class HighQualitySampleSyncer:
                 for shard in list(manifest.get("shards", []) or [])
             )
             logger.info(
-                "[ShardCL][Upload] high-quality sync edge_id={} "
-                "shard_size={} samples={} shards={} partial={} payload_bytes={}",
+                "[EdgeUpload] high-quality shard uploaded: edge={} samples={} shards={} "
+                "partial={} size={} version={}.",
                 self.edge_id,
-                self.shard_size,
                 len(sample_ids),
                 int(stats.get("shard_count", 0)),
                 partial,
-                int(stats.get("zip_payload_bytes", 0)),
+                transmit._format_bytes(int(stats.get("zip_payload_bytes", 0))),
+                str(manifest.get("model_version", "")),
+            )
+            log_diagnostic_debug(
+                self,
+                "[EdgeUpload] high-quality shard diagnostics",
+                lambda: {
+                    "request_id": request_id,
+                    "split_config_id": manifest.get("split_config_id"),
+                    "shard_ids": sorted(set(shard_by_sample.values())),
+                    "zip_path": zip_path,
+                },
             )
             return True
         except Exception as exc:
             self._mark_samples(sample_ids, UPLOAD_FAILED, error=str(exc))
-            logger.exception("High-quality sample sync failed: {}", exc)
+            logger.error(
+                "[EdgeUpload] high-quality sample sync failed: {}.",
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "[EdgeUpload] high-quality sync failure diagnostics",
+                lambda error=exc: {
+                    "request_id": request_id,
+                    "sample_ids": sample_ids,
+                    "zip_path": zip_path,
+                    "error": repr(error),
+                },
+            )
             return False
         finally:
             if zip_path:
@@ -709,7 +736,12 @@ class HighQualitySampleSyncer:
             with open(self.ledger_path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except Exception:
-            logger.warning("Ignoring unreadable sample upload ledger at {}.", self.ledger_path)
+            logger.warning("Ignoring unreadable sample upload ledger.")
+            log_diagnostic_debug(
+                self,
+                "unreadable sample upload ledger diagnostics",
+                lambda: {"ledger_path": self.ledger_path},
+            )
             return self._empty_ledger()
         if not isinstance(payload, dict):
             return self._empty_ledger()
@@ -735,7 +767,10 @@ class HighQualitySampleSyncer:
             try:
                 provider_context.update(dict(self._context_provider() or {}))
             except Exception as exc:
-                logger.warning("High-quality sync context provider failed: {}", exc)
+                logger.warning(
+                    "High-quality sync context provider failed: {}.",
+                    safe_error_summary(exc),
+                )
         first_record = records[0] if records else None
         context = {
             "model_id": _first_nonempty(
@@ -843,7 +878,10 @@ class HighQualitySampleSyncer:
                     dict(self._context_provider() or {}).get("split_config_id") or ""
                 ).strip()
             except Exception as exc:
-                logger.warning("High-quality sync context provider failed: {}", exc)
+                logger.warning(
+                    "High-quality sync context provider failed: {}.",
+                    safe_error_summary(exc),
+                )
         with self._ledger_lock:
             samples = dict(self._load_ledger_unlocked().get("samples", {}))
         groups: dict[tuple[str, str, str], list[StoredSampleRecord]] = {}

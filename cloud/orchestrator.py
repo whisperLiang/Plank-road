@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from loguru import logger
-
 from cloud.orchestration.fixed_split_pipeline import FixedSplitPipeline
 from model_management.object_detection import Object_Detection
 
@@ -60,10 +58,7 @@ class CloudFixedSplitOrchestrator:
         frame_indices: list[int],
         cache_path: str,
     ) -> tuple[bool, str, str]:
-        del edge_id, frame_indices, cache_path
-        message = "fixed-split training failed; legacy full-image retrain has been removed"
-        logger.error("[CL] {}", message)
-        return False, "", message
+        return self._pipeline.get_ground_truth_and_retrain(edge_id, frame_indices, cache_path)
 
     def get_ground_truth_and_fixed_split_retrain(
         self,

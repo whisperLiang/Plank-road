@@ -17,6 +17,7 @@ from cloud.annotation import (
 )
 from cloud.orchestration.fixed_split_dependencies import _GLOBAL_TEACHER_ANNOTATION_QUEUE
 from cloud.training.proxy_metadata import normalise_shard_dtype as _normalise_shard_dtype
+from common.logging_sanitizer import log_diagnostic_debug
 from model_management.fixed_split_runtime_template import (
     get_fixed_split_runtime_template_cache,
 )
@@ -66,6 +67,7 @@ class OrchestrationSettings:
     trace_batch_size: int
     fixed_split_runtime_smoke_validate: bool
     fixed_split_runtime_diagnostics: bool
+    log_internal_ids: bool
     feature_cache: FeatureCacheSettings
     teacher_annotation: TeacherAnnotationSettings
     sample_pool: SamplePoolSettings
@@ -112,6 +114,7 @@ class OrchestrationSettings:
             )
             if cl_cfg
             else False,
+            log_internal_ids=bool(getattr(cl_cfg, "log_internal_ids", False)) if cl_cfg else False,
             feature_cache=FeatureCacheSettings(
                 store_root_dir=os.path.abspath(
                     str(
@@ -204,6 +207,7 @@ class PipelineLifecycleMixin:
         self.large_od = large_object_detection
         self.settings = OrchestrationSettings.from_config(config)
         settings = self.settings
+        self.log_internal_ids = settings.log_internal_ids
 
         # Name of the lightweight model to retrain (mirrors edge model)
         self.edge_model_name = settings.edge_model_name
@@ -230,25 +234,44 @@ class PipelineLifecycleMixin:
                     != self._normalize_model_name_for_lookup(self.edge_model_name)
                 ):
                     logger.warning(
-                        "[CloudCL] server.weights_path {} is the known artifact for {}, "
-                        "not edge_model_name {}; it will be ignored for edge retraining.",
-                        configured_weights,
+                        "[CloudCL] configured weights artifact belongs to model={} "
+                        "and will be ignored for edge model={}.",
                         configured_model,
                         self.edge_model_name,
                     )
+                    log_diagnostic_debug(
+                        self,
+                        "[CloudCL] ignored configured weights",
+                        lambda: {
+                            "weights_path": configured_weights,
+                            "configured_model": configured_model,
+                            "edge_model_name": self.edge_model_name,
+                        },
+                    )
                 else:
                     logger.info(
-                        "[CloudCL] Using configured weights_path for {}: {}",
+                        "[CloudCL] Using configured weights for model={}.",
                         self.edge_model_name,
-                        configured_weights,
+                    )
+                    log_diagnostic_debug(
+                        self,
+                        "[CloudCL] configured weights path",
+                        lambda: {
+                            "model": self.edge_model_name,
+                            "weights_path": configured_weights,
+                        },
                     )
                 # Update config with resolved absolute path
                 config.weights_path = configured_weights
             else:
                 logger.error(
-                    "[CloudCL] Configured weights_path does not exist: {}. "
-                    "This will cause model incompatibility issues!",
-                    configured_weights,
+                    "[CloudCL] Configured weights artifact is unavailable for model={}.",
+                    self.edge_model_name,
+                )
+                log_diagnostic_debug(
+                    self,
+                    "[CloudCL] missing configured weights",
+                    lambda: {"weights_path": configured_weights},
                 )
         else:
             logger.warning(
@@ -463,6 +486,7 @@ class PipelineLifecycleMixin:
         self.teacher_label_cache = TeacherLabelCache(
             self.teacher_annotation_cache_root,
             enabled=self.teacher_annotation_cache_enabled,
+            log_internal_ids=self.log_internal_ids,
         )
         self.teacher_annotation_worker: TeacherAnnotationWorker | None = None
         if self.teacher_annotation_async_enabled and self.teacher_annotation_cache_enabled:
@@ -477,19 +501,25 @@ class PipelineLifecycleMixin:
                 max_retries=self.teacher_annotation_worker_max_retries,
                 oom_retry_enabled=self.teacher_annotation_oom_retry_enabled,
                 min_worker_batch_size=self.teacher_annotation_min_worker_batch_size,
+                log_internal_ids=self.log_internal_ids,
             )
         self.teacher_annotation_service = TeacherAnnotationService(
             label_cache=self.teacher_label_cache,
             worker=self.teacher_annotation_worker,
+            log_internal_ids=self.log_internal_ids,
         )
         logger.info(
             "[TeacherAnnotation][Worker] async_enabled={} cache_enabled={} worker_batch_size={} "
-            "max_queue_size={} cache_root={}",
+            "max_queue_size={}",
             self.teacher_annotation_async_enabled,
             self.teacher_annotation_cache_enabled,
             self.teacher_annotation_worker_batch_size,
             self.teacher_annotation_worker_max_queue_size,
-            self.teacher_annotation_cache_root,
+        )
+        log_diagnostic_debug(
+            self,
+            "[TeacherAnnotation][Worker] cache diagnostics",
+            lambda: {"cache_root": self.teacher_annotation_cache_root},
         )
 
     def close(self) -> None:

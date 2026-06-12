@@ -16,6 +16,7 @@ from loguru import logger
 
 from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.types import NPY_MEMMAP_SHARD, SAFETENSORS_SHARD
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from edge.sample_quality import LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
@@ -506,65 +507,6 @@ def pack_low_quality_trigger_bundle_to_file(
         raise
 
 
-def pack_training_payload(cache_path, frame_indices):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for idx in frame_indices:
-            frame_path = os.path.join(cache_path, "frames", f"{idx}.jpg")
-            if os.path.exists(frame_path):
-                zf.write(frame_path, arcname=f"frames/{idx}.jpg")
-    return buf.getvalue()
-
-
-import socket
-
-
-def is_network_connected(address):
-    ip, port = address.split(":")[0], int(address.split(":")[1])
-    try:
-        socket.create_connection((ip, port), timeout=1)
-        return True
-    except OSError:
-        return False
-
-
-def request_cloud_training(server_ip, edge_id, frame_indices, cache_path):
-    """Send selected frame indices to the cloud for GT annotation and edge-model
-    fine-tuning.  Returns ``(success, model_data_b64, message)``.
-
-    Parameters
-    ----------
-    server_ip : str
-        gRPC server address, e.g. ``"192.168.1.1:50051"``.
-    edge_id : int
-        Identifier of this edge node.
-    frame_indices : list[int]
-        Frame indices (relative to ``cache_path``) chosen for retraining.
-    cache_path : str
-        Absolute path to the local frame cache directory shared with the cloud
-        (or accessible by both).
-
-    Returns
-    -------
-    tuple[bool, str, str]
-        ``(success, base64_model_state_dict, message)``
-    """
-    try:
-        channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
-        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
-        req = message_transmission_pb2.TrainRequest(
-            edge_id=int(edge_id),
-            frame_indices=[int(index) for index in frame_indices],
-            cache_path=_server_workspace_hint(edge_id, "train_model"),
-            payload_zip=pack_training_payload(cache_path, frame_indices),
-        )
-        reply = stub.train_model_request(req)
-        return reply.success, reply.model_data, reply.message
-    except Exception as exc:
-        logger.exception("request_cloud_training failed: {}", exc)
-        return False, "", str(exc)
-
-
 def submit_training_job(
     server_ip: str,
     *,
@@ -577,6 +519,7 @@ def submit_training_job(
     frame_indices: list[int] | None = None,
     payload_zip: bytes = b"",
     channel=None,
+    log_internal_ids: bool = False,
 ):
     owned_channel = channel is None
     request_started = time.perf_counter()
@@ -586,12 +529,20 @@ def submit_training_job(
         stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
         payload_size = len(payload_zip or b"")
         logger.info(
-            "Submitting training job request_id={} edge_id={} job_type={} payload_zip={} server={}",
-            request_id,
+            "[EdgeCL] submitting training request: edge={} type={} size={}.",
             edge_id,
             job_type,
             _format_bytes(payload_size),
-            server_ip,
+        )
+        log_diagnostic_debug(
+            log_internal_ids,
+            "[EdgeCL] training request diagnostics",
+            lambda: {
+                "request_id": request_id,
+                "cache_path": cache_path,
+                "server": server_ip,
+                "payload_zip_bytes": payload_size,
+            },
         )
         req = message_transmission_pb2.SubmitTrainingJobRequest(
             protocol_version=str(protocol_version or ""),
@@ -605,20 +556,29 @@ def submit_training_job(
         )
         reply = stub.submit_training_job(req)
         logger.info(
-            "submit_training_job reply request_id={} accepted={} job_id={} "
-            "status={} elapsed={:.3f}s",
-            request_id,
+            "[EdgeCL] training request reply: accepted={} status={} "
+            "queue_position={} elapsed={:.3f}s.",
             bool(reply.accepted),
-            reply.job_id,
             reply.status,
+            int(getattr(reply, "queue_position", -1)),
             time.perf_counter() - request_started,
+        )
+        log_diagnostic_debug(
+            log_internal_ids,
+            "[EdgeCL] training reply diagnostics",
+            lambda: {"request_id": request_id, "job_id": reply.job_id},
         )
         return reply
     except Exception as exc:
-        logger.exception(
-            "submit_training_job failed after {:.3f}s: {}",
+        logger.error(
+            "[EdgeCL] training request failed: elapsed={:.3f}s reason={}.",
             time.perf_counter() - request_started,
-            exc,
+            safe_error_summary(exc),
+        )
+        log_diagnostic_debug(
+            log_internal_ids,
+            "[EdgeCL] training request failure diagnostics",
+            lambda error=exc: {"request_id": request_id, "error": repr(error)},
         )
         return None
     finally:
@@ -655,6 +615,7 @@ def submit_sample_sync(
     payload_zip: bytes,
     cache_path: str | None = None,
     channel=None,
+    log_internal_ids: bool = False,
 ):
     owned_channel = channel is None
     request_started = time.perf_counter()
@@ -680,16 +641,35 @@ def submit_sample_sync(
         )
         reply = stub.sync_samples(req)
         logger.info(
-            "submit_sample_sync reply request_id={} elapsed={:.3f}s",
-            request_id,
+            "[EdgeUpload] sample shard uploaded: edge={} quality={} model={} "
+            "version={} size={} elapsed={:.3f}s.",
+            edge_id,
+            sync_type,
+            model_id,
+            model_version,
+            _format_bytes(len(payload_zip or b"")),
             time.perf_counter() - request_started,
+        )
+        log_diagnostic_debug(
+            log_internal_ids,
+            "[EdgeUpload] sample sync diagnostics",
+            lambda: {
+                "request_id": request_id,
+                "split_config_id": split_config_id,
+                "cache_path": cache_path,
+            },
         )
         return reply
     except Exception as exc:
-        logger.exception(
-            "submit_sample_sync failed after {:.3f}s: {}",
+        logger.error(
+            "[EdgeUpload] sample sync failed: elapsed={:.3f}s reason={}.",
             time.perf_counter() - request_started,
-            exc,
+            safe_error_summary(exc),
+        )
+        log_diagnostic_debug(
+            log_internal_ids,
+            "[EdgeUpload] sample sync failure diagnostics",
+            lambda error=exc: {"request_id": request_id, "error": repr(error)},
         )
         return None
     finally:
@@ -715,7 +695,7 @@ def get_training_job_status(
         )
         return stub.get_training_job_status(req)
     except Exception as exc:
-        logger.exception("get_training_job_status failed: {}", exc)
+        logger.error("[EdgeCL] training status poll failed: {}.", safe_error_summary(exc))
         return None
     finally:
         if owned_channel and channel is not None:
@@ -741,7 +721,7 @@ def download_trained_model(
         reply = stub.download_trained_model(req)
         return reply.success, reply.model_data, reply.message
     except Exception as exc:
-        logger.exception("download_trained_model failed: {}", exc)
+        logger.error("[EdgeCL] model update download failed: {}.", safe_error_summary(exc))
         return False, "", str(exc)
     finally:
         if owned_channel and channel is not None:
@@ -764,14 +744,15 @@ def submit_continual_learning_job(
     bandwidth_mbps: float = 0.0,
     request_id: str | None = None,
     channel=None,
+    log_internal_ids: bool = False,
 ):
+    resolved_request_id: str | None = None
     try:
         pack_started = time.perf_counter()
         stats = sample_store.stats()
         logger.info(
-            "Packing low-quality trigger bundle for edge {} "
-            "(samples={}, high_quality={}, low_quality={}, "
-            "send_low_conf_features={}, model_id={}, model_version={})",
+            "[EdgeUpload] packing low-quality trigger: edge={} samples={} high={} "
+            "low={} include_features={} model={} version={}.",
             edge_id,
             int(stats.get("total_samples", 0)),
             int(stats.get("high_quality_count", 0)),
@@ -798,11 +779,9 @@ def submit_continual_learning_job(
         if bandwidth_mbps > 0.0 and zip_payload_bytes > 0:
             estimated_upload_sec = zip_payload_bytes * 8.0 / (float(bandwidth_mbps) * 1_000_000.0)
         logger.info(
-            "Packed low-quality trigger bundle for edge {} "
-            "(total_pack_time={:.3f}s, "
-            "samples={}, raw_shards={}, feature_shards={}, "
-            "source_total_bytes={}, cap={}, zip_payload={}, "
-            "estimated_upload_sec={}).",
+            "[EdgeUpload] low-quality trigger packed: edge={} elapsed={:.3f}s "
+            "samples={} raw_shards={} feature_shards={} source_size={} cap={} "
+            "size={} estimated_upload={}.",
             edge_id,
             time.perf_counter() - pack_started,
             int(manifest.get("sample_count", 0) or 0),
@@ -814,16 +793,18 @@ def submit_continual_learning_job(
             (f"{estimated_upload_sec:.3f}s" if estimated_upload_sec is not None else "unknown"),
         )
         upload_started = time.perf_counter()
+        resolved_request_id = str(request_id or uuid.uuid4().hex)
         reply = submit_training_job(
             server_ip,
             edge_id=edge_id,
-            request_id=str(request_id or uuid.uuid4().hex),
+            request_id=resolved_request_id,
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
             cache_path=_server_workspace_hint(edge_id, "continual_learning"),
             protocol_version=manifest["protocol_version"],
             send_low_conf_features=bool(send_low_conf_features),
             payload_zip=payload_zip,
             channel=channel,
+            log_internal_ids=log_internal_ids,
         )
         upload_elapsed = time.perf_counter() - upload_started
         upload_mbps = (
@@ -833,8 +814,8 @@ def submit_continual_learning_job(
         )
         if reply is None:
             logger.error(
-                "Low-quality trigger upload failed for edge {} "
-                "(elapsed={:.3f}s, average_speed={:.3f} Mbps, zip_payload={}).",
+                "[EdgeUpload] low-quality trigger upload failed: edge={} "
+                "elapsed={:.3f}s speed={:.3f}Mbps size={}.",
                 edge_id,
                 upload_elapsed,
                 upload_mbps,
@@ -842,14 +823,37 @@ def submit_continual_learning_job(
             )
             return False, "", "submit_training_job failed"
         logger.info(
-            "Low-quality trigger upload completed for edge {} "
-            "(actual_upload_time={:.3f}s, upload_speed={:.3f} Mbps, zip_payload={}).",
+            "[EdgeUpload] low-quality trigger uploaded: edge={} samples={} version={} "
+            "size={} elapsed={:.3f}s speed={:.3f}Mbps.",
             edge_id,
+            int(manifest.get("sample_count", 0) or 0),
+            model_version,
+            _format_bytes(zip_payload_bytes),
             upload_elapsed,
             upload_mbps,
-            _format_bytes(zip_payload_bytes),
+        )
+        log_diagnostic_debug(
+            log_internal_ids,
+            "[EdgeUpload] continual-learning submission diagnostics",
+            lambda: {
+                "request_id": resolved_request_id,
+                "job_id": reply.job_id,
+                "split_config_id": getattr(split_plan, "split_config_id", ""),
+                "session_id": edge_session_id,
+            },
         )
         return bool(reply.accepted), str(reply.job_id), str(reply.message)
     except Exception as exc:
-        logger.exception("submit_continual_learning_job failed: {}", exc)
+        logger.error(
+            "[EdgeUpload] continual-learning submission failed: {}.",
+            safe_error_summary(exc),
+        )
+        log_diagnostic_debug(
+            log_internal_ids,
+            "[EdgeUpload] continual-learning failure diagnostics",
+            lambda error=exc: {
+                "request_id": resolved_request_id or request_id,
+                "error": repr(error),
+            },
+        )
         return False, "", str(exc)

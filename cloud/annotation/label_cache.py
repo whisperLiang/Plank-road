@@ -16,6 +16,7 @@ from cloud.annotation.types import (
     TeacherAnnotationStatus,
     TeacherLabelCacheKey,
 )
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 
 _CACHE_VERSION = "teacher-label-cache.v1"
 
@@ -72,9 +73,16 @@ def _normalise_label_payload(labels: Mapping[str, Any] | None) -> dict[str, Any]
 
 
 class TeacherLabelCache:
-    def __init__(self, root_dir: str, *, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        root_dir: str,
+        *,
+        enabled: bool = True,
+        log_internal_ids: bool = False,
+    ) -> None:
         self.root_dir = os.path.abspath(str(root_dir))
         self.enabled = bool(enabled)
+        self.log_internal_ids = bool(log_internal_ids)
         self.cache_version = _CACHE_VERSION
         self._lock = threading.Lock()
         if self.enabled:
@@ -145,10 +153,19 @@ class TeacherLabelCache:
         except Exception as exc:
             if log_errors:
                 logger.warning(
-                    "[TeacherAnnotation][CacheMiss] unreadable cache_key={} sample_id={} error={}",
-                    key.digest,
-                    request.sample_id,
-                    exc,
+                    "[TeacherAnnotation][CacheMiss] unreadable cache entry: reason={}.",
+                    safe_error_summary(exc),
+                )
+                log_diagnostic_debug(
+                    self,
+                    "[TeacherAnnotation][CacheMiss] diagnostics",
+                    lambda error=exc: {
+                        "cache_key": key.digest,
+                        "sample_id": request.sample_id,
+                        "label_path": label_path,
+                        "metadata_path": meta_path,
+                        "error": repr(error),
+                    },
                 )
             return None
         return _normalise_label_payload(labels)

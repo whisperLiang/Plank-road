@@ -27,6 +27,7 @@ from cloud.training.proxy_metadata import (
 from cloud.training.proxy_metadata import (
     looks_like_fused_ultralytics_state_dict as _looks_like_fused_ultralytics_state_dict,
 )
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from model_management.model_info import model_lib
 from model_management.split_model_adapters import get_split_runtime_model
 
@@ -101,12 +102,15 @@ class CheckpointStageMixin:
         if configured_model is not None and configured_model != requested_model:
             if warn:
                 logger.warning(
-                    "[CL] Ignoring server.weights_path {} because it is the known artifact "
-                    "for {}, not requested edge model {}. Using native {} weights.",
-                    configured_weights,
+                    "[CL] Ignoring configured weights for model={} because the requested "
+                    "edge model is={}; using native weights.",
                     configured_model,
                     requested_model,
-                    requested_model,
+                )
+                log_diagnostic_debug(
+                    self,
+                    "[CL] ignored configured weights diagnostics",
+                    lambda: {"weights_path": configured_weights},
                 )
             return ""
         return configured_weights
@@ -209,9 +213,13 @@ class CheckpointStageMixin:
             # Validate and use configured weights path
             if not os.path.exists(configured_weights):
                 logger.error(
-                    "[CL] Configured weights_path does not exist: {}. "
-                    "This may cause model incompatibility issues.",
-                    configured_weights,
+                    "[CL] Configured weights artifact is unavailable for model={}.",
+                    model_name,
+                )
+                log_diagnostic_debug(
+                    self,
+                    "[CL] unavailable configured weights diagnostics",
+                    lambda: {"weights_path": configured_weights},
                 )
             else:
                 _validate_rfdetr_weights_match_metadata(
@@ -222,18 +230,27 @@ class CheckpointStageMixin:
                 )
                 build_kwargs["weights_path"] = configured_weights
                 logger.info(
-                    "[CL] Building model {} with configured weights: {}",
+                    "[CL] Building model={} with configured weights.",
                     model_name,
-                    configured_weights,
+                )
+                log_diagnostic_debug(
+                    self,
+                    "[CL] configured build weights diagnostics",
+                    lambda: {"weights_path": configured_weights},
                 )
         elif source_label == "pretrained":
             try:
                 artifact_path = model_zoo.ensure_local_model_artifact(model_name)
             except Exception as exc:
                 logger.warning(
-                    "[CL] Failed to resolve native weights for {}: {}",
+                    "[CL] Failed to resolve native weights for model={}: {}.",
                     model_name,
-                    exc,
+                    safe_error_summary(exc),
+                )
+                log_diagnostic_debug(
+                    self,
+                    "[CL] native weights resolution diagnostics",
+                    lambda error=exc: {"error": repr(error)},
                 )
             else:
                 if artifact_path.exists():
@@ -369,10 +386,9 @@ class CheckpointStageMixin:
             if cache_num_classes is not None and cache_num_classes != 80:
                 build_kwargs["num_classes"] = cache_num_classes
                 logger.info(
-                    "[CL] Inferred {} {} class(es) from edge-scoped weights at {}.",
+                    "[CL] Inferred {} {} class(es) from edge-scoped weights.",
                     cache_num_classes,
                     model_name,
-                    edge_weights,
                 )
         elif model_family == "rfdetr":
             cache_num_classes = model_zoo.infer_rfdetr_state_dict_num_classes(state)
@@ -383,20 +399,18 @@ class CheckpointStageMixin:
             if cache_num_classes is not None and cache_num_classes != 91:
                 build_kwargs["num_classes"] = cache_num_classes
                 logger.info(
-                    "[CL] Inferred {} RF-DETR logits from edge-scoped {} weights at {}.",
+                    "[CL] Inferred {} RF-DETR logits from edge-scoped {} weights.",
                     cache_num_classes,
                     model_name,
-                    edge_weights,
                 )
         elif model_family == "tinynext":
             cache_num_classes = model_zoo.infer_tinynext_state_dict_num_classes(state)
             if cache_num_classes is not None and cache_num_classes != 91:
                 build_kwargs["num_classes"] = cache_num_classes
                 logger.info(
-                    "[CL] Inferred {} TinyNeXt SSD class logits from edge-scoped {} weights at {}.",
+                    "[CL] Inferred {} TinyNeXt SSD class logits from edge-scoped {} weights.",
                     cache_num_classes,
                     model_name,
-                    edge_weights,
                 )
 
         tmp_model = model_zoo.build_detection_model(
@@ -415,11 +429,15 @@ class CheckpointStageMixin:
         missing_keys = list(getattr(load_result, "missing_keys", ()) or ())
         unexpected_keys = list(getattr(load_result, "unexpected_keys", ()) or ())
         logger.info(
-            "[CL] Loaded edge-scoped {} weights from {} (missing_keys={}, unexpected_keys={}).",
+            "[CL] Loaded edge-scoped {} weights: missing_keys={} unexpected_keys={}.",
             model_name,
-            edge_weights,
             len(missing_keys),
             len(unexpected_keys),
+        )
+        log_diagnostic_debug(
+            self,
+            "[CL] edge-scoped weights diagnostics",
+            lambda: {"weights_path": edge_weights},
         )
         tmp_model.to(self.device)
         get_split_runtime_model(tmp_model).eval()
@@ -513,22 +531,31 @@ class CheckpointStageMixin:
             weights_metadata=weights_metadata,
             metadata_path=metadata_path,
         )
-        checkpoint_sha1 = file_sha1(checkpoint_path)
+        source_version = (
+            dict(weights_metadata or {}).get("source_base_model_version")
+            if weights_metadata is not None
+            else ""
+        )
+        checkpoint_version = (
+            dict(weights_metadata or {}).get("checkpoint_model_version")
+            if weights_metadata is not None
+            else ""
+        )
         logger.info(
-            "[FixedSplitCL] checkpoint serialized path={} model_name={} "
-            "source_version={} checkpoint_version={} sha1={}.",
-            checkpoint_path,
+            "[FixedSplitCL] Checkpoint serialized: model={} source_version={} "
+            "checkpoint_version={} size={:.1f}MB.",
             resolved_model_name,
-            (
-                dict(weights_metadata or {}).get("source_base_model_version")
-                if weights_metadata is not None
-                else ""
-            ),
-            (
-                dict(weights_metadata or {}).get("checkpoint_model_version")
-                if weights_metadata is not None
-                else ""
-            ),
-            checkpoint_sha1,
+            source_version,
+            checkpoint_version,
+            len(payload or b"") / (1024.0 * 1024.0),
+        )
+        log_diagnostic_debug(
+            self,
+            "[FixedSplitCL] checkpoint serialization diagnostics",
+            lambda: {
+                "checkpoint_path": checkpoint_path,
+                "metadata_path": metadata_path,
+                "sha1": file_sha1(checkpoint_path),
+            },
         )
         return payload

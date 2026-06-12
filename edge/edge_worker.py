@@ -12,6 +12,7 @@ import grpc
 import torch
 from loguru import logger
 
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from edge.box_motion import compensate_boxes_between_frames
 from edge.diff import DiffProcessor
 from edge.info import TASK_STATE
@@ -314,7 +315,10 @@ class AsyncSampleCollector:
                     self._handler(item)
                 except BaseException as exc:  # noqa: BLE001 - preserve worker thread.
                     self._errors.append(exc)
-                    logger.exception("Async sample collection failed: {}", exc)
+                    logger.error(
+                        "Async sample collection failed: {}.",
+                        safe_error_summary(exc),
+                    )
             finally:
                 self._queue.task_done()
 
@@ -397,7 +401,10 @@ class AsyncSampleWriter:
                 except BaseException as exc:  # noqa: BLE001 - preserve worker thread.
                     error = exc
                     self._errors.append(exc)
-                    logger.exception("Async sample write failed: {}", exc)
+                    logger.error(
+                        "Async sample write failed: {}.",
+                        safe_error_summary(exc),
+                    )
                 finally:
                     if self._on_done is not None:
                         self._on_done(job, record, error)
@@ -463,6 +470,9 @@ class EdgeWorker:
     def __init__(self, config):
         self.config = config
         self.edge_id = config.edge_id
+        self.log_internal_ids = bool(
+            getattr(getattr(config, "continual_learning", None), "log_internal_ids", False)
+        )
 
         self.edge_processor = DiffProcessor.str_to_class(config.feature)()
         self.small_object_detection = Object_Detection(config, type="small inference")
@@ -537,6 +547,7 @@ class EdgeWorker:
             sample_pool_config=getattr(self.config, "sample_pool", None),
             feature_upload_config=getattr(self.config, "feature_upload", None),
             context_provider=self._sample_sync_context,
+            log_internal_ids=self.log_internal_ids,
         )
         self.bundle_cache_path = os.path.join(self.config.retrain.cache_path, "server_bundle")
         self.min_low_quality_samples = int(
@@ -601,6 +612,7 @@ class EdgeWorker:
             logger.info("Split learning disabled in config; skipping fixed split initialisation.")
             return
 
+        cache_path = ""
         try:
             split_model = self.small_object_detection.get_split_runtime_model()
             self.universal_splitter = UniversalModelSplitter(
@@ -656,18 +668,45 @@ class EdgeWorker:
             logger.info("Warming up fixed split runtime.")
             self._warmup_fixed_split_runtime(sample_input)
             logger.info(
-                "Fixed split plan ready (split_config_id={}, {}, image_size={})",
-                self.fixed_split_plan.split_config_id,
-                self.fixed_split_plan.describe(),
+                "[EdgeCL] runtime ready: model={} split={} image_size={} elapsed={:.3f}s.",
+                self.model_id,
+                getattr(self.fixed_split_plan, "canonical_split_key", "auto"),
                 self.split_trace_image_size,
+                time.perf_counter() - plan_started,
+            )
+            log_diagnostic_debug(
+                self,
+                "[EdgeCL] fixed split plan diagnostics",
+                lambda: {
+                    "split_config_id": self.fixed_split_plan.split_config_id,
+                    "cache_path": cache_path,
+                    "plan": self.fixed_split_plan.describe(),
+                },
+                runtime=True,
             )
         except RuntimeError as exc:
-            logger.warning("Fixed split plan unavailable for model {}: {}", self.model_id, exc)
+            logger.warning(
+                "Fixed split plan unavailable for model={}: {}.",
+                self.model_id,
+                safe_error_summary(exc),
+            )
             self.split_learning_disable_reason = str(exc)
             self.split_learning_enabled = False
             self._reset_split_runtime_state()
         except Exception as exc:
-            logger.exception("Failed to initialise fixed split plan: {}", exc)
+            logger.error(
+                "Failed to initialise fixed split plan: {}.",
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "fixed split initialisation failure diagnostics",
+                lambda error=exc: {
+                    "cache_path": cache_path,
+                    "error": repr(error),
+                },
+                runtime=True,
+            )
             self.split_learning_disable_reason = str(exc)
             self.split_learning_enabled = False
             self._reset_split_runtime_state()
@@ -686,7 +725,10 @@ class EdgeWorker:
                         return_split_output=True,
                     )
         except Exception as exc:
-            logger.warning("Fixed split warmup failed; continuing without warm cache: {}", exc)
+            logger.warning(
+                "Fixed split warmup failed; continuing without warm cache: {}.",
+                safe_error_summary(exc),
+            )
             return
         logger.info(
             "Fixed split warmup completed (iterations={}, elapsed={:.3f}s).",
@@ -748,9 +790,9 @@ class EdgeWorker:
         except Exception as exc:
             torch.set_num_threads(current_threads)
             logger.warning(
-                "CPU suffix replay thread tuning failed; restored torch_num_threads={}: {}",
+                "CPU suffix replay thread tuning failed; restored torch_num_threads={}: {}.",
                 current_threads,
-                exc,
+                safe_error_summary(exc),
             )
             return
 
@@ -845,9 +887,16 @@ class EdgeWorker:
         self._apply_pending_sample_stats(job.stats_delta, sign=-1)
         if error is not None:
             logger.error(
-                "Dropped queued sample {} after async write failure: {}",
-                job.store_kwargs.get("sample_id"),
-                error,
+                "Dropped queued sample after async write failure: {}.",
+                safe_error_summary(error),
+            )
+            log_diagnostic_debug(
+                self,
+                "async sample write failure diagnostics",
+                lambda: {
+                    "sample_id": job.store_kwargs.get("sample_id"),
+                    "error": repr(error),
+                },
             )
             return
         if record is not None:
@@ -861,9 +910,16 @@ class EdgeWorker:
             syncer.notify_sample(record)
         except Exception as exc:
             logger.warning(
-                "Failed to queue high-quality sample {} for background sync: {}",
-                getattr(record, "sample_id", None),
-                exc,
+                "Failed to queue high-quality sample for background sync: {}.",
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "background sample sync queue diagnostics",
+                lambda error=exc: {
+                    "sample_id": getattr(record, "sample_id", None),
+                    "error": repr(error),
+                },
             )
 
     def _current_model_metadata(self) -> dict[str, object]:
@@ -986,11 +1042,19 @@ class EdgeWorker:
         self._apply_pending_sample_stats(job.stats_delta, sign=1)
         try:
             writer.submit(job)
-        except Exception:
+        except Exception as exc:
             self._apply_pending_sample_stats(job.stats_delta, sign=-1)
-            logger.exception(
-                "Async sample writer unavailable; storing sample {} synchronously.",
-                job.store_kwargs.get("sample_id"),
+            logger.warning(
+                "Async sample writer unavailable; storing sample synchronously: {}.",
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "async sample writer fallback diagnostics",
+                lambda error=exc: {
+                    "sample_id": job.store_kwargs.get("sample_id"),
+                    "error": repr(error),
+                },
             )
             record = self.sample_store.store_sample(**job.store_kwargs)
             self._notify_sample_syncer(record)
@@ -1005,15 +1069,27 @@ class EdgeWorker:
             return True
         except Full:
             logger.warning(
-                "Async sample collector is full; collecting sample {} synchronously.",
-                job.sample_id,
+                "Async sample collector is full; collecting sample synchronously."
+            )
+            log_diagnostic_debug(
+                self,
+                "full sample collector diagnostics",
+                lambda: {"sample_id": job.sample_id},
             )
             self._collect_data_from_job(job)
             return False
-        except Exception:
-            logger.exception(
-                "Async sample collector unavailable; collecting sample {} synchronously.",
-                job.sample_id,
+        except Exception as exc:
+            logger.warning(
+                "Async sample collector unavailable; collecting sample synchronously: {}.",
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "sample collector fallback diagnostics",
+                lambda error=exc: {
+                    "sample_id": job.sample_id,
+                    "error": repr(error),
+                },
             )
             self._collect_data_from_job(job)
             return False
@@ -1025,7 +1101,9 @@ class EdgeWorker:
         try:
             return bool(collector.flush(timeout=timeout))
         except Exception as exc:
-            logger.error("Failed to flush async sample collector: {}", exc)
+            logger.error(
+                "Failed to flush async sample collector: {}.", safe_error_summary(exc)
+            )
             return False
 
     def _flush_sample_writer(self, *, timeout: float = 10.0) -> bool:
@@ -1035,7 +1113,7 @@ class EdgeWorker:
         try:
             return bool(writer.flush(timeout=timeout))
         except Exception as exc:
-            logger.error("Failed to flush async sample writer: {}", exc)
+            logger.error("Failed to flush async sample writer: {}.", safe_error_summary(exc))
             return False
 
     def _flush_sample_syncer(self, *, timeout: float = 10.0) -> bool:
@@ -1045,7 +1123,9 @@ class EdgeWorker:
         try:
             return bool(syncer.flush(timeout=timeout, include_partial=True))
         except Exception as exc:
-            logger.error("Failed to flush high-quality sample syncer: {}", exc)
+            logger.error(
+                "Failed to flush high-quality sample syncer: {}.", safe_error_summary(exc)
+            )
             return False
 
     def _sample_pool_shard_size(self) -> int | None:
@@ -1149,9 +1229,11 @@ class EdgeWorker:
             )
             return
         logger.warning(
-            "Continual learning sample collection disabled for edge model {}: {}",
+            "Continual learning sample collection disabled for edge model {}: {}.",
             self.model_id,
-            self.split_learning_disable_reason or "split learning unavailable",
+            safe_error_summary(
+                self.split_learning_disable_reason or "split learning unavailable"
+            ),
         )
 
     def _reset_split_runtime_state(self) -> None:
@@ -1316,8 +1398,8 @@ class EdgeWorker:
             )
         except Exception as exc:
             logger.warning(
-                "Resource probe cloud-state refresh failed; using conservative cache: {}",
-                exc,
+                "Resource probe cloud-state refresh failed; using conservative cache: {}.",
+                safe_error_summary(exc),
             )
             self._update_resource_probe_cache(
                 cloud_state=self._conservative_cloud_state(),
@@ -1367,7 +1449,9 @@ class EdgeWorker:
                     sample_stats=stats,
                 )
             except Exception as exc:
-                logger.warning("Resource-aware trigger decision failed: {}", exc)
+                logger.warning(
+                    "Resource-aware trigger decision failed: {}.", safe_error_summary(exc)
+                )
 
         should_train = (
             stats.low_quality_count >= max(1, int(getattr(self, "min_low_quality_samples", 1)))
@@ -1570,16 +1654,25 @@ class EdgeWorker:
                     trigger_shard_size=self._sample_pool_shard_size(),
                     bandwidth_mbps=decision.bandwidth_mbps,
                     channel=training_channel,
+                    log_internal_ids=self.log_internal_ids,
                 )
                 if not accepted or not job_id:
-                    logger.error("Cloud continual learning submission failed: {}", msg)
+                    logger.error(
+                        "[EdgeCL] cloud continual learning submission failed: {}.",
+                        safe_error_summary(msg),
+                    )
                     self._reset_pending_training_cycle()
                     continue
 
                 logger.info(
-                    "Submitted continual learning job {} for edge {}.",
-                    job_id,
+                    "[EdgeCL] training accepted: edge={} model_version={}.",
                     self.edge_id,
+                    self.model_version,
+                )
+                log_diagnostic_debug(
+                    self,
+                    "[EdgeCL] accepted training job diagnostics",
+                    lambda: {"job_id": job_id},
                 )
 
                 terminal_message = msg
@@ -1608,9 +1701,8 @@ class EdgeWorker:
                             and elapsed <= self.training_not_found_grace_sec
                         ):
                             logger.warning(
-                                "Continual learning job {} temporarily not visible "
-                                "on cloud poll {} ({:.1f}/{:.1f}s); retrying.",
-                                job_id,
+                                "[EdgeCL] training temporarily not visible on cloud "
+                                "poll={} elapsed={:.1f}/{:.1f}s; retrying.",
                                 not_found_count,
                                 elapsed,
                                 self.training_not_found_grace_sec,
@@ -1621,9 +1713,13 @@ class EdgeWorker:
 
                         terminal_message = f"Training job not found on cloud after {elapsed:.1f}s."
                         logger.error(
-                            "Cloud continual learning failed for job {}: {}",
-                            job_id,
-                            terminal_message,
+                            "[EdgeCL] cloud training unavailable: elapsed={:.1f}s.",
+                            elapsed,
+                        )
+                        log_diagnostic_debug(
+                            self,
+                            "[EdgeCL] missing training job diagnostics",
+                            lambda: {"job_id": job_id},
                         )
                         break
 
@@ -1633,10 +1729,14 @@ class EdgeWorker:
                     if status != last_status:
                         queue_position = int(getattr(reply, "queue_position", -1))
                         logger.info(
-                            "Continual learning job {} status={} queue_position={}",
-                            job_id,
+                            "[EdgeCL] training status={} queue_position={}.",
                             status,
                             queue_position,
+                        )
+                        log_diagnostic_debug(
+                            self,
+                            "[EdgeCL] training status diagnostics",
+                            lambda: {"job_id": job_id, "status": status},
                         )
                         last_status = status
 
@@ -1654,9 +1754,8 @@ class EdgeWorker:
                         )
                         if not success:
                             logger.error(
-                                "Cloud continual learning download failed for job {}: {}",
-                                job_id,
-                                terminal_message,
+                                "[EdgeCL] model update download failed: reason={}.",
+                                safe_error_summary(terminal_message),
                             )
                         break
 
@@ -1664,9 +1763,14 @@ class EdgeWorker:
                         reply.message or f"Training job ended with status {status}"
                     )
                     logger.error(
-                        "Cloud continual learning failed for job {}: {}",
-                        job_id,
-                        terminal_message,
+                        "[EdgeCL] cloud training failed: status={} reason={}.",
+                        status,
+                        safe_error_summary(terminal_message),
+                    )
+                    log_diagnostic_debug(
+                        self,
+                        "[EdgeCL] failed training job diagnostics",
+                        lambda: {"job_id": job_id, "message": terminal_message},
                     )
                     break
             finally:
@@ -1679,17 +1783,27 @@ class EdgeWorker:
                 current_version = str(self.model_version)
                 if current_version != submitted_model_version:
                     logger.warning(
-                        "Discarding training result for job {}: "
-                        "submitted at model_version={} but current is {} (stale).",
-                        job_id,
+                        "[EdgeCL] discarding stale training result: submitted_version={} "
+                        "current_version={}.",
                         submitted_model_version,
                         current_version,
+                    )
+                    log_diagnostic_debug(
+                        self,
+                        "[EdgeCL] stale result diagnostics",
+                        lambda: {"job_id": job_id},
                     )
                     self._reset_pending_training_cycle()
                     continue
 
                 try:
+                    apply_started = time.perf_counter()
                     buf = io.BytesIO(base64.b64decode(model_b64))
+                    logger.info(
+                        "[EdgeCL] model update received: version={} size={:.1f}MB.",
+                        int(submitted_model_version) + 1,
+                        len(buf.getbuffer()) / (1024.0 * 1024.0),
+                    )
                     update_payload = require_state_dict_delta_payload(
                         torch.load(buf, map_location="cpu", weights_only=False)
                     )
@@ -1701,9 +1815,8 @@ class EdgeWorker:
                     ]
                     if not weight_keys:
                         logger.warning(
-                            "Cloud model update for job {} contains only threshold metadata; "
-                            "model weights will not change.",
-                            job_id,
+                            "[EdgeCL] cloud model update contains only threshold metadata; "
+                            "model weights will not change."
                         )
                     with self.small_object_detection.model_lock:
                         self._validate_cloud_update_state_compatible(
@@ -1719,39 +1832,57 @@ class EdgeWorker:
                         self.small_object_detection.refresh_thresholds_from_model()
                         if self.fixed_split_plan is not None:
                             logger.info(
-                                "Reusing fixed split plan after edge model update "
-                                "(split_config_id={}).",
-                                self.fixed_split_plan.split_config_id,
+                                "[EdgeCL] reusing fixed split plan after model update: split={}.",
+                                getattr(self.fixed_split_plan, "canonical_split_key", "auto"),
+                            )
+                            log_diagnostic_debug(
+                                self,
+                                "[EdgeCL] reused split plan diagnostics",
+                                lambda: {
+                                    "split_config_id": self.fixed_split_plan.split_config_id
+                                },
                             )
                     self.model_version = str(int(self.model_version) + 1)
                     self.sample_store.clear()
                     self.window_drift_detector.reset()
                     logger.info(
-                        "Applied cloud model update for job {} "
-                        "(state_keys={}, weight_keys={}, missing_keys={}, unexpected_keys={}).",
-                        job_id,
+                        "[EdgeCL] model update applied: version={} state_keys={} weight_keys={} "
+                        "missing_keys={} unexpected_keys={} elapsed={:.3f}s.",
+                        self.model_version,
                         len(state_dict),
                         len(weight_keys),
                         len(list(getattr(load_result, "missing_keys", ()) or ())),
                         len(list(getattr(load_result, "unexpected_keys", ()) or ())),
+                        time.perf_counter() - apply_started,
                     )
-                    if terminal_message:
-                        logger.success(
-                            "Edge model updated from cloud successfully (v{} -> v{}, {})",
-                            submitted_model_version,
-                            self.model_version,
-                            terminal_message,
-                        )
-                    else:
-                        logger.success(
-                            "Edge model updated from cloud successfully (v{} -> v{})",
-                            submitted_model_version,
-                            self.model_version,
-                        )
+                    logger.success(
+                        "[EdgeCL] model update successful: version={} -> {}.",
+                        submitted_model_version,
+                        self.model_version,
+                    )
+                    log_diagnostic_debug(
+                        self,
+                        "[EdgeCL] model update diagnostics",
+                        lambda: {"job_id": job_id, "message": terminal_message},
+                    )
                 except Exception as exc:
-                    logger.exception("Failed to load cloud-returned model weights: {}", exc)
+                    logger.error(
+                        "[EdgeCL] failed to apply cloud model update: {}.",
+                        safe_error_summary(exc),
+                    )
+                    log_diagnostic_debug(
+                        self,
+                        "[EdgeCL] model update failure diagnostics",
+                        lambda error=exc: {
+                            "job_id": job_id,
+                            "error": repr(error),
+                        },
+                    )
             elif not self._stop_event.is_set():
-                logger.error("Cloud continual learning failed: {}", terminal_message)
+                logger.error(
+                    "[EdgeCL] cloud continual learning failed: {}.",
+                    safe_error_summary(terminal_message),
+                )
 
             self._reset_pending_training_cycle()
 

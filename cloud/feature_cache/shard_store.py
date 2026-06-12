@@ -18,6 +18,7 @@ from cloud.feature_cache.types import (
     SUPPORTED_STORAGE_FORMATS,
     FeatureShardRef,
 )
+from common.logging_sanitizer import log_diagnostic_debug
 
 
 def _read_json(path: str) -> dict[str, Any]:
@@ -50,6 +51,7 @@ class FeatureShardStore:
         payload_cache_max_cpu_bytes: int = 4 * 1024 * 1024 * 1024,
         pin_memory: bool = True,
         non_blocking_transfer: bool = True,
+        log_internal_ids: bool = False,
     ) -> None:
         self.root_dir = os.path.abspath(str(root_dir))
         self.storage_format = str(storage_format or SAFETENSORS_SHARD)
@@ -65,6 +67,7 @@ class FeatureShardStore:
             )
         self.shard_max_samples = max(1, int(shard_max_samples or 64))
         self.shard_dtype = None if shard_dtype in (None, "") else str(shard_dtype)
+        self.log_internal_ids = bool(log_internal_ids)
         self.payload_cache = FeatureShardPayloadCache(
             enabled=payload_cache_enabled,
             max_cpu_bytes=payload_cache_max_cpu_bytes,
@@ -264,20 +267,30 @@ class FeatureShardStore:
                 )
                 registered.append({"sample_id": str(sample_id), "feature_ref": ref})
             logger.info(
-                "[FeatureShard][Register] storage_format={} shard_id={} samples={} "
-                "feature_layout_id={} dtype={}",
+                "[FeatureShard][Register] format={} samples={} dtype={}.",
                 storage_format,
-                shard_id,
                 len(sample_to_row),
-                index_payload.get("feature_layout_id") or feature_layout_id,
                 index_payload.get("dtype") or "",
             )
+            log_diagnostic_debug(
+                self,
+                "[FeatureShard][Register] diagnostics",
+                lambda: {
+                    "shard_id": shard_id,
+                    "shard_path": shard_path,
+                    "index_path": index_path,
+                    "feature_layout_id": index_payload.get("feature_layout_id")
+                    or feature_layout_id,
+                    "feature_abi_id": index_payload.get("feature_abi_id")
+                    or feature_abi_id,
+                    "contract_id": index_payload.get("contract_id"),
+                },
+            )
         logger.info(
-            "[FeatureShard][Receive] storage_format={} shards={} "
-            "registered_samples={} register_time={:.3f}s",
-            ",".join(sorted({str(item.get("storage_format") or "") for item in shard_entries})),
+            "[FeatureShard][Receive] shards={} samples={} format={} time={:.3f}s.",
             len(list(shard_entries or [])),
             len(registered),
+            ",".join(sorted({str(item.get("storage_format") or "") for item in shard_entries})),
             time.perf_counter() - started,
         )
         return registered

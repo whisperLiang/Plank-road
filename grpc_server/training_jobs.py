@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from grpc_server import message_transmission_pb2
 from grpc_server.workspace import prepare_request_workspace
 
@@ -33,6 +34,15 @@ TERMINAL_JOB_STATUSES = {
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _format_bytes(size: int) -> str:
+    value = float(max(0, int(size or 0)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024.0 or unit == "GB":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024.0
+    return f"{value:.1f}GB"
 
 
 @dataclass(slots=True)
@@ -67,10 +77,12 @@ class TrainingJobManager:
         continual_learner: "CloudContinualLearner",
         max_concurrent_jobs: int,
         edge_registry: "EdgeRegistry | None" = None,
+        log_internal_ids: bool = False,
     ) -> None:
         self.continual_learner = continual_learner
         self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
         self.edge_registry = edge_registry
+        self.log_internal_ids = bool(log_internal_ids)
 
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
@@ -289,11 +301,18 @@ class TrainingJobManager:
             frame_indices = list(job.frame_indices)
             send_low_conf_features = job.send_low_conf_features
         logger.info(
-            "Async training job {} started: edge_id={} job_type={} workspace={}",
-            job_id,
+            "Training job started: edge={} type={}.",
             edge_id,
-            job_type,
-            workspace,
+            request_kind or self._request_kind_for_job_type(job_type),
+        )
+        log_diagnostic_debug(
+            self,
+            "training job started details",
+            lambda: {
+                "job_id": job_id,
+                "workspace": workspace,
+                "payload_zip_bytes": len(payload_zip or b""),
+            },
         )
 
         try:
@@ -305,6 +324,7 @@ class TrainingJobManager:
                         request_kind=(request_kind or self._request_kind_for_job_type(job_type)),
                         payload_zip=payload_zip,
                         client_cache_path=workspace,
+                        log_internal_ids=self.log_internal_ids,
                     )
                 )
             success, model_data, message = self._execute_job(
@@ -315,7 +335,17 @@ class TrainingJobManager:
                 send_low_conf_features=send_low_conf_features,
             )
         except Exception as exc:
-            logger.exception("Async training job {} failed: {}", job_id, exc)
+            logger.error(
+                "Training job failed: edge={} type={} reason={}.",
+                edge_id,
+                request_kind or self._request_kind_for_job_type(job_type),
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "training job failure details",
+                lambda error=exc: {"job_id": job_id, "error": repr(error)},
+            )
             success = False
             model_data = ""
             message = str(exc)
@@ -348,12 +378,16 @@ class TrainingJobManager:
                             f"while job was based on v{job.base_model_version}"
                         )
                         logger.warning(
-                            "Training job {} for edge {} marked STALE: "
-                            "base_v={} but edge is at v={}",
-                            job_id,
+                            "Training job marked STALE: edge={} base_version={} "
+                            "current_version={}.",
                             job.edge_id,
                             job.base_model_version,
                             current_edge_version,
+                        )
+                        log_diagnostic_debug(
+                            self,
+                            "stale training job details",
+                            lambda: {"job_id": job_id},
                         )
                 except (ValueError, TypeError):
                     pass
@@ -369,13 +403,19 @@ class TrainingJobManager:
                 )
 
             logger.info(
-                "Async training job {} completed: edge_id={} status={} "
-                "model_data_len={} message={}",
-                job_id,
+                "Training job completed: edge={} status={} model_size={}.",
                 job.edge_id,
                 job.status,
-                len(job.model_data or ""),
-                job.message,
+                _format_bytes(len((job.model_data or "").encode("utf-8"))),
+            )
+            log_diagnostic_debug(
+                self,
+                "training job completed details",
+                lambda: {
+                    "job_id": job_id,
+                    "request_id": job.request_id,
+                    "message": job.message,
+                },
             )
 
             self._cv.notify_all()
@@ -389,12 +429,6 @@ class TrainingJobManager:
         frame_indices: list[int],
         send_low_conf_features: bool,
     ) -> tuple[bool, str, str]:
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
-            return self.continual_learner.get_ground_truth_and_retrain(
-                edge_id,
-                frame_indices,
-                workspace,
-            )
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
             return self.continual_learner.get_ground_truth_and_fixed_split_retrain(
                 edge_id,
@@ -404,8 +438,6 @@ class TrainingJobManager:
 
     @staticmethod
     def _request_kind_for_job_type(job_type: int) -> str:
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
-            return "train_model"
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
             return "continual_learning"
         raise ValueError(f"Unsupported training job type: {job_type!r}")

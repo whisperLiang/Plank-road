@@ -34,6 +34,7 @@ from cloud.training import build_proxy_validation_split
 from cloud.training.proxy_metadata import (
     runtime_input_tensor_shape_from_metadata as _runtime_input_tensor_shape_from_metadata,
 )
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from model_management.split_model_adapters import (
     get_split_runtime_input_resize_mode,
     get_split_runtime_model,
@@ -56,17 +57,7 @@ class FixedSplitPipeline(
     ProxyStageMixin,
     TrainingStageMixin,
 ):
-    """Performs ground-truth labelling and model retraining on the cloud side.
-
-    Workflow triggered when the edge detects drift:
-      1. Edge sends selected frame indices and the path of its local cache.
-      2. Cloud runs the large model on each frame to obtain ground-truth boxes.
-      3. Cloud saves a CSV annotation file inside the cache directory.
-      4. Cloud retrains a **fresh copy** of the lightweight edge model.
-      5. Cloud returns the updated state-dict bytes (base-64 encoded).
-
-    The edge model weights are kept separately from the cloud inference model.
-    """
+    """Run shard-based annotation, fixed-split retraining, and model publication."""
 
     def get_ground_truth_and_retrain(
         self,
@@ -75,7 +66,7 @@ class FixedSplitPipeline(
         cache_path: str,
     ) -> tuple[bool, str, str]:
         del edge_id, frame_indices, cache_path
-        message = "fixed-split training failed; legacy full-image retrain has been removed"
+        message = "full-frame retrain is unavailable; use fixed-split continual learning"
         logger.error("[CL] {}", message)
         return False, "", message
 
@@ -99,8 +90,7 @@ class FixedSplitPipeline(
                 if materialized_manifest is None:
                     raise RuntimeError(
                         "Shard-based continual-learning trigger payload must contain "
-                        "trigger_manifest.json; legacy bundle_manifest.json uploads "
-                        "are no longer supported."
+                        "trigger_manifest.json; bundle_manifest.json uploads are not supported."
                     )
                 manifest = materialized_manifest
                 self._log_stage_duration("loading bundle manifest", stage_started)
@@ -510,6 +500,17 @@ class FixedSplitPipeline(
                 return True, encoded, success_message
             except Exception as exc:
                 self._log_stage_duration("total round time", total_round_started)
-                message = "fixed-split training failed; legacy full-image retrain has been removed"
-                logger.exception("[FixedSplitCL] {} for edge {}: {}", message, edge_id, exc)
+                message = "fixed-split training failed"
+                logger.error(
+                    "[FixedSplitCL] {} for edge={}: {}.",
+                    message,
+                    edge_id,
+                    safe_error_summary(exc),
+                )
+                log_diagnostic_debug(
+                    self,
+                    "[FixedSplitCL] training failure diagnostics",
+                    lambda error=exc: {"error": repr(error)},
+                    runtime=True,
+                )
                 return False, "", f"{message}: {exc}"

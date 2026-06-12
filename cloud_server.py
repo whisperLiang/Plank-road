@@ -10,6 +10,7 @@ from loguru import logger
 from baselines.distributed.cloud_controller import DistributedBaselineController
 from cloud.edge_registry import EdgeRegistry
 from cloud.orchestrator import CloudContinualLearner, CloudFixedSplitOrchestrator
+from common.logging_sanitizer import log_diagnostic_debug
 from config import default_run_id, load_runtime_config, validate_baseline_method
 from grpc_server import message_transmission_pb2_grpc
 from grpc_server.rpc_server import MessageTransmissionServicer
@@ -38,6 +39,7 @@ class CloudServer:
         self.large_object_detection = None
         self.continual_learner = None
         self.training_job_manager = None
+        self.log_internal_ids = False
         if self.mode == "baseline":
             method = validate_baseline_method(
                 baseline_method or getattr(baseline_config, "method", "")
@@ -66,10 +68,14 @@ class CloudServer:
                 config,
                 self.large_object_detection,
             )
+            self.log_internal_ids = bool(
+                getattr(self.continual_learner, "log_internal_ids", False)
+            )
             self.training_job_manager = TrainingJobManager(
                 continual_learner=self.continual_learner,
                 max_concurrent_jobs=self.continual_learner.max_concurrent_jobs,
                 edge_registry=self.edge_registry,
+                log_internal_ids=self.log_internal_ids,
             )
 
     def start_server(self):
@@ -94,19 +100,23 @@ class CloudServer:
         max_concurrent_jobs = int(getattr(self.continual_learner, "max_concurrent_jobs", 0))
         logger.info(
             "cloud server effective startup config: pid={}, golden={}, "
-            "edge_model_name={}, listen_address={}, workspace_root={}, "
+            "edge_model_name={}, listen_address={}, "
             "grpc_max_workers={}, max_concurrent_jobs={}, mode={}, "
             "baseline_method={}, run_id={}",
             os.getpid(),
             getattr(self.config, "golden", "unknown"),
             getattr(self.config, "edge_model_name", "unknown"),
             listen_address,
-            workspace_root,
             grpc_max_workers,
             max_concurrent_jobs,
             self.mode,
             getattr(self, "baseline_method", ""),
             getattr(self, "run_id", ""),
+        )
+        log_diagnostic_debug(
+            self.log_internal_ids,
+            "cloud server startup paths",
+            lambda: {"workspace_root": workspace_root},
         )
         server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=grpc_max_workers),
@@ -120,6 +130,7 @@ class CloudServer:
                 training_job_manager=self.training_job_manager,
                 edge_registry=self.edge_registry,
                 baseline_controller=self.baseline_controller,
+                log_internal_ids=self.log_internal_ids,
             ),
             server,
         )

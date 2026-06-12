@@ -9,6 +9,7 @@ import torch
 from loguru import logger
 
 from cloud.contracts import validate_fixed_split_plan
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from model_management.universal_model_split import load_cached_split_batches
 
 FIXED_SPLIT_DYNAMIC_BATCH = (1, 64)
@@ -226,7 +227,8 @@ def negotiate_cached_split_runtime_batch_size(
         return int(candidate_batch_size)
 
     error_summary = ", ".join(
-        f"batch_size={batch_size}: {error}" for batch_size, error in errors.items()
+        f"batch_size={batch_size}: {safe_error_summary(error)}"
+        for batch_size, error in errors.items()
     )
     logger.warning(
         "[FixedSplitCL] cached split runtime batch-size negotiation failed "
@@ -443,21 +445,32 @@ class FixedSplitRuntimeContractMixin:
                 )
         logger.info(
             "[SamplePool] pending high-quality layout alignment: pending={} "
-            "compatible={} rename_compatible={} mismatched={} expected_source={} "
-            "expected_feature_layout_id={} low_quality_feature_layout_id={}.",
+            "compatible={} renamed={} mismatched={}.",
             len(pending_high_quality),
             compatible,
             renamed_compatible,
             len(pending_high_quality) - compatible,
-            expected_source,
-            expected_layout_id,
-            make_feature_layout_id(low_quality_layout) if low_quality_layout else "",
+        )
+        log_diagnostic_debug(
+            self,
+            "[SamplePool] pending high-quality layout diagnostics",
+            lambda: {
+                "expected_source": expected_source,
+                "expected_feature_layout_id": expected_layout_id,
+                "low_quality_feature_layout_id": (
+                    make_feature_layout_id(low_quality_layout) if low_quality_layout else ""
+                ),
+            },
         )
         if mismatches:
             logger.info(
-                "[SamplePool] pending high-quality feature-only samples are not compatible "
-                "with the active runtime layout and will remain deferred: preview={}",
-                mismatches,
+                "[SamplePool] deferred feature-only samples: count={} reason=layout_mismatch.",
+                len(mismatches),
+            )
+            log_diagnostic_debug(
+                self,
+                "[SamplePool] deferred feature-only sample diagnostics",
+                lambda: {"mismatches": mismatches},
             )
 
     def _contract_layout_tensors_from_runtime(
@@ -482,8 +495,14 @@ class FixedSplitRuntimeContractMixin:
         except Exception as exc:
             logger.warning(
                 "[FixedSplitCL] Could not sample cloud batch feature layout from "
-                "runtime; using uploaded feature layout for contract creation: {}",
-                exc,
+                "runtime; using uploaded feature layout. reason={}.",
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "[FixedSplitCL] feature-layout sampling failure",
+                lambda error=exc: {"error": repr(error)},
+                runtime=True,
             )
             return None
         if not isinstance(payload, BoundaryPayload):
@@ -595,9 +614,18 @@ class FixedSplitRuntimeContractMixin:
             return False
         shutil.move(source_path, stale_path)
         logger.info(
-            "[FixedSplitCL] Moved stale SplitRuntimeContract to {} reason={}.",
-            stale_path,
+            "[FixedSplitCL] Stale split contract archived: reason={}.",
             reason,
+        )
+        log_diagnostic_debug(
+            self,
+            "[FixedSplitCL] stale split contract archive diagnostics",
+            lambda: {
+                "split_config_id": split_config_id,
+                "source_path": source_path,
+                "stale_path": stale_path,
+            },
+            runtime=True,
         )
         return True
 
@@ -781,21 +809,27 @@ class FixedSplitRuntimeContractMixin:
                             path = proposed.save(self.split_contract_root)
                             if proposed.runtime_identity_id != existing.runtime_identity_id:
                                 logger.info(
-                                    "Runtime identity changed but feature ABI is "
-                                    "compatible; rebinding contract without dropping "
-                                    "active samples."
+                                    "[FixedSplitCL] Split contract rebound: feature ABI "
+                                    "compatible; active samples preserved."
                                 )
-                            logger.info(
-                                "[FixedSplitCL] SplitRuntimeContract rebound edge_id={} "
-                                "model_id={} split_config_id={} feature_abi_id={} "
-                                "source_contract_id={} current_contract_id={} path={}",
-                                edge_id,
-                                model_id,
-                                split_config_id,
-                                proposed.feature_abi_id,
-                                existing.contract_id,
-                                proposed.contract_id,
-                                path,
+                            else:
+                                logger.info(
+                                    "[FixedSplitCL] Split contract rebound: feature ABI "
+                                    "compatible; active samples preserved."
+                                )
+                            log_diagnostic_debug(
+                                self,
+                                "[FixedSplitCL] split contract rebound diagnostics",
+                                lambda: {
+                                    "edge_id": edge_id,
+                                    "model_id": model_id,
+                                    "split_config_id": split_config_id,
+                                    "feature_abi_id": proposed.feature_abi_id,
+                                    "source_contract_id": existing.contract_id,
+                                    "current_contract_id": proposed.contract_id,
+                                    "path": path,
+                                },
+                                runtime=True,
                             )
                             return proposed
                         return existing
@@ -917,16 +951,22 @@ class FixedSplitRuntimeContractMixin:
         )
         path = contract.save(self.split_contract_root)
         logger.info(
-            "[FixedSplitCL] SplitRuntimeContract created edge_id={} model_id={} "
-            "split_config_id={} canonical_split_key={} cloud_batch_split_id={} "
-            "feature_layout_id={} feature_abi_id={} path={}",
+            "[FixedSplitCL] Split contract created: edge={} model={} split={}.",
             edge_id,
             model_id,
-            split_config_id,
             canonical_split_key,
-            cloud_batch_split_id,
-            contract.feature_layout_id,
-            contract.feature_abi_id,
-            path,
+        )
+        log_diagnostic_debug(
+            self,
+            "[FixedSplitCL] split contract creation diagnostics",
+            lambda: {
+                "split_config_id": split_config_id,
+                "cloud_batch_split_id": cloud_batch_split_id,
+                "contract_id": contract.contract_id,
+                "feature_layout_id": contract.feature_layout_id,
+                "feature_abi_id": contract.feature_abi_id,
+                "path": path,
+            },
+            runtime=True,
         )
         return contract

@@ -39,6 +39,7 @@ from cloud.training.proxy_metadata import (
 from cloud.training.proxy_metadata import (
     runtime_input_tensor_shape_from_metadata as _runtime_input_tensor_shape_from_metadata,
 )
+from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES, model_lib
 from model_management.split_model_adapters import prepare_split_runtime_input
 from model_management.split_runtime.torchlens_forward_guard import torchlens_forward_guard
@@ -66,10 +67,17 @@ class TeacherAnnotationStage:
         if ensure_result.unresolved_count:
             logger.info(
                 "[TeacherAnnotation][Ensure] deferring unresolved low-quality "
-                "samples before canonical staging: "
-                "unresolved_count={} sample_ids_preview={}",
+                "samples before canonical staging: unresolved_count={}.",
                 ensure_result.unresolved_count,
-                [str(sample_id) for sample_id in ensure_result.unresolved_sample_ids[:5]],
+            )
+            log_diagnostic_debug(
+                self.service,
+                "[TeacherAnnotation][Ensure] deferred sample diagnostics",
+                lambda: {
+                    "sample_ids_preview": [
+                        str(sample_id) for sample_id in ensure_result.unresolved_sample_ids[:5]
+                    ]
+                },
             )
         return {
             str(sample_id): dict(labels)
@@ -112,8 +120,12 @@ class TeacherAnnotationMixin:
         ticket = self._reserve_teacher_ticket()
         queue_state.ticket_local.ticket = int(ticket)
         logger.warning(
-            "[FixedSplitCL] Reserved ad-hoc teacher ticket {} outside training-job scope.",
-            ticket,
+            "[FixedSplitCL] Reserved ad-hoc teacher slot outside training-job scope."
+        )
+        log_diagnostic_debug(
+            self,
+            "[FixedSplitCL] ad-hoc teacher ticket diagnostics",
+            lambda: {"ticket": ticket},
         )
         return int(ticket)
 
@@ -129,8 +141,7 @@ class TeacherAnnotationMixin:
         ticket = self._current_teacher_ticket()
         wait_started = time.perf_counter()
         logger.info(
-            "[FixedSplitCL] waiting for teacher slot (ticket={}, stage={}, samples={}).",
-            ticket,
+            "[FixedSplitCL] waiting for teacher slot: stage={} samples={}.",
             stage_label,
             sample_count,
         )
@@ -148,8 +159,7 @@ class TeacherAnnotationMixin:
                 queue_state.condition.wait()
         wait_elapsed = time.perf_counter() - wait_started
         logger.info(
-            "[FixedSplitCL] acquired teacher slot (ticket={}, stage={}, wait_time={:.3f}s).",
-            ticket,
+            "[FixedSplitCL] acquired teacher slot: stage={} wait_time={:.3f}s.",
             stage_label,
             wait_elapsed,
         )
@@ -165,12 +175,16 @@ class TeacherAnnotationMixin:
                 self._advance_teacher_queue_locked()
                 queue_state.condition.notify_all()
             logger.info(
-                "[FixedSplitCL] released teacher slot (ticket={}, stage={}, "
-                "wait_time={:.3f}s, execution_time={:.3f}s).",
-                ticket,
+                "[FixedSplitCL] released teacher slot: stage={} "
+                "wait_time={:.3f}s execution_time={:.3f}s.",
                 stage_label,
                 wait_elapsed,
                 execution_elapsed,
+            )
+            log_diagnostic_debug(
+                self,
+                "[FixedSplitCL] teacher slot diagnostics",
+                lambda: {"ticket": ticket, "stage": stage_label},
             )
 
     def _teacher_label_schema(self) -> str:
@@ -435,11 +449,17 @@ class TeacherAnnotationMixin:
             image_sha1 = _file_sha1(image_path)
         except Exception as exc:
             logger.warning(
-                "[TeacherAnnotation][Submit] skipped sample_id={} with unreadable "
-                "image hash path={} error={}",
-                sample_id,
-                image_path,
-                exc,
+                "[TeacherAnnotation][Submit] skipped unreadable image: reason={}.",
+                safe_error_summary(exc),
+            )
+            log_diagnostic_debug(
+                self,
+                "[TeacherAnnotation][Submit] unreadable image diagnostics",
+                lambda error=exc: {
+                    "sample_id": sample_id,
+                    "image_path": image_path,
+                    "error": repr(error),
+                },
             )
             return None
         return TeacherAnnotationRequest(
@@ -477,7 +497,14 @@ class TeacherAnnotationMixin:
             img_path = os.path.join(frame_dir, f"{sample_id}.jpg")
             if not os.path.exists(img_path):
                 if missing_raw_message is not None:
-                    logger.warning(missing_raw_message, sample_id)
+                    logger.warning(
+                        "[TeacherAnnotation][Submit] skipped sample with missing raw image."
+                    )
+                    log_diagnostic_debug(
+                        self,
+                        "[TeacherAnnotation][Submit] missing raw image diagnostics",
+                        lambda: {"sample_id": sample_id, "image_path": img_path},
+                    )
                 continue
             request = self._build_teacher_annotation_request(
                 sample_id=sample_id,

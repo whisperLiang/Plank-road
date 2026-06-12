@@ -89,6 +89,9 @@ client:
   shard_dtype: null # e.g. float16; null to inherit model dtype
   include_index_json: true
   include_meta_json: true
+ continual_learning:
+  # Diagnostics-only internal ids/hash/path logging. Default edge logs stay experiment-readable.
+  log_internal_ids: false
  # retrain
  retrain:
   flag: True
@@ -215,6 +218,8 @@ server:
   fixed_split_runtime_smoke_validate: false
   # Development-only detailed key/hash/signature diagnostics. Default runtime logs stay concise.
   fixed_split_runtime_diagnostics: false
+  # Diagnostics-only internal ids/hash/path logging. Default cloud logs stay experiment-readable.
+  log_internal_ids: false
   # Configured upper bound; RF-DETR small rounds shrink this toward the
   # target step count and retry at 16 if CUDA runs out of memory.
   batch_size: 32
