@@ -2,6 +2,11 @@ import argparse
 import json
 from pathlib import Path
 
+if __name__ == "__main__":
+    from common.cuda_visibility import configure_default_cuda_visible_devices
+
+    configure_default_cuda_visible_devices()
+
 import numpy as np
 from loguru import logger
 from mapcalc import calculate_map

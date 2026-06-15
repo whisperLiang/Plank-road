@@ -6,6 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+if __name__ == "__main__":
+    from common.cuda_visibility import configure_default_cuda_visible_devices
+
+    configure_default_cuda_visible_devices()
+
 from loguru import logger
 
 from cloud.orchestrator import CloudFixedSplitOrchestrator

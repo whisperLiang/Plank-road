@@ -3,6 +3,11 @@ import json
 import time
 from pathlib import Path
 
+if __name__ == "__main__":
+    from common.cuda_visibility import configure_default_cuda_visible_devices
+
+    configure_default_cuda_visible_devices()
+
 import cv2
 from loguru import logger
 

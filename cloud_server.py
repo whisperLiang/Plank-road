@@ -3,6 +3,11 @@ import os
 from concurrent import futures
 from pathlib import Path
 
+if __name__ == "__main__":
+    from common.cuda_visibility import configure_default_cuda_visible_devices
+
+    configure_default_cuda_visible_devices()
+
 import cv2
 import grpc
 import numpy as np
