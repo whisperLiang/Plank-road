@@ -267,6 +267,7 @@ class LocalContinualLearningBackend:
             protocol_version=job.protocol_version,
             base_model_version=job.base_model_version,
             result_model_version=job.result_model_version,
+            worker_id=str(getattr(job, "worker_id", "") or ""),
         )
 
     def download_trained_model(
@@ -588,6 +589,7 @@ class EdgeWorkerRoutedContinualLearningBackend:
             payload_zip=b"",
             payload_bundle_path=str(bundle_path),
             base_model_version=str(request.base_model_version or ""),
+            exclusive_gpu_lease=bool(getattr(request, "exclusive_gpu_lease", False)),
         )
 
     def _start_exclusive_retry(
@@ -632,6 +634,8 @@ class EdgeWorkerRoutedContinualLearningBackend:
                 finished_at_ms=failed_reply.finished_at_ms,
                 protocol_version=failed_reply.protocol_version,
                 base_model_version=failed_reply.base_model_version,
+                result_model_version=failed_reply.result_model_version,
+                worker_id=failed_reply.worker_id,
             )
         self._exclusive_retries[(edge_id, original_job_id)] = str(retry_reply.job_id)
         self._submitted_jobs[(edge_id, str(retry_reply.job_id))] = snapshot
@@ -685,6 +689,7 @@ class EdgeWorkerRoutedContinualLearningBackend:
             protocol_version=retry_reply.protocol_version,
             base_model_version=retry_reply.base_model_version,
             result_model_version=retry_reply.result_model_version,
+            worker_id=retry_reply.worker_id,
         )
 
 
@@ -769,4 +774,6 @@ def _read_trigger_manifest(*, workspace, payload_zip: bytes) -> dict | None:
 def _request_kind_for_job_type(job_type: int) -> str:
     if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
         return "continual_learning"
+    if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO:
+        return "baseline_frozen_ratio"
     raise ValueError(f"Unsupported training job type: {job_type!r}")

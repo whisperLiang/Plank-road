@@ -12,9 +12,11 @@ class TrainingJobType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     TRAINING_JOB_TYPE_UNSPECIFIED: _ClassVar[TrainingJobType]
     TRAINING_JOB_TYPE_FULL_FRAME: _ClassVar[TrainingJobType]
     TRAINING_JOB_TYPE_CONTINUAL_LEARNING: _ClassVar[TrainingJobType]
+    TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO: _ClassVar[TrainingJobType]
 TRAINING_JOB_TYPE_UNSPECIFIED: TrainingJobType
 TRAINING_JOB_TYPE_FULL_FRAME: TrainingJobType
 TRAINING_JOB_TYPE_CONTINUAL_LEARNING: TrainingJobType
+TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO: TrainingJobType
 
 class TrainRequest(_message.Message):
     __slots__ = ("edge_id", "frame_indices", "cache_path", "payload_zip")
@@ -137,7 +139,7 @@ class TrainingJobStatusRequest(_message.Message):
     def __init__(self, edge_id: _Optional[int] = ..., job_id: _Optional[str] = ...) -> None: ...
 
 class TrainingJobStatusReply(_message.Message):
-    __slots__ = ("found", "job_id", "edge_id", "status", "queue_position", "message", "request_id", "job_type", "result_available", "submitted_at_ms", "started_at_ms", "finished_at_ms", "protocol_version", "base_model_version", "result_model_version")
+    __slots__ = ("found", "job_id", "edge_id", "status", "queue_position", "message", "request_id", "job_type", "result_available", "submitted_at_ms", "started_at_ms", "finished_at_ms", "protocol_version", "base_model_version", "result_model_version", "worker_id")
     FOUND_FIELD_NUMBER: _ClassVar[int]
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -153,6 +155,7 @@ class TrainingJobStatusReply(_message.Message):
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     BASE_MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
     RESULT_MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     found: bool
     job_id: str
     edge_id: int
@@ -168,7 +171,8 @@ class TrainingJobStatusReply(_message.Message):
     protocol_version: str
     base_model_version: str
     result_model_version: str
-    def __init__(self, found: bool = ..., job_id: _Optional[str] = ..., edge_id: _Optional[int] = ..., status: _Optional[str] = ..., queue_position: _Optional[int] = ..., message: _Optional[str] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., result_available: bool = ..., submitted_at_ms: _Optional[int] = ..., started_at_ms: _Optional[int] = ..., finished_at_ms: _Optional[int] = ..., protocol_version: _Optional[str] = ..., base_model_version: _Optional[str] = ..., result_model_version: _Optional[str] = ...) -> None: ...
+    worker_id: str
+    def __init__(self, found: bool = ..., job_id: _Optional[str] = ..., edge_id: _Optional[int] = ..., status: _Optional[str] = ..., queue_position: _Optional[int] = ..., message: _Optional[str] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., result_available: bool = ..., submitted_at_ms: _Optional[int] = ..., started_at_ms: _Optional[int] = ..., finished_at_ms: _Optional[int] = ..., protocol_version: _Optional[str] = ..., base_model_version: _Optional[str] = ..., result_model_version: _Optional[str] = ..., worker_id: _Optional[str] = ...) -> None: ...
 
 class DownloadTrainedModelRequest(_message.Message):
     __slots__ = ("edge_id", "job_id")
@@ -423,18 +427,24 @@ class BaselineTrainingRequest(_message.Message):
     def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., training_strategy: _Optional[str] = ..., frame_ids: _Optional[_Iterable[int]] = ..., payload_json: _Optional[str] = ...) -> None: ...
 
 class BaselineTrainingReply(_message.Message):
-    __slots__ = ("accepted", "job_id", "status", "message", "training_strategy")
+    __slots__ = ("accepted", "job_id", "status", "message", "training_strategy", "queue_position", "protocol_version", "result_model_version")
     ACCEPTED_FIELD_NUMBER: _ClassVar[int]
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     MESSAGE_FIELD_NUMBER: _ClassVar[int]
     TRAINING_STRATEGY_FIELD_NUMBER: _ClassVar[int]
+    QUEUE_POSITION_FIELD_NUMBER: _ClassVar[int]
+    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    RESULT_MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
     accepted: bool
     job_id: str
     status: str
     message: str
     training_strategy: str
-    def __init__(self, accepted: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., message: _Optional[str] = ..., training_strategy: _Optional[str] = ...) -> None: ...
+    queue_position: int
+    protocol_version: str
+    result_model_version: str
+    def __init__(self, accepted: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., message: _Optional[str] = ..., training_strategy: _Optional[str] = ..., queue_position: _Optional[int] = ..., protocol_version: _Optional[str] = ..., result_model_version: _Optional[str] = ...) -> None: ...
 
 class BaselineTrainingStatusRequest(_message.Message):
     __slots__ = ("run_id", "baseline_method", "edge_id", "job_id")
@@ -449,18 +459,40 @@ class BaselineTrainingStatusRequest(_message.Message):
     def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., job_id: _Optional[str] = ...) -> None: ...
 
 class BaselineTrainingStatusReply(_message.Message):
-    __slots__ = ("found", "job_id", "status", "message", "result_available")
+    __slots__ = ("found", "job_id", "status", "message", "result_available", "queue_position", "edge_id", "request_id", "job_type", "submitted_at_ms", "started_at_ms", "finished_at_ms", "protocol_version", "base_model_version", "result_model_version", "worker_id")
     FOUND_FIELD_NUMBER: _ClassVar[int]
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     MESSAGE_FIELD_NUMBER: _ClassVar[int]
     RESULT_AVAILABLE_FIELD_NUMBER: _ClassVar[int]
+    QUEUE_POSITION_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    JOB_TYPE_FIELD_NUMBER: _ClassVar[int]
+    SUBMITTED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    STARTED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    FINISHED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    BASE_MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    RESULT_MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     found: bool
     job_id: str
     status: str
     message: str
     result_available: bool
-    def __init__(self, found: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., message: _Optional[str] = ..., result_available: bool = ...) -> None: ...
+    queue_position: int
+    edge_id: int
+    request_id: str
+    job_type: TrainingJobType
+    submitted_at_ms: int
+    started_at_ms: int
+    finished_at_ms: int
+    protocol_version: str
+    base_model_version: str
+    result_model_version: str
+    worker_id: str
+    def __init__(self, found: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., message: _Optional[str] = ..., result_available: bool = ..., queue_position: _Optional[int] = ..., edge_id: _Optional[int] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., submitted_at_ms: _Optional[int] = ..., started_at_ms: _Optional[int] = ..., finished_at_ms: _Optional[int] = ..., protocol_version: _Optional[str] = ..., base_model_version: _Optional[str] = ..., result_model_version: _Optional[str] = ..., worker_id: _Optional[str] = ...) -> None: ...
 
 class BaselineModelUpdateRequest(_message.Message):
     __slots__ = ("run_id", "baseline_method", "edge_id", "job_id")
@@ -475,17 +507,21 @@ class BaselineModelUpdateRequest(_message.Message):
     def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., job_id: _Optional[str] = ...) -> None: ...
 
 class BaselineModelUpdateReply(_message.Message):
-    __slots__ = ("success", "job_id", "status", "model_data", "message", "model_version")
+    __slots__ = ("success", "job_id", "status", "model_data", "message", "model_version", "protocol_version", "result_model_version")
     SUCCESS_FIELD_NUMBER: _ClassVar[int]
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     MODEL_DATA_FIELD_NUMBER: _ClassVar[int]
     MESSAGE_FIELD_NUMBER: _ClassVar[int]
     MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    RESULT_MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
     success: bool
     job_id: str
     status: str
     model_data: str
     message: str
     model_version: str
-    def __init__(self, success: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ..., model_version: _Optional[str] = ...) -> None: ...
+    protocol_version: str
+    result_model_version: str
+    def __init__(self, success: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ..., model_version: _Optional[str] = ..., protocol_version: _Optional[str] = ..., result_model_version: _Optional[str] = ...) -> None: ...

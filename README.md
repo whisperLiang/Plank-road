@@ -312,6 +312,25 @@ accuracy_trigger_cloud_retraining
 ekya_style_centralized_scheduling
 ```
 
+All three baselines use the baseline frozen-ratio trainer for updates. The
+default keeps the last 30% of model parameters trainable and freezes the
+earlier 70% in module registration order:
+
+```yaml
+baseline:
+  training:
+    trainable_param_ratio: 0.3
+    freeze_order: forward_module_order
+    batch_size: 32
+    num_epoch: 50
+    learning_rate: 1.0e-3
+```
+
+This baseline trainer consumes raw frames and teacher/pseudo labels, runs a
+full-model forward/backward pass, and updates only the unfrozen parameter
+suffix. It does not use Plank-Road fixed-split runtime contracts, feature
+shards, or split-tail suffix replay.
+
 Accuracy-Trigger Cloud Retraining cloud:
 
 ```bash
@@ -392,7 +411,7 @@ uv run python edge_client.py \
   --headless
 ```
 
-Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud. Accuracy-Trigger uploads only edge-selected keyframes and uses cloud-side `frozen_training`. Ekya disables frame filtering, uploads raw frames, receives cloud inference results for visualization, and uses `ekya_style` training.
+Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. Ekya disables frame filtering, uploads raw frames, receives cloud inference results for visualization, and schedules cloud-side frozen-ratio retraining through the same edge-affine worker pool.
 
 ## Testing
 

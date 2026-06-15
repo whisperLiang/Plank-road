@@ -13,7 +13,9 @@ class EkyaStyleCentralizedSchedulingPolicy(BaseBaselinePolicy):
             getattr(config, "return_cloud_inference_to_edge", True)
         )
         self.enable_micro_profiling = bool(getattr(config, "enable_micro_profiling", True))
-        self._training_strategy = str(getattr(config, "training_strategy", "ekya_style"))
+        self._training_strategy = str(
+            getattr(config, "training_strategy", "frozen_ratio_training")
+        )
 
     @property
     def frame_filter_enabled(self) -> bool:

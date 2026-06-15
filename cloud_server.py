@@ -65,6 +65,14 @@ class CloudServer:
                 resolved_run_id = default_run_id(method)
             inference_fn = None
             if method != "pure_edge_local_updating":
+                edge_affine = getattr(config, "edge_affine_workers", None)
+                if edge_affine is None or not bool(getattr(edge_affine, "enabled", False)):
+                    raise ValueError(
+                        "Cloud-backed baseline training requires "
+                        "server.edge_affine_workers.enabled=true."
+                    )
+                edge_affine.run_id = resolved_run_id
+                self._init_edge_affine_backend(edge_affine)
                 from model_management.object_detection import Object_Detection
 
                 self.large_object_detection = Object_Detection(config, type="large inference")
@@ -76,6 +84,10 @@ class CloudServer:
                     getattr(baseline_config, "results_root", "results/baselines_distributed")
                 ),
                 inference_fn=inference_fn,
+                training_backend=self.continual_backend,
+                baseline_training_config=getattr(baseline_config, "training", None),
+                model_weights_path=str(getattr(config, "weights_path", "") or ""),
+                tinynext_input_size=getattr(config, "tinynext_input_size", None),
                 strict_run_id=True,
             )
             self.baseline_method = method

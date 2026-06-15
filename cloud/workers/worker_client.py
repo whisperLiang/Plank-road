@@ -111,6 +111,7 @@ class EdgeWorkerClient:
             protocol_version=str(result.get("protocol_version", "")),
             base_model_version=str(result.get("base_model_version", "")),
             result_model_version=str(result.get("result_model_version", "")),
+            worker_id=str(result.get("worker_id", "")),
         )
 
     def download_trained_model(self, request) -> message_transmission_pb2.DownloadTrainedModelReply:

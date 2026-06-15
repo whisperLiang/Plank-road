@@ -11,6 +11,7 @@ from loguru import logger
 from cloud.orchestrator import CloudFixedSplitOrchestrator
 from cloud.workers.worker_client import GpuLeaseHttpClient, decode_payload_zip
 from cloud.workers.worker_protocol import JsonRpcServer
+from baselines.training import BaselineFrozenRatioTrainer
 from config import load_runtime_config
 from grpc_server import message_transmission_pb2
 from grpc_server.continual_backends import LocalContinualLearningBackend
@@ -68,10 +69,14 @@ class EdgeWorkerService:
             gpu_lease_client=self.lease_client,
             worker_id=self.worker_id,
         )
+        self.baseline_trainer = BaselineFrozenRatioTrainer(
+            config=getattr(runtime_config.baseline, "training", None),
+        )
         self.training_jobs = TrainingJobManager(
             continual_learner=self.learner,
             max_concurrent_jobs=1,
             edge_registry=None,
+            baseline_trainer=self.baseline_trainer,
             log_internal_ids=bool(getattr(self.learner, "log_internal_ids", False)),
         )
         self.backend = LocalContinualLearningBackend(
@@ -172,6 +177,7 @@ class EdgeWorkerService:
             "protocol_version": reply.protocol_version,
             "base_model_version": reply.base_model_version,
             "result_model_version": reply.result_model_version,
+            "worker_id": reply.worker_id,
         }
 
     def download_trained_model(self, payload: dict[str, Any]) -> dict[str, Any]:

@@ -68,6 +68,7 @@ class TrainingJob:
     finished_at_ms: int = 0
     base_model_version: str = "0"
     result_model_version: str = ""
+    worker_id: str = ""
 
 
 class TrainingJobManager:
@@ -79,11 +80,13 @@ class TrainingJobManager:
         continual_learner: "CloudContinualLearner",
         max_concurrent_jobs: int,
         edge_registry: "EdgeRegistry | None" = None,
+        baseline_trainer: object | None = None,
         log_internal_ids: bool = False,
     ) -> None:
         self.continual_learner = continual_learner
         self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
         self.edge_registry = edge_registry
+        self.baseline_trainer = baseline_trainer
         self.log_internal_ids = bool(log_internal_ids)
 
         self._lock = threading.Lock()
@@ -142,22 +145,23 @@ class TrainingJobManager:
                 existing_job_id = self._request_index.get(request_key)
                 if existing_job_id is not None:
                     return self._jobs[existing_job_id], False
-            for existing in self._jobs.values():
-                if existing.edge_id != int(edge_id):
-                    continue
-                if existing.job_type != int(job_type):
-                    continue
-                if existing.base_model_version != str(base_model_version or "0"):
-                    continue
-                if existing.status in TERMINAL_JOB_STATUSES:
-                    continue
-                logger.info(
-                    "[TrainingJob] Reusing existing continual-learning job: "
-                    "edge={} existing_job={}",
-                    int(edge_id),
-                    existing.job_id,
-                )
-                return existing, False
+            if int(job_type) == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
+                for existing in self._jobs.values():
+                    if existing.edge_id != int(edge_id):
+                        continue
+                    if existing.job_type != int(job_type):
+                        continue
+                    if existing.base_model_version != str(base_model_version or "0"):
+                        continue
+                    if existing.status in TERMINAL_JOB_STATUSES:
+                        continue
+                    logger.info(
+                        "[TrainingJob] Reusing existing continual-learning job: "
+                        "edge={} existing_job={}",
+                        int(edge_id),
+                        existing.job_id,
+                    )
+                    return existing, False
 
             job_id = uuid.uuid4().hex
             job = TrainingJob(
@@ -174,6 +178,7 @@ class TrainingJobManager:
                 frame_indices=tuple(int(value) for value in (frame_indices or [])),
                 exclusive_gpu_lease=bool(exclusive_gpu_lease),
                 base_model_version=str(base_model_version or "0"),
+                worker_id=str(getattr(self.continual_learner, "worker_id", "") or ""),
             )
             self._jobs[job_id] = job
             if normalized_request_id:
@@ -321,6 +326,7 @@ class TrainingJobManager:
             frame_indices = list(job.frame_indices)
             send_low_conf_features = job.send_low_conf_features
             exclusive_gpu_lease = job.exclusive_gpu_lease
+            base_model_version = job.base_model_version
         logger.info(
             "Training job started: edge={} type={}.",
             edge_id,
@@ -366,6 +372,7 @@ class TrainingJobManager:
                     workspace=workspace,
                     frame_indices=frame_indices,
                     send_low_conf_features=send_low_conf_features,
+                    base_model_version=base_model_version,
                 )
         except Exception as exc:
             logger.error(
@@ -461,11 +468,25 @@ class TrainingJobManager:
         workspace: str,
         frame_indices: list[int],
         send_low_conf_features: bool,
+        base_model_version: str = "0",
     ) -> tuple[bool, str, str]:
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
             return self.continual_learner.get_ground_truth_and_fixed_split_retrain(
                 edge_id,
                 workspace,
+            )
+        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO:
+            if self.baseline_trainer is None:
+                raise RuntimeError("baseline frozen-ratio trainer is not configured")
+            result = self.baseline_trainer.train_from_workspace(
+                workspace,
+                base_model_version=str(base_model_version or "0"),
+                result_model_version=_next_model_version(base_model_version),
+            )
+            return (
+                bool(result.get("success", True)),
+                str(result.get("model_data", "") or ""),
+                str(result.get("message", "baseline frozen-ratio training completed")),
             )
         raise ValueError(f"Unsupported training job type: {job_type!r}")
 
@@ -473,6 +494,8 @@ class TrainingJobManager:
     def _request_kind_for_job_type(job_type: int) -> str:
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
             return "continual_learning"
+        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO:
+            return "baseline_frozen_ratio"
         raise ValueError(f"Unsupported training job type: {job_type!r}")
 
     def _queue_position_locked(self, job_id: str) -> int:
@@ -498,3 +521,10 @@ class TrainingJobManager:
         self._edge_round_robin = deque(
             value for value in self._edge_round_robin if value != edge_id
         )
+
+
+def _next_model_version(base_model_version: str) -> str:
+    try:
+        return str(int(base_model_version or "0") + 1)
+    except (TypeError, ValueError):
+        return "1"

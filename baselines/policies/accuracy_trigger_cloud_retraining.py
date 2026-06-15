@@ -14,7 +14,9 @@ class AccuracyTriggerCloudRetrainingPolicy(BaseBaselinePolicy):
             getattr(config, "trigger_on_cloud_comparison", True)
         )
         self.return_model_update = bool(getattr(config, "return_model_update", True))
-        self._training_strategy = str(getattr(config, "training_strategy", "frozen_training"))
+        self._training_strategy = str(
+            getattr(config, "training_strategy", "frozen_ratio_training")
+        )
 
     @property
     def frame_filter_enabled(self) -> bool:

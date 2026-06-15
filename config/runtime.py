@@ -249,7 +249,7 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     reuse_plank_road_frame_filter: bool = True
     upload_keyframes_only: bool = True
     trigger_on_cloud_comparison: bool = True
-    training_strategy: str = "frozen_training"
+    training_strategy: str = "frozen_ratio_training"
     return_model_update: bool = True
 
 
@@ -259,8 +259,24 @@ class EkyaStyleBaselineConfig(ConfigSection):
     use_frame_filter: bool = False
     cloud_inference: bool = True
     return_cloud_inference_to_edge: bool = True
-    training_strategy: str = "ekya_style"
+    training_strategy: str = "frozen_ratio_training"
     enable_micro_profiling: bool = True
+
+
+@dataclass
+class BaselineTrainingConfig(ConfigSection):
+    trainable_param_ratio: float = 0.3
+    freeze_order: str = "forward_module_order"
+    batch_size: int = 32
+    num_epoch: int = 50
+    learning_rate: float = 1e-3
+    optimizer_name: str = "adam"
+    weight_decay: float = 0.0
+    min_training_samples: int = 1
+    training_window_size: int = 8
+    microprofile_epochs: int = 1
+    microprofile_max_samples: int = 16
+    device: str = "auto"
 
 
 @dataclass
@@ -269,6 +285,7 @@ class BaselineConfig(ConfigSection):
     method: str = "accuracy_trigger_cloud_retraining"
     run_id: str | None = None
     results_root: str = "results/baselines_distributed"
+    training: BaselineTrainingConfig = field(default_factory=BaselineTrainingConfig)
     pure_edge_local_updating: PureEdgeBaselineConfig = field(default_factory=PureEdgeBaselineConfig)
     accuracy_trigger_cloud_retraining: AccuracyTriggerBaselineConfig = field(
         default_factory=AccuracyTriggerBaselineConfig
@@ -487,6 +504,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["gpu_lease"] = _section(GpuLeaseConfig, known.get("gpu_lease"))
         known["worker"] = _section(WorkerServiceConfig, known.get("worker"))
     elif section_cls is BaselineConfig:
+        known["training"] = _section(
+            BaselineTrainingConfig,
+            known.get("training"),
+        )
         known["pure_edge_local_updating"] = _section(
             PureEdgeBaselineConfig,
             known.get("pure_edge_local_updating"),
@@ -629,6 +650,36 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError("baseline.enabled must be a boolean")
     if not str(config.baseline.results_root or "").strip():
         raise ValueError("baseline.results_root must be non-empty")
+    baseline_training = config.baseline.training
+    trainable_ratio = float(baseline_training.trainable_param_ratio)
+    if not 0.0 < trainable_ratio <= 1.0:
+        raise ValueError("baseline.training.trainable_param_ratio must be within (0, 1]")
+    if str(baseline_training.freeze_order) != "forward_module_order":
+        raise ValueError(
+            "baseline.training.freeze_order currently supports only forward_module_order"
+        )
+    _validate_positive("baseline.training.batch_size", int(baseline_training.batch_size))
+    _validate_positive("baseline.training.num_epoch", int(baseline_training.num_epoch))
+    _validate_positive(
+        "baseline.training.learning_rate",
+        float(baseline_training.learning_rate),
+    )
+    _validate_positive(
+        "baseline.training.min_training_samples",
+        int(baseline_training.min_training_samples),
+    )
+    _validate_positive(
+        "baseline.training.training_window_size",
+        int(baseline_training.training_window_size),
+    )
+    _validate_positive(
+        "baseline.training.microprofile_epochs",
+        int(baseline_training.microprofile_epochs),
+    )
+    _validate_positive(
+        "baseline.training.microprofile_max_samples",
+        int(baseline_training.microprofile_max_samples),
+    )
     pure_edge = config.baseline.pure_edge_local_updating
     if str(pure_edge.label_source) not in {"pseudo_label", "local_gt_dir", "none"}:
         raise ValueError(

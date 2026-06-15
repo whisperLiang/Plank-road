@@ -351,14 +351,18 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 baseline_method=request.baseline_method,
                 edge_id=int(request.edge_id),
                 training_strategy=request.training_strategy,
+                frame_ids=[int(value) for value in request.frame_ids],
                 payload=json_loads(request.payload_json),
             )
             return message_transmission_pb2.BaselineTrainingReply(
                 accepted=True,
                 job_id=str(job["job_id"]),
                 status=str(job["status"]),
-                message="training job accepted",
+                message=str(job.get("message", "training job accepted")),
                 training_strategy=str(job["training_strategy"]),
+                queue_position=int(job.get("queue_position", -1)),
+                protocol_version=str(job.get("protocol_version", "")),
+                result_model_version=str(job.get("result_model_version", "")),
             )
         except Exception as exc:
             self._log_failure("RequestTraining", exc)
@@ -378,6 +382,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 status="",
                 message="baseline controller is not configured",
                 result_available=False,
+                queue_position=-1,
             )
         try:
             job = self.baseline_controller.poll_training_job(
@@ -390,8 +395,23 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 found=job is not None,
                 job_id=request.job_id,
                 status=str(job.get("status", "")) if job is not None else "",
-                message="training job found" if job is not None else "training job not found",
-                result_available=job is not None and str(job.get("status")) == "SUCCEEDED",
+                message=str(job.get("message", "training job found"))
+                if job is not None
+                else "training job not found",
+                result_available=bool(job.get("result_available", False))
+                if job is not None
+                else False,
+                queue_position=int(job.get("queue_position", -1)) if job is not None else -1,
+                edge_id=int(job.get("edge_id", request.edge_id)) if job is not None else int(request.edge_id),
+                request_id=str(job.get("request_id", "")) if job is not None else "",
+                job_type=int(job.get("job_type", 0)) if job is not None else 0,
+                submitted_at_ms=int(job.get("submitted_at_ms", 0)) if job is not None else 0,
+                started_at_ms=int(job.get("started_at_ms", 0)) if job is not None else 0,
+                finished_at_ms=int(job.get("finished_at_ms", 0)) if job is not None else 0,
+                protocol_version=str(job.get("protocol_version", "")) if job is not None else "",
+                base_model_version=str(job.get("base_model_version", "")) if job is not None else "",
+                result_model_version=str(job.get("result_model_version", "")) if job is not None else "",
+                worker_id=str(job.get("worker_id", "")) if job is not None else "",
             )
         except Exception as exc:
             self._log_failure("PollTrainingJob", exc)
@@ -401,6 +421,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 status="",
                 message=str(exc),
                 result_available=False,
+                queue_position=-1,
             )
 
     def DownloadModelUpdate(self, request, context):
@@ -427,6 +448,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 model_data=str(update.get("model_data", "")) if update is not None else "",
                 message="model update found" if update is not None else "model update not found",
                 model_version=str(update.get("model_version", "")) if update is not None else "",
+                protocol_version=str(update.get("protocol_version", ""))
+                if update is not None
+                else "",
+                result_model_version=str(update.get("result_model_version", ""))
+                if update is not None
+                else "",
             )
         except Exception as exc:
             self._log_failure("DownloadModelUpdate", exc)
