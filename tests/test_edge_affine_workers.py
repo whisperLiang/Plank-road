@@ -16,6 +16,12 @@ from grpc_server import message_transmission_pb2
 from grpc_server.continual_backends import EdgeWorkerRoutedContinualLearningBackend
 
 
+def test_edge_worker_module_imports() -> None:
+    import cloud.workers.edge_worker as edge_worker
+
+    assert edge_worker.EdgeWorkerService is not None
+
+
 def test_assignment_store_sticky_and_isolated(tmp_path: Path) -> None:
     store_path = tmp_path / "worker_assignments.json"
     store = EdgeAssignmentStore(

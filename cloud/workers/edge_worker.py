@@ -9,8 +9,8 @@ from typing import Any
 from loguru import logger
 
 from cloud.orchestrator import CloudFixedSplitOrchestrator
-from cloud.workers.worker_client import GpuLeaseHttpClient
-from cloud.workers.worker_protocol import JsonRpcServer, decode_payload_zip
+from cloud.workers.worker_client import GpuLeaseHttpClient, decode_payload_zip
+from cloud.workers.worker_protocol import JsonRpcServer
 from config import load_runtime_config
 from grpc_server import message_transmission_pb2
 from grpc_server.continual_backends import LocalContinualLearningBackend
