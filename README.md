@@ -31,14 +31,14 @@ Run a single edge against one cloud server:
 
 ```bash
 # Terminal 1
-uv run python cloud_server.py \
+python cloud_server.py \
   --yaml_path ./config/config.yaml \
   --edge_affine_workers_enabled true \
   --edge_affine_worker_mode edge_affine_single_gpu_mps \
   --run_id plank_road_single_edge_001
 
 # Terminal 2
-uv run python edge_client.py --headless
+python edge_client.py --headless
 ```
 
 Runtime defaults come from [config/config.yaml](./config/config.yaml), including video source, model choices, split-learning settings, resource trigger budgets, cloud workspace paths, and gRPC addresses.
@@ -46,7 +46,7 @@ Runtime defaults come from [config/config.yaml](./config/config.yaml), including
 Generated gRPC files are committed under [grpc_server/](./grpc_server/). Rebuild them only after changing [grpc_server/protos/message_transmission.proto](./grpc_server/protos/message_transmission.proto):
 
 ```bash
-uv run python -m grpc_tools.protoc \
+python -m grpc_tools.protoc \
     -I ./grpc_server/protos \
     --python_out=./grpc_server \
     --pyi_out=./grpc_server \
@@ -196,13 +196,13 @@ server:
 Start the cloud server and one edge client:
 
 ```bash
-uv run python cloud_server.py \
+python cloud_server.py \
   --yaml_path ./config/config.yaml \
   --edge_affine_workers_enabled true \
   --edge_affine_worker_mode edge_affine_single_gpu_mps \
   --run_id plank_road_single_edge_001
 
-uv run python edge_client.py --headless
+python edge_client.py --headless
 ```
 
 Useful edge overrides:
@@ -239,7 +239,7 @@ nvidia-cuda-mps-control -d
 Start the cloud:
 
 ```bash
-uv run python cloud_server.py \
+python cloud_server.py \
   --yaml_path ./config/config.yaml \
   --listen_address "[::]:50051" \
   --edge_affine_workers_enabled true \
@@ -250,7 +250,7 @@ uv run python cloud_server.py \
 Start each physical edge with a unique `edge_id`:
 
 ```bash
-uv run python edge_client.py \
+python edge_client.py \
   --yaml_path ./config/config.yaml \
   --edge_id 1 \
   --server_ip <cloud_ip>:50051 \
@@ -260,7 +260,7 @@ uv run python edge_client.py \
 ```
 
 ```bash
-uv run python edge_client.py \
+python edge_client.py \
   --yaml_path ./config/config.yaml \
   --edge_id 2 \
   --server_ip <cloud_ip>:50051 \
@@ -270,7 +270,7 @@ uv run python edge_client.py \
 ```
 
 ```bash
-uv run python edge_client.py \
+python edge_client.py \
   --yaml_path ./config/config.yaml \
   --edge_id 3 \
   --server_ip <cloud_ip>:50051 \
@@ -334,7 +334,7 @@ shards, or split-tail suffix replay.
 Accuracy-Trigger Cloud Retraining cloud:
 
 ```bash
-uv run python cloud_server.py \
+python cloud_server.py \
   --yaml_path ./config/config.yaml \
   --mode baseline \
   --baseline_method accuracy_trigger_cloud_retraining \
@@ -345,7 +345,7 @@ uv run python cloud_server.py \
 Accuracy-Trigger edge device 1:
 
 ```bash
-uv run python edge_client.py \
+python edge_client.py \
   --yaml_path ./config/config.yaml \
   --mode baseline \
   --baseline_method accuracy_trigger_cloud_retraining \
@@ -360,7 +360,7 @@ uv run python edge_client.py \
 Accuracy-Trigger edge device 2:
 
 ```bash
-uv run python edge_client.py \
+python edge_client.py \
   --yaml_path ./config/config.yaml \
   --mode baseline \
   --baseline_method accuracy_trigger_cloud_retraining \
@@ -375,7 +375,7 @@ uv run python edge_client.py \
 Pure Edge Local Updating:
 
 ```bash
-uv run python edge_client.py \
+python edge_client.py \
   --yaml_path ./config/config.yaml \
   --mode baseline \
   --baseline_method pure_edge_local_updating \
@@ -388,7 +388,7 @@ uv run python edge_client.py \
 Ekya-Style Centralized Scheduling cloud:
 
 ```bash
-uv run python cloud_server.py \
+python cloud_server.py \
   --yaml_path ./config/config.yaml \
   --mode baseline \
   --baseline_method ekya_style_centralized_scheduling \
@@ -399,7 +399,7 @@ uv run python cloud_server.py \
 Ekya edge:
 
 ```bash
-uv run python edge_client.py \
+python edge_client.py \
   --yaml_path ./config/config.yaml \
   --mode baseline \
   --baseline_method ekya_style_centralized_scheduling \
@@ -418,7 +418,7 @@ Pure Edge Local Updating writes metrics locally under `results/baselines_distrib
 Run the full test suite:
 
 ```bash
-uv run pytest
+pytest
 ```
 
 Core coverage includes cloud contracts/orchestration, feature shard and cache handling, fixed-split runtime and retraining, teacher annotation, baseline metrics, and edge/cloud gRPC behavior.
@@ -426,7 +426,7 @@ Core coverage includes cloud contracts/orchestration, feature shard and cache ha
 Focused validation command:
 
 ```bash
-uv run pytest \
+pytest \
     tests/test_cloud_contracts.py \
     tests/test_orchestration_refactor.py \
     tests/test_edge_feature_shard_writer.py \
