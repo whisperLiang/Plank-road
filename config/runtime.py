@@ -212,7 +212,7 @@ class ContinualLearningConfig(ConfigSection):
     tinynext_fixed_split_target_steps_per_round: int = 4
     yolo_fixed_split_target_steps_per_round: int = 4
     rfdetr_fixed_split_target_steps_per_round: int = 4
-    max_concurrent_jobs: int = 2
+    max_concurrent_jobs: int = 1
     teacher_annotation: TeacherAnnotationConfig = field(default_factory=TeacherAnnotationConfig)
     feature_cache: FeatureCacheConfig = field(default_factory=FeatureCacheConfig)
 
@@ -338,7 +338,7 @@ class WorkerServiceConfig(ConfigSection):
 
 @dataclass
 class EdgeAffineWorkersConfig(ConfigSection):
-    enabled: bool = False
+    enabled: bool = True
     run_id: str | None = None
     mode: str = "edge_affine_single_gpu_mps"
     edge_workers: EdgeWorkerConfig = field(default_factory=EdgeWorkerConfig)

@@ -578,9 +578,20 @@ def test_cloud_server_worker_pool_does_not_create_local_training_objects(
     server = CloudServer(config, yaml_path="./config/config.yaml")
 
     assert server.large_object_detection is None
-    assert server.continual_learner is None
-    assert server.training_job_manager is None
+    assert not hasattr(server, "continual_learner")
+    assert not hasattr(server, "training_job_manager")
     assert isinstance(server.continual_backend, EdgeWorkerRoutedContinualLearningBackend)
+
+
+def test_cloud_server_main_requires_edge_affine_workers(tmp_path: Path) -> None:
+    from cloud_server import CloudServer
+
+    config = load_runtime_config("./config/config.yaml").server
+    config.workspace_root = str(tmp_path)
+    config.edge_affine_workers.enabled = False
+
+    with pytest.raises(ValueError, match=r"edge_affine_workers\.enabled=true"):
+        CloudServer(config, yaml_path="./config/config.yaml")
 
 
 def test_torchlens_prepare_split_error_message(monkeypatch) -> None:

@@ -18,12 +18,8 @@ from cloud.workers.mps_runtime import ensure_mps_runtime
 from common.logging_sanitizer import log_diagnostic_debug
 from config import default_run_id, load_runtime_config, validate_baseline_method
 from grpc_server import message_transmission_pb2_grpc
-from grpc_server.continual_backends import (
-    EdgeWorkerRoutedContinualLearningBackend,
-    LocalContinualLearningBackend,
-)
+from grpc_server.continual_backends import EdgeWorkerRoutedContinualLearningBackend
 from grpc_server.rpc_server import MessageTransmissionServicer
-from grpc_server.training_jobs import TrainingJobManager
 from tools.grpc_options import grpc_message_options
 
 __all__ = ["CloudServer"]
@@ -55,8 +51,6 @@ class CloudServer:
         self.edge_registry = EdgeRegistry()
         self.baseline_controller = None
         self.large_object_detection = None
-        self.continual_learner = None
-        self.training_job_manager = None
         self.continual_backend = None
         self.worker_pool = None
         self.gpu_lease_manager = None
@@ -88,35 +82,13 @@ class CloudServer:
             self.run_id = resolved_run_id
         else:
             edge_affine = getattr(config, "edge_affine_workers", None)
-            if edge_affine is not None and bool(getattr(edge_affine, "enabled", False)):
-                self._init_edge_affine_backend(edge_affine)
-            else:
-                from cloud.orchestrator import CloudFixedSplitOrchestrator
-                from model_management.object_detection import Object_Detection
-
-                self.large_object_detection = Object_Detection(config, type="large inference")
-                self.continual_learner = CloudFixedSplitOrchestrator(
-                    config,
-                    self.large_object_detection,
+            if edge_affine is None or not bool(getattr(edge_affine, "enabled", False)):
+                raise ValueError(
+                    "Main-mode cloud continual learning requires "
+                    "server.edge_affine_workers.enabled=true. The fixed-split "
+                    "fallback has been removed."
                 )
-                self.log_internal_ids = bool(
-                    getattr(self.continual_learner, "log_internal_ids", False)
-                )
-                self.training_job_manager = TrainingJobManager(
-                    continual_learner=self.continual_learner,
-                    max_concurrent_jobs=1,
-                    edge_registry=self.edge_registry,
-                    log_internal_ids=self.log_internal_ids,
-                )
-                self.continual_backend = LocalContinualLearningBackend(
-                    continual_learner=self.continual_learner,
-                    workspace_root=str(
-                        getattr(config, "workspace_root", "./cache/server_workspace")
-                    ),
-                    training_job_manager=self.training_job_manager,
-                    edge_registry=self.edge_registry,
-                    log_internal_ids=self.log_internal_ids,
-                )
+            self._init_edge_affine_backend(edge_affine)
 
     def _init_edge_affine_backend(self, edge_affine) -> None:
         run_id = str(getattr(edge_affine, "run_id", "") or "").strip()
@@ -127,6 +99,7 @@ class CloudServer:
                 "Set an explicit run_id for formal experiments to avoid assignment reuse.",
                 run_id,
             )
+        self.run_id = run_id
         workspace_root = str(getattr(self.config, "workspace_root", "./cache/server_workspace"))
         assignment_store = EdgeAssignmentStore(
             Path(workspace_root) / "worker_assignments.json",
@@ -191,30 +164,18 @@ class CloudServer:
         ).strip()
         grpc_max_workers = max(
             4,
-            int(
-                getattr(
-                    self.config,
-                    "grpc_max_workers",
-                    (
-                        self.continual_learner.max_concurrent_jobs + 4
-                        if self.continual_learner is not None
-                        else 8
-                    ),
-                )
-            ),
+            int(getattr(self.config, "grpc_max_workers", 8)),
         )
-        max_concurrent_jobs = int(getattr(self.continual_learner, "max_concurrent_jobs", 0))
         logger.info(
             "cloud server effective startup config: pid={}, golden={}, "
             "edge_model_name={}, listen_address={}, "
-            "grpc_max_workers={}, max_concurrent_jobs={}, mode={}, "
+            "grpc_max_workers={}, mode={}, "
             "baseline_method={}, run_id={}",
             os.getpid(),
             getattr(self.config, "golden", "unknown"),
             getattr(self.config, "edge_model_name", "unknown"),
             listen_address,
             grpc_max_workers,
-            max_concurrent_jobs,
             self.mode,
             getattr(self, "baseline_method", ""),
             getattr(self, "run_id", ""),
@@ -231,9 +192,7 @@ class CloudServer:
         message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
             MessageTransmissionServicer(
                 id=self.server_id,
-                continual_learner=self.continual_learner,
                 workspace_root=workspace_root,
-                training_job_manager=self.training_job_manager,
                 edge_registry=self.edge_registry,
                 baseline_controller=self.baseline_controller,
                 continual_backend=self.continual_backend,
@@ -252,10 +211,6 @@ class CloudServer:
         try:
             server.wait_for_termination()
         finally:
-            if self.training_job_manager is not None:
-                self.training_job_manager.close()
-            if self.continual_learner is not None:
-                self.continual_learner.close()
             if self.worker_pool is not None:
                 self.worker_pool.close()
             if self.gpu_lease_service is not None:

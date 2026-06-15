@@ -31,7 +31,11 @@ Run a single edge against one cloud server:
 
 ```bash
 # Terminal 1
-uv run python cloud_server.py
+uv run python cloud_server.py \
+  --yaml_path ./config/config.yaml \
+  --edge_affine_workers_enabled true \
+  --edge_affine_worker_mode edge_affine_single_gpu_mps \
+  --run_id plank_road_single_edge_001
 
 # Terminal 2
 uv run python edge_client.py --headless
@@ -78,7 +82,7 @@ Core areas: [cloud/orchestration/](./cloud/orchestration/), [cloud/annotation/](
 
 ### Model Update And Multi-Edge Safety
 
-Cloud training jobs are routed by `edge_id`. In the default local mode, fixed-split continual-learning jobs run serially. For real multi-edge GPU concurrency, enable the edge-affine worker pool: each edge gets an isolated worker process, and the GPU lease manager decides how many workers may enter CUDA-heavy fixed-split stages.
+Cloud training jobs are routed by `edge_id` into the edge-affine worker pool. Each edge gets an isolated worker process, and the GPU lease manager decides how many workers may enter CUDA-heavy fixed-split stages.
 
 Core areas: [grpc_server/training_jobs.py](./grpc_server/training_jobs.py), [grpc_server/rpc_server.py](./grpc_server/rpc_server.py), [cloud/workers/](./cloud/workers/).
 
@@ -177,7 +181,7 @@ server:
     enabled: False
     strategy: entropy
   edge_affine_workers:
-    enabled: false
+    enabled: true
     mode: edge_affine_single_gpu_mps
     gpu_lease:
       memory_usage_threshold: 0.85
@@ -192,7 +196,12 @@ server:
 Start the cloud server and one edge client:
 
 ```bash
-uv run python cloud_server.py
+uv run python cloud_server.py \
+  --yaml_path ./config/config.yaml \
+  --edge_affine_workers_enabled true \
+  --edge_affine_worker_mode edge_affine_single_gpu_mps \
+  --run_id plank_road_single_edge_001
+
 uv run python edge_client.py --headless
 ```
 
@@ -209,75 +218,13 @@ Useful edge overrides:
 
 ### Real Multi-Device Deployment
 
-A real multi-device deployment starts the cloud server once and starts one edge client on each physical edge device. All edge devices connect to the same cloud gRPC address, and every edge device must use a unique `edge_id`. Reusing an `edge_id` across physical devices is an invalid deployment configuration because the cloud identifies edge state, jobs, and model updates by `edge_id`.
+The supported Plank-Road topology is one cloud server plus one `edge_client.py` process on each physical edge device. The cloud uses the edge-affine worker pool: every `edge_id` gets a sticky isolated worker process, while GPU admission is controlled by `GpuLeaseManager` using the configured memory threshold, reserve budget, estimated peak memory, active leases, and lease heartbeat TTL.
+
+All edge devices connect to the same cloud gRPC address, and every edge device must use a unique `edge_id`. Reusing an `edge_id` across physical devices is invalid because the cloud identifies edge state, jobs, worker assignment, and model updates by `edge_id`.
 
 The cloud `server.listen_address` must listen on an external interface, such as `[::]:50051` or `0.0.0.0:50051`; do not bind only to `127.0.0.1:50051` for real devices. Make sure the machine firewall or cloud security group allows inbound traffic on port `50051`.
 
 Each real edge device has its own filesystem, so each device may use `./cache` locally. For clearer logs and debugging, prefer explicit per-edge paths such as `./cache/edge_1` and `./cache/edge_2`. Multiple edges may use different video files, camera sources, or the same configuration file, but their `edge_id` values must not repeat.
-
-Cloud machine:
-
-```bash
-uv run python cloud_server.py --yaml_path ./config/config.yaml
-```
-
-Optional cloud listen-address override:
-
-```bash
-uv run python cloud_server.py --listen_address "[::]:50051"
-```
-
-Edge device 1:
-
-```bash
-uv run python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --edge_id 1 \
-  --server_ip 192.168.66.205:50051 \
-  --cache_path ./cache/edge_1 \
-  --video_path ./video_data/road.mp4 \
-  --headless
-```
-
-Edge device 2:
-
-```bash
-uv run python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --edge_id 2 \
-  --server_ip 192.168.66.205:50051 \
-  --cache_path ./cache/edge_2 \
-  --video_path ./video_data/cam1-rin.mp4 \
-  --headless
-```
-
-Edge device 3:
-
-```bash
-uv run python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --edge_id 3 \
-  --server_ip 192.168.66.205:50051 \
-  --cache_path ./cache/edge_3 \
-  --video_path ./video_data/suwon#86_04_01.mp4 \
-  --headless
-```
-
-```text
-Real deployment checklist:
-1. Cloud server is reachable from every edge device.
-2. server.listen_address is not loopback-only.
-3. Every edge uses a unique edge_id.
-4. Every edge points to the same server_ip.
-5. Each edge has a valid local video/camera source.
-6. Edge cache directories are not shared through NFS unless intentionally configured.
-7. Cloud workspace_root has enough disk space for uploaded bundles and feature caches.
-8. For concurrent fixed-split GPU training, enable `server.edge_affine_workers`; do not use `continual_learning.max_concurrent_jobs` as the fixed-split parallelism knob.
-```
-
-### Single-GPU Edge-Affine MPS Worker Pool
-
-The worker pool keeps Plank-Road's physical deployment unchanged: one cloud server and one edge client per physical edge. Internally, each edge is assigned an independent worker process for state isolation. The number of edge workers does not equal GPU parallelism. Actual fixed-split GPU parallelism is controlled by the GPU lease manager using the configured memory threshold, reserve budget, estimated peak memory, active leases, and lease heartbeat TTL.
 
 Start MPS on the cloud machine:
 
@@ -289,11 +236,12 @@ mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
 nvidia-cuda-mps-control -d
 ```
 
-Start the cloud with edge-affine workers:
+Start the cloud:
 
 ```bash
 uv run python cloud_server.py \
   --yaml_path ./config/config.yaml \
+  --listen_address "[::]:50051" \
   --edge_affine_workers_enabled true \
   --edge_affine_worker_mode edge_affine_single_gpu_mps \
   --run_id plank_road_real_devices_001
@@ -314,14 +262,39 @@ uv run python edge_client.py \
 ```bash
 uv run python edge_client.py \
   --yaml_path ./config/config.yaml \
-  --edge_id 110 \
+  --edge_id 2 \
   --server_ip <cloud_ip>:50051 \
-  --cache_path ./cache/edge_110 \
+  --cache_path ./cache/edge_2 \
   --video_path ./video_data/cam1-rin.mp4 \
   --headless
 ```
 
-When GPU memory approaches the configured threshold, additional edge workers wait until an active worker releases its lease. If a lease heartbeat expires, the lease is released automatically and the job is treated as retryable. Shut MPS down with:
+```bash
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --edge_id 3 \
+  --server_ip <cloud_ip>:50051 \
+  --cache_path ./cache/edge_3 \
+  --video_path ./video_data/suwon#86_04_01.mp4 \
+  --headless
+```
+
+When GPU memory approaches the configured threshold, additional edge workers wait until an active worker releases its lease. If a lease heartbeat expires, the lease is released automatically and the job is treated as retryable.
+
+```text
+Real deployment checklist:
+1. Cloud server is reachable from every edge device.
+2. server.listen_address is not loopback-only.
+3. Every edge uses a unique edge_id.
+4. Every edge points to the same server_ip.
+5. Each edge has a valid local video/camera source.
+6. Edge cache directories are not shared through NFS unless intentionally configured.
+7. Cloud workspace_root has enough disk space for uploaded bundles and feature caches.
+8. GPU concurrency is controlled by GpuLeaseManager.
+9. Formal experiments should use an explicit run_id so worker assignments are not reused accidentally.
+```
+
+Shut MPS down with:
 
 ```bash
 echo quit | nvidia-cuda-mps-control

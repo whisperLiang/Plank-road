@@ -1,8 +1,4 @@
-import io
-import json
 import subprocess
-import zipfile
-from pathlib import Path
 
 import psutil
 from loguru import logger
@@ -10,7 +6,7 @@ from loguru import logger
 from baselines.distributed.messages import BaselineFramePayload, json_dumps, json_loads
 from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
-from grpc_server.continual_backends import LocalContinualLearningBackend
+from grpc_server.continual_backends import DisabledContinualLearningBackend
 from grpc_server.workspace import (
     normalize_client_cache_path,
 )
@@ -56,27 +52,17 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
     def __init__(
         self,
         id,
-        continual_learner=None,
         workspace_root=None,
-        training_job_manager=None,
         edge_registry=None,
         baseline_controller=None,
         continual_backend=None,
         log_internal_ids: bool = False,
     ):
         self.id = id
-        self.continual_learner = continual_learner
         self.workspace_root = workspace_root or "./cache/server_workspace"
-        self.training_job_manager = training_job_manager
         self.edge_registry = edge_registry
         self.baseline_controller = baseline_controller
-        self.continual_backend = continual_backend or LocalContinualLearningBackend(
-            continual_learner=continual_learner,
-            workspace_root=self.workspace_root,
-            training_job_manager=training_job_manager,
-            edge_registry=edge_registry,
-            log_internal_ids=log_internal_ids,
-        )
+        self.continual_backend = continual_backend or DisabledContinualLearningBackend()
         self.log_internal_ids = bool(log_internal_ids)
 
     def _log_failure(self, label: str, exc: BaseException) -> None:
@@ -86,14 +72,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             f"{label} failure",
             lambda error=exc: {"error": repr(error)},
         )
-
-    @staticmethod
-    def _request_kind_for_job_type(job_type: int) -> str:
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
-            return "train_model"
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
-            return "continual_learning"
-        raise ValueError(f"Unsupported training job type: {job_type!r}")
 
     def train_model_request(self, request, context):
         """Compatibility endpoint for retired full-frame retraining requests."""
@@ -141,102 +119,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             },
         )
         return self.continual_backend.sync_samples(request)
-
-    def _async_not_configured_reply(self, method_name: str):
-        if self.continual_learner is None or self.training_job_manager is None:
-            logger.error("{}: async training is not configured", method_name)
-            return message_transmission_pb2.SubmitTrainingJobReply(
-                accepted=False,
-                job_id="",
-                status="",
-                queue_position=-1,
-                message="async training is not configured",
-            )
-        return None
-
-    def _submit_training_job_from_workspace(
-        self,
-        request,
-        *,
-        workspace,
-        request_kind: str,
-        payload_zip: bytes = b"",
-    ):
-        base_model_version = str(getattr(request, "base_model_version", "") or "0")
-        try:
-            manifest = None
-            if payload_zip:
-                with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as archive:
-                    if "trigger_manifest.json" in archive.namelist():
-                        with archive.open("trigger_manifest.json", "r") as handle:
-                            manifest = json.loads(handle.read().decode("utf-8"))
-            else:
-                trigger_manifest_path = Path(workspace) / "trigger_manifest.json"
-                if trigger_manifest_path.exists():
-                    manifest = json.loads(trigger_manifest_path.read_text(encoding="utf-8"))
-            if manifest is not None:
-                model_info = manifest.get("model", {})
-                if not model_info:
-                    model_info = {
-                        "model_id": manifest.get("model_id", ""),
-                        "model_version": manifest.get("model_version", ""),
-                    }
-                base_model_version = str(model_info.get("model_version", base_model_version))
-                if self.edge_registry is not None:
-                    self.edge_registry.touch(
-                        int(request.edge_id),
-                        model_id=str(model_info.get("model_id", "")),
-                        model_version=base_model_version,
-                    )
-        except Exception:
-            pass
-
-        job, created = self.training_job_manager.submit(
-            edge_id=int(request.edge_id),
-            request_id=str(request.request_id or ""),
-            job_type=int(request.job_type),
-            workspace=str(workspace),
-            protocol_version=str(request.protocol_version or ""),
-            workspace_root=str(self.workspace_root),
-            request_kind=str(request_kind),
-            payload_zip=payload_zip,
-            send_low_conf_features=bool(request.send_low_conf_features),
-            frame_indices=[int(index) for index in request.frame_indices],
-            base_model_version=base_model_version,
-        )
-
-        if self.edge_registry is not None and created:
-            self.edge_registry.record_job_submitted(
-                int(request.edge_id),
-                job.job_id,
-            )
-
-        queue_position = self.training_job_manager.queue_position(job.job_id)
-        message = "Training job accepted." if created else "Training job already exists."
-        logger.info(
-            "Accepted continual-learning job: edge={} type={} queue_position={} created={}.",
-            request.edge_id,
-            request_kind,
-            queue_position,
-            created,
-        )
-        log_diagnostic_debug(
-            self,
-            "accepted training request details",
-            lambda: {
-                "request_id": request.request_id,
-                "job_id": job.job_id,
-                "workspace": workspace,
-                "payload_zip_bytes": len(payload_zip or b""),
-            },
-        )
-        return message_transmission_pb2.SubmitTrainingJobReply(
-            accepted=True,
-            job_id=job.job_id,
-            status=job.status,
-            queue_position=queue_position,
-            message=message,
-        )
 
     def submit_training_job(self, request, context):
         logger.info(
@@ -296,16 +178,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         gpu = _get_gpu_utilization()
         mem = _get_memory_utilization()
 
-        # Approximate train-queue depth: if the continual_learner lock is
-        # held, there is 1 active job; max capacity is treated as 10.
-        train_q = 0
-        max_q = 0
         train_q, max_q = self.continual_backend.training_queue_state()
-        if self.continual_learner is not None:
-            if hasattr(self.continual_learner, "training_queue_state"):
-                learner_q, learner_max_q = self.continual_learner.training_queue_state()
-                train_q = max(train_q, learner_q)
-                max_q = max(max_q, learner_max_q)
         if max_q <= 0:
             max_q = 10
 

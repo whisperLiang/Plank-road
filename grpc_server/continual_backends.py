@@ -12,10 +12,9 @@ from uuid import uuid4
 from loguru import logger
 
 from cloud.workers.gpu_lease_manager import is_oom_message
-from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
+from common.logging_sanitizer import safe_error_summary
 from grpc_server import message_transmission_pb2
 from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED
-from grpc_server.workspace import prepare_request_workspace
 
 
 class ContinualLearningBackend(Protocol):
@@ -46,7 +45,89 @@ class ContinualLearningBackend(Protocol):
     def training_queue_state(self) -> tuple[int, int]: ...
 
 
+class DisabledContinualLearningBackend:
+    def train_model_request(self, request) -> message_transmission_pb2.TrainReply:
+        del request
+        return message_transmission_pb2.TrainReply(
+            success=False,
+            model_data="",
+            message="continual learning backend is not configured",
+        )
+
+    def continual_learning_request(
+        self, request
+    ) -> message_transmission_pb2.ContinualLearningReply:
+        return message_transmission_pb2.ContinualLearningReply(
+            success=False,
+            model_data="",
+            message="continual learning backend is not configured",
+            protocol_version=str(getattr(request, "protocol_version", "") or ""),
+        )
+
+    def sync_samples(self, request) -> message_transmission_pb2.SampleSyncReply:
+        del request
+        return message_transmission_pb2.SampleSyncReply(
+            success=False,
+            message="continual learning backend is not configured",
+        )
+
+    def submit_training_job(self, request) -> message_transmission_pb2.SubmitTrainingJobReply:
+        del request
+        return message_transmission_pb2.SubmitTrainingJobReply(
+            accepted=False,
+            job_id="",
+            status="",
+            queue_position=-1,
+            message="continual learning backend is not configured",
+        )
+
+    def get_training_job_status(
+        self, request
+    ) -> message_transmission_pb2.TrainingJobStatusReply:
+        return message_transmission_pb2.TrainingJobStatusReply(
+            found=False,
+            job_id=str(getattr(request, "job_id", "") or ""),
+            edge_id=int(getattr(request, "edge_id", 0) or 0),
+            status="",
+            queue_position=-1,
+            message="continual learning backend is not configured",
+        )
+
+    def download_trained_model(
+        self, request
+    ) -> message_transmission_pb2.DownloadTrainedModelReply:
+        return message_transmission_pb2.DownloadTrainedModelReply(
+            success=False,
+            job_id=str(getattr(request, "job_id", "") or ""),
+            status="",
+            model_data="",
+            message="continual learning backend is not configured",
+            protocol_version="",
+        )
+
+    def cancel_training_job(self, request) -> message_transmission_pb2.CancelTrainingJobReply:
+        del request
+        return message_transmission_pb2.CancelTrainingJobReply(
+            cancelled=False,
+            message="continual learning backend is not configured",
+        )
+
+    def report_edge_model_version(
+        self, request
+    ) -> message_transmission_pb2.ReportEdgeModelVersionReply:
+        del request
+        return message_transmission_pb2.ReportEdgeModelVersionReply(
+            success=False,
+            message="continual learning backend is not configured",
+        )
+
+    def training_queue_state(self) -> tuple[int, int]:
+        return 0, 0
+
+
 class LocalContinualLearningBackend:
+    """Backend used inside edge worker processes."""
+
     def __init__(
         self,
         *,
@@ -63,60 +144,20 @@ class LocalContinualLearningBackend:
         self.log_internal_ids = bool(log_internal_ids)
 
     def train_model_request(self, request) -> message_transmission_pb2.TrainReply:
-        if self.continual_learner is None:
-            return message_transmission_pb2.TrainReply(
-                success=False,
-                model_data="",
-                message="continual_learner not configured",
-            )
-        success, model_data, message = self.continual_learner.get_ground_truth_and_retrain(
-            request.edge_id,
-            [],
-            "",
-        )
+        del request
         return message_transmission_pb2.TrainReply(
-            success=success,
-            model_data=model_data,
-            message=message,
+            success=False,
+            model_data="",
+            message="full-frame retrain is unavailable; use fixed-split continual learning",
         )
 
     def continual_learning_request(
         self, request
     ) -> message_transmission_pb2.ContinualLearningReply:
-        if self.continual_learner is None:
-            return message_transmission_pb2.ContinualLearningReply(
-                success=False,
-                model_data="",
-                message="continual_learner not configured",
-                protocol_version=request.protocol_version,
-            )
-        try:
-            workspace = prepare_request_workspace(
-                self.workspace_root,
-                edge_id=request.edge_id,
-                request_kind="continual_learning",
-                payload_zip=request.payload_zip,
-                client_cache_path=request.cache_path,
-                log_internal_ids=self.log_internal_ids,
-            )
-            success, model_data, message = (
-                self.continual_learner.get_ground_truth_and_fixed_split_retrain(
-                    request.edge_id,
-                    str(workspace),
-                )
-            )
-        except Exception as exc:
-            logger.error("continual_learning_request failed: {}", safe_error_summary(exc))
-            log_diagnostic_debug(
-                self,
-                "continual_learning_request failure",
-                lambda error=exc: {"error": repr(error)},
-            )
-            success, model_data, message = False, "", str(exc)
         return message_transmission_pb2.ContinualLearningReply(
-            success=success,
-            model_data=model_data,
-            message=message,
+            success=False,
+            model_data="",
+            message="synchronous continual learning is unavailable; use submit_training_job",
             protocol_version=request.protocol_version,
         )
 
@@ -160,17 +201,12 @@ class LocalContinualLearningBackend:
             )
         try:
             if int(request.job_type) == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
-                success, _model_data, message = self.continual_learner.get_ground_truth_and_retrain(
-                    request.edge_id,
-                    [],
-                    "",
-                )
                 return message_transmission_pb2.SubmitTrainingJobReply(
-                    accepted=bool(success),
+                    accepted=False,
                     job_id="",
                     status="",
                     queue_position=-1,
-                    message=message,
+                    message="full-frame retrain is unavailable; use fixed-split continual learning",
                 )
             request_kind = _request_kind_for_job_type(int(request.job_type))
             return self._submit_training_job_from_workspace(
