@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from grpc_server.protos import message_transmission_pb2 as grpc__server_dot_protos_dot_message__transmission__pb2
+from grpc_server.protos import message_transmission_pb2 as message__transmission__pb2
 
 GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in grpc_server/protos/message_transmission_pb2_grpc.py depends on'
+        + ' but the generated code in message_transmission_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -36,103 +36,108 @@ class MessageTransmissionStub(object):
         """
         self.train_model_request = channel.unary_unary(
                 '/MessageTransmission/train_model_request',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.FromString,
+                request_serializer=message__transmission__pb2.TrainRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.TrainReply.FromString,
                 _registered_method=True)
         self.continual_learning_request = channel.unary_unary(
                 '/MessageTransmission/continual_learning_request',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningReply.FromString,
+                request_serializer=message__transmission__pb2.ContinualLearningRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.ContinualLearningReply.FromString,
                 _registered_method=True)
         self.sync_samples = channel.unary_unary(
                 '/MessageTransmission/sync_samples',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncReply.FromString,
+                request_serializer=message__transmission__pb2.SampleSyncRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.SampleSyncReply.FromString,
                 _registered_method=True)
         self.submit_training_job = channel.unary_unary(
                 '/MessageTransmission/submit_training_job',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
+                request_serializer=message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.SubmitTrainingJobReply.FromString,
                 _registered_method=True)
         self.get_training_job_status = channel.unary_unary(
                 '/MessageTransmission/get_training_job_status',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusReply.FromString,
+                request_serializer=message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.TrainingJobStatusReply.FromString,
                 _registered_method=True)
         self.download_trained_model = channel.unary_unary(
                 '/MessageTransmission/download_trained_model',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelReply.FromString,
+                request_serializer=message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.DownloadTrainedModelReply.FromString,
+                _registered_method=True)
+        self.report_edge_model_version = channel.unary_unary(
+                '/MessageTransmission/report_edge_model_version',
+                request_serializer=message__transmission__pb2.ReportEdgeModelVersionRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.ReportEdgeModelVersionReply.FromString,
                 _registered_method=True)
         self.cancel_training_job = channel.unary_unary(
                 '/MessageTransmission/cancel_training_job',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobReply.FromString,
+                request_serializer=message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.CancelTrainingJobReply.FromString,
                 _registered_method=True)
         self.query_resource = channel.unary_unary(
                 '/MessageTransmission/query_resource',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.FromString,
+                request_serializer=message__transmission__pb2.ResourceRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.ResourceReply.FromString,
                 _registered_method=True)
         self.bandwidth_probe = channel.unary_unary(
                 '/MessageTransmission/bandwidth_probe',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.FromString,
+                request_serializer=message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BandwidthProbeReply.FromString,
                 _registered_method=True)
         self.RegisterEdge = channel.unary_unary(
                 '/MessageTransmission/RegisterEdge',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineRegisterEdgeRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+                request_serializer=message__transmission__pb2.BaselineRegisterEdgeRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
                 _registered_method=True)
         self.Heartbeat = channel.unary_unary(
                 '/MessageTransmission/Heartbeat',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineHeartbeatRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+                request_serializer=message__transmission__pb2.BaselineHeartbeatRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
                 _registered_method=True)
         self.UploadFrame = channel.unary_unary(
                 '/MessageTransmission/UploadFrame',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+                request_serializer=message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
                 _registered_method=True)
         self.UploadKeyFrame = channel.unary_unary(
                 '/MessageTransmission/UploadKeyFrame',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+                request_serializer=message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
                 _registered_method=True)
         self.UploadPrediction = channel.unary_unary(
                 '/MessageTransmission/UploadPrediction',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+                request_serializer=message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
                 _registered_method=True)
         self.RequestCloudInference = channel.unary_unary(
                 '/MessageTransmission/RequestCloudInference',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceReply.FromString,
+                request_serializer=message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineInferenceReply.FromString,
                 _registered_method=True)
         self.PollCommand = channel.unary_unary(
                 '/MessageTransmission/PollCommand',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineCommandRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineCommandReply.FromString,
+                request_serializer=message__transmission__pb2.BaselineCommandRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineCommandReply.FromString,
                 _registered_method=True)
         self.DownloadInferenceResult = channel.unary_unary(
                 '/MessageTransmission/DownloadInferenceResult',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceReply.FromString,
+                request_serializer=message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineInferenceReply.FromString,
                 _registered_method=True)
         self.RequestTraining = channel.unary_unary(
                 '/MessageTransmission/RequestTraining',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingReply.FromString,
+                request_serializer=message__transmission__pb2.BaselineTrainingRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineTrainingReply.FromString,
                 _registered_method=True)
         self.PollTrainingJob = channel.unary_unary(
                 '/MessageTransmission/PollTrainingJob',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingStatusRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingStatusReply.FromString,
+                request_serializer=message__transmission__pb2.BaselineTrainingStatusRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineTrainingStatusReply.FromString,
                 _registered_method=True)
         self.DownloadModelUpdate = channel.unary_unary(
                 '/MessageTransmission/DownloadModelUpdate',
-                request_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineModelUpdateRequest.SerializeToString,
-                response_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineModelUpdateReply.FromString,
+                request_serializer=message__transmission__pb2.BaselineModelUpdateRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineModelUpdateReply.FromString,
                 _registered_method=True)
 
 
@@ -177,6 +182,13 @@ class MessageTransmissionServicer(object):
 
     def download_trained_model(self, request, context):
         """Download trained model for a completed async training job.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def report_edge_model_version(self, request, context):
+        """Report that an edge has applied a model update.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -275,103 +287,108 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'train_model_request': grpc.unary_unary_rpc_method_handler(
                     servicer.train_model_request,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.TrainRequest.FromString,
+                    response_serializer=message__transmission__pb2.TrainReply.SerializeToString,
             ),
             'continual_learning_request': grpc.unary_unary_rpc_method_handler(
                     servicer.continual_learning_request,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.ContinualLearningRequest.FromString,
+                    response_serializer=message__transmission__pb2.ContinualLearningReply.SerializeToString,
             ),
             'sync_samples': grpc.unary_unary_rpc_method_handler(
                     servicer.sync_samples,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.SampleSyncRequest.FromString,
+                    response_serializer=message__transmission__pb2.SampleSyncReply.SerializeToString,
             ),
             'submit_training_job': grpc.unary_unary_rpc_method_handler(
                     servicer.submit_training_job,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.SubmitTrainingJobRequest.FromString,
+                    response_serializer=message__transmission__pb2.SubmitTrainingJobReply.SerializeToString,
             ),
             'get_training_job_status': grpc.unary_unary_rpc_method_handler(
                     servicer.get_training_job_status,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.TrainingJobStatusRequest.FromString,
+                    response_serializer=message__transmission__pb2.TrainingJobStatusReply.SerializeToString,
             ),
             'download_trained_model': grpc.unary_unary_rpc_method_handler(
                     servicer.download_trained_model,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.DownloadTrainedModelRequest.FromString,
+                    response_serializer=message__transmission__pb2.DownloadTrainedModelReply.SerializeToString,
+            ),
+            'report_edge_model_version': grpc.unary_unary_rpc_method_handler(
+                    servicer.report_edge_model_version,
+                    request_deserializer=message__transmission__pb2.ReportEdgeModelVersionRequest.FromString,
+                    response_serializer=message__transmission__pb2.ReportEdgeModelVersionReply.SerializeToString,
             ),
             'cancel_training_job': grpc.unary_unary_rpc_method_handler(
                     servicer.cancel_training_job,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.CancelTrainingJobRequest.FromString,
+                    response_serializer=message__transmission__pb2.CancelTrainingJobReply.SerializeToString,
             ),
             'query_resource': grpc.unary_unary_rpc_method_handler(
                     servicer.query_resource,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.ResourceRequest.FromString,
+                    response_serializer=message__transmission__pb2.ResourceReply.SerializeToString,
             ),
             'bandwidth_probe': grpc.unary_unary_rpc_method_handler(
                     servicer.bandwidth_probe,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BandwidthProbeRequest.FromString,
+                    response_serializer=message__transmission__pb2.BandwidthProbeReply.SerializeToString,
             ),
             'RegisterEdge': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterEdge,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineRegisterEdgeRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineRegisterEdgeRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
             ),
             'Heartbeat': grpc.unary_unary_rpc_method_handler(
                     servicer.Heartbeat,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineHeartbeatRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineHeartbeatRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
             ),
             'UploadFrame': grpc.unary_unary_rpc_method_handler(
                     servicer.UploadFrame,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineFrameRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
             ),
             'UploadKeyFrame': grpc.unary_unary_rpc_method_handler(
                     servicer.UploadKeyFrame,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineFrameRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
             ),
             'UploadPrediction': grpc.unary_unary_rpc_method_handler(
                     servicer.UploadPrediction,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineFrameRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
             ),
             'RequestCloudInference': grpc.unary_unary_rpc_method_handler(
                     servicer.RequestCloudInference,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineInferenceRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineInferenceReply.SerializeToString,
             ),
             'PollCommand': grpc.unary_unary_rpc_method_handler(
                     servicer.PollCommand,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineCommandRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineCommandReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineCommandRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineCommandReply.SerializeToString,
             ),
             'DownloadInferenceResult': grpc.unary_unary_rpc_method_handler(
                     servicer.DownloadInferenceResult,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineInferenceRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineInferenceReply.SerializeToString,
             ),
             'RequestTraining': grpc.unary_unary_rpc_method_handler(
                     servicer.RequestTraining,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineTrainingRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineTrainingReply.SerializeToString,
             ),
             'PollTrainingJob': grpc.unary_unary_rpc_method_handler(
                     servicer.PollTrainingJob,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingStatusRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingStatusReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineTrainingStatusRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineTrainingStatusReply.SerializeToString,
             ),
             'DownloadModelUpdate': grpc.unary_unary_rpc_method_handler(
                     servicer.DownloadModelUpdate,
-                    request_deserializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineModelUpdateRequest.FromString,
-                    response_serializer=grpc__server_dot_protos_dot_message__transmission__pb2.BaselineModelUpdateReply.SerializeToString,
+                    request_deserializer=message__transmission__pb2.BaselineModelUpdateRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineModelUpdateReply.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -399,8 +416,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/train_model_request',
-            grpc__server_dot_protos_dot_message__transmission__pb2.TrainRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.TrainReply.FromString,
+            message__transmission__pb2.TrainRequest.SerializeToString,
+            message__transmission__pb2.TrainReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -426,8 +443,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/continual_learning_request',
-            grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.ContinualLearningReply.FromString,
+            message__transmission__pb2.ContinualLearningRequest.SerializeToString,
+            message__transmission__pb2.ContinualLearningReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -453,8 +470,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/sync_samples',
-            grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.SampleSyncReply.FromString,
+            message__transmission__pb2.SampleSyncRequest.SerializeToString,
+            message__transmission__pb2.SampleSyncReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -480,8 +497,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/submit_training_job',
-            grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.SubmitTrainingJobReply.FromString,
+            message__transmission__pb2.SubmitTrainingJobRequest.SerializeToString,
+            message__transmission__pb2.SubmitTrainingJobReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -507,8 +524,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/get_training_job_status',
-            grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.TrainingJobStatusReply.FromString,
+            message__transmission__pb2.TrainingJobStatusRequest.SerializeToString,
+            message__transmission__pb2.TrainingJobStatusReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -534,8 +551,35 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/download_trained_model',
-            grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.DownloadTrainedModelReply.FromString,
+            message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
+            message__transmission__pb2.DownloadTrainedModelReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def report_edge_model_version(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/report_edge_model_version',
+            message__transmission__pb2.ReportEdgeModelVersionRequest.SerializeToString,
+            message__transmission__pb2.ReportEdgeModelVersionReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -561,8 +605,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/cancel_training_job',
-            grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.CancelTrainingJobReply.FromString,
+            message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
+            message__transmission__pb2.CancelTrainingJobReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -588,8 +632,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/query_resource',
-            grpc__server_dot_protos_dot_message__transmission__pb2.ResourceRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.ResourceReply.FromString,
+            message__transmission__pb2.ResourceRequest.SerializeToString,
+            message__transmission__pb2.ResourceReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -615,8 +659,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/bandwidth_probe',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BandwidthProbeReply.FromString,
+            message__transmission__pb2.BandwidthProbeRequest.SerializeToString,
+            message__transmission__pb2.BandwidthProbeReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -642,8 +686,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/RegisterEdge',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineRegisterEdgeRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+            message__transmission__pb2.BaselineRegisterEdgeRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
             options,
             channel_credentials,
             insecure,
@@ -669,8 +713,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/Heartbeat',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineHeartbeatRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+            message__transmission__pb2.BaselineHeartbeatRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
             options,
             channel_credentials,
             insecure,
@@ -696,8 +740,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/UploadFrame',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+            message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
             options,
             channel_credentials,
             insecure,
@@ -723,8 +767,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/UploadKeyFrame',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+            message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
             options,
             channel_credentials,
             insecure,
@@ -750,8 +794,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/UploadPrediction',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineFrameRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineAck.FromString,
+            message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
             options,
             channel_credentials,
             insecure,
@@ -777,8 +821,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/RequestCloudInference',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceReply.FromString,
+            message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
+            message__transmission__pb2.BaselineInferenceReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -804,8 +848,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/PollCommand',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineCommandRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineCommandReply.FromString,
+            message__transmission__pb2.BaselineCommandRequest.SerializeToString,
+            message__transmission__pb2.BaselineCommandReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -831,8 +875,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/DownloadInferenceResult',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineInferenceReply.FromString,
+            message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
+            message__transmission__pb2.BaselineInferenceReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -858,8 +902,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/RequestTraining',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingReply.FromString,
+            message__transmission__pb2.BaselineTrainingRequest.SerializeToString,
+            message__transmission__pb2.BaselineTrainingReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -885,8 +929,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/PollTrainingJob',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingStatusRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineTrainingStatusReply.FromString,
+            message__transmission__pb2.BaselineTrainingStatusRequest.SerializeToString,
+            message__transmission__pb2.BaselineTrainingStatusReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -912,8 +956,8 @@ class MessageTransmission(object):
             request,
             target,
             '/MessageTransmission/DownloadModelUpdate',
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineModelUpdateRequest.SerializeToString,
-            grpc__server_dot_protos_dot_message__transmission__pb2.BaselineModelUpdateReply.FromString,
+            message__transmission__pb2.BaselineModelUpdateRequest.SerializeToString,
+            message__transmission__pb2.BaselineModelUpdateReply.FromString,
             options,
             channel_credentials,
             insecure,

@@ -83,13 +83,14 @@ class FakeDetector:
 def test_legacy_baseline_files_are_removed() -> None:
     removed = [
         "launch_multi" + "_edge.py",
-        "multi_edge" + "_runner.py",
+        "multi" + "_edge" + "_runner.py",
         "tools/run_baselines" + "_real.py",
         "tools/baselines" + "_real_common.py",
         "config/experiment.py",
         "config/experiment.yaml",
         "config/baselines_real_advantage.yaml",
         "baselines/plank_road" + "_multi_device.py",
+        "multi" + "_edge",
     ]
     for relpath in removed:
         assert not (PROJECT_ROOT / relpath).exists(), relpath

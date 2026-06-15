@@ -1,24 +1,22 @@
 import io
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
 import psutil
-import torch as _torch
 from loguru import logger
 
 from baselines.distributed.messages import BaselineFramePayload, json_dumps, json_loads
 from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
-from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED
+from grpc_server.continual_backends import LocalContinualLearningBackend
 from grpc_server.workspace import (
     normalize_client_cache_path,
-    prepare_request_workspace,
 )
 
 # ── Resource monitoring helpers ──────────────────
 _HAS_PSUTIL = True
-_HAS_TORCH = True
 
 
 def _get_cpu_utilization() -> float:
@@ -37,30 +35,18 @@ def _get_memory_utilization() -> float:
 
 def _get_gpu_utilization() -> float:
     """Return GPU utilisation in [0, 1] (NVIDIA only)."""
-    if not _HAS_TORCH or not _torch.cuda.is_available():
-        return 0.0
     try:
-        # Try nvidia-smi via pynvml (bundled with recent PyTorch)
-        import subprocess
-
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
+            check=False,
             timeout=5,
         )
         if result.returncode == 0:
             vals = [float(v.strip()) for v in result.stdout.strip().split("\n") if v.strip()]
             if vals:
                 return max(vals) / 100.0
-    except Exception:
-        pass
-    # Fallback: memory-based estimate
-    try:
-        allocated = _torch.cuda.memory_allocated()
-        total = _torch.cuda.get_device_properties(0).total_mem
-        if total > 0:
-            return allocated / total
     except Exception:
         pass
     return 0.0
@@ -75,6 +61,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         training_job_manager=None,
         edge_registry=None,
         baseline_controller=None,
+        continual_backend=None,
         log_internal_ids: bool = False,
     ):
         self.id = id
@@ -83,6 +70,13 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         self.training_job_manager = training_job_manager
         self.edge_registry = edge_registry
         self.baseline_controller = baseline_controller
+        self.continual_backend = continual_backend or LocalContinualLearningBackend(
+            continual_learner=continual_learner,
+            workspace_root=self.workspace_root,
+            training_job_manager=training_job_manager,
+            edge_registry=edge_registry,
+            log_internal_ids=log_internal_ids,
+        )
         self.log_internal_ids = bool(log_internal_ids)
 
     def _log_failure(self, label: str, exc: BaseException) -> None:
@@ -104,19 +98,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
     def train_model_request(self, request, context):
         """Compatibility endpoint for retired full-frame retraining requests."""
         logger.warning("Rejected full-frame training request: edge={}.", request.edge_id)
-        if self.continual_learner is None:
-            logger.error("train_model_request: continual_learner not configured")
-            return message_transmission_pb2.TrainReply(
-                success=False, model_data="", message="continual_learner not configured"
-            )
-        success, model_data, message = self.continual_learner.get_ground_truth_and_retrain(
-            request.edge_id,
-            [],
-            "",
-        )
-        return message_transmission_pb2.TrainReply(
-            success=success, model_data=model_data, message=message
-        )
+        return self.continual_backend.train_model_request(request)
 
     def continual_learning_request(self, request, context):
         cache_path = normalize_client_cache_path(request.cache_path)
@@ -140,56 +122,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 "continual-learning workspace hint",
                 lambda: {"cache_path": cache_path or "<uploaded-bundle>"},
             )
-        if self.continual_learner is None:
-            logger.error("continual_learning_request: continual_learner not configured")
-            return message_transmission_pb2.ContinualLearningReply(
-                success=False,
-                model_data="",
-                message="continual_learner not configured",
-                protocol_version=request.protocol_version,
-            )
-        try:
-            workspace = prepare_request_workspace(
-                self.workspace_root,
-                edge_id=request.edge_id,
-                request_kind="continual_learning",
-                payload_zip=request.payload_zip,
-                client_cache_path=request.cache_path,
-                log_internal_ids=self.log_internal_ids,
-            )
-
-            success, model_data, message = (
-                self.continual_learner.get_ground_truth_and_fixed_split_retrain(
-                    request.edge_id,
-                    str(workspace),
-                )
-            )
-            logger.info(
-                "Continual-learning request finished: edge={} success={} reason={}.",
-                request.edge_id,
-                success,
-                message,
-            )
-            log_diagnostic_debug(
-                self,
-                "continual-learning request workspace",
-                lambda: {"workspace": str(workspace)},
-            )
-        except Exception as exc:
-            logger.error("continual_learning_request failed: {}", safe_error_summary(exc))
-            log_diagnostic_debug(
-                self,
-                "continual_learning_request failure",
-                lambda error=exc: {"error": repr(error)},
-            )
-            success, model_data, message = False, "", str(exc)
-
-        return message_transmission_pb2.ContinualLearningReply(
-            success=success,
-            model_data=model_data,
-            message=message,
-            protocol_version=request.protocol_version,
-        )
+        return self.continual_backend.continual_learning_request(request)
 
     def sync_samples(self, request, context):
         logger.info(
@@ -207,64 +140,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 "payload_zip_bytes": len(getattr(request, "payload_zip", b"") or b""),
             },
         )
-        if self.edge_registry is not None:
-            self.edge_registry.touch(int(request.edge_id))
-
-        if self.continual_learner is None:
-            logger.error("sync_samples: continual_learner not configured")
-            return message_transmission_pb2.SampleSyncReply(
-                success=False,
-                message="continual_learner not configured",
-            )
-
-        sync_method = getattr(self.continual_learner, "sync_samples", None)
-        if sync_method is None:
-            logger.error("sync_samples: continual_learner has no sample sync method")
-            return message_transmission_pb2.SampleSyncReply(
-                success=False,
-                message="continual_learner has no sample sync method",
-            )
-
-        try:
-            result = sync_method(
-                edge_id=int(request.edge_id),
-                protocol_version=str(request.protocol_version or ""),
-                sync_type=str(request.sync_type or ""),
-                payload_zip=bytes(request.payload_zip or b""),
-                model_id=str(request.model_id or ""),
-                model_version=str(request.model_version or ""),
-                split_config_id=str(request.split_config_id or ""),
-            )
-            if isinstance(result, message_transmission_pb2.SampleSyncReply):
-                return result
-            if isinstance(result, tuple):
-                values = list(result)
-                return message_transmission_pb2.SampleSyncReply(
-                    success=bool(values[0]) if values else True,
-                    message=str(values[1]) if len(values) > 1 else "sample sync completed",
-                    committed_samples=int(values[2] or 0) if len(values) > 2 else 0,
-                )
-            if isinstance(result, dict):
-                return message_transmission_pb2.SampleSyncReply(
-                    success=bool(result.get("success", True)),
-                    message=str(result.get("message", "sample sync completed")),
-                    committed_samples=int(result.get("committed_samples", 0) or 0),
-                )
-            return message_transmission_pb2.SampleSyncReply(
-                success=bool(result),
-                message="sample sync completed",
-            )
-        except Exception as exc:
-            logger.error("sync_samples failed: {}", safe_error_summary(exc))
-            log_diagnostic_debug(
-                self,
-                "sync_samples failure",
-                lambda error=exc: {"error": repr(error)},
-            )
-            return message_transmission_pb2.SampleSyncReply(
-                success=False,
-                message=str(exc),
-            )
+        return self.continual_backend.sync_samples(request)
 
     def _async_not_configured_reply(self, method_name: str):
         if self.continual_learner is None or self.training_job_manager is None:
@@ -378,148 +254,33 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             },
         )
 
-        if self.edge_registry is not None:
-            self.edge_registry.touch(int(request.edge_id))
-
-        not_configured = self._async_not_configured_reply("submit_training_job")
-        if not_configured is not None:
-            return not_configured
-
-        try:
-            if int(request.job_type) == message_transmission_pb2.TRAINING_JOB_TYPE_FULL_FRAME:
-                success, _model_data, message = self.continual_learner.get_ground_truth_and_retrain(
-                    request.edge_id,
-                    [],
-                    "",
-                )
-                return message_transmission_pb2.SubmitTrainingJobReply(
-                    accepted=bool(success),
-                    job_id="",
-                    status="",
-                    queue_position=-1,
-                    message=message,
-                )
-            request_kind = self._request_kind_for_job_type(int(request.job_type))
-            logger.info(
-                "Training request queued for unpacking: edge={} type={}.",
-                request.edge_id,
-                request_kind,
-            )
-
-            return self._submit_training_job_from_workspace(
-                request,
-                workspace=request.cache_path,
-                request_kind=request_kind,
-                payload_zip=getattr(request, "payload_zip", b""),
-            )
-        except Exception as exc:
-            logger.error("submit_training_job failed: {}", safe_error_summary(exc))
-            log_diagnostic_debug(
-                self,
-                "submit_training_job failure",
-                lambda error=exc: {"error": repr(error)},
-            )
-            return message_transmission_pb2.SubmitTrainingJobReply(
-                accepted=False,
-                job_id="",
-                status="",
-                queue_position=-1,
-                message=str(exc),
-            )
+        return self.continual_backend.submit_training_job(request)
 
     def get_training_job_status(self, request, context):
-        if self.training_job_manager is None:
-            return message_transmission_pb2.TrainingJobStatusReply(
-                found=False,
-                job_id=str(request.job_id or ""),
-                edge_id=int(request.edge_id),
-                status="",
-                queue_position=-1,
-                message="async training is not configured",
-            )
-
-        job = self.training_job_manager.get_job(
-            edge_id=int(request.edge_id),
-            job_id=str(request.job_id or ""),
-        )
-        if job is None:
-            return message_transmission_pb2.TrainingJobStatusReply(
-                found=False,
-                job_id=str(request.job_id or ""),
-                edge_id=int(request.edge_id),
-                status="",
-                queue_position=-1,
-                message="Training job not found.",
-            )
-
-        queue_position = self.training_job_manager.queue_position(job.job_id)
-        return message_transmission_pb2.TrainingJobStatusReply(
-            found=True,
-            job_id=job.job_id,
-            edge_id=job.edge_id,
-            status=job.status,
-            queue_position=queue_position,
-            message=job.message,
-            request_id=job.request_id,
-            job_type=job.job_type,
-            result_available=(job.status == JOB_STATUS_SUCCEEDED and bool(job.model_data)),
-            submitted_at_ms=job.submitted_at_ms,
-            started_at_ms=job.started_at_ms,
-            finished_at_ms=job.finished_at_ms,
-            protocol_version=job.protocol_version,
-        )
+        return self.continual_backend.get_training_job_status(request)
 
     def download_trained_model(self, request, context):
-        if self.training_job_manager is None:
-            return message_transmission_pb2.DownloadTrainedModelReply(
-                success=False,
-                job_id=str(request.job_id or ""),
-                status="",
-                model_data="",
-                message="async training is not configured",
-                protocol_version="",
-            )
-
-        success, job, message = self.training_job_manager.download_result(
-            edge_id=int(request.edge_id),
-            job_id=str(request.job_id or ""),
-        )
-        return message_transmission_pb2.DownloadTrainedModelReply(
-            success=success,
-            job_id=job.job_id if job is not None else str(request.job_id or ""),
-            status=job.status if job is not None else "",
-            model_data=job.model_data if success and job is not None else "",
-            message=message,
-            protocol_version=job.protocol_version if job is not None else "",
-        )
+        return self.continual_backend.download_trained_model(request)
 
     def cancel_training_job(self, request, context):
         """Cancel a queued training job by edge_id and job_id."""
-        if self.training_job_manager is None:
-            return message_transmission_pb2.CancelTrainingJobReply(
-                cancelled=False,
-                message="async training is not configured",
-            )
-
-        cancelled, message = self.training_job_manager.cancel_job(
-            edge_id=int(request.edge_id),
-            job_id=str(request.job_id or ""),
-        )
+        reply = self.continual_backend.cancel_training_job(request)
         logger.info(
             "Training job cancellation requested: edge={} cancelled={} reason={}.",
             request.edge_id,
-            cancelled,
-            message,
+            reply.cancelled,
+            reply.message,
         )
         log_diagnostic_debug(
             self,
             "cancel_training_job details",
             lambda: {"job_id": request.job_id},
         )
-        return message_transmission_pb2.CancelTrainingJobReply(
-            cancelled=cancelled,
-            message=message,
-        )
+        return reply
+
+    def report_edge_model_version(self, request, context):
+        del context
+        return self.continual_backend.report_edge_model_version(request)
 
     # ---- Resource-aware CL trigger: cloud resource query ----
 
@@ -539,8 +300,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         # held, there is 1 active job; max capacity is treated as 10.
         train_q = 0
         max_q = 0
-        if self.training_job_manager is not None:
-            train_q, max_q = self.training_job_manager.training_queue_state()
+        train_q, max_q = self.continual_backend.training_queue_state()
         if self.continual_learner is not None:
             if hasattr(self.continual_learner, "training_queue_state"):
                 learner_q, learner_max_q = self.continual_learner.training_queue_state()

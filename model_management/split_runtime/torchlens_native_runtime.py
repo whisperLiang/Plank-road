@@ -138,10 +138,12 @@ def prepare_split_runtime(
             return tl.prepare_split(model, normalize_example_inputs(example_inputs), spec)
         except Exception as exc:
             raise RuntimeError(
-                "Failed to build TorchLens native split runtime with the installed "
-                "torchlens wheel. Please ensure the new torchlens.whl exposing "
-                "SplitSpec, ReplayBoundary, SplitRuntime, prepare_split, and "
-                "prepare_split_replay is installed."
+                "TorchLens native split runtime construction failed during tl.prepare_split. "
+                "This does not necessarily mean the installed torchlens wheel is missing "
+                "the native split API. The cause may be runtime tracing failure, model "
+                "forward failure, invalid split spec, concurrent TorchLens execution, "
+                "CUDA OOM, or worker/MPS resource contention. "
+                f"cause={type(exc).__name__}: {exc}"
             ) from exc
 
 
@@ -160,10 +162,12 @@ def prepare_split_replay_runtime(
             return tl.prepare_split_replay(model, normalize_example_inputs(example_inputs), spec)
         except Exception as exc:
             raise RuntimeError(
-                "Failed to build TorchLens native replay runtime with the installed "
-                "torchlens wheel. Please ensure the new torchlens.whl exposing "
-                "SplitSpec, ReplayBoundary, SplitRuntime, prepare_split, and "
-                "prepare_split_replay is installed."
+                "TorchLens native split runtime construction failed during "
+                "tl.prepare_split_replay. This does not necessarily mean the installed "
+                "torchlens wheel is missing the native split API. The cause may be "
+                "runtime tracing failure, model forward failure, invalid split spec, "
+                "concurrent TorchLens execution, CUDA OOM, or worker/MPS resource "
+                f"contention. cause={type(exc).__name__}: {exc}"
             ) from exc
 
 

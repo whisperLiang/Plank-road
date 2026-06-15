@@ -82,7 +82,6 @@ client:
  server_ip: '192.168.66.205:50051'
  # edge nodes
  edge_id: 1
- edge_num: 1
  feature_upload:
   storage_format: "safetensors_shard"
   shard_max_samples: 64
@@ -204,6 +203,44 @@ server:
  grpc_max_workers: 16
  # cloud-owned workspace used for uploaded retraining bundles
  workspace_root: "./cache/server_workspace"
+ edge_affine_workers:
+  enabled: false
+  run_id: null
+  mode: edge_affine_single_gpu_mps
+  edge_workers:
+   assignment: one_worker_per_edge
+   lazy_start: true
+   lazy_cuda_init: true
+   max_workers: auto
+   idle_timeout_sec: 900
+   worker_base_port: 56000
+   workspace_root: "./cache/server_workspace/workers"
+  mps:
+   enabled: true
+   auto_start: false
+   cuda_visible_devices: "0"
+   pipe_directory: /tmp/nvidia-mps
+   log_directory: /tmp/nvidia-mps-log
+   active_thread_percentage: auto
+  gpu_lease:
+   enabled: true
+   device: "cuda:0"
+   memory_usage_threshold: 0.85
+   reserve_memory_gb: 4
+   max_active_gpu_workers: auto
+   default_estimated_job_memory_gb: 18
+   adaptive_peak_memory_estimation: true
+   fallback_to_exclusive_on_oom: true
+   max_exclusive_retries: 1
+   lease_ttl_sec: 120
+   heartbeat_interval_sec: 10
+   teacher_reserved_memory_gb: 0
+   teacher_gpu_policy: lease
+  worker:
+   max_concurrent_jobs: 1
+   startup_timeout_sec: 30
+   request_timeout_sec: 600
+   healthcheck_interval_sec: 10
  #the queue maxsize
  local_queue_maxsize: 10
  # the max wait time

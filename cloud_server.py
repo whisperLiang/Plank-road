@@ -1,6 +1,7 @@
 import argparse
 import os
 from concurrent import futures
+from pathlib import Path
 
 import cv2
 import grpc
@@ -9,16 +10,31 @@ from loguru import logger
 
 from baselines.distributed.cloud_controller import DistributedBaselineController
 from cloud.edge_registry import EdgeRegistry
-from cloud.orchestrator import CloudContinualLearner, CloudFixedSplitOrchestrator
+from cloud.workers.assignment_store import EdgeAssignmentStore
+from cloud.workers.edge_worker_pool import EdgeWorkerPool
+from cloud.workers.gpu_lease_manager import GpuLeaseManager
+from cloud.workers.lease_service import GpuLeaseService
+from cloud.workers.mps_runtime import ensure_mps_runtime
 from common.logging_sanitizer import log_diagnostic_debug
 from config import default_run_id, load_runtime_config, validate_baseline_method
 from grpc_server import message_transmission_pb2_grpc
+from grpc_server.continual_backends import (
+    EdgeWorkerRoutedContinualLearningBackend,
+    LocalContinualLearningBackend,
+)
 from grpc_server.rpc_server import MessageTransmissionServicer
 from grpc_server.training_jobs import TrainingJobManager
-from model_management.object_detection import Object_Detection
 from tools.grpc_options import grpc_message_options
 
-__all__ = ["CloudContinualLearner", "CloudServer"]
+__all__ = ["CloudServer"]
+
+
+def __getattr__(name: str):
+    if name == "CloudContinualLearner":
+        from cloud.orchestrator import CloudContinualLearner
+
+        return CloudContinualLearner
+    raise AttributeError(name)
 
 
 class CloudServer:
@@ -30,8 +46,10 @@ class CloudServer:
         baseline_config=None,
         baseline_method: str = "",
         run_id: str = "",
+        yaml_path: str = "./config/config.yaml",
     ):
         self.config = config
+        self.yaml_path = str(yaml_path)
         self.mode = str(mode or "main")
         self.server_id = config.server_id
         self.edge_registry = EdgeRegistry()
@@ -39,6 +57,10 @@ class CloudServer:
         self.large_object_detection = None
         self.continual_learner = None
         self.training_job_manager = None
+        self.continual_backend = None
+        self.worker_pool = None
+        self.gpu_lease_manager = None
+        self.gpu_lease_service = None
         self.log_internal_ids = False
         if self.mode == "baseline":
             method = validate_baseline_method(
@@ -49,6 +71,8 @@ class CloudServer:
                 resolved_run_id = default_run_id(method)
             inference_fn = None
             if method != "pure_edge_local_updating":
+                from model_management.object_detection import Object_Detection
+
                 self.large_object_detection = Object_Detection(config, type="large inference")
                 inference_fn = _baseline_cloud_inference_adapter(self.large_object_detection)
             self.baseline_controller = DistributedBaselineController(
@@ -63,20 +87,102 @@ class CloudServer:
             self.baseline_method = method
             self.run_id = resolved_run_id
         else:
-            self.large_object_detection = Object_Detection(config, type="large inference")
-            self.continual_learner = CloudFixedSplitOrchestrator(
-                config,
-                self.large_object_detection,
+            edge_affine = getattr(config, "edge_affine_workers", None)
+            if edge_affine is not None and bool(getattr(edge_affine, "enabled", False)):
+                self._init_edge_affine_backend(edge_affine)
+            else:
+                from cloud.orchestrator import CloudFixedSplitOrchestrator
+                from model_management.object_detection import Object_Detection
+
+                self.large_object_detection = Object_Detection(config, type="large inference")
+                self.continual_learner = CloudFixedSplitOrchestrator(
+                    config,
+                    self.large_object_detection,
+                )
+                self.log_internal_ids = bool(
+                    getattr(self.continual_learner, "log_internal_ids", False)
+                )
+                self.training_job_manager = TrainingJobManager(
+                    continual_learner=self.continual_learner,
+                    max_concurrent_jobs=1,
+                    edge_registry=self.edge_registry,
+                    log_internal_ids=self.log_internal_ids,
+                )
+                self.continual_backend = LocalContinualLearningBackend(
+                    continual_learner=self.continual_learner,
+                    workspace_root=str(
+                        getattr(config, "workspace_root", "./cache/server_workspace")
+                    ),
+                    training_job_manager=self.training_job_manager,
+                    edge_registry=self.edge_registry,
+                    log_internal_ids=self.log_internal_ids,
+                )
+
+    def _init_edge_affine_backend(self, edge_affine) -> None:
+        run_id = str(getattr(edge_affine, "run_id", "") or "").strip()
+        if not run_id:
+            run_id = "plank_road_real_devices"
+            logger.warning(
+                "server.edge_affine_workers.run_id is not configured; using default {}. "
+                "Set an explicit run_id for formal experiments to avoid assignment reuse.",
+                run_id,
             )
-            self.log_internal_ids = bool(
-                getattr(self.continual_learner, "log_internal_ids", False)
-            )
-            self.training_job_manager = TrainingJobManager(
-                continual_learner=self.continual_learner,
-                max_concurrent_jobs=self.continual_learner.max_concurrent_jobs,
-                edge_registry=self.edge_registry,
-                log_internal_ids=self.log_internal_ids,
-            )
+        workspace_root = str(getattr(self.config, "workspace_root", "./cache/server_workspace"))
+        assignment_store = EdgeAssignmentStore(
+            Path(workspace_root) / "worker_assignments.json",
+            run_id=run_id,
+            mode=str(getattr(edge_affine, "mode", "edge_affine_single_gpu_mps")),
+            worker_workspace_root=str(edge_affine.edge_workers.workspace_root),
+        )
+        lease_cfg = edge_affine.gpu_lease
+        self.gpu_lease_manager = GpuLeaseManager(
+            memory_usage_threshold=float(lease_cfg.memory_usage_threshold),
+            reserve_memory_gb=float(lease_cfg.reserve_memory_gb),
+            max_active_gpu_workers=lease_cfg.max_active_gpu_workers,
+            default_estimated_job_memory_gb=float(lease_cfg.default_estimated_job_memory_gb),
+            lease_ttl_sec=float(lease_cfg.lease_ttl_sec),
+            teacher_reserved_memory_gb=float(lease_cfg.teacher_reserved_memory_gb),
+        )
+        self.gpu_lease_service = GpuLeaseService(
+            listen_address="127.0.0.1:0",
+            manager=self.gpu_lease_manager,
+        )
+        self.gpu_lease_service.start()
+        mps_env = ensure_mps_runtime(
+            edge_affine.mps,
+            max_active_gpu_workers=self.gpu_lease_manager.max_active_gpu_workers,
+        )
+        self.worker_pool = EdgeWorkerPool(
+            yaml_path=self.yaml_path,
+            run_id=run_id,
+            mode=str(edge_affine.mode),
+            assignment_store=assignment_store,
+            edge_workers_config=edge_affine.edge_workers,
+            worker_service_config=edge_affine.worker,
+            mps_env=mps_env,
+            lease_address=self.gpu_lease_service.listen_address,
+            log_internal_ids=self.log_internal_ids,
+        )
+        self.continual_backend = EdgeWorkerRoutedContinualLearningBackend(
+            worker_pool=self.worker_pool,
+            edge_registry=self.edge_registry,
+            gpu_lease_manager=self.gpu_lease_manager,
+        )
+        logger.info(
+            "edge_affine_worker_pool enabled=true mode={} assignment={} lazy_start={} "
+            "lazy_cuda_init={} mps_enabled={} gpu_device={} memory_usage_threshold={} "
+            "reserve_memory_gb={} max_active_gpu_workers={} default_estimated_job_memory_gb={}",
+            edge_affine.mode,
+            edge_affine.edge_workers.assignment,
+            edge_affine.edge_workers.lazy_start,
+            edge_affine.edge_workers.lazy_cuda_init,
+            edge_affine.mps.enabled,
+            lease_cfg.device,
+            lease_cfg.memory_usage_threshold,
+            lease_cfg.reserve_memory_gb,
+            self.gpu_lease_manager.max_active_gpu_workers,
+            lease_cfg.default_estimated_job_memory_gb,
+        )
 
     def start_server(self):
         listen_address = str(getattr(self.config, "listen_address", "[::]:50051")).strip()
@@ -130,6 +236,7 @@ class CloudServer:
                 training_job_manager=self.training_job_manager,
                 edge_registry=self.edge_registry,
                 baseline_controller=self.baseline_controller,
+                continual_backend=self.continual_backend,
                 log_internal_ids=self.log_internal_ids,
             ),
             server,
@@ -149,6 +256,12 @@ class CloudServer:
                 self.training_job_manager.close()
             if self.continual_learner is not None:
                 self.continual_learner.close()
+            if self.worker_pool is not None:
+                self.worker_pool.close()
+            if self.gpu_lease_service is not None:
+                self.gpu_lease_service.shutdown()
+            if self.gpu_lease_manager is not None:
+                self.gpu_lease_manager.close()
 
 
 def _baseline_cloud_inference_adapter(detector):
@@ -207,6 +320,15 @@ def _jsonable_item(value: object):
     return value
 
 
+def _parse_bool(value: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value: {value!r}")
+
+
 if __name__ == "__main__":
     from tools.logging_config import configure_logging
 
@@ -229,6 +351,17 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
     parser.add_argument("--run_id", default=None, help="baseline run id")
+    parser.add_argument(
+        "--edge_affine_workers_enabled",
+        type=str,
+        default=None,
+        help="override server.edge_affine_workers.enabled",
+    )
+    parser.add_argument(
+        "--edge_affine_worker_mode",
+        default=None,
+        help="override server.edge_affine_workers.mode",
+    )
     args = parser.parse_args()
     config = load_runtime_config(args.yaml_path)
     server_config = config.server
@@ -238,6 +371,14 @@ if __name__ == "__main__":
         server_config.workspace_root = args.workspace_root
     if args.grpc_max_workers is not None:
         server_config.grpc_max_workers = args.grpc_max_workers
+    if args.edge_affine_workers_enabled is not None:
+        server_config.edge_affine_workers.enabled = _parse_bool(
+            args.edge_affine_workers_enabled
+        )
+    if args.edge_affine_worker_mode is not None:
+        server_config.edge_affine_workers.mode = args.edge_affine_worker_mode
+    if args.run_id is not None and args.mode == "main":
+        server_config.edge_affine_workers.run_id = args.run_id
     baseline_method = args.baseline_method or config.baseline.method
     if args.mode == "baseline":
         baseline_method = validate_baseline_method(baseline_method)
@@ -251,5 +392,6 @@ if __name__ == "__main__":
         baseline_config=config.baseline,
         baseline_method=baseline_method,
         run_id=args.run_id or "",
+        yaml_path=args.yaml_path,
     )
     cloud_server.start_server()

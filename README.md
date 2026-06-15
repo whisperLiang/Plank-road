@@ -78,9 +78,9 @@ Core areas: [cloud/orchestration/](./cloud/orchestration/), [cloud/annotation/](
 
 ### Model Update And Multi-Edge Safety
 
-Cloud training jobs are queued with per-edge isolation, round-robin fairness, and model-version checks. Updated lightweight weights are returned only to the originating edge; stale results are discarded if the edge model has already advanced.
+Cloud training jobs are routed by `edge_id`. In the default local mode, fixed-split continual-learning jobs run serially. For real multi-edge GPU concurrency, enable the edge-affine worker pool: each edge gets an isolated worker process, and the GPU lease manager decides how many workers may enter CUDA-heavy fixed-split stages.
 
-Core areas: [grpc_server/training_jobs.py](./grpc_server/training_jobs.py), [grpc_server/rpc_server.py](./grpc_server/rpc_server.py), [multi_edge/](./multi_edge/).
+Core areas: [grpc_server/training_jobs.py](./grpc_server/training_jobs.py), [grpc_server/rpc_server.py](./grpc_server/rpc_server.py), [cloud/workers/](./cloud/workers/).
 
 ## Project Structure
 
@@ -95,7 +95,8 @@ Plank-road/
 |   |-- annotation/             # Teacher annotation service and label cache
 |   |-- feature_cache/          # Cloud feature shard store, planner, materializer, GC
 |   |-- orchestration/          # Fixed-split training pipeline stages
-|   `-- sample_pool/            # Canonical sample pool, labels, staging, views
+|   |-- sample_pool/            # Canonical sample pool, labels, staging, views
+|   `-- workers/                # Edge-affine workers, assignment, MPS, GPU leases
 |-- grpc_server/                # Protobuf contract, RPC server, jobs, workspace helpers
 |   `-- protos/                 # message_transmission.proto and generated stubs
 |-- model_management/           # Detectors, inference helpers, fixed split, DAS, runtimes
@@ -165,7 +166,7 @@ client:
 server:
   continual_learning:
     batch_size: 32
-    max_concurrent_jobs: 4
+    max_concurrent_jobs: 1
     feature_cache:
       materialization_mode: direct_ref
       storage_format: safetensors_shard
@@ -175,6 +176,13 @@ server:
   das:
     enabled: False
     strategy: entropy
+  edge_affine_workers:
+    enabled: false
+    mode: edge_affine_single_gpu_mps
+    gpu_lease:
+      memory_usage_threshold: 0.85
+      reserve_memory_gb: 4
+      default_estimated_job_memory_gb: 18
 ```
 
 ## Usage
@@ -264,7 +272,59 @@ Real deployment checklist:
 5. Each edge has a valid local video/camera source.
 6. Edge cache directories are not shared through NFS unless intentionally configured.
 7. Cloud workspace_root has enough disk space for uploaded bundles and feature caches.
-8. Cloud grpc_max_workers and continual_learning.max_concurrent_jobs are configured for the expected number of devices.
+8. For concurrent fixed-split GPU training, enable `server.edge_affine_workers`; do not use `continual_learning.max_concurrent_jobs` as the fixed-split parallelism knob.
+```
+
+### Single-GPU Edge-Affine MPS Worker Pool
+
+The worker pool keeps Plank-Road's physical deployment unchanged: one cloud server and one edge client per physical edge. Internally, each edge is assigned an independent worker process for state isolation. The number of edge workers does not equal GPU parallelism. Actual fixed-split GPU parallelism is controlled by the GPU lease manager using the configured memory threshold, reserve budget, estimated peak memory, active leases, and lease heartbeat TTL.
+
+Start MPS on the cloud machine:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
+mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+nvidia-cuda-mps-control -d
+```
+
+Start the cloud with edge-affine workers:
+
+```bash
+uv run python cloud_server.py \
+  --yaml_path ./config/config.yaml \
+  --edge_affine_workers_enabled true \
+  --edge_affine_worker_mode edge_affine_single_gpu_mps \
+  --run_id plank_road_real_devices_001
+```
+
+Start each physical edge with a unique `edge_id`:
+
+```bash
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --edge_id 1 \
+  --server_ip <cloud_ip>:50051 \
+  --cache_path ./cache/edge_1 \
+  --video_path ./video_data/road.mp4 \
+  --headless
+```
+
+```bash
+uv run python edge_client.py \
+  --yaml_path ./config/config.yaml \
+  --edge_id 110 \
+  --server_ip <cloud_ip>:50051 \
+  --cache_path ./cache/edge_110 \
+  --video_path ./video_data/cam1-rin.mp4 \
+  --headless
+```
+
+When GPU memory approaches the configured threshold, additional edge workers wait until an active worker releases its lease. If a lease heartbeat expires, the lease is released automatically and the job is treated as retryable. Shut MPS down with:
+
+```bash
+echo quit | nvidia-cuda-mps-control
 ```
 
 ### Distributed Baseline Deployment

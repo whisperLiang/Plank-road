@@ -728,6 +728,34 @@ def download_trained_model(
             channel.close()
 
 
+def report_edge_model_version(
+    server_ip: str,
+    *,
+    edge_id: int,
+    model_id: str,
+    model_version: str,
+    channel=None,
+) -> tuple[bool, str]:
+    owned_channel = channel is None
+    try:
+        if channel is None:
+            channel = grpc.insecure_channel(server_ip, options=grpc_message_options())
+        stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+        req = message_transmission_pb2.ReportEdgeModelVersionRequest(
+            edge_id=int(edge_id),
+            model_id=str(model_id or ""),
+            model_version=str(model_version or ""),
+        )
+        reply = stub.report_edge_model_version(req)
+        return bool(reply.success), str(reply.message)
+    except Exception as exc:
+        logger.warning("[EdgeCL] model version report failed: {}.", safe_error_summary(exc))
+        return False, str(exc)
+    finally:
+        if owned_channel and channel is not None:
+            channel.close()
+
+
 def submit_continual_learning_job(
     server_ip: str,
     *,

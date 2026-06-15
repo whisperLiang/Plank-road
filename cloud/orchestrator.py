@@ -1,16 +1,30 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cloud.orchestration.fixed_split_pipeline import FixedSplitPipeline
-from model_management.object_detection import Object_Detection
+
+if TYPE_CHECKING:
+    from model_management.object_detection import Object_Detection
 
 
 class CloudFixedSplitOrchestrator:
     """Thin cloud-side facade for fixed-split continual learning RPC calls."""
 
-    def __init__(self, config: Any, large_object_detection: Object_Detection):
-        self._pipeline = FixedSplitPipeline(config, large_object_detection)
+    def __init__(
+        self,
+        config: Any,
+        large_object_detection: "Object_Detection",
+        *,
+        gpu_lease_client=None,
+        worker_id: str = "",
+    ):
+        self._pipeline = FixedSplitPipeline(
+            config,
+            large_object_detection,
+            gpu_lease_client=gpu_lease_client,
+            worker_id=worker_id,
+        )
         self.config = config
         self.large_od = large_object_detection
         self.max_concurrent_jobs = self._pipeline.max_concurrent_jobs

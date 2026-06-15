@@ -32,6 +32,7 @@ from edge.task import Task
 from edge.transmit import (
     download_trained_model,
     get_training_job_status,
+    report_edge_model_version,
     submit_continual_learning_job,
 )
 from edge.window_drift_detector import DriftWindowState, WindowDriftDetector
@@ -508,7 +509,6 @@ class EdgeWorker:
                 self.resource_trigger.lambda_bw,
             )
 
-        self.queue_info = {f"{i + 1}": 0 for i in range(self.config.edge_num)}
         self.frame_cache = Queue(config.frame_cache_maxsize)
         self.local_queue = Queue(config.local_queue_maxsize)
         self.latest_result_lock = threading.Lock()
@@ -1860,6 +1860,17 @@ class EdgeWorker:
                         submitted_model_version,
                         self.model_version,
                     )
+                    reported, report_message = report_edge_model_version(
+                        self.config.server_ip,
+                        edge_id=self.edge_id,
+                        model_id=self.model_id,
+                        model_version=self.model_version,
+                    )
+                    if not reported:
+                        logger.warning(
+                            "[EdgeCL] model version report was not acknowledged: {}.",
+                            safe_error_summary(report_message),
+                        )
                     log_diagnostic_debug(
                         self,
                         "[EdgeCL] model update diagnostics",
@@ -2016,7 +2027,6 @@ class EdgeWorker:
                 getattr(task, "local_queue_enqueued_perf", time.perf_counter())
             )
             task.set_timing("local_queue_wait", (time.perf_counter() - local_enqueued) * 1000.0)
-            self.queue_info[f"{self.edge_id}"] = self.local_queue.qsize()
             current_frame = task.frame_edge
             frame_image_size = tuple(int(value) for value in current_frame.shape[:2])
             split_resolve_started = time.perf_counter()

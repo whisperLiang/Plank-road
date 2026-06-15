@@ -5,7 +5,8 @@ import re
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import torch
 from loguru import logger
@@ -17,11 +18,14 @@ from cloud.annotation import (
 )
 from cloud.orchestration.fixed_split_dependencies import _GLOBAL_TEACHER_ANNOTATION_QUEUE
 from cloud.training.proxy_metadata import normalise_shard_dtype as _normalise_shard_dtype
+from cloud.workers.gpu_lease_manager import LeaseRequest
 from common.logging_sanitizer import log_diagnostic_debug
 from model_management.fixed_split_runtime_template import (
     get_fixed_split_runtime_template_cache,
 )
-from model_management.object_detection import Object_Detection
+
+if TYPE_CHECKING:
+    from model_management.object_detection import Object_Detection
 
 
 @dataclass(frozen=True)
@@ -202,9 +206,19 @@ class OrchestrationSettings:
 
 
 class PipelineLifecycleMixin:
-    def __init__(self, config, large_object_detection: Object_Detection):
+    def __init__(
+        self,
+        config,
+        large_object_detection: "Object_Detection",
+        *,
+        gpu_lease_client=None,
+        worker_id: str = "",
+    ):
         self.config = config
         self.large_od = large_object_detection
+        self.gpu_lease_client = gpu_lease_client
+        self.worker_id = str(worker_id or "")
+        self.lazy_cuda_init = bool(gpu_lease_client is not None)
         self.settings = OrchestrationSettings.from_config(config)
         settings = self.settings
         self.log_internal_ids = settings.log_internal_ids
@@ -217,7 +231,11 @@ class PipelineLifecycleMixin:
             "models",
         )
         os.makedirs(self.weight_folder, exist_ok=True)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = (
+            torch.device("cpu")
+            if self.lazy_cuda_init
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
 
         # Resolve and validate configured weights_path if provided
         configured_weights = str(getattr(config, "weights_path", "") or "").strip()
@@ -563,3 +581,97 @@ class PipelineLifecycleMixin:
     def training_queue_state(self) -> tuple[int, int]:
         with self._job_state_lock:
             return self._queued_jobs + self._active_jobs, self.max_concurrent_jobs
+
+    @contextmanager
+    def gpu_lease_scope(
+        self,
+        *,
+        edge_id: int,
+        job_id: str,
+        workspace: str,
+        exclusive: bool = False,
+    ):
+        if self.gpu_lease_client is None:
+            yield
+            return
+        manifest = _read_workspace_manifest(workspace)
+        model_meta = dict(manifest.get("model", {}) or {})
+        split_plan = dict(manifest.get("split_plan", {}) or {})
+        model_name = str(
+            model_meta.get("model_id")
+            or manifest.get("model_id")
+            or getattr(self, "edge_model_name", "")
+        )
+        split_key = str(
+            split_plan.get("canonical_split_key")
+            or manifest.get("canonical_split_key")
+            or ""
+        )
+        train_samples = len(
+            [
+                sample
+                for sample in list(manifest.get("samples", []) or [])
+                if isinstance(sample, dict) and str(sample.get("sample_id", "")).strip()
+            ]
+        )
+        estimate = float(
+            getattr(
+                getattr(
+                    getattr(self.config, "edge_affine_workers", None),
+                    "gpu_lease",
+                    None,
+                ),
+                "default_estimated_job_memory_gb",
+                18.0,
+            )
+        )
+        handle = self.gpu_lease_client.acquire(
+            LeaseRequest(
+                edge_id=int(edge_id),
+                worker_id=self.worker_id,
+                job_id=str(job_id),
+                model_name=model_name,
+                split_key=split_key,
+                batch_size=int(getattr(self, "batch_size", 0) or 0),
+                train_samples=train_samples,
+                estimated_peak_memory_gb=estimate,
+                exclusive=bool(exclusive),
+            )
+        )
+        with handle:
+            try:
+                if torch.cuda.is_available():
+                    self.device = torch.device("cuda")
+                    torch.cuda.reset_peak_memory_stats()
+                else:
+                    self.device = torch.device("cpu")
+            except Exception:
+                pass
+            try:
+                yield
+            except Exception as exc:
+                try:
+                    self.gpu_lease_client.mark_oom(job_id=str(job_id), message=str(exc))
+                except Exception:
+                    pass
+                raise
+            finally:
+                try:
+                    if torch.cuda.is_available():
+                        handle.observed_peak_memory_gb = torch.cuda.max_memory_reserved() / (
+                            1024.0**3
+                        )
+                except Exception:
+                    pass
+
+
+def _read_workspace_manifest(workspace: str) -> dict[str, object]:
+    path = Path(workspace) / "trigger_manifest.json"
+    if not path.exists():
+        return {}
+    try:
+        import json
+
+        return dict(json.loads(path.read_text(encoding="utf-8")) or {})
+    except Exception:
+        return {}

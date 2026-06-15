@@ -14,6 +14,8 @@ service MessageTransmission {
   rpc get_training_job_status (TrainingJobStatusRequest) returns (TrainingJobStatusReply) {}
   // Download trained model for a completed async training job.
   rpc download_trained_model (DownloadTrainedModelRequest) returns (DownloadTrainedModelReply) {}
+  // Report that an edge has applied a model update.
+  rpc report_edge_model_version (ReportEdgeModelVersionRequest) returns (ReportEdgeModelVersionReply) {}
   // Cancel a queued or running training job.
   rpc cancel_training_job (CancelTrainingJobRequest) returns (CancelTrainingJobReply) {}
   // Resource-aware CL trigger: edge queries cloud resource utilisation.
@@ -149,6 +151,17 @@ message DownloadTrainedModelReply {
   string message = 5;
   string protocol_version = 6;
   string result_model_version = 7;
+}
+
+message ReportEdgeModelVersionRequest {
+  int64 edge_id = 1;
+  string model_id = 2;
+  string model_version = 3;
+}
+
+message ReportEdgeModelVersionReply {
+  bool success = 1;
+  string message = 2;
 }
 
 // Cancel a queued or running training job

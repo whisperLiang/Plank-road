@@ -1,12 +1,9 @@
-from collections.abc import Iterable as _Iterable
-from typing import ClassVar as _ClassVar
-from typing import Optional as _Optional
-from typing import Union as _Union
-
-from google.protobuf import descriptor as _descriptor
-from google.protobuf import message as _message
 from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import message as _message
+from collections.abc import Iterable as _Iterable
+from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
@@ -15,7 +12,6 @@ class TrainingJobType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     TRAINING_JOB_TYPE_UNSPECIFIED: _ClassVar[TrainingJobType]
     TRAINING_JOB_TYPE_FULL_FRAME: _ClassVar[TrainingJobType]
     TRAINING_JOB_TYPE_CONTINUAL_LEARNING: _ClassVar[TrainingJobType]
-
 TRAINING_JOB_TYPE_UNSPECIFIED: TrainingJobType
 TRAINING_JOB_TYPE_FULL_FRAME: TrainingJobType
 TRAINING_JOB_TYPE_CONTINUAL_LEARNING: TrainingJobType
@@ -30,13 +26,7 @@ class TrainRequest(_message.Message):
     frame_indices: _containers.RepeatedScalarFieldContainer[int]
     cache_path: str
     payload_zip: bytes
-    def __init__(
-        self,
-        edge_id: _Optional[int] = ...,
-        frame_indices: _Optional[_Iterable[int]] = ...,
-        cache_path: _Optional[str] = ...,
-        payload_zip: _Optional[bytes] = ...,
-    ) -> None: ...
+    def __init__(self, edge_id: _Optional[int] = ..., frame_indices: _Optional[_Iterable[int]] = ..., cache_path: _Optional[str] = ..., payload_zip: _Optional[bytes] = ...) -> None: ...
 
 class TrainReply(_message.Message):
     __slots__ = ("success", "model_data", "message")
@@ -46,18 +36,10 @@ class TrainReply(_message.Message):
     success: bool
     model_data: str
     message: str
-    def __init__(
-        self, success: bool = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ...
-    ) -> None: ...
+    def __init__(self, success: bool = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ...) -> None: ...
 
 class ContinualLearningRequest(_message.Message):
-    __slots__ = (
-        "protocol_version",
-        "edge_id",
-        "cache_path",
-        "send_low_conf_features",
-        "payload_zip",
-    )
+    __slots__ = ("protocol_version", "edge_id", "cache_path", "send_low_conf_features", "payload_zip")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
     CACHE_PATH_FIELD_NUMBER: _ClassVar[int]
@@ -68,14 +50,7 @@ class ContinualLearningRequest(_message.Message):
     cache_path: str
     send_low_conf_features: bool
     payload_zip: bytes
-    def __init__(
-        self,
-        protocol_version: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        cache_path: _Optional[str] = ...,
-        send_low_conf_features: bool = ...,
-        payload_zip: _Optional[bytes] = ...,
-    ) -> None: ...
+    def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., cache_path: _Optional[str] = ..., send_low_conf_features: bool = ..., payload_zip: _Optional[bytes] = ...) -> None: ...
 
 class ContinualLearningReply(_message.Message):
     __slots__ = ("success", "model_data", "message", "protocol_version")
@@ -87,24 +62,10 @@ class ContinualLearningReply(_message.Message):
     model_data: str
     message: str
     protocol_version: str
-    def __init__(
-        self,
-        success: bool = ...,
-        model_data: _Optional[str] = ...,
-        message: _Optional[str] = ...,
-        protocol_version: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, success: bool = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ..., protocol_version: _Optional[str] = ...) -> None: ...
 
 class SampleSyncRequest(_message.Message):
-    __slots__ = (
-        "protocol_version",
-        "edge_id",
-        "model_id",
-        "model_version",
-        "split_config_id",
-        "sync_type",
-        "payload_zip",
-    )
+    __slots__ = ("protocol_version", "edge_id", "model_id", "model_version", "split_config_id", "sync_type", "payload_zip")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
     MODEL_ID_FIELD_NUMBER: _ClassVar[int]
@@ -119,16 +80,7 @@ class SampleSyncRequest(_message.Message):
     split_config_id: str
     sync_type: str
     payload_zip: bytes
-    def __init__(
-        self,
-        protocol_version: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        model_id: _Optional[str] = ...,
-        model_version: _Optional[str] = ...,
-        split_config_id: _Optional[str] = ...,
-        sync_type: _Optional[str] = ...,
-        payload_zip: _Optional[bytes] = ...,
-    ) -> None: ...
+    def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., model_id: _Optional[str] = ..., model_version: _Optional[str] = ..., split_config_id: _Optional[str] = ..., sync_type: _Optional[str] = ..., payload_zip: _Optional[bytes] = ...) -> None: ...
 
 class SampleSyncReply(_message.Message):
     __slots__ = ("success", "message", "committed_samples")
@@ -138,25 +90,10 @@ class SampleSyncReply(_message.Message):
     success: bool
     message: str
     committed_samples: int
-    def __init__(
-        self,
-        success: bool = ...,
-        message: _Optional[str] = ...,
-        committed_samples: _Optional[int] = ...,
-    ) -> None: ...
+    def __init__(self, success: bool = ..., message: _Optional[str] = ..., committed_samples: _Optional[int] = ...) -> None: ...
 
 class SubmitTrainingJobRequest(_message.Message):
-    __slots__ = (
-        "protocol_version",
-        "edge_id",
-        "request_id",
-        "job_type",
-        "cache_path",
-        "send_low_conf_features",
-        "frame_indices",
-        "payload_zip",
-        "base_model_version",
-    )
+    __slots__ = ("protocol_version", "edge_id", "request_id", "job_type", "cache_path", "send_low_conf_features", "frame_indices", "payload_zip", "base_model_version")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
@@ -175,18 +112,7 @@ class SubmitTrainingJobRequest(_message.Message):
     frame_indices: _containers.RepeatedScalarFieldContainer[int]
     payload_zip: bytes
     base_model_version: str
-    def __init__(
-        self,
-        protocol_version: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        request_id: _Optional[str] = ...,
-        job_type: _Optional[_Union[TrainingJobType, str]] = ...,
-        cache_path: _Optional[str] = ...,
-        send_low_conf_features: bool = ...,
-        frame_indices: _Optional[_Iterable[int]] = ...,
-        payload_zip: _Optional[bytes] = ...,
-        base_model_version: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, protocol_version: _Optional[str] = ..., edge_id: _Optional[int] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., cache_path: _Optional[str] = ..., send_low_conf_features: bool = ..., frame_indices: _Optional[_Iterable[int]] = ..., payload_zip: _Optional[bytes] = ..., base_model_version: _Optional[str] = ...) -> None: ...
 
 class SubmitTrainingJobReply(_message.Message):
     __slots__ = ("accepted", "job_id", "status", "queue_position", "message")
@@ -200,14 +126,7 @@ class SubmitTrainingJobReply(_message.Message):
     status: str
     queue_position: int
     message: str
-    def __init__(
-        self,
-        accepted: bool = ...,
-        job_id: _Optional[str] = ...,
-        status: _Optional[str] = ...,
-        queue_position: _Optional[int] = ...,
-        message: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, accepted: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., queue_position: _Optional[int] = ..., message: _Optional[str] = ...) -> None: ...
 
 class TrainingJobStatusRequest(_message.Message):
     __slots__ = ("edge_id", "job_id")
@@ -218,23 +137,7 @@ class TrainingJobStatusRequest(_message.Message):
     def __init__(self, edge_id: _Optional[int] = ..., job_id: _Optional[str] = ...) -> None: ...
 
 class TrainingJobStatusReply(_message.Message):
-    __slots__ = (
-        "found",
-        "job_id",
-        "edge_id",
-        "status",
-        "queue_position",
-        "message",
-        "request_id",
-        "job_type",
-        "result_available",
-        "submitted_at_ms",
-        "started_at_ms",
-        "finished_at_ms",
-        "protocol_version",
-        "base_model_version",
-        "result_model_version",
-    )
+    __slots__ = ("found", "job_id", "edge_id", "status", "queue_position", "message", "request_id", "job_type", "result_available", "submitted_at_ms", "started_at_ms", "finished_at_ms", "protocol_version", "base_model_version", "result_model_version")
     FOUND_FIELD_NUMBER: _ClassVar[int]
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -265,24 +168,7 @@ class TrainingJobStatusReply(_message.Message):
     protocol_version: str
     base_model_version: str
     result_model_version: str
-    def __init__(
-        self,
-        found: bool = ...,
-        job_id: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        status: _Optional[str] = ...,
-        queue_position: _Optional[int] = ...,
-        message: _Optional[str] = ...,
-        request_id: _Optional[str] = ...,
-        job_type: _Optional[_Union[TrainingJobType, str]] = ...,
-        result_available: bool = ...,
-        submitted_at_ms: _Optional[int] = ...,
-        started_at_ms: _Optional[int] = ...,
-        finished_at_ms: _Optional[int] = ...,
-        protocol_version: _Optional[str] = ...,
-        base_model_version: _Optional[str] = ...,
-        result_model_version: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, found: bool = ..., job_id: _Optional[str] = ..., edge_id: _Optional[int] = ..., status: _Optional[str] = ..., queue_position: _Optional[int] = ..., message: _Optional[str] = ..., request_id: _Optional[str] = ..., job_type: _Optional[_Union[TrainingJobType, str]] = ..., result_available: bool = ..., submitted_at_ms: _Optional[int] = ..., started_at_ms: _Optional[int] = ..., finished_at_ms: _Optional[int] = ..., protocol_version: _Optional[str] = ..., base_model_version: _Optional[str] = ..., result_model_version: _Optional[str] = ...) -> None: ...
 
 class DownloadTrainedModelRequest(_message.Message):
     __slots__ = ("edge_id", "job_id")
@@ -293,15 +179,7 @@ class DownloadTrainedModelRequest(_message.Message):
     def __init__(self, edge_id: _Optional[int] = ..., job_id: _Optional[str] = ...) -> None: ...
 
 class DownloadTrainedModelReply(_message.Message):
-    __slots__ = (
-        "success",
-        "job_id",
-        "status",
-        "model_data",
-        "message",
-        "protocol_version",
-        "result_model_version",
-    )
+    __slots__ = ("success", "job_id", "status", "model_data", "message", "protocol_version", "result_model_version")
     SUCCESS_FIELD_NUMBER: _ClassVar[int]
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
@@ -316,16 +194,25 @@ class DownloadTrainedModelReply(_message.Message):
     message: str
     protocol_version: str
     result_model_version: str
-    def __init__(
-        self,
-        success: bool = ...,
-        job_id: _Optional[str] = ...,
-        status: _Optional[str] = ...,
-        model_data: _Optional[str] = ...,
-        message: _Optional[str] = ...,
-        protocol_version: _Optional[str] = ...,
-        result_model_version: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, success: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ..., protocol_version: _Optional[str] = ..., result_model_version: _Optional[str] = ...) -> None: ...
+
+class ReportEdgeModelVersionRequest(_message.Message):
+    __slots__ = ("edge_id", "model_id", "model_version")
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    edge_id: int
+    model_id: str
+    model_version: str
+    def __init__(self, edge_id: _Optional[int] = ..., model_id: _Optional[str] = ..., model_version: _Optional[str] = ...) -> None: ...
+
+class ReportEdgeModelVersionReply(_message.Message):
+    __slots__ = ("success", "message")
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    success: bool
+    message: str
+    def __init__(self, success: bool = ..., message: _Optional[str] = ...) -> None: ...
 
 class CancelTrainingJobRequest(_message.Message):
     __slots__ = ("edge_id", "job_id")
@@ -350,13 +237,7 @@ class ResourceRequest(_message.Message):
     def __init__(self, edge_id: _Optional[int] = ...) -> None: ...
 
 class ResourceReply(_message.Message):
-    __slots__ = (
-        "cpu_utilization",
-        "gpu_utilization",
-        "memory_utilization",
-        "train_queue_size",
-        "max_queue_size",
-    )
+    __slots__ = ("cpu_utilization", "gpu_utilization", "memory_utilization", "train_queue_size", "max_queue_size")
     CPU_UTILIZATION_FIELD_NUMBER: _ClassVar[int]
     GPU_UTILIZATION_FIELD_NUMBER: _ClassVar[int]
     MEMORY_UTILIZATION_FIELD_NUMBER: _ClassVar[int]
@@ -367,14 +248,7 @@ class ResourceReply(_message.Message):
     memory_utilization: float
     train_queue_size: int
     max_queue_size: int
-    def __init__(
-        self,
-        cpu_utilization: _Optional[float] = ...,
-        gpu_utilization: _Optional[float] = ...,
-        memory_utilization: _Optional[float] = ...,
-        train_queue_size: _Optional[int] = ...,
-        max_queue_size: _Optional[int] = ...,
-    ) -> None: ...
+    def __init__(self, cpu_utilization: _Optional[float] = ..., gpu_utilization: _Optional[float] = ..., memory_utilization: _Optional[float] = ..., train_queue_size: _Optional[int] = ..., max_queue_size: _Optional[int] = ...) -> None: ...
 
 class BandwidthProbeRequest(_message.Message):
     __slots__ = ("payload",)
@@ -397,15 +271,7 @@ class BaselineAck(_message.Message):
     def __init__(self, success: bool = ..., message: _Optional[str] = ...) -> None: ...
 
 class BaselineRegisterEdgeRequest(_message.Message):
-    __slots__ = (
-        "run_id",
-        "baseline_method",
-        "edge_id",
-        "model_name",
-        "model_version",
-        "video_source",
-        "timestamp_ms",
-    )
+    __slots__ = ("run_id", "baseline_method", "edge_id", "model_name", "model_version", "video_source", "timestamp_ms")
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     BASELINE_METHOD_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -420,26 +286,10 @@ class BaselineRegisterEdgeRequest(_message.Message):
     model_version: str
     video_source: str
     timestamp_ms: int
-    def __init__(
-        self,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        model_name: _Optional[str] = ...,
-        model_version: _Optional[str] = ...,
-        video_source: _Optional[str] = ...,
-        timestamp_ms: _Optional[int] = ...,
-    ) -> None: ...
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., model_name: _Optional[str] = ..., model_version: _Optional[str] = ..., video_source: _Optional[str] = ..., timestamp_ms: _Optional[int] = ...) -> None: ...
 
 class BaselineHeartbeatRequest(_message.Message):
-    __slots__ = (
-        "run_id",
-        "baseline_method",
-        "edge_id",
-        "timestamp_ms",
-        "metrics_ref",
-        "metrics_json",
-    )
+    __slots__ = ("run_id", "baseline_method", "edge_id", "timestamp_ms", "metrics_ref", "metrics_json")
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     BASELINE_METHOD_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -452,40 +302,10 @@ class BaselineHeartbeatRequest(_message.Message):
     timestamp_ms: int
     metrics_ref: str
     metrics_json: str
-    def __init__(
-        self,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        timestamp_ms: _Optional[int] = ...,
-        metrics_ref: _Optional[str] = ...,
-        metrics_json: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ..., metrics_ref: _Optional[str] = ..., metrics_json: _Optional[str] = ...) -> None: ...
 
 class BaselineFrameRequest(_message.Message):
-    __slots__ = (
-        "run_id",
-        "baseline_method",
-        "edge_id",
-        "frame_id",
-        "timestamp_ms",
-        "model_name",
-        "model_version",
-        "video_source",
-        "upload_mode",
-        "is_keyframe",
-        "edge_prediction_json",
-        "cloud_prediction_json",
-        "teacher_prediction_json",
-        "confidence",
-        "entropy",
-        "quality_metadata_json",
-        "raw_frame",
-        "raw_frame_ref",
-        "feature_ref_json",
-        "metrics_ref",
-        "job_id",
-    )
+    __slots__ = ("run_id", "baseline_method", "edge_id", "frame_id", "timestamp_ms", "model_name", "model_version", "video_source", "upload_mode", "is_keyframe", "edge_prediction_json", "cloud_prediction_json", "teacher_prediction_json", "confidence", "entropy", "quality_metadata_json", "raw_frame", "raw_frame_ref", "feature_ref_json", "metrics_ref", "job_id")
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     BASELINE_METHOD_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -528,30 +348,7 @@ class BaselineFrameRequest(_message.Message):
     feature_ref_json: str
     metrics_ref: str
     job_id: str
-    def __init__(
-        self,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        frame_id: _Optional[int] = ...,
-        timestamp_ms: _Optional[int] = ...,
-        model_name: _Optional[str] = ...,
-        model_version: _Optional[str] = ...,
-        video_source: _Optional[str] = ...,
-        upload_mode: _Optional[str] = ...,
-        is_keyframe: bool = ...,
-        edge_prediction_json: _Optional[str] = ...,
-        cloud_prediction_json: _Optional[str] = ...,
-        teacher_prediction_json: _Optional[str] = ...,
-        confidence: _Optional[float] = ...,
-        entropy: _Optional[float] = ...,
-        quality_metadata_json: _Optional[str] = ...,
-        raw_frame: _Optional[bytes] = ...,
-        raw_frame_ref: _Optional[str] = ...,
-        feature_ref_json: _Optional[str] = ...,
-        metrics_ref: _Optional[str] = ...,
-        job_id: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., frame_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ..., model_name: _Optional[str] = ..., model_version: _Optional[str] = ..., video_source: _Optional[str] = ..., upload_mode: _Optional[str] = ..., is_keyframe: bool = ..., edge_prediction_json: _Optional[str] = ..., cloud_prediction_json: _Optional[str] = ..., teacher_prediction_json: _Optional[str] = ..., confidence: _Optional[float] = ..., entropy: _Optional[float] = ..., quality_metadata_json: _Optional[str] = ..., raw_frame: _Optional[bytes] = ..., raw_frame_ref: _Optional[str] = ..., feature_ref_json: _Optional[str] = ..., metrics_ref: _Optional[str] = ..., job_id: _Optional[str] = ...) -> None: ...
 
 class BaselineInferenceRequest(_message.Message):
     __slots__ = ("run_id", "baseline_method", "edge_id", "frame_id")
@@ -563,26 +360,10 @@ class BaselineInferenceRequest(_message.Message):
     baseline_method: str
     edge_id: int
     frame_id: int
-    def __init__(
-        self,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        frame_id: _Optional[int] = ...,
-    ) -> None: ...
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., frame_id: _Optional[int] = ...) -> None: ...
 
 class BaselineInferenceReply(_message.Message):
-    __slots__ = (
-        "success",
-        "message",
-        "run_id",
-        "baseline_method",
-        "edge_id",
-        "frame_id",
-        "cloud_prediction_json",
-        "confidence",
-        "timestamp_ms",
-    )
+    __slots__ = ("success", "message", "run_id", "baseline_method", "edge_id", "frame_id", "cloud_prediction_json", "confidence", "timestamp_ms")
     SUCCESS_FIELD_NUMBER: _ClassVar[int]
     MESSAGE_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
@@ -601,18 +382,7 @@ class BaselineInferenceReply(_message.Message):
     cloud_prediction_json: str
     confidence: float
     timestamp_ms: int
-    def __init__(
-        self,
-        success: bool = ...,
-        message: _Optional[str] = ...,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        frame_id: _Optional[int] = ...,
-        cloud_prediction_json: _Optional[str] = ...,
-        confidence: _Optional[float] = ...,
-        timestamp_ms: _Optional[int] = ...,
-    ) -> None: ...
+    def __init__(self, success: bool = ..., message: _Optional[str] = ..., run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., frame_id: _Optional[int] = ..., cloud_prediction_json: _Optional[str] = ..., confidence: _Optional[float] = ..., timestamp_ms: _Optional[int] = ...) -> None: ...
 
 class BaselineCommandRequest(_message.Message):
     __slots__ = ("run_id", "baseline_method", "edge_id", "timestamp_ms")
@@ -624,13 +394,7 @@ class BaselineCommandRequest(_message.Message):
     baseline_method: str
     edge_id: int
     timestamp_ms: int
-    def __init__(
-        self,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        timestamp_ms: _Optional[int] = ...,
-    ) -> None: ...
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ...) -> None: ...
 
 class BaselineCommandReply(_message.Message):
     __slots__ = ("success", "message", "command_json")
@@ -640,22 +404,10 @@ class BaselineCommandReply(_message.Message):
     success: bool
     message: str
     command_json: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(
-        self,
-        success: bool = ...,
-        message: _Optional[str] = ...,
-        command_json: _Optional[_Iterable[str]] = ...,
-    ) -> None: ...
+    def __init__(self, success: bool = ..., message: _Optional[str] = ..., command_json: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class BaselineTrainingRequest(_message.Message):
-    __slots__ = (
-        "run_id",
-        "baseline_method",
-        "edge_id",
-        "training_strategy",
-        "frame_ids",
-        "payload_json",
-    )
+    __slots__ = ("run_id", "baseline_method", "edge_id", "training_strategy", "frame_ids", "payload_json")
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     BASELINE_METHOD_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -668,15 +420,7 @@ class BaselineTrainingRequest(_message.Message):
     training_strategy: str
     frame_ids: _containers.RepeatedScalarFieldContainer[int]
     payload_json: str
-    def __init__(
-        self,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        training_strategy: _Optional[str] = ...,
-        frame_ids: _Optional[_Iterable[int]] = ...,
-        payload_json: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., training_strategy: _Optional[str] = ..., frame_ids: _Optional[_Iterable[int]] = ..., payload_json: _Optional[str] = ...) -> None: ...
 
 class BaselineTrainingReply(_message.Message):
     __slots__ = ("accepted", "job_id", "status", "message", "training_strategy")
@@ -690,14 +434,7 @@ class BaselineTrainingReply(_message.Message):
     status: str
     message: str
     training_strategy: str
-    def __init__(
-        self,
-        accepted: bool = ...,
-        job_id: _Optional[str] = ...,
-        status: _Optional[str] = ...,
-        message: _Optional[str] = ...,
-        training_strategy: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, accepted: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., message: _Optional[str] = ..., training_strategy: _Optional[str] = ...) -> None: ...
 
 class BaselineTrainingStatusRequest(_message.Message):
     __slots__ = ("run_id", "baseline_method", "edge_id", "job_id")
@@ -709,13 +446,7 @@ class BaselineTrainingStatusRequest(_message.Message):
     baseline_method: str
     edge_id: int
     job_id: str
-    def __init__(
-        self,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        job_id: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., job_id: _Optional[str] = ...) -> None: ...
 
 class BaselineTrainingStatusReply(_message.Message):
     __slots__ = ("found", "job_id", "status", "message", "result_available")
@@ -729,14 +460,7 @@ class BaselineTrainingStatusReply(_message.Message):
     status: str
     message: str
     result_available: bool
-    def __init__(
-        self,
-        found: bool = ...,
-        job_id: _Optional[str] = ...,
-        status: _Optional[str] = ...,
-        message: _Optional[str] = ...,
-        result_available: bool = ...,
-    ) -> None: ...
+    def __init__(self, found: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., message: _Optional[str] = ..., result_available: bool = ...) -> None: ...
 
 class BaselineModelUpdateRequest(_message.Message):
     __slots__ = ("run_id", "baseline_method", "edge_id", "job_id")
@@ -748,13 +472,7 @@ class BaselineModelUpdateRequest(_message.Message):
     baseline_method: str
     edge_id: int
     job_id: str
-    def __init__(
-        self,
-        run_id: _Optional[str] = ...,
-        baseline_method: _Optional[str] = ...,
-        edge_id: _Optional[int] = ...,
-        job_id: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., job_id: _Optional[str] = ...) -> None: ...
 
 class BaselineModelUpdateReply(_message.Message):
     __slots__ = ("success", "job_id", "status", "model_data", "message", "model_version")
@@ -770,12 +488,4 @@ class BaselineModelUpdateReply(_message.Message):
     model_data: str
     message: str
     model_version: str
-    def __init__(
-        self,
-        success: bool = ...,
-        job_id: _Optional[str] = ...,
-        status: _Optional[str] = ...,
-        model_data: _Optional[str] = ...,
-        message: _Optional[str] = ...,
-        model_version: _Optional[str] = ...,
-    ) -> None: ...
+    def __init__(self, success: bool = ..., job_id: _Optional[str] = ..., status: _Optional[str] = ..., model_data: _Optional[str] = ..., message: _Optional[str] = ..., model_version: _Optional[str] = ...) -> None: ...

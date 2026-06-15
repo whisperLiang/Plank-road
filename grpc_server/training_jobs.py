@@ -4,6 +4,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -58,6 +59,7 @@ class TrainingJob:
     payload_zip: bytes = b""
     send_low_conf_features: bool = False
     frame_indices: tuple[int, ...] = ()
+    exclusive_gpu_lease: bool = False
     status: str = JOB_STATUS_QUEUED
     message: str = ""
     model_data: str = ""
@@ -130,6 +132,7 @@ class TrainingJobManager:
         payload_zip: bytes = b"",
         send_low_conf_features: bool = False,
         frame_indices: list[int] | tuple[int, ...] | None = None,
+        exclusive_gpu_lease: bool = False,
         base_model_version: str = "0",
     ) -> tuple[TrainingJob, bool]:
         normalized_request_id = str(request_id or "").strip()
@@ -139,6 +142,22 @@ class TrainingJobManager:
                 existing_job_id = self._request_index.get(request_key)
                 if existing_job_id is not None:
                     return self._jobs[existing_job_id], False
+            for existing in self._jobs.values():
+                if existing.edge_id != int(edge_id):
+                    continue
+                if existing.job_type != int(job_type):
+                    continue
+                if existing.base_model_version != str(base_model_version or "0"):
+                    continue
+                if existing.status in TERMINAL_JOB_STATUSES:
+                    continue
+                logger.info(
+                    "[TrainingJob] Reusing existing continual-learning job: "
+                    "edge={} existing_job={}",
+                    int(edge_id),
+                    existing.job_id,
+                )
+                return existing, False
 
             job_id = uuid.uuid4().hex
             job = TrainingJob(
@@ -153,6 +172,7 @@ class TrainingJobManager:
                 payload_zip=bytes(payload_zip or b""),
                 send_low_conf_features=bool(send_low_conf_features),
                 frame_indices=tuple(int(value) for value in (frame_indices or [])),
+                exclusive_gpu_lease=bool(exclusive_gpu_lease),
                 base_model_version=str(base_model_version or "0"),
             )
             self._jobs[job_id] = job
@@ -300,6 +320,7 @@ class TrainingJobManager:
             payload_zip = job.payload_zip
             frame_indices = list(job.frame_indices)
             send_low_conf_features = job.send_low_conf_features
+            exclusive_gpu_lease = job.exclusive_gpu_lease
         logger.info(
             "Training job started: edge={} type={}.",
             edge_id,
@@ -327,13 +348,25 @@ class TrainingJobManager:
                         log_internal_ids=self.log_internal_ids,
                     )
                 )
-            success, model_data, message = self._execute_job(
-                edge_id=edge_id,
-                job_type=job_type,
-                workspace=workspace,
-                frame_indices=frame_indices,
-                send_low_conf_features=send_low_conf_features,
+            lease_scope = getattr(self.continual_learner, "gpu_lease_scope", None)
+            context = (
+                lease_scope(
+                    edge_id=edge_id,
+                    job_id=job_id,
+                    workspace=workspace,
+                    exclusive=exclusive_gpu_lease,
+                )
+                if callable(lease_scope)
+                else nullcontext()
             )
+            with context:
+                success, model_data, message = self._execute_job(
+                    edge_id=edge_id,
+                    job_type=job_type,
+                    workspace=workspace,
+                    frame_indices=frame_indices,
+                    send_low_conf_features=send_low_conf_features,
+                )
         except Exception as exc:
             logger.error(
                 "Training job failed: edge={} type={} reason={}.",

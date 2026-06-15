@@ -291,6 +291,63 @@ class DASConfig(ConfigSection):
 
 
 @dataclass
+class EdgeWorkerConfig(ConfigSection):
+    assignment: str = "one_worker_per_edge"
+    lazy_start: bool = True
+    lazy_cuda_init: bool = True
+    max_workers: int | str = "auto"
+    idle_timeout_sec: int = 900
+    worker_base_port: int = 56000
+    workspace_root: str = "./cache/server_workspace/workers"
+
+
+@dataclass
+class MPSConfig(ConfigSection):
+    enabled: bool = True
+    auto_start: bool = False
+    cuda_visible_devices: str = "0"
+    pipe_directory: str = "/tmp/nvidia-mps"
+    log_directory: str = "/tmp/nvidia-mps-log"
+    active_thread_percentage: int | str = "auto"
+
+
+@dataclass
+class GpuLeaseConfig(ConfigSection):
+    enabled: bool = True
+    device: str = "cuda:0"
+    memory_usage_threshold: float = 0.85
+    reserve_memory_gb: float = 4.0
+    max_active_gpu_workers: int | str = "auto"
+    default_estimated_job_memory_gb: float = 18.0
+    adaptive_peak_memory_estimation: bool = True
+    fallback_to_exclusive_on_oom: bool = True
+    max_exclusive_retries: int = 1
+    lease_ttl_sec: float = 120.0
+    heartbeat_interval_sec: float = 10.0
+    teacher_reserved_memory_gb: float = 0.0
+    teacher_gpu_policy: str = "lease"
+
+
+@dataclass
+class WorkerServiceConfig(ConfigSection):
+    max_concurrent_jobs: int = 1
+    startup_timeout_sec: float = 30.0
+    request_timeout_sec: float = 600.0
+    healthcheck_interval_sec: float = 10.0
+
+
+@dataclass
+class EdgeAffineWorkersConfig(ConfigSection):
+    enabled: bool = False
+    run_id: str | None = None
+    mode: str = "edge_affine_single_gpu_mps"
+    edge_workers: EdgeWorkerConfig = field(default_factory=EdgeWorkerConfig)
+    mps: MPSConfig = field(default_factory=MPSConfig)
+    gpu_lease: GpuLeaseConfig = field(default_factory=GpuLeaseConfig)
+    worker: WorkerServiceConfig = field(default_factory=WorkerServiceConfig)
+
+
+@dataclass
 class ClientConfig(ConfigSection):
     source: SourceConfig = field(default_factory=SourceConfig)
     interval: int = 1
@@ -307,7 +364,6 @@ class ClientConfig(ConfigSection):
     tinynext_input_size: int = 320
     server_ip: str = "192.168.66.205:50051"
     edge_id: int = 1
-    edge_num: int = 1
     retrain: RetrainConfig = field(default_factory=RetrainConfig)
     sample_quality: SampleQualityConfig = field(default_factory=SampleQualityConfig)
     window_drift: WindowDriftConfig = field(default_factory=WindowDriftConfig)
@@ -336,6 +392,7 @@ class ServerConfig(ConfigSection):
     das: DASConfig = field(default_factory=DASConfig)
     workspace_root: str = "./cache/server_workspace"
     sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
+    edge_affine_workers: EdgeAffineWorkersConfig = field(default_factory=EdgeAffineWorkersConfig)
 
 
 @dataclass
@@ -420,6 +477,15 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             known.get("continual_learning"),
         )
         known["das"] = _section(DASConfig, known.get("das"))
+        known["edge_affine_workers"] = _section(
+            EdgeAffineWorkersConfig,
+            known.get("edge_affine_workers"),
+        )
+    elif section_cls is EdgeAffineWorkersConfig:
+        known["edge_workers"] = _section(EdgeWorkerConfig, known.get("edge_workers"))
+        known["mps"] = _section(MPSConfig, known.get("mps"))
+        known["gpu_lease"] = _section(GpuLeaseConfig, known.get("gpu_lease"))
+        known["worker"] = _section(WorkerServiceConfig, known.get("worker"))
     elif section_cls is BaselineConfig:
         known["pure_edge_local_updating"] = _section(
             PureEdgeBaselineConfig,
@@ -609,7 +675,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive("client.local_queue_maxsize", int(config.client.local_queue_maxsize))
     _validate_positive("client.wait_thresh", int(config.client.wait_thresh))
     _validate_positive("client.frame_cache_maxsize", int(config.client.frame_cache_maxsize))
-    _validate_positive("client.edge_num", int(config.client.edge_num))
     _validate_positive(
         "client.split_learning.warmup_iterations",
         int(config.client.split_learning.warmup_iterations),
@@ -718,6 +783,79 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     _validate_positive("server.local_queue_maxsize", int(config.server.local_queue_maxsize))
     _validate_positive("server.wait_thresh", int(config.server.wait_thresh))
+    edge_affine = config.server.edge_affine_workers
+    if not isinstance(edge_affine.enabled, bool):
+        raise ValueError("server.edge_affine_workers.enabled must be a boolean")
+    if str(edge_affine.mode) != "edge_affine_single_gpu_mps":
+        raise ValueError(
+            "server.edge_affine_workers.mode must be edge_affine_single_gpu_mps"
+        )
+    if str(edge_affine.edge_workers.assignment) != "one_worker_per_edge":
+        raise ValueError(
+            "server.edge_affine_workers.edge_workers.assignment must be one_worker_per_edge"
+        )
+    _validate_positive(
+        "server.edge_affine_workers.edge_workers.worker_base_port",
+        int(edge_affine.edge_workers.worker_base_port),
+    )
+    _validate_positive(
+        "server.edge_affine_workers.edge_workers.idle_timeout_sec",
+        int(edge_affine.edge_workers.idle_timeout_sec),
+    )
+    if not str(edge_affine.edge_workers.workspace_root).strip():
+        raise ValueError("server.edge_affine_workers.edge_workers.workspace_root must be non-empty")
+    if not str(edge_affine.mps.cuda_visible_devices).strip():
+        raise ValueError("server.edge_affine_workers.mps.cuda_visible_devices must be non-empty")
+    if not str(edge_affine.mps.pipe_directory).strip():
+        raise ValueError("server.edge_affine_workers.mps.pipe_directory must be non-empty")
+    if not str(edge_affine.mps.log_directory).strip():
+        raise ValueError("server.edge_affine_workers.mps.log_directory must be non-empty")
+    if not str(edge_affine.gpu_lease.device).strip():
+        raise ValueError("server.edge_affine_workers.gpu_lease.device must be non-empty")
+    if not 0.0 < float(edge_affine.gpu_lease.memory_usage_threshold) <= 1.0:
+        raise ValueError(
+            "server.edge_affine_workers.gpu_lease.memory_usage_threshold must be in (0, 1]"
+        )
+    _validate_positive(
+        "server.edge_affine_workers.gpu_lease.reserve_memory_gb",
+        float(edge_affine.gpu_lease.reserve_memory_gb),
+        allow_zero=True,
+    )
+    _validate_positive(
+        "server.edge_affine_workers.gpu_lease.default_estimated_job_memory_gb",
+        float(edge_affine.gpu_lease.default_estimated_job_memory_gb),
+    )
+    _validate_positive(
+        "server.edge_affine_workers.gpu_lease.lease_ttl_sec",
+        float(edge_affine.gpu_lease.lease_ttl_sec),
+    )
+    _validate_positive(
+        "server.edge_affine_workers.gpu_lease.heartbeat_interval_sec",
+        float(edge_affine.gpu_lease.heartbeat_interval_sec),
+    )
+    if str(edge_affine.gpu_lease.teacher_gpu_policy) not in {"lease", "reserved_budget"}:
+        raise ValueError(
+            "server.edge_affine_workers.gpu_lease.teacher_gpu_policy must be "
+            "lease or reserved_budget"
+        )
+    _validate_positive(
+        "server.edge_affine_workers.worker.max_concurrent_jobs",
+        int(edge_affine.worker.max_concurrent_jobs),
+    )
+    if int(edge_affine.worker.max_concurrent_jobs) != 1:
+        raise ValueError("server.edge_affine_workers.worker.max_concurrent_jobs must be 1")
+    _validate_positive(
+        "server.edge_affine_workers.worker.startup_timeout_sec",
+        float(edge_affine.worker.startup_timeout_sec),
+    )
+    _validate_positive(
+        "server.edge_affine_workers.worker.request_timeout_sec",
+        float(edge_affine.worker.request_timeout_sec),
+    )
+    _validate_positive(
+        "server.edge_affine_workers.worker.healthcheck_interval_sec",
+        float(edge_affine.worker.healthcheck_interval_sec),
+    )
     _validate_positive(
         "server.tinynext_input_size",
         int(config.server.tinynext_input_size),

@@ -64,6 +64,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.DownloadTrainedModelReply.FromString,
                 _registered_method=True)
+        self.report_edge_model_version = channel.unary_unary(
+                '/MessageTransmission/report_edge_model_version',
+                request_serializer=message__transmission__pb2.ReportEdgeModelVersionRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.ReportEdgeModelVersionReply.FromString,
+                _registered_method=True)
         self.cancel_training_job = channel.unary_unary(
                 '/MessageTransmission/cancel_training_job',
                 request_serializer=message__transmission__pb2.CancelTrainingJobRequest.SerializeToString,
@@ -177,6 +182,13 @@ class MessageTransmissionServicer(object):
 
     def download_trained_model(self, request, context):
         """Download trained model for a completed async training job.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def report_edge_model_version(self, request, context):
+        """Report that an edge has applied a model update.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -302,6 +314,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.download_trained_model,
                     request_deserializer=message__transmission__pb2.DownloadTrainedModelRequest.FromString,
                     response_serializer=message__transmission__pb2.DownloadTrainedModelReply.SerializeToString,
+            ),
+            'report_edge_model_version': grpc.unary_unary_rpc_method_handler(
+                    servicer.report_edge_model_version,
+                    request_deserializer=message__transmission__pb2.ReportEdgeModelVersionRequest.FromString,
+                    response_serializer=message__transmission__pb2.ReportEdgeModelVersionReply.SerializeToString,
             ),
             'cancel_training_job': grpc.unary_unary_rpc_method_handler(
                     servicer.cancel_training_job,
@@ -536,6 +553,33 @@ class MessageTransmission(object):
             '/MessageTransmission/download_trained_model',
             message__transmission__pb2.DownloadTrainedModelRequest.SerializeToString,
             message__transmission__pb2.DownloadTrainedModelReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def report_edge_model_version(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/report_edge_model_version',
+            message__transmission__pb2.ReportEdgeModelVersionRequest.SerializeToString,
+            message__transmission__pb2.ReportEdgeModelVersionReply.FromString,
             options,
             channel_credentials,
             insecure,
