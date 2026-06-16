@@ -7,7 +7,6 @@ from typing import Any
 
 from cloud.orchestrator import CloudFixedSplitOrchestrator
 from cloud.training.strategies import (
-    CloudRawFreezeTrainingStrategy,
     CloudTorchLensFreezeTrainingStrategy,
 )
 from cloud.workers.worker_client import GpuLeaseHttpClient, decode_payload_zip
@@ -73,7 +72,6 @@ class EdgeWorkerService:
             max_concurrent_jobs=1,
             edge_registry=None,
             training_strategies={
-                "raw_freeze": CloudRawFreezeTrainingStrategy(learner=self.learner),
                 "freeze": CloudTorchLensFreezeTrainingStrategy(learner=self.learner),
             },
             log_internal_ids=bool(getattr(self.learner, "log_internal_ids", False)),

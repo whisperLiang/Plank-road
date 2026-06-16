@@ -215,6 +215,35 @@ def _baseline_requires_cloud(baseline_method: str) -> bool:
     return validate_baseline_method(baseline_method) != "pure_edge_local_updating"
 
 
+def _baseline_split_runtime_policy(baseline_config) -> str:
+    edge_cfg = getattr(baseline_config, "edge", None)
+    policy = (
+        str(getattr(edge_cfg, "split_runtime_policy", "disabled") or "disabled")
+        .strip()
+        .lower()
+    )
+    if policy not in {"disabled", "replay_only"}:
+        raise ValueError("baseline.edge.split_runtime_policy must be disabled or replay_only")
+    return policy
+
+
+def _configure_baseline_client_runtime(config, baseline_config) -> str:
+    policy = _baseline_split_runtime_policy(baseline_config)
+    config.baseline = baseline_config
+    if getattr(config, "retrain", None) is not None:
+        config.retrain.flag = False
+    if getattr(config, "resource_aware_trigger", None) is not None:
+        config.resource_aware_trigger.enabled = False
+    if getattr(config, "sample_pool", None) is not None:
+        config.sample_pool.enabled = False
+    split_learning = getattr(config, "split_learning", None)
+    if split_learning is not None:
+        split_learning.enabled = policy == "replay_only"
+    if policy == "disabled":
+        logger.info("[BaselineEdge] split_runtime_policy=disabled; fixed-split runtime skipped.")
+    return policy
+
+
 def _resolve_baseline_run_id(baseline_method: str, run_id: str | None) -> str | None:
     value = str(run_id or "").strip()
     if _baseline_requires_cloud(baseline_method) and not value:
@@ -536,6 +565,7 @@ if __name__ == "__main__":
         config.server_ip = args.server_ip
 
     baseline_method = None
+    baseline_split_runtime_policy = "disabled"
     if args.mode == "baseline":
         baseline_method = args.baseline_method or runtime_config.baseline.method
         try:
@@ -564,11 +594,14 @@ if __name__ == "__main__":
         runtime_config.baseline.enabled = True
         runtime_config.baseline.method = baseline_method
         runtime_config.baseline.run_id = baseline_run_id
-        config.baseline = runtime_config.baseline
         logger.add(
             f"log/client/baseline_{baseline_method}_edge_{config.edge_id}_{{time}}.log",
             level="INFO",
             rotation="500 MB",
+        )
+        baseline_split_runtime_policy = _configure_baseline_client_runtime(
+            config,
+            runtime_config.baseline,
         )
         logger.info(
             "baseline edge effective startup config: run_id={}, baseline_method={}, "
@@ -596,7 +629,13 @@ if __name__ == "__main__":
         )
 
     preserve_cache_entries = {"pytest_tmp"}
-    if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
+    if (
+        bool(getattr(getattr(config, "split_learning", None), "enabled", False))
+        or (
+            args.mode == "baseline"
+            and baseline_split_runtime_policy == "replay_only"
+        )
+    ):
         preserve_cache_entries.add("fixed_split_plan.json")
     _log_startup_config(config)
     clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)

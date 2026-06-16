@@ -14,11 +14,11 @@ import numpy as np
 import pytest
 import torch
 
+import cloud.training.strategies.torchlens_freeze as freeze_strategy_module
 from baselines.runtime.upload_client import (
     BASELINE_TRAINING_PROTOCOL_VERSION,
     build_baseline_training_bundle,
 )
-from cloud.training.strategies.raw_freeze import CloudRawFreezeTrainingStrategy
 from cloud.training.strategies.torchlens_freeze import (
     CloudTorchLensFreezeTrainingStrategy,
     build_default_torchlens_freeze_runtime,
@@ -35,7 +35,7 @@ def test_baseline_bundle_is_raw_frame_protocol_without_split_artifacts() -> None
 
     serialized = json.dumps(manifest, sort_keys=True)
     assert manifest["protocol_version"] == BASELINE_TRAINING_PROTOCOL_VERSION
-    assert manifest["training_strategy"] == "raw_freeze"
+    assert manifest["training_strategy"] == "freeze"
     assert "split_plan" not in serialized
     assert "runtime_contract" not in serialized
     assert "low-quality-trigger-shard.v1" not in serialized
@@ -59,7 +59,7 @@ def test_baseline_bundle_keeps_tinynext_input_size_model_specific() -> None:
     assert tinynext_manifest["tinynext_input_size"] == 640
 
 
-def test_raw_freeze_strategy_uses_cloud_teacher_targets(tmp_path: Path) -> None:
+def test_freeze_strategy_uses_cloud_teacher_targets(tmp_path: Path, monkeypatch) -> None:
     bundle = _bundle(training_config={"num_epoch": 1, "batch_size": 2, "device": "cpu"})
     with zipfile.ZipFile(io.BytesIO(bundle), "r") as archive:
         archive.extractall(tmp_path)
@@ -72,8 +72,10 @@ def test_raw_freeze_strategy_uses_cloud_teacher_targets(tmp_path: Path) -> None:
         built_models.append(model)
         return model
 
-    strategy = CloudRawFreezeTrainingStrategy(
+    _patch_freeze_training(monkeypatch)
+    strategy = CloudTorchLensFreezeTrainingStrategy(
         learner=SimpleNamespace(large_od=teacher),
+        runtime_factory=lambda model, manifest, workspace: SimpleNamespace(),
         model_builder=build_model,
         update_serializer=_fake_update_serializer,
         loss_builder=lambda _model: _count_loss,
@@ -91,15 +93,20 @@ def test_raw_freeze_strategy_uses_cloud_teacher_targets(tmp_path: Path) -> None:
     )
     assert payload["format"] == "state_dict_delta.v1"
     assert payload["state_dict"]
-    assert built_models[0].forward_calls > 0
+    assert built_models
 
 
-def test_raw_freeze_strategy_rejects_edge_targets_unless_explicit(tmp_path: Path) -> None:
+def test_freeze_strategy_rejects_edge_targets_unless_explicit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     bundle = _bundle(training_config={"num_epoch": 1, "batch_size": 2, "device": "cpu"})
     with zipfile.ZipFile(io.BytesIO(bundle), "r") as archive:
         archive.extractall(tmp_path)
-    strategy = CloudRawFreezeTrainingStrategy(
+    _patch_freeze_training(monkeypatch)
+    strategy = CloudTorchLensFreezeTrainingStrategy(
         learner=SimpleNamespace(large_od=None),
+        runtime_factory=lambda model, manifest, workspace: SimpleNamespace(),
         model_builder=lambda *args, **kwargs: TinyRawDetectionModel(),
         update_serializer=_fake_update_serializer,
         loss_builder=lambda _model: _count_loss,
@@ -123,12 +130,80 @@ def test_freeze_strategy_has_default_runtime_factory() -> None:
     assert strategy.runtime_factory is build_default_torchlens_freeze_runtime
 
 
+def test_default_freeze_runtime_uses_existing_cloud_split_plan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    plan = {
+        "split_config_id": "split-a",
+        "model_name": "tiny",
+        "candidate_id": "after:head",
+        "split_index": 1,
+        "split_label": "after:head",
+        "boundary_tensor_labels": ["node_a"],
+        "payload_bytes": 0,
+        "privacy_metric": 0.0,
+        "privacy_risk": 0.0,
+        "layer_freezing_ratio": 0.0,
+        "canonical_split_key": "after:head",
+        "edge_split_id": "after:head",
+        "input_tensor_shape": [1, 3, 8, 8],
+        "trace_batch_mode": "batch_gt1",
+        "dynamic_batch": [2, 16],
+        "plan_version": freeze_strategy_module.FIXED_SPLIT_PLAN_VERSION,
+        "runtime_contract": {"logical_split_id": "after:head"},
+    }
+    (tmp_path / "fixed_split_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class FakeSplitter:
+        def __init__(self, *, device):
+            self.device = device
+
+        def trace(self, *args, **kwargs):
+            pytest.fail("cloud freeze should replay the existing split plan")
+
+        def bind_runtime(self, runtime, *, model, split_spec):
+            captured["runtime"] = runtime
+            captured["model"] = model
+            captured["split_spec"] = split_spec
+            return self
+
+    def fake_prepare(model, sample_input, split_spec, *, mode, expected_boundary_tensor_labels):
+        captured["prepared_model"] = model
+        captured["sample_input"] = sample_input
+        captured["expected_labels"] = list(expected_boundary_tensor_labels)
+        captured["mode"] = mode
+        return SimpleNamespace(split_id=split_spec.boundary, split_spec=split_spec)
+
+    monkeypatch.setattr(freeze_strategy_module, "UniversalModelSplitter", FakeSplitter)
+    monkeypatch.setattr(freeze_strategy_module, "prepare_exact_split_runtime", fake_prepare)
+    monkeypatch.setattr(
+        freeze_strategy_module,
+        "build_split_runtime_sample_input",
+        lambda *args, **kwargs: torch.zeros((1, 3, 8, 8)),
+    )
+
+    splitter = build_default_torchlens_freeze_runtime(
+        TinyRawDetectionModel(),
+        {"model_name": "tiny", "training_config": {"device": "cpu"}},
+        tmp_path,
+    )
+
+    spec = captured["split_spec"]
+    assert isinstance(splitter, FakeSplitter)
+    assert spec.boundary == "after:head"
+    assert spec.dynamic_batch == (2, 16)
+    assert spec.trainable is True
+    assert captured["expected_labels"] == ["node_a"]
+
+
 def test_baseline_jobs_parallelize_across_edges_and_serialize_same_edge(tmp_path: Path) -> None:
     strategy = RecordingSleepStrategy()
     manager = TrainingJobManager(
         continual_learner=SimpleNamespace(worker_id="worker-test"),
         max_concurrent_jobs=2,
-        training_strategies={"raw_freeze": strategy},
+        training_strategies={"freeze": strategy},
     )
     try:
         first, _ = manager.submit(
@@ -165,7 +240,7 @@ def test_baseline_jobs_parallelize_across_edges_and_serialize_same_edge(tmp_path
 
         assert strategy.max_active == 2
         assert strategy.same_edge_overlap is False
-        assert strategy.seen_strategies == ["raw_freeze", "raw_freeze", "raw_freeze"]
+        assert strategy.seen_strategies == ["freeze", "freeze", "freeze"]
     finally:
         manager.close()
 
@@ -175,7 +250,7 @@ def test_baseline_manager_dedupes_exact_request_id_only(tmp_path: Path) -> None:
     manager = TrainingJobManager(
         continual_learner=SimpleNamespace(worker_id="worker-test"),
         max_concurrent_jobs=1,
-        training_strategies={"raw_freeze": strategy},
+        training_strategies={"freeze": strategy},
     )
     try:
         first, first_created = manager.submit(
@@ -286,7 +361,7 @@ def _bundle(
     model_name: str = "tiny",
     tinynext_input_size: int | None = None,
     edge_id: int = 1,
-    training_strategy: str = "raw_freeze",
+    training_strategy: str = "freeze",
     training_config: dict[str, object] | None = None,
     frame_ids: tuple[int, int] = (1, 2),
 ) -> bytes:
@@ -317,6 +392,33 @@ def _jpeg_bytes() -> bytes:
     ok, encoded = cv2.imencode(".jpg", np.zeros((8, 8, 3), dtype=np.uint8))
     assert ok
     return bytes(encoded.tobytes())
+
+
+def _patch_freeze_training(monkeypatch) -> None:
+    def fake_configure(model, runtime):
+        del runtime
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        params = [model.layers[-1].weight, model.layers[-1].bias]
+        for parameter in params:
+            parameter.requires_grad_(True)
+        return ("layers.2.weight", "layers.2.bias"), params
+
+    monkeypatch.setattr(
+        freeze_strategy_module,
+        "configure_fixed_prefix_training",
+        fake_configure,
+    )
+    monkeypatch.setattr(
+        freeze_strategy_module,
+        "build_split_retrain_optimizer",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        freeze_strategy_module,
+        "run_freeze_training",
+        lambda **kwargs: {"batch_count": len(list(kwargs["samples"])), "final_loss": 0.0},
+    )
 
 
 def _count_loss(outputs, targets) -> torch.Tensor:

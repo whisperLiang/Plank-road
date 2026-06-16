@@ -337,144 +337,37 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             return _baseline_inference_reply(request, success=False, message=str(exc))
 
     def RequestTraining(self, request, context):
-        if self.baseline_controller is None:
-            return message_transmission_pb2.BaselineTrainingReply(
-                accepted=False,
-                job_id="",
-                status="",
-                message="baseline controller is not configured",
-                training_strategy=request.training_strategy,
-            )
-        try:
-            job = self.baseline_controller.request_training(
-                run_id=request.run_id,
-                baseline_method=request.baseline_method,
-                edge_id=int(request.edge_id),
-                training_strategy=request.training_strategy,
-                frame_ids=[int(value) for value in request.frame_ids],
-                payload=json_loads(request.payload_json),
-            )
-            return message_transmission_pb2.BaselineTrainingReply(
-                accepted=bool(job.get("accepted", True)),
-                job_id=str(job.get("job_id", "")),
-                status=str(job.get("status", "")),
-                message=str(job.get("message", "training job accepted")),
-                training_strategy=str(job["training_strategy"]),
-                queue_position=int(job.get("queue_position", -1)),
-                protocol_version=str(job.get("protocol_version", "")),
-                result_model_version=str(job.get("result_model_version", "")),
-            )
-        except Exception as exc:
-            self._log_failure("RequestTraining", exc)
-            return message_transmission_pb2.BaselineTrainingReply(
-                accepted=False,
-                job_id="",
-                status="",
-                message=str(exc),
-                training_strategy=request.training_strategy,
-            )
+        del context
+        return message_transmission_pb2.BaselineTrainingReply(
+            accepted=False,
+            job_id="",
+            status="DISABLED",
+            message="legacy baseline training RPC is disabled; use submit_training_job",
+            training_strategy=request.training_strategy,
+        )
 
     def PollTrainingJob(self, request, context):
-        if self.baseline_controller is None:
-            return message_transmission_pb2.BaselineTrainingStatusReply(
-                found=False,
-                job_id=request.job_id,
-                status="",
-                message="baseline controller is not configured",
-                result_available=False,
-                queue_position=-1,
-            )
-        try:
-            job = self.baseline_controller.poll_training_job(
-                run_id=request.run_id,
-                baseline_method=request.baseline_method,
-                edge_id=int(request.edge_id),
-                job_id=request.job_id,
-            )
-            return message_transmission_pb2.BaselineTrainingStatusReply(
-                found=job is not None,
-                job_id=request.job_id,
-                status=str(job.get("status", "")) if job is not None else "",
-                message=str(job.get("message", "training job found"))
-                if job is not None
-                else "training job not found",
-                result_available=bool(job.get("result_available", False))
-                if job is not None
-                else False,
-                queue_position=int(job.get("queue_position", -1))
-                if job is not None
-                else -1,
-                edge_id=int(job.get("edge_id", request.edge_id))
-                if job is not None
-                else int(request.edge_id),
-                request_id=str(job.get("request_id", "")) if job is not None else "",
-                job_type=int(job.get("job_type", 0)) if job is not None else 0,
-                submitted_at_ms=int(job.get("submitted_at_ms", 0)) if job is not None else 0,
-                started_at_ms=int(job.get("started_at_ms", 0)) if job is not None else 0,
-                finished_at_ms=int(job.get("finished_at_ms", 0)) if job is not None else 0,
-                protocol_version=str(job.get("protocol_version", ""))
-                if job is not None
-                else "",
-                base_model_version=str(job.get("base_model_version", ""))
-                if job is not None
-                else "",
-                result_model_version=str(job.get("result_model_version", ""))
-                if job is not None
-                else "",
-                worker_id=str(job.get("worker_id", "")) if job is not None else "",
-            )
-        except Exception as exc:
-            self._log_failure("PollTrainingJob", exc)
-            return message_transmission_pb2.BaselineTrainingStatusReply(
-                found=False,
-                job_id=request.job_id,
-                status="",
-                message=str(exc),
-                result_available=False,
-                queue_position=-1,
-            )
+        del context
+        return message_transmission_pb2.BaselineTrainingStatusReply(
+            found=False,
+            job_id=request.job_id,
+            status="DISABLED",
+            message="legacy baseline training RPC is disabled; use get_training_job_status",
+            result_available=False,
+            queue_position=-1,
+            edge_id=int(request.edge_id),
+        )
 
     def DownloadModelUpdate(self, request, context):
-        if self.baseline_controller is None:
-            return message_transmission_pb2.BaselineModelUpdateReply(
-                success=False,
-                job_id=request.job_id,
-                status="",
-                model_data="",
-                message="baseline controller is not configured",
-                model_version="",
-            )
-        try:
-            update = self.baseline_controller.download_model_update(
-                run_id=request.run_id,
-                baseline_method=request.baseline_method,
-                edge_id=int(request.edge_id),
-                job_id=request.job_id,
-            )
-            return message_transmission_pb2.BaselineModelUpdateReply(
-                success=update is not None,
-                job_id=request.job_id,
-                status=str(update.get("status", "")) if update is not None else "",
-                model_data=str(update.get("model_data", "")) if update is not None else "",
-                message="model update found" if update is not None else "model update not found",
-                model_version=str(update.get("model_version", "")) if update is not None else "",
-                protocol_version=str(update.get("protocol_version", ""))
-                if update is not None
-                else "",
-                result_model_version=str(update.get("result_model_version", ""))
-                if update is not None
-                else "",
-            )
-        except Exception as exc:
-            self._log_failure("DownloadModelUpdate", exc)
-            return message_transmission_pb2.BaselineModelUpdateReply(
-                success=False,
-                job_id=request.job_id,
-                status="",
-                model_data="",
-                message=str(exc),
-                model_version="",
-            )
+        del context
+        return message_transmission_pb2.BaselineModelUpdateReply(
+            success=False,
+            job_id=request.job_id,
+            status="DISABLED",
+            model_data="",
+            message="legacy baseline model update RPC is disabled; use download_trained_model",
+            model_version="",
+        )
 
 
 def _baseline_frame_from_request(request) -> BaselineFramePayload:

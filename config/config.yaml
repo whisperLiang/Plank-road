@@ -12,6 +12,8 @@ baseline:
  method: accuracy_trigger_cloud_retraining
  run_id: null
  results_root: results/baselines_distributed
+ edge:
+  split_runtime_policy: disabled
  training:
   batch_size: 32
   num_epoch: 50
@@ -35,14 +37,15 @@ baseline:
   reuse_plank_road_frame_filter: true
   upload_keyframes_only: true
   trigger_on_cloud_comparison: true
-  training_strategy: raw_freeze
+  training_strategy: freeze
+  training_failure_backoff_sec: 30.0
   return_model_update: true
  ekya_style_centralized_scheduling:
   upload_raw_frames: true
   use_frame_filter: false
   cloud_inference: true
   return_cloud_inference_to_edge: true
-  training_strategy: raw_freeze
+  training_strategy: freeze
   display_source: cloud
   enable_micro_profiling: true
 

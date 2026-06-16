@@ -14,7 +14,7 @@ from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from tools.grpc_options import grpc_message_options
 
 BASELINE_TRAINING_PROTOCOL_VERSION = "baseline-training-trigger.v1"
-ALLOWED_BASELINE_TRAINING_STRATEGIES = {"raw_freeze", "freeze"}
+ALLOWED_BASELINE_TRAINING_STRATEGIES = {"freeze"}
 
 
 def encode_frame(frame: object | None) -> bytes:
@@ -94,7 +94,7 @@ def build_baseline_training_bundle(
 def validate_baseline_training_strategy(value: object) -> str:
     strategy = str(value or "").strip()
     if strategy not in ALLOWED_BASELINE_TRAINING_STRATEGIES:
-        raise ValueError("baseline training_strategy must be raw_freeze or freeze")
+        raise ValueError("baseline training_strategy must be freeze")
     return strategy
 
 

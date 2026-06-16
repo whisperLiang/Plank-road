@@ -91,6 +91,10 @@ class EdgeWorkerPool:
             0,
             int(getattr(worker_service_config, "startup_max_retries", 2)),
         )
+        self.ready_cache_ttl_sec = max(
+            0.0,
+            float(getattr(worker_service_config, "healthcheck_interval_sec", 10.0)),
+        )
         self.worker_base_port = int(getattr(edge_workers_config, "worker_base_port", 56000))
         self.worker_workspace_root = str(
             getattr(edge_workers_config, "workspace_root", "./cache/server_workspace/workers")
@@ -102,6 +106,8 @@ class EdgeWorkerPool:
         self._startup_events: dict[int, threading.Event] = {}
         self._startup_errors: dict[int, str] = {}
         self._edge_locks: dict[int, threading.Lock] = {}
+        self._ready_cache: dict[int, tuple[float, EdgeAssignment]] = {}
+        self._ready_logged: set[int] = set()
         self._reserved_ports: set[int] = {
             port
             for assignment in self.assignment_store.all()
@@ -121,6 +127,9 @@ class EdgeWorkerPool:
             return self._ensure_worker_locked_by_edge(edge)
 
     def _ensure_worker_locked_by_edge(self, edge: int) -> EdgeAssignment:
+        cached = self._ready_assignment_if_fresh(edge)
+        if cached is not None:
+            return cached
         max_attempts = self.startup_max_retries + 1
         last_error = ""
         last_error_type = WORKER_STARTUP_FAILED
@@ -129,9 +138,7 @@ class EdgeWorkerPool:
             try:
                 ready = self._wait_until_ready_or_failed(edge, assignment)
                 with self._lock:
-                    self._states[edge] = "READY"
-                    event = self._startup_events.setdefault(edge, threading.Event())
-                    event.set()
+                    self._mark_ready_locked(edge, ready)
                 return ready
             except WorkerStartupError as exc:
                 last_error = str(exc)
@@ -140,6 +147,7 @@ class EdgeWorkerPool:
                     if self._closing:
                         raise WorkerPoolClosingError() from exc
                     process = self._processes.pop(edge, None)
+                    self._ready_cache.pop(edge, None)
                     if process is not None:
                         self._states[edge] = "STOPPING"
                     self._startup_errors[edge] = last_error
@@ -175,6 +183,8 @@ class EdgeWorkerPool:
             if self._closing:
                 raise WorkerPoolClosingError()
             process = self._processes.pop(edge, None)
+            self._ready_cache.pop(edge, None)
+            self._ready_logged.discard(edge)
             assignment = self._get_or_create_assignment_locked(edge)
             self._states[edge] = "STOPPING"
         if process is not None:
@@ -196,6 +206,7 @@ class EdgeWorkerPool:
             self._processes.clear()
             for edge in list(self._states):
                 self._states[edge] = "STOPPING"
+            self._ready_cache.clear()
         for _edge, process, assignment in items:
             if assignment is not None and process.poll() is None:
                 self._request_worker_shutdown(assignment)
@@ -221,14 +232,13 @@ class EdgeWorkerPool:
             if process is not None and process.poll() is None:
                 probe = self._health_probe(assignment)
                 if probe.ready:
-                    self._states[edge] = "READY"
-                    event = self._startup_events.setdefault(edge, threading.Event())
-                    event.set()
+                    self._mark_ready_locked(edge, assignment)
                     return assignment
                 if probe.failed:
                     self._states[edge] = "FAILED"
                     self._startup_errors[edge] = probe.message
                     self._processes.pop(edge, None)
+                    self._ready_cache.pop(edge, None)
                     self._mark_bad_endpoint_locked(assignment.endpoint)
                     process_to_stop = process
                 else:
@@ -238,20 +248,19 @@ class EdgeWorkerPool:
                 process_to_stop = None
                 if process is not None:
                     self._processes.pop(edge, None)
+                    self._ready_cache.pop(edge, None)
                     self._mark_bad_endpoint_locked(assignment.endpoint)
                     assignment = self._replace_endpoint_locked(edge, assignment)
                 else:
                     probe = self._health_probe(assignment)
                     if probe.ready:
-                        logger.info(
+                        logger.debug(
                             "[EdgeWorkerPool] using existing healthy worker={} endpoint={} edge={}",
                             assignment.worker_id,
                             assignment.endpoint,
                             assignment.edge_id,
                         )
-                        self._states[edge] = "READY"
-                        event = self._startup_events.setdefault(edge, threading.Event())
-                        event.set()
+                        self._mark_ready_locked(edge, assignment)
                         return assignment
                     if probe.state == "STARTING":
                         self._states[edge] = "STARTING"
@@ -323,6 +332,8 @@ class EdgeWorkerPool:
         process = self._start_worker_process(assignment)
         self._processes[edge] = process
         self._states[edge] = "STARTING"
+        self._ready_cache.pop(edge, None)
+        self._ready_logged.discard(edge)
         self._startup_errors.pop(edge, None)
         self._startup_events[edge] = threading.Event()
         return process
@@ -377,12 +388,22 @@ class EdgeWorkerPool:
                 process = self._processes.get(edge)
             probe = self._health_probe(assignment)
             if probe.ready:
-                logger.info(
-                    "[EdgeWorkerPool] worker ready worker={} edge={} endpoint={}",
-                    assignment.worker_id,
-                    assignment.edge_id,
-                    assignment.endpoint,
-                )
+                with self._lock:
+                    if edge not in self._ready_logged:
+                        logger.info(
+                            "[EdgeWorkerPool] worker ready worker={} edge={} endpoint={}",
+                            assignment.worker_id,
+                            assignment.edge_id,
+                            assignment.endpoint,
+                        )
+                    else:
+                        logger.debug(
+                            "[EdgeWorkerPool] worker ready worker={} edge={} endpoint={}",
+                            assignment.worker_id,
+                            assignment.edge_id,
+                            assignment.endpoint,
+                        )
+                    self._mark_ready_locked(edge, assignment)
                 return assignment
             last_message = probe.message
             last_error_type = probe.error_type or last_error_type
@@ -404,6 +425,31 @@ class EdgeWorkerPool:
 
     def _health(self, assignment: EdgeAssignment) -> bool:
         return self._health_probe(assignment).ready
+
+    def _ready_assignment_if_fresh(self, edge: int) -> EdgeAssignment | None:
+        with self._lock:
+            cached = self._ready_cache.get(edge)
+            if cached is None:
+                return None
+            expires_at, assignment = cached
+            if time.monotonic() >= expires_at:
+                self._ready_cache.pop(edge, None)
+                return None
+            process = self._processes.get(edge)
+            if process is not None and process.poll() is not None:
+                self._ready_cache.pop(edge, None)
+                self._states[edge] = "FAILED"
+                return None
+            return assignment
+
+    def _mark_ready_locked(self, edge: int, assignment: EdgeAssignment) -> None:
+        self._states[edge] = "READY"
+        ttl = float(getattr(self, "ready_cache_ttl_sec", 0.0) or 0.0)
+        if ttl > 0.0:
+            self._ready_cache[edge] = (time.monotonic() + ttl, assignment)
+        self._ready_logged.add(edge)
+        event = self._startup_events.setdefault(edge, threading.Event())
+        event.set()
 
     def _health_probe(self, assignment: EdgeAssignment) -> _HealthProbe:
         try:

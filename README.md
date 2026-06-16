@@ -313,13 +313,16 @@ ekya_style_centralized_scheduling
 ```
 
 Cloud-backed baseline updates use the shared training-job API with one generic
-baseline job type. The manifest selects `training_strategy: raw_freeze` or
-`training_strategy: freeze`; the default is `raw_freeze`:
+baseline job type. The production baseline training strategy is
+`training_strategy: freeze`:
 
 ```yaml
 baseline:
+  edge:
+    split_runtime_policy: disabled
   accuracy_trigger_cloud_retraining:
-    training_strategy: raw_freeze
+    training_strategy: freeze
+    training_failure_backoff_sec: 30
   ekya_style_centralized_scheduling:
     display_source: cloud
   training:

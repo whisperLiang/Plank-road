@@ -45,7 +45,7 @@ class BaselineEdgeAdapter:
         method_cfg = getattr(baseline_cfg, self.baseline_method, None)
         self.policy = create_policy(self.baseline_method, method_cfg)
         self.training_strategy = validate_baseline_training_strategy(
-            getattr(self.policy, "training_strategy", "raw_freeze")
+            getattr(self.policy, "training_strategy", "freeze")
         )
         self.display_source = str(getattr(method_cfg, "display_source", "local") or "local")
         self.metrics = DistributedMetricsWriter(
@@ -73,6 +73,10 @@ class BaselineEdgeAdapter:
             edge_id=self.edge_id,
             max_window_size=max(1, int(self._training_config.get("training_window_size", 8))),
             min_samples=max(1, int(self._training_config.get("min_training_samples", 1))),
+            failure_backoff_sec=_training_failure_backoff_sec(
+                method_cfg,
+                getattr(baseline_cfg, "training", None),
+            ),
         )
         if self.policy.requires_cloud:
             self._worker = threading.Thread(
@@ -266,10 +270,28 @@ class BaselineEdgeAdapter:
             or not hasattr(self.transport, "submit_training_bundle")
         ):
             return
-        ready = self._training_state.ready_window()
+        now = time.monotonic()
+        ready = self._training_state.ready_window(now=now)
         if ready is None:
             return
-        window_id, samples = ready
+        if ready.skip_reason:
+            if ready.skip_reason == "training_failure_backoff":
+                logger.info(
+                    "[BaselineAdapter] skipped trigger edge={} window={} "
+                    "reason=training_failure_backoff remaining={:.1f}",
+                    self.edge_id,
+                    ready.window_id,
+                    ready.remaining_backoff_sec,
+                )
+            self.metrics.record(
+                "training_trigger_skipped",
+                window_id=ready.window_id,
+                reason=ready.skip_reason,
+                remaining_backoff_sec=ready.remaining_backoff_sec,
+            )
+            return
+        window_id = ready.window_id
+        samples = ready.samples
         sample_dicts = [
             {
                 "frame_id": sample.frame_id,
@@ -280,34 +302,59 @@ class BaselineEdgeAdapter:
             }
             for sample in samples
         ]
-        payload_zip = build_baseline_training_bundle(
-            run_id=self.run_id,
-            baseline_method=self.baseline_method,
-            edge_id=self.edge_id,
-            model_name=str(getattr(self.config, "lightweight", "")),
-            model_version=str(samples[-1].model_version if samples else "0"),
-            training_strategy=self.training_strategy,
-            window_id=window_id,
-            samples=sample_dicts,
-            training_config=self._training_config,
-            weights_path=str(getattr(self.config, "weights_path", "") or ""),
-            tinynext_input_size=getattr(self.config, "tinynext_input_size", None),
-        )
-        request_id = (
-            f"baseline:{self.baseline_method}:{self.run_id}:{self.edge_id}:{window_id}"
-        )
-        reply = self.transport.submit_training_bundle(
-            edge_id=self.edge_id,
-            request_id=request_id,
-            payload_zip=payload_zip,
-            frame_ids=[sample.frame_id for sample in samples],
-            base_model_version=str(samples[-1].model_version if samples else "0"),
-        )
+        try:
+            payload_zip = build_baseline_training_bundle(
+                run_id=self.run_id,
+                baseline_method=self.baseline_method,
+                edge_id=self.edge_id,
+                model_name=str(getattr(self.config, "lightweight", "")),
+                model_version=str(samples[-1].model_version if samples else "0"),
+                training_strategy=self.training_strategy,
+                window_id=window_id,
+                samples=sample_dicts,
+                training_config=self._training_config,
+                weights_path=str(getattr(self.config, "weights_path", "") or ""),
+                tinynext_input_size=getattr(self.config, "tinynext_input_size", None),
+            )
+            request_id = (
+                f"baseline:{self.baseline_method}:{self.run_id}:{self.edge_id}:{window_id}"
+            )
+            reply = self.transport.submit_training_bundle(
+                edge_id=self.edge_id,
+                request_id=request_id,
+                payload_zip=payload_zip,
+                frame_ids=[sample.frame_id for sample in samples],
+                base_model_version=str(samples[-1].model_version if samples else "0"),
+            )
+        except Exception as exc:
+            self._training_state.mark_submit_failed(
+                window_id=window_id,
+                message=str(exc),
+                now=time.monotonic(),
+            )
+            logger.warning(
+                "[BaselineAdapter] training trigger failed edge={} window={} reason={}",
+                self.edge_id,
+                window_id,
+                exc,
+            )
+            self.metrics.record(
+                "training_request_failed",
+                window_id=window_id,
+                message=str(exc),
+            )
+            return
         if not bool(getattr(reply, "accepted", False)):
+            message = str(getattr(reply, "message", "") or "training job rejected")
+            self._training_state.mark_submit_failed(
+                window_id=window_id,
+                message=message,
+                now=time.monotonic(),
+            )
             self.metrics.record(
                 "training_request_rejected",
                 window_id=window_id,
-                message=str(getattr(reply, "message", "")),
+                message=message,
             )
             return
         job_id = str(getattr(reply, "job_id", "") or "")
@@ -315,6 +362,7 @@ class BaselineEdgeAdapter:
             job_id=job_id,
             window_id=window_id,
             samples=samples,
+            now=time.monotonic(),
         )
         logger.info(
             "[BaselineAdapter] training trigger accepted edge={} window={} samples={}",
@@ -345,6 +393,7 @@ class BaselineEdgeAdapter:
         status = str(getattr(reply, "status", "") or "").upper()
         if status in {"", "QUEUED", "RUNNING"}:
             return
+        terminal_message = str(getattr(reply, "message", "") or "")
         try:
             if status == "SUCCEEDED" and bool(getattr(reply, "result_available", False)):
                 download = self.transport.download_trained_model(
@@ -383,7 +432,7 @@ class BaselineEdgeAdapter:
                     window_id=active.window_id,
                     job_id=active.job_id,
                     status=status,
-                    message=str(getattr(reply, "message", "") or ""),
+                    message=terminal_message,
                 )
         except Exception as exc:
             logger.warning("[BaselineAdapter] model update handling failed: {}", exc)
@@ -394,7 +443,13 @@ class BaselineEdgeAdapter:
                 message=str(exc),
             )
         finally:
-            self._training_state.mark_terminal(active.window_id)
+            self._training_state.mark_terminal(
+                active.window_id,
+                status=status,
+                now=time.monotonic(),
+                job_id=active.job_id,
+                message=terminal_message,
+            )
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -417,6 +472,7 @@ def _training_config_dict(config: object | None) -> dict[str, Any]:
         "microprofile_epochs",
         "microprofile_max_samples",
         "device",
+        "training_failure_backoff_sec",
     ):
         if isinstance(config, dict):
             if name in config:
@@ -429,3 +485,18 @@ def _training_config_dict(config: object | None) -> dict[str, Any]:
     result.setdefault("min_training_samples", 1)
     result.setdefault("training_window_size", 8)
     return result
+
+
+def _training_failure_backoff_sec(
+    method_config: object | None,
+    training_config: object | None,
+) -> float:
+    value = None
+    if method_config is not None and hasattr(method_config, "training_failure_backoff_sec"):
+        value = getattr(method_config, "training_failure_backoff_sec")
+    elif training_config is not None and hasattr(training_config, "training_failure_backoff_sec"):
+        value = getattr(training_config, "training_failure_backoff_sec")
+    try:
+        return max(0.0, float(30.0 if value is None else value))
+    except (TypeError, ValueError):
+        return 30.0

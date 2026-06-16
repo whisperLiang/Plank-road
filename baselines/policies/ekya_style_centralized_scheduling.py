@@ -14,9 +14,7 @@ class EkyaStyleCentralizedSchedulingPolicy(BaseBaselinePolicy):
         )
         self.enable_micro_profiling = bool(getattr(config, "enable_micro_profiling", True))
         self.display_source = str(getattr(config, "display_source", "cloud") or "cloud")
-        self._training_strategy = str(
-            getattr(config, "training_strategy", "raw_freeze")
-        )
+        self._training_strategy = str(getattr(config, "training_strategy", "freeze"))
 
     @property
     def frame_filter_enabled(self) -> bool:

@@ -17,8 +17,14 @@ from baselines.method_factory import create_policy, registered_methods
 from baselines.runtime import BaselineEdgeAdapter, stable_window_id
 from baselines.runtime.upload_client import BASELINE_TRAINING_PROTOCOL_VERSION
 from config.baseline import PLANK_ROAD_BASELINE_ERROR
-from edge_client import _resolve_baseline_run_id, _validate_startup_config
+from config.runtime import RuntimeConfig
+from edge_client import (
+    _configure_baseline_client_runtime,
+    _resolve_baseline_run_id,
+    _validate_startup_config,
+)
 from grpc_server import message_transmission_pb2
+from model_management.fixed_split import FIXED_SPLIT_PLAN_VERSION, SplitPlan
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,7 +51,8 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 reuse_plank_road_frame_filter=True,
                 upload_keyframes_only=True,
                 trigger_on_cloud_comparison=True,
-                training_strategy="raw_freeze",
+                training_strategy="freeze",
+                training_failure_backoff_sec=30.0,
                 return_model_update=True,
             ),
             ekya_style_centralized_scheduling=SimpleNamespace(
@@ -53,10 +60,11 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 use_frame_filter=False,
                 cloud_inference=True,
                 return_cloud_inference_to_edge=True,
-                training_strategy="raw_freeze",
+                training_strategy="freeze",
                 enable_micro_profiling=True,
                 display_source="cloud",
             ),
+            edge=SimpleNamespace(split_runtime_policy="disabled"),
             training=SimpleNamespace(
                 batch_size=2,
                 num_epoch=1,
@@ -129,6 +137,17 @@ class RecordingTransport:
             found=True,
             status="RUNNING",
             result_available=False,
+        )
+
+
+class FailingTrainingTransport(RecordingTransport):
+    def get_training_job_status(self, *, edge_id: int, job_id: str):
+        del edge_id, job_id
+        return message_transmission_pb2.TrainingJobStatusReply(
+            found=True,
+            status="FAILED",
+            result_available=False,
+            message="boom",
         )
 
 
@@ -225,6 +244,30 @@ def test_only_three_baseline_methods_are_registered() -> None:
     assert str(PLANK_ROAD_BASELINE_ERROR).startswith("plank_road" + "_multi_device")
 
 
+def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
+    config = RuntimeConfig()
+
+    assert config.baseline.accuracy_trigger_cloud_retraining.training_strategy == "freeze"
+    assert config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec == 30.0
+    assert config.baseline.edge.split_runtime_policy == "disabled"
+
+
+def test_default_baseline_edge_disables_main_cl_side_effects(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.retrain = SimpleNamespace(flag=True, cache_path=str(tmp_path / "cache"))
+    config.resource_aware_trigger = SimpleNamespace(enabled=True)
+    config.sample_pool = SimpleNamespace(enabled=True)
+    config.split_learning = SimpleNamespace(enabled=True)
+
+    policy = _configure_baseline_client_runtime(config, config.baseline)
+
+    assert policy == "disabled"
+    assert config.retrain.flag is False
+    assert config.resource_aware_trigger.enabled is False
+    assert config.sample_pool.enabled is False
+    assert config.split_learning.enabled is False
+
+
 def test_pure_edge_adapter_uses_shared_artifacts_without_cloud(tmp_path) -> None:
     adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
@@ -308,19 +351,19 @@ def test_accuracy_adapter_uploads_keyframes_and_generic_training_bundle(tmp_path
         assert payload.edge_prediction["boxes"] == [[1, 2, 3, 4]]
         assert payload.confidence == pytest.approx(0.9)
         assert payload.entropy == pytest.approx(0.25)
-        assert payload.quality_metadata["training_strategy"] == "raw_freeze"
+        assert payload.quality_metadata["training_strategy"] == "freeze"
 
         manifest = _manifest_from_bundle(transport.training_requests[0]["payload_zip"])
         expected_window = stable_window_id(
             run_id="acc-run",
             baseline_method="accuracy_trigger_cloud_retraining",
-            training_strategy="raw_freeze",
+            training_strategy="freeze",
             edge_id=2,
             model_version="0",
             frame_ids=[2],
         )
         assert manifest["protocol_version"] == BASELINE_TRAINING_PROTOCOL_VERSION
-        assert manifest["training_strategy"] == "raw_freeze"
+        assert manifest["training_strategy"] == "freeze"
         assert manifest["window_id"] == expected_window
         assert manifest["frames"][0]["edge_prediction"]["result_source"] == "inference"
 
@@ -334,6 +377,50 @@ def test_accuracy_adapter_uploads_keyframes_and_generic_training_bundle(tmp_path
             latency_ms=1.0,
         )
         time.sleep(0.1)
+        assert len(transport.training_requests) == 1
+    finally:
+        adapter.close()
+
+
+def test_accuracy_adapter_failed_window_enters_backoff(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.training.training_window_size = 1
+    config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec = 30.0
+    transport = FailingTrainingTransport()
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="acc-run",
+        edge_id=2,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    try:
+        adapter.before_video_start(FakeEdge())
+        adapter.on_sampled_inference_result(
+            frame=frame,
+            frame_index=2,
+            task=FakeTask(source="inference", model_version="0"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+        _wait_until(lambda: len(transport.training_requests) == 1)
+        _wait_until(lambda: adapter._training_state.active_job is None)
+
+        adapter.on_sampled_inference_result(
+            frame=frame,
+            frame_index=2,
+            task=FakeTask(source="inference", model_version="0"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+        time.sleep(0.1)
+
         assert len(transport.training_requests) == 1
     finally:
         adapter.close()
@@ -366,7 +453,7 @@ def test_ekya_adapter_uploads_raw_frames_and_cloud_overlay_without_training(tmp_
         payload = transport.uploaded[0]
         assert payload.upload_mode == "raw_frame"
         assert payload.edge_prediction == {}
-        assert payload.quality_metadata["training_strategy"] == "raw_freeze"
+        assert payload.quality_metadata["training_strategy"] == "freeze"
         assert transport.training_requests == []
         visual = adapter.display_visual({"boxes": [], "labels": [], "scores": [], "mode": "Local"})
         assert visual["mode"] == "Cloud"
@@ -379,7 +466,7 @@ def test_stable_window_id_includes_strategy_and_sorts_frames() -> None:
     first = stable_window_id(
         run_id="run-a",
         baseline_method="accuracy_trigger_cloud_retraining",
-        training_strategy="raw_freeze",
+        training_strategy="freeze",
         edge_id=1,
         model_version="0",
         frame_ids=[5, 1, 3],
@@ -387,7 +474,7 @@ def test_stable_window_id_includes_strategy_and_sorts_frames() -> None:
     reordered = stable_window_id(
         run_id="run-a",
         baseline_method="accuracy_trigger_cloud_retraining",
-        training_strategy="raw_freeze",
+        training_strategy="freeze",
         edge_id=1,
         model_version="0",
         frame_ids=[1, 3, 5],
@@ -395,7 +482,7 @@ def test_stable_window_id_includes_strategy_and_sorts_frames() -> None:
     different_strategy = stable_window_id(
         run_id="run-a",
         baseline_method="accuracy_trigger_cloud_retraining",
-        training_strategy="freeze",
+        training_strategy="diagnostic",
         edge_id=1,
         model_version="0",
         frame_ids=[1, 3, 5],
@@ -404,67 +491,182 @@ def test_stable_window_id_includes_strategy_and_sorts_frames() -> None:
     assert first != different_strategy
 
 
-def test_cloud_controller_submits_generic_strategy_bundle() -> None:
-    backend = FakeTrainingBackend()
+def test_cloud_controller_no_longer_exposes_training_state_machine() -> None:
     controller = DistributedBaselineController(
         baseline_method="accuracy_trigger_cloud_retraining",
         run_id="run-a",
         results_root="unused",
-        training_backend=backend,
         strict_run_id=False,
     )
-    controller.upload_frame(
-        BaselineFramePayload(
-            run_id="run-a",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=1,
-            frame_id=4,
-            model_name="tiny",
-            model_version="7",
-            raw_frame=_jpeg_bytes(),
-            edge_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.8]},
-            upload_mode="keyframe_raw",
-            is_keyframe=True,
-        )
+    assert not hasattr(controller, "request_training")
+    assert not hasattr(controller, "poll_training_job")
+    assert not hasattr(controller, "download_model_update")
+
+
+def test_baseline_replay_only_loads_existing_plan_without_solver(tmp_path, monkeypatch) -> None:
+    import torch
+
+    import edge.edge_worker as edge_worker_module
+    from edge.edge_worker import EdgeWorker
+
+    cache_path = tmp_path / "cache"
+    cache_path.mkdir()
+    plan = SplitPlan(
+        split_config_id="split-a",
+        model_name="tiny",
+        candidate_id="after:head",
+        split_index=None,
+        split_label="after:head",
+        boundary_tensor_labels=["node_a"],
+        payload_bytes=0,
+        privacy_metric=0.0,
+        privacy_risk=0.0,
+        layer_freezing_ratio=0.0,
+        canonical_split_key="after:head",
+        input_tensor_shape=[1, 3, 8, 8],
+        runtime_contract={"logical_split_id": "after:head", "model_id": "tiny"},
+        plan_version=FIXED_SPLIT_PLAN_VERSION,
     )
-    job = controller.request_training(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        training_strategy="freeze",
-        frame_ids=[4],
-    )
-    request = backend.submitted[(1, job["job_id"])]
-    manifest = _manifest_from_bundle(request.payload_zip)
-    expected_window = stable_window_id(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        training_strategy="freeze",
-        edge_id=1,
-        model_version="7",
-        frame_ids=[4],
+    (cache_path / "fixed_split_plan.json").write_text(
+        json.dumps(plan.to_dict()),
+        encoding="utf-8",
     )
 
-    assert request.job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING
-    assert manifest["training_strategy"] == "freeze"
-    assert manifest["window_id"] == expected_window
-    assert manifest["frames"][0]["edge_prediction"]["boxes"] == [[1, 1, 4, 4]]
-    assert "teacher_prediction" not in json.dumps(manifest)
-    assert controller.download_model_update(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        job_id=job["job_id"],
+    class FakeDetection:
+        def __init__(self) -> None:
+            self.model = TinyModel()
+
+        def get_split_runtime_model(self):
+            return self.model
+
+        def prepare_splitter_input(self, _frame):
+            return torch.zeros((1, 3, 8, 8))
+
+        def build_split_sample_input(self, image_size):
+            return torch.zeros((1, 3, *tuple(image_size)))
+
+    class FakeSplitter:
+        def __init__(self, *, device):
+            self.device = device
+
+        def bind_runtime(self, runtime, *, model, split_spec):
+            self.runtime = runtime
+            self.model = model
+            self.split_spec = split_spec
+            return self
+
+    monkeypatch.setattr(
+        edge_worker_module,
+        "load_or_compute_fixed_split_plan",
+        lambda *args, **kwargs: pytest.fail("baseline replay_only solved a split candidate"),
     )
-    assert (
-        controller.download_model_update(
-            run_id="run-b",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=1,
-            job_id=job["job_id"],
-        )
-        is None
+    monkeypatch.setattr(edge_worker_module, "UniversalModelSplitter", FakeSplitter)
+    monkeypatch.setattr(
+        edge_worker_module,
+        "build_split_training_loss",
+        lambda _model: (lambda outputs, targets: outputs),
     )
+    monkeypatch.setattr(
+        edge_worker_module,
+        "prepare_split_replay_runtime",
+        lambda *args, **kwargs: SimpleNamespace(
+            split_id="after:head",
+            plan=SimpleNamespace(boundary_nodes=["node_a"]),
+        ),
+    )
+
+    worker = object.__new__(EdgeWorker)
+    worker.config = SimpleNamespace(retrain=SimpleNamespace(cache_path=str(cache_path)))
+    worker.small_object_detection = FakeDetection()
+    worker.baseline_split_runtime_policy = "replay_only"
+    worker.model_id = "tiny"
+    worker.edge_id = 1
+    worker.log_internal_ids = False
+
+    worker._init_baseline_split_runtime(frame=np.zeros((8, 8, 3), dtype=np.uint8))
+
+    assert worker.fixed_split_plan.split_config_id == "split-a"
+    assert worker.universal_split_enabled is True
+    assert worker.collect_flag is False
+
+
+def test_baseline_replay_only_rejects_stale_plan_runtime(tmp_path, monkeypatch) -> None:
+    import torch
+
+    import edge.edge_worker as edge_worker_module
+    from edge.edge_worker import EdgeWorker
+
+    cache_path = tmp_path / "cache"
+    cache_path.mkdir()
+    plan = SplitPlan(
+        split_config_id="split-a",
+        model_name="tiny",
+        candidate_id="after:head",
+        split_index=None,
+        split_label="after:head",
+        boundary_tensor_labels=["node_a"],
+        payload_bytes=0,
+        privacy_metric=0.0,
+        privacy_risk=0.0,
+        layer_freezing_ratio=0.0,
+        canonical_split_key="after:head",
+        input_tensor_shape=[1, 3, 8, 8],
+        runtime_contract={"logical_split_id": "after:head", "model_id": "tiny"},
+        plan_version=FIXED_SPLIT_PLAN_VERSION,
+    )
+    (cache_path / "fixed_split_plan.json").write_text(
+        json.dumps(plan.to_dict()),
+        encoding="utf-8",
+    )
+
+    class FakeDetection:
+        def __init__(self) -> None:
+            self.model = TinyModel()
+
+        def get_split_runtime_model(self):
+            return self.model
+
+        def prepare_splitter_input(self, _frame):
+            return torch.zeros((1, 3, 8, 8))
+
+    monkeypatch.setattr(
+        edge_worker_module,
+        "UniversalModelSplitter",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        edge_worker_module,
+        "build_split_training_loss",
+        lambda _model: (lambda outputs, targets: outputs),
+    )
+    monkeypatch.setattr(
+        edge_worker_module,
+        "prepare_split_replay_runtime",
+        lambda *args, **kwargs: SimpleNamespace(
+            split_id="after:head",
+            plan=SimpleNamespace(boundary_nodes=["wrong_node"]),
+        ),
+    )
+
+    worker = object.__new__(EdgeWorker)
+    worker.config = SimpleNamespace(retrain=SimpleNamespace(cache_path=str(cache_path)))
+    worker.small_object_detection = FakeDetection()
+    worker.baseline_split_runtime_policy = "replay_only"
+    worker.model_id = "tiny"
+
+    with pytest.raises(RuntimeError, match="boundary mismatch"):
+        worker._init_baseline_split_runtime(frame=np.zeros((8, 8, 3), dtype=np.uint8))
+
+
+def test_baseline_replay_only_missing_plan_errors(tmp_path) -> None:
+    from edge.edge_worker import EdgeWorker
+
+    worker = object.__new__(EdgeWorker)
+    worker.config = SimpleNamespace(retrain=SimpleNamespace(cache_path=str(tmp_path)))
+    worker.baseline_split_runtime_policy = "replay_only"
+
+    with pytest.raises(RuntimeError, match="requires an existing fixed split plan"):
+        worker._init_baseline_split_runtime()
 
 
 def test_cloud_controller_infers_then_strips_raw_frame_bytes() -> None:
@@ -496,20 +698,33 @@ def test_cloud_controller_infers_then_strips_raw_frame_bytes() -> None:
     assert controller._frames[frame_key].raw_frame == b""
 
 
-def test_cloud_controller_rejects_wrong_training_strategy() -> None:
-    controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
-        run_id="run-a",
-        results_root="unused",
-        training_backend=FakeTrainingBackend(),
-    )
-    with pytest.raises(ValueError, match="raw_freeze or freeze"):
-        controller.request_training(
-            run_id="run-a",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=1,
-            training_strategy="ekya_style",
-        )
+def test_upload_client_rejects_raw_freeze_strategy() -> None:
+    from baselines.runtime.upload_client import validate_baseline_training_strategy
+
+    with pytest.raises(ValueError, match="freeze"):
+        validate_baseline_training_strategy("raw_freeze")
+
+
+def test_production_code_has_no_old_baseline_training_fallbacks() -> None:
+    roots = [
+        PROJECT_ROOT / "cloud",
+        PROJECT_ROOT / "baselines",
+        PROJECT_ROOT / "config",
+        PROJECT_ROOT / "grpc_server",
+        PROJECT_ROOT / "edge_client.py",
+    ]
+    banned = [
+        "raw_freeze",
+        "CloudRawFreezeTrainingStrategy",
+        "BaselineFrozenRatioTrainer",
+        "TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO",
+        "frozen_ratio_training",
+        "BaselineEdgeRuntime",
+    ]
+    for path in _iter_text_files(roots):
+        text = path.read_text(encoding="utf-8")
+        for token in banned:
+            assert token not in text, f"{token} found in {path.relative_to(PROJECT_ROOT)}"
 
 
 def _manifest_from_bundle(bundle: object) -> dict[str, object]:
@@ -521,6 +736,26 @@ def _jpeg_bytes() -> bytes:
     ok, encoded = cv2.imencode(".jpg", np.zeros((8, 8, 3), dtype=np.uint8))
     assert ok
     return bytes(encoded.tobytes())
+
+
+class TinyModel:
+    def __init__(self) -> None:
+        import torch
+
+        self.weight = torch.nn.Parameter(torch.ones(()))
+
+    def parameters(self):
+        yield self.weight
+
+
+def _iter_text_files(paths):
+    for path in paths:
+        if path.is_file():
+            yield path
+            continue
+        for child in path.rglob("*.py"):
+            if "__pycache__" not in child.parts:
+                yield child
 
 
 def _wait_until(predicate, timeout: float = 2.0) -> None:

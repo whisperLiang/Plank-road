@@ -57,9 +57,6 @@ import model_management.object_detection as object_detection_module
 from cloud.training.freeze_modes import (
     configure_fixed_prefix_training as _shared_configure_fixed_prefix_training,
 )
-from cloud.training.freeze_modes import (
-    configure_raw_freeze_training as _shared_configure_raw_freeze_training,
-)
 from cloud.training.proxy_eval import _evaluate_detection_proxy_metrics
 from config import load_runtime_config
 from model_management.model_zoo import (
@@ -1025,8 +1022,36 @@ def _configure_raw_freeze_eval_forward_training(
     split_model: torch.nn.Module,
     suffix_names: tuple[str, ...],
 ) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
-    """Compatibility wrapper around the production raw_freeze trainer helper."""
-    return _shared_configure_raw_freeze_training(split_model, suffix_names)
+    """Experiment-only raw full-model freeze helper."""
+    suffix_names = tuple(suffix_names)
+    suffix_name_set = set(suffix_names)
+    split_model.eval()
+    for parameter in split_model.parameters():
+        parameter.requires_grad_(False)
+        parameter.grad = None
+
+    suffix_params: list[torch.nn.Parameter] = []
+    modules_with_suffix: set[str] = set()
+    named_parameters = dict(split_model.named_parameters())
+    for name, parameter in named_parameters.items():
+        if name not in suffix_name_set:
+            continue
+        parameter.requires_grad_(True)
+        suffix_params.append(parameter)
+        modules_with_suffix.add(name.rsplit(".", 1)[0])
+
+    missing = sorted(suffix_name_set - set(named_parameters))
+    if missing:
+        raise RuntimeError("raw_freeze suffix parameters missing: " + ", ".join(missing))
+
+    module_lookup = dict(split_model.named_modules())
+    for module_name in modules_with_suffix:
+        module = module_lookup.get(module_name)
+        if module is not None:
+            module.train()
+    if not suffix_params:
+        raise RuntimeError("No suffix parameters were selected for raw_freeze training")
+    return suffix_names, suffix_params
 
 
 # ---------------------------------------------------------------------------

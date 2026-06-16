@@ -68,70 +68,6 @@ def configure_fixed_prefix_training(
     return suffix_names, suffix_params
 
 
-def configure_raw_freeze_training(
-    split_model: torch.nn.Module,
-    suffix_names: tuple[str, ...],
-) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
-    suffix_names = tuple(suffix_names)
-    suffix_name_set = set(suffix_names)
-    split_model.eval()
-    for parameter in split_model.parameters():
-        parameter.requires_grad_(False)
-        parameter.grad = None
-    suffix_params: list[torch.nn.Parameter] = []
-    modules_with_suffix: set[str] = set()
-    named_parameters = dict(split_model.named_parameters())
-    for name, parameter in named_parameters.items():
-        if name in suffix_name_set:
-            parameter.requires_grad_(True)
-            suffix_params.append(parameter)
-            modules_with_suffix.add(name.rsplit(".", 1)[0])
-    missing = sorted(suffix_name_set - set(named_parameters.keys()))
-    if missing:
-        raise RuntimeError("raw_freeze suffix parameters missing: " + ", ".join(missing))
-    module_lookup = dict(split_model.named_modules())
-    for module_name in modules_with_suffix:
-        module = module_lookup.get(module_name)
-        if module is not None:
-            module.train()
-    if not suffix_params:
-        raise RuntimeError("No suffix parameters were selected for raw_freeze training")
-    return suffix_names, suffix_params
-
-
-def run_raw_freeze_training(
-    *,
-    model: torch.nn.Module,
-    suffix_param_names: tuple[str, ...],
-    samples: Iterable[RawFrameTrainingSample],
-    batch_size: int,
-    epochs: int,
-    device: torch.device,
-    loss_fn: Callable[[Any, Any], torch.Tensor],
-    optimizer: torch.optim.Optimizer,
-) -> dict[str, Any]:
-    sample_list = list(samples)
-    configure_raw_freeze_training(model, tuple(suffix_param_names))
-    losses: list[float] = []
-    started = time.perf_counter()
-    for _epoch in range(int(epochs)):
-        for batch in _batches(sample_list, max(1, int(batch_size))):
-            inputs, targets = _prepare_raw_batch(batch, device=device)
-            optimizer.zero_grad(set_to_none=True)
-            outputs = model(inputs)
-            loss = loss_fn(outputs, copy.deepcopy(targets))
-            if not torch.is_tensor(loss) or not bool(loss.requires_grad):
-                raise RuntimeError("raw_freeze loss has no gradient signal")
-            loss.backward()
-            optimizer.step()
-            losses.append(float(loss.detach().cpu().item()))
-    return {
-        "suffix_train_time_sec": time.perf_counter() - started,
-        "final_loss": losses[-1] if losses else None,
-        "batch_count": len(losses),
-    }
-
-
 def run_freeze_training(
     *,
     model: torch.nn.Module,
@@ -170,15 +106,6 @@ def run_freeze_training(
         "final_loss": losses[-1] if losses else None,
         "batch_count": len(losses),
     }
-
-
-def default_suffix_parameter_names(model: torch.nn.Module) -> tuple[str, ...]:
-    names = [name for name, _parameter in model.named_parameters()]
-    if not names:
-        raise RuntimeError("model has no parameters")
-    module_names = [name.rsplit(".", 1)[0] for name in names]
-    suffix_module = module_names[-1]
-    return tuple(name for name in names if name.rsplit(".", 1)[0] == suffix_module)
 
 
 def decode_training_sample(

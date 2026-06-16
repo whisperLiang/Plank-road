@@ -599,12 +599,12 @@ class PipelineLifecycleMixin:
         split_plan = dict(manifest.get("split_plan", {}) or {})
         training_config = dict(manifest.get("training_config", {}) or {})
         is_baseline_training = (
-            str(manifest.get("protocol_version") or "") == "baseline-training-trigger.v1"
-            or (
-                bool(manifest.get("frames"))
-                and str(manifest.get("training_strategy") or "") in {"raw_freeze", "freeze"}
+                str(manifest.get("protocol_version") or "") == "baseline-training-trigger.v1"
+                or (
+                    bool(manifest.get("frames"))
+                    and str(manifest.get("training_strategy") or "") == "freeze"
+                )
             )
-        )
         model_name = str(
             model_meta.get("model_id")
             or model_meta.get("model_name")

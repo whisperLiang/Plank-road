@@ -547,6 +547,6 @@ def _baseline_strategy_from_workspace(workspace: str) -> str:
         raise RuntimeError("baseline training workspace is missing baseline_trigger_manifest.json")
     manifest = json.loads(path.read_text(encoding="utf-8"))
     strategy = str(manifest.get("training_strategy", "") or "").strip()
-    if strategy not in {"raw_freeze", "freeze"}:
+    if strategy != "freeze":
         raise RuntimeError(f"unsupported baseline training_strategy: {strategy!r}")
     return strategy

@@ -37,9 +37,11 @@ from edge.transmit import (
 )
 from edge.window_drift_detector import DriftWindowState, WindowDriftDetector
 from model_management.fixed_split import (
+    FIXED_SPLIT_PLAN_VERSION,
     SplitConstraints,
     SplitPlan,
     load_or_compute_fixed_split_plan,
+    load_split_plan,
 )
 from model_management.model_delta_payload import require_state_dict_delta_payload
 from model_management.object_detection import InferenceArtifacts, Object_Detection
@@ -47,6 +49,7 @@ from model_management.split_model_adapters import (
     build_split_training_loss,
     get_split_runtime_input_resize_mode,
 )
+from model_management.split_runtime import make_split_spec, prepare_split_replay_runtime
 from model_management.universal_model_split import UniversalModelSplitter
 from tools.grpc_options import grpc_message_options
 
@@ -144,6 +147,84 @@ def _first_tensor_batch_size(value: object) -> int | None:
             if found is not None:
                 return found
     return None
+
+
+def _input_tensor_shape_from_sample(value: object) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        return [int(dim) for dim in value.shape]
+    if isinstance(value, Mapping):
+        for item in value.values():
+            found = _input_tensor_shape_from_sample(item)
+            if found:
+                return found
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _input_tensor_shape_from_sample(item)
+            if found:
+                return found
+    return []
+
+
+def _validate_baseline_replay_plan_runtime(
+    plan: SplitPlan,
+    *,
+    model_id: str,
+    sample_input: object,
+    runtime: object | None = None,
+) -> None:
+    model_names = _split_plan_model_identities(plan)
+    current_model = str(model_id or "").strip()
+    if current_model and model_names and current_model not in model_names:
+        raise RuntimeError(
+            "baseline edge replay_only fixed split plan model mismatch: "
+            f"current_model={current_model!r}, plan_models={sorted(model_names)!r}"
+        )
+
+    expected_shape = [int(dim) for dim in list(getattr(plan, "input_tensor_shape", []) or [])]
+    actual_shape = _input_tensor_shape_from_sample(sample_input)
+    if expected_shape and actual_shape and expected_shape != actual_shape:
+        raise RuntimeError(
+            "baseline edge replay_only fixed split plan input shape mismatch: "
+            f"expected={expected_shape}, actual={actual_shape}"
+        )
+
+    if runtime is None:
+        return
+
+    expected_split = str(plan.logical_split_id or plan.canonical_split_key or "").strip()
+    actual_split = str(getattr(runtime, "split_id", "") or "").strip()
+    if expected_split and actual_split and expected_split != actual_split:
+        raise RuntimeError(
+            "baseline edge replay_only fixed split runtime split mismatch: "
+            f"expected={expected_split!r}, actual={actual_split!r}"
+        )
+
+    expected_labels = [
+        str(label) for label in list(getattr(plan, "boundary_tensor_labels", []) or [])
+    ]
+    if not expected_labels:
+        return
+    runtime_plan = getattr(runtime, "plan", None)
+    actual_labels = [
+        str(label) for label in list(getattr(runtime_plan, "boundary_nodes", ()) or [])
+    ]
+    if actual_labels != expected_labels:
+        raise RuntimeError(
+            "baseline edge replay_only fixed split runtime boundary mismatch: "
+            f"expected={expected_labels!r}, actual={actual_labels!r}"
+        )
+
+
+def _split_plan_model_identities(plan: SplitPlan) -> set[str]:
+    contract = dict(getattr(plan, "runtime_contract", {}) or {})
+    return {
+        value
+        for value in (
+            str(getattr(plan, "model_name", "") or "").strip(),
+            str(contract.get("model_id") or "").strip(),
+        )
+        if value
+    }
 
 
 def resize_batch(value: object, current_batch_size: int, target_batch_size: int) -> object:
@@ -486,6 +567,12 @@ class EdgeWorker:
             low_quality_rate_threshold=float(getattr(drift_cfg, "low_quality_rate_threshold", 0.3)),
             persistence_windows=int(getattr(drift_cfg, "persistence_windows", 3)),
         )
+        baseline_cfg = getattr(config, "baseline", None)
+        self.baseline_mode = bool(getattr(baseline_cfg, "enabled", False))
+        baseline_edge_cfg = getattr(baseline_cfg, "edge", None) if baseline_cfg else None
+        self.baseline_split_runtime_policy = str(
+            getattr(baseline_edge_cfg, "split_runtime_policy", "disabled") or "disabled"
+        ).strip().lower()
 
         self.resource_trigger: ResourceAwareCLTrigger | None = None
         self._cloud_state: CloudResourceState | None = None
@@ -499,7 +586,9 @@ class EdgeWorker:
         self._resource_probe_required_after = 0.0
         self._drift_probe_active = False
         ra_cfg = getattr(config, "resource_aware_trigger", None)
-        self.resource_trigger_enabled = bool(getattr(ra_cfg, "enabled", False)) if ra_cfg else False
+        self.resource_trigger_enabled = (
+            bool(getattr(ra_cfg, "enabled", False)) if ra_cfg and not self.baseline_mode else False
+        )
         if self.resource_trigger_enabled:
             self.resource_trigger = create_resource_aware_trigger(config)
             logger.info(
@@ -524,7 +613,7 @@ class EdgeWorker:
             "frame": None,
         }
 
-        self.collect_flag = bool(self.config.retrain.flag)
+        self.collect_flag = False if self.baseline_mode else bool(self.config.retrain.flag)
         self.retrain_flag = False
         self.pending_training_decision: TrainingDecision | None = None
         self.edge_session_id = uuid.uuid4().hex
@@ -533,26 +622,31 @@ class EdgeWorker:
         )
         self._pending_sample_stats_lock = threading.Lock()
         self._pending_sample_stats = SampleStatsDelta(total_samples=0)
-        self.sample_writer = AsyncSampleWriter(
-            self.sample_store,
-            on_done=self._on_sample_write_done,
-        )
-        self.sample_collector = AsyncSampleCollector(
-            self._collect_data_from_job,
-            maxsize=int(getattr(config, "local_queue_maxsize", 0) or 0),
-        )
+        self.sample_writer = None
+        self.sample_collector = None
+        if not self.baseline_mode:
+            self.sample_writer = AsyncSampleWriter(
+                self.sample_store,
+                on_done=self._on_sample_write_done,
+            )
+            self.sample_collector = AsyncSampleCollector(
+                self._collect_data_from_job,
+                maxsize=int(getattr(config, "local_queue_maxsize", 0) or 0),
+            )
         self.model_id = getattr(self.small_object_detection, "model_name", "edge-model")
         self.model_version = "0"
         self.front_version = "0"
-        self.sample_syncer = HighQualitySampleSyncer(
-            self.sample_store,
-            server_ip=self.config.server_ip,
-            edge_id=self.edge_id,
-            sample_pool_config=getattr(self.config, "sample_pool", None),
-            feature_upload_config=getattr(self.config, "feature_upload", None),
-            context_provider=self._sample_sync_context,
-            log_internal_ids=self.log_internal_ids,
-        )
+        self.sample_syncer = None
+        if not self.baseline_mode:
+            self.sample_syncer = HighQualitySampleSyncer(
+                self.sample_store,
+                server_ip=self.config.server_ip,
+                edge_id=self.edge_id,
+                sample_pool_config=getattr(self.config, "sample_pool", None),
+                feature_upload_config=getattr(self.config, "feature_upload", None),
+                context_provider=self._sample_sync_context,
+                log_internal_ids=self.log_internal_ids,
+            )
         self.bundle_cache_path = os.path.join(self.config.retrain.cache_path, "server_bundle")
         self.min_low_quality_samples = int(
             getattr(
@@ -568,7 +662,12 @@ class EdgeWorker:
         self.bandwidth_probe_size_bytes = self._resolve_bandwidth_probe_size(config)
 
         sl_cfg = getattr(config, "split_learning", None)
-        self.split_learning_enabled = bool(getattr(sl_cfg, "enabled", False)) if sl_cfg else False
+        if self.baseline_mode and self.baseline_split_runtime_policy == "disabled":
+            self.split_learning_enabled = False
+        else:
+            self.split_learning_enabled = (
+                bool(getattr(sl_cfg, "enabled", False)) if sl_cfg else False
+            )
         self.split_learning_disable_reason: str | None = None
         self.universal_split_enabled = False
         self.universal_splitter: UniversalModelSplitter | None = None
@@ -577,7 +676,15 @@ class EdgeWorker:
         self._fixed_split_init_lock = threading.Lock()
         self.split_trace_image_size: tuple[int, int] | None = None
         if not self.split_learning_enabled:
-            self.split_learning_disable_reason = "disabled_in_config"
+            self.split_learning_disable_reason = (
+                "baseline_split_runtime_disabled"
+                if self.baseline_mode and self.baseline_split_runtime_policy == "disabled"
+                else "disabled_in_config"
+            )
+        if self.baseline_mode:
+            self.collect_flag = False
+            self.resource_trigger_enabled = False
+            self.resource_trigger = None
         if self.collect_flag and not self.split_learning_enabled:
             self.collect_flag = False
             self._log_split_collection_disabled()
@@ -594,7 +701,8 @@ class EdgeWorker:
                 daemon=True,
             )
             self.resource_probe_processor.start()
-        self.sample_syncer.start()
+        if self.sample_syncer is not None:
+            self.sample_syncer.start()
 
         self.diff_processor = threading.Thread(target=self.diff_worker, daemon=False)
         self.local_processor = threading.Thread(target=self.local_worker, daemon=False)
@@ -608,6 +716,9 @@ class EdgeWorker:
         frame=None,
         image_size: tuple[int, int] | None = None,
     ) -> None:
+        if getattr(self, "baseline_mode", False):
+            self._init_baseline_split_runtime(frame, image_size)
+            return
         sl_cfg = getattr(self.config, "split_learning", None)
         fixed_split_cfg = getattr(sl_cfg, "fixed_split", None) if sl_cfg else None
         self._fixed_split_init_attempted = True
@@ -714,6 +825,97 @@ class EdgeWorker:
             self.split_learning_disable_reason = str(exc)
             self.split_learning_enabled = False
             self._reset_split_runtime_state()
+
+    def _init_baseline_split_runtime(
+        self,
+        frame=None,
+        image_size: tuple[int, int] | None = None,
+    ) -> None:
+        self._fixed_split_init_attempted = True
+        policy = str(getattr(self, "baseline_split_runtime_policy", "disabled") or "disabled")
+        if policy == "disabled":
+            self.split_learning_enabled = False
+            self.split_learning_disable_reason = "baseline_split_runtime_disabled"
+            logger.info(
+                "[BaselineEdge] split_runtime_policy=disabled; fixed-split runtime skipped."
+            )
+            return
+        if policy != "replay_only":
+            raise RuntimeError(f"Unsupported baseline split_runtime_policy: {policy!r}")
+
+        cache_path = os.path.join(self.config.retrain.cache_path, "fixed_split_plan.json")
+        plan = load_split_plan(cache_path)
+        if plan is None:
+            raise RuntimeError(
+                "baseline.edge.split_runtime_policy=replay_only requires an existing "
+                f"fixed split plan at {cache_path}; candidate solving is disabled"
+            )
+        if str(plan.plan_version or "") != FIXED_SPLIT_PLAN_VERSION:
+            raise RuntimeError(
+                "baseline edge replay_only found unsupported fixed split plan version "
+                f"{plan.plan_version!r}; expected {FIXED_SPLIT_PLAN_VERSION!r}"
+            )
+
+        split_model = self.small_object_detection.get_split_runtime_model()
+        device = next(split_model.parameters()).device
+        self.universal_splitter = UniversalModelSplitter(device=device)
+        self.universal_splitter.trainability_loss_fn = build_split_training_loss(
+            self.small_object_detection.model
+        )
+        if frame is not None:
+            trace_image_size = tuple(int(value) for value in frame.shape[:2])
+            sample_input = self.small_object_detection.prepare_splitter_input(frame)
+        else:
+            trace_image_size = image_size or tuple(plan.input_tensor_shape[-2:] or (224, 224))
+            sample_input = self.small_object_detection.build_split_sample_input(
+                tuple(int(value) for value in trace_image_size)
+            )
+        boundary = str(plan.logical_split_id or plan.canonical_split_key)
+        trace_batch_size = _first_tensor_batch_size(sample_input) or 1
+        spec = make_split_spec(
+            boundary,
+            dynamic_batch=tuple(plan.dynamic_batch) if plan.dynamic_batch else (1, 64),
+            trainable=False,
+            trace_batch_mode="batch_gt1" if trace_batch_size > 1 else "batch_1",
+            mode="generated_eager",
+        )
+        _validate_baseline_replay_plan_runtime(
+            plan,
+            model_id=self.model_id,
+            sample_input=sample_input,
+        )
+        runtime = prepare_split_replay_runtime(
+            split_model,
+            sample_input,
+            spec,
+            mode=spec.mode,
+        )
+        _validate_baseline_replay_plan_runtime(
+            plan,
+            model_id=self.model_id,
+            sample_input=sample_input,
+            runtime=runtime,
+        )
+        self.universal_splitter.bind_runtime(runtime, model=split_model, split_spec=spec)
+        self.fixed_split_plan = plan
+        self.universal_split_enabled = True
+        self.split_learning_enabled = True
+        self.collect_flag = False
+        self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
+        logger.info(
+            "[BaselineEdge] split_runtime_policy=replay_only; loaded existing fixed split "
+            "replay plan."
+        )
+        log_diagnostic_debug(
+            self,
+            "[BaselineEdge] replay-only fixed split diagnostics",
+            lambda: {
+                "split_config_id": plan.split_config_id,
+                "split": boundary,
+                "cache_path": cache_path,
+            },
+            runtime=True,
+        )
 
     def _warmup_fixed_split_runtime(self, sample_input) -> None:
         sl_cfg = getattr(self.config, "split_learning", None)

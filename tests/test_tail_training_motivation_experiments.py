@@ -53,9 +53,8 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
     model = CountingModel()
     inputs = torch.randn(2, 4)
     targets = torch.zeros(2, 1)
-    _patch_raw_batches(monkeypatch, inputs, targets)
     suffix_names = ("head.weight", "head.bias")
-    _suffix_names, suffix_params = fm.configure_raw_freeze_training(
+    _suffix_names, suffix_params = exp._configure_raw_freeze_eval_forward_training(
         model,
         suffix_names,
     )
@@ -69,16 +68,12 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
         ),
     )
 
-    fm.run_raw_freeze_training(
-        model=model,
-        suffix_param_names=suffix_names,
-        samples=[object(), object(), object(), object()],
-        batch_size=2,
-        epochs=2,
-        device=torch.device("cpu"),
-        loss_fn=lambda outputs, batch_targets: ((outputs - batch_targets) ** 2).mean(),
-        optimizer=optimizer,
-    )
+    for _epoch in range(2):
+        for _batch in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            loss = ((model(inputs) - targets) ** 2).mean()
+            loss.backward()
+            optimizer.step()
 
     assert model.forward_calls == 4
     assert _suffix_names == suffix_names
@@ -87,7 +82,7 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
 def test_raw_freeze_can_use_torchlens_suffix_names() -> None:
     model = CountingModel()
 
-    suffix_names, suffix_params = fm.configure_raw_freeze_training(
+    suffix_names, suffix_params = exp._configure_raw_freeze_eval_forward_training(
         model,
         ("head.weight", "head.bias"),
     )
@@ -145,7 +140,7 @@ def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
     assert split_model.suffix_dropout.training
 
     raw_model = BatchNormPolicyModel()
-    fm.configure_raw_freeze_training(
+    exp._configure_raw_freeze_eval_forward_training(
         raw_model,
         suffix_names,
     )

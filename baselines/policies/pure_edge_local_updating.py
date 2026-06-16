@@ -18,7 +18,7 @@ class PureEdgeLocalUpdatingPolicy(BaseBaselinePolicy):
 
     @property
     def training_strategy(self) -> str:
-        return "raw_freeze"
+        return "freeze"
 
     def decide_frame(self, *, frame_id: int, is_keyframe: bool) -> BaselineFrameDecision:
         del frame_id, is_keyframe

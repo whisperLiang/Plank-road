@@ -249,7 +249,8 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     reuse_plank_road_frame_filter: bool = True
     upload_keyframes_only: bool = True
     trigger_on_cloud_comparison: bool = True
-    training_strategy: str = "raw_freeze"
+    training_strategy: str = "freeze"
+    training_failure_backoff_sec: float = 30.0
     return_model_update: bool = True
 
 
@@ -259,9 +260,17 @@ class EkyaStyleBaselineConfig(ConfigSection):
     use_frame_filter: bool = False
     cloud_inference: bool = True
     return_cloud_inference_to_edge: bool = True
-    training_strategy: str = "raw_freeze"
+    training_strategy: str = "freeze"
     display_source: str = "cloud"
     enable_micro_profiling: bool = True
+
+
+@dataclass
+class BaselineEdgeConfig(ConfigSection):
+    split_runtime_policy: str = "disabled"
+
+    def __post_init__(self) -> None:
+        self.split_runtime_policy = str(self.split_runtime_policy or "disabled").strip().lower()
 
 
 @dataclass
@@ -286,6 +295,7 @@ class BaselineConfig(ConfigSection):
     method: str = "accuracy_trigger_cloud_retraining"
     run_id: str | None = None
     results_root: str = "results/baselines_distributed"
+    edge: BaselineEdgeConfig = field(default_factory=BaselineEdgeConfig)
     training: BaselineTrainingConfig = field(default_factory=BaselineTrainingConfig)
     pure_edge_local_updating: PureEdgeBaselineConfig = field(default_factory=PureEdgeBaselineConfig)
     accuracy_trigger_cloud_retraining: AccuracyTriggerBaselineConfig = field(
@@ -506,6 +516,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["gpu_lease"] = _section(GpuLeaseConfig, known.get("gpu_lease"))
         known["worker"] = _section(WorkerServiceConfig, known.get("worker"))
     elif section_cls is BaselineConfig:
+        known["edge"] = _section(
+            BaselineEdgeConfig,
+            known.get("edge"),
+        )
         known["training"] = _section(
             BaselineTrainingConfig,
             known.get("training"),
@@ -693,21 +707,31 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         )
     if bool(pure_edge.use_cloud_teacher):
         raise ValueError("baseline.pure_edge_local_updating.use_cloud_teacher must remain false")
-    allowed_baseline_training = {"raw_freeze", "freeze"}
+    edge_policy = str(config.baseline.edge.split_runtime_policy or "").strip().lower()
+    if edge_policy not in {"disabled", "replay_only"}:
+        raise ValueError(
+            "baseline.edge.split_runtime_policy must be disabled or replay_only"
+        )
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec",
+        float(config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec),
+        allow_zero=True,
+    )
+    allowed_baseline_training = {"freeze"}
     accuracy_strategy = str(
         config.baseline.accuracy_trigger_cloud_retraining.training_strategy or ""
     ).strip()
     if accuracy_strategy not in allowed_baseline_training:
         raise ValueError(
             "baseline.accuracy_trigger_cloud_retraining.training_strategy must be "
-            "raw_freeze or freeze"
+            "freeze"
         )
     ekya = config.baseline.ekya_style_centralized_scheduling
     ekya_strategy = str(ekya.training_strategy or "").strip()
     if ekya_strategy not in allowed_baseline_training:
         raise ValueError(
             "baseline.ekya_style_centralized_scheduling.training_strategy must be "
-            "raw_freeze or freeze"
+            "freeze"
         )
     if str(getattr(ekya, "display_source", "cloud") or "cloud").strip() not in {
         "cloud",
