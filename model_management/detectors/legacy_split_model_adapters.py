@@ -1910,12 +1910,25 @@ def _infer_split_resize_mode(targets: Any) -> str:
 
 def _assert_original_xyxy_targets(targets: dict[str, Any]) -> None:
     coordinate_space = str(targets.get("label_coordinate_space") or "").strip()
-    has_targets = bool(targets.get("boxes") or targets.get("labels"))
+    has_targets = _has_target_values(targets.get("boxes")) or _has_target_values(
+        targets.get("labels")
+    )
     if coordinate_space != ORIGINAL_XYXY and (coordinate_space or has_targets):
         raise RuntimeError(
             "Split training targets must use original_xyxy canonical labels before "
             "model-specific loss conversion."
         )
+
+
+def _has_target_values(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        return int(value.numel()) > 0
+    try:
+        return len(value) > 0
+    except TypeError:
+        return True
 
 
 def _infer_ultralytics_image_sizes(targets: Any) -> tuple[tuple[int, int], tuple[int, int]]:

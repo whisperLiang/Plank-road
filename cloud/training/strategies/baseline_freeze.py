@@ -300,10 +300,18 @@ def _target_to_training_dict(
     input_resize_mode: str,
     device: torch.device,
 ) -> dict[str, Any]:
-    boxes = torch.as_tensor(target.get("boxes", []) or [], dtype=torch.float32, device=device)
+    boxes = torch.as_tensor(
+        _target_value_or_empty(target, "boxes"),
+        dtype=torch.float32,
+        device=device,
+    )
     if boxes.ndim == 1:
         boxes = boxes.reshape((-1, 4)) if boxes.numel() else boxes.reshape((0, 4))
-    labels = torch.as_tensor(target.get("labels", []) or [], dtype=torch.int64, device=device)
+    labels = torch.as_tensor(
+        _target_value_or_empty(target, "labels"),
+        dtype=torch.int64,
+        device=device,
+    )
     if labels.ndim == 0:
         labels = labels.reshape((1,))
     if labels.numel() != boxes.shape[0]:
@@ -334,11 +342,16 @@ def _target_to_training_dict(
     }
     if "scores" in target:
         result["scores"] = torch.as_tensor(
-            target.get("scores") or [],
+            _target_value_or_empty(target, "scores"),
             dtype=torch.float32,
             device=device,
         )
     return result
+
+
+def _target_value_or_empty(target: Mapping[str, Any], key: str) -> Any:
+    value = target.get(key)
+    return [] if value is None else value
 
 
 def _prepare_split_adapter_batch(

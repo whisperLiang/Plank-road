@@ -28,6 +28,8 @@ from cloud.training.parameter_freeze import (
 from cloud.training.strategies.baseline_freeze import CloudBaselineFreezeTrainingStrategy
 from grpc_server import message_transmission_pb2
 from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED, TrainingJobManager
+from model_management.detection_box_projection import ORIGINAL_XYXY
+from model_management.detectors import legacy_split_model_adapters as split_adapters
 
 
 def test_baseline_bundle_is_raw_frame_protocol_without_split_artifacts() -> None:
@@ -270,6 +272,46 @@ def test_freeze_training_uses_wrapper_preprocess_resize_metadata(monkeypatch) ->
         "letterbox",
     ]
     assert prepared.targets[0]["_split_meta"]["input_tensor_shape"] == [2, 3, 16, 32]
+
+
+def test_freeze_training_target_conversion_accepts_tensor_values() -> None:
+    target = {
+        "boxes": torch.tensor([[1.0, 1.0, 4.0, 4.0]]),
+        "labels": torch.tensor([1]),
+        "scores": torch.tensor([0.9]),
+    }
+
+    converted = freeze_strategy_module._target_to_training_dict(
+        target,
+        frame_id=7,
+        original_image_size=(10, 12),
+        model_input_size=(16, 32),
+        input_tensor_shape=[1, 3, 16, 32],
+        input_resize_mode="letterbox",
+        device=torch.device("cpu"),
+    )
+
+    assert tuple(converted["boxes"].shape) == (1, 4)
+    assert converted["labels"].tolist() == [1]
+    assert converted["scores"].tolist() == pytest.approx([0.9])
+
+
+def test_legacy_split_target_guard_accepts_tensor_targets() -> None:
+    target = {
+        "boxes": torch.tensor([[1.0, 1.0, 4.0, 4.0]]),
+        "labels": torch.tensor([1]),
+        "label_coordinate_space": ORIGINAL_XYXY,
+    }
+
+    split_adapters._assert_original_xyxy_targets(target)
+
+    with pytest.raises(RuntimeError, match="original_xyxy canonical labels"):
+        split_adapters._assert_original_xyxy_targets(
+            {
+                "boxes": torch.tensor([[1.0, 1.0, 4.0, 4.0]]),
+                "labels": torch.tensor([1]),
+            }
+        )
 
 
 def test_freeze_strategy_has_no_torchlens_runtime_factory() -> None:
