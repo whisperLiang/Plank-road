@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any
 
 import torch
-from ultralytics.models.utils.loss import RTDETRDetectionLoss
 
 from model_management.detection_box_projection import (
     ORIGINAL_XYXY,

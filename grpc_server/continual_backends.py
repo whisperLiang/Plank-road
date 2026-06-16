@@ -399,6 +399,10 @@ class EdgeWorkerRoutedContinualLearningBackend:
         self._submitted_jobs: dict[tuple[int, str], _SubmitRequestSnapshot] = {}
         self._exclusive_retries: dict[tuple[int, str], str] = {}
 
+    def close(self) -> None:
+        self._submitted_jobs.clear()
+        self._exclusive_retries.clear()
+
     def _client(self, edge_id: int):
         if self.edge_registry is not None:
             self.edge_registry.touch(int(edge_id))

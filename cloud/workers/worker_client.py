@@ -3,11 +3,23 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict
+from json import JSONDecodeError
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 from cloud.workers.gpu_lease_manager import LeaseRequest
-from cloud.workers.worker_protocol import decode_bytes, encode_bytes, open_direct, post_json
+from cloud.workers.worker_protocol import (
+    WORKER_PORT_CONFLICT,
+    WORKER_REQUEST_TIMEOUT,
+    WORKER_RPC_UNAVAILABLE,
+    JsonRpcError,
+    WorkerHealth,
+    decode_bytes,
+    encode_bytes,
+    open_direct,
+    post_json,
+)
 from grpc_server import message_transmission_pb2
 
 
@@ -16,21 +28,54 @@ class EdgeWorkerClient:
         self.endpoint = str(endpoint)
         self.timeout_sec = float(timeout_sec)
 
-    def health(self, *, expected_worker_id: str = "") -> bool:
+    def get_health(self) -> WorkerHealth:
         try:
             with open_direct(
                 Request(f"http://{self.endpoint}/health"),
                 timeout=min(5.0, self.timeout_sec),
             ) as response:
                 if response.status != 200:
-                    return False
+                    raise JsonRpcError(
+                        f"worker health returned HTTP {response.status}",
+                        error_type=WORKER_RPC_UNAVAILABLE,
+                        status=int(response.status),
+                    )
                 payload = json.loads(response.read().decode("utf-8") or "{}")
-                if expected_worker_id and str(payload.get("worker_id", "")) != str(
-                    expected_worker_id
-                ):
-                    return False
-                return bool(payload.get("ok", True))
-        except Exception:
+                return WorkerHealth.from_payload(dict(payload or {}))
+        except HTTPError as exc:
+            raise JsonRpcError(
+                f"worker health returned HTTP {exc.code}",
+                error_type=WORKER_RPC_UNAVAILABLE,
+                status=int(exc.code),
+            ) from exc
+        except (JSONDecodeError, TypeError, ValueError) as exc:
+            raise JsonRpcError(
+                f"invalid worker health response: {exc}",
+                error_type=WORKER_RPC_UNAVAILABLE,
+            ) from exc
+        except (TimeoutError, URLError) as exc:
+            raise JsonRpcError(
+                str(exc),
+                error_type=_classify_transport_error(exc),
+            ) from exc
+
+    def health(
+        self,
+        *,
+        expected_worker_id: str = "",
+        expected_run_id: str = "",
+        expected_lease_address: str = "",
+    ) -> bool:
+        try:
+            health = self.get_health()
+            if expected_worker_id and health.worker_id != str(expected_worker_id):
+                return False
+            if expected_run_id and health.run_id != str(expected_run_id):
+                return False
+            if expected_lease_address and health.lease_address != str(expected_lease_address):
+                return False
+            return bool(health.ok and health.state == "READY")
+        except JsonRpcError:
             return False
 
     def sync_samples(self, request) -> message_transmission_pb2.SampleSyncReply:
@@ -162,6 +207,14 @@ class EdgeWorkerClient:
             message=str(result.get("message", "")),
         )
 
+    def shutdown(self) -> dict[str, Any]:
+        return post_json(
+            self.endpoint,
+            "/shutdown",
+            {},
+            timeout=min(5.0, self.timeout_sec),
+        )
+
 
 class GpuLeaseHttpClient:
     def __init__(
@@ -268,3 +321,14 @@ class GpuLeaseHandle:
 
 def decode_payload_zip(payload: dict[str, Any]) -> bytes:
     return decode_bytes(payload.get("payload_zip"))
+
+
+def _classify_transport_error(exc: BaseException) -> str:
+    text = str(exc).lower()
+    reason = getattr(exc, "reason", None)
+    errno_value = getattr(reason, "errno", None)
+    if errno_value == 98 or "address already in use" in text:
+        return WORKER_PORT_CONFLICT
+    if isinstance(exc, TimeoutError) or "timed out" in text or "timeout" in text:
+        return WORKER_REQUEST_TIMEOUT
+    return WORKER_RPC_UNAVAILABLE

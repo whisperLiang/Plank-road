@@ -60,6 +60,8 @@ class CloudServer:
         self.worker_pool = None
         self.gpu_lease_manager = None
         self.gpu_lease_service = None
+        self.grpc_server = None
+        self._closing = False
         self.log_internal_ids = False
         if self.mode == "baseline":
             method = validate_baseline_method(
@@ -206,6 +208,7 @@ class CloudServer:
             futures.ThreadPoolExecutor(max_workers=grpc_max_workers),
             options=grpc_message_options(),
         )
+        self.grpc_server = server
         message_transmission_pb2_grpc.add_MessageTransmissionServicer_to_server(
             MessageTransmissionServicer(
                 id=self.server_id,
@@ -228,12 +231,29 @@ class CloudServer:
         try:
             server.wait_for_termination()
         finally:
-            if self.worker_pool is not None:
-                self.worker_pool.close()
-            if self.gpu_lease_service is not None:
-                self.gpu_lease_service.shutdown()
-            if self.gpu_lease_manager is not None:
-                self.gpu_lease_manager.close()
+            self.close()
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        if self.grpc_server is not None:
+            self.grpc_server.stop(0)
+            self.grpc_server = None
+        if self.baseline_controller is not None:
+            self.baseline_controller.close()
+        close_backend = getattr(self.continual_backend, "close", None)
+        if callable(close_backend):
+            close_backend()
+        if self.worker_pool is not None:
+            self.worker_pool.close()
+        if self.gpu_lease_service is not None:
+            self.gpu_lease_service.shutdown()
+        if self.gpu_lease_manager is not None:
+            self.gpu_lease_manager.close()
+        training_job_manager = getattr(self, "training_job_manager", None)
+        if training_job_manager is not None:
+            training_job_manager.close()
 
 
 def _baseline_cloud_inference_adapter(detector):

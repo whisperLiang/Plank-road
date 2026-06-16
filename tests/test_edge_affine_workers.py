@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,11 +9,23 @@ from types import SimpleNamespace
 import pytest
 
 from cloud.workers.assignment_store import EdgeAssignment, EdgeAssignmentStore
-from cloud.workers.edge_worker_pool import EdgeWorkerPool
+from cloud.workers.edge_worker_pool import (
+    EdgeWorkerPool,
+    WorkerPoolClosingError,
+    WorkerStartupError,
+)
 from cloud.workers.gpu_lease_manager import GpuLeaseManager, LeaseRequest
 from cloud.workers.lease_service import GpuLeaseService
 from cloud.workers.mps_runtime import MpsEnvironment
 from cloud.workers.worker_client import EdgeWorkerClient, GpuLeaseHttpClient
+from cloud.workers.worker_protocol import (
+    WORKER_NOT_READY,
+    WORKER_RPC_UNAVAILABLE,
+    JsonRpcError,
+    JsonRpcServer,
+    WorkerHealth,
+    post_json,
+)
 from config import load_runtime_config
 from grpc_server import message_transmission_pb2
 from grpc_server.continual_backends import EdgeWorkerRoutedContinualLearningBackend
@@ -22,6 +35,64 @@ def test_edge_worker_module_imports() -> None:
     import cloud.workers.edge_worker as edge_worker
 
     assert edge_worker.EdgeWorkerService is not None
+
+
+def test_edge_worker_health_is_available_before_service_ready(monkeypatch) -> None:
+    from cloud.workers.edge_worker import EdgeWorkerServiceManager
+
+    init_can_finish = threading.Event()
+
+    class FakeService:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            init_can_finish.wait(timeout=2.0)
+
+        def close(self) -> None:
+            pass
+
+        def sync_samples(self, payload):
+            del payload
+            return {"success": True, "message": "ok", "committed_samples": 0}
+
+    monkeypatch.setattr("cloud.workers.edge_worker.EdgeWorkerService", FakeService)
+    manager = EdgeWorkerServiceManager(
+        edge_id=1,
+        worker_id="edge_1",
+        run_id="run-a",
+        yaml_path="./config/config.yaml",
+        workspace_root="/tmp/edge_1",
+        lease_address="127.0.0.1:55999",
+    )
+    server = JsonRpcServer(
+        listen_address="127.0.0.1:0",
+        routes=manager.routes(),
+        health_provider=manager.health,
+        health_payload={"edge_id": 1, "worker_id": "edge_1"},
+    )
+    manager.set_shutdown_callback(server.shutdown)
+    server.start()
+    try:
+        manager.start()
+        health = EdgeWorkerClient(server.listen_address, timeout_sec=1).get_health()
+        assert health.state == "STARTING"
+        assert health.ok is False
+        with pytest.raises(JsonRpcError) as exc_info:
+            post_json(server.listen_address, "/sync_samples", {}, timeout=1)
+        assert exc_info.value.error_type == WORKER_NOT_READY
+
+        init_can_finish.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            health = EdgeWorkerClient(server.listen_address, timeout_sec=1).get_health()
+            if health.state == "READY":
+                break
+            time.sleep(0.01)
+        assert health.state == "READY"
+        assert health.ok is True
+    finally:
+        init_can_finish.set()
+        manager.close()
+        server.shutdown()
 
 
 def test_assignment_store_sticky_and_isolated(tmp_path: Path) -> None:
@@ -132,9 +203,15 @@ def test_worker_pool_health_rejects_wrong_worker_id(monkeypatch, tmp_path: Path)
             captured["endpoint"] = endpoint
             captured["timeout_sec"] = str(timeout_sec)
 
-        def health(self, *, expected_worker_id: str = "") -> bool:
-            captured["expected_worker_id"] = expected_worker_id
-            return expected_worker_id == "edge_1"
+        def get_health(self) -> WorkerHealth:
+            return WorkerHealth(
+                ok=True,
+                state="READY",
+                edge_id=1,
+                worker_id="edge_1",
+                run_id="run-a",
+                lease_address="127.0.0.1:55999",
+            )
 
     monkeypatch.setattr("cloud.workers.edge_worker_pool.EdgeWorkerClient", FakeClient)
     pool = EdgeWorkerPool(
@@ -174,6 +251,510 @@ def test_worker_pool_health_rejects_wrong_worker_id(monkeypatch, tmp_path: Path)
         )
     )
     assert captured["endpoint"] == "127.0.0.1:56000"
+    assert captured["timeout_sec"] == "2.0"
+
+
+def test_worker_pool_reallocates_port_for_stale_worker_health(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {"started": []}
+
+    class FakeClient:
+        def __init__(self, endpoint: str, *, timeout_sec: float) -> None:
+            del timeout_sec
+            self.endpoint = endpoint
+
+        def get_health(self) -> WorkerHealth:
+            if self.endpoint != "127.0.0.1:56001":
+                raise JsonRpcError(
+                    "connection refused",
+                    error_type=WORKER_RPC_UNAVAILABLE,
+                )
+            return WorkerHealth(
+                ok=True,
+                state="READY",
+                edge_id=1,
+                worker_id="edge_1",
+                run_id="run-a",
+                lease_address="127.0.0.1:55999",
+            )
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    def fake_port_available(host: str, port: int) -> bool:
+        del host
+        return port != 56000
+
+    def fake_popen(cmd, cwd, env):
+        del cwd, env
+        captured["started"].append(cmd)
+        return FakeProcess()
+
+    monkeypatch.setattr("cloud.workers.edge_worker_pool.EdgeWorkerClient", FakeClient)
+    monkeypatch.setattr("cloud.workers.edge_worker_pool._port_available", fake_port_available)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    store = EdgeAssignmentStore(
+        tmp_path / "assignments.json",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        worker_workspace_root=tmp_path / "workers",
+    )
+    store.assign(edge_id=1, endpoint="127.0.0.1:56000")
+    pool = EdgeWorkerPool(
+        yaml_path="./config/config.yaml",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        assignment_store=store,
+        edge_workers_config=SimpleNamespace(
+            worker_base_port=56000,
+            workspace_root=str(tmp_path / "workers"),
+            lazy_cuda_init=True,
+        ),
+        worker_service_config=SimpleNamespace(request_timeout_sec=1, startup_timeout_sec=1),
+        mps_env=MpsEnvironment("0", "/tmp/mps", "/tmp/mps-log", "50"),
+        lease_address="127.0.0.1:55999",
+    )
+
+    assignment = pool.ensure_worker(1)
+
+    assert assignment.endpoint == "127.0.0.1:56001"
+    assert len(captured["started"]) == 1
+    assert "--run_id" in captured["started"][0]
+
+
+def test_worker_pool_does_not_spawn_over_matching_untracked_worker(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self, endpoint: str, *, timeout_sec: float) -> None:
+            del endpoint, timeout_sec
+
+        def get_health(self) -> WorkerHealth:
+            return WorkerHealth(
+                ok=True,
+                state="READY",
+                edge_id=1,
+                worker_id="edge_1",
+                run_id="run-a",
+                lease_address="127.0.0.1:55999",
+            )
+
+    def fail_popen(*_args, **_kwargs):
+        raise AssertionError("matching healthy worker should not be respawned")
+
+    monkeypatch.setattr("cloud.workers.edge_worker_pool.EdgeWorkerClient", FakeClient)
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+    store = EdgeAssignmentStore(
+        tmp_path / "assignments.json",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        worker_workspace_root=tmp_path / "workers",
+    )
+    store.assign(edge_id=1, endpoint="127.0.0.1:56000")
+    pool = EdgeWorkerPool(
+        yaml_path="./config/config.yaml",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        assignment_store=store,
+        edge_workers_config=SimpleNamespace(
+            worker_base_port=56000,
+            workspace_root=str(tmp_path / "workers"),
+            lazy_cuda_init=True,
+        ),
+        worker_service_config=SimpleNamespace(request_timeout_sec=1, startup_timeout_sec=1),
+        mps_env=MpsEnvironment("0", "/tmp/mps", "/tmp/mps-log", "50"),
+        lease_address="127.0.0.1:55999",
+    )
+
+    assignment = pool.ensure_worker(1)
+
+    assert assignment.endpoint == "127.0.0.1:56000"
+
+
+def test_worker_pool_serializes_failed_worker_replacement(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {"started": []}
+
+    class FakeClient:
+        def __init__(self, endpoint: str, *, timeout_sec: float) -> None:
+            del timeout_sec
+            self.endpoint = endpoint
+
+        def get_health(self) -> WorkerHealth:
+            if self.endpoint == "127.0.0.1:56000":
+                return WorkerHealth(
+                    ok=False,
+                    state="FAILED",
+                    edge_id=1,
+                    worker_id="edge_1",
+                    run_id="run-a",
+                    lease_address="127.0.0.1:55999",
+                    message="startup failed",
+                )
+            return WorkerHealth(
+                ok=True,
+                state="READY",
+                edge_id=1,
+                worker_id="edge_1",
+                run_id="run-a",
+                lease_address="127.0.0.1:55999",
+            )
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def poll(self):
+            return 0 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            del timeout
+            self.terminated = True
+            return 0
+
+        def kill(self):
+            self.terminated = True
+
+    def fake_stop(process, *, timeout: float) -> None:
+        del timeout
+        time.sleep(0.05)
+        process.terminated = True
+
+    def fake_popen(cmd, cwd, env):
+        del cwd, env
+        captured["started"].append(cmd)
+        return FakeProcess()
+
+    monkeypatch.setattr("cloud.workers.edge_worker_pool.EdgeWorkerClient", FakeClient)
+    monkeypatch.setattr("cloud.workers.edge_worker_pool._port_available", lambda *_: True)
+    monkeypatch.setattr(EdgeWorkerPool, "_stop_process", staticmethod(fake_stop))
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    store = EdgeAssignmentStore(
+        tmp_path / "assignments.json",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        worker_workspace_root=tmp_path / "workers",
+    )
+    store.assign(edge_id=1, endpoint="127.0.0.1:56000")
+    pool = EdgeWorkerPool(
+        yaml_path="./config/config.yaml",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        assignment_store=store,
+        edge_workers_config=SimpleNamespace(
+            worker_base_port=56000,
+            workspace_root=str(tmp_path / "workers"),
+            lazy_cuda_init=True,
+        ),
+        worker_service_config=SimpleNamespace(request_timeout_sec=1, startup_timeout_sec=1),
+        mps_env=MpsEnvironment("0", "/tmp/mps", "/tmp/mps-log", "50"),
+        lease_address="127.0.0.1:55999",
+    )
+    pool._processes[1] = FakeProcess()
+    start = threading.Event()
+    assignments: list[str] = []
+
+    def ensure() -> None:
+        start.wait(timeout=1.0)
+        assignments.append(pool.ensure_worker(1).endpoint)
+
+    threads = [threading.Thread(target=ensure) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    start.set()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert assignments == ["127.0.0.1:56001", "127.0.0.1:56001"]
+    assert len(captured["started"]) == 1
+
+
+def test_worker_pool_waits_for_alive_starting_worker_without_respawn(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls = {"health": 0}
+
+    class FakeClient:
+        def __init__(self, endpoint: str, *, timeout_sec: float) -> None:
+            del endpoint, timeout_sec
+
+        def get_health(self) -> WorkerHealth:
+            calls["health"] += 1
+            if calls["health"] < 3:
+                return WorkerHealth(
+                    ok=False,
+                    state="STARTING",
+                    edge_id=1,
+                    worker_id="edge_1",
+                    run_id="run-a",
+                    lease_address="127.0.0.1:55999",
+                )
+            return WorkerHealth(
+                ok=True,
+                state="READY",
+                edge_id=1,
+                worker_id="edge_1",
+                run_id="run-a",
+                lease_address="127.0.0.1:55999",
+            )
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    def fail_popen(*_args, **_kwargs):
+        raise AssertionError("alive STARTING worker should not be respawned")
+
+    monkeypatch.setattr("cloud.workers.edge_worker_pool.EdgeWorkerClient", FakeClient)
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+    store = EdgeAssignmentStore(
+        tmp_path / "assignments.json",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        worker_workspace_root=tmp_path / "workers",
+    )
+    store.assign(edge_id=1, endpoint="127.0.0.1:56000")
+    pool = EdgeWorkerPool(
+        yaml_path="./config/config.yaml",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        assignment_store=store,
+        edge_workers_config=SimpleNamespace(
+            worker_base_port=56000,
+            workspace_root=str(tmp_path / "workers"),
+            lazy_cuda_init=True,
+        ),
+        worker_service_config=SimpleNamespace(
+            request_timeout_sec=1,
+            startup_timeout_sec=1,
+        ),
+        mps_env=MpsEnvironment("0", "/tmp/mps", "/tmp/mps-log", "50"),
+        lease_address="127.0.0.1:55999",
+    )
+    pool._processes[1] = FakeProcess()
+
+    assignment = pool.ensure_worker(1)
+
+    assert assignment.endpoint == "127.0.0.1:56000"
+    assert calls["health"] >= 3
+
+
+def test_worker_pool_startup_timeout_stops_alive_worker(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self, endpoint: str, *, timeout_sec: float) -> None:
+            del endpoint, timeout_sec
+
+        def get_health(self) -> WorkerHealth:
+            return WorkerHealth(
+                ok=False,
+                state="STARTING",
+                edge_id=1,
+                worker_id="edge_1",
+                run_id="run-a",
+                lease_address="127.0.0.1:55999",
+            )
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return 0 if self.terminated or self.killed else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            del timeout
+            return 0
+
+    monkeypatch.setattr("cloud.workers.edge_worker_pool.EdgeWorkerClient", FakeClient)
+    store = EdgeAssignmentStore(
+        tmp_path / "assignments.json",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        worker_workspace_root=tmp_path / "workers",
+    )
+    store.assign(edge_id=1, endpoint="127.0.0.1:56000")
+    pool = EdgeWorkerPool(
+        yaml_path="./config/config.yaml",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        assignment_store=store,
+        edge_workers_config=SimpleNamespace(
+            worker_base_port=56000,
+            workspace_root=str(tmp_path / "workers"),
+            lazy_cuda_init=True,
+        ),
+        worker_service_config=SimpleNamespace(
+            request_timeout_sec=1,
+            startup_timeout_sec=0.01,
+            startup_max_retries=0,
+        ),
+        mps_env=MpsEnvironment("0", "/tmp/mps", "/tmp/mps-log", "50"),
+        lease_address="127.0.0.1:55999",
+    )
+    process = FakeProcess()
+    pool._processes[1] = process
+
+    with pytest.raises(WorkerStartupError):
+        pool.ensure_worker(1)
+
+    assert process.terminated
+    assert pool._processes == {}
+
+
+def test_worker_pool_close_requests_shutdown_and_blocks_new_starts(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    shutdown_calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, endpoint: str, *, timeout_sec: float) -> None:
+            del timeout_sec
+            self.endpoint = endpoint
+
+        def shutdown(self):
+            shutdown_calls.append(self.endpoint)
+            return {"success": True}
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def poll(self):
+            return 0 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            if self.terminated:
+                return 0
+            raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+
+    monkeypatch.setattr("cloud.workers.edge_worker_pool.EdgeWorkerClient", FakeClient)
+    store = EdgeAssignmentStore(
+        tmp_path / "assignments.json",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        worker_workspace_root=tmp_path / "workers",
+    )
+    store.assign(edge_id=1, endpoint="127.0.0.1:56000")
+    pool = EdgeWorkerPool(
+        yaml_path="./config/config.yaml",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        assignment_store=store,
+        edge_workers_config=SimpleNamespace(
+            worker_base_port=56000,
+            workspace_root=str(tmp_path / "workers"),
+            lazy_cuda_init=True,
+        ),
+        worker_service_config=SimpleNamespace(request_timeout_sec=1, startup_timeout_sec=1),
+        mps_env=MpsEnvironment("0", "/tmp/mps", "/tmp/mps-log", "50"),
+        lease_address="127.0.0.1:55999",
+    )
+    process = FakeProcess()
+    pool._processes[1] = process
+
+    pool.close()
+
+    assert shutdown_calls == ["127.0.0.1:56000"]
+    assert process.terminated
+    with pytest.raises(WorkerPoolClosingError):
+        pool.ensure_worker(1)
+
+
+def test_worker_pool_restart_reallocates_occupied_untracked_endpoint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {"started": []}
+
+    class FakeClient:
+        def __init__(self, endpoint: str, *, timeout_sec: float) -> None:
+            del timeout_sec
+            self.endpoint = endpoint
+
+        def get_health(self) -> WorkerHealth:
+            if self.endpoint != "127.0.0.1:56001":
+                raise JsonRpcError(
+                    "connection refused",
+                    error_type=WORKER_RPC_UNAVAILABLE,
+                )
+            return WorkerHealth(
+                ok=True,
+                state="READY",
+                edge_id=1,
+                worker_id="edge_1",
+                run_id="run-a",
+                lease_address="127.0.0.1:55999",
+            )
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    def fake_port_available(host: str, port: int) -> bool:
+        del host
+        return port != 56000
+
+    def fake_popen(cmd, cwd, env):
+        del cwd, env
+        captured["started"].append(cmd)
+        return FakeProcess()
+
+    monkeypatch.setattr("cloud.workers.edge_worker_pool.EdgeWorkerClient", FakeClient)
+    monkeypatch.setattr("cloud.workers.edge_worker_pool._port_available", fake_port_available)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    store = EdgeAssignmentStore(
+        tmp_path / "assignments.json",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        worker_workspace_root=tmp_path / "workers",
+    )
+    store.assign(edge_id=1, endpoint="127.0.0.1:56000")
+    pool = EdgeWorkerPool(
+        yaml_path="./config/config.yaml",
+        run_id="run-a",
+        mode="edge_affine_single_gpu_mps",
+        assignment_store=store,
+        edge_workers_config=SimpleNamespace(
+            worker_base_port=56000,
+            workspace_root=str(tmp_path / "workers"),
+            lazy_cuda_init=True,
+        ),
+        worker_service_config=SimpleNamespace(request_timeout_sec=1, startup_timeout_sec=1),
+        mps_env=MpsEnvironment("0", "/tmp/mps", "/tmp/mps-log", "50"),
+        lease_address="127.0.0.1:55999",
+    )
+
+    assignment = pool.restart_worker(1)
+
+    assert assignment.endpoint == "127.0.0.1:56001"
+    assert len(captured["started"]) == 1
 
 
 def test_worker_pool_process_env_includes_mps(monkeypatch, tmp_path: Path) -> None:
@@ -224,6 +805,7 @@ def test_worker_pool_process_env_includes_mps(monkeypatch, tmp_path: Path) -> No
     assert env["CUDA_MPS_PIPE_DIRECTORY"] == "/tmp/nvidia-mps"
     assert env["CUDA_MPS_LOG_DIRECTORY"] == "/tmp/nvidia-mps-log"
     assert "--edge_id" in captured["cmd"]
+    assert "--run_id" in captured["cmd"]
 
 
 def test_gpu_lease_grant_wait_release() -> None:
@@ -267,6 +849,30 @@ def test_internal_worker_rpc_ignores_http_proxy(monkeypatch) -> None:
     finally:
         service.shutdown()
         manager.close()
+
+
+def test_worker_health_malformed_response_is_unavailable(monkeypatch) -> None:
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+
+        def read(self):
+            return b"not-json"
+
+    monkeypatch.setattr(
+        "cloud.workers.worker_client.open_direct",
+        lambda request, *, timeout: FakeResponse(),
+    )
+
+    with pytest.raises(JsonRpcError) as exc_info:
+        EdgeWorkerClient("127.0.0.1:56000", timeout_sec=1).get_health()
+
+    assert exc_info.value.error_type == WORKER_RPC_UNAVAILABLE
 
 
 def test_gpu_lease_ttl_expires_stale_worker() -> None:

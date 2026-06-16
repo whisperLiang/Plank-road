@@ -447,12 +447,18 @@ def _prediction_with_boxes(item: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _target_to_tensors(target: Mapping[str, Any], *, device: torch.device) -> dict[str, torch.Tensor]:
+def _target_to_tensors(
+    target: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
     boxes = torch.as_tensor(target.get("boxes", []) or [], dtype=torch.float32, device=device)
     if boxes.ndim == 1:
         boxes = boxes.reshape((-1, 4)) if boxes.numel() else boxes.reshape((0, 4))
     if boxes.numel() and boxes.shape[-1] != 4:
-        raise RuntimeError(f"baseline target boxes must have shape [N, 4], got {tuple(boxes.shape)}")
+        raise RuntimeError(
+            f"baseline target boxes must have shape [N, 4], got {tuple(boxes.shape)}"
+        )
     labels = torch.as_tensor(target.get("labels", []) or [], dtype=torch.int64, device=device)
     if labels.ndim == 0:
         labels = labels.reshape((1,))
@@ -785,7 +791,12 @@ def _build_optimizer(
         raise RuntimeError("baseline frozen-ratio training has no trainable parameters")
     name = str(optimizer_name or "adam").strip().lower()
     if name == "sgd":
-        return torch.optim.SGD(params, lr=float(learning_rate), momentum=0.9, weight_decay=weight_decay)
+        return torch.optim.SGD(
+            params,
+            lr=float(learning_rate),
+            momentum=0.9,
+            weight_decay=weight_decay,
+        )
     if name == "adamw":
         return torch.optim.AdamW(params, lr=float(learning_rate), weight_decay=weight_decay)
     if name == "adam":

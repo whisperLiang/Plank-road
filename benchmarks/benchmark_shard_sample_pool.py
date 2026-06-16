@@ -4,10 +4,10 @@ import argparse
 import hashlib
 import io
 import json
+import sys
 import tarfile
 import time
 import zipfile
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal

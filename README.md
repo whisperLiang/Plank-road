@@ -218,7 +218,7 @@ Useful edge overrides:
 
 ### Real Multi-Device Deployment
 
-The supported Plank-Road topology is one cloud server plus one `edge_client.py` process on each physical edge device. The cloud uses the edge-affine worker pool: every `edge_id` gets a sticky isolated worker process, while GPU admission is controlled by `GpuLeaseManager` using the configured memory threshold, reserve budget, estimated peak memory, active leases, and lease heartbeat TTL.
+The supported Plank-Road topology is one cloud server plus one `edge_client.py` process on each physical edge device. The cloud uses the edge-affine worker pool: every `edge_id` gets a sticky isolated worker process, while GPU admission is controlled by `GpuLeaseManager` using the configured memory threshold, reserve budget, estimated peak memory, active leases, and lease heartbeat TTL. Worker processes bind their local JSON-RPC port before initializing heavy model/runtime objects, and `/health` reports `STARTING`, `READY`, `FAILED`, or `STOPPING` so the cloud can wait, retry on a new endpoint, or shut down cleanly without treating worker startup as a training result.
 
 All edge devices connect to the same cloud gRPC address, and every edge device must use a unique `edge_id`. Reusing an `edge_id` across physical devices is invalid because the cloud identifies edge state, jobs, worker assignment, and model updates by `edge_id`.
 
@@ -411,7 +411,7 @@ python edge_client.py \
   --headless
 ```
 
-Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. Ekya disables frame filtering, uploads raw frames, receives cloud inference results for visualization, and schedules cloud-side frozen-ratio retraining through the same edge-affine worker pool.
+Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. Ekya disables frame filtering, uploads raw frames, receives cloud inference results for visualization, and schedules cloud-side frozen-ratio retraining through the same edge-affine worker pool. If a worker is still starting or its endpoint is being replaced, cloud-backed baseline triggers enter worker-infra backoff instead of recording an algorithm training failure.
 
 ## Testing
 

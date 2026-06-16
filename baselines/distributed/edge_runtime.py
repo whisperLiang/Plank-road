@@ -558,7 +558,9 @@ class BaselineEdgeRuntime:
             self.edge_detector.model.eval()
             self.edge_detector.refresh_thresholds_from_model()
         previous_version = str(self.model_version or "0")
-        self.model_version = str(result_model_version or update_payload.get("result_model_version") or "")
+        self.model_version = str(
+            result_model_version or update_payload.get("result_model_version") or ""
+        )
         if not self.model_version:
             try:
                 self.model_version = str(int(previous_version) + 1)

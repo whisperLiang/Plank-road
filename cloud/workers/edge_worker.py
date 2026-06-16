@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
+import threading
+from typing import Any, Callable
 
 if __name__ == "__main__":
     from common.cuda_visibility import configure_default_cuda_visible_devices
@@ -13,240 +12,176 @@ if __name__ == "__main__":
 
 from loguru import logger
 
-from cloud.orchestrator import CloudFixedSplitOrchestrator
-from cloud.workers.worker_client import GpuLeaseHttpClient, decode_payload_zip
-from cloud.workers.worker_protocol import JsonRpcServer
-from baselines.training import BaselineFrozenRatioTrainer
-from config import load_runtime_config
-from grpc_server import message_transmission_pb2
-from grpc_server.continual_backends import LocalContinualLearningBackend
-from grpc_server.training_jobs import TrainingJobManager
+from cloud.workers.edge_worker_service import EdgeWorkerService
+from cloud.workers.worker_protocol import (
+    WORKER_STARTUP_FAILED,
+    JsonRpcServer,
+    WorkerHealth,
+    WorkerState,
+)
 
 
-class LazyObjectDetection:
-    def __init__(self, config: object, detector_type: str) -> None:
-        self.config = config
-        self.detector_type = detector_type
-        self._detector = None
-
-    def _ensure(self):
-        if self._detector is None:
-            from model_management.object_detection import Object_Detection
-
-            self._detector = Object_Detection(self.config, type=self.detector_type)
-        return self._detector
-
-    def __getattr__(self, name: str):
-        return getattr(self._ensure(), name)
-
-    def large_inference(self, *args, **kwargs):
-        return self._ensure().large_inference(*args, **kwargs)
-
-    def large_inference_batch(self, *args, **kwargs):
-        return self._ensure().large_inference_batch(*args, **kwargs)
-
-
-class EdgeWorkerService:
+class EdgeWorkerServiceManager:
     def __init__(
         self,
         *,
         edge_id: int,
         worker_id: str,
+        run_id: str,
         yaml_path: str,
         workspace_root: str,
         lease_address: str,
     ) -> None:
         self.edge_id = int(edge_id)
         self.worker_id = str(worker_id)
-        runtime_config = load_runtime_config(yaml_path)
-        self.config = runtime_config.server
-        self._override_worker_paths(workspace_root)
-        lease_cfg = self.config.edge_affine_workers.gpu_lease
-        self.lease_client = GpuLeaseHttpClient(
-            lease_address,
-            timeout_sec=float(self.config.edge_affine_workers.worker.request_timeout_sec),
-            heartbeat_interval_sec=float(lease_cfg.heartbeat_interval_sec),
-        )
-        large_od = LazyObjectDetection(self.config, "large inference")
-        self.learner = CloudFixedSplitOrchestrator(
-            self.config,
-            large_od,
-            gpu_lease_client=self.lease_client,
-            worker_id=self.worker_id,
-        )
-        self.baseline_trainer = BaselineFrozenRatioTrainer(
-            config=getattr(runtime_config.baseline, "training", None),
-        )
-        self.training_jobs = TrainingJobManager(
-            continual_learner=self.learner,
-            max_concurrent_jobs=1,
-            edge_registry=None,
-            baseline_trainer=self.baseline_trainer,
-            log_internal_ids=bool(getattr(self.learner, "log_internal_ids", False)),
-        )
-        self.backend = LocalContinualLearningBackend(
-            continual_learner=self.learner,
-            workspace_root=str(workspace_root),
-            training_job_manager=self.training_jobs,
-            edge_registry=None,
-            log_internal_ids=bool(getattr(self.learner, "log_internal_ids", False)),
-        )
+        self.run_id = str(run_id or "")
+        self.yaml_path = str(yaml_path)
+        self.workspace_root = str(workspace_root)
+        self.lease_address = str(lease_address)
+        self._lock = threading.RLock()
+        self._state: WorkerState = "STARTING"
+        self._message = "edge worker is still starting"
+        self._error_type = ""
+        self._service: EdgeWorkerService | None = None
+        self._thread: threading.Thread | None = None
+        self._shutdown_callback: Callable[[], None] | None = None
+        self._closing = False
 
-    def close(self) -> None:
-        self.training_jobs.close()
-        self.learner.close()
+    def set_shutdown_callback(self, callback: Callable[[], None]) -> None:
+        self._shutdown_callback = callback
 
-    def routes(self) -> dict[str, Any]:
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self._initialize,
+                name=f"edge-worker-init-{self.worker_id}",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def health(self) -> WorkerHealth:
+        with self._lock:
+            return WorkerHealth(
+                ok=self._state == "READY",
+                state=self._state,
+                edge_id=self.edge_id,
+                worker_id=self.worker_id,
+                message=self._message,
+                error_type=self._error_type,
+                run_id=self.run_id,
+                lease_address=self.lease_address,
+            )
+
+    def routes(self) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
         return {
-            "/sync_samples": self.sync_samples,
-            "/submit_training_job": self.submit_training_job,
-            "/get_training_job_status": self.get_training_job_status,
-            "/download_trained_model": self.download_trained_model,
-            "/cancel_training_job": self.cancel_training_job,
-            "/report_edge_model_version": self.report_edge_model_version,
+            "/sync_samples": self._call("sync_samples"),
+            "/submit_training_job": self._call("submit_training_job"),
+            "/get_training_job_status": self._call("get_training_job_status"),
+            "/download_trained_model": self._call("download_trained_model"),
+            "/cancel_training_job": self._call("cancel_training_job"),
+            "/report_edge_model_version": self._call("report_edge_model_version"),
             "/shutdown": self.shutdown,
         }
 
-    def sync_samples(self, payload: dict[str, Any]) -> dict[str, Any]:
-        reply = self.backend.sync_samples(
-            message_transmission_pb2.SampleSyncRequest(
-                protocol_version=str(payload.get("protocol_version", "")),
-                edge_id=int(payload.get("edge_id", self.edge_id) or self.edge_id),
-                model_id=str(payload.get("model_id", "")),
-                model_version=str(payload.get("model_version", "")),
-                split_config_id=str(payload.get("split_config_id", "")),
-                sync_type=str(payload.get("sync_type", "")),
-                payload_zip=decode_payload_zip(payload),
-            )
-        )
-        return {
-            "success": bool(reply.success),
-            "message": reply.message,
-            "committed_samples": int(reply.committed_samples),
-        }
-
-    def submit_training_job(self, payload: dict[str, Any]) -> dict[str, Any]:
-        payload_zip = decode_payload_zip(payload)
-        payload_bundle_path = str(payload.get("payload_bundle_path", "") or "")
-        if payload_bundle_path and not payload_zip:
-            try:
-                payload_zip = Path(payload_bundle_path).read_bytes()
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Unable to read routed payload bundle: {payload_bundle_path}"
-                ) from exc
-        reply = self.backend.submit_training_job(
-            SimpleNamespace(
-                protocol_version=str(payload.get("protocol_version", "")),
-                edge_id=int(payload.get("edge_id", self.edge_id) or self.edge_id),
-                request_id=str(payload.get("request_id", "")),
-                job_type=int(payload.get("job_type", 0) or 0),
-                cache_path=str(payload.get("cache_path", "")),
-                send_low_conf_features=bool(payload.get("send_low_conf_features", False)),
-                frame_indices=[
-                    int(value) for value in list(payload.get("frame_indices", []) or [])
-                ],
-                payload_zip=payload_zip,
-                base_model_version=str(payload.get("base_model_version", "")),
-                exclusive_gpu_lease=bool(payload.get("exclusive_gpu_lease", False)),
-            )
-        )
-        return {
-            "accepted": bool(reply.accepted),
-            "job_id": reply.job_id,
-            "status": reply.status,
-            "queue_position": int(reply.queue_position),
-            "message": reply.message,
-        }
-
-    def get_training_job_status(self, payload: dict[str, Any]) -> dict[str, Any]:
-        reply = self.backend.get_training_job_status(
-            message_transmission_pb2.TrainingJobStatusRequest(
-                edge_id=int(payload.get("edge_id", self.edge_id) or self.edge_id),
-                job_id=str(payload.get("job_id", "")),
-            )
-        )
-        return {
-            "found": bool(reply.found),
-            "job_id": reply.job_id,
-            "edge_id": int(reply.edge_id),
-            "status": reply.status,
-            "queue_position": int(reply.queue_position),
-            "message": reply.message,
-            "request_id": reply.request_id,
-            "job_type": int(reply.job_type),
-            "result_available": bool(reply.result_available),
-            "submitted_at_ms": int(reply.submitted_at_ms),
-            "started_at_ms": int(reply.started_at_ms),
-            "finished_at_ms": int(reply.finished_at_ms),
-            "protocol_version": reply.protocol_version,
-            "base_model_version": reply.base_model_version,
-            "result_model_version": reply.result_model_version,
-            "worker_id": reply.worker_id,
-        }
-
-    def download_trained_model(self, payload: dict[str, Any]) -> dict[str, Any]:
-        reply = self.backend.download_trained_model(
-            message_transmission_pb2.DownloadTrainedModelRequest(
-                edge_id=int(payload.get("edge_id", self.edge_id) or self.edge_id),
-                job_id=str(payload.get("job_id", "")),
-            )
-        )
-        return {
-            "success": bool(reply.success),
-            "job_id": reply.job_id,
-            "status": reply.status,
-            "model_data": reply.model_data,
-            "message": reply.message,
-            "protocol_version": reply.protocol_version,
-            "result_model_version": reply.result_model_version,
-        }
-
-    def cancel_training_job(self, payload: dict[str, Any]) -> dict[str, Any]:
-        reply = self.backend.cancel_training_job(
-            message_transmission_pb2.CancelTrainingJobRequest(
-                edge_id=int(payload.get("edge_id", self.edge_id) or self.edge_id),
-                job_id=str(payload.get("job_id", "")),
-            )
-        )
-        return {"cancelled": bool(reply.cancelled), "message": reply.message}
-
-    def report_edge_model_version(self, payload: dict[str, Any]) -> dict[str, Any]:
-        reply = self.backend.report_edge_model_version(
-            message_transmission_pb2.ReportEdgeModelVersionRequest(
-                edge_id=int(payload.get("edge_id", self.edge_id) or self.edge_id),
-                model_id=str(payload.get("model_id", "")),
-                model_version=str(payload.get("model_version", "")),
-            )
-        )
-        return {"success": bool(reply.success), "message": reply.message}
+    def close(self) -> None:
+        with self._lock:
+            self._closing = True
+            service = self._service
+            self._service = None
+            if self._state != "FAILED":
+                self._state = "STOPPING"
+                self._message = "edge worker is stopping"
+        if service is not None:
+            service.close()
 
     def shutdown(self, payload: dict[str, Any]) -> dict[str, Any]:
         del payload
         self.close()
+        callback = self._shutdown_callback
+        if callback is not None:
+            threading.Thread(
+                target=callback,
+                name=f"edge-worker-shutdown-{self.worker_id}",
+                daemon=True,
+            ).start()
         return {"success": True, "message": "worker shutdown"}
 
-    def _override_worker_paths(self, workspace_root: str) -> None:
-        root = os.path.abspath(str(workspace_root))
-        self.config.workspace_root = root
-        self.config.continual_learning.max_concurrent_jobs = 1
-        self.config.sample_pool.root_dir = os.path.join(root, "cloud_sample_pool")
-        self.config.sample_pool.staging_root = os.path.join(root, "cloud_sample_staging")
-        self.config.sample_pool.split_contract_root = os.path.join(root, "split_contracts")
-        feature_cache = self.config.continual_learning.feature_cache
-        feature_cache.view_root_dir = os.path.join(root, "cloud_training_views")
-        feature_cache.store_root_dir = os.path.join(root, "cloud_feature_shards")
-        feature_cache.shard_root_dir = os.path.join(root, "cloud_feature_shards")
-        self.config.continual_learning.teacher_annotation.cache_root_dir = os.path.join(
-            root,
-            "teacher_label_cache",
+    def _initialize(self) -> None:
+        logger.info(
+            "[EdgeWorker] service initializing worker={} edge={}",
+            self.worker_id,
+            self.edge_id,
         )
+        try:
+            service = EdgeWorkerService(
+                edge_id=self.edge_id,
+                worker_id=self.worker_id,
+                yaml_path=self.yaml_path,
+                workspace_root=self.workspace_root,
+                lease_address=self.lease_address,
+            )
+        except Exception as exc:
+            with self._lock:
+                if self._closing:
+                    self._state = "STOPPING"
+                    self._message = "edge worker is stopping"
+                    self._error_type = ""
+                    return
+                self._state = "FAILED"
+                self._message = str(exc)
+                self._error_type = WORKER_STARTUP_FAILED
+            logger.exception(
+                "[EdgeWorker] service startup failed worker={} edge={}",
+                self.worker_id,
+                self.edge_id,
+            )
+            return
+        should_close = False
+        with self._lock:
+            if self._closing or self._state == "STOPPING":
+                should_close = True
+            else:
+                self._service = service
+                self._state = "READY"
+                self._message = ""
+                self._error_type = ""
+        if should_close:
+            service.close()
+            logger.info(
+                "[EdgeWorker] service initialized during shutdown worker={} edge={}",
+                self.worker_id,
+                self.edge_id,
+            )
+            return
+        logger.info(
+            "[EdgeWorker] service ready worker={} edge={}",
+            self.worker_id,
+            self.edge_id,
+        )
+
+    def _call(self, method_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        def handler(payload: dict[str, Any]) -> dict[str, Any]:
+            with self._lock:
+                service = self._service
+                state = self._state
+                message = self._message
+            if service is None or state != "READY":
+                raise RuntimeError(message or "edge worker is not ready")
+            method = getattr(service, method_name, None)
+            if not callable(method):
+                raise RuntimeError(f"edge worker route is not configured: {method_name}")
+            return method(payload)
+
+        return handler
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plank-Road edge-affine cloud worker")
     parser.add_argument("--edge_id", type=int, required=True)
     parser.add_argument("--worker_id", required=True)
+    parser.add_argument("--run_id", default="")
     parser.add_argument("--yaml_path", default="./config/config.yaml")
     parser.add_argument("--listen_address", required=True)
     parser.add_argument("--workspace_root", required=True)
@@ -256,32 +191,46 @@ def main() -> None:
 
     os.environ.setdefault("PLANK_ROAD_EDGE_WORKER_ID", str(args.worker_id))
     os.environ.setdefault("PLANK_ROAD_EDGE_ID", str(args.edge_id))
-    service = EdgeWorkerService(
+    manager = EdgeWorkerServiceManager(
         edge_id=args.edge_id,
         worker_id=args.worker_id,
+        run_id=args.run_id,
         yaml_path=args.yaml_path,
         workspace_root=args.workspace_root,
         lease_address=args.lease_address,
     )
     server = JsonRpcServer(
         listen_address=args.listen_address,
-        routes=service.routes(),
+        routes=manager.routes(),
         health_payload={
             "edge_id": int(args.edge_id),
             "worker_id": str(args.worker_id),
+            "run_id": str(args.run_id),
+            "lease_address": str(args.lease_address),
         },
+        health_provider=manager.health,
+        always_available_routes={"/shutdown"},
     )
+    manager.set_shutdown_callback(server.shutdown)
     logger.info(
-        "[EdgeWorker] listening worker={} edge={} endpoint={} lazy_cuda={}",
+        "[EdgeWorker] rpc server bound worker={} edge={} endpoint={} lazy_cuda={}",
         args.worker_id,
         args.edge_id,
-        args.listen_address,
+        server.listen_address,
         args.lazy_cuda_init,
     )
+    manager.start()
     try:
         server.serve_forever()
     finally:
-        service.close()
+        try:
+            manager.close()
+        except Exception:
+            logger.exception(
+                "[EdgeWorker] service close failed worker={} edge={}",
+                args.worker_id,
+                args.edge_id,
+            )
 
 
 if __name__ == "__main__":

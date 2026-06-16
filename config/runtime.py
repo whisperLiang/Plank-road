@@ -349,6 +349,7 @@ class GpuLeaseConfig(ConfigSection):
 class WorkerServiceConfig(ConfigSection):
     max_concurrent_jobs: int = 1
     startup_timeout_sec: float = 30.0
+    startup_max_retries: int = 2
     request_timeout_sec: float = 600.0
     healthcheck_interval_sec: float = 10.0
 
@@ -898,6 +899,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive(
         "server.edge_affine_workers.worker.startup_timeout_sec",
         float(edge_affine.worker.startup_timeout_sec),
+    )
+    _validate_positive(
+        "server.edge_affine_workers.worker.startup_max_retries",
+        int(edge_affine.worker.startup_max_retries),
+        allow_zero=True,
     )
     _validate_positive(
         "server.edge_affine_workers.worker.request_timeout_sec",

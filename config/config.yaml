@@ -251,6 +251,7 @@ server:
   worker:
    max_concurrent_jobs: 1
    startup_timeout_sec: 30
+   startup_max_retries: 2
    request_timeout_sec: 600
    healthcheck_interval_sec: 10
  #the queue maxsize

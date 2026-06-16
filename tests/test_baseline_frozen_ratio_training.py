@@ -179,6 +179,44 @@ def test_baseline_jobs_parallelize_across_edges_and_serialize_same_edge(tmp_path
         manager.close()
 
 
+def test_baseline_same_edge_active_job_is_reused(tmp_path: Path) -> None:
+    trainer = RecordingSleepTrainer()
+    manager = TrainingJobManager(
+        continual_learner=SimpleNamespace(worker_id="worker-test"),
+        max_concurrent_jobs=1,
+        baseline_trainer=trainer,
+    )
+    try:
+        first, first_created = manager.submit(
+            edge_id=1,
+            request_id="accuracy_trigger_cloud_retraining:run-a:1:first",
+            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO,
+            workspace="",
+            workspace_root=str(tmp_path),
+            request_kind="baseline_frozen_ratio",
+            protocol_version=BASELINE_FROZEN_RATIO_PROTOCOL_VERSION,
+            payload_zip=_bundle(),
+            base_model_version="0",
+        )
+        second, second_created = manager.submit(
+            edge_id=1,
+            request_id="accuracy_trigger_cloud_retraining:run-a:1:second",
+            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO,
+            workspace="",
+            workspace_root=str(tmp_path),
+            request_kind="baseline_frozen_ratio",
+            protocol_version=BASELINE_FROZEN_RATIO_PROTOCOL_VERSION,
+            payload_zip=_bundle(),
+            base_model_version="0",
+        )
+
+        assert first_created is True
+        assert second_created is False
+        assert second.job_id == first.job_id
+    finally:
+        manager.close()
+
+
 class TinyDetectionModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()

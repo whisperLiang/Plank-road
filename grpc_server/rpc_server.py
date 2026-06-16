@@ -355,9 +355,9 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 payload=json_loads(request.payload_json),
             )
             return message_transmission_pb2.BaselineTrainingReply(
-                accepted=True,
-                job_id=str(job["job_id"]),
-                status=str(job["status"]),
+                accepted=bool(job.get("accepted", True)),
+                job_id=str(job.get("job_id", "")),
+                status=str(job.get("status", "")),
                 message=str(job.get("message", "training job accepted")),
                 training_strategy=str(job["training_strategy"]),
                 queue_position=int(job.get("queue_position", -1)),
@@ -401,16 +401,26 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 result_available=bool(job.get("result_available", False))
                 if job is not None
                 else False,
-                queue_position=int(job.get("queue_position", -1)) if job is not None else -1,
-                edge_id=int(job.get("edge_id", request.edge_id)) if job is not None else int(request.edge_id),
+                queue_position=int(job.get("queue_position", -1))
+                if job is not None
+                else -1,
+                edge_id=int(job.get("edge_id", request.edge_id))
+                if job is not None
+                else int(request.edge_id),
                 request_id=str(job.get("request_id", "")) if job is not None else "",
                 job_type=int(job.get("job_type", 0)) if job is not None else 0,
                 submitted_at_ms=int(job.get("submitted_at_ms", 0)) if job is not None else 0,
                 started_at_ms=int(job.get("started_at_ms", 0)) if job is not None else 0,
                 finished_at_ms=int(job.get("finished_at_ms", 0)) if job is not None else 0,
-                protocol_version=str(job.get("protocol_version", "")) if job is not None else "",
-                base_model_version=str(job.get("base_model_version", "")) if job is not None else "",
-                result_model_version=str(job.get("result_model_version", "")) if job is not None else "",
+                protocol_version=str(job.get("protocol_version", ""))
+                if job is not None
+                else "",
+                base_model_version=str(job.get("base_model_version", ""))
+                if job is not None
+                else "",
+                result_model_version=str(job.get("result_model_version", ""))
+                if job is not None
+                else "",
                 worker_id=str(job.get("worker_id", "")) if job is not None else "",
             )
         except Exception as exc:

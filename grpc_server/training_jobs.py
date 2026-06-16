@@ -145,7 +145,14 @@ class TrainingJobManager:
                 existing_job_id = self._request_index.get(request_key)
                 if existing_job_id is not None:
                     return self._jobs[existing_job_id], False
-            if int(job_type) == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
+            if int(job_type) in {
+                message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+                message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO,
+            }:
+                baseline_method = _baseline_method_for_request(
+                    normalized_request_id,
+                    request_kind=str(request_kind or ""),
+                )
                 for existing in self._jobs.values():
                     if existing.edge_id != int(edge_id):
                         continue
@@ -155,6 +162,24 @@ class TrainingJobManager:
                         continue
                     if existing.status in TERMINAL_JOB_STATUSES:
                         continue
+                    if (
+                        int(job_type)
+                        == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO
+                    ):
+                        existing_method = _baseline_method_for_request(
+                            existing.request_id,
+                            request_kind=existing.request_kind,
+                        )
+                        if existing_method != baseline_method:
+                            continue
+                        logger.info(
+                            "[TrainingJob] Reusing existing baseline job: edge={} "
+                            "type={} existing_job={}",
+                            int(edge_id),
+                            request_kind or self._request_kind_for_job_type(int(job_type)),
+                            existing.job_id,
+                        )
+                        return existing, False
                     logger.info(
                         "[TrainingJob] Reusing existing continual-learning job: "
                         "edge={} existing_job={}",
@@ -528,3 +553,10 @@ def _next_model_version(base_model_version: str) -> str:
         return str(int(base_model_version or "0") + 1)
     except (TypeError, ValueError):
         return "1"
+
+
+def _baseline_method_for_request(request_id: str, *, request_kind: str) -> str:
+    if str(request_kind or "") and str(request_kind) != "baseline_frozen_ratio":
+        return str(request_kind)
+    prefix = str(request_id or "").split(":", 1)[0]
+    return prefix or str(request_kind or "baseline_frozen_ratio")
