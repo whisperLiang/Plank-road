@@ -10,7 +10,9 @@ import pytest
 from cloud.workers.assignment_store import EdgeAssignment, EdgeAssignmentStore
 from cloud.workers.edge_worker_pool import EdgeWorkerPool
 from cloud.workers.gpu_lease_manager import GpuLeaseManager, LeaseRequest
+from cloud.workers.lease_service import GpuLeaseService
 from cloud.workers.mps_runtime import MpsEnvironment
+from cloud.workers.worker_client import EdgeWorkerClient, GpuLeaseHttpClient
 from config import load_runtime_config
 from grpc_server import message_transmission_pb2
 from grpc_server.continual_backends import EdgeWorkerRoutedContinualLearningBackend
@@ -242,6 +244,28 @@ def test_gpu_lease_grant_wait_release() -> None:
         lease_3 = manager.acquire(_lease_request(edge_id=2, job_id="job-3"), timeout_sec=0.1)
         assert {lease_2.edge_id, lease_3.edge_id} == {110, 2}
     finally:
+        manager.close()
+
+
+def test_internal_worker_rpc_ignores_http_proxy(monkeypatch) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    manager = GpuLeaseManager(
+        max_active_gpu_workers=1,
+        query_total_memory_gb=lambda: 48,
+    )
+    service = GpuLeaseService(listen_address="127.0.0.1:0", manager=manager)
+    service.start()
+    try:
+        assert EdgeWorkerClient(service.listen_address, timeout_sec=1).health()
+        lease = GpuLeaseHttpClient(service.listen_address, timeout_sec=1).acquire(
+            _lease_request(edge_id=1, job_id="direct-rpc")
+        )
+        lease.release()
+    finally:
+        service.shutdown()
         manager.close()
 
 

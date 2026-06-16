@@ -6,9 +6,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, ProxyHandler
 
 JsonHandler = Callable[[dict[str, Any]], dict[str, Any]]
+_DIRECT_HTTP_OPENER = build_opener(ProxyHandler({}))
 
 
 class JsonRpcError(RuntimeError):
@@ -41,16 +42,21 @@ def post_json(
         method="POST",
     )
     try:
-        with urlopen(request, timeout=float(timeout)) as response:
+        with open_direct(request, timeout=float(timeout)) as response:
             response_data = response.read()
     except HTTPError as exc:
         message = exc.read().decode("utf-8", errors="replace") or str(exc)
         raise JsonRpcError(message) from exc
-    except URLError as exc:
+    except (TimeoutError, URLError) as exc:
         raise JsonRpcError(str(exc)) from exc
     if not response_data:
         return {}
     return json.loads(response_data.decode("utf-8"))
+
+
+def open_direct(request, *, timeout: float):
+    """Open internal worker RPC URLs without honoring process proxy env vars."""
+    return _DIRECT_HTTP_OPENER.open(request, timeout=float(timeout))
 
 
 class JsonRpcServer:

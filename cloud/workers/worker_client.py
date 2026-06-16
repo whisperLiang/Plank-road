@@ -4,10 +4,10 @@ import json
 import time
 from dataclasses import asdict
 from typing import Any
-from urllib.request import urlopen
+from urllib.request import Request
 
 from cloud.workers.gpu_lease_manager import LeaseRequest
-from cloud.workers.worker_protocol import decode_bytes, encode_bytes, post_json
+from cloud.workers.worker_protocol import decode_bytes, encode_bytes, open_direct, post_json
 from grpc_server import message_transmission_pb2
 
 
@@ -18,8 +18,8 @@ class EdgeWorkerClient:
 
     def health(self, *, expected_worker_id: str = "") -> bool:
         try:
-            with urlopen(
-                f"http://{self.endpoint}/health",
+            with open_direct(
+                Request(f"http://{self.endpoint}/health"),
                 timeout=min(5.0, self.timeout_sec),
             ) as response:
                 if response.status != 200:

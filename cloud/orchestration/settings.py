@@ -597,23 +597,52 @@ class PipelineLifecycleMixin:
         manifest = _read_workspace_manifest(workspace)
         model_meta = dict(manifest.get("model", {}) or {})
         split_plan = dict(manifest.get("split_plan", {}) or {})
+        training_config = dict(manifest.get("training_config", {}) or {})
+        is_baseline_frozen_ratio = (
+            str(manifest.get("protocol_version") or "") == "baseline-frozen-ratio.v1"
+            or bool(manifest.get("frames"))
+        )
         model_name = str(
             model_meta.get("model_id")
+            or model_meta.get("model_name")
             or manifest.get("model_id")
+            or manifest.get("model_name")
             or getattr(self, "edge_model_name", "")
         )
-        split_key = str(
-            split_plan.get("canonical_split_key")
-            or manifest.get("canonical_split_key")
-            or ""
-        )
-        train_samples = len(
-            [
-                sample
-                for sample in list(manifest.get("samples", []) or [])
-                if isinstance(sample, dict) and str(sample.get("sample_id", "")).strip()
-            ]
-        )
+        if is_baseline_frozen_ratio:
+            split_key = str(
+                manifest.get("training_strategy")
+                or manifest.get("protocol_version")
+                or "baseline_frozen_ratio"
+            )
+            train_samples = len(
+                [
+                    frame
+                    for frame in list(manifest.get("frames", []) or [])
+                    if isinstance(frame, dict)
+                    and (
+                        str(frame.get("image_path", "")).strip()
+                        or str(frame.get("frame_id", "")).strip()
+                    )
+                ]
+            )
+            batch_size = int(training_config.get("batch_size") or 0)
+        else:
+            split_key = str(
+                split_plan.get("canonical_split_key")
+                or manifest.get("canonical_split_key")
+                or ""
+            )
+            train_samples = len(
+                [
+                    sample
+                    for sample in list(manifest.get("samples", []) or [])
+                    if isinstance(sample, dict) and str(sample.get("sample_id", "")).strip()
+                ]
+            )
+            batch_size = 0
+        if batch_size <= 0:
+            batch_size = int(getattr(self, "batch_size", 0) or 0)
         estimate = float(
             getattr(
                 getattr(
@@ -632,7 +661,7 @@ class PipelineLifecycleMixin:
                 job_id=str(job_id),
                 model_name=model_name,
                 split_key=split_key,
-                batch_size=int(getattr(self, "batch_size", 0) or 0),
+                batch_size=batch_size,
                 train_samples=train_samples,
                 estimated_peak_memory_gb=estimate,
                 exclusive=bool(exclusive),
@@ -666,12 +695,14 @@ class PipelineLifecycleMixin:
 
 
 def _read_workspace_manifest(workspace: str) -> dict[str, object]:
-    path = Path(workspace) / "trigger_manifest.json"
-    if not path.exists():
-        return {}
-    try:
-        import json
+    for filename in ("trigger_manifest.json", "baseline_manifest.json"):
+        path = Path(workspace) / filename
+        if not path.exists():
+            continue
+        try:
+            import json
 
-        return dict(json.loads(path.read_text(encoding="utf-8")) or {})
-    except Exception:
-        return {}
+            return dict(json.loads(path.read_text(encoding="utf-8")) or {})
+        except Exception:
+            return {}
+    return {}
