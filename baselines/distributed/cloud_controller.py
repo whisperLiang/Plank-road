@@ -52,8 +52,10 @@ class EdgeBaselineState:
 class BaselineTrainingGate:
     pending_or_running: dict[tuple[int, str, str], str] = field(default_factory=dict)
     recent_infra_failures: dict[tuple[int, str], float] = field(default_factory=dict)
+    recent_training_failures: dict[tuple[int, str, str], float] = field(default_factory=dict)
     job_to_gate_key: dict[str, tuple[int, str, str]] = field(default_factory=dict)
     failure_backoff_sec: float = 10.0
+    training_failure_backoff_sec: float = 10.0
 
 
 _WORKER_INFRA_ERROR_TYPES = {
@@ -97,18 +99,25 @@ class DistributedBaselineController:
         self._raw_frames: dict[tuple[str, str, int, int], bytes] = {}
         self._inference_results: dict[tuple[str, str, int, int], dict[str, Any]] = {}
         self._submitted_training_keys: dict[str, tuple[str, str, int]] = {}
+        infra_backoff_sec = _config_float(
+            baseline_training_config,
+            "worker_infra_failure_backoff_sec",
+            10.0,
+        )
         self._training_gate = BaselineTrainingGate(
-            failure_backoff_sec=float(
-                getattr(baseline_training_config, "worker_infra_failure_backoff_sec", 10.0)
-                if baseline_training_config is not None
-                else 10.0
-            )
+            failure_backoff_sec=infra_backoff_sec,
+            training_failure_backoff_sec=_config_float(
+                baseline_training_config,
+                "training_failure_backoff_sec",
+                infra_backoff_sec,
+            ),
         )
 
     def close(self) -> None:
         with self._lock:
             self._training_gate.pending_or_running.clear()
             self._training_gate.recent_infra_failures.clear()
+            self._training_gate.recent_training_failures.clear()
             self._training_gate.job_to_gate_key.clear()
 
     def register_edge(
@@ -317,6 +326,29 @@ class DistributedBaselineController:
                     "protocol_version": BASELINE_FROZEN_RATIO_PROTOCOL_VERSION,
                     "result_model_version": "",
                 }
+            remaining = self._training_failure_backoff_remaining_locked(gate_key)
+            if remaining > 0.0:
+                logger.info(
+                    "[BaselineTraining] skipped trigger: edge={} "
+                    "reason=training_failure_backoff remaining={:.2f}",
+                    key[2],
+                    remaining,
+                )
+                return {
+                    "accepted": False,
+                    "run_id": key[0],
+                    "baseline_method": key[1],
+                    "edge_id": key[2],
+                    "job_id": "",
+                    "status": "TRAINING_FAILURE_BACKOFF",
+                    "message": f"training failure backoff active for {remaining:.2f}s",
+                    "training_strategy": expected_strategy,
+                    "payload": payload_dict,
+                    "created_at_ms": now_ms(),
+                    "queue_position": -1,
+                    "protocol_version": BASELINE_FROZEN_RATIO_PROTOCOL_VERSION,
+                    "result_model_version": "",
+                }
             self._training_gate.pending_or_running[gate_key] = _PENDING_TRAINING_JOB
             gate_reserved = True
         try:
@@ -419,7 +451,14 @@ class DistributedBaselineController:
             return None
         status = str(getattr(reply, "status", "") or "")
         if status.upper() in _TERMINAL_TRAINING_STATUSES:
-            self._release_training_gate(str(job_id))
+            if status.upper() == "FAILED":
+                self._record_training_failure(
+                    str(job_id),
+                    status=status,
+                    message=str(getattr(reply, "message", "") or ""),
+                )
+            else:
+                self._release_training_gate(str(job_id))
         return {
             "run_id": key[0],
             "baseline_method": key[1],
@@ -602,6 +641,22 @@ class DistributedBaselineController:
             return 0.0
         return remaining
 
+    def _training_failure_backoff_remaining_locked(
+        self,
+        gate_key: tuple[int, str, str],
+    ) -> float:
+        started_at = float(
+            self._training_gate.recent_training_failures.get(gate_key, 0.0) or 0.0
+        )
+        if started_at <= 0.0:
+            return 0.0
+        elapsed = time.monotonic() - started_at
+        remaining = float(self._training_gate.training_failure_backoff_sec) - elapsed
+        if remaining <= 0.0:
+            self._training_gate.recent_training_failures.pop(gate_key, None)
+            return 0.0
+        return remaining
+
     def _record_worker_infra_failure(
         self,
         edge_id: int,
@@ -625,6 +680,27 @@ class DistributedBaselineController:
             gate_key = self._training_gate.job_to_gate_key.pop(str(job_id), None)
             if gate_key is not None:
                 self._training_gate.pending_or_running.pop(gate_key, None)
+
+    def _record_training_failure(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        message: str,
+    ) -> None:
+        with self._lock:
+            gate_key = self._training_gate.job_to_gate_key.pop(str(job_id), None)
+            if gate_key is None:
+                return
+            self._training_gate.pending_or_running.pop(gate_key, None)
+            self._training_gate.recent_training_failures[gate_key] = time.monotonic()
+        logger.info(
+            "[BaselineTraining] training failure backoff started: edge={} "
+            "status={} message={}",
+            gate_key[0],
+            str(status or "FAILED"),
+            str(message or "")[:240],
+        )
 
     def _clear_pending_training_gate(self, gate_key: tuple[int, str, str]) -> None:
         with self._lock:
@@ -667,3 +743,16 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _config_float(config: object | dict[str, Any] | None, name: str, default: float) -> float:
+    if isinstance(config, dict):
+        value = config.get(name, default)
+    elif config is not None and hasattr(config, name):
+        value = getattr(config, name)
+    else:
+        value = default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)

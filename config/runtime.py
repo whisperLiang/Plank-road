@@ -277,6 +277,8 @@ class BaselineTrainingConfig(ConfigSection):
     microprofile_epochs: int = 1
     microprofile_max_samples: int = 16
     device: str = "auto"
+    worker_infra_failure_backoff_sec: float = 10.0
+    training_failure_backoff_sec: float = 10.0
 
 
 @dataclass
@@ -680,6 +682,16 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive(
         "baseline.training.microprofile_max_samples",
         int(baseline_training.microprofile_max_samples),
+    )
+    _validate_positive(
+        "baseline.training.worker_infra_failure_backoff_sec",
+        float(baseline_training.worker_infra_failure_backoff_sec),
+        allow_zero=True,
+    )
+    _validate_positive(
+        "baseline.training.training_failure_backoff_sec",
+        float(baseline_training.training_failure_backoff_sec),
+        allow_zero=True,
     )
     pure_edge = config.baseline.pure_edge_local_updating
     if str(pure_edge.label_source) not in {"pseudo_label", "local_gt_dir", "none"}:

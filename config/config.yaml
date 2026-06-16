@@ -25,6 +25,8 @@ baseline:
   microprofile_epochs: 1
   microprofile_max_samples: 16
   device: auto
+  worker_infra_failure_backoff_sec: 10.0
+  training_failure_backoff_sec: 10.0
  pure_edge_local_updating:
   label_source: pseudo_label
   local_metrics: true

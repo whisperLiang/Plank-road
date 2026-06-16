@@ -24,6 +24,7 @@ from model_management.model_zoo import build_detection_model
 
 BASELINE_FROZEN_RATIO_PROTOCOL_VERSION = "baseline-frozen-ratio.v1"
 BASELINE_FROZEN_RATIO_TRAINING_STRATEGY = "frozen_ratio_training"
+_TINYNEXT_MODEL_PREFIX = "tinynext"
 _WRAPPER_INNER_MODULE_PATHS = (
     ("yolo", "model"),
     ("rtdetr", "model"),
@@ -271,7 +272,7 @@ class BaselineFrozenRatioTrainer:
         build_kwargs = {}
         if "num_classes" in manifest:
             build_kwargs["num_classes"] = int(manifest["num_classes"])
-        if "tinynext_input_size" in manifest:
+        if _is_tinynext_model(model_name) and "tinynext_input_size" in manifest:
             build_kwargs["tinynext_input_size"] = int(manifest["tinynext_input_size"])
         model = self.model_builder(
             model_name,
@@ -392,7 +393,7 @@ def build_baseline_training_bundle(
         }
         if num_classes is not None:
             manifest["num_classes"] = int(num_classes)
-        if tinynext_input_size is not None:
+        if tinynext_input_size is not None and _is_tinynext_model(model_name):
             manifest["tinynext_input_size"] = int(tinynext_input_size)
         archive.writestr(
             "baseline_manifest.json",
@@ -409,6 +410,14 @@ def _load_manifest(workspace: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError("baseline_manifest.json must contain a JSON object")
     return value
+
+
+def _normalise_model_name(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _is_tinynext_model(model_name: object) -> bool:
+    return _normalise_model_name(model_name).startswith(_TINYNEXT_MODEL_PREFIX)
 
 
 def _samples_from_manifest(workspace: Path, manifest: Mapping[str, Any]) -> list[_BaselineSample]:

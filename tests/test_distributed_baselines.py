@@ -168,6 +168,39 @@ class FailingInfraTrainingBackend:
         raise JsonRpcError("worker still starting", error_type=WORKER_NOT_READY)
 
 
+class FailingTrainingJobBackend:
+    def __init__(self) -> None:
+        self.submit_calls = 0
+        self.submitted: dict[tuple[int, str], object] = {}
+
+    def submit_training_job(self, request):
+        self.submit_calls += 1
+        job_id = f"job-{self.submit_calls}"
+        self.submitted[(int(request.edge_id), job_id)] = request
+        return message_transmission_pb2.SubmitTrainingJobReply(
+            accepted=True,
+            job_id=job_id,
+            status="QUEUED",
+            queue_position=1,
+            message="accepted",
+        )
+
+    def get_training_job_status(self, request):
+        found = (int(request.edge_id), str(request.job_id)) in self.submitted
+        return message_transmission_pb2.TrainingJobStatusReply(
+            found=found,
+            job_id=str(request.job_id),
+            edge_id=int(request.edge_id),
+            status="FAILED" if found else "",
+            queue_position=-1,
+            message="model builder failed" if found else "not found",
+            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO,
+            result_available=False,
+            result_model_version="",
+            worker_id="edge_1" if found else "",
+        )
+
+
 class BlockingTrainingBackend:
     def __init__(self) -> None:
         self.entered = threading.Event()
@@ -473,6 +506,58 @@ def test_cloud_controller_worker_infra_failure_enters_backoff() -> None:
     assert first["status"] == "WORKER_INFRA_BACKOFF"
     assert second["accepted"] is False
     assert second["status"] == "WORKER_INFRA_BACKOFF"
+    assert backend.submit_calls == 1
+
+
+def test_cloud_controller_training_failure_enters_backoff() -> None:
+    backend = FailingTrainingJobBackend()
+    controller = DistributedBaselineController(
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="run-a",
+        results_root="unused",
+        training_backend=backend,
+    )
+    controller.upload_frame(
+        BaselineFramePayload(
+            run_id="run-a",
+            baseline_method="accuracy_trigger_cloud_retraining",
+            edge_id=1,
+            frame_id=1,
+            model_name="tiny",
+            model_version="0",
+            raw_frame=_jpeg_bytes(),
+            teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1]},
+            upload_mode="keyframe_raw",
+            is_keyframe=True,
+        )
+    )
+
+    first = controller.request_training(
+        run_id="run-a",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        edge_id=1,
+        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
+        frame_ids=[1],
+    )
+    status = controller.poll_training_job(
+        run_id="run-a",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        edge_id=1,
+        job_id=str(first["job_id"]),
+    )
+    second = controller.request_training(
+        run_id="run-a",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        edge_id=1,
+        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
+        frame_ids=[1],
+    )
+
+    assert first["accepted"] is True
+    assert status is not None
+    assert status["status"] == "FAILED"
+    assert second["accepted"] is False
+    assert second["status"] == "TRAINING_FAILURE_BACKOFF"
     assert backend.submit_calls == 1
 
 

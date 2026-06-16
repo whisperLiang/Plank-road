@@ -77,6 +77,19 @@ def test_baseline_bundle_is_raw_frame_protocol_without_split_artifacts() -> None
     assert "feature_shard" not in serialized
 
 
+def test_baseline_bundle_keeps_tinynext_input_size_model_specific() -> None:
+    rfdetr_bundle = _bundle(model_name="rfdetr_nano", tinynext_input_size=640)
+    tinynext_bundle = _bundle(model_name="tinynext_s", tinynext_input_size=640)
+
+    with zipfile.ZipFile(io.BytesIO(rfdetr_bundle), "r") as archive:
+        rfdetr_manifest = json.loads(archive.read("baseline_manifest.json").decode("utf-8"))
+    with zipfile.ZipFile(io.BytesIO(tinynext_bundle), "r") as archive:
+        tinynext_manifest = json.loads(archive.read("baseline_manifest.json").decode("utf-8"))
+
+    assert "tinynext_input_size" not in rfdetr_manifest
+    assert tinynext_manifest["tinynext_input_size"] == 640
+
+
 def test_frozen_ratio_trainer_runs_full_model_loss(tmp_path: Path) -> None:
     bundle = _bundle()
     with zipfile.ZipFile(io.BytesIO(bundle), "r") as archive:
@@ -131,6 +144,42 @@ def test_frozen_ratio_trainer_optimizes_unregistered_wrapper_inner_model(
 
     assert result["success"] is True
     assert not torch.equal(model.model[-1].weight.detach(), before)
+
+
+def test_frozen_ratio_trainer_ignores_stale_tinynext_size_for_non_tinynext(
+    tmp_path: Path,
+) -> None:
+    bundle = _bundle(model_name="rfdetr_nano")
+    with zipfile.ZipFile(io.BytesIO(bundle), "r") as archive:
+        archive.extractall(tmp_path)
+    manifest_path = tmp_path / "baseline_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["tinynext_input_size"] = 640
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    seen_kwargs: list[dict[str, object]] = []
+
+    def builder(*args, **kwargs):
+        del args
+        seen_kwargs.append(dict(kwargs))
+        return TinyDetectionModel()
+
+    trainer = BaselineFrozenRatioTrainer(
+        config=BaselineFrozenRatioConfig(
+            trainable_param_ratio=0.5,
+            batch_size=2,
+            num_epoch=1,
+            learning_rate=1e-2,
+            device="cpu",
+        ),
+        model_builder=builder,
+        update_serializer=_constant_update_serializer,
+    )
+
+    result = trainer.train_from_workspace(tmp_path)
+
+    assert result["success"] is True
+    assert seen_kwargs
+    assert "tinynext_input_size" not in seen_kwargs[0]
 
 
 def test_baseline_jobs_parallelize_across_edges_and_serialize_same_edge(tmp_path: Path) -> None:
@@ -291,12 +340,16 @@ class RecordingSleepTrainer:
         }
 
 
-def _bundle() -> bytes:
+def _bundle(
+    *,
+    model_name: str = "tiny",
+    tinynext_input_size: int | None = None,
+) -> bytes:
     return build_baseline_training_bundle(
         run_id="run-a",
         baseline_method="accuracy_trigger_cloud_retraining",
         edge_id=1,
-        model_name="tiny",
+        model_name=model_name,
         model_version="0",
         frames=[
             {
@@ -311,6 +364,7 @@ def _bundle() -> bytes:
             },
         ],
         training_config={"trainable_param_ratio": 0.5, "num_epoch": 1, "batch_size": 2},
+        tinynext_input_size=tinynext_input_size,
     )
 
 
