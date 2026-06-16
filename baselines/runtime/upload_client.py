@@ -39,6 +39,7 @@ def build_baseline_training_bundle(
     weights_path: str = "",
     tinynext_input_size: int | None = None,
     base_model_update_model_data: str = "",
+    trigger_metadata: Mapping[str, Any] | None = None,
 ) -> bytes:
     strategy = validate_baseline_training_strategy(training_strategy)
     frame_entries: list[dict[str, Any]] = []
@@ -93,6 +94,7 @@ def build_baseline_training_bundle(
             "training_config": normalized_training_config,
             "frames": frame_entries,
         }
+        manifest.update(dict(trigger_metadata or {}))
         if tinynext_input_size is not None and str(model_name).lower().startswith("tinynext"):
             manifest["tinynext_input_size"] = int(tinynext_input_size)
         update_data = str(base_model_update_model_data or "")
@@ -200,14 +202,17 @@ class BaselineUploadClient:
         baseline_method: str,
         edge_id: int,
         command_id: str,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
+        metrics = {"acked_commands": [str(command_id)]}
+        metrics.update(dict(metadata or {}))
         reply = self.stub.Heartbeat(
             message_transmission_pb2.BaselineHeartbeatRequest(
                 run_id=str(run_id),
                 baseline_method=str(baseline_method),
                 edge_id=int(edge_id),
                 timestamp_ms=int(time.time() * 1000),
-                metrics_json=json_dumps({"acked_commands": [str(command_id)]}),
+                metrics_json=json_dumps(metrics),
             )
         )
         if not bool(reply.success):

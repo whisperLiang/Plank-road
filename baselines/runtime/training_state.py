@@ -54,6 +54,9 @@ class BaselineActiveTrainingJob:
     trainable_param_ratio: float
     frame_ids: tuple[int, ...]
     last_poll_at: float = 0.0
+    command_id: str = ""
+    run_id: str = ""
+    baseline_method: str = ""
 
 
 @dataclass(frozen=True)

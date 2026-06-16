@@ -1,0 +1,567 @@
+from __future__ import annotations
+
+import json
+import math
+import threading
+from collections import deque
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from baselines.distributed.messages import BaselineFramePayload, now_ms
+from baselines.runtime.training_state import stable_window_id
+from cloud.baselines.detection_agreement import teacher_f1
+
+_METHOD = "accuracy_trigger_cloud_retraining"
+_TERMINAL_FAILURES = {"FAILED", "STALE", "CANCELLED"}
+
+
+@dataclass(frozen=True)
+class AccuracyTriggerFrame:
+    run_id: str
+    baseline_method: str
+    edge_id: int
+    frame_id: int
+    timestamp_ms: int
+    model_name: str
+    model_version: str
+    video_source: str
+    raw_frame: bytes
+    edge_prediction: dict[str, Any]
+    teacher_prediction: dict[str, Any]
+    quality_metadata: dict[str, Any]
+    is_keyframe: bool
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: BaselineFramePayload,
+        *,
+        teacher_prediction: Mapping[str, Any],
+    ) -> "AccuracyTriggerFrame":
+        return cls(
+            run_id=str(payload.run_id),
+            baseline_method=str(payload.baseline_method),
+            edge_id=int(payload.edge_id),
+            frame_id=int(payload.frame_id),
+            timestamp_ms=int(payload.timestamp_ms),
+            model_name=str(payload.model_name or ""),
+            model_version=str(payload.model_version or "0"),
+            video_source=str(payload.video_source or ""),
+            raw_frame=bytes(payload.raw_frame or b""),
+            edge_prediction=dict(payload.edge_prediction or {}),
+            teacher_prediction=dict(teacher_prediction or {}),
+            quality_metadata=dict(payload.quality_metadata or {}),
+            is_keyframe=bool(payload.is_keyframe),
+        )
+
+    def to_training_sample(self) -> dict[str, Any]:
+        return {
+            "frame_id": int(self.frame_id),
+            "raw_frame": bytes(self.raw_frame),
+            "edge_prediction": dict(self.edge_prediction),
+            "teacher_prediction": dict(self.teacher_prediction),
+            "quality_metadata": dict(self.quality_metadata),
+            "is_keyframe": bool(self.is_keyframe),
+        }
+
+
+@dataclass(frozen=True)
+class AccuracyTriggerWindow:
+    window_id: str
+    samples: tuple[AccuracyTriggerFrame, ...]
+    accuracy: float
+    history_mean_accuracy: float
+    history_std_accuracy: float
+    accuracy_drop_threshold: float
+    triggered: bool
+
+    @property
+    def frame_ids(self) -> tuple[int, ...]:
+        return tuple(int(sample.frame_id) for sample in self.samples)
+
+
+@dataclass(frozen=True)
+class AccuracyTriggerSubmission:
+    model_key: tuple[str, int, str, str]
+    run_id: str
+    edge_id: int
+    model_name: str
+    model_version: str
+    video_source: str
+    window_id: str
+    trigger_window_frame_ids: tuple[int, ...]
+    training_samples: tuple[AccuracyTriggerFrame, ...]
+    window_accuracy: float
+    history_mean_accuracy: float
+    history_std_accuracy: float
+    accuracy_drop_threshold: float
+    buffered_window_count: int
+
+    @property
+    def training_frame_ids(self) -> tuple[int, ...]:
+        return tuple(int(sample.frame_id) for sample in self.training_samples)
+
+    def trigger_metadata(self) -> dict[str, Any]:
+        return {
+            "trigger_reason": "accuracy_drop",
+            "window_accuracy": float(self.window_accuracy),
+            "history_mean_accuracy": float(self.history_mean_accuracy),
+            "history_std_accuracy": float(self.history_std_accuracy),
+            "accuracy_drop_threshold": float(self.accuracy_drop_threshold),
+            "buffered_window_count": int(self.buffered_window_count),
+            "trigger_window_frame_ids": [int(v) for v in self.trigger_window_frame_ids],
+            "training_frame_ids": [int(v) for v in self.training_frame_ids],
+        }
+
+
+@dataclass
+class AccuracyTriggerPendingJob:
+    model_key: tuple[str, int, str, str]
+    job_id: str
+    window_id: str
+    base_model_version: str
+    frame_ids: tuple[int, ...]
+    status: str = "QUEUED"
+    message: str = ""
+    result_model_version: str = ""
+    submitted_at_ms: int = 0
+    finished_at_ms: int = 0
+
+
+@dataclass
+class AccuracyTriggerCommandRecord:
+    command_id: str
+    run_id: str
+    edge_id: int
+    job_id: str
+    window_id: str
+    base_model_version: str
+    frame_ids: tuple[int, ...]
+    result_model_version: str = ""
+    state: str = "pending"
+    created_at_ms: int = 0
+    delivered_at_ms: int = 0
+    expires_at_ms: int = 0
+    acked_at_ms: int = 0
+    delivery_count: int = 0
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "type": "baseline_training_job_available",
+            "command_id": self.command_id,
+            "run_id": self.run_id,
+            "baseline_method": _METHOD,
+            "edge_id": int(self.edge_id),
+            "job_id": self.job_id,
+            "window_id": self.window_id,
+            "base_model_version": self.base_model_version,
+            "result_model_version": self.result_model_version,
+            "training_frame_ids": [int(value) for value in self.frame_ids],
+            "trigger_reason": "accuracy_drop",
+            "expires_at_ms": int(self.expires_at_ms),
+        }
+
+
+@dataclass
+class _ModelAccuracyState:
+    current_window: list[AccuracyTriggerFrame] = field(default_factory=list)
+    history: list[float] = field(default_factory=list)
+    buffer_windows: deque[AccuracyTriggerWindow] = field(default_factory=deque)
+    pending_jobs: dict[str, AccuracyTriggerPendingJob] = field(default_factory=dict)
+    last_decision: AccuracyTriggerWindow | None = None
+    last_failure_message: str = ""
+
+
+class AccuracyTriggerController:
+    def __init__(self, config: object | Mapping[str, Any] | None = None) -> None:
+        self.config = config
+        self.trigger_window_size = max(
+            1,
+            int(_config_value(config, "trigger_window_size", 8)),
+        )
+        self.min_history_windows = max(
+            1,
+            int(_config_value(config, "min_history_windows", 2)),
+        )
+        self.accuracy_drop_sigma = float(_config_value(config, "accuracy_drop_sigma", 1.0))
+        self.history_decay = float(_config_value(config, "history_decay", 0.9))
+        self.buffer_max_windows = max(1, int(_config_value(config, "buffer_max_windows", 8)))
+        self.buffer_max_samples = max(1, int(_config_value(config, "buffer_max_samples", 64)))
+        self.metric = str(_config_value(config, "metric", "teacher_f1") or "teacher_f1")
+        self.agreement_iou_threshold = float(
+            _config_value(config, "agreement_iou_threshold", 0.5)
+        )
+        self.agreement_score_threshold = float(
+            _config_value(config, "agreement_score_threshold", 0.0)
+        )
+        self.training_strategy = str(_config_value(config, "training_strategy", "freeze"))
+        self.trainable_param_ratio = float(_config_value(config, "trainable_param_ratio", 0.3))
+        self.command_timeout_ms = max(
+            1000,
+            int(_config_value(config, "command_timeout_ms", 30000)),
+        )
+        if self.metric != "teacher_f1":
+            raise ValueError("accuracy trigger metric must be teacher_f1")
+        self._lock = threading.RLock()
+        self._states: dict[tuple[str, int, str, str], _ModelAccuracyState] = {}
+        self._commands: dict[str, AccuracyTriggerCommandRecord] = {}
+        self._command_by_job: dict[str, str] = {}
+
+    def add_frame(
+        self,
+        payload: BaselineFramePayload,
+        *,
+        teacher_prediction: Mapping[str, Any],
+    ) -> AccuracyTriggerSubmission | None:
+        if str(payload.baseline_method) != _METHOD or not payload.raw_frame:
+            return None
+        frame = AccuracyTriggerFrame.from_payload(
+            payload,
+            teacher_prediction=teacher_prediction,
+        )
+        key = _model_key(frame.run_id, frame.edge_id, frame.model_name, frame.model_version)
+        with self._lock:
+            state = self._states.setdefault(key, _ModelAccuracyState())
+            state.current_window.append(frame)
+            if len(state.current_window) < self.trigger_window_size:
+                return None
+            window_samples = tuple(state.current_window[: self.trigger_window_size])
+            state.current_window = state.current_window[self.trigger_window_size :]
+            return self._close_window_locked(key, state, window_samples)
+
+    def record_submission_result(
+        self,
+        submission: AccuracyTriggerSubmission,
+        *,
+        accepted: bool,
+        job_id: str,
+        status: str,
+        message: str = "",
+    ) -> None:
+        with self._lock:
+            state = self._states.setdefault(submission.model_key, _ModelAccuracyState())
+            if not bool(accepted) or not str(job_id or ""):
+                state.last_failure_message = str(message or "training job rejected")
+                return
+            normalized_status = str(status or "QUEUED").upper() or "QUEUED"
+            pending = AccuracyTriggerPendingJob(
+                model_key=submission.model_key,
+                job_id=str(job_id),
+                window_id=str(submission.window_id),
+                base_model_version=str(submission.model_version or "0"),
+                frame_ids=tuple(int(value) for value in submission.training_frame_ids),
+                status=normalized_status,
+                message=str(message or ""),
+                submitted_at_ms=now_ms(),
+            )
+            state.pending_jobs[str(job_id)] = pending
+            command_id = f"accuracy-trigger-{submission.edge_id}-{job_id}"
+            self._command_by_job[str(job_id)] = command_id
+            self._commands[command_id] = AccuracyTriggerCommandRecord(
+                command_id=command_id,
+                run_id=str(submission.run_id),
+                edge_id=int(submission.edge_id),
+                job_id=str(job_id),
+                window_id=str(submission.window_id),
+                base_model_version=str(submission.model_version or "0"),
+                frame_ids=tuple(int(value) for value in submission.training_frame_ids),
+                created_at_ms=now_ms(),
+            )
+
+    def poll_commands(self, *, run_id: str, edge_id: int) -> list[dict[str, Any]]:
+        current_ms = now_ms()
+        with self._lock:
+            for command in self._commands.values():
+                if command.run_id != str(run_id) or int(command.edge_id) != int(edge_id):
+                    continue
+                if command.state == "acked":
+                    continue
+                if command.state == "delivered" and int(command.expires_at_ms) > current_ms:
+                    continue
+                command.state = "delivered"
+                command.delivered_at_ms = current_ms
+                command.expires_at_ms = current_ms + self.command_timeout_ms
+                command.delivery_count += 1
+                return [command.to_payload()]
+        return []
+
+    def ack_from_metrics(self, *, edge_id: int, metrics_json: str) -> None:
+        if not metrics_json:
+            return
+        try:
+            payload = json.loads(metrics_json)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, Mapping):
+            return
+        update_ack = payload.get("accuracy_trigger_model_update_applied")
+        if isinstance(update_ack, Mapping):
+            self.mark_model_update_applied(
+                edge_id=int(edge_id),
+                command_id=str(update_ack.get("command_id", "") or ""),
+                job_id=str(update_ack.get("job_id", "") or ""),
+                result_model_version=str(update_ack.get("result_model_version", "") or ""),
+            )
+            return
+        terminal_ack = payload.get("accuracy_trigger_job_terminal")
+        if isinstance(terminal_ack, Mapping):
+            self.mark_job_terminal(
+                edge_id=int(edge_id),
+                command_id=str(terminal_ack.get("command_id", "") or ""),
+                job_id=str(terminal_ack.get("job_id", "") or ""),
+                status=str(terminal_ack.get("status", "") or ""),
+                message=str(terminal_ack.get("message", "") or ""),
+            )
+            return
+        for command_id in list(payload.get("acked_commands") or []):
+            self.mark_command_acked(edge_id=int(edge_id), command_id=str(command_id))
+
+    def mark_model_update_applied(
+        self,
+        *,
+        edge_id: int,
+        command_id: str = "",
+        job_id: str = "",
+        result_model_version: str = "",
+    ) -> None:
+        with self._lock:
+            command = self._resolve_command_locked(
+                edge_id=int(edge_id),
+                command_id=command_id,
+                job_id=job_id,
+            )
+            if command is not None:
+                command.state = "acked"
+                command.acked_at_ms = now_ms()
+                command.result_model_version = str(result_model_version or "")
+            pending = self._resolve_pending_locked(command=command, job_id=job_id)
+            if pending is None:
+                return
+            pending.status = "SUCCEEDED"
+            pending.result_model_version = str(result_model_version or "")
+            pending.finished_at_ms = now_ms()
+            self._states.pop(pending.model_key, None)
+
+    def mark_job_terminal(
+        self,
+        *,
+        edge_id: int,
+        command_id: str = "",
+        job_id: str = "",
+        status: str,
+        message: str = "",
+    ) -> None:
+        normalized = str(status or "").upper()
+        with self._lock:
+            command = self._resolve_command_locked(
+                edge_id=int(edge_id),
+                command_id=command_id,
+                job_id=job_id,
+            )
+            if command is not None:
+                command.state = "acked"
+                command.acked_at_ms = now_ms()
+            pending = self._resolve_pending_locked(command=command, job_id=job_id)
+            if pending is None:
+                return
+            pending.status = normalized if normalized in _TERMINAL_FAILURES else "FAILED"
+            pending.message = str(message or "")
+            pending.finished_at_ms = now_ms()
+
+    def mark_command_acked(self, *, edge_id: int, command_id: str) -> None:
+        with self._lock:
+            command = self._commands.get(str(command_id))
+            if command is None or int(command.edge_id) != int(edge_id):
+                return
+            command.state = "acked"
+            command.acked_at_ms = now_ms()
+
+    def snapshot(self, *, run_id: str, edge_id: int, model_name: str, model_version: str) -> dict:
+        key = _model_key(run_id, edge_id, model_name, model_version)
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return {
+                    "history": [],
+                    "buffer_window_count": 0,
+                    "buffer_frame_ids": [],
+                    "pending_jobs": {},
+                    "last_decision": None,
+                }
+            return {
+                "history": list(state.history),
+                "buffer_window_count": len(state.buffer_windows),
+                "buffer_frame_ids": [
+                    int(sample.frame_id)
+                    for window in state.buffer_windows
+                    for sample in window.samples
+                ],
+                "pending_jobs": {
+                    job_id: pending.status for job_id, pending in state.pending_jobs.items()
+                },
+                "last_decision": (
+                    {
+                        "window_id": state.last_decision.window_id,
+                        "accuracy": state.last_decision.accuracy,
+                        "history_mean_accuracy": state.last_decision.history_mean_accuracy,
+                        "history_std_accuracy": state.last_decision.history_std_accuracy,
+                        "accuracy_drop_threshold": state.last_decision.accuracy_drop_threshold,
+                        "triggered": state.last_decision.triggered,
+                        "frame_ids": list(state.last_decision.frame_ids),
+                    }
+                    if state.last_decision is not None
+                    else None
+                ),
+            }
+
+    def _close_window_locked(
+        self,
+        key: tuple[str, int, str, str],
+        state: _ModelAccuracyState,
+        samples: tuple[AccuracyTriggerFrame, ...],
+    ) -> AccuracyTriggerSubmission | None:
+        accuracy = self._window_accuracy(samples)
+        mean, std = _weighted_stats(state.history, decay=self.history_decay)
+        threshold = mean - (float(self.accuracy_drop_sigma) * std)
+        history_ready = len(state.history) >= self.min_history_windows
+        active_pending = any(
+            str(pending.status).upper() not in _TERMINAL_FAILURES | {"SUCCEEDED"}
+            for pending in state.pending_jobs.values()
+        )
+        triggered = bool(history_ready and not active_pending and threshold > accuracy)
+        window_id = stable_window_id(
+            run_id=key[0],
+            baseline_method=_METHOD,
+            training_strategy=self.training_strategy,
+            trainable_param_ratio=self.trainable_param_ratio,
+            edge_id=key[1],
+            model_version=key[3],
+            frame_ids=[sample.frame_id for sample in samples],
+        )
+        window = AccuracyTriggerWindow(
+            window_id=window_id,
+            samples=samples,
+            accuracy=accuracy,
+            history_mean_accuracy=mean,
+            history_std_accuracy=std,
+            accuracy_drop_threshold=threshold,
+            triggered=triggered,
+        )
+        prior_buffered_window_count = len(state.buffer_windows)
+        state.history.append(float(accuracy))
+        state.buffer_windows.append(window)
+        self._trim_buffer_locked(state)
+        state.last_decision = window
+        if not triggered:
+            return None
+        training_samples = tuple(
+            sample for buffered in state.buffer_windows for sample in buffered.samples
+        )
+        return AccuracyTriggerSubmission(
+            model_key=key,
+            run_id=key[0],
+            edge_id=key[1],
+            model_name=key[2],
+            model_version=key[3],
+            video_source=str(samples[-1].video_source if samples else ""),
+            window_id=window_id,
+            trigger_window_frame_ids=tuple(int(sample.frame_id) for sample in samples),
+            training_samples=training_samples,
+            window_accuracy=accuracy,
+            history_mean_accuracy=mean,
+            history_std_accuracy=std,
+            accuracy_drop_threshold=threshold,
+            buffered_window_count=prior_buffered_window_count,
+        )
+
+    def _window_accuracy(self, samples: tuple[AccuracyTriggerFrame, ...]) -> float:
+        if not samples:
+            return 0.0
+        scores = [
+            teacher_f1(
+                sample.edge_prediction,
+                sample.teacher_prediction,
+                iou_threshold=self.agreement_iou_threshold,
+                score_threshold=self.agreement_score_threshold,
+            )
+            for sample in samples
+        ]
+        return float(sum(scores) / len(scores))
+
+    def _trim_buffer_locked(self, state: _ModelAccuracyState) -> None:
+        while len(state.buffer_windows) > self.buffer_max_windows:
+            state.buffer_windows.popleft()
+        while (
+            len(state.buffer_windows) > 1
+            and _buffer_sample_count(state) > self.buffer_max_samples
+        ):
+            state.buffer_windows.popleft()
+
+    def _resolve_command_locked(
+        self,
+        *,
+        edge_id: int,
+        command_id: str = "",
+        job_id: str = "",
+    ) -> AccuracyTriggerCommandRecord | None:
+        command = self._commands.get(str(command_id or ""))
+        if command is None and job_id:
+            mapped_command_id = self._command_by_job.get(str(job_id))
+            command = self._commands.get(str(mapped_command_id or ""))
+        if command is None or int(command.edge_id) != int(edge_id):
+            return None
+        return command
+
+    def _resolve_pending_locked(
+        self,
+        *,
+        command: AccuracyTriggerCommandRecord | None,
+        job_id: str = "",
+    ) -> AccuracyTriggerPendingJob | None:
+        resolved_job_id = str(job_id or (command.job_id if command is not None else "") or "")
+        if not resolved_job_id:
+            return None
+        for state in self._states.values():
+            pending = state.pending_jobs.get(resolved_job_id)
+            if pending is not None:
+                return pending
+        return None
+
+
+def _model_key(
+    run_id: str,
+    edge_id: int,
+    model_name: str,
+    model_version: str,
+) -> tuple[str, int, str, str]:
+    return (str(run_id), int(edge_id), str(model_name or ""), str(model_version or "0"))
+
+
+def _buffer_sample_count(state: _ModelAccuracyState) -> int:
+    return sum(len(window.samples) for window in state.buffer_windows)
+
+
+def _weighted_stats(values: list[float], *, decay: float) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    if len(values) == 1:
+        return float(values[0]), 0.0
+    bounded_decay = min(1.0, max(1.0e-12, float(decay)))
+    count = len(values)
+    weights = [bounded_decay ** (count - index - 1) for index in range(count)]
+    total_weight = sum(weights)
+    mean = sum(weight * float(value) for weight, value in zip(weights, values)) / total_weight
+    variance = (
+        sum(weight * ((float(value) - mean) ** 2) for weight, value in zip(weights, values))
+        / total_weight
+    )
+    return float(mean), float(math.sqrt(max(0.0, variance)))
+
+
+def _config_value(config: object | Mapping[str, Any] | None, name: str, default: Any) -> Any:
+    if isinstance(config, Mapping):
+        return config.get(name, default)
+    if config is not None and hasattr(config, name):
+        return getattr(config, name)
+    return default

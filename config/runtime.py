@@ -253,6 +253,15 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     trainable_param_ratio: float = 0.3
     training_failure_backoff_sec: float = 30.0
     return_model_update: bool = True
+    trigger_window_size: int = 8
+    min_history_windows: int = 2
+    accuracy_drop_sigma: float = 1.0
+    history_decay: float = 0.9
+    buffer_max_windows: int = 8
+    buffer_max_samples: int = 64
+    metric: str = "teacher_f1"
+    agreement_iou_threshold: float = 0.5
+    agreement_score_threshold: float = 0.0
 
 
 @dataclass
@@ -733,13 +742,58 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio",
         float(config.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio),
     )
-    if float(config.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio) > 1.0:
+    accuracy_cfg = config.baseline.accuracy_trigger_cloud_retraining
+    if float(accuracy_cfg.trainable_param_ratio) > 1.0:
         raise ValueError(
             "baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio must be <= 1"
         )
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.trigger_window_size",
+        int(accuracy_cfg.trigger_window_size),
+    )
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.min_history_windows",
+        int(accuracy_cfg.min_history_windows),
+    )
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.accuracy_drop_sigma",
+        float(accuracy_cfg.accuracy_drop_sigma),
+        allow_zero=True,
+    )
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.history_decay",
+        float(accuracy_cfg.history_decay),
+    )
+    if float(accuracy_cfg.history_decay) > 1.0:
+        raise ValueError(
+            "baseline.accuracy_trigger_cloud_retraining.history_decay must be <= 1"
+        )
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.buffer_max_windows",
+        int(accuracy_cfg.buffer_max_windows),
+    )
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.buffer_max_samples",
+        int(accuracy_cfg.buffer_max_samples),
+    )
+    if str(accuracy_cfg.metric or "").strip() != "teacher_f1":
+        raise ValueError(
+            "baseline.accuracy_trigger_cloud_retraining.metric must be teacher_f1"
+        )
+    for name in ("agreement_iou_threshold", "agreement_score_threshold"):
+        value = float(getattr(accuracy_cfg, name))
+        _validate_positive(
+            f"baseline.accuracy_trigger_cloud_retraining.{name}",
+            value,
+            allow_zero=True,
+        )
+        if value > 1.0:
+            raise ValueError(
+                f"baseline.accuracy_trigger_cloud_retraining.{name} must be <= 1"
+            )
     allowed_baseline_training = {"freeze"}
     accuracy_strategy = str(
-        config.baseline.accuracy_trigger_cloud_retraining.training_strategy or ""
+        accuracy_cfg.training_strategy or ""
     ).strip()
     if accuracy_strategy not in allowed_baseline_training:
         raise ValueError(

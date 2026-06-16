@@ -270,6 +270,57 @@ class RunningCommandTrainingTransport(CommandTrainingTransport):
         )
 
 
+class AccuracyCommandTrainingTransport(RecordingTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.commands: list[dict[str, object]] = []
+        self.acked: list[dict[str, object]] = []
+
+    def poll_command(self, *, run_id: str, baseline_method: str, edge_id: int):
+        del run_id, baseline_method, edge_id
+        return list(self.commands)
+
+    def ack_command(
+        self,
+        *,
+        run_id: str,
+        baseline_method: str,
+        edge_id: int,
+        command_id: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.acked.append(
+            {
+                "run_id": run_id,
+                "baseline_method": baseline_method,
+                "edge_id": int(edge_id),
+                "command_id": command_id,
+                "metadata": dict(metadata or {}),
+            }
+        )
+        self.commands = [item for item in self.commands if item.get("command_id") != command_id]
+
+    def get_training_job_status(self, *, edge_id: int, job_id: str):
+        return message_transmission_pb2.TrainingJobStatusReply(
+            found=True,
+            job_id=str(job_id),
+            edge_id=int(edge_id),
+            status="SUCCEEDED",
+            result_available=True,
+            result_model_version="1",
+        )
+
+    def download_trained_model(self, *, edge_id: int, job_id: str):
+        del edge_id
+        return message_transmission_pb2.DownloadTrainedModelReply(
+            success=True,
+            job_id=str(job_id),
+            status="SUCCEEDED",
+            model_data="model-update",
+            result_model_version="1",
+        )
+
+
 class FakeTask:
     def __init__(self, *, source: str, model_version: str = "0") -> None:
         self.result_source = source
@@ -359,6 +410,21 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
         == pytest.approx(0.3)
     )
     assert config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec == 30.0
+    assert config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size == 8
+    assert config.baseline.accuracy_trigger_cloud_retraining.min_history_windows == 2
+    assert config.baseline.accuracy_trigger_cloud_retraining.accuracy_drop_sigma == pytest.approx(
+        1.0
+    )
+    assert config.baseline.accuracy_trigger_cloud_retraining.history_decay == pytest.approx(0.9)
+    assert config.baseline.accuracy_trigger_cloud_retraining.buffer_max_windows == 8
+    assert config.baseline.accuracy_trigger_cloud_retraining.buffer_max_samples == 64
+    assert config.baseline.accuracy_trigger_cloud_retraining.metric == "teacher_f1"
+    assert config.baseline.accuracy_trigger_cloud_retraining.agreement_iou_threshold == (
+        pytest.approx(0.5)
+    )
+    assert config.baseline.accuracy_trigger_cloud_retraining.agreement_score_threshold == (
+        pytest.approx(0.0)
+    )
     assert config.baseline.edge.split_runtime_policy == "disabled"
 
 
@@ -430,7 +496,7 @@ def test_cloud_backed_baselines_require_explicit_run_id() -> None:
     assert _resolve_baseline_run_id("pure_edge_local_updating", None) is None
 
 
-def test_accuracy_adapter_uploads_keyframes_and_generic_training_bundle(tmp_path) -> None:
+def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_path) -> None:
     transport = RecordingTransport()
     adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
@@ -462,7 +528,6 @@ def test_accuracy_adapter_uploads_keyframes_and_generic_training_bundle(tmp_path
             latency_ms=1.0,
         )
         _wait_until(lambda: len(transport.uploaded) == 1)
-        _wait_until(lambda: len(transport.training_requests) == 1)
 
         payload = transport.uploaded[0]
         assert payload.frame_id == 2
@@ -470,22 +535,7 @@ def test_accuracy_adapter_uploads_keyframes_and_generic_training_bundle(tmp_path
         assert payload.confidence == pytest.approx(0.9)
         assert payload.entropy == pytest.approx(0.25)
         assert payload.quality_metadata["training_strategy"] == "freeze"
-
-        manifest = _manifest_from_bundle(transport.training_requests[0]["payload_zip"])
-        expected_window = stable_window_id(
-            run_id="acc-run",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            training_strategy="freeze",
-            trainable_param_ratio=0.3,
-            edge_id=2,
-            model_version="0",
-            frame_ids=[2],
-        )
-        assert manifest["protocol_version"] == BASELINE_TRAINING_PROTOCOL_VERSION
-        assert manifest["training_strategy"] == "freeze"
-        assert manifest["training_config"]["trainable_param_ratio"] == pytest.approx(0.3)
-        assert manifest["window_id"] == expected_window
-        assert manifest["frames"][0]["edge_prediction"]["result_source"] == "inference"
+        assert transport.training_requests == []
 
         adapter.on_sampled_inference_result(
             frame=frame,
@@ -497,12 +547,12 @@ def test_accuracy_adapter_uploads_keyframes_and_generic_training_bundle(tmp_path
             latency_ms=1.0,
         )
         time.sleep(0.1)
-        assert len(transport.training_requests) == 1
+        assert transport.training_requests == []
     finally:
         adapter.close()
 
 
-def test_accuracy_adapter_failed_window_enters_backoff(tmp_path) -> None:
+def test_accuracy_adapter_never_enters_local_training_backoff(tmp_path) -> None:
     config = _config(tmp_path)
     config.baseline.training.training_window_size = 1
     config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec = 30.0
@@ -527,8 +577,10 @@ def test_accuracy_adapter_failed_window_enters_backoff(tmp_path) -> None:
             detection_score=[],
             latency_ms=1.0,
         )
-        _wait_until(lambda: len(transport.training_requests) == 1)
-        _wait_until(lambda: adapter._training_state.active_job is None)
+        _wait_until(lambda: len(transport.uploaded) == 1)
+        time.sleep(0.1)
+        assert transport.training_requests == []
+        assert adapter._training_state.active_job is None
 
         adapter.on_sampled_inference_result(
             frame=frame,
@@ -541,7 +593,7 @@ def test_accuracy_adapter_failed_window_enters_backoff(tmp_path) -> None:
         )
         time.sleep(0.1)
 
-        assert len(transport.training_requests) == 1
+        assert transport.training_requests == []
     finally:
         adapter.close()
 
@@ -675,6 +727,70 @@ def test_ekya_adapter_defers_command_ack_while_cloud_job_active(tmp_path) -> Non
         assert transport.acked == ["cmd-1", "cmd-2"]
         assert adapter._cloud_scheduled_active_job is not None
         assert adapter._cloud_scheduled_active_job.job_id == "job-2"
+    finally:
+        adapter.close()
+
+
+def test_accuracy_adapter_validates_cloud_command_and_acks_after_update(tmp_path) -> None:
+    transport = AccuracyCommandTrainingTransport()
+    edge = RecordingEdge()
+    adapter = BaselineEdgeAdapter(
+        config=_config(tmp_path),
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="acc-run",
+        edge_id=2,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    try:
+        adapter.before_video_start(edge)
+        transport.commands = [
+            {
+                "type": "baseline_training_job_available",
+                "command_id": "bad-cmd",
+                "run_id": "wrong-run",
+                "baseline_method": "accuracy_trigger_cloud_retraining",
+                "edge_id": 2,
+                "job_id": "job-bad",
+                "window_id": "window-bad",
+                "base_model_version": "0",
+            }
+        ]
+        adapter._discover_cloud_scheduled_training()
+        assert adapter._cloud_scheduled_active_job is None
+        assert transport.acked == []
+
+        transport.commands = [
+            {
+                "type": "baseline_training_job_available",
+                "command_id": "cmd-1",
+                "run_id": "acc-run",
+                "baseline_method": "accuracy_trigger_cloud_retraining",
+                "edge_id": 2,
+                "job_id": "job-1",
+                "window_id": "window-1",
+                "base_model_version": "0",
+            }
+        ]
+        adapter._last_command_poll_at = 0.0
+        adapter._discover_cloud_scheduled_training()
+
+        assert adapter._cloud_scheduled_active_job is not None
+        assert adapter._cloud_scheduled_active_job.job_id == "job-1"
+        assert transport.acked == []
+
+        adapter._poll_cloud_scheduled_training()
+
+        assert edge.updates
+        assert edge.updates[0]["submitted_model_version"] == "0"
+        assert edge.updates[0]["result_model_version"] == "1"
+        assert transport.acked
+        ack = transport.acked[0]
+        assert ack["command_id"] == "cmd-1"
+        update_ack = ack["metadata"]["accuracy_trigger_model_update_applied"]
+        assert update_ack["job_id"] == "job-1"
+        assert update_ack["base_model_version"] == "0"
+        assert update_ack["result_model_version"] == "1"
     finally:
         adapter.close()
 

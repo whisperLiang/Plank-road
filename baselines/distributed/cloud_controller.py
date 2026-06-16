@@ -30,6 +30,10 @@ from baselines.runtime.upload_client import (
     BASELINE_TRAINING_PROTOCOL_VERSION,
     build_baseline_training_bundle,
 )
+from cloud.baselines.accuracy_trigger_controller import (
+    AccuracyTriggerController,
+    AccuracyTriggerSubmission,
+)
 from config.baseline import validate_baseline_method
 from grpc_server import message_transmission_pb2
 from model_management.model_delta_payload import (
@@ -38,6 +42,7 @@ from model_management.model_delta_payload import (
 )
 
 _EKYA_METHOD = "ekya_style_centralized_scheduling"
+_ACCURACY_TRIGGER_METHOD = "accuracy_trigger_cloud_retraining"
 _TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "STALE", "CANCELLED"}
 
 
@@ -88,6 +93,12 @@ class DistributedBaselineController:
         self._inference_results: dict[tuple[str, str, int, int], dict[str, Any]] = {}
 
         self._ekya_enabled = self.baseline_method == _EKYA_METHOD
+        self._accuracy_trigger_enabled = self.baseline_method == _ACCURACY_TRIGGER_METHOD
+        self._accuracy_trigger_controller = (
+            AccuracyTriggerController(baseline_method_config)
+            if self._accuracy_trigger_enabled
+            else None
+        )
         self._teacher_results: dict[tuple[str, str, int, int], dict[str, Any]] = {}
         self._ekya_windows: dict[tuple[str, str, int], deque[EkyaWindowSample]] = {}
         self._ekya_window_status: dict[tuple[int, str], str] = {}
@@ -185,15 +196,30 @@ class DistributedBaselineController:
         self.register_edge(run_id=run_id, baseline_method=baseline_method, edge_id=edge_id)
         if self._ekya_enabled:
             self._ack_ekya_commands_from_metrics(edge_id=int(edge_id), metrics_json=metrics_json)
+        if self._accuracy_trigger_controller is not None:
+            self._accuracy_trigger_controller.ack_from_metrics(
+                edge_id=int(edge_id),
+                metrics_json=metrics_json,
+            )
 
     def upload_frame(self, payload: BaselineFramePayload) -> dict[str, Any]:
         key = self._state_key(payload.run_id, payload.baseline_method, payload.edge_id)
         is_ekya = payload.baseline_method == _EKYA_METHOD
-        inference_result = self._infer_payload_if_available(payload, key, purpose="display")
+        is_accuracy_trigger = payload.baseline_method == _ACCURACY_TRIGGER_METHOD
+        inference_result = (
+            {}
+            if is_accuracy_trigger
+            else self._infer_payload_if_available(payload, key, purpose="display")
+        )
         teacher_result = (
             self._infer_payload_if_available(payload, key, purpose="annotation")
-            if is_ekya
+            if is_ekya or is_accuracy_trigger
             else {}
+        )
+        teacher_prediction = (
+            dict(teacher_result.get("cloud_prediction", {}) or {})
+            if teacher_result
+            else dict(payload.teacher_prediction)
         )
         stored_payload = replace(
             payload,
@@ -201,11 +227,10 @@ class DistributedBaselineController:
             cloud_prediction=dict(inference_result.get("cloud_prediction", {}))
             if inference_result
             else dict(payload.cloud_prediction),
-            teacher_prediction=dict(teacher_result.get("cloud_prediction", {}))
-            if teacher_result
-            else dict(payload.teacher_prediction),
+            teacher_prediction=teacher_prediction,
         )
         frame_key = (*key, int(payload.frame_id))
+        accuracy_submission: AccuracyTriggerSubmission | None = None
         with self._lock:
             state = self.register_edge(
                 run_id=payload.run_id,
@@ -233,6 +258,13 @@ class DistributedBaselineController:
                     teacher_result=teacher_result,
                 )
                 self._ekya_condition.notify_all()
+            if is_accuracy_trigger and self._accuracy_trigger_controller is not None:
+                accuracy_submission = self._accuracy_trigger_controller.add_frame(
+                    payload,
+                    teacher_prediction=teacher_prediction,
+                )
+        if accuracy_submission is not None:
+            self._submit_accuracy_trigger_training(accuracy_submission)
         return {
             "accepted": True,
             "message": "frame accepted",
@@ -289,6 +321,11 @@ class DistributedBaselineController:
     ) -> list[dict[str, Any]]:
         self._state_key(run_id, baseline_method, edge_id)
         if not self._ekya_enabled:
+            if self._accuracy_trigger_controller is not None:
+                return self._accuracy_trigger_controller.poll_commands(
+                    run_id=run_id,
+                    edge_id=int(edge_id),
+                )
             return []
         current_ms = now_ms()
         timeout_ms = max(
@@ -315,6 +352,92 @@ class DistributedBaselineController:
             return None
         self._poll_ekya_jobs()
         return self._ekya_scheduler.run_once()
+
+    def _submit_accuracy_trigger_training(
+        self,
+        submission: AccuracyTriggerSubmission,
+    ) -> None:
+        if self.training_backend is None or self._accuracy_trigger_controller is None:
+            if self._accuracy_trigger_controller is not None:
+                self._accuracy_trigger_controller.record_submission_result(
+                    submission,
+                    accepted=False,
+                    job_id="",
+                    status="",
+                    message="training backend is not configured",
+                )
+            return
+        training_config = _training_config_dict(self.baseline_training_config)
+        training_config.update(
+            {
+                "trainable_param_ratio": float(
+                    _config_value(self.baseline_method_config, "trainable_param_ratio", 0.3)
+                ),
+                "teacher_annotation_threshold": _config_value(
+                    self.baseline_method_config,
+                    "teacher_annotation_threshold",
+                    None,
+                ),
+            }
+        )
+        sample_dicts = [sample.to_training_sample() for sample in submission.training_samples]
+        payload_zip = build_baseline_training_bundle(
+            run_id=submission.run_id,
+            baseline_method=_ACCURACY_TRIGGER_METHOD,
+            edge_id=submission.edge_id,
+            model_name=submission.model_name,
+            model_version=submission.model_version,
+            training_strategy="freeze",
+            window_id=submission.window_id,
+            samples=sample_dicts,
+            training_config=training_config,
+            weights_path=self.model_weights_path,
+            tinynext_input_size=self.tinynext_input_size,
+            trigger_metadata=submission.trigger_metadata(),
+        )
+        request_id = (
+            f"accuracy-trigger:{submission.run_id}:{submission.edge_id}:"
+            f"{submission.model_version}:{submission.window_id}"
+        )
+        request = message_transmission_pb2.SubmitTrainingJobRequest(
+            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
+            edge_id=int(submission.edge_id),
+            request_id=request_id,
+            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
+            cache_path=f"edge_{int(submission.edge_id)}/baseline_training",
+            send_low_conf_features=False,
+            frame_indices=[int(sample.frame_id) for sample in submission.training_samples],
+            payload_zip=payload_zip,
+            base_model_version=str(submission.model_version or "0"),
+        )
+        reply = self.training_backend.submit_training_job(request)
+        accepted = bool(getattr(reply, "accepted", False))
+        job_id = str(getattr(reply, "job_id", "") or "")
+        self._accuracy_trigger_controller.record_submission_result(
+            submission,
+            accepted=accepted,
+            job_id=job_id,
+            status=str(getattr(reply, "status", "") or ""),
+            message=str(getattr(reply, "message", "") or ""),
+        )
+        if accepted and job_id:
+            logger.info(
+                "accuracy_trigger_training_job_submitted edge={} window={} job_id={} "
+                "samples={} accuracy={:.4f} threshold={:.4f}",
+                submission.edge_id,
+                submission.window_id,
+                job_id,
+                len(submission.training_samples),
+                submission.window_accuracy,
+                submission.accuracy_drop_threshold,
+            )
+        else:
+            logger.info(
+                "accuracy_trigger_training_job_rejected edge={} window={} reason={}",
+                submission.edge_id,
+                submission.window_id,
+                str(getattr(reply, "message", "") or "training job rejected"),
+            )
 
     def _state_key(
         self,

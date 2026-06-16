@@ -34,6 +34,9 @@ baseline:
   upload_frames_to_cloud: false
   use_cloud_teacher: false
  accuracy_trigger_cloud_retraining:
+  # Engineering variant for this refactor: this reuses the existing
+  # Plank-Road frame filter as the keyframe selector, while training
+  # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
   reuse_plank_road_frame_filter: true
   upload_keyframes_only: true
   trigger_on_cloud_comparison: true
@@ -41,14 +44,23 @@ baseline:
   trainable_param_ratio: 0.3
   training_failure_backoff_sec: 30.0
   return_model_update: true
+  trigger_window_size: 8
+  min_history_windows: 2
+  accuracy_drop_sigma: 1.0
+  history_decay: 0.9
+  buffer_max_windows: 8
+  buffer_max_samples: 64
+  metric: teacher_f1
+  agreement_iou_threshold: 0.5
+  agreement_score_threshold: 0.0
  ekya_style_centralized_scheduling:
   upload_raw_frames: true
   use_frame_filter: false
   cloud_inference: true
   return_cloud_inference_to_edge: true
- training_strategy: freeze
- display_source: cloud
- enable_micro_profiling: true
+  training_strategy: freeze
+  display_source: cloud
+  enable_micro_profiling: true
   max_microprofile_configs: 8
   trainable_param_ratios: [0.1, 0.3, 0.5]
   sample_fractions: [0.5, 1.0]

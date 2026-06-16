@@ -12,12 +12,10 @@ from baselines.distributed.metrics import DistributedMetricsWriter
 from baselines.runtime.policies import create_policy
 from baselines.runtime.training_state import (
     BaselineActiveTrainingJob,
-    BaselineTrainingSample,
     BaselineTrainingState,
 )
 from baselines.runtime.upload_client import (
     BaselineUploadClient,
-    build_baseline_training_bundle,
     encode_frame,
     validate_baseline_training_strategy,
 )
@@ -178,21 +176,6 @@ class BaselineEdgeAdapter:
             training_strategy=self.training_strategy,
             result_source=edge_prediction["result_source"],
         )
-        if (
-            self.baseline_method == "accuracy_trigger_cloud_retraining"
-            and decision.upload_frame
-            and raw_frame
-        ):
-            self._training_state.add_sample(
-                BaselineTrainingSample(
-                    frame_id=int(frame_index),
-                    raw_frame=raw_frame,
-                    edge_prediction=edge_prediction,
-                    quality_metadata=quality_metadata,
-                    is_keyframe=bool(decision.is_keyframe),
-                    model_version=edge_prediction["model_version"],
-                )
-            )
         if decision.upload_frame and self.transport is not None:
             self._queue.put(payload)
 
@@ -278,124 +261,11 @@ class BaselineEdgeAdapter:
                 frame_id=int(payload.frame_id),
                 result=cloud_result,
             )
-        self._maybe_submit_training()
-
-    def _maybe_submit_training(self) -> None:
-        if (
-            self.baseline_method != "accuracy_trigger_cloud_retraining"
-            or self.transport is None
-            or not hasattr(self.transport, "submit_training_bundle")
-        ):
-            return
-        now = time.monotonic()
-        ready = self._training_state.ready_window(now=now)
-        if ready is None:
-            return
-        if ready.skip_reason:
-            if ready.skip_reason == "training_failure_backoff":
-                logger.info(
-                    "[BaselineAdapter] skipped trigger edge={} window={} "
-                    "reason=training_failure_backoff remaining={:.1f}",
-                    self.edge_id,
-                    ready.window_id,
-                    ready.remaining_backoff_sec,
-                )
-            self.metrics.record(
-                "training_trigger_skipped",
-                window_id=ready.window_id,
-                reason=ready.skip_reason,
-                remaining_backoff_sec=ready.remaining_backoff_sec,
-            )
-            return
-        window_id = ready.window_id
-        samples = ready.samples
-        sample_dicts = [
-            {
-                "frame_id": sample.frame_id,
-                "raw_frame": sample.raw_frame,
-                "edge_prediction": sample.edge_prediction,
-                "quality_metadata": sample.quality_metadata,
-                "is_keyframe": sample.is_keyframe,
-            }
-            for sample in samples
-        ]
-        try:
-            payload_zip = build_baseline_training_bundle(
-                run_id=self.run_id,
-                baseline_method=self.baseline_method,
-                edge_id=self.edge_id,
-                model_name=str(getattr(self.config, "lightweight", "")),
-                model_version=str(samples[-1].model_version if samples else "0"),
-                training_strategy=self.training_strategy,
-                window_id=window_id,
-                samples=sample_dicts,
-                training_config=self._training_config,
-                weights_path=str(getattr(self.config, "weights_path", "") or ""),
-                tinynext_input_size=getattr(self.config, "tinynext_input_size", None),
-            )
-            request_id = (
-                f"baseline:{self.baseline_method}:{self.run_id}:{self.edge_id}:{window_id}"
-            )
-            reply = self.transport.submit_training_bundle(
-                edge_id=self.edge_id,
-                request_id=request_id,
-                payload_zip=payload_zip,
-                frame_ids=[sample.frame_id for sample in samples],
-                base_model_version=str(samples[-1].model_version if samples else "0"),
-            )
-        except Exception as exc:
-            self._training_state.mark_submit_failed(
-                window_id=window_id,
-                message=str(exc),
-                now=time.monotonic(),
-            )
-            logger.warning(
-                "[BaselineAdapter] training trigger failed edge={} window={} reason={}",
-                self.edge_id,
-                window_id,
-                exc,
-            )
-            self.metrics.record(
-                "training_request_failed",
-                window_id=window_id,
-                message=str(exc),
-            )
-            return
-        if not bool(getattr(reply, "accepted", False)):
-            message = str(getattr(reply, "message", "") or "training job rejected")
-            self._training_state.mark_submit_failed(
-                window_id=window_id,
-                message=message,
-                now=time.monotonic(),
-            )
-            self.metrics.record(
-                "training_request_rejected",
-                window_id=window_id,
-                message=message,
-            )
-            return
-        job_id = str(getattr(reply, "job_id", "") or "")
-        self._training_state.mark_submitted(
-            job_id=job_id,
-            window_id=window_id,
-            samples=samples,
-            now=time.monotonic(),
-        )
-        logger.info(
-            "[BaselineAdapter] training trigger accepted edge={} window={} samples={}",
-            self.edge_id,
-            window_id,
-            len(samples),
-        )
-        self.metrics.record(
-            "training_job_submitted",
-            window_id=window_id,
-            job_id=job_id,
-            samples=len(samples),
-        )
-
     def _poll_active_training(self) -> None:
-        if self.baseline_method == "ekya_style_centralized_scheduling":
+        if self.baseline_method in {
+            "ekya_style_centralized_scheduling",
+            "accuracy_trigger_cloud_retraining",
+        }:
             self._discover_cloud_scheduled_training()
             self._poll_cloud_scheduled_training()
             return
@@ -496,6 +366,17 @@ class BaselineEdgeAdapter:
             job_id = str(command.get("job_id", "") or "")
             if not job_id:
                 continue
+            if (
+                self.baseline_method == "accuracy_trigger_cloud_retraining"
+                and not self._valid_accuracy_trigger_command(command)
+            ):
+                self.metrics.record(
+                    "cloud_scheduled_training_command_rejected",
+                    command_id=command_id,
+                    job_id=job_id,
+                    reason="identity_or_lineage_mismatch",
+                )
+                continue
             adopted_or_known = job_id in self._known_cloud_scheduled_job_ids
             if not adopted_or_known:
                 if self._cloud_scheduled_active_job is not None:
@@ -513,11 +394,19 @@ class BaselineEdgeAdapter:
                     training_strategy="freeze",
                     trainable_param_ratio=self.trainable_param_ratio,
                     frame_ids=tuple(),
+                    command_id=command_id,
+                    run_id=str(command.get("run_id", self.run_id) or self.run_id),
+                    baseline_method=str(
+                        command.get("baseline_method", self.baseline_method)
+                        or self.baseline_method
+                    ),
                 )
                 adopted_or_known = True
                 logger.info(
-                    "[BaselineAdapter] adopted cloud-scheduled Ekya job edge={} job={}",
+                    "[BaselineAdapter] adopted cloud-scheduled baseline job edge={} "
+                    "method={} job={}",
                     self.edge_id,
+                    self.baseline_method,
                     job_id,
                 )
                 self.metrics.record(
@@ -525,21 +414,55 @@ class BaselineEdgeAdapter:
                     job_id=job_id,
                     window_id=str(command.get("window_id", "") or ""),
                 )
-            if command_id and adopted_or_known:
+            if (
+                command_id
+                and adopted_or_known
+                and self.baseline_method == "ekya_style_centralized_scheduling"
+            ):
                 self._ack_cloud_command(command_id)
 
-    def _ack_cloud_command(self, command_id: str) -> None:
+    def _valid_accuracy_trigger_command(self, command: dict[str, Any]) -> bool:
+        if str(command.get("run_id", "") or "") != self.run_id:
+            return False
+        if str(command.get("baseline_method", "") or "") != self.baseline_method:
+            return False
+        try:
+            if int(command.get("edge_id", -1)) != self.edge_id:
+                return False
+        except (TypeError, ValueError):
+            return False
+        if not str(command.get("job_id", "") or ""):
+            return False
+        base_model_version = str(command.get("base_model_version", "0") or "0")
+        current_version = str(getattr(self._edge, "model_version", "0") or "0")
+        return base_model_version == current_version
+
+    def _ack_cloud_command(
+        self,
+        command_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         if not command_id or command_id in self._acked_command_ids:
             return
         if self.transport is None or not hasattr(self.transport, "ack_command"):
             return
         try:
-            self.transport.ack_command(
-                run_id=self.run_id,
-                baseline_method=self.baseline_method,
-                edge_id=self.edge_id,
-                command_id=command_id,
-            )
+            if metadata:
+                self.transport.ack_command(
+                    run_id=self.run_id,
+                    baseline_method=self.baseline_method,
+                    edge_id=self.edge_id,
+                    command_id=command_id,
+                    metadata=metadata,
+                )
+            else:
+                self.transport.ack_command(
+                    run_id=self.run_id,
+                    baseline_method=self.baseline_method,
+                    edge_id=self.edge_id,
+                    command_id=command_id,
+                )
             self._acked_command_ids.add(command_id)
         except Exception as exc:
             logger.warning("[BaselineAdapter] command ack failed: {}", exc)
@@ -562,6 +485,8 @@ class BaselineEdgeAdapter:
         if status in {"", "QUEUED", "RUNNING"}:
             return
         terminal_message = str(getattr(reply, "message", "") or "")
+        update_applied = False
+        result_model_version = str(getattr(reply, "result_model_version", "") or "")
         try:
             if status == "SUCCEEDED" and bool(getattr(reply, "result_available", False)):
                 download = self.transport.download_trained_model(
@@ -582,6 +507,10 @@ class BaselineEdgeAdapter:
                         job_id=active.job_id,
                         message=str(getattr(download, "message", "") or ""),
                         log_prefix="[BaselineAdapter]",
+                    )
+                    update_applied = True
+                    result_model_version = str(
+                        getattr(download, "result_model_version", "") or result_model_version
                     )
                     logger.info(
                         "[BaselineAdapter] cloud-scheduled model update applied edge={} "
@@ -612,6 +541,31 @@ class BaselineEdgeAdapter:
                 message=str(exc),
             )
         finally:
+            if self.baseline_method == "accuracy_trigger_cloud_retraining" and active.command_id:
+                if update_applied:
+                    self._ack_cloud_command(
+                        active.command_id,
+                        metadata={
+                            "accuracy_trigger_model_update_applied": {
+                                "command_id": active.command_id,
+                                "job_id": active.job_id,
+                                "base_model_version": active.model_version,
+                                "result_model_version": result_model_version,
+                            }
+                        },
+                    )
+                elif status not in {"", "QUEUED", "RUNNING"}:
+                    self._ack_cloud_command(
+                        active.command_id,
+                        metadata={
+                            "accuracy_trigger_job_terminal": {
+                                "command_id": active.command_id,
+                                "job_id": active.job_id,
+                                "status": status,
+                                "message": terminal_message,
+                            }
+                        },
+                    )
             self._cloud_scheduled_active_job = None
 
 
