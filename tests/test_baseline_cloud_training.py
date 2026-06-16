@@ -124,6 +124,68 @@ def test_freeze_strategy_rejects_edge_targets_unless_explicit(
     assert result["success"] is True
 
 
+def test_freeze_strategy_uses_suffix_segment_optimizer_when_graph_optimizer_is_empty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bundle = _bundle(
+        training_config={
+            "num_epoch": 1,
+            "batch_size": 2,
+            "device": "cpu",
+            "allow_edge_targets": True,
+        }
+    )
+    with zipfile.ZipFile(io.BytesIO(bundle), "r") as archive:
+        archive.extractall(tmp_path)
+    configured: dict[str, list[torch.nn.Parameter]] = {}
+
+    def fake_configure(model, runtime):
+        del runtime
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        params = [model.layers[-1].weight, model.layers[-1].bias]
+        for parameter in params:
+            parameter.requires_grad_(True)
+        configured["params"] = params
+        return ("layers.2.weight", "layers.2.bias"), params
+
+    def fake_run_freeze_training(**kwargs):
+        optimizer = kwargs["optimizer"]
+        optimizer_params = list(optimizer.param_groups[0]["params"])
+        assert optimizer_params == configured["params"]
+        return {"batch_count": len(list(kwargs["samples"])), "final_loss": 0.0}
+
+    monkeypatch.setattr(
+        freeze_strategy_module,
+        "configure_fixed_prefix_training",
+        fake_configure,
+    )
+    monkeypatch.setattr(
+        freeze_strategy_module,
+        "build_split_retrain_optimizer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("TorchLens suffix optimizer found no trainable suffix parameters.")
+        ),
+    )
+    monkeypatch.setattr(
+        freeze_strategy_module,
+        "run_freeze_training",
+        fake_run_freeze_training,
+    )
+    strategy = CloudTorchLensFreezeTrainingStrategy(
+        learner=SimpleNamespace(large_od=None),
+        runtime_factory=lambda model, manifest, workspace: SimpleNamespace(),
+        model_builder=lambda *args, **kwargs: TinyRawDetectionModel(),
+        update_serializer=_fake_update_serializer,
+        loss_builder=lambda _model: _count_loss,
+    )
+
+    result = strategy.train_from_workspace(tmp_path)
+
+    assert result["success"] is True
+
+
 def test_freeze_strategy_has_default_runtime_factory() -> None:
     strategy = CloudTorchLensFreezeTrainingStrategy()
 

@@ -39,6 +39,22 @@ class BatchNormPolicyModel(nn.Module):
         return self.head(self.suffix_dropout(self.head_bn(self.prefix(x))))
 
 
+class EmptyNamedParameterWrapper(nn.Module):
+    def __init__(self, model: CountingModel) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+    def parameters(self, recurse: bool = True):
+        return self.model.parameters(recurse=recurse)
+
+    def named_parameters(self, *args, **kwargs):
+        del args, kwargs
+        return iter(())
+
+
 def _patch_raw_batches(monkeypatch, inputs: torch.Tensor, targets: torch.Tensor) -> None:
     monkeypatch.setattr(exp, "get_split_runtime_input_resize_mode", lambda _model: "direct_resize")
 
@@ -95,11 +111,8 @@ def test_raw_freeze_can_use_torchlens_suffix_names() -> None:
     assert not model.stem.bias.requires_grad
 
 
-def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
-    monkeypatch,
-) -> None:
+def test_fixed_prefix_config_trains_suffix_with_eval_prefix() -> None:
     suffix_names = ("head_bn.weight", "head_bn.bias", "head.weight", "head.bias")
-    monkeypatch.setattr(fm, "_suffix_parameter_names", lambda _runtime: suffix_names)
 
     full_model = BatchNormPolicyModel()
     full_runtime = SimpleNamespace(
@@ -110,10 +123,17 @@ def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
             full_model.head,
         ),
     )
-    fm.configure_fixed_prefix_training(
+    configured_names, configured_params = fm.configure_fixed_prefix_training(
         full_model,
         full_runtime,
     )
+    assert configured_names == suffix_names
+    assert configured_params == [
+        full_model.head_bn.weight,
+        full_model.head_bn.bias,
+        full_model.head.weight,
+        full_model.head.bias,
+    ]
     assert not full_model.prefix[0].training
     assert not full_model.prefix[1].training
     assert full_model.head_bn.training
@@ -150,6 +170,36 @@ def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
     assert not raw_model.suffix_dropout.training
     assert not raw_model.prefix[2].weight.requires_grad
     assert raw_model.head.weight.requires_grad
+
+
+def test_fixed_prefix_config_uses_suffix_segment_when_wrapper_has_no_named_parameters() -> None:
+    inner = CountingModel()
+    wrapper = EmptyNamedParameterWrapper(inner)
+    runtime = SimpleNamespace(
+        prefix_segment=inner.stem,
+        suffix_segment=inner.head,
+    )
+
+    suffix_names, suffix_params = fm.configure_fixed_prefix_training(wrapper, runtime)
+
+    assert suffix_names == ("suffix_segment.weight", "suffix_segment.bias")
+    assert suffix_params == [inner.head.weight, inner.head.bias]
+    assert not inner.stem.weight.requires_grad
+    assert not inner.stem.bias.requires_grad
+    assert inner.head.weight.requires_grad
+    assert inner.head.bias.requires_grad
+
+
+def test_fixed_prefix_config_rejects_detached_suffix_segment_parameters() -> None:
+    inner = CountingModel()
+    wrapper = EmptyNamedParameterWrapper(inner)
+    runtime = SimpleNamespace(
+        prefix_segment=inner.stem,
+        suffix_segment=nn.Linear(5, 1),
+    )
+
+    with pytest.raises(RuntimeError, match="No suffix parameters"):
+        fm.configure_fixed_prefix_training(wrapper, runtime)
 
 
 def test_freeze_rebuilds_prefix_each_batch_without_cached_boundaries(monkeypatch) -> None:

@@ -11,7 +11,7 @@ import torch
 from torchvision.transforms import functional as F
 
 from cloud.training.adapters import train_split_suffix_batch
-from model_management.universal_model_split import _suffix_parameter_names
+from model_management.universal_model_split import _suffix_parameter_entries
 
 
 @dataclass(frozen=True)
@@ -25,46 +25,45 @@ def configure_fixed_prefix_training(
     split_model: torch.nn.Module,
     runtime: Any,
 ) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
-    torchlens_runtime = (
-        runtime._ensure_runtime()
-        if callable(getattr(runtime, "_ensure_runtime", None))
-        else runtime
-    )
-    suffix_names = tuple(_suffix_parameter_names(runtime))
-    suffix_name_set = set(suffix_names)
+    torchlens_runtime = _runtime_from_splitter(runtime)
 
     split_model.eval()
     for parameter in split_model.parameters():
         parameter.requires_grad_(False)
         parameter.grad = None
+    serializable_parameter_ids = _parameter_id_set(split_model)
 
     suffix_segment = getattr(torchlens_runtime, "suffix_segment", None)
     if isinstance(suffix_segment, torch.nn.Module):
         suffix_segment.train()
 
+    prefix_parameter_ids: set[int] = set()
     for segment_name in ("prefix_segment", "training_prefix_segment"):
         prefix_segment = getattr(torchlens_runtime, segment_name, None)
         if not isinstance(prefix_segment, torch.nn.Module):
             continue
         prefix_segment.eval()
         for parameter in prefix_segment.parameters(recurse=True):
+            prefix_parameter_ids.add(id(parameter))
             parameter.requires_grad_(False)
             parameter.grad = None
 
-    suffix_params: list[torch.nn.Parameter] = []
-    named_parameters = dict(split_model.named_parameters())
-    for name, parameter in named_parameters.items():
-        if name in suffix_name_set:
-            parameter.requires_grad_(True)
-            suffix_params.append(parameter)
-
-    missing = sorted(suffix_name_set - set(named_parameters.keys()))
-    if missing:
-        raise RuntimeError(
-            "Suffix trainable parameters missing from split model: " + ", ".join(missing)
+    suffix_names, suffix_params = _collect_graph_suffix_parameters(
+        runtime,
+        allowed_parameter_ids=serializable_parameter_ids,
+        frozen_parameter_ids=prefix_parameter_ids,
+    )
+    if not suffix_params:
+        suffix_names, suffix_params = _collect_suffix_segment_parameters(
+            torchlens_runtime,
+            split_model=split_model,
+            allowed_parameter_ids=serializable_parameter_ids,
+            frozen_parameter_ids=prefix_parameter_ids,
         )
     if not suffix_params:
         raise RuntimeError("No suffix parameters were selected for freeze training")
+    for parameter in suffix_params:
+        parameter.requires_grad_(True)
     return suffix_names, suffix_params
 
 
@@ -188,11 +187,7 @@ def _batches(samples: list[RawFrameTrainingSample], batch_size: int):
 
 
 def _set_runtime_prefix_module_state(runtime: Any) -> None:
-    torchlens_runtime = (
-        runtime._ensure_runtime()
-        if callable(getattr(runtime, "_ensure_runtime", None))
-        else runtime
-    )
+    torchlens_runtime = _runtime_from_splitter(runtime)
     for segment_name in ("prefix_segment", "training_prefix_segment"):
         prefix_segment = getattr(torchlens_runtime, segment_name, None)
         if isinstance(prefix_segment, torch.nn.Module):
@@ -200,11 +195,97 @@ def _set_runtime_prefix_module_state(runtime: Any) -> None:
 
 
 def _set_runtime_suffix_module_state(runtime: Any) -> None:
-    torchlens_runtime = (
-        runtime._ensure_runtime()
-        if callable(getattr(runtime, "_ensure_runtime", None))
-        else runtime
-    )
+    torchlens_runtime = _runtime_from_splitter(runtime)
     suffix_segment = getattr(torchlens_runtime, "suffix_segment", None)
     if isinstance(suffix_segment, torch.nn.Module):
         suffix_segment.train()
+
+
+def _runtime_from_splitter(runtime: Any) -> Any:
+    ensure_runtime = getattr(runtime, "_ensure_runtime", None)
+    if callable(ensure_runtime):
+        return ensure_runtime()
+    return getattr(runtime, "runtime", runtime)
+
+
+def _collect_graph_suffix_parameters(
+    runtime: Any,
+    *,
+    allowed_parameter_ids: set[int],
+    frozen_parameter_ids: set[int],
+) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
+    try:
+        entries = list(_suffix_parameter_entries(runtime))
+    except RuntimeError:
+        return (), []
+    suffix_names: list[str] = []
+    suffix_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for name, parameter in entries:
+        parameter_id = id(parameter)
+        if (
+            parameter_id in seen
+            or parameter_id in frozen_parameter_ids
+            or parameter_id not in allowed_parameter_ids
+        ):
+            continue
+        seen.add(parameter_id)
+        suffix_names.append(str(name))
+        suffix_params.append(parameter)
+    return tuple(suffix_names), suffix_params
+
+
+def _collect_suffix_segment_parameters(
+    torchlens_runtime: Any,
+    *,
+    split_model: torch.nn.Module,
+    allowed_parameter_ids: set[int],
+    frozen_parameter_ids: set[int],
+) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
+    suffix_segment = getattr(torchlens_runtime, "suffix_segment", None)
+    if not isinstance(suffix_segment, torch.nn.Module):
+        return (), []
+    name_lookup = _parameter_name_lookup(
+        split_model,
+        getattr(torchlens_runtime, "model", None),
+    )
+    suffix_names: list[str] = []
+    suffix_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for index, (segment_name, parameter) in enumerate(
+        suffix_segment.named_parameters(recurse=True)
+    ):
+        parameter_id = id(parameter)
+        if (
+            parameter_id in seen
+            or parameter_id in frozen_parameter_ids
+            or parameter_id not in allowed_parameter_ids
+        ):
+            continue
+        seen.add(parameter_id)
+        suffix_names.append(
+            name_lookup.get(
+                parameter_id,
+                f"suffix_segment.{segment_name}" if segment_name else f"suffix_segment.{index}",
+            )
+        )
+        suffix_params.append(parameter)
+    return tuple(suffix_names), suffix_params
+
+
+def _parameter_name_lookup(*modules: object) -> dict[int, str]:
+    names: dict[int, str] = {}
+    for module in modules:
+        if not isinstance(module, torch.nn.Module):
+            continue
+        try:
+            iterator = module.named_parameters(recurse=True)
+        except TypeError:
+            iterator = module.named_parameters()
+        for name, parameter in iterator:
+            names.setdefault(id(parameter), str(name))
+    return names
+
+
+def _parameter_id_set(module: torch.nn.Module) -> set[int]:
+    return {id(parameter) for parameter in module.parameters()}

@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping
 
 import cv2
 import torch
+from loguru import logger
 
 from cloud.model_update import serialize_model_update
 from cloud.training.baseline_workspace import (
@@ -85,19 +86,32 @@ class CloudTorchLensFreezeTrainingStrategy:
         model.to(device)
         runtime = self.runtime_factory(model, dict(manifest), workspace_path)
         _names, suffix_params = configure_fixed_prefix_training(model, runtime)
-        optimizer = build_split_retrain_optimizer(
-            model,
-            runtime=runtime,
-            learning_rate=float(training_cfg.get("learning_rate", 1e-3) or 1e-3),
-            optimizer_name=str(training_cfg.get("optimizer_name", "adam") or "adam"),
-            weight_decay=float(training_cfg.get("weight_decay", 0.0) or 0.0),
-        )
+        learning_rate = float(training_cfg.get("learning_rate", 1e-3) or 1e-3)
+        optimizer_name = str(training_cfg.get("optimizer_name", "adam") or "adam")
+        weight_decay = float(training_cfg.get("weight_decay", 0.0) or 0.0)
+        try:
+            optimizer = build_split_retrain_optimizer(
+                model,
+                runtime=runtime,
+                learning_rate=learning_rate,
+                optimizer_name=optimizer_name,
+                weight_decay=weight_decay,
+            )
+        except RuntimeError as exc:
+            if not suffix_params:
+                raise
+            optimizer = None
+            logger.info(
+                "[CloudTraining] strategy=freeze using suffix segment optimizer "
+                "because TorchLens graph optimizer was unavailable: {}",
+                exc,
+            )
         if optimizer is None:
             optimizer = build_optimizer(
                 suffix_params,
-                learning_rate=float(training_cfg.get("learning_rate", 1e-3) or 1e-3),
-                optimizer_name=str(training_cfg.get("optimizer_name", "adam") or "adam"),
-                weight_decay=float(training_cfg.get("weight_decay", 0.0) or 0.0),
+                learning_rate=learning_rate,
+                optimizer_name=optimizer_name,
+                weight_decay=weight_decay,
             )
         samples = samples_from_baseline_manifest(
             workspace_path,
