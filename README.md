@@ -306,8 +306,10 @@ baseline:
 `accuracy_trigger_cloud_retraining` uses edge predictions only for trigger and
 evaluation metadata; cloud training targets come from the cloud teacher unless
 an explicit ablation opts into edge targets. `ekya_style_centralized_scheduling`
-shares display, raw-frame upload, cloud inference, and optional cloud-result
-overlay; full Ekya scheduler training is intentionally separate future work.
+uploads raw sampled frames, returns cloud inference for display, runs
+cloud-side Ekya-style microprofiling over candidate freeze configs, schedules
+formal freeze training centrally, and publishes cloud-scheduled model updates to
+the selected edge through the shared training-job API.
 
 Accuracy-Trigger Cloud Retraining cloud:
 

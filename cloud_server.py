@@ -93,6 +93,7 @@ class CloudServer:
                 inference_fn=inference_fn,
                 training_backend=self.continual_backend,
                 baseline_training_config=getattr(baseline_config, "training", None),
+                baseline_method_config=getattr(baseline_config, method, None),
                 model_weights_path=str(getattr(config, "weights_path", "") or ""),
                 tinynext_input_size=getattr(config, "tinynext_input_size", None),
                 strict_run_id=True,
@@ -257,11 +258,12 @@ class CloudServer:
 
 
 def _baseline_cloud_inference_adapter(detector):
-    def infer(raw_frame: bytes) -> dict:
+    def infer(raw_frame: bytes, *, threshold=None, purpose: str = "display") -> dict:
+        del purpose
         frame = _decode_frame(raw_frame)
         if frame is None:
             return {"boxes": [], "labels": [], "scores": [], "confidence": 0.0}
-        boxes, labels, scores = detector.large_inference(frame)
+        boxes, labels, scores = detector.large_inference(frame, threshold=threshold)
         scores_list = _jsonable_list(scores)
         return {
             "boxes": _jsonable_list(boxes),

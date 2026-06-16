@@ -46,9 +46,22 @@ baseline:
   use_frame_filter: false
   cloud_inference: true
   return_cloud_inference_to_edge: true
-  training_strategy: freeze
-  display_source: cloud
-  enable_micro_profiling: true
+ training_strategy: freeze
+ display_source: cloud
+ enable_micro_profiling: true
+  max_microprofile_configs: 8
+  trainable_param_ratios: [0.1, 0.3, 0.5]
+  sample_fractions: [0.5, 1.0]
+  batch_sizes: []
+  formal_num_epochs: []
+  learning_rates: []
+  min_teacher_objects: 1
+  teacher_annotation_threshold: null
+  teacher_agreement_iou_threshold: 0.5
+  teacher_agreement_confidence_threshold: 0.0
+  min_inference_quality: 0.0
+  max_cloud_inference_latency_ms: 0.0
+  min_cloud_inference_fps: 0.0
 
 client:
  # the source video

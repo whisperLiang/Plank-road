@@ -34,7 +34,13 @@ def samples_from_baseline_manifest(
             continue
         image_path = workspace / str(item.get("image_path", "") or "")
         raw_frame = image_path.read_bytes()
-        target = _teacher_prediction(raw_frame, teacher)
+        target = dict(item.get("teacher_prediction") or {})
+        if not target:
+            teacher_predictions = manifest.get("teacher_predictions") or {}
+            if isinstance(teacher_predictions, Mapping):
+                target = dict(teacher_predictions.get(str(item.get("frame_id", ""))) or {})
+        if not target:
+            target = _teacher_prediction(raw_frame, teacher)
         if not target and allow_edge_targets:
             target = dict(item.get("edge_prediction") or {})
         if not target:

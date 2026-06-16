@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import io
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from cloud.training.parameter_freeze import (
     unwrap_trainable_module,
 )
 from model_management.detection_box_projection import ORIGINAL_XYXY
+from model_management.model_delta_payload import require_state_dict_delta_payload
 from model_management.model_zoo import build_detection_model
 from model_management.split_model_adapters import (
     build_split_training_loss,
@@ -91,6 +93,12 @@ class CloudBaselineFreezeTrainingStrategy:
         if not isinstance(model, torch.nn.Module):
             raise RuntimeError(f"model_builder returned non-module: {type(model)!r}")
         model.to(device)
+        _load_optional_base_model_update(
+            model,
+            workspace_path=workspace_path,
+            manifest=manifest,
+            device=device,
+        )
 
         trainable_module = unwrap_trainable_module(model, model_name=model_name)
         trainable_module.to(device)
@@ -203,6 +211,59 @@ def run_parameter_ratio_freeze_training(
         "full_train_time_sec": time.perf_counter() - started,
         "final_loss": losses[-1] if losses else None,
         "batch_count": len(losses),
+    }
+
+
+def run_parameter_ratio_freeze_microprofile(
+    *,
+    model: torch.nn.Module,
+    trainable_module: torch.nn.Module,
+    samples: Iterable[RawFrameTrainingSample],
+    batch_size: int,
+    epochs: int,
+    device: torch.device,
+    loss_fn: Callable[[Any, Any], torch.Tensor] | None,
+    optimizer: torch.optim.Optimizer,
+    evaluate_epoch: Callable[[int], float | None],
+) -> dict[str, Any]:
+    sample_list = list(samples)
+    losses: list[float] = []
+    proxy_metric_after_by_epoch: list[float | None] = []
+    started = time.perf_counter()
+    model.train()
+    trainable_module.train()
+    for epoch in range(1, int(epochs) + 1):
+        for batch in _batches(sample_list, max(1, int(batch_size))):
+            prepared = _prepare_raw_batch_for_full_forward(
+                model,
+                trainable_module,
+                batch,
+                device=device,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            outputs = _forward_full_model(
+                model,
+                trainable_module,
+                prepared,
+            )
+            loss = _compute_loss(outputs, copy.deepcopy(prepared.targets), loss_fn)
+            if not torch.is_tensor(loss):
+                raise RuntimeError(f"baseline freeze loss returned {type(loss)!r}")
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach().cpu().item()))
+        model.eval()
+        trainable_module.eval()
+        with torch.no_grad():
+            proxy_metric_after_by_epoch.append(evaluate_epoch(epoch))
+        model.train()
+        trainable_module.train()
+    return {
+        "microprofile_time_sec": time.perf_counter() - started,
+        "loss_before": losses[0] if losses else None,
+        "final_loss": losses[-1] if losses else None,
+        "batch_count": len(losses),
+        "proxy_metric_after_by_epoch": proxy_metric_after_by_epoch,
     }
 
 
@@ -451,6 +512,36 @@ def _build_optimizer(
     if name == "sgd":
         return torch.optim.SGD(params, lr=float(learning_rate), weight_decay=float(weight_decay))
     return torch.optim.Adam(params, lr=float(learning_rate), weight_decay=float(weight_decay))
+
+
+def _load_optional_base_model_update(
+    model: torch.nn.Module,
+    *,
+    workspace_path: Path,
+    manifest: Mapping[str, Any],
+    device: torch.device,
+) -> None:
+    payload_bytes = b""
+    update_path = str(manifest.get("base_model_update_path", "") or "")
+    if update_path:
+        path = workspace_path / update_path
+        if path.exists():
+            payload_bytes = path.read_bytes()
+    if not payload_bytes:
+        encoded = str(manifest.get("base_model_update_model_data", "") or "")
+        if encoded:
+            payload_bytes = base64.b64decode(encoded)
+    if not payload_bytes:
+        return
+    payload = require_state_dict_delta_payload(
+        torch.load(io.BytesIO(payload_bytes), map_location=device, weights_only=False)
+    )
+    state_dict = dict(payload["state_dict"])
+    model.load_state_dict(state_dict, strict=False)
+    logger.info(
+        "[BaselineTraining] loaded base model update: state_keys={}",
+        len(state_dict),
+    )
 
 
 def _trainable_param_ratio(training_cfg: Mapping[str, Any]) -> float:

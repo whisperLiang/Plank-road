@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import time
@@ -37,10 +38,12 @@ def build_baseline_training_bundle(
     training_config: Mapping[str, Any] | None = None,
     weights_path: str = "",
     tinynext_input_size: int | None = None,
+    base_model_update_model_data: str = "",
 ) -> bytes:
     strategy = validate_baseline_training_strategy(training_strategy)
     frame_entries: list[dict[str, Any]] = []
     edge_predictions: dict[str, dict[str, Any]] = {}
+    teacher_predictions: dict[str, dict[str, Any]] = {}
     quality_metadata: dict[str, dict[str, Any]] = {}
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -52,18 +55,22 @@ def build_baseline_training_bundle(
             frame_name = f"frames/{frame_id}.jpg"
             archive.writestr(frame_name, raw_frame)
             edge_prediction = dict(item.get("edge_prediction") or {})
+            teacher_prediction = dict(item.get("teacher_prediction") or {})
             metadata = dict(item.get("quality_metadata") or {})
             edge_predictions[str(frame_id)] = edge_prediction
+            if teacher_prediction:
+                teacher_predictions[str(frame_id)] = teacher_prediction
             quality_metadata[str(frame_id)] = metadata
-            frame_entries.append(
-                {
-                    "frame_id": frame_id,
-                    "image_path": frame_name,
-                    "is_keyframe": bool(item.get("is_keyframe", False)),
-                    "edge_prediction": edge_prediction,
-                    "quality_metadata": metadata,
-                }
-            )
+            frame_entry = {
+                "frame_id": frame_id,
+                "image_path": frame_name,
+                "is_keyframe": bool(item.get("is_keyframe", False)),
+                "edge_prediction": edge_prediction,
+                "quality_metadata": metadata,
+            }
+            if teacher_prediction:
+                frame_entry["teacher_prediction"] = teacher_prediction
+            frame_entries.append(frame_entry)
         if not frame_entries:
             raise RuntimeError("baseline training bundle contains no raw frames")
         normalized_training_config = dict(training_config or {})
@@ -80,6 +87,7 @@ def build_baseline_training_bundle(
             "window_id": str(window_id),
             "frame_ids": [int(item["frame_id"]) for item in frame_entries],
             "edge_predictions": edge_predictions,
+            "teacher_predictions": teacher_predictions,
             "quality_metadata": quality_metadata,
             "weights_path": str(weights_path or ""),
             "training_config": normalized_training_config,
@@ -87,6 +95,13 @@ def build_baseline_training_bundle(
         }
         if tinynext_input_size is not None and str(model_name).lower().startswith("tinynext"):
             manifest["tinynext_input_size"] = int(tinynext_input_size)
+        update_data = str(base_model_update_model_data or "")
+        if update_data:
+            try:
+                archive.writestr("base_model_update.pt", base64.b64decode(update_data))
+                manifest["base_model_update_path"] = "base_model_update.pt"
+            except Exception:
+                manifest["base_model_update_model_data"] = update_data
         archive.writestr(
             "baseline_trigger_manifest.json",
             json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8"),
@@ -153,6 +168,50 @@ class BaselineUploadClient:
             "success": bool(reply.success),
             "timestamp_ms": int(reply.timestamp_ms or int(time.time() * 1000)),
         }
+
+    def poll_command(
+        self,
+        *,
+        run_id: str,
+        baseline_method: str,
+        edge_id: int,
+    ) -> list[dict[str, Any]]:
+        reply = self.stub.PollCommand(
+            message_transmission_pb2.BaselineCommandRequest(
+                run_id=str(run_id),
+                baseline_method=str(baseline_method),
+                edge_id=int(edge_id),
+                timestamp_ms=int(time.time() * 1000),
+            )
+        )
+        if not bool(reply.success):
+            raise RuntimeError(reply.message)
+        commands: list[dict[str, Any]] = []
+        for item in list(reply.command_json):
+            value = json_loads(item)
+            if value:
+                commands.append(value)
+        return commands
+
+    def ack_command(
+        self,
+        *,
+        run_id: str,
+        baseline_method: str,
+        edge_id: int,
+        command_id: str,
+    ) -> None:
+        reply = self.stub.Heartbeat(
+            message_transmission_pb2.BaselineHeartbeatRequest(
+                run_id=str(run_id),
+                baseline_method=str(baseline_method),
+                edge_id=int(edge_id),
+                timestamp_ms=int(time.time() * 1000),
+                metrics_json=json_dumps({"acked_commands": [str(command_id)]}),
+            )
+        )
+        if not bool(reply.success):
+            raise RuntimeError(reply.message)
 
     def submit_training_bundle(
         self,

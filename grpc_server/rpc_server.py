@@ -227,6 +227,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 run_id=request.run_id,
                 baseline_method=request.baseline_method,
                 edge_id=int(request.edge_id),
+                metrics_json=request.metrics_json,
             )
             return message_transmission_pb2.BaselineAck(success=True, message="heartbeat recorded")
         except Exception as exc:
@@ -298,11 +299,30 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
     def PollCommand(self, request, context):
         del context
-        return message_transmission_pb2.BaselineCommandReply(
-            success=True,
-            message="no command",
-            command_json=[],
-        )
+        if self.baseline_controller is None:
+            return message_transmission_pb2.BaselineCommandReply(
+                success=False,
+                message="baseline controller is not configured",
+                command_json=[],
+            )
+        try:
+            commands = self.baseline_controller.poll_command(
+                run_id=request.run_id,
+                baseline_method=request.baseline_method,
+                edge_id=int(request.edge_id),
+            )
+            return message_transmission_pb2.BaselineCommandReply(
+                success=True,
+                message="command found" if commands else "no command",
+                command_json=[json_dumps(command) for command in commands],
+            )
+        except Exception as exc:
+            self._log_failure("PollCommand", exc)
+            return message_transmission_pb2.BaselineCommandReply(
+                success=False,
+                message=str(exc),
+                command_json=[],
+            )
 
     def DownloadInferenceResult(self, request, context):
         if self.baseline_controller is None:

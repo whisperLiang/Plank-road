@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import time
@@ -10,8 +11,18 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 import pytest
+import torch
 
 from baselines.distributed.cloud_controller import DistributedBaselineController
+from baselines.distributed.ekya import (
+    CloudScheduledEkyaJob,
+    EkyaCentralScheduler,
+    EkyaMicroProfiler,
+    EkyaReadyWindow,
+    EkyaWindowSample,
+    MicroProfileResult,
+    teacher_agreement_counts,
+)
 from baselines.distributed.messages import BaselineFramePayload
 from baselines.method_factory import create_policy, registered_methods
 from baselines.runtime import BaselineEdgeAdapter, stable_window_id
@@ -194,6 +205,71 @@ class FakeTrainingBackend:
         )
 
 
+class CommandTrainingTransport(RecordingTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.commands = [
+            {
+                "type": "baseline_training_job_available",
+                "command_id": "cmd-1",
+                "job_id": "job-1",
+                "window_id": "window-1",
+                "base_model_version": "0",
+                "expires_at_ms": int(time.time() * 1000) + 10000,
+            }
+        ]
+        self.acked: list[str] = []
+
+    def poll_command(self, *, run_id: str, baseline_method: str, edge_id: int):
+        del run_id, baseline_method, edge_id
+        return list(self.commands)
+
+    def ack_command(
+        self,
+        *,
+        run_id: str,
+        baseline_method: str,
+        edge_id: int,
+        command_id: str,
+    ) -> None:
+        del run_id, baseline_method, edge_id
+        self.acked.append(str(command_id))
+        self.commands = [item for item in self.commands if item.get("command_id") != command_id]
+
+    def get_training_job_status(self, *, edge_id: int, job_id: str):
+        del edge_id
+        return message_transmission_pb2.TrainingJobStatusReply(
+            found=True,
+            job_id=str(job_id),
+            edge_id=3,
+            status="SUCCEEDED",
+            result_available=True,
+            result_model_version="1",
+        )
+
+    def download_trained_model(self, *, edge_id: int, job_id: str):
+        del edge_id
+        return message_transmission_pb2.DownloadTrainedModelReply(
+            success=True,
+            job_id=str(job_id),
+            status="SUCCEEDED",
+            model_data="model-update",
+            result_model_version="1",
+        )
+
+
+class RunningCommandTrainingTransport(CommandTrainingTransport):
+    def get_training_job_status(self, *, edge_id: int, job_id: str):
+        del edge_id
+        return message_transmission_pb2.TrainingJobStatusReply(
+            found=True,
+            job_id=str(job_id),
+            edge_id=3,
+            status="RUNNING",
+            result_available=False,
+        )
+
+
 class FakeTask:
     def __init__(self, *, source: str, model_version: str = "0") -> None:
         self.result_source = source
@@ -214,6 +290,36 @@ class FakeEdge:
 
     def apply_model_update(self, *args, **kwargs) -> None:
         del args, kwargs
+
+
+class RecordingEdge(FakeEdge):
+    def __init__(self) -> None:
+        self.model_version = "0"
+        self.updates: list[dict[str, object]] = []
+
+    def apply_model_update(self, model_data, **kwargs) -> None:
+        self.updates.append({"model_data": model_data, **kwargs})
+        self.model_version = str(kwargs.get("result_model_version") or "1")
+
+
+class TinyMicroprofileDetectionModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.logit = torch.nn.Parameter(torch.tensor([0.0]))
+        self.forward_calls = 0
+
+    def forward(self, images):
+        self.forward_calls += 1
+        batch_size = int(images.shape[0]) if torch.is_tensor(images) and images.ndim else 1
+        score = torch.sigmoid(self.logit).reshape(1)
+        return [
+            {
+                "boxes": torch.tensor([[1.0, 1.0, 4.0, 4.0]], device=score.device),
+                "labels": torch.tensor([1], dtype=torch.int64, device=score.device),
+                "scores": score,
+            }
+            for _ in range(batch_size)
+        ]
 
 
 def test_legacy_baseline_files_are_removed() -> None:
@@ -476,6 +582,103 @@ def test_ekya_adapter_uploads_raw_frames_and_cloud_overlay_without_training(tmp_
         adapter.close()
 
 
+def test_ekya_adapter_shows_pending_before_cloud_result(tmp_path) -> None:
+    adapter = BaselineEdgeAdapter(
+        config=_config(tmp_path),
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        edge_id=3,
+        server_ip="127.0.0.1:1",
+        transport=RecordingTransport(),
+    )
+    try:
+        visual = adapter.display_visual(
+            {
+                "boxes": [[1, 1, 2, 2]],
+                "labels": [1],
+                "scores": [0.5],
+                "mode": "Local",
+                "frame_index": 9,
+            }
+        )
+        assert visual["mode"] == "CloudPending"
+        assert visual["boxes"] == []
+    finally:
+        adapter.close()
+
+
+def test_ekya_adapter_adopts_cloud_scheduled_job_without_edge_trigger(tmp_path) -> None:
+    transport = CommandTrainingTransport()
+    edge = RecordingEdge()
+    adapter = BaselineEdgeAdapter(
+        config=_config(tmp_path),
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        edge_id=3,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    try:
+        adapter.before_video_start(edge)
+        adapter._poll_active_training()
+
+        assert transport.training_requests == []
+        assert transport.acked == ["cmd-1"]
+        assert edge.updates
+        assert edge.updates[0]["submitted_model_version"] == "0"
+        assert edge.updates[0]["result_model_version"] == "1"
+        assert adapter._training_state.active_job is None
+    finally:
+        adapter.close()
+
+
+def test_ekya_adapter_defers_command_ack_while_cloud_job_active(tmp_path) -> None:
+    transport = RunningCommandTrainingTransport()
+    edge = RecordingEdge()
+    adapter = BaselineEdgeAdapter(
+        config=_config(tmp_path),
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        edge_id=3,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    try:
+        adapter.before_video_start(edge)
+        adapter._discover_cloud_scheduled_training()
+
+        assert transport.acked == ["cmd-1"]
+        assert adapter._cloud_scheduled_active_job is not None
+        assert adapter._cloud_scheduled_active_job.job_id == "job-1"
+
+        transport.commands = [
+            {
+                "type": "baseline_training_job_available",
+                "command_id": "cmd-2",
+                "job_id": "job-2",
+                "window_id": "window-2",
+                "base_model_version": "0",
+                "expires_at_ms": int(time.time() * 1000) + 10000,
+            }
+        ]
+        adapter._last_command_poll_at = 0.0
+        adapter._discover_cloud_scheduled_training()
+
+        assert transport.acked == ["cmd-1"]
+        assert "job-2" not in adapter._known_cloud_scheduled_job_ids
+        assert transport.commands[0]["command_id"] == "cmd-2"
+
+        adapter._cloud_scheduled_active_job = None
+        adapter._last_command_poll_at = 0.0
+        adapter._discover_cloud_scheduled_training()
+
+        assert transport.acked == ["cmd-1", "cmd-2"]
+        assert adapter._cloud_scheduled_active_job is not None
+        assert adapter._cloud_scheduled_active_job.job_id == "job-2"
+    finally:
+        adapter.close()
+
+
 def test_stable_window_id_includes_strategy_ratio_and_sorts_frames() -> None:
     first = stable_window_id(
         run_id="run-a",
@@ -559,6 +762,542 @@ def test_cloud_controller_infers_then_strips_raw_frame_bytes() -> None:
     assert controller._frames[frame_key].raw_frame == b""
 
 
+def test_cloud_controller_separates_display_and_teacher_annotation_cache() -> None:
+    calls: list[dict[str, object]] = []
+
+    def infer(raw, *, threshold=None, purpose="display"):
+        calls.append({"threshold": threshold, "purpose": purpose, "bytes": len(raw)})
+        score = 0.8 if purpose == "display" else 0.55
+        return {"boxes": [[0, 0, 4, 4]], "labels": [1], "scores": [score], "confidence": score}
+
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        inference_fn=infer,
+        baseline_method_config=SimpleNamespace(teacher_annotation_threshold=0.4),
+    )
+    try:
+        payload = BaselineFramePayload(
+            run_id="ekya-run",
+            baseline_method="ekya_style_centralized_scheduling",
+            edge_id=1,
+            frame_id=4,
+            raw_frame=b"frame-bytes",
+            upload_mode="raw_frame",
+        )
+        controller.upload_frame(payload)
+        frame_key = ("ekya-run", "ekya_style_centralized_scheduling", 1, 4)
+
+        assert controller._inference_results[frame_key]["cloud_prediction"]["scores"] == [0.8]
+        assert controller._teacher_results[frame_key]["cloud_prediction"]["scores"] == [0.55]
+        assert calls == [
+            {"threshold": None, "purpose": "display", "bytes": len(b"frame-bytes")},
+            {"threshold": 0.4, "purpose": "annotation", "bytes": len(b"frame-bytes")},
+        ]
+    finally:
+        controller.close()
+
+
+def test_ekya_poll_command_delivery_ack_and_timeout() -> None:
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        baseline_method_config=SimpleNamespace(command_timeout_ms=10),
+    )
+    try:
+        job = CloudScheduledEkyaJob(
+            edge_id=1,
+            window_id="window-1",
+            config_id="config-1",
+            job_id="job-1",
+            request_id="request-1",
+            base_model_version="0",
+            result_model_version="1",
+            frame_ids=(1,),
+            model_data="model",
+        )
+        with controller._lock:
+            controller._enqueue_ekya_update_command_locked(job)
+
+        first = controller.poll_command(
+            run_id="ekya-run",
+            baseline_method="ekya_style_centralized_scheduling",
+            edge_id=1,
+        )
+        assert len(first) == 1
+        command_id = first[0]["command_id"]
+        assert controller.poll_command(
+            run_id="ekya-run",
+            baseline_method="ekya_style_centralized_scheduling",
+            edge_id=1,
+        ) == []
+        with controller._lock:
+            controller._ekya_commands[command_id].expires_at_ms = int(time.time() * 1000) - 1
+        assert controller.poll_command(
+            run_id="ekya-run",
+            baseline_method="ekya_style_centralized_scheduling",
+            edge_id=1,
+        )[0]["command_id"] == command_id
+
+        controller.heartbeat(
+            run_id="ekya-run",
+            baseline_method="ekya_style_centralized_scheduling",
+            edge_id=1,
+            metrics_json=json.dumps({"acked_commands": [command_id]}),
+        )
+        assert controller.poll_command(
+            run_id="ekya-run",
+            baseline_method="ekya_style_centralized_scheduling",
+            edge_id=1,
+        ) == []
+    finally:
+        controller.close()
+
+
+def test_ekya_formal_training_request_has_shared_job_api_fields() -> None:
+    backend = FakeTrainingBackend()
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        training_backend=backend,
+        baseline_training_config=SimpleNamespace(
+            batch_size=2,
+            num_epoch=1,
+            learning_rate=1e-3,
+            min_training_samples=1,
+            training_window_size=8,
+            microprofile_epochs=1,
+            microprofile_max_samples=2,
+            device="cpu",
+        ),
+        baseline_method_config=SimpleNamespace(teacher_annotation_threshold=0.25),
+    )
+    sample = EkyaWindowSample(
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        edge_id=1,
+        frame_id=5,
+        timestamp_ms=1,
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        raw_frame=_jpeg_bytes(),
+        edge_prediction={},
+        cloud_prediction={},
+        teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.9]},
+        quality_metadata={},
+    )
+    window = EkyaReadyWindow(
+        edge_id=1,
+        window_id="window-1",
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        samples=(sample,),
+    )
+    result = MicroProfileResult(
+        edge_id=1,
+        window_id="window-1",
+        config_id="config-1",
+        training_strategy="freeze",
+        trainable_param_ratio=0.1,
+        sample_count=1,
+        microprofile_epochs=1,
+        formal_num_epoch=3,
+        batch_size=4,
+        learning_rate=0.01,
+        proxy_metric_name="teacher_agreement_f1",
+        proxy_metric_before=0.1,
+        proxy_metric_after_by_epoch=[0.2],
+        estimated_final_proxy_metric=0.4,
+        proxy_metric_gain=0.3,
+        elapsed_ms=1.0,
+        epoch_time_ms_at_full_gpu=1.0,
+        estimated_full_training_time_ms=3.0,
+        estimated_inference_penalty=0.0,
+        estimated_window_average_quality=0.4,
+        score=0.3,
+    )
+    try:
+        job_id = controller._submit_ekya_training(window, result)
+        assert job_id == "job-1"
+        request = backend.submitted[(1, "job-1")]
+        assert request.protocol_version == BASELINE_TRAINING_PROTOCOL_VERSION
+        assert request.job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING
+        assert request.edge_id == 1
+        assert request.frame_indices == [5]
+        assert request.base_model_version == "0"
+        assert request.payload_zip
+        assert request.cache_path == "edge_1/baseline_training"
+        assert request.request_id.startswith("ekya:ekya-run:1:window-1:config-1")
+        manifest = _manifest_from_bundle(request.payload_zip)
+        assert manifest["training_config"]["trainable_param_ratio"] == pytest.approx(0.1)
+        assert manifest["training_config"]["batch_size"] == 4
+        assert manifest["training_config"]["num_epoch"] == 3
+        assert manifest["training_config"]["learning_rate"] == pytest.approx(0.01)
+        assert manifest["frames"][0]["teacher_prediction"]["boxes"] == [[1, 1, 4, 4]]
+    finally:
+        controller.close()
+
+
+def test_ekya_model_update_cache_builds_cumulative_base_delta() -> None:
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+    )
+    first_update = _encoded_model_delta(
+        {"head.weight": torch.tensor([1.0])},
+        base_model_version="0",
+        result_model_version="1",
+    )
+    second_update = _encoded_model_delta(
+        {"tail.weight": torch.tensor([2.0])},
+        base_model_version="1",
+        result_model_version="2",
+    )
+    first_job = CloudScheduledEkyaJob(
+        edge_id=1,
+        window_id="window-1",
+        config_id="config-1",
+        job_id="job-1",
+        request_id="request-1",
+        base_model_version="0",
+        result_model_version="1",
+        frame_ids=(1,),
+    )
+    second_job = CloudScheduledEkyaJob(
+        edge_id=1,
+        window_id="window-2",
+        config_id="config-2",
+        job_id="job-2",
+        request_id="request-2",
+        base_model_version="1",
+        result_model_version="2",
+        frame_ids=(2,),
+    )
+    try:
+        with controller._lock:
+            controller._cache_ekya_model_update_locked(
+                first_job,
+                model_data=first_update,
+                result_model_version="1",
+            )
+            controller._cache_ekya_model_update_locked(
+                second_job,
+                model_data=second_update,
+                result_model_version="2",
+            )
+            cumulative = controller._edge_model_updates[(1, "2")]
+
+        payload = torch.load(
+            io.BytesIO(base64.b64decode(cumulative)),
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        assert payload["format"] == "state_dict_delta.v1"
+        assert payload["base_model_version"] == "0"
+        assert payload["result_model_version"] == "2"
+        assert set(payload["state_dict"]) == {"head.weight", "tail.weight"}
+        assert torch.equal(payload["state_dict"]["head.weight"], torch.tensor([1.0]))
+        assert torch.equal(payload["state_dict"]["tail.weight"], torch.tensor([2.0]))
+    finally:
+        controller.close()
+
+
+def test_ekya_training_skips_when_nonzero_base_update_is_missing() -> None:
+    backend = FakeTrainingBackend()
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        training_backend=backend,
+    )
+    window = _ekya_ready_window(model_version="1")
+    result = _microprofile_result()
+    try:
+        assert controller._ekya_profile_window(window) == []
+        assert controller._submit_ekya_training(window, result) is None
+        assert backend.submitted == {}
+    finally:
+        controller.close()
+
+
+def test_ekya_candidate_grid_limits_lightweight_configs_first() -> None:
+    profiler = EkyaMicroProfiler(
+        training_config=SimpleNamespace(batch_size=8, num_epoch=5, learning_rate=1e-3),
+        ekya_config=SimpleNamespace(
+            max_microprofile_configs=3,
+            trainable_param_ratios=[0.5, 0.1],
+            sample_fractions=[1.0, 0.5],
+            batch_sizes=[8, 2],
+            formal_num_epochs=[5, 1],
+            learning_rates=[1e-3],
+        ),
+    )
+
+    configs = profiler.candidate_configs(window_sample_count=10)
+
+    assert len(configs) == 3
+    assert [config.sample_count for config in configs] == [5, 5, 5]
+    assert [config.trainable_param_ratio for config in configs] == [0.1, 0.1, 0.1]
+    assert [config.formal_num_epoch for config in configs] == [1, 1, 5]
+
+
+def test_ekya_scheduler_selects_highest_window_average_quality() -> None:
+    submitted: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
+    first = EkyaReadyWindow(
+        edge_id=1,
+        window_id="window-1",
+        run_id="run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        samples=tuple(),
+    )
+    second = EkyaReadyWindow(
+        edge_id=2,
+        window_id="window-2",
+        run_id="run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        samples=tuple(),
+    )
+
+    def result(window, score, quality):
+        return MicroProfileResult(
+            edge_id=window.edge_id,
+            window_id=window.window_id,
+            config_id=f"config-{window.edge_id}",
+            training_strategy="freeze",
+            trainable_param_ratio=0.1,
+            sample_count=1,
+            microprofile_epochs=1,
+            formal_num_epoch=1,
+            batch_size=1,
+            learning_rate=1e-3,
+            proxy_metric_name="teacher_agreement_f1",
+            proxy_metric_before=0.1,
+            proxy_metric_after_by_epoch=[quality],
+            estimated_final_proxy_metric=quality,
+            proxy_metric_gain=quality - 0.1,
+            elapsed_ms=1.0,
+            epoch_time_ms_at_full_gpu=1.0,
+            estimated_full_training_time_ms=1.0,
+            estimated_inference_penalty=0.0,
+            estimated_window_average_quality=quality,
+            score=score,
+        )
+
+    scheduler = EkyaCentralScheduler(
+        ready_windows=lambda: [first, second],
+        profile_window=lambda window: [
+            result(window, 0.1, 0.2) if window.edge_id == 1 else result(window, 0.3, 0.4)
+        ],
+        submit_training=lambda window, selected: submitted.append(
+            (window.window_id, selected.config_id)
+        )
+        or "job",
+        mark_skip=lambda window, reason: skipped.append((window.window_id, reason)),
+    )
+
+    selected = scheduler.run_once()
+
+    assert selected is not None
+    assert selected.edge_id == 2
+    assert submitted == [("window-2", "config-2")]
+    assert skipped == []
+
+
+def test_ekya_scheduler_rejects_service_quality_violation() -> None:
+    window = EkyaReadyWindow(
+        edge_id=1,
+        window_id="window-1",
+        run_id="run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        samples=tuple(),
+    )
+    result = MicroProfileResult(
+        edge_id=1,
+        window_id="window-1",
+        config_id="config-1",
+        training_strategy="freeze",
+        trainable_param_ratio=0.1,
+        sample_count=1,
+        microprofile_epochs=1,
+        formal_num_epoch=1,
+        batch_size=1,
+        learning_rate=1e-3,
+        proxy_metric_name="teacher_agreement_f1",
+        proxy_metric_before=0.1,
+        proxy_metric_after_by_epoch=[0.5],
+        estimated_final_proxy_metric=0.5,
+        proxy_metric_gain=0.4,
+        elapsed_ms=1.0,
+        epoch_time_ms_at_full_gpu=1.0,
+        estimated_full_training_time_ms=1.0,
+        estimated_inference_penalty=0.0,
+        estimated_window_average_quality=0.5,
+        score=0.4,
+    )
+    skipped: list[tuple[str, str]] = []
+    scheduler = EkyaCentralScheduler(
+        ready_windows=lambda: [window],
+        profile_window=lambda _window: [result],
+        submit_training=lambda _window, _result: "job",
+        mark_skip=lambda item, reason: skipped.append((item.window_id, reason)),
+        service_state=lambda: {"cloud_inference_latency_ms": 50.0, "cloud_inference_fps": 10.0},
+        ekya_config=SimpleNamespace(max_cloud_inference_latency_ms=10.0),
+    )
+
+    assert scheduler.run_once() is None
+    assert skipped == [("window-1", "no_candidate_improves_window_quality")]
+
+
+def test_teacher_agreement_does_not_reward_empty_empty_frames() -> None:
+    assert teacher_agreement_counts(
+        {"boxes": [], "labels": [], "scores": []},
+        {"boxes": [], "labels": [], "scores": []},
+        iou_threshold=0.5,
+        confidence_threshold=0.0,
+    ) == (0, 0, 0)
+
+
+def test_ekya_microprofile_skips_when_teacher_objects_are_too_low() -> None:
+    def fail_build_model(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("model should not be built without enough teacher objects")
+
+    profiler = EkyaMicroProfiler(
+        training_config=SimpleNamespace(
+            batch_size=1,
+            num_epoch=1,
+            learning_rate=1e-3,
+            microprofile_epochs=1,
+            microprofile_max_samples=1,
+        ),
+        ekya_config=SimpleNamespace(min_teacher_objects=2),
+        model_builder=fail_build_model,
+    )
+    sample = EkyaWindowSample(
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        edge_id=1,
+        frame_id=1,
+        timestamp_ms=1,
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        raw_frame=_jpeg_bytes(),
+        edge_prediction={},
+        cloud_prediction={},
+        teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.9]},
+        quality_metadata={},
+    )
+    window = EkyaReadyWindow(
+        edge_id=1,
+        window_id="window-1",
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        samples=(sample,),
+    )
+    candidate = profiler.candidate_configs(window_sample_count=1)[0]
+
+    assert profiler.profile_candidate(window, candidate) is None
+
+
+def test_ekya_microprofile_runs_short_training_and_epoch_proxy_eval() -> None:
+    built_models: list[TinyMicroprofileDetectionModel] = []
+
+    def build_model(*args, **kwargs):
+        del args, kwargs
+        model = TinyMicroprofileDetectionModel()
+        built_models.append(model)
+        return model
+
+    def build_loss(model):
+        def loss(_outputs, _targets):
+            return torch.nn.functional.mse_loss(
+                model.logit,
+                torch.tensor([1.0], dtype=model.logit.dtype, device=model.logit.device),
+            )
+
+        return loss
+
+    profiler = EkyaMicroProfiler(
+        training_config=SimpleNamespace(
+            batch_size=1,
+            num_epoch=2,
+            learning_rate=0.1,
+            microprofile_epochs=2,
+            microprofile_max_samples=1,
+            device="cpu",
+        ),
+        ekya_config=SimpleNamespace(
+            max_microprofile_configs=1,
+            min_teacher_objects=1,
+            trainable_param_ratios=[1.0],
+            sample_fractions=[1.0],
+            batch_sizes=[1],
+            formal_num_epochs=[2],
+            learning_rates=[0.1],
+            teacher_agreement_iou_threshold=0.5,
+            teacher_agreement_confidence_threshold=0.0,
+        ),
+        model_builder=build_model,
+        loss_builder=build_loss,
+    )
+    sample = EkyaWindowSample(
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        edge_id=1,
+        frame_id=1,
+        timestamp_ms=1,
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        raw_frame=_jpeg_bytes(),
+        edge_prediction={},
+        cloud_prediction={},
+        teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.9]},
+        quality_metadata={},
+    )
+    window = EkyaReadyWindow(
+        edge_id=1,
+        window_id="window-1",
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        samples=(sample,),
+    )
+
+    results = profiler.profile_window(window)
+
+    assert len(results) == 1
+    assert len(results[0].proxy_metric_after_by_epoch) == 2
+    assert results[0].proxy_metric_name == "teacher_agreement_f1"
+    assert results[0].diagnostic_loss_after is not None
+    assert built_models[0].forward_calls > 0
+
+
 def test_upload_client_rejects_raw_freeze_strategy() -> None:
     from baselines.runtime.upload_client import validate_baseline_training_strategy
 
@@ -598,6 +1337,80 @@ def _jpeg_bytes() -> bytes:
     ok, encoded = cv2.imencode(".jpg", np.zeros((8, 8, 3), dtype=np.uint8))
     assert ok
     return bytes(encoded.tobytes())
+
+
+def _encoded_model_delta(
+    state_dict: dict[str, object],
+    *,
+    base_model_version: str,
+    result_model_version: str,
+) -> str:
+    buffer = io.BytesIO()
+    torch.save(
+        {
+            "format": "state_dict_delta.v1",
+            "model_name": "tiny",
+            "base_model_version": str(base_model_version),
+            "result_model_version": str(result_model_version),
+            "state_dict": state_dict,
+        },
+        buffer,
+    )
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _ekya_ready_window(*, model_version: str = "0") -> EkyaReadyWindow:
+    sample = EkyaWindowSample(
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        edge_id=1,
+        frame_id=5,
+        timestamp_ms=1,
+        model_name="tiny",
+        model_version=str(model_version),
+        video_source="video",
+        raw_frame=_jpeg_bytes(),
+        edge_prediction={},
+        cloud_prediction={},
+        teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.9]},
+        quality_metadata={},
+    )
+    return EkyaReadyWindow(
+        edge_id=1,
+        window_id="window-1",
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version=str(model_version),
+        video_source="video",
+        samples=(sample,),
+    )
+
+
+def _microprofile_result() -> MicroProfileResult:
+    return MicroProfileResult(
+        edge_id=1,
+        window_id="window-1",
+        config_id="config-1",
+        training_strategy="freeze",
+        trainable_param_ratio=0.1,
+        sample_count=1,
+        microprofile_epochs=1,
+        formal_num_epoch=3,
+        batch_size=4,
+        learning_rate=0.01,
+        proxy_metric_name="teacher_agreement_f1",
+        proxy_metric_before=0.1,
+        proxy_metric_after_by_epoch=[0.2],
+        estimated_final_proxy_metric=0.4,
+        proxy_metric_gain=0.3,
+        elapsed_ms=1.0,
+        epoch_time_ms_at_full_gpu=1.0,
+        estimated_full_training_time_ms=3.0,
+        estimated_inference_penalty=0.0,
+        estimated_window_average_quality=0.4,
+        score=0.3,
+    )
 
 
 def _iter_text_files(paths):

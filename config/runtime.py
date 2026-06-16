@@ -264,6 +264,19 @@ class EkyaStyleBaselineConfig(ConfigSection):
     training_strategy: str = "freeze"
     display_source: str = "cloud"
     enable_micro_profiling: bool = True
+    max_microprofile_configs: int = 8
+    trainable_param_ratios: list[float] = field(default_factory=lambda: [0.1, 0.3, 0.5])
+    sample_fractions: list[float] = field(default_factory=lambda: [0.5, 1.0])
+    batch_sizes: list[int] = field(default_factory=list)
+    formal_num_epochs: list[int] = field(default_factory=list)
+    learning_rates: list[float] = field(default_factory=list)
+    min_teacher_objects: int = 1
+    teacher_annotation_threshold: float | None = None
+    teacher_agreement_iou_threshold: float = 0.5
+    teacher_agreement_confidence_threshold: float = 0.0
+    min_inference_quality: float = 0.0
+    max_cloud_inference_latency_ms: float = 0.0
+    min_cloud_inference_fps: float = 0.0
 
 
 @dataclass
@@ -746,6 +759,75 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     }:
         raise ValueError(
             "baseline.ekya_style_centralized_scheduling.display_source must be cloud or local"
+        )
+    _validate_positive(
+        "baseline.ekya_style_centralized_scheduling.max_microprofile_configs",
+        int(getattr(ekya, "max_microprofile_configs", 8)),
+    )
+    _validate_positive(
+        "baseline.ekya_style_centralized_scheduling.min_teacher_objects",
+        int(getattr(ekya, "min_teacher_objects", 1)),
+    )
+    for ratio in list(getattr(ekya, "trainable_param_ratios", []) or []):
+        _validate_positive(
+            "baseline.ekya_style_centralized_scheduling.trainable_param_ratios",
+            float(ratio),
+        )
+        if float(ratio) > 1.0:
+            raise ValueError(
+                "baseline.ekya_style_centralized_scheduling.trainable_param_ratios "
+                "must be <= 1"
+            )
+    for fraction in list(getattr(ekya, "sample_fractions", []) or []):
+        _validate_positive(
+            "baseline.ekya_style_centralized_scheduling.sample_fractions",
+            float(fraction),
+        )
+        if float(fraction) > 1.0:
+            raise ValueError(
+                "baseline.ekya_style_centralized_scheduling.sample_fractions must be <= 1"
+            )
+    for batch_size in list(getattr(ekya, "batch_sizes", []) or []):
+        _validate_positive(
+            "baseline.ekya_style_centralized_scheduling.batch_sizes",
+            int(batch_size),
+        )
+    for epoch_count in list(getattr(ekya, "formal_num_epochs", []) or []):
+        _validate_positive(
+            "baseline.ekya_style_centralized_scheduling.formal_num_epochs",
+            int(epoch_count),
+        )
+    for learning_rate in list(getattr(ekya, "learning_rates", []) or []):
+        _validate_positive(
+            "baseline.ekya_style_centralized_scheduling.learning_rates",
+            float(learning_rate),
+        )
+    threshold = getattr(ekya, "teacher_annotation_threshold", None)
+    if threshold is not None:
+        _validate_positive(
+            "baseline.ekya_style_centralized_scheduling.teacher_annotation_threshold",
+            float(threshold),
+            allow_zero=True,
+        )
+    _validate_positive(
+        "baseline.ekya_style_centralized_scheduling.teacher_agreement_iou_threshold",
+        float(getattr(ekya, "teacher_agreement_iou_threshold", 0.5)),
+        allow_zero=True,
+    )
+    _validate_positive(
+        "baseline.ekya_style_centralized_scheduling.teacher_agreement_confidence_threshold",
+        float(getattr(ekya, "teacher_agreement_confidence_threshold", 0.0)),
+        allow_zero=True,
+    )
+    for name in (
+        "min_inference_quality",
+        "max_cloud_inference_latency_ms",
+        "min_cloud_inference_fps",
+    ):
+        _validate_positive(
+            f"baseline.ekya_style_centralized_scheduling.{name}",
+            float(getattr(ekya, name, 0.0)),
+            allow_zero=True,
         )
     feature_upload = config.client.feature_upload
     if str(feature_upload.storage_format).strip().lower() not in {

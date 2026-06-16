@@ -10,7 +10,11 @@ from loguru import logger
 from baselines.distributed.messages import BaselineFramePayload, now_ms
 from baselines.distributed.metrics import DistributedMetricsWriter
 from baselines.runtime.policies import create_policy
-from baselines.runtime.training_state import BaselineTrainingSample, BaselineTrainingState
+from baselines.runtime.training_state import (
+    BaselineActiveTrainingJob,
+    BaselineTrainingSample,
+    BaselineTrainingState,
+)
 from baselines.runtime.upload_client import (
     BaselineUploadClient,
     build_baseline_training_bundle,
@@ -66,6 +70,10 @@ class BaselineEdgeAdapter:
         self._queue: Queue[BaselineFramePayload] = Queue()
         self._worker: threading.Thread | None = None
         self._latest_cloud_visual: dict[str, Any] | None = None
+        self._cloud_scheduled_active_job: BaselineActiveTrainingJob | None = None
+        self._known_cloud_scheduled_job_ids: set[str] = set()
+        self._acked_command_ids: set[str] = set()
+        self._last_command_poll_at = 0.0
         self._training_config = _training_config_dict(getattr(baseline_cfg, "training", None))
         self._training_config["trainable_param_ratio"] = self.trainable_param_ratio
         self._training_state = BaselineTrainingState(
@@ -198,9 +206,14 @@ class BaselineEdgeAdapter:
         ):
             return local_visual
         cloud = self._latest_cloud_visual
-        if cloud is None:
+        local_frame = int(local_visual.get("frame_index", -1) or -1)
+        cloud_frame = int(cloud.get("frame_index", -2) or -2) if cloud is not None else -2
+        if cloud is None or (local_frame >= 0 and cloud_frame != local_frame):
             pending = dict(local_visual)
             pending["mode"] = "CloudPending"
+            pending["boxes"] = []
+            pending["labels"] = []
+            pending["scores"] = []
             return pending
         return dict(cloud)
 
@@ -382,6 +395,10 @@ class BaselineEdgeAdapter:
         )
 
     def _poll_active_training(self) -> None:
+        if self.baseline_method == "ekya_style_centralized_scheduling":
+            self._discover_cloud_scheduled_training()
+            self._poll_cloud_scheduled_training()
+            return
         active = self._training_state.active_job
         if active is None or self.transport is None or self._edge is None:
             return
@@ -454,6 +471,148 @@ class BaselineEdgeAdapter:
                 job_id=active.job_id,
                 message=terminal_message,
             )
+
+    def _discover_cloud_scheduled_training(self) -> None:
+        if self.transport is None or not hasattr(self.transport, "poll_command"):
+            return
+        now = time.monotonic()
+        if now - self._last_command_poll_at < 1.0:
+            return
+        self._last_command_poll_at = now
+        try:
+            commands = self.transport.poll_command(
+                run_id=self.run_id,
+                baseline_method=self.baseline_method,
+                edge_id=self.edge_id,
+            )
+        except Exception as exc:
+            logger.warning("[BaselineAdapter] command polling failed: {}", exc)
+            self.metrics.record("command_poll_failed", message=str(exc))
+            return
+        for command in commands:
+            if str(command.get("type", "")) != "baseline_training_job_available":
+                continue
+            command_id = str(command.get("command_id", "") or "")
+            job_id = str(command.get("job_id", "") or "")
+            if not job_id:
+                continue
+            adopted_or_known = job_id in self._known_cloud_scheduled_job_ids
+            if not adopted_or_known:
+                if self._cloud_scheduled_active_job is not None:
+                    self.metrics.record(
+                        "cloud_scheduled_training_job_deferred",
+                        job_id=job_id,
+                        window_id=str(command.get("window_id", "") or ""),
+                    )
+                    continue
+                self._known_cloud_scheduled_job_ids.add(job_id)
+                self._cloud_scheduled_active_job = BaselineActiveTrainingJob(
+                    job_id=job_id,
+                    window_id=str(command.get("window_id", "") or ""),
+                    model_version=str(command.get("base_model_version", "0") or "0"),
+                    training_strategy="freeze",
+                    trainable_param_ratio=self.trainable_param_ratio,
+                    frame_ids=tuple(),
+                )
+                adopted_or_known = True
+                logger.info(
+                    "[BaselineAdapter] adopted cloud-scheduled Ekya job edge={} job={}",
+                    self.edge_id,
+                    job_id,
+                )
+                self.metrics.record(
+                    "cloud_scheduled_training_job_adopted",
+                    job_id=job_id,
+                    window_id=str(command.get("window_id", "") or ""),
+                )
+            if command_id and adopted_or_known:
+                self._ack_cloud_command(command_id)
+
+    def _ack_cloud_command(self, command_id: str) -> None:
+        if not command_id or command_id in self._acked_command_ids:
+            return
+        if self.transport is None or not hasattr(self.transport, "ack_command"):
+            return
+        try:
+            self.transport.ack_command(
+                run_id=self.run_id,
+                baseline_method=self.baseline_method,
+                edge_id=self.edge_id,
+                command_id=command_id,
+            )
+            self._acked_command_ids.add(command_id)
+        except Exception as exc:
+            logger.warning("[BaselineAdapter] command ack failed: {}", exc)
+            self.metrics.record("command_ack_failed", command_id=command_id, message=str(exc))
+
+    def _poll_cloud_scheduled_training(self) -> None:
+        active = self._cloud_scheduled_active_job
+        if active is None or self.transport is None or self._edge is None:
+            return
+        now = time.monotonic()
+        if now - float(active.last_poll_at or 0.0) < 1.0:
+            return
+        active.last_poll_at = now
+        if not hasattr(self.transport, "get_training_job_status"):
+            return
+        reply = self.transport.get_training_job_status(edge_id=self.edge_id, job_id=active.job_id)
+        if reply is None or not bool(getattr(reply, "found", False)):
+            return
+        status = str(getattr(reply, "status", "") or "").upper()
+        if status in {"", "QUEUED", "RUNNING"}:
+            return
+        terminal_message = str(getattr(reply, "message", "") or "")
+        try:
+            if status == "SUCCEEDED" and bool(getattr(reply, "result_available", False)):
+                download = self.transport.download_trained_model(
+                    edge_id=self.edge_id,
+                    job_id=active.job_id,
+                )
+                if bool(getattr(download, "success", False)) and getattr(
+                    download,
+                    "model_data",
+                    "",
+                ):
+                    self._edge.apply_model_update(
+                        str(download.model_data),
+                        submitted_model_version=active.model_version,
+                        result_model_version=str(
+                            getattr(download, "result_model_version", "") or ""
+                        ),
+                        job_id=active.job_id,
+                        message=str(getattr(download, "message", "") or ""),
+                        log_prefix="[BaselineAdapter]",
+                    )
+                    logger.info(
+                        "[BaselineAdapter] cloud-scheduled model update applied edge={} "
+                        "version={}",
+                        self.edge_id,
+                        getattr(self._edge, "model_version", ""),
+                    )
+                    self.metrics.record(
+                        "cloud_scheduled_model_update_applied",
+                        window_id=active.window_id,
+                        job_id=active.job_id,
+                        result_model_version=str(getattr(self._edge, "model_version", "")),
+                    )
+            else:
+                self.metrics.record(
+                    "cloud_scheduled_training_job_terminal",
+                    window_id=active.window_id,
+                    job_id=active.job_id,
+                    status=status,
+                    message=terminal_message,
+                )
+        except Exception as exc:
+            logger.warning("[BaselineAdapter] cloud-scheduled update handling failed: {}", exc)
+            self.metrics.record(
+                "cloud_scheduled_model_update_failed",
+                window_id=active.window_id,
+                job_id=active.job_id,
+                message=str(exc),
+            )
+        finally:
+            self._cloud_scheduled_active_job = None
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
