@@ -517,6 +517,10 @@ class EdgeWorker:
             "boxes": [],
             "labels": [],
             "scores": [],
+            "confidence": 0.0,
+            "entropy": 0.0,
+            "model_version": "0",
+            "result_source": "empty",
             "frame": None,
         }
 
@@ -1149,15 +1153,65 @@ class EdgeWorker:
             list(detection_score),
         )
 
+    def _task_artifact_snapshot(
+        self,
+        task: Task,
+        inference: InferenceArtifacts | None = None,
+        *,
+        result_source: str | None = None,
+    ) -> dict[str, object]:
+        boxes, labels, scores = self._snapshot_result(task)
+        confidence = getattr(inference, "confidence", None) if inference is not None else None
+        entropy = None
+        if inference is not None:
+            entropy = getattr(inference, "logit_entropy", None)
+            if entropy is None:
+                entropy = getattr(inference, "feature_spectral_entropy", None)
+        try:
+            confidence_value = float(
+                confidence if confidence is not None else max(scores, default=0.0)
+            )
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        try:
+            entropy_value = float(entropy if entropy is not None else 0.0)
+        except (TypeError, ValueError):
+            entropy_value = 0.0
+        return {
+            "boxes": boxes,
+            "labels": labels,
+            "scores": [float(score) for score in scores],
+            "confidence": confidence_value,
+            "entropy": entropy_value,
+            "model_version": str(getattr(self, "model_version", "0") or "0"),
+            "result_source": str(result_source or task.result_source or "pending"),
+        }
+
+    def _set_task_inference_artifacts(
+        self,
+        task: Task,
+        inference: InferenceArtifacts | None = None,
+        *,
+        result_source: str | None = None,
+    ) -> None:
+        task.set_inference_artifacts(
+            self._task_artifact_snapshot(task, inference, result_source=result_source)
+        )
+
     def _remember_latest_result(self, task: Task) -> None:
         detection_boxes, detection_class, detection_score = self._snapshot_result(task)
         frame = getattr(task, "frame_edge", None)
+        artifacts = dict(getattr(task, "inference_artifacts", {}) or {})
         with self.latest_result_lock:
             self.latest_result = {
                 "frame_index": task.frame_index,
                 "boxes": detection_boxes,
                 "labels": detection_class,
                 "scores": detection_score,
+                "confidence": float(artifacts.get("confidence", 0.0) or 0.0),
+                "entropy": float(artifacts.get("entropy", 0.0) or 0.0),
+                "model_version": str(artifacts.get("model_version", self.model_version) or "0"),
+                "result_source": str(artifacts.get("result_source", task.result_source) or ""),
                 "frame": frame.copy() if hasattr(frame, "copy") else None,
             }
 
@@ -1168,6 +1222,9 @@ class EdgeWorker:
                 "boxes": [list(box) for box in self.latest_result["boxes"]],
                 "labels": list(self.latest_result["labels"]),
                 "scores": list(self.latest_result["scores"]),
+                "confidence": float(self.latest_result.get("confidence", 0.0) or 0.0),
+                "entropy": float(self.latest_result.get("entropy", 0.0) or 0.0),
+                "model_version": str(self.latest_result.get("model_version", "0") or "0"),
                 "frame": self.latest_result.get("frame"),
             }
         boxes = cached["boxes"]
@@ -1201,6 +1258,17 @@ class EdgeWorker:
             task.result_source = "cached"
         else:
             task.result_source = "empty"
+        task.set_inference_artifacts(
+            {
+                "boxes": [list(box) for box in boxes],
+                "labels": list(labels),
+                "scores": [float(score) for score in scores],
+                "confidence": cached["confidence"],
+                "entropy": cached["entropy"],
+                "model_version": cached["model_version"],
+                "result_source": task.result_source,
+            }
+        )
 
     def _set_task_terminal_state(
         self,
@@ -1217,6 +1285,13 @@ class EdgeWorker:
         self._finalize_task(task)
 
     def _finalize_task(self, task: Task) -> None:
+        artifacts = dict(getattr(task, "inference_artifacts", {}) or {})
+        if artifacts and str(artifacts.get("result_source", "pending")) != "pending":
+            artifacts["result_source"] = str(task.result_source or artifacts["result_source"])
+            artifacts["model_version"] = str(getattr(self, "model_version", "0") or "0")
+            task.set_inference_artifacts(artifacts)
+        else:
+            self._set_task_inference_artifacts(task, result_source=task.result_source)
         if task.state == TASK_STATE.FINISHED and task.result_source == "inference":
             self._remember_latest_result(task)
         task.mark_done()
@@ -1248,6 +1323,120 @@ class EdgeWorker:
         self.collect_flag = True
         self._drift_probe_active = False
         self._retrain_requested.clear()
+
+    def apply_model_update(
+        self,
+        model_b64: str,
+        *,
+        submitted_model_version: str | None = None,
+        result_model_version: str | None = None,
+        job_id: str = "",
+        message: str = "",
+        report: bool = True,
+        clear_samples: bool = True,
+        reset_drift: bool = True,
+        log_prefix: str = "[EdgeCL]",
+    ) -> str:
+        if not model_b64:
+            raise RuntimeError("model update payload is empty")
+        expected_version = None if submitted_model_version is None else str(submitted_model_version)
+        current_version = str(self.model_version)
+        if expected_version is not None and current_version != expected_version:
+            raise RuntimeError(
+                "stale model update: "
+                f"submitted_version={expected_version} current_version={current_version}"
+            )
+
+        apply_started = time.perf_counter()
+        buf = io.BytesIO(base64.b64decode(model_b64))
+        next_version = str(result_model_version or "")
+        if not next_version:
+            try:
+                next_version = str(int(current_version) + 1)
+            except (TypeError, ValueError):
+                next_version = "1"
+        logger.info(
+            "{} model update received: version={} size={:.1f}MB.",
+            log_prefix,
+            next_version,
+            len(buf.getbuffer()) / (1024.0 * 1024.0),
+        )
+        update_payload = require_state_dict_delta_payload(
+            torch.load(buf, map_location="cpu", weights_only=False)
+        )
+        state_dict = dict(update_payload["state_dict"])
+        weight_keys = [
+            name
+            for name in state_dict
+            if name not in {"plank_threshold_low", "plank_threshold_high"}
+        ]
+        if not weight_keys:
+            logger.warning(
+                "{} cloud model update contains only threshold metadata; "
+                "model weights will not change.",
+                log_prefix,
+            )
+        with self.small_object_detection.model_lock:
+            self._validate_cloud_update_state_compatible(update_payload, state_dict)
+            load_result = self.small_object_detection.model.load_state_dict(
+                state_dict,
+                strict=False,
+            )
+            self.small_object_detection.model.eval()
+            self.small_object_detection.get_split_runtime_model().eval()
+            self.small_object_detection.refresh_thresholds_from_model()
+            if self.fixed_split_plan is not None:
+                logger.info(
+                    "{} reusing fixed split plan after model update: split={}.",
+                    log_prefix,
+                    getattr(self.fixed_split_plan, "canonical_split_key", "auto"),
+                )
+                log_diagnostic_debug(
+                    self,
+                    f"{log_prefix} reused split plan diagnostics",
+                    lambda: {"split_config_id": self.fixed_split_plan.split_config_id},
+                )
+        self.model_version = next_version
+        if clear_samples:
+            self.sample_store.clear()
+        if reset_drift:
+            self.window_drift_detector.reset()
+        logger.info(
+            "{} model update applied: version={} state_keys={} weight_keys={} "
+            "missing_keys={} unexpected_keys={} elapsed={:.3f}s.",
+            log_prefix,
+            self.model_version,
+            len(state_dict),
+            len(weight_keys),
+            len(list(getattr(load_result, "missing_keys", ()) or ())),
+            len(list(getattr(load_result, "unexpected_keys", ()) or ())),
+            time.perf_counter() - apply_started,
+        )
+        logger.success(
+            "{} model update successful: version={} -> {}.",
+            log_prefix,
+            current_version,
+            self.model_version,
+        )
+        if report:
+            reported, report_message = report_edge_model_version(
+                self.config.server_ip,
+                edge_id=self.edge_id,
+                model_id=self.model_id,
+                model_version=self.model_version,
+            )
+            if not reported:
+                logger.warning(
+                    "{} model version report was not acknowledged: {}.",
+                    log_prefix,
+                    safe_error_summary(report_message),
+                )
+        log_diagnostic_debug(
+            self,
+            f"{log_prefix} model update diagnostics",
+            lambda: {"job_id": job_id, "message": message},
+        )
+        return self.model_version
 
     def _resolve_active_splitter(self, current_frame, frame_image_size: tuple[int, int]):
         if self.split_learning_enabled and not getattr(self, "_fixed_split_init_attempted", False):
@@ -1797,84 +1986,13 @@ class EdgeWorker:
                     continue
 
                 try:
-                    apply_started = time.perf_counter()
-                    buf = io.BytesIO(base64.b64decode(model_b64))
-                    logger.info(
-                        "[EdgeCL] model update received: version={} size={:.1f}MB.",
-                        int(submitted_model_version) + 1,
-                        len(buf.getbuffer()) / (1024.0 * 1024.0),
-                    )
-                    update_payload = require_state_dict_delta_payload(
-                        torch.load(buf, map_location="cpu", weights_only=False)
-                    )
-                    state_dict = dict(update_payload["state_dict"])
-                    weight_keys = [
-                        name
-                        for name in state_dict
-                        if name not in {"plank_threshold_low", "plank_threshold_high"}
-                    ]
-                    if not weight_keys:
-                        logger.warning(
-                            "[EdgeCL] cloud model update contains only threshold metadata; "
-                            "model weights will not change."
-                        )
-                    with self.small_object_detection.model_lock:
-                        self._validate_cloud_update_state_compatible(
-                            update_payload,
-                            state_dict,
-                        )
-                        load_result = self.small_object_detection.model.load_state_dict(
-                            state_dict,
-                            strict=False,
-                        )
-                        self.small_object_detection.model.eval()
-                        self.small_object_detection.get_split_runtime_model().eval()
-                        self.small_object_detection.refresh_thresholds_from_model()
-                        if self.fixed_split_plan is not None:
-                            logger.info(
-                                "[EdgeCL] reusing fixed split plan after model update: split={}.",
-                                getattr(self.fixed_split_plan, "canonical_split_key", "auto"),
-                            )
-                            log_diagnostic_debug(
-                                self,
-                                "[EdgeCL] reused split plan diagnostics",
-                                lambda: {
-                                    "split_config_id": self.fixed_split_plan.split_config_id
-                                },
-                            )
-                    self.model_version = str(int(self.model_version) + 1)
-                    self.sample_store.clear()
-                    self.window_drift_detector.reset()
-                    logger.info(
-                        "[EdgeCL] model update applied: version={} state_keys={} weight_keys={} "
-                        "missing_keys={} unexpected_keys={} elapsed={:.3f}s.",
-                        self.model_version,
-                        len(state_dict),
-                        len(weight_keys),
-                        len(list(getattr(load_result, "missing_keys", ()) or ())),
-                        len(list(getattr(load_result, "unexpected_keys", ()) or ())),
-                        time.perf_counter() - apply_started,
-                    )
-                    logger.success(
-                        "[EdgeCL] model update successful: version={} -> {}.",
-                        submitted_model_version,
-                        self.model_version,
-                    )
-                    reported, report_message = report_edge_model_version(
-                        self.config.server_ip,
-                        edge_id=self.edge_id,
-                        model_id=self.model_id,
-                        model_version=self.model_version,
-                    )
-                    if not reported:
-                        logger.warning(
-                            "[EdgeCL] model version report was not acknowledged: {}.",
-                            safe_error_summary(report_message),
-                        )
-                    log_diagnostic_debug(
-                        self,
-                        "[EdgeCL] model update diagnostics",
-                        lambda: {"job_id": job_id, "message": terminal_message},
+                    self.apply_model_update(
+                        model_b64,
+                        submitted_model_version=submitted_model_version,
+                        result_model_version="",
+                        job_id=job_id,
+                        message=terminal_message,
+                        log_prefix="[EdgeCL]",
                     )
                 except Exception as exc:
                     logger.error(
@@ -2046,6 +2164,11 @@ class EdgeWorker:
                 inference.final_detection_boxes or None,
                 inference.final_detection_labels or None,
                 inference.final_detection_scores or None,
+            )
+            self._set_task_inference_artifacts(
+                task,
+                inference,
+                result_source="inference",
             )
 
             if (

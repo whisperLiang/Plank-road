@@ -13,8 +13,9 @@ class EkyaStyleCentralizedSchedulingPolicy(BaseBaselinePolicy):
             getattr(config, "return_cloud_inference_to_edge", True)
         )
         self.enable_micro_profiling = bool(getattr(config, "enable_micro_profiling", True))
+        self.display_source = str(getattr(config, "display_source", "cloud") or "cloud")
         self._training_strategy = str(
-            getattr(config, "training_strategy", "frozen_ratio_training")
+            getattr(config, "training_strategy", "raw_freeze")
         )
 
     @property
@@ -38,6 +39,7 @@ class EkyaStyleCentralizedSchedulingPolicy(BaseBaselinePolicy):
             metadata={
                 "frame_id": int(frame_id),
                 "return_cloud_inference_to_edge": self.return_cloud_inference_to_edge,
+                "display_source": self.display_source,
                 "enable_micro_profiling": self.enable_micro_profiling,
             },
         )

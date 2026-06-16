@@ -778,6 +778,10 @@ def _read_trigger_manifest(*, workspace, payload_zip: bytes) -> dict | None:
 def _request_kind_for_job_type(job_type: int) -> str:
     if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
         return "continual_learning"
-    if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO:
-        return "baseline_frozen_ratio"
+    if job_type == _baseline_training_job_type():
+        return "baseline_training"
     raise ValueError(f"Unsupported training job type: {job_type!r}")
+
+
+def _baseline_training_job_type() -> int:
+    return int(getattr(message_transmission_pb2, "TRAINING_JOB_TYPE_BASELINE_TRAINING", 4))

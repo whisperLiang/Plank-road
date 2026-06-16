@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from cloud.training import freeze_modes as fm
 from model_management.payload import boundary_payload_from_tensors
 from tools import run_tail_training_motivation_experiments as exp
 
@@ -41,11 +42,11 @@ class BatchNormPolicyModel(nn.Module):
 def _patch_raw_batches(monkeypatch, inputs: torch.Tensor, targets: torch.Tensor) -> None:
     monkeypatch.setattr(exp, "get_split_runtime_input_resize_mode", lambda _model: "direct_resize")
 
-    def fake_prepare_raw_batch(**kwargs):
-        del kwargs
+    def fake_prepare_raw_batch(samples, *, device):
+        del samples, device
         return inputs.clone(), targets.clone()
 
-    monkeypatch.setattr(exp, "_prepare_raw_batch", fake_prepare_raw_batch)
+    monkeypatch.setattr(fm, "_prepare_raw_batch", fake_prepare_raw_batch)
 
 
 def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None:
@@ -54,7 +55,7 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
     targets = torch.zeros(2, 1)
     _patch_raw_batches(monkeypatch, inputs, targets)
     suffix_names = ("head.weight", "head.bias")
-    _suffix_names, suffix_params = exp._configure_raw_freeze_eval_forward_training(
+    _suffix_names, suffix_params = fm.configure_raw_freeze_training(
         model,
         suffix_names,
     )
@@ -68,13 +69,10 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
         ),
     )
 
-    exp._run_raw_freeze_mode(
-        split_model=model,
+    fm.run_raw_freeze_training(
+        model=model,
         suffix_param_names=suffix_names,
-        edge_model=model,
-        frames_by_id={1: object(), 2: object(), 3: object(), 4: object()},
-        sample_ids=[1, 2, 3, 4],
-        annotations={},
+        samples=[object(), object(), object(), object()],
         batch_size=2,
         epochs=2,
         device=torch.device("cpu"),
@@ -89,7 +87,7 @@ def test_raw_freeze_full_forwards_without_torchlens_runtime(monkeypatch) -> None
 def test_raw_freeze_can_use_torchlens_suffix_names() -> None:
     model = CountingModel()
 
-    suffix_names, suffix_params = exp._configure_raw_freeze_eval_forward_training(
+    suffix_names, suffix_params = fm.configure_raw_freeze_training(
         model,
         ("head.weight", "head.bias"),
     )
@@ -106,7 +104,7 @@ def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
     monkeypatch,
 ) -> None:
     suffix_names = ("head_bn.weight", "head_bn.bias", "head.weight", "head.bias")
-    monkeypatch.setattr(exp, "_suffix_parameter_names", lambda _runtime: suffix_names)
+    monkeypatch.setattr(fm, "_suffix_parameter_names", lambda _runtime: suffix_names)
 
     full_model = BatchNormPolicyModel()
     full_runtime = SimpleNamespace(
@@ -117,7 +115,7 @@ def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
             full_model.head,
         ),
     )
-    exp._configure_fixed_prefix_training(
+    fm.configure_fixed_prefix_training(
         full_model,
         full_runtime,
     )
@@ -137,7 +135,7 @@ def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
             split_model.head,
         ),
     )
-    exp._configure_fixed_prefix_training(
+    fm.configure_fixed_prefix_training(
         split_model,
         split_runtime,
     )
@@ -147,7 +145,7 @@ def test_fixed_prefix_config_trains_suffix_with_eval_prefix(
     assert split_model.suffix_dropout.training
 
     raw_model = BatchNormPolicyModel()
-    exp._configure_raw_freeze_eval_forward_training(
+    fm.configure_raw_freeze_training(
         raw_model,
         suffix_names,
     )
@@ -186,9 +184,9 @@ def test_freeze_rebuilds_prefix_each_batch_without_cached_boundaries(monkeypatch
             parameter.requires_grad_(True)
         return ("head.weight", "head.bias"), suffix
 
-    monkeypatch.setattr(exp, "_configure_fixed_prefix_training", configure_fixed)
+    monkeypatch.setattr(fm, "configure_fixed_prefix_training", configure_fixed)
     monkeypatch.setattr(
-        exp,
+        fm,
         "train_split_suffix_batch",
         lambda runtime_arg, batch_boundary, batch_targets, loss_fn, optimizer_arg: (
             train_calls.append((runtime_arg, batch_boundary, batch_targets, loss_fn, optimizer_arg))
@@ -198,13 +196,10 @@ def test_freeze_rebuilds_prefix_each_batch_without_cached_boundaries(monkeypatch
     suffix_names, suffix_params = configure_fixed(model, runtime)
     optimizer = torch.optim.SGD(suffix_params, lr=0.01)
 
-    exp._run_freeze_mode(
-        split_model=model,
+    fm.run_freeze_training(
+        model=model,
         runtime=runtime,
-        edge_model=model,
-        frames_by_id={1: object(), 2: object(), 3: object(), 4: object()},
-        sample_ids=[1, 2, 3, 4],
-        annotations={},
+        samples=[object(), object(), object(), object()],
         batch_size=2,
         epochs=3,
         device=torch.device("cpu"),

@@ -33,6 +33,15 @@ class Task:
         self.done_event = threading.Event()
         self.result_source = "pending"
         self.timing_ms = {}
+        self.inference_artifacts = {
+            "boxes": [],
+            "labels": [],
+            "scores": [],
+            "confidence": 0.0,
+            "entropy": 0.0,
+            "model_version": "",
+            "result_source": "pending",
+        }
 
         self.detection_boxes = []
         self.detection_class = []
@@ -60,6 +69,17 @@ class Task:
 
     def get_result(self):
         return self.detection_boxes, self.detection_class, self.detection_score
+
+    def set_inference_artifacts(self, artifacts):
+        data = dict(artifacts or {})
+        data.setdefault("boxes", [list(box) for box in self.detection_boxes])
+        data.setdefault("labels", list(self.detection_class))
+        data.setdefault("scores", list(self.detection_score))
+        data.setdefault("confidence", 0.0)
+        data.setdefault("entropy", 0.0)
+        data.setdefault("model_version", "")
+        data.setdefault("result_source", self.result_source)
+        self.inference_artifacts = data
 
     def mark_done(self):
         self.done_event.set()

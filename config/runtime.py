@@ -249,7 +249,7 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     reuse_plank_road_frame_filter: bool = True
     upload_keyframes_only: bool = True
     trigger_on_cloud_comparison: bool = True
-    training_strategy: str = "frozen_ratio_training"
+    training_strategy: str = "raw_freeze"
     return_model_update: bool = True
 
 
@@ -259,14 +259,13 @@ class EkyaStyleBaselineConfig(ConfigSection):
     use_frame_filter: bool = False
     cloud_inference: bool = True
     return_cloud_inference_to_edge: bool = True
-    training_strategy: str = "frozen_ratio_training"
+    training_strategy: str = "raw_freeze"
+    display_source: str = "cloud"
     enable_micro_profiling: bool = True
 
 
 @dataclass
 class BaselineTrainingConfig(ConfigSection):
-    trainable_param_ratio: float = 0.3
-    freeze_order: str = "forward_module_order"
     batch_size: int = 32
     num_epoch: int = 50
     learning_rate: float = 1e-3
@@ -654,13 +653,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     if not str(config.baseline.results_root or "").strip():
         raise ValueError("baseline.results_root must be non-empty")
     baseline_training = config.baseline.training
-    trainable_ratio = float(baseline_training.trainable_param_ratio)
-    if not 0.0 < trainable_ratio <= 1.0:
-        raise ValueError("baseline.training.trainable_param_ratio must be within (0, 1]")
-    if str(baseline_training.freeze_order) != "forward_module_order":
-        raise ValueError(
-            "baseline.training.freeze_order currently supports only forward_module_order"
-        )
     _validate_positive("baseline.training.batch_size", int(baseline_training.batch_size))
     _validate_positive("baseline.training.num_epoch", int(baseline_training.num_epoch))
     _validate_positive(
@@ -701,6 +693,29 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         )
     if bool(pure_edge.use_cloud_teacher):
         raise ValueError("baseline.pure_edge_local_updating.use_cloud_teacher must remain false")
+    allowed_baseline_training = {"raw_freeze", "freeze"}
+    accuracy_strategy = str(
+        config.baseline.accuracy_trigger_cloud_retraining.training_strategy or ""
+    ).strip()
+    if accuracy_strategy not in allowed_baseline_training:
+        raise ValueError(
+            "baseline.accuracy_trigger_cloud_retraining.training_strategy must be "
+            "raw_freeze or freeze"
+        )
+    ekya = config.baseline.ekya_style_centralized_scheduling
+    ekya_strategy = str(ekya.training_strategy or "").strip()
+    if ekya_strategy not in allowed_baseline_training:
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.training_strategy must be "
+            "raw_freeze or freeze"
+        )
+    if str(getattr(ekya, "display_source", "cloud") or "cloud").strip() not in {
+        "cloud",
+        "local",
+    }:
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.display_source must be cloud or local"
+        )
     feature_upload = config.client.feature_upload
     if str(feature_upload.storage_format).strip().lower() not in {
         "safetensors_shard",

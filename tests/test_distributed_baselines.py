@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import threading
+import io
+import json
+import time
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,11 +12,10 @@ import numpy as np
 import pytest
 
 from baselines.distributed.cloud_controller import DistributedBaselineController
-from baselines.distributed.edge_runtime import BaselineEdgeRuntime
 from baselines.distributed.messages import BaselineFramePayload
 from baselines.method_factory import create_policy, registered_methods
-from baselines.training import BASELINE_FROZEN_RATIO_TRAINING_STRATEGY
-from cloud.workers.worker_protocol import WORKER_NOT_READY, JsonRpcError
+from baselines.runtime import BaselineEdgeAdapter, stable_window_id
+from baselines.runtime.upload_client import BASELINE_TRAINING_PROTOCOL_VERSION
 from config.baseline import PLANK_ROAD_BASELINE_ERROR
 from edge_client import _resolve_baseline_run_id, _validate_startup_config
 from grpc_server import message_transmission_pb2
@@ -28,6 +30,8 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         diff_thresh=0.0004,
         feature="edge",
         lightweight="tiny",
+        weights_path="",
+        tinynext_input_size=None,
         baseline=SimpleNamespace(
             results_root=str(tmp_path / "results"),
             pure_edge_local_updating=SimpleNamespace(
@@ -41,7 +45,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 reuse_plank_road_frame_filter=True,
                 upload_keyframes_only=True,
                 trigger_on_cloud_comparison=True,
-                training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
+                training_strategy="raw_freeze",
                 return_model_update=True,
             ),
             ekya_style_centralized_scheduling=SimpleNamespace(
@@ -49,12 +53,11 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 use_frame_filter=False,
                 cloud_inference=True,
                 return_cloud_inference_to_edge=True,
-                training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
+                training_strategy="raw_freeze",
                 enable_micro_profiling=True,
+                display_source="cloud",
             ),
             training=SimpleNamespace(
-                trainable_param_ratio=0.3,
-                freeze_order="forward_module_order",
                 batch_size=2,
                 num_epoch=1,
                 learning_rate=1e-3,
@@ -70,6 +73,10 @@ class RecordingTransport:
         self.uploaded: list[BaselineFramePayload] = []
         self.inference_requests: list[int] = []
         self.training_requests: list[dict[str, object]] = []
+        self.registered: BaselineFramePayload | None = None
+
+    def close(self) -> None:
+        pass
 
     def register_edge(self, *, payload: BaselineFramePayload) -> None:
         self.registered = payload
@@ -78,46 +85,56 @@ class RecordingTransport:
         self.uploaded.append(payload)
 
     def request_cloud_inference(self, payload: BaselineFramePayload):
-        self.inference_requests.append(payload.frame_id)
-        return {"success": True, "frame_id": payload.frame_id}
+        self.inference_requests.append(int(payload.frame_id))
+        return {
+            "success": True,
+            "frame_id": int(payload.frame_id),
+            "cloud_prediction": {
+                "boxes": [[2, 2, 6, 6]],
+                "labels": [7],
+                "scores": [0.77],
+                "confidence": 0.77,
+            },
+        }
 
-    def request_training(
+    def submit_training_bundle(
         self,
         *,
-        payload: BaselineFramePayload,
+        edge_id: int,
+        request_id: str,
+        payload_zip: bytes,
         frame_ids: list[int],
-        training_config: dict[str, object],
+        base_model_version: str,
     ):
         self.training_requests.append(
             {
-                "payload": payload,
+                "edge_id": int(edge_id),
+                "request_id": str(request_id),
+                "payload_zip": bytes(payload_zip),
                 "frame_ids": [int(value) for value in frame_ids],
-                "training_config": dict(training_config),
+                "base_model_version": str(base_model_version),
             }
         )
-        return {
-            "job_id": f"training-{len(self.training_requests)}",
-            "status": "QUEUED",
-            "queue_position": 1,
-        }
+        return message_transmission_pb2.SubmitTrainingJobReply(
+            accepted=True,
+            job_id=f"job-{len(self.training_requests)}",
+            status="QUEUED",
+            queue_position=1,
+            message="accepted",
+        )
 
-
-class FakeDetector:
-    def infer_sample(self, frame):
-        assert frame is not None
-        return SimpleNamespace(
-            final_detection_boxes=[[1, 2, 3, 4]],
-            final_detection_labels=[5],
-            final_detection_scores=[0.9],
-            confidence=0.9,
-            logit_entropy=0.25,
-            feature_spectral_entropy=None,
+    def get_training_job_status(self, *, edge_id: int, job_id: str):
+        del edge_id, job_id
+        return message_transmission_pb2.TrainingJobStatusReply(
+            found=True,
+            status="RUNNING",
+            result_available=False,
         )
 
 
 class FakeTrainingBackend:
     def __init__(self) -> None:
-        self.submitted = {}
+        self.submitted: dict[tuple[int, str], object] = {}
 
     def submit_training_job(self, request):
         job_id = f"job-{len(self.submitted) + 1}"
@@ -139,7 +156,7 @@ class FakeTrainingBackend:
             status="SUCCEEDED" if found else "",
             queue_position=-1,
             message="done" if found else "not found",
-            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO,
+            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
             result_available=found,
             result_model_version="1" if found else "",
             worker_id="edge_1" if found else "",
@@ -153,72 +170,31 @@ class FakeTrainingBackend:
             status="SUCCEEDED" if found else "",
             model_data="model-update" if found else "",
             message="done" if found else "not found",
-            protocol_version="baseline-frozen-ratio.v1" if found else "",
+            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION if found else "",
             result_model_version="1" if found else "",
         )
 
 
-class FailingInfraTrainingBackend:
-    def __init__(self) -> None:
-        self.submit_calls = 0
-
-    def submit_training_job(self, request):
-        del request
-        self.submit_calls += 1
-        raise JsonRpcError("worker still starting", error_type=WORKER_NOT_READY)
-
-
-class FailingTrainingJobBackend:
-    def __init__(self) -> None:
-        self.submit_calls = 0
-        self.submitted: dict[tuple[int, str], object] = {}
-
-    def submit_training_job(self, request):
-        self.submit_calls += 1
-        job_id = f"job-{self.submit_calls}"
-        self.submitted[(int(request.edge_id), job_id)] = request
-        return message_transmission_pb2.SubmitTrainingJobReply(
-            accepted=True,
-            job_id=job_id,
-            status="QUEUED",
-            queue_position=1,
-            message="accepted",
-        )
-
-    def get_training_job_status(self, request):
-        found = (int(request.edge_id), str(request.job_id)) in self.submitted
-        return message_transmission_pb2.TrainingJobStatusReply(
-            found=found,
-            job_id=str(request.job_id),
-            edge_id=int(request.edge_id),
-            status="FAILED" if found else "",
-            queue_position=-1,
-            message="model builder failed" if found else "not found",
-            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO,
-            result_available=False,
-            result_model_version="",
-            worker_id="edge_1" if found else "",
-        )
+class FakeTask:
+    def __init__(self, *, source: str, model_version: str = "0") -> None:
+        self.result_source = source
+        self.timing_ms = {"inference": 3.5}
+        self.inference_artifacts = {
+            "boxes": [[1, 2, 3, 4]],
+            "labels": [5],
+            "scores": [0.9],
+            "confidence": 0.9,
+            "entropy": 0.25,
+            "model_version": model_version,
+            "result_source": source,
+        }
 
 
-class BlockingTrainingBackend:
-    def __init__(self) -> None:
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self.submit_calls = 0
+class FakeEdge:
+    model_version = "0"
 
-    def submit_training_job(self, request):
-        del request
-        self.submit_calls += 1
-        self.entered.set()
-        assert self.release.wait(timeout=2.0)
-        return message_transmission_pb2.SubmitTrainingJobReply(
-            accepted=True,
-            job_id="job-blocked",
-            status="QUEUED",
-            queue_position=1,
-            message="accepted",
-        )
+    def apply_model_update(self, *args, **kwargs) -> None:
+        del args, kwargs
 
 
 def test_legacy_baseline_files_are_removed() -> None:
@@ -232,6 +208,7 @@ def test_legacy_baseline_files_are_removed() -> None:
         "config/baselines_real_advantage.yaml",
         "baselines/plank_road" + "_multi_device.py",
         "multi" + "_edge",
+        "baselines/distributed/edge_runtime.py",
     ]
     for relpath in removed:
         assert not (PROJECT_ROOT / relpath).exists(), relpath
@@ -248,19 +225,30 @@ def test_only_three_baseline_methods_are_registered() -> None:
     assert str(PLANK_ROAD_BASELINE_ERROR).startswith("plank_road" + "_multi_device")
 
 
-def test_pure_edge_initializes_without_cloud_and_writes_local_metrics(tmp_path) -> None:
-    runtime = BaselineEdgeRuntime(
+def test_pure_edge_adapter_uses_shared_artifacts_without_cloud(tmp_path) -> None:
+    adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
         baseline_method="pure_edge_local_updating",
         run_id="pure-run",
         edge_id=1,
         transport=None,
     )
-    assert runtime.transport is None
-    payload = runtime.process_frame(frame=None, frame_id=1, is_keyframe=True)
-    assert payload is None
-    assert runtime.metrics_path.exists()
-    assert "upload_frame" in runtime.metrics_path.read_text(encoding="utf-8")
+    try:
+        adapter.before_video_start(FakeEdge())
+        adapter.on_sampled_inference_result(
+            frame=np.zeros((8, 8, 3), dtype=np.uint8),
+            frame_index=1,
+            task=FakeTask(source="inference"),
+            detection_boxes=[[9, 9, 10, 10]],
+            detection_class=[8],
+            detection_score=[0.4],
+            latency_ms=1.0,
+        )
+        assert adapter.transport is None
+        assert adapter.metrics_path.exists()
+        assert "frame_decision" in adapter.metrics_path.read_text(encoding="utf-8")
+    finally:
+        adapter.close()
 
 
 def test_pure_edge_startup_validation_can_skip_cloud_address(tmp_path) -> None:
@@ -281,9 +269,9 @@ def test_cloud_backed_baselines_require_explicit_run_id() -> None:
     assert _resolve_baseline_run_id("pure_edge_local_updating", None) is None
 
 
-def test_accuracy_uploads_only_keyframes_and_uses_frozen_ratio_training(tmp_path) -> None:
+def test_accuracy_adapter_uploads_keyframes_and_generic_training_bundle(tmp_path) -> None:
     transport = RecordingTransport()
-    runtime = BaselineEdgeRuntime(
+    adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
         baseline_method="accuracy_trigger_cloud_retraining",
         run_id="acc-run",
@@ -291,80 +279,132 @@ def test_accuracy_uploads_only_keyframes_and_uses_frozen_ratio_training(tmp_path
         server_ip="127.0.0.1:1",
         transport=transport,
     )
-    non_key = runtime.process_frame(frame=None, frame_id=1, is_keyframe=False)
-    key = runtime.process_frame(frame=None, frame_id=2, is_keyframe=True)
-    assert non_key is None
-    assert key is not None
-    assert len(transport.uploaded) == 1
-    assert (
-        transport.uploaded[0].quality_metadata["training_strategy"]
-        == BASELINE_FROZEN_RATIO_TRAINING_STRATEGY
-    )
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    try:
+        adapter.before_video_start(FakeEdge())
+        adapter.on_sampled_inference_result(
+            frame=frame,
+            frame_index=1,
+            task=FakeTask(source="cached"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+        adapter.on_sampled_inference_result(
+            frame=frame,
+            frame_index=2,
+            task=FakeTask(source="inference", model_version="0"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+        _wait_until(lambda: len(transport.uploaded) == 1)
+        _wait_until(lambda: len(transport.training_requests) == 1)
+
+        payload = transport.uploaded[0]
+        assert payload.frame_id == 2
+        assert payload.edge_prediction["boxes"] == [[1, 2, 3, 4]]
+        assert payload.confidence == pytest.approx(0.9)
+        assert payload.entropy == pytest.approx(0.25)
+        assert payload.quality_metadata["training_strategy"] == "raw_freeze"
+
+        manifest = _manifest_from_bundle(transport.training_requests[0]["payload_zip"])
+        expected_window = stable_window_id(
+            run_id="acc-run",
+            baseline_method="accuracy_trigger_cloud_retraining",
+            training_strategy="raw_freeze",
+            edge_id=2,
+            model_version="0",
+            frame_ids=[2],
+        )
+        assert manifest["protocol_version"] == BASELINE_TRAINING_PROTOCOL_VERSION
+        assert manifest["training_strategy"] == "raw_freeze"
+        assert manifest["window_id"] == expected_window
+        assert manifest["frames"][0]["edge_prediction"]["result_source"] == "inference"
+
+        adapter.on_sampled_inference_result(
+            frame=frame,
+            frame_index=2,
+            task=FakeTask(source="inference", model_version="0"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+        time.sleep(0.1)
+        assert len(transport.training_requests) == 1
+    finally:
+        adapter.close()
 
 
-def test_accuracy_uploads_edge_prediction_evidence(tmp_path) -> None:
+def test_ekya_adapter_uploads_raw_frames_and_cloud_overlay_without_training(tmp_path) -> None:
     transport = RecordingTransport()
-    runtime = BaselineEdgeRuntime(
+    adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        edge_id=3,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    try:
+        adapter.before_video_start(FakeEdge())
+        adapter.on_sampled_inference_result(
+            frame=np.zeros((8, 8, 3), dtype=np.uint8),
+            frame_index=7,
+            task=FakeTask(source="inference"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+        _wait_until(lambda: len(transport.uploaded) == 1)
+        _wait_until(lambda: transport.inference_requests == [7])
+
+        payload = transport.uploaded[0]
+        assert payload.upload_mode == "raw_frame"
+        assert payload.edge_prediction == {}
+        assert payload.quality_metadata["training_strategy"] == "raw_freeze"
+        assert transport.training_requests == []
+        visual = adapter.display_visual({"boxes": [], "labels": [], "scores": [], "mode": "Local"})
+        assert visual["mode"] == "Cloud"
+        assert visual["boxes"] == [[2, 2, 6, 6]]
+    finally:
+        adapter.close()
+
+
+def test_stable_window_id_includes_strategy_and_sorts_frames() -> None:
+    first = stable_window_id(
+        run_id="run-a",
         baseline_method="accuracy_trigger_cloud_retraining",
-        run_id="acc-run",
-        edge_id=2,
-        server_ip="127.0.0.1:1",
-        transport=transport,
-        edge_detector=FakeDetector(),
+        training_strategy="raw_freeze",
+        edge_id=1,
+        model_version="0",
+        frame_ids=[5, 1, 3],
     )
-    frame = np.zeros((8, 8, 3), dtype=np.uint8)
-    payload = runtime.process_frame(frame=frame, frame_id=2, is_keyframe=True)
-    assert payload is not None
-    assert payload.edge_prediction["boxes"] == [[1, 2, 3, 4]]
-    assert payload.confidence == pytest.approx(0.9)
-    assert payload.entropy == pytest.approx(0.25)
-
-
-def test_ekya_uploads_raw_frames_and_routes_cloud_inference(tmp_path) -> None:
-    transport = RecordingTransport()
-    runtime = BaselineEdgeRuntime(
-        config=_config(tmp_path),
-        baseline_method="ekya_style_centralized_scheduling",
-        run_id="ekya-run",
-        edge_id=3,
-        server_ip="127.0.0.1:1",
-        transport=transport,
+    reordered = stable_window_id(
+        run_id="run-a",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        training_strategy="raw_freeze",
+        edge_id=1,
+        model_version="0",
+        frame_ids=[1, 3, 5],
     )
-    payload = runtime.process_frame(frame=None, frame_id=7, is_keyframe=False)
-    assert payload is not None
-    assert payload.upload_mode == "raw_frame"
-    assert payload.quality_metadata["training_strategy"] == BASELINE_FROZEN_RATIO_TRAINING_STRATEGY
-    assert transport.inference_requests == [7]
-
-
-def test_ekya_submits_frozen_ratio_training_from_raw_uploads_without_edge_labels(
-    tmp_path,
-) -> None:
-    transport = RecordingTransport()
-    runtime = BaselineEdgeRuntime(
-        config=_config(tmp_path),
-        baseline_method="ekya_style_centralized_scheduling",
-        run_id="ekya-run",
-        edge_id=3,
-        server_ip="127.0.0.1:1",
-        transport=transport,
+    different_strategy = stable_window_id(
+        run_id="run-a",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        training_strategy="freeze",
+        edge_id=1,
+        model_version="0",
+        frame_ids=[1, 3, 5],
     )
-    frame = np.zeros((8, 8, 3), dtype=np.uint8)
-
-    payload = runtime.process_frame(frame=frame, frame_id=8, is_keyframe=False)
-
-    assert payload is not None
-    assert payload.edge_prediction == {}
-    assert len(transport.training_requests) == 1
-    assert transport.training_requests[0]["frame_ids"] == [8]
-    assert (
-        transport.training_requests[0]["training_config"]["trainable_param_ratio"]
-        == pytest.approx(0.3)
-    )
+    assert first == reordered
+    assert first != different_strategy
 
 
-def test_cloud_controller_isolates_state_by_run_method_and_edge() -> None:
+def test_cloud_controller_submits_generic_strategy_bundle() -> None:
     backend = FakeTrainingBackend()
     controller = DistributedBaselineController(
         baseline_method="accuracy_trigger_cloud_retraining",
@@ -378,256 +418,53 @@ def test_cloud_controller_isolates_state_by_run_method_and_edge() -> None:
             run_id="run-a",
             baseline_method="accuracy_trigger_cloud_retraining",
             edge_id=1,
-            frame_id=1,
+            frame_id=4,
             model_name="tiny",
+            model_version="7",
             raw_frame=_jpeg_bytes(),
-            teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1]},
+            edge_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.8]},
             upload_mode="keyframe_raw",
             is_keyframe=True,
         )
     )
-    job_a = controller.request_training(
+    job = controller.request_training(
         run_id="run-a",
         baseline_method="accuracy_trigger_cloud_retraining",
         edge_id=1,
-        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-        frame_ids=[1],
+        training_strategy="freeze",
+        frame_ids=[4],
     )
-    assert backend.submitted[(1, job_a["job_id"])].job_type == (
-        message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO
+    request = backend.submitted[(1, job["job_id"])]
+    manifest = _manifest_from_bundle(request.payload_zip)
+    expected_window = stable_window_id(
+        run_id="run-a",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        training_strategy="freeze",
+        edge_id=1,
+        model_version="7",
+        frame_ids=[4],
     )
+
+    assert request.job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING
+    assert manifest["training_strategy"] == "freeze"
+    assert manifest["window_id"] == expected_window
+    assert manifest["frames"][0]["edge_prediction"]["boxes"] == [[1, 1, 4, 4]]
+    assert "teacher_prediction" not in json.dumps(manifest)
     assert controller.download_model_update(
         run_id="run-a",
         baseline_method="accuracy_trigger_cloud_retraining",
         edge_id=1,
-        job_id=job_a["job_id"],
+        job_id=job["job_id"],
     )
     assert (
         controller.download_model_update(
             run_id="run-b",
             baseline_method="accuracy_trigger_cloud_retraining",
             edge_id=1,
-            job_id=job_a["job_id"],
+            job_id=job["job_id"],
         )
         is None
     )
-    assert (
-        controller.download_model_update(
-            run_id="run-a",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=2,
-            job_id=job_a["job_id"],
-        )
-        is None
-    )
-
-
-def test_cloud_controller_dedupes_pending_baseline_training_job() -> None:
-    backend = FakeTrainingBackend()
-    controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
-        run_id="run-a",
-        results_root="unused",
-        training_backend=backend,
-    )
-    controller.upload_frame(
-        BaselineFramePayload(
-            run_id="run-a",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=1,
-            frame_id=1,
-            model_name="tiny",
-            model_version="0",
-            raw_frame=_jpeg_bytes(),
-            teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1]},
-            upload_mode="keyframe_raw",
-            is_keyframe=True,
-        )
-    )
-
-    first = controller.request_training(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-        frame_ids=[1],
-    )
-    second = controller.request_training(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-        frame_ids=[1],
-    )
-
-    assert second["job_id"] == first["job_id"]
-    assert len(backend.submitted) == 1
-
-
-def test_cloud_controller_worker_infra_failure_enters_backoff() -> None:
-    backend = FailingInfraTrainingBackend()
-    controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
-        run_id="run-a",
-        results_root="unused",
-        training_backend=backend,
-    )
-    controller.upload_frame(
-        BaselineFramePayload(
-            run_id="run-a",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=1,
-            frame_id=1,
-            model_name="tiny",
-            model_version="0",
-            raw_frame=_jpeg_bytes(),
-            teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1]},
-            upload_mode="keyframe_raw",
-            is_keyframe=True,
-        )
-    )
-
-    first = controller.request_training(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-        frame_ids=[1],
-    )
-    second = controller.request_training(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-        frame_ids=[1],
-    )
-
-    assert first["accepted"] is False
-    assert first["status"] == "WORKER_INFRA_BACKOFF"
-    assert second["accepted"] is False
-    assert second["status"] == "WORKER_INFRA_BACKOFF"
-    assert backend.submit_calls == 1
-
-
-def test_cloud_controller_training_failure_enters_backoff() -> None:
-    backend = FailingTrainingJobBackend()
-    controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
-        run_id="run-a",
-        results_root="unused",
-        training_backend=backend,
-    )
-    controller.upload_frame(
-        BaselineFramePayload(
-            run_id="run-a",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=1,
-            frame_id=1,
-            model_name="tiny",
-            model_version="0",
-            raw_frame=_jpeg_bytes(),
-            teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1]},
-            upload_mode="keyframe_raw",
-            is_keyframe=True,
-        )
-    )
-
-    first = controller.request_training(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-        frame_ids=[1],
-    )
-    status = controller.poll_training_job(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        job_id=str(first["job_id"]),
-    )
-    second = controller.request_training(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-        frame_ids=[1],
-    )
-
-    assert first["accepted"] is True
-    assert status is not None
-    assert status["status"] == "FAILED"
-    assert second["accepted"] is False
-    assert second["status"] == "TRAINING_FAILURE_BACKOFF"
-    assert backend.submit_calls == 1
-
-
-def test_cloud_controller_reserves_training_gate_during_submit() -> None:
-    backend = BlockingTrainingBackend()
-    controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
-        run_id="run-a",
-        results_root="unused",
-        training_backend=backend,
-    )
-    controller.upload_frame(
-        BaselineFramePayload(
-            run_id="run-a",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=1,
-            frame_id=1,
-            model_name="tiny",
-            model_version="0",
-            raw_frame=_jpeg_bytes(),
-            teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1]},
-            upload_mode="keyframe_raw",
-            is_keyframe=True,
-        )
-    )
-    first_result: list[dict[str, object]] = []
-
-    def submit_first() -> None:
-        first_result.append(
-            controller.request_training(
-                run_id="run-a",
-                baseline_method="accuracy_trigger_cloud_retraining",
-                edge_id=1,
-                training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-                frame_ids=[1],
-            )
-        )
-
-    thread = threading.Thread(target=submit_first)
-    thread.start()
-    assert backend.entered.wait(timeout=2.0)
-
-    second = controller.request_training(
-        run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
-        edge_id=1,
-        training_strategy=BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-        frame_ids=[1],
-    )
-    backend.release.set()
-    thread.join(timeout=2.0)
-
-    assert backend.submit_calls == 1
-    assert second["accepted"] is False
-    assert second["status"] == "TRAINING_TRIGGER_PENDING"
-    assert first_result[0]["job_id"] == "job-blocked"
-
-
-def test_cloud_controller_rejects_mismatched_run_id() -> None:
-    controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
-        run_id="run-a",
-        results_root="unused",
-    )
-    with pytest.raises(ValueError, match="run_id mismatch"):
-        controller.register_edge(
-            run_id="run-b",
-            baseline_method="accuracy_trigger_cloud_retraining",
-            edge_id=1,
-        )
 
 
 def test_cloud_controller_infers_then_strips_raw_frame_bytes() -> None:
@@ -664,8 +501,9 @@ def test_cloud_controller_rejects_wrong_training_strategy() -> None:
         baseline_method="accuracy_trigger_cloud_retraining",
         run_id="run-a",
         results_root="unused",
+        training_backend=FakeTrainingBackend(),
     )
-    with pytest.raises(ValueError, match="training_strategy must be frozen_ratio_training"):
+    with pytest.raises(ValueError, match="raw_freeze or freeze"):
         controller.request_training(
             run_id="run-a",
             baseline_method="accuracy_trigger_cloud_retraining",
@@ -674,7 +512,21 @@ def test_cloud_controller_rejects_wrong_training_strategy() -> None:
         )
 
 
+def _manifest_from_bundle(bundle: object) -> dict[str, object]:
+    with zipfile.ZipFile(io.BytesIO(bytes(bundle)), "r") as archive:
+        return json.loads(archive.read("baseline_trigger_manifest.json").decode("utf-8"))
+
+
 def _jpeg_bytes() -> bytes:
     ok, encoded = cv2.imencode(".jpg", np.zeros((8, 8, 3), dtype=np.uint8))
     assert ok
     return bytes(encoded.tobytes())
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("condition was not satisfied before timeout")

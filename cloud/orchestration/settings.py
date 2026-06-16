@@ -598,9 +598,12 @@ class PipelineLifecycleMixin:
         model_meta = dict(manifest.get("model", {}) or {})
         split_plan = dict(manifest.get("split_plan", {}) or {})
         training_config = dict(manifest.get("training_config", {}) or {})
-        is_baseline_frozen_ratio = (
-            str(manifest.get("protocol_version") or "") == "baseline-frozen-ratio.v1"
-            or bool(manifest.get("frames"))
+        is_baseline_training = (
+            str(manifest.get("protocol_version") or "") == "baseline-training-trigger.v1"
+            or (
+                bool(manifest.get("frames"))
+                and str(manifest.get("training_strategy") or "") in {"raw_freeze", "freeze"}
+            )
         )
         model_name = str(
             model_meta.get("model_id")
@@ -609,11 +612,11 @@ class PipelineLifecycleMixin:
             or manifest.get("model_name")
             or getattr(self, "edge_model_name", "")
         )
-        if is_baseline_frozen_ratio:
+        if is_baseline_training:
             split_key = str(
                 manifest.get("training_strategy")
                 or manifest.get("protocol_version")
-                or "baseline_frozen_ratio"
+                or "baseline_training"
             )
             train_samples = len(
                 [
@@ -695,7 +698,7 @@ class PipelineLifecycleMixin:
 
 
 def _read_workspace_manifest(workspace: str) -> dict[str, object]:
-    for filename in ("trigger_manifest.json", "baseline_manifest.json"):
+    for filename in ("trigger_manifest.json", "baseline_trigger_manifest.json"):
         path = Path(workspace) / filename
         if not path.exists():
             continue

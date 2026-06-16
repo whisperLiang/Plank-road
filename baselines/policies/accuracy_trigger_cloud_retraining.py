@@ -15,7 +15,7 @@ class AccuracyTriggerCloudRetrainingPolicy(BaseBaselinePolicy):
         )
         self.return_model_update = bool(getattr(config, "return_model_update", True))
         self._training_strategy = str(
-            getattr(config, "training_strategy", "frozen_ratio_training")
+            getattr(config, "training_strategy", "raw_freeze")
         )
 
     @property

@@ -1,19 +1,6 @@
-from baselines.training.frozen_ratio import (
-    BASELINE_FROZEN_RATIO_PROTOCOL_VERSION,
-    BASELINE_FROZEN_RATIO_TRAINING_STRATEGY,
-    BaselineFrozenRatioConfig,
-    BaselineFrozenRatioTrainer,
-    FreezeRatioSummary,
-    apply_trainable_param_ratio,
-    build_baseline_training_bundle,
-)
+"""Deprecated namespace for retired baseline training helpers.
 
-__all__ = [
-    "BASELINE_FROZEN_RATIO_PROTOCOL_VERSION",
-    "BASELINE_FROZEN_RATIO_TRAINING_STRATEGY",
-    "BaselineFrozenRatioConfig",
-    "BaselineFrozenRatioTrainer",
-    "FreezeRatioSummary",
-    "apply_trainable_param_ratio",
-    "build_baseline_training_bundle",
-]
+Production baseline cloud training now lives under ``cloud.training.strategies``.
+"""
+
+__all__: list[str] = []

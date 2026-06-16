@@ -54,6 +54,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import model_management.object_detection as object_detection_module
+from cloud.training.freeze_modes import (
+    configure_fixed_prefix_training as _shared_configure_fixed_prefix_training,
+)
+from cloud.training.freeze_modes import (
+    configure_raw_freeze_training as _shared_configure_raw_freeze_training,
+)
 from cloud.training.proxy_eval import _evaluate_detection_proxy_metrics
 from config import load_runtime_config
 from model_management.model_zoo import (
@@ -985,64 +991,8 @@ def _configure_fixed_prefix_training(
     split_model: torch.nn.Module,
     runtime: Any,
 ) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
-    """Apply the fixed-prefix + trainable-suffix regime to ``split_model``.
-
-    * suffix params -> ``requires_grad=True`` and the TorchLens suffix segment
-      uses ``.train()`` state;
-    * every other parameter -> ``requires_grad=False``;
-    * frozen prefix modules stay eval/cache-compatible;
-    * the suffix segment enters train mode, so suffix BatchNorm/Dropout behave
-      like normal tail training.
-    """
-    torchlens_runtime = (
-        runtime._ensure_runtime()
-        if callable(getattr(runtime, "_ensure_runtime", None))
-        else runtime
-    )
-    suffix_names = tuple(_suffix_parameter_names(runtime))
-    suffix_name_set = set(suffix_names)
-
-    split_model.eval()
-    for parameter in split_model.parameters():
-        parameter.requires_grad_(False)
-        parameter.grad = None
-
-    suffix_segment = getattr(torchlens_runtime, "suffix_segment", None)
-    if isinstance(suffix_segment, torch.nn.Module):
-        suffix_segment.train()
-
-    for segment_name in ("prefix_segment", "training_prefix_segment"):
-        prefix_segment = getattr(torchlens_runtime, segment_name, None)
-        if not isinstance(prefix_segment, torch.nn.Module):
-            continue
-        prefix_segment.eval()
-        for parameter in prefix_segment.parameters(recurse=True):
-            parameter.requires_grad_(False)
-            parameter.grad = None
-
-    suffix_params: list[torch.nn.Parameter] = []
-    modules_with_suffix: set[str] = set()
-    named_parameters = dict(split_model.named_parameters())
-    for name, parameter in named_parameters.items():
-        if name in suffix_name_set:
-            parameter.requires_grad_(True)
-            suffix_params.append(parameter)
-            module_name = name.rsplit(".", 1)[0]
-            modules_with_suffix.add(module_name)
-
-    missing = [name for name in suffix_name_set if name not in named_parameters]
-    if missing:
-        raise RuntimeError(
-            "Suffix trainable parameters missing from split model: " + ", ".join(missing)
-        )
-
-    module_lookup = dict(split_model.named_modules())
-    for module_name in modules_with_suffix:
-        module = module_lookup.get(module_name)
-        if module is None:
-            continue
-        module.train()
-    return suffix_names, suffix_params
+    """Compatibility wrapper around the production fixed-prefix trainer helper."""
+    return _shared_configure_fixed_prefix_training(split_model, runtime)
 
 
 def _set_runtime_prefix_module_state(
@@ -1075,32 +1025,8 @@ def _configure_raw_freeze_eval_forward_training(
     split_model: torch.nn.Module,
     suffix_names: tuple[str, ...],
 ) -> tuple[tuple[str, ...], list[torch.nn.Parameter]]:
-    """Configure raw_freeze directly on the original PyTorch model."""
-
-    suffix_names = tuple(suffix_names)
-    suffix_name_set = set(suffix_names)
-    split_model.eval()
-    for parameter in split_model.parameters():
-        parameter.requires_grad_(False)
-        parameter.grad = None
-    suffix_params: list[torch.nn.Parameter] = []
-    modules_with_suffix: set[str] = set()
-    for name, parameter in split_model.named_parameters():
-        if name in suffix_name_set:
-            parameter.requires_grad_(True)
-            suffix_params.append(parameter)
-            modules_with_suffix.add(name.rsplit(".", 1)[0])
-    missing = sorted(suffix_name_set - set(dict(split_model.named_parameters()).keys()))
-    if missing:
-        raise RuntimeError(
-            "raw_freeze suffix parameters missing from split model: " + ", ".join(missing)
-        )
-    module_lookup = dict(split_model.named_modules())
-    for module_name in modules_with_suffix:
-        module = module_lookup.get(module_name)
-        if module is not None:
-            module.train()
-    return suffix_names, suffix_params
+    """Compatibility wrapper around the production raw_freeze trainer helper."""
+    return _shared_configure_raw_freeze_training(split_model, suffix_names)
 
 
 # ---------------------------------------------------------------------------

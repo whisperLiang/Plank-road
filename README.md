@@ -312,24 +312,27 @@ accuracy_trigger_cloud_retraining
 ekya_style_centralized_scheduling
 ```
 
-All three baselines use the baseline frozen-ratio trainer for updates. The
-default keeps the last 30% of model parameters trainable and freezes the
-earlier 70% in module registration order:
+Cloud-backed baseline updates use the shared training-job API with one generic
+baseline job type. The manifest selects `training_strategy: raw_freeze` or
+`training_strategy: freeze`; the default is `raw_freeze`:
 
 ```yaml
 baseline:
+  accuracy_trigger_cloud_retraining:
+    training_strategy: raw_freeze
+  ekya_style_centralized_scheduling:
+    display_source: cloud
   training:
-    trainable_param_ratio: 0.3
-    freeze_order: forward_module_order
     batch_size: 32
     num_epoch: 50
     learning_rate: 1.0e-3
 ```
 
-This baseline trainer consumes raw frames and teacher/pseudo labels, runs a
-full-model forward/backward pass, and updates only the unfrozen parameter
-suffix. It does not use Plank-Road fixed-split runtime contracts, feature
-shards, or split-tail suffix replay.
+`accuracy_trigger_cloud_retraining` uses edge predictions only for trigger and
+evaluation metadata; cloud training targets come from the cloud teacher unless
+an explicit ablation opts into edge targets. `ekya_style_centralized_scheduling`
+shares display, raw-frame upload, cloud inference, and optional cloud-result
+overlay; full Ekya scheduler training is intentionally separate future work.
 
 Accuracy-Trigger Cloud Retraining cloud:
 

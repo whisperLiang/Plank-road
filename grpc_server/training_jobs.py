@@ -80,13 +80,13 @@ class TrainingJobManager:
         continual_learner: "CloudContinualLearner",
         max_concurrent_jobs: int,
         edge_registry: "EdgeRegistry | None" = None,
-        baseline_trainer: object | None = None,
+        training_strategies: dict[str, object] | None = None,
         log_internal_ids: bool = False,
     ) -> None:
         self.continual_learner = continual_learner
         self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
         self.edge_registry = edge_registry
-        self.baseline_trainer = baseline_trainer
+        self.training_strategies = dict(training_strategies or {})
         self.log_internal_ids = bool(log_internal_ids)
 
         self._lock = threading.Lock()
@@ -145,14 +145,7 @@ class TrainingJobManager:
                 existing_job_id = self._request_index.get(request_key)
                 if existing_job_id is not None:
                     return self._jobs[existing_job_id], False
-            if int(job_type) in {
-                message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
-                message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO,
-            }:
-                baseline_method = _baseline_method_for_request(
-                    normalized_request_id,
-                    request_kind=str(request_kind or ""),
-                )
+            if int(job_type) == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
                 for existing in self._jobs.values():
                     if existing.edge_id != int(edge_id):
                         continue
@@ -162,24 +155,6 @@ class TrainingJobManager:
                         continue
                     if existing.status in TERMINAL_JOB_STATUSES:
                         continue
-                    if (
-                        int(job_type)
-                        == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO
-                    ):
-                        existing_method = _baseline_method_for_request(
-                            existing.request_id,
-                            request_kind=existing.request_kind,
-                        )
-                        if existing_method != baseline_method:
-                            continue
-                        logger.info(
-                            "[TrainingJob] Reusing existing baseline job: edge={} "
-                            "type={} existing_job={}",
-                            int(edge_id),
-                            request_kind or self._request_kind_for_job_type(int(job_type)),
-                            existing.job_id,
-                        )
-                        return existing, False
                     logger.info(
                         "[TrainingJob] Reusing existing continual-learning job: "
                         "edge={} existing_job={}",
@@ -500,18 +475,22 @@ class TrainingJobManager:
                 edge_id,
                 workspace,
             )
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO:
-            if self.baseline_trainer is None:
-                raise RuntimeError("baseline frozen-ratio trainer is not configured")
-            result = self.baseline_trainer.train_from_workspace(
+        if job_type == _baseline_training_job_type():
+            strategy_name = _baseline_strategy_from_workspace(workspace)
+            strategy = self.training_strategies.get(strategy_name)
+            if strategy is None:
+                raise RuntimeError(f"baseline training strategy is not configured: {strategy_name}")
+            result = strategy.train_from_workspace(
                 workspace,
                 base_model_version=str(base_model_version or "0"),
                 result_model_version=_next_model_version(base_model_version),
             )
+            if isinstance(result, tuple):
+                return result
             return (
                 bool(result.get("success", True)),
                 str(result.get("model_data", "") or ""),
-                str(result.get("message", "baseline frozen-ratio training completed")),
+                str(result.get("message", f"baseline {strategy_name} training completed")),
             )
         raise ValueError(f"Unsupported training job type: {job_type!r}")
 
@@ -519,8 +498,8 @@ class TrainingJobManager:
     def _request_kind_for_job_type(job_type: int) -> str:
         if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING:
             return "continual_learning"
-        if job_type == message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO:
-            return "baseline_frozen_ratio"
+        if job_type == _baseline_training_job_type():
+            return "baseline_training"
         raise ValueError(f"Unsupported training job type: {job_type!r}")
 
     def _queue_position_locked(self, job_id: str) -> int:
@@ -555,8 +534,19 @@ def _next_model_version(base_model_version: str) -> str:
         return "1"
 
 
-def _baseline_method_for_request(request_id: str, *, request_kind: str) -> str:
-    if str(request_kind or "") and str(request_kind) != "baseline_frozen_ratio":
-        return str(request_kind)
-    prefix = str(request_id or "").split(":", 1)[0]
-    return prefix or str(request_kind or "baseline_frozen_ratio")
+def _baseline_training_job_type() -> int:
+    return int(getattr(message_transmission_pb2, "TRAINING_JOB_TYPE_BASELINE_TRAINING", 4))
+
+
+def _baseline_strategy_from_workspace(workspace: str) -> str:
+    import json
+    from pathlib import Path
+
+    path = Path(workspace) / "baseline_trigger_manifest.json"
+    if not path.exists():
+        raise RuntimeError("baseline training workspace is missing baseline_trigger_manifest.json")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    strategy = str(manifest.get("training_strategy", "") or "").strip()
+    if strategy not in {"raw_freeze", "freeze"}:
+        raise RuntimeError(f"unsupported baseline training_strategy: {strategy!r}")
+    return strategy

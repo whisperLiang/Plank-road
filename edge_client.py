@@ -11,7 +11,7 @@ if __name__ == "__main__":
 import cv2
 from loguru import logger
 
-from baselines.distributed.edge_runtime import BaselineEdgeRuntime
+from baselines.runtime import BaselineEdgeAdapter
 from common.logging_sanitizer import log_diagnostic_debug, summarize_path
 from config import load_runtime_config
 from config.baseline import validate_baseline_method
@@ -246,7 +246,13 @@ def _log_startup_config(config) -> None:
     )
 
 
-def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None:
+def _run_video_loop(
+    config,
+    edge: EdgeWorker,
+    *,
+    headless: bool = False,
+    baseline_adapter: BaselineEdgeAdapter | None = None,
+) -> None:
     result_path = Path("log") / "client" / "latest_inference_results.jsonl"
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -274,6 +280,8 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
         "frame_index": None,
         "frame": None,
     }
+    if baseline_adapter is not None:
+        baseline_adapter.before_video_start(edge)
 
     with result_path.open("w", encoding="utf-8") as result_file:
         with VideoProcessor(config.source) as video:
@@ -346,7 +354,6 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
                     else:
                         mode = "Inference"
 
-                    show_boxes = bool(detection_boxes)
                     last_visual = {
                         "boxes": [list(box) for box in detection_boxes],
                         "labels": list(detection_class),
@@ -358,19 +365,34 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
                         "frame": frame.copy(),
                     }
                     _write_task_result(result_file, task)
+                    if baseline_adapter is not None:
+                        baseline_adapter.on_sampled_inference_result(
+                            frame=frame,
+                            frame_index=index,
+                            task=task,
+                            detection_boxes=last_visual["boxes"],
+                            detection_class=last_visual["labels"],
+                            detection_score=last_visual["scores"],
+                            latency_ms=latency_ms,
+                        )
+                    display_visual = (
+                        baseline_adapter.display_visual(last_visual)
+                        if baseline_adapter is not None
+                        else last_visual
+                    )
                     display_frame = _build_display_frame(
                         frame,
                         frame_index=index,
-                        detection_boxes=last_visual["boxes"],
-                        detection_class=last_visual["labels"],
-                        detection_score=last_visual["scores"],
-                        mode=mode,
+                        detection_boxes=display_visual["boxes"],
+                        detection_class=display_visual["labels"],
+                        detection_score=display_visual["scores"],
+                        mode=display_visual["mode"],
                         sampled=True,
-                        latency_ms=latency_ms,
-                        ref=task.ref,
-                        latest_result_frame=last_visual["frame_index"],
-                        show_boxes=show_boxes,
-                        detection_count=len(last_visual["boxes"]),
+                        latency_ms=display_visual.get("latency_ms"),
+                        ref=display_visual.get("ref"),
+                        latest_result_frame=display_visual.get("frame_index"),
+                        show_boxes=bool(display_visual["boxes"]),
+                        detection_count=len(display_visual["boxes"]),
                         class_names=display_class_names,
                         label_schema=display_label_schema,
                     )
@@ -396,19 +418,40 @@ def _run_video_loop(config, edge: EdgeWorker, *, headless: bool = False) -> None
                         display_boxes = []
                         display_labels = []
                         display_scores = []
+                    local_visual = {
+                        "boxes": display_boxes,
+                        "labels": display_labels,
+                        "scores": display_scores,
+                        "mode": last_visual["mode"],
+                        "latency_ms": last_visual["latency_ms"],
+                        "ref": last_visual["ref"],
+                        "frame_index": last_visual["frame_index"],
+                        "frame": last_visual.get("frame"),
+                    }
+                    if baseline_adapter is not None:
+                        baseline_adapter.on_unsampled_frame(
+                            frame=frame,
+                            frame_index=index,
+                            latest_visual=local_visual,
+                        )
+                    display_visual = (
+                        baseline_adapter.display_visual(local_visual)
+                        if baseline_adapter is not None
+                        else local_visual
+                    )
                     display_frame = _build_display_frame(
                         frame,
                         frame_index=index,
-                        detection_boxes=display_boxes,
-                        detection_class=display_labels,
-                        detection_score=display_scores,
-                        mode=last_visual["mode"],
+                        detection_boxes=display_visual["boxes"],
+                        detection_class=display_visual["labels"],
+                        detection_score=display_visual["scores"],
+                        mode=display_visual["mode"],
                         sampled=False,
-                        latency_ms=last_visual["latency_ms"],
-                        ref=last_visual["ref"],
-                        latest_result_frame=last_visual["frame_index"],
-                        show_boxes=bool(display_boxes),
-                        detection_count=len(display_boxes),
+                        latency_ms=display_visual.get("latency_ms"),
+                        ref=display_visual.get("ref"),
+                        latest_result_frame=display_visual.get("frame_index"),
+                        show_boxes=bool(display_visual["boxes"]),
+                        detection_count=len(display_visual["boxes"]),
                         class_names=display_class_names,
                         label_schema=display_label_schema,
                     )
@@ -516,6 +559,7 @@ if __name__ == "__main__":
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
 
+    baseline_adapter = None
     if args.mode == "baseline":
         runtime_config.baseline.enabled = True
         runtime_config.baseline.method = baseline_method
@@ -544,7 +588,21 @@ if __name__ == "__main__":
                 "video_path": _effective_video_source(config),
             },
         )
-        runtime = BaselineEdgeRuntime(
+    else:
+        logger.add(
+            f"log/client/edge_{config.edge_id}_{{time}}.log",
+            level="INFO",
+            rotation="500 MB",
+        )
+
+    preserve_cache_entries = {"pytest_tmp"}
+    if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
+        preserve_cache_entries.add("fixed_split_plan.json")
+    _log_startup_config(config)
+    clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
+    edge = EdgeWorker(config)
+    if args.mode == "baseline":
+        baseline_adapter = BaselineEdgeAdapter(
             config=config,
             baseline_method=baseline_method,
             run_id=runtime_config.baseline.run_id,
@@ -553,32 +611,19 @@ if __name__ == "__main__":
             cache_path=str(config.retrain.cache_path),
             video_path=_effective_video_source(config),
         )
-        try:
-            runtime.run()
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user.")
-        finally:
-            runtime.close()
-        raise SystemExit(0)
-
-    logger.add(
-        f"log/client/edge_{config.edge_id}_{{time}}.log",
-        level="INFO",
-        rotation="500 MB",
-    )
-
-    preserve_cache_entries = {"pytest_tmp"}
-    if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
-        preserve_cache_entries.add("fixed_split_plan.json")
-    _log_startup_config(config)
-    clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
-    edge = EdgeWorker(config)
 
     try:
-        _run_video_loop(config, edge, headless=args.headless)
+        _run_video_loop(
+            config,
+            edge,
+            headless=args.headless,
+            baseline_adapter=baseline_adapter,
+        )
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
     finally:
+        if baseline_adapter is not None:
+            baseline_adapter.close()
         edge.close()
         if not args.headless:
             cv2.destroyAllWindows()

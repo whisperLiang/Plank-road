@@ -5,8 +5,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from baselines.training import BaselineFrozenRatioTrainer
 from cloud.orchestrator import CloudFixedSplitOrchestrator
+from cloud.training.strategies import (
+    CloudRawFreezeTrainingStrategy,
+    CloudTorchLensFreezeTrainingStrategy,
+)
 from cloud.workers.worker_client import GpuLeaseHttpClient, decode_payload_zip
 from config import load_runtime_config
 from grpc_server import message_transmission_pb2
@@ -65,14 +68,14 @@ class EdgeWorkerService:
             gpu_lease_client=self.lease_client,
             worker_id=self.worker_id,
         )
-        self.baseline_trainer = BaselineFrozenRatioTrainer(
-            config=getattr(runtime_config.baseline, "training", None),
-        )
         self.training_jobs = TrainingJobManager(
             continual_learner=self.learner,
             max_concurrent_jobs=1,
             edge_registry=None,
-            baseline_trainer=self.baseline_trainer,
+            training_strategies={
+                "raw_freeze": CloudRawFreezeTrainingStrategy(learner=self.learner),
+                "freeze": CloudTorchLensFreezeTrainingStrategy(learner=self.learner),
+            },
             log_internal_ids=bool(getattr(self.learner, "log_internal_ids", False)),
         )
         self.backend = LocalContinualLearningBackend(

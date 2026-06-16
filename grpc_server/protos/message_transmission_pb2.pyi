@@ -12,11 +12,11 @@ class TrainingJobType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     TRAINING_JOB_TYPE_UNSPECIFIED: _ClassVar[TrainingJobType]
     TRAINING_JOB_TYPE_FULL_FRAME: _ClassVar[TrainingJobType]
     TRAINING_JOB_TYPE_CONTINUAL_LEARNING: _ClassVar[TrainingJobType]
-    TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO: _ClassVar[TrainingJobType]
+    TRAINING_JOB_TYPE_BASELINE_TRAINING: _ClassVar[TrainingJobType]
 TRAINING_JOB_TYPE_UNSPECIFIED: TrainingJobType
 TRAINING_JOB_TYPE_FULL_FRAME: TrainingJobType
 TRAINING_JOB_TYPE_CONTINUAL_LEARNING: TrainingJobType
-TRAINING_JOB_TYPE_BASELINE_FROZEN_RATIO: TrainingJobType
+TRAINING_JOB_TYPE_BASELINE_TRAINING: TrainingJobType
 
 class TrainRequest(_message.Message):
     __slots__ = ("edge_id", "frame_indices", "cache_path", "payload_zip")
