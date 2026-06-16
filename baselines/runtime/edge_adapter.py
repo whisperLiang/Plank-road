@@ -47,6 +47,7 @@ class BaselineEdgeAdapter:
         self.training_strategy = validate_baseline_training_strategy(
             getattr(self.policy, "training_strategy", "freeze")
         )
+        self.trainable_param_ratio = _trainable_param_ratio(method_cfg)
         self.display_source = str(getattr(method_cfg, "display_source", "local") or "local")
         self.metrics = DistributedMetricsWriter(
             results_root=str(
@@ -66,10 +67,12 @@ class BaselineEdgeAdapter:
         self._worker: threading.Thread | None = None
         self._latest_cloud_visual: dict[str, Any] | None = None
         self._training_config = _training_config_dict(getattr(baseline_cfg, "training", None))
+        self._training_config["trainable_param_ratio"] = self.trainable_param_ratio
         self._training_state = BaselineTrainingState(
             run_id=self.run_id,
             baseline_method=self.baseline_method,
             training_strategy=self.training_strategy,
+            trainable_param_ratio=self.trainable_param_ratio,
             edge_id=self.edge_id,
             max_window_size=max(1, int(self._training_config.get("training_window_size", 8))),
             min_samples=max(1, int(self._training_config.get("min_training_samples", 1))),
@@ -93,9 +96,10 @@ class BaselineEdgeAdapter:
     def before_video_start(self, edge) -> None:
         self._edge = edge
         logger.info(
-            "[BaselineAdapter] enabled method={} training_strategy={}",
+            "[BaselineAdapter] enabled method={} training_strategy={} trainable_param_ratio={}",
             self.baseline_method,
             self.training_strategy,
+            self.trainable_param_ratio,
         )
         logger.info("[EdgeVideo] using shared Plank-Road inference/display loop")
 
@@ -500,3 +504,16 @@ def _training_failure_backoff_sec(
         return max(0.0, float(30.0 if value is None else value))
     except (TypeError, ValueError):
         return 30.0
+
+
+def _trainable_param_ratio(method_config: object | None) -> float:
+    value = 0.3
+    if method_config is not None and hasattr(method_config, "trainable_param_ratio"):
+        value = getattr(method_config, "trainable_param_ratio")
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("trainable_param_ratio must be numeric") from exc
+    if ratio <= 0.0 or ratio > 1.0:
+        raise ValueError("trainable_param_ratio must be in (0, 1]")
+    return ratio

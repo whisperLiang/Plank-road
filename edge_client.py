@@ -222,8 +222,8 @@ def _baseline_split_runtime_policy(baseline_config) -> str:
         .strip()
         .lower()
     )
-    if policy not in {"disabled", "replay_only"}:
-        raise ValueError("baseline.edge.split_runtime_policy must be disabled or replay_only")
+    if policy != "disabled":
+        raise ValueError("baseline.edge.split_runtime_policy must be disabled")
     return policy
 
 
@@ -238,7 +238,7 @@ def _configure_baseline_client_runtime(config, baseline_config) -> str:
         config.sample_pool.enabled = False
     split_learning = getattr(config, "split_learning", None)
     if split_learning is not None:
-        split_learning.enabled = policy == "replay_only"
+        split_learning.enabled = False
     if policy == "disabled":
         logger.info("[BaselineEdge] split_runtime_policy=disabled; fixed-split runtime skipped.")
     return policy
@@ -565,7 +565,6 @@ if __name__ == "__main__":
         config.server_ip = args.server_ip
 
     baseline_method = None
-    baseline_split_runtime_policy = "disabled"
     if args.mode == "baseline":
         baseline_method = args.baseline_method or runtime_config.baseline.method
         try:
@@ -599,10 +598,7 @@ if __name__ == "__main__":
             level="INFO",
             rotation="500 MB",
         )
-        baseline_split_runtime_policy = _configure_baseline_client_runtime(
-            config,
-            runtime_config.baseline,
-        )
+        _configure_baseline_client_runtime(config, runtime_config.baseline)
         logger.info(
             "baseline edge effective startup config: run_id={}, baseline_method={}, "
             "edge_id={}, server_ip={}, video_source={}, split_learning={}",
@@ -629,13 +625,7 @@ if __name__ == "__main__":
         )
 
     preserve_cache_entries = {"pytest_tmp"}
-    if (
-        bool(getattr(getattr(config, "split_learning", None), "enabled", False))
-        or (
-            args.mode == "baseline"
-            and baseline_split_runtime_policy == "replay_only"
-        )
-    ):
+    if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
         preserve_cache_entries.add("fixed_split_plan.json")
     _log_startup_config(config)
     clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)

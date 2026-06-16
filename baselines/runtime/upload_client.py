@@ -66,6 +66,9 @@ def build_baseline_training_bundle(
             )
         if not frame_entries:
             raise RuntimeError("baseline training bundle contains no raw frames")
+        normalized_training_config = dict(training_config or {})
+        if str(baseline_method) == "accuracy_trigger_cloud_retraining":
+            normalized_training_config.setdefault("trainable_param_ratio", 0.3)
         manifest: dict[str, Any] = {
             "protocol_version": BASELINE_TRAINING_PROTOCOL_VERSION,
             "run_id": str(run_id),
@@ -79,7 +82,7 @@ def build_baseline_training_bundle(
             "edge_predictions": edge_predictions,
             "quality_metadata": quality_metadata,
             "weights_path": str(weights_path or ""),
-            "training_config": dict(training_config or {}),
+            "training_config": normalized_training_config,
             "frames": frame_entries,
         }
         if tinynext_input_size is not None and str(model_name).lower().startswith("tinynext"):

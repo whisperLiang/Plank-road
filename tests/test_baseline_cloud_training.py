@@ -14,15 +14,18 @@ import numpy as np
 import pytest
 import torch
 
-import cloud.training.strategies.torchlens_freeze as freeze_strategy_module
+import cloud.training.strategies.baseline_freeze as freeze_strategy_module
 from baselines.runtime.upload_client import (
     BASELINE_TRAINING_PROTOCOL_VERSION,
     build_baseline_training_bundle,
 )
-from cloud.training.strategies.torchlens_freeze import (
-    CloudTorchLensFreezeTrainingStrategy,
-    build_default_torchlens_freeze_runtime,
+from cloud.training.parameter_freeze import (
+    RawFrameTrainingSample,
+    apply_parameter_ratio_freeze,
+    select_suffix_trainable_parameters_by_ratio,
+    unwrap_trainable_module,
 )
+from cloud.training.strategies.baseline_freeze import CloudBaselineFreezeTrainingStrategy
 from grpc_server import message_transmission_pb2
 from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED, TrainingJobManager
 
@@ -36,6 +39,7 @@ def test_baseline_bundle_is_raw_frame_protocol_without_split_artifacts() -> None
     serialized = json.dumps(manifest, sort_keys=True)
     assert manifest["protocol_version"] == BASELINE_TRAINING_PROTOCOL_VERSION
     assert manifest["training_strategy"] == "freeze"
+    assert manifest["training_config"]["trainable_param_ratio"] == pytest.approx(0.3)
     assert "split_plan" not in serialized
     assert "runtime_contract" not in serialized
     assert "low-quality-trigger-shard.v1" not in serialized
@@ -60,7 +64,14 @@ def test_baseline_bundle_keeps_tinynext_input_size_model_specific() -> None:
 
 
 def test_freeze_strategy_uses_cloud_teacher_targets(tmp_path: Path, monkeypatch) -> None:
-    bundle = _bundle(training_config={"num_epoch": 1, "batch_size": 2, "device": "cpu"})
+    bundle = _bundle(
+        training_config={
+            "num_epoch": 1,
+            "batch_size": 2,
+            "device": "cpu",
+            "trainable_param_ratio": 0.3,
+        }
+    )
     with zipfile.ZipFile(io.BytesIO(bundle), "r") as archive:
         archive.extractall(tmp_path)
     teacher = RecordingTeacher()
@@ -73,9 +84,8 @@ def test_freeze_strategy_uses_cloud_teacher_targets(tmp_path: Path, monkeypatch)
         return model
 
     _patch_freeze_training(monkeypatch)
-    strategy = CloudTorchLensFreezeTrainingStrategy(
+    strategy = CloudBaselineFreezeTrainingStrategy(
         learner=SimpleNamespace(large_od=teacher),
-        runtime_factory=lambda model, manifest, workspace: SimpleNamespace(),
         model_builder=build_model,
         update_serializer=_fake_update_serializer,
         loss_builder=lambda _model: _count_loss,
@@ -100,13 +110,19 @@ def test_freeze_strategy_rejects_edge_targets_unless_explicit(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    bundle = _bundle(training_config={"num_epoch": 1, "batch_size": 2, "device": "cpu"})
+    bundle = _bundle(
+        training_config={
+            "num_epoch": 1,
+            "batch_size": 2,
+            "device": "cpu",
+            "trainable_param_ratio": 0.3,
+        }
+    )
     with zipfile.ZipFile(io.BytesIO(bundle), "r") as archive:
         archive.extractall(tmp_path)
     _patch_freeze_training(monkeypatch)
-    strategy = CloudTorchLensFreezeTrainingStrategy(
+    strategy = CloudBaselineFreezeTrainingStrategy(
         learner=SimpleNamespace(large_od=None),
-        runtime_factory=lambda model, manifest, workspace: SimpleNamespace(),
         model_builder=lambda *args, **kwargs: TinyRawDetectionModel(),
         update_serializer=_fake_update_serializer,
         loss_builder=lambda _model: _count_loss,
@@ -124,7 +140,7 @@ def test_freeze_strategy_rejects_edge_targets_unless_explicit(
     assert result["success"] is True
 
 
-def test_freeze_strategy_uses_suffix_segment_optimizer_when_graph_optimizer_is_empty(
+def test_freeze_strategy_optimizer_only_receives_ratio_suffix_parameters(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -134,49 +150,29 @@ def test_freeze_strategy_uses_suffix_segment_optimizer_when_graph_optimizer_is_e
             "batch_size": 2,
             "device": "cpu",
             "allow_edge_targets": True,
+            "trainable_param_ratio": 0.3,
         }
     )
     with zipfile.ZipFile(io.BytesIO(bundle), "r") as archive:
         archive.extractall(tmp_path)
-    configured: dict[str, list[torch.nn.Parameter]] = {}
+    built_model = TinySuffixModel()
 
-    def fake_configure(model, runtime):
-        del runtime
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-        params = [model.layers[-1].weight, model.layers[-1].bias]
-        for parameter in params:
-            parameter.requires_grad_(True)
-        configured["params"] = params
-        return ("layers.2.weight", "layers.2.bias"), params
-
-    def fake_run_freeze_training(**kwargs):
+    def fake_run_parameter_ratio_training(**kwargs):
         optimizer = kwargs["optimizer"]
         optimizer_params = list(optimizer.param_groups[0]["params"])
-        assert optimizer_params == configured["params"]
+        assert optimizer_params == [built_model.tail]
+        assert built_model.front.requires_grad is False
+        assert built_model.tail.requires_grad is True
         return {"batch_count": len(list(kwargs["samples"])), "final_loss": 0.0}
 
     monkeypatch.setattr(
         freeze_strategy_module,
-        "configure_fixed_prefix_training",
-        fake_configure,
+        "run_parameter_ratio_freeze_training",
+        fake_run_parameter_ratio_training,
     )
-    monkeypatch.setattr(
-        freeze_strategy_module,
-        "build_split_retrain_optimizer",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("TorchLens suffix optimizer found no trainable suffix parameters.")
-        ),
-    )
-    monkeypatch.setattr(
-        freeze_strategy_module,
-        "run_freeze_training",
-        fake_run_freeze_training,
-    )
-    strategy = CloudTorchLensFreezeTrainingStrategy(
+    strategy = CloudBaselineFreezeTrainingStrategy(
         learner=SimpleNamespace(large_od=None),
-        runtime_factory=lambda model, manifest, workspace: SimpleNamespace(),
-        model_builder=lambda *args, **kwargs: TinyRawDetectionModel(),
+        model_builder=lambda *args, **kwargs: built_model,
         update_serializer=_fake_update_serializer,
         loss_builder=lambda _model: _count_loss,
     )
@@ -186,78 +182,102 @@ def test_freeze_strategy_uses_suffix_segment_optimizer_when_graph_optimizer_is_e
     assert result["success"] is True
 
 
-def test_freeze_strategy_has_default_runtime_factory() -> None:
-    strategy = CloudTorchLensFreezeTrainingStrategy()
+def test_parameter_ratio_selects_rear_suffix_and_freezes_prefix() -> None:
+    model = TinySuffixModel()
 
-    assert strategy.runtime_factory is build_default_torchlens_freeze_runtime
+    frozen_names, trainable_names = select_suffix_trainable_parameters_by_ratio(model, 0.3)
+    summary = apply_parameter_ratio_freeze(model, 0.3)
+
+    assert frozen_names == ["front"]
+    assert trainable_names == ["tail"]
+    assert model.front.requires_grad is False
+    assert model.tail.requires_grad is True
+    assert summary["total_params"] == 10
+    assert summary["frozen_params"] == 7
+    assert summary["trainable_params"] == 3
+    assert summary["first_trainable_param"] == "tail"
+    assert summary["last_trainable_param"] == "tail"
 
 
-def test_default_freeze_runtime_uses_existing_cloud_split_plan(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    plan = {
-        "split_config_id": "split-a",
-        "model_name": "tiny",
-        "candidate_id": "after:head",
-        "split_index": 1,
-        "split_label": "after:head",
-        "boundary_tensor_labels": ["node_a"],
-        "payload_bytes": 0,
-        "privacy_metric": 0.0,
-        "privacy_risk": 0.0,
-        "layer_freezing_ratio": 0.0,
-        "canonical_split_key": "after:head",
-        "edge_split_id": "after:head",
-        "input_tensor_shape": [1, 3, 8, 8],
-        "trace_batch_mode": "batch_gt1",
-        "dynamic_batch": [2, 16],
-        "plan_version": freeze_strategy_module.FIXED_SPLIT_PLAN_VERSION,
-        "runtime_contract": {"logical_split_id": "after:head"},
-    }
-    (tmp_path / "fixed_split_plan.json").write_text(json.dumps(plan), encoding="utf-8")
-    captured: dict[str, object] = {}
+def test_rfdetr_like_wrapper_unwraps_inner_trainable_module() -> None:
+    inner = TinySuffixModel()
+    wrapper = SimpleNamespace(rfdetr=SimpleNamespace(model=SimpleNamespace(model=inner)))
 
-    class FakeSplitter:
-        def __init__(self, *, device):
-            self.device = device
+    assert unwrap_trainable_module(wrapper, model_name="rfdetr_nano") is inner
 
-        def trace(self, *args, **kwargs):
-            pytest.fail("cloud freeze should replay the existing split plan")
 
-        def bind_runtime(self, runtime, *, model, split_spec):
-            captured["runtime"] = runtime
-            captured["model"] = model
-            captured["split_spec"] = split_spec
-            return self
+def test_detr_like_wrapper_unwraps_inner_trainable_module_before_self() -> None:
+    class DetrLikeWrapper(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.outer = torch.nn.Parameter(torch.ones(1))
+            self.detr = TinySuffixModel()
 
-    def fake_prepare(model, sample_input, split_spec, *, mode, expected_boundary_tensor_labels):
-        captured["prepared_model"] = model
-        captured["sample_input"] = sample_input
-        captured["expected_labels"] = list(expected_boundary_tensor_labels)
-        captured["mode"] = mode
-        return SimpleNamespace(split_id=split_spec.boundary, split_spec=split_spec)
+    wrapper = DetrLikeWrapper()
 
-    monkeypatch.setattr(freeze_strategy_module, "UniversalModelSplitter", FakeSplitter)
-    monkeypatch.setattr(freeze_strategy_module, "prepare_exact_split_runtime", fake_prepare)
+    assert unwrap_trainable_module(wrapper, model_name="detr_resnet50") is wrapper.detr
+
+
+def test_freeze_training_uses_wrapper_preprocess_resize_metadata(monkeypatch) -> None:
+    class WrapperWithCore(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = TinyRawDetectionModel()
+
+    wrapper = WrapperWithCore()
+    calls: list[tuple[int, int, int]] = []
+
+    def fake_prepare_split_runtime_input(model, frame, *, device, input_tensor_shape=None):
+        del input_tensor_shape
+        assert model is wrapper
+        calls.append(tuple(int(value) for value in frame.shape))
+        return torch.ones((1, 3, 16, 32), device=device)
+
     monkeypatch.setattr(
         freeze_strategy_module,
-        "build_split_runtime_sample_input",
-        lambda *args, **kwargs: torch.zeros((1, 3, 8, 8)),
+        "prepare_split_runtime_input",
+        fake_prepare_split_runtime_input,
+    )
+    monkeypatch.setattr(
+        freeze_strategy_module,
+        "get_split_runtime_input_resize_mode",
+        lambda _model: "letterbox",
+    )
+    samples = [
+        RawFrameTrainingSample(
+            frame_id=1,
+            image_bgr=np.zeros((10, 12, 3), dtype=np.uint8),
+            target={"boxes": [[1, 1, 4, 4]], "labels": [1]},
+        ),
+        RawFrameTrainingSample(
+            frame_id=2,
+            image_bgr=np.zeros((10, 12, 3), dtype=np.uint8),
+            target={"boxes": [[2, 2, 5, 5]], "labels": [2]},
+        ),
+    ]
+
+    prepared = freeze_strategy_module._prepare_raw_batch_for_full_forward(
+        wrapper,
+        wrapper.model,
+        samples,
+        device=torch.device("cpu"),
     )
 
-    splitter = build_default_torchlens_freeze_runtime(
-        TinyRawDetectionModel(),
-        {"model_name": "tiny", "training_config": {"device": "cpu"}},
-        tmp_path,
-    )
+    assert calls == [(10, 12, 3), (10, 12, 3)]
+    assert tuple(prepared.model_inputs.shape) == (2, 3, 16, 32)
+    assert [target["_split_meta"]["input_resize_mode"] for target in prepared.targets] == [
+        "letterbox",
+        "letterbox",
+    ]
+    assert prepared.targets[0]["_split_meta"]["input_tensor_shape"] == [2, 3, 16, 32]
 
-    spec = captured["split_spec"]
-    assert isinstance(splitter, FakeSplitter)
-    assert spec.boundary == "after:head"
-    assert spec.dynamic_batch == (2, 16)
-    assert spec.trainable is True
-    assert captured["expected_labels"] == ["node_a"]
+
+def test_freeze_strategy_has_no_torchlens_runtime_factory() -> None:
+    strategy = CloudBaselineFreezeTrainingStrategy()
+
+    assert not hasattr(strategy, "runtime_factory")
+    assert not hasattr(freeze_strategy_module, "prepare_exact_split_runtime")
+    assert not hasattr(freeze_strategy_module, "load_or_compute_fixed_split_plan")
 
 
 def test_baseline_jobs_parallelize_across_edges_and_serialize_same_edge(tmp_path: Path) -> None:
@@ -374,6 +394,17 @@ class TinyRawDetectionModel(torch.nn.Module):
         return self.layers(x).flatten()
 
 
+class TinySuffixModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.front = torch.nn.Parameter(torch.ones(7))
+        self.tail = torch.nn.Parameter(torch.ones(3))
+
+    def forward(self, images):
+        batch_size = int(images.shape[0]) if torch.is_tensor(images) and images.ndim else 1
+        return (self.tail.mean() + self.front.mean()).expand(batch_size)
+
+
 class RecordingTeacher:
     def __init__(self) -> None:
         self.calls = 0
@@ -457,28 +488,9 @@ def _jpeg_bytes() -> bytes:
 
 
 def _patch_freeze_training(monkeypatch) -> None:
-    def fake_configure(model, runtime):
-        del runtime
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-        params = [model.layers[-1].weight, model.layers[-1].bias]
-        for parameter in params:
-            parameter.requires_grad_(True)
-        return ("layers.2.weight", "layers.2.bias"), params
-
     monkeypatch.setattr(
         freeze_strategy_module,
-        "configure_fixed_prefix_training",
-        fake_configure,
-    )
-    monkeypatch.setattr(
-        freeze_strategy_module,
-        "build_split_retrain_optimizer",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        freeze_strategy_module,
-        "run_freeze_training",
+        "run_parameter_ratio_freeze_training",
         lambda **kwargs: {"batch_count": len(list(kwargs["samples"])), "final_loss": 0.0},
     )
 

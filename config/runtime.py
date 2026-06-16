@@ -250,6 +250,7 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     upload_keyframes_only: bool = True
     trigger_on_cloud_comparison: bool = True
     training_strategy: str = "freeze"
+    trainable_param_ratio: float = 0.3
     training_failure_backoff_sec: float = 30.0
     return_model_update: bool = True
 
@@ -708,15 +709,21 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     if bool(pure_edge.use_cloud_teacher):
         raise ValueError("baseline.pure_edge_local_updating.use_cloud_teacher must remain false")
     edge_policy = str(config.baseline.edge.split_runtime_policy or "").strip().lower()
-    if edge_policy not in {"disabled", "replay_only"}:
-        raise ValueError(
-            "baseline.edge.split_runtime_policy must be disabled or replay_only"
-        )
+    if edge_policy != "disabled":
+        raise ValueError("baseline.edge.split_runtime_policy must be disabled")
     _validate_positive(
         "baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec",
         float(config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec),
         allow_zero=True,
     )
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio",
+        float(config.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio),
+    )
+    if float(config.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio) > 1.0:
+        raise ValueError(
+            "baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio must be <= 1"
+        )
     allowed_baseline_training = {"freeze"}
     accuracy_strategy = str(
         config.baseline.accuracy_trigger_cloud_retraining.training_strategy or ""

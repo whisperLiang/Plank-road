@@ -38,6 +38,7 @@ baseline:
   upload_keyframes_only: true
   trigger_on_cloud_comparison: true
   training_strategy: freeze
+  trainable_param_ratio: 0.3
   training_failure_backoff_sec: 30.0
   return_model_update: true
  ekya_style_centralized_scheduling:

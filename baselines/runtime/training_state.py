@@ -11,6 +11,7 @@ def stable_window_id(
     run_id: str,
     baseline_method: str,
     training_strategy: str,
+    trainable_param_ratio: float,
     edge_id: int,
     model_version: str,
     frame_ids: list[int] | tuple[int, ...],
@@ -21,12 +22,17 @@ def stable_window_id(
             str(run_id),
             str(baseline_method),
             str(training_strategy),
+            _ratio_key(trainable_param_ratio),
             str(int(edge_id)),
             str(model_version or "0"),
             sorted_ids,
         ]
     )
     return hashlib.sha1(source.encode("utf-8")).hexdigest()
+
+
+def _ratio_key(value: float) -> str:
+    return format(float(value), ".12g")
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,7 @@ class BaselineActiveTrainingJob:
     window_id: str
     model_version: str
     training_strategy: str
+    trainable_param_ratio: float
     frame_ids: tuple[int, ...]
     last_poll_at: float = 0.0
 
@@ -61,6 +68,7 @@ class BaselineReadyWindow:
 class BaselineWindowTrainingRecord:
     status: str
     training_strategy: str
+    trainable_param_ratio: float
     updated_at: float
     job_id: str = ""
     failure_backoff_until: float = 0.0
@@ -72,12 +80,13 @@ class BaselineTrainingState:
     run_id: str
     baseline_method: str
     training_strategy: str
+    trainable_param_ratio: float
     edge_id: int
     max_window_size: int
     min_samples: int
     failure_backoff_sec: float = 30.0
     samples: deque[BaselineTrainingSample] = field(init=False)
-    window_records: dict[tuple[str, str], BaselineWindowTrainingRecord] = field(
+    window_records: dict[tuple[str, str, str], BaselineWindowTrainingRecord] = field(
         default_factory=dict
     )
     active_job: BaselineActiveTrainingJob | None = None
@@ -99,15 +108,18 @@ class BaselineTrainingState:
             run_id=self.run_id,
             baseline_method=self.baseline_method,
             training_strategy=self.training_strategy,
+            trainable_param_ratio=self.trainable_param_ratio,
             edge_id=self.edge_id,
             model_version=model_version,
             frame_ids=frame_ids,
         )
-        key = (window_id, self.training_strategy)
+        key = self._record_key(window_id)
         if self.active_job is not None:
             if (
                 self.active_job.window_id == window_id
                 and self.active_job.training_strategy == self.training_strategy
+                and _ratio_key(self.active_job.trainable_param_ratio)
+                == _ratio_key(self.trainable_param_ratio)
             ):
                 return BaselineReadyWindow(
                     window_id=window_id,
@@ -150,10 +162,11 @@ class BaselineTrainingState:
         message: str,
         now: float,
     ) -> None:
-        self.window_records[(str(window_id), self.training_strategy)] = (
+        self.window_records[self._record_key(window_id)] = (
             BaselineWindowTrainingRecord(
                 status="FAILED",
                 training_strategy=self.training_strategy,
+                trainable_param_ratio=float(self.trainable_param_ratio),
                 updated_at=float(now),
                 failure_backoff_until=float(now) + max(0.0, float(self.failure_backoff_sec)),
                 message=str(message or ""),
@@ -168,10 +181,11 @@ class BaselineTrainingState:
         samples: list[BaselineTrainingSample],
         now: float = 0.0,
     ) -> None:
-        self.window_records[(str(window_id), self.training_strategy)] = (
+        self.window_records[self._record_key(window_id)] = (
             BaselineWindowTrainingRecord(
                 status="RUNNING",
                 training_strategy=self.training_strategy,
+                trainable_param_ratio=float(self.trainable_param_ratio),
                 updated_at=float(now or 0.0),
                 job_id=str(job_id),
             )
@@ -181,6 +195,7 @@ class BaselineTrainingState:
             window_id=str(window_id),
             model_version=str(samples[-1].model_version if samples else "0"),
             training_strategy=self.training_strategy,
+            trainable_param_ratio=float(self.trainable_param_ratio),
             frame_ids=tuple(int(sample.frame_id) for sample in samples),
         )
 
@@ -196,10 +211,11 @@ class BaselineTrainingState:
         normalized = str(status or "").upper()
         if normalized != "SUCCEEDED":
             normalized = "FAILED"
-        self.window_records[(str(window_id), self.training_strategy)] = (
+        self.window_records[self._record_key(window_id)] = (
             BaselineWindowTrainingRecord(
                 status=normalized,
                 training_strategy=self.training_strategy,
+                trainable_param_ratio=float(self.trainable_param_ratio),
                 updated_at=float(now),
                 job_id=str(job_id or ""),
                 failure_backoff_until=(
@@ -215,7 +231,18 @@ class BaselineTrainingState:
     def clear_active(self) -> None:
         self.active_job = None
 
-    def active_key(self) -> tuple[str, str] | None:
+    def active_key(self) -> tuple[str, str, str] | None:
         if self.active_job is None:
             return None
-        return self.active_job.window_id, self.active_job.training_strategy
+        return (
+            self.active_job.window_id,
+            self.active_job.training_strategy,
+            _ratio_key(self.active_job.trainable_param_ratio),
+        )
+
+    def _record_key(self, window_id: str) -> tuple[str, str, str]:
+        return (
+            str(window_id),
+            self.training_strategy,
+            _ratio_key(self.trainable_param_ratio),
+        )

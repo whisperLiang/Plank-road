@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import torch
 
-from cloud.training.freeze_modes import decode_training_sample
+from cloud.training.parameter_freeze import decode_training_sample
 
 
 def load_baseline_manifest(workspace: Path) -> dict[str, Any]:
