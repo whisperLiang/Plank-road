@@ -20,24 +20,26 @@ When training is triggered, the edge sends a versioned gRPC bundle with cached f
 
 ## Quick Start
 
+Python, `uv`, `pytest`, server, and client examples below are written as single-line invocations so they can be copied into Linux Bash, Windows PowerShell, or Windows CMD. CUDA MPS setup and shutdown are Linux CUDA host commands and are labeled separately. Replace sample host values such as `192.168.66.205` with your cloud machine IP before real deployment.
+
 Install dependencies with `uv`:
 
-```bash
+```shell
 python -m pip install --upgrade uv
 uv sync --all-extras
 ```
 
 Run a single edge against one cloud server:
 
-```bash
-# Terminal 1
-python cloud_server.py \
-  --yaml_path ./config/config.yaml \
-  --edge_affine_workers_enabled true \
-  --edge_affine_worker_mode edge_affine_single_gpu_mps \
-  --run_id plank_road_single_edge_001
+Cloud terminal:
 
-# Terminal 2
+```shell
+python cloud_server.py --yaml_path ./config/config.yaml --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps --run_id plank_road_single_edge_001
+```
+
+Edge terminal:
+
+```shell
 python edge_client.py --headless
 ```
 
@@ -45,13 +47,8 @@ Runtime defaults come from [config/config.yaml](./config/config.yaml), including
 
 Generated gRPC files are committed under [grpc_server/](./grpc_server/). Rebuild them only after changing [grpc_server/protos/message_transmission.proto](./grpc_server/protos/message_transmission.proto):
 
-```bash
-python -m grpc_tools.protoc \
-    -I ./grpc_server/protos \
-    --python_out=./grpc_server \
-    --pyi_out=./grpc_server \
-    --grpc_python_out=./grpc_server \
-    ./grpc_server/protos/message_transmission.proto
+```shell
+python -m grpc_tools.protoc -I ./grpc_server/protos --python_out=./grpc_server --pyi_out=./grpc_server --grpc_python_out=./grpc_server ./grpc_server/protos/message_transmission.proto
 ```
 
 ## Architecture
@@ -195,13 +192,15 @@ server:
 
 Start the cloud server and one edge client:
 
-```bash
-python cloud_server.py \
-  --yaml_path ./config/config.yaml \
-  --edge_affine_workers_enabled true \
-  --edge_affine_worker_mode edge_affine_single_gpu_mps \
-  --run_id plank_road_single_edge_001
+Cloud terminal:
 
+```shell
+python cloud_server.py --yaml_path ./config/config.yaml --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps --run_id plank_road_single_edge_001
+```
+
+Edge terminal:
+
+```shell
 python edge_client.py --headless
 ```
 
@@ -226,57 +225,30 @@ The cloud `server.listen_address` must listen on an external interface, such as 
 
 Each real edge device has its own filesystem, so each device may use `./cache` locally. For clearer logs and debugging, prefer explicit per-edge paths such as `./cache/edge_1` and `./cache/edge_2`. Multiple edges may use different video files, camera sources, or the same configuration file, but their `edge_id` values must not repeat.
 
-Start MPS on the cloud machine:
+Start MPS on the Linux CUDA cloud machine:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
-export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
-mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-nvidia-cuda-mps-control -d
+export CUDA_VISIBLE_DEVICES=0 CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log && mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY" && nvidia-cuda-mps-control -d
 ```
 
 Start the cloud:
 
-```bash
-python cloud_server.py \
-  --yaml_path ./config/config.yaml \
-  --listen_address "[::]:50051" \
-  --edge_affine_workers_enabled true \
-  --edge_affine_worker_mode edge_affine_single_gpu_mps \
-  --run_id plank_road_real_devices_001
+```shell
+python cloud_server.py --yaml_path ./config/config.yaml --listen_address "[::]:50051" --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps --run_id plank_road_real_devices_001
 ```
 
 Start each physical edge with a unique `edge_id`:
 
-```bash
-python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --edge_id 1 \
-  --server_ip <cloud_ip>:50051 \
-  --cache_path ./cache/edge_1 \
-  --video_path ./video_data/road.mp4 \
-  --headless
+```shell
+python edge_client.py --yaml_path ./config/config.yaml --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
 ```
 
-```bash
-python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --edge_id 2 \
-  --server_ip <cloud_ip>:50051 \
-  --cache_path ./cache/edge_2 \
-  --video_path ./video_data/cam1-rin.mp4 \
-  --headless
+```shell
+python edge_client.py --yaml_path ./config/config.yaml --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
 ```
 
-```bash
-python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --edge_id 3 \
-  --server_ip <cloud_ip>:50051 \
-  --cache_path ./cache/edge_3 \
-  --video_path ./video_data/suwon#86_04_01.mp4 \
-  --headless
+```shell
+python edge_client.py --yaml_path ./config/config.yaml --edge_id 3 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_3 --video_path "./video_data/suwon#86_04_01.mp4" --headless
 ```
 
 When GPU memory approaches the configured threshold, additional edge workers wait until an active worker releases its lease. If a lease heartbeat expires, the lease is released automatically and the job is treated as retryable.
@@ -339,82 +311,38 @@ overlay; full Ekya scheduler training is intentionally separate future work.
 
 Accuracy-Trigger Cloud Retraining cloud:
 
-```bash
-python cloud_server.py \
-  --yaml_path ./config/config.yaml \
-  --mode baseline \
-  --baseline_method accuracy_trigger_cloud_retraining \
-  --listen_address "[::]:50051" \
-  --run_id baseline_acc_trigger_001
+```shell
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --listen_address "[::]:50051" --run_id baseline_acc_trigger_001
 ```
 
 Accuracy-Trigger edge device 1:
 
-```bash
-python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --mode baseline \
-  --baseline_method accuracy_trigger_cloud_retraining \
-  --run_id baseline_acc_trigger_001 \
-  --edge_id 1 \
-  --server_ip 192.168.66.205:50051 \
-  --cache_path ./cache/edge_1 \
-  --video_path ./video_data/road.mp4 \
-  --headless
+```shell
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --run_id baseline_acc_trigger_001 --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
 ```
 
 Accuracy-Trigger edge device 2:
 
-```bash
-python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --mode baseline \
-  --baseline_method accuracy_trigger_cloud_retraining \
-  --run_id baseline_acc_trigger_001 \
-  --edge_id 2 \
-  --server_ip 192.168.66.205:50051 \
-  --cache_path ./cache/edge_2 \
-  --video_path ./video_data/cam1-rin.mp4 \
-  --headless
+```shell
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --run_id baseline_acc_trigger_001 --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
 ```
 
 Pure Edge Local Updating:
 
-```bash
-python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --mode baseline \
-  --baseline_method pure_edge_local_updating \
-  --edge_id 1 \
-  --cache_path ./cache/edge_1 \
-  --video_path ./video_data/road.mp4 \
-  --headless
+```shell
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --edge_id 1 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
 ```
 
 Ekya-Style Centralized Scheduling cloud:
 
-```bash
-python cloud_server.py \
-  --yaml_path ./config/config.yaml \
-  --mode baseline \
-  --baseline_method ekya_style_centralized_scheduling \
-  --listen_address "[::]:50051" \
-  --run_id baseline_ekya_001
+```shell
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_centralized_scheduling --listen_address "[::]:50051" --run_id baseline_ekya_001
 ```
 
 Ekya edge:
 
-```bash
-python edge_client.py \
-  --yaml_path ./config/config.yaml \
-  --mode baseline \
-  --baseline_method ekya_style_centralized_scheduling \
-  --run_id baseline_ekya_001 \
-  --edge_id 1 \
-  --server_ip 192.168.66.205:50051 \
-  --cache_path ./cache/edge_1 \
-  --video_path ./video_data/road.mp4 \
-  --headless
+```shell
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_centralized_scheduling --run_id baseline_ekya_001 --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
 ```
 
 Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. Ekya disables frame filtering, uploads raw frames, receives cloud inference results for visualization, and schedules cloud-side frozen-ratio retraining through the same edge-affine worker pool. If a worker is still starting or its endpoint is being replaced, cloud-backed baseline triggers enter worker-infra backoff instead of recording an algorithm training failure.
@@ -423,7 +351,7 @@ Pure Edge Local Updating writes metrics locally under `results/baselines_distrib
 
 Run the full test suite:
 
-```bash
+```shell
 pytest
 ```
 
@@ -431,17 +359,8 @@ Core coverage includes cloud contracts/orchestration, feature shard and cache ha
 
 Focused validation command:
 
-```bash
-pytest \
-    tests/test_cloud_contracts.py \
-    tests/test_orchestration_refactor.py \
-    tests/test_edge_feature_shard_writer.py \
-    tests/test_cloud_feature_shard_receive.py \
-    tests/test_fixed_split_retrain_engine.py \
-    tests/test_teacher_annotation_service.py \
-    tests/test_baseline_metrics.py \
-    tests/test_low_quality_trigger_bundle.py \
-    tests/test_fixed_split_e2e_processes.py
+```shell
+pytest tests/test_cloud_contracts.py tests/test_orchestration_refactor.py tests/test_edge_feature_shard_writer.py tests/test_cloud_feature_shard_receive.py tests/test_fixed_split_retrain_engine.py tests/test_teacher_annotation_service.py tests/test_baseline_metrics.py tests/test_low_quality_trigger_bundle.py tests/test_fixed_split_e2e_processes.py
 ```
 
 ## References
