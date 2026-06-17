@@ -301,6 +301,7 @@ baseline:
     cloud_inference_timeout_sec: 3.0
     display_cloud_failure_mode: empty
     require_micro_profiling: true
+    allow_zero_gain_training: true
   training:
     batch_size: 32
     num_epoch: 50

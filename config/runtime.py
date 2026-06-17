@@ -274,6 +274,7 @@ class EkyaStyleBaselineConfig(ConfigSection):
     cloud_inference_timeout_sec: float = 3.0
     display_cloud_failure_mode: str = "empty"
     require_micro_profiling: bool = True
+    allow_zero_gain_training: bool = True
     training_strategy: str = "freeze"
     display_source: str = "cloud"
     max_microprofile_configs: int = 8
@@ -826,6 +827,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     if not bool(getattr(ekya, "require_micro_profiling", True)):
         raise ValueError(
             "baseline.ekya_style_centralized_scheduling.require_micro_profiling must be true"
+        )
+    if not isinstance(getattr(ekya, "allow_zero_gain_training", True), bool):
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.allow_zero_gain_training "
+            "must be boolean"
         )
     if not bool(getattr(ekya, "wait_for_cloud_inference", True)):
         raise ValueError(

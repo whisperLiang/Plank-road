@@ -62,6 +62,10 @@ baseline:
   cloud_inference_timeout_sec: 3.0
   display_cloud_failure_mode: empty
   require_micro_profiling: true
+  # RF-DETR proxy F1 can stay exactly 0 during one-epoch microprofiling even
+  # when formal training should still run; allow zero-gain candidates so Ekya
+  # does not starve before the first model update.
+  allow_zero_gain_training: true
   training_strategy: freeze
   display_source: cloud
   max_microprofile_configs: 8

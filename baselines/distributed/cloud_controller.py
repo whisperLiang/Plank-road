@@ -663,7 +663,17 @@ class DistributedBaselineController:
     ) -> str | None:
         if self.training_backend is None:
             return None
-        if not _valid_ekya_microprofile_result(window, result):
+        if not _valid_ekya_microprofile_result(
+            window,
+            result,
+            allow_zero_gain_training=bool(
+                _config_value(
+                    self.baseline_method_config,
+                    "allow_zero_gain_training",
+                    True,
+                )
+            ),
+        ):
             self._mark_ekya_skip(window, "microprofile_failed")
             return None
         selected_samples = select_window_samples(
@@ -996,6 +1006,8 @@ def _merge_model_update_payloads(
 def _valid_ekya_microprofile_result(
     window: EkyaReadyWindow,
     result: MicroProfileResult,
+    *,
+    allow_zero_gain_training: bool = True,
 ) -> bool:
     if not str(getattr(result, "result_id", "") or ""):
         return False
@@ -1011,7 +1023,12 @@ def _valid_ekya_microprofile_result(
         return False
     if str(result.proxy_metric_name) != "teacher_agreement_f1":
         return False
-    return float(result.score) > 0.0
+    score = float(result.score)
+    if score < 0.0:
+        return False
+    if score == 0.0 and not bool(allow_zero_gain_training):
+        return False
+    return True
 
 
 def _decode_model_update_payload(model_data: str) -> Mapping[str, Any]:

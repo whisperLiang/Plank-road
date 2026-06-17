@@ -30,6 +30,7 @@ from cloud.training.strategies.baseline_freeze import (
 )
 from model_management.model_delta_payload import require_state_dict_delta_payload
 from model_management.model_zoo import build_detection_model
+from model_management.split_model_adapters import postprocess_split_runtime_output
 
 
 @dataclass(frozen=True)
@@ -608,7 +609,10 @@ class EkyaCentralScheduler:
             return "proxy_metric_unavailable"
         if str(result.base_model_version or "0") != str(window.model_version or "0"):
             return "microprofile_failed"
-        if result.score <= 0.0:
+        allow_zero_gain = bool(self.ekya_config.get("allow_zero_gain_training", True))
+        if float(result.score) < 0.0 or (
+            float(result.score) <= 0.0 and not allow_zero_gain
+        ):
             return "no_candidate_improves_window_quality"
         min_quality = float(self.ekya_config.get("min_inference_quality", 0.0) or 0.0)
         if min_quality > 0.0 and result.estimated_window_average_quality < min_quality:
@@ -692,7 +696,22 @@ def evaluate_teacher_agreement_f1(
     denominator = (2 * tp) + fp + fn
     if denominator <= 0:
         return None
-    return float((2 * tp) / denominator)
+    metric = float((2 * tp) / denominator)
+    if metric == 0.0:
+        predicted_objects = sum(
+            len(list(prediction.get("boxes") or [])) for prediction in predictions
+        )
+        logger.info(
+            "ekya_proxy_eval_zero samples={} teacher_objects={} predicted_objects={} "
+            "tp={} fp={} fn={}",
+            len(samples),
+            teacher_objects,
+            predicted_objects,
+            tp,
+            fp,
+            fn,
+        )
+    return metric
 
 
 def teacher_agreement_counts(
@@ -793,15 +812,96 @@ def _predict_samples(
             device=device,
         )
         outputs = _forward_full_model(model, trainable_module, prepared)
-        predictions.extend(
-            _batched_predictions_from_model_output(
-                outputs,
-                batch_size=len(batch),
-                threshold_low=0.0,
-                threshold_high=0.0,
-            )
+        batch_predictions = _batched_predictions_from_model_output(
+            outputs,
+            batch_size=len(batch),
+            threshold_low=0.0,
+            threshold_high=0.0,
         )
+        if _looks_like_raw_detection_output(outputs):
+            postprocessed = _postprocess_raw_detection_output(
+                model,
+                outputs,
+                prepared=prepared,
+                batch=batch,
+            )
+            if postprocessed is not None:
+                batch_predictions = postprocessed
+        predictions.extend(batch_predictions)
     return predictions
+
+
+def _looks_like_raw_detection_output(outputs: Any) -> bool:
+    if isinstance(outputs, Mapping):
+        if "pred_boxes" in outputs and (
+            "pred_logits" in outputs or "logits" in outputs
+        ):
+            return True
+    if hasattr(outputs, "pred_boxes") and (
+        hasattr(outputs, "pred_logits") or hasattr(outputs, "logits")
+    ):
+        return True
+    # RF-DETR and several DETR-style internals return tuple outputs before
+    # wrapper postprocessing converts them into boxes/labels/scores.
+    return isinstance(outputs, tuple)
+
+
+def _postprocess_raw_detection_output(
+    model: torch.nn.Module,
+    outputs: Any,
+    *,
+    prepared: Any,
+    batch: list[RawFrameTrainingSample],
+) -> list[dict[str, list]] | None:
+    if not batch:
+        return []
+    predictions: list[dict[str, list]] = []
+    for index, sample in enumerate(batch):
+        try:
+            decoded = postprocess_split_runtime_output(
+                model,
+                _slice_batch_item(outputs, index),
+                threshold=0.0,
+                model_input=_slice_batch_item(prepared.model_inputs, index),
+                orig_image=sample.image_bgr,
+            )
+        except Exception as exc:
+            logger.debug(
+                "ekya_microprofile_postprocess_failed model_type={} index={} error={}",
+                type(model).__name__,
+                index,
+                exc,
+            )
+            return None
+        sample_predictions = _batched_predictions_from_model_output(
+            decoded,
+            batch_size=1,
+            threshold_low=0.0,
+            threshold_high=0.0,
+        )
+        if len(sample_predictions) != 1:
+            logger.debug(
+                "ekya_microprofile_postprocess_mismatch index={} predictions={}",
+                index,
+                len(sample_predictions),
+            )
+            return None
+        predictions.extend(sample_predictions)
+    return predictions
+
+
+def _slice_batch_item(value: Any, index: int) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return value
+        return value[index : index + 1]
+    if isinstance(value, Mapping):
+        return {key: _slice_batch_item(item, index) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_slice_batch_item(item, index) for item in value)
+    if isinstance(value, list):
+        return [_slice_batch_item(item, index) for item in value]
+    return value
 
 
 def _batches(samples: list[RawFrameTrainingSample], batch_size: int):
