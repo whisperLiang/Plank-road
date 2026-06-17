@@ -263,34 +263,6 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
 
 
 @dataclass
-class EkyaStyleBaselineConfig(ConfigSection):
-    upload_raw_frames: bool = True
-    use_frame_filter: bool = False
-    cloud_inference: bool = True
-    return_cloud_inference_to_edge: bool = True
-    wait_for_cloud_inference: bool = True
-    cloud_inference_timeout_sec: float = 3.0
-    display_cloud_failure_mode: str = "empty"
-    require_micro_profiling: bool = True
-    allow_zero_gain_training: bool = True
-    training_strategy: str = "freeze"
-    display_source: str = "cloud"
-    max_microprofile_configs: int = 8
-    trainable_param_ratios: list[float] = field(default_factory=lambda: [0.1, 0.3, 0.5])
-    sample_fractions: list[float] = field(default_factory=lambda: [0.5, 1.0])
-    batch_sizes: list[int] = field(default_factory=list)
-    formal_num_epochs: list[int] = field(default_factory=list)
-    learning_rates: list[float] = field(default_factory=list)
-    min_teacher_objects: int = 1
-    teacher_annotation_threshold: float | None = None
-    teacher_agreement_iou_threshold: float = 0.5
-    teacher_agreement_confidence_threshold: float = 0.0
-    min_inference_quality: float = 0.0
-    max_cloud_inference_latency_ms: float = 0.0
-    min_cloud_inference_fps: float = 0.0
-
-
-@dataclass
 class BaselineEdgeConfig(ConfigSection):
     split_runtime_policy: str = "disabled"
 
@@ -324,9 +296,6 @@ class BaselineConfig(ConfigSection):
     pure_edge_local_updating: PureEdgeBaselineConfig = field(default_factory=PureEdgeBaselineConfig)
     accuracy_trigger_cloud_retraining: AccuracyTriggerBaselineConfig = field(
         default_factory=AccuracyTriggerBaselineConfig
-    )
-    ekya_style_centralized_scheduling: EkyaStyleBaselineConfig = field(
-        default_factory=EkyaStyleBaselineConfig
     )
 
     def __post_init__(self) -> None:
@@ -556,10 +525,6 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             AccuracyTriggerBaselineConfig,
             known.get("accuracy_trigger_cloud_retraining"),
         )
-        known["ekya_style_centralized_scheduling"] = _section(
-            EkyaStyleBaselineConfig,
-            known.get("ekya_style_centralized_scheduling"),
-        )
     elif section_cls is RuntimeConfig:
         sample_pool = _section(SamplePoolConfig, known.get("sample_pool"))
         client_data = dict(known.get("client") or {})
@@ -686,6 +651,17 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
 
     _validate_sample_pool_config("sample_pool", config.sample_pool)
     validate_baseline_method(config.baseline.method)
+    removed_baseline_sections = {"ekya_style_centralized_scheduling"}
+    stale_sections = removed_baseline_sections.intersection(
+        set(getattr(config.baseline, "_extras", {}) or {})
+    )
+    if stale_sections:
+        names = ", ".join(sorted(stale_sections))
+        raise ValueError(
+            f"baseline section(s) removed and no longer supported: {names}. "
+            "Valid baseline methods are pure_edge_local_updating and "
+            "accuracy_trigger_cloud_retraining."
+        )
     if not isinstance(config.baseline.enabled, bool):
         raise ValueError("baseline.enabled must be a boolean")
     if not str(config.baseline.results_root or "").strip():
@@ -799,147 +775,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "baseline.accuracy_trigger_cloud_retraining.training_strategy must be "
             "freeze"
-        )
-    ekya = config.baseline.ekya_style_centralized_scheduling
-    ekya_strategy = str(ekya.training_strategy or "").strip()
-    if ekya_strategy not in allowed_baseline_training:
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.training_strategy must be "
-            "freeze"
-        )
-    if str(getattr(ekya, "display_source", "cloud") or "cloud").strip() not in {
-        "cloud",
-        "local",
-    }:
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.display_source must be cloud or local"
-        )
-    legacy_enable_micro = ekya._extras.get("enable_micro_profiling")
-    if legacy_enable_micro is not None and not bool(legacy_enable_micro):
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.enable_micro_profiling=false "
-            "is no longer supported; Ekya requires microprofiling"
-        )
-    if not bool(getattr(ekya, "require_micro_profiling", True)):
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.require_micro_profiling must be true"
-        )
-    if not isinstance(getattr(ekya, "allow_zero_gain_training", True), bool):
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.allow_zero_gain_training "
-            "must be boolean"
-        )
-    if not bool(getattr(ekya, "wait_for_cloud_inference", True)):
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.wait_for_cloud_inference must be true"
-        )
-    if not bool(getattr(ekya, "cloud_inference", True)):
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.cloud_inference must be true"
-        )
-    if not bool(getattr(ekya, "upload_raw_frames", True)):
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.upload_raw_frames must be true"
-        )
-    if not bool(getattr(ekya, "return_cloud_inference_to_edge", True)):
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.return_cloud_inference_to_edge "
-            "must be true"
-        )
-    failure_mode = str(
-        getattr(ekya, "display_cloud_failure_mode", "empty") or "empty"
-    ).strip()
-    if failure_mode not in {"empty", "local"}:
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.display_cloud_failure_mode "
-            "must be empty or local"
-        )
-    _validate_positive(
-        "baseline.ekya_style_centralized_scheduling.cloud_inference_timeout_sec",
-        float(getattr(ekya, "cloud_inference_timeout_sec", 3.0)),
-    )
-    _validate_positive(
-        "baseline.ekya_style_centralized_scheduling.max_microprofile_configs",
-        int(getattr(ekya, "max_microprofile_configs", 8)),
-    )
-    _validate_positive(
-        "baseline.ekya_style_centralized_scheduling.min_teacher_objects",
-        int(getattr(ekya, "min_teacher_objects", 1)),
-    )
-    for ratio in list(getattr(ekya, "trainable_param_ratios", []) or []):
-        _validate_positive(
-            "baseline.ekya_style_centralized_scheduling.trainable_param_ratios",
-            float(ratio),
-        )
-        if float(ratio) > 1.0:
-            raise ValueError(
-                "baseline.ekya_style_centralized_scheduling.trainable_param_ratios "
-                "must be <= 1"
-            )
-    for fraction in list(getattr(ekya, "sample_fractions", []) or []):
-        _validate_positive(
-            "baseline.ekya_style_centralized_scheduling.sample_fractions",
-            float(fraction),
-        )
-        if float(fraction) > 1.0:
-            raise ValueError(
-                "baseline.ekya_style_centralized_scheduling.sample_fractions must be <= 1"
-            )
-    for batch_size in list(getattr(ekya, "batch_sizes", []) or []):
-        _validate_positive(
-            "baseline.ekya_style_centralized_scheduling.batch_sizes",
-            int(batch_size),
-        )
-    for epoch_count in list(getattr(ekya, "formal_num_epochs", []) or []):
-        _validate_positive(
-            "baseline.ekya_style_centralized_scheduling.formal_num_epochs",
-            int(epoch_count),
-        )
-    for learning_rate in list(getattr(ekya, "learning_rates", []) or []):
-        _validate_positive(
-            "baseline.ekya_style_centralized_scheduling.learning_rates",
-            float(learning_rate),
-        )
-    threshold = getattr(ekya, "teacher_annotation_threshold", None)
-    if threshold is not None:
-        _validate_positive(
-            "baseline.ekya_style_centralized_scheduling.teacher_annotation_threshold",
-            float(threshold),
-            allow_zero=True,
-        )
-    _validate_positive(
-        "baseline.ekya_style_centralized_scheduling.teacher_agreement_iou_threshold",
-        float(getattr(ekya, "teacher_agreement_iou_threshold", 0.5)),
-        allow_zero=True,
-    )
-    if float(getattr(ekya, "teacher_agreement_iou_threshold", 0.5)) > 1.0:
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.teacher_agreement_iou_threshold "
-            "must be <= 1"
-        )
-    _validate_positive(
-        "baseline.ekya_style_centralized_scheduling.teacher_agreement_confidence_threshold",
-        float(getattr(ekya, "teacher_agreement_confidence_threshold", 0.0)),
-        allow_zero=True,
-    )
-    if float(getattr(ekya, "teacher_agreement_confidence_threshold", 0.0)) > 1.0:
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling."
-            "teacher_agreement_confidence_threshold must be <= 1"
-        )
-    for name in (
-        "min_inference_quality",
-        "max_cloud_inference_latency_ms",
-        "min_cloud_inference_fps",
-    ):
-        _validate_positive(
-            f"baseline.ekya_style_centralized_scheduling.{name}",
-            float(getattr(ekya, name, 0.0)),
-            allow_zero=True,
-        )
-    if float(getattr(ekya, "min_inference_quality", 0.0)) > 1.0:
-        raise ValueError(
-            "baseline.ekya_style_centralized_scheduling.min_inference_quality must be <= 1"
         )
     feature_upload = config.client.feature_upload
     if str(feature_upload.storage_format).strip().lower() not in {

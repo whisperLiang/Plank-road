@@ -272,30 +272,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
 
     def RequestCloudInference(self, request, context):
-        if self.baseline_controller is None:
-            return _baseline_inference_reply(
-                request,
-                success=False,
-                message="baseline controller is not configured",
-            )
-        try:
-            result = self.baseline_controller.request_cloud_inference(
-                run_id=request.run_id,
-                baseline_method=request.baseline_method,
-                edge_id=int(request.edge_id),
-                frame_id=int(request.frame_id),
-            )
-            return _baseline_inference_reply(
-                request,
-                success=True,
-                message="cloud inference completed",
-                cloud_prediction_json=json_dumps(result.get("cloud_prediction", {})),
-                confidence=float(result.get("confidence", 0.0) or 0.0),
-                timestamp_ms=int(result.get("timestamp_ms", 0) or 0),
-            )
-        except Exception as exc:
-            self._log_failure("RequestCloudInference", exc)
-            return _baseline_inference_reply(request, success=False, message=str(exc))
+        del context
+        return _baseline_inference_reply(
+            request,
+            success=False,
+            message="baseline cloud inference is not supported",
+        )
 
     def PollCommand(self, request, context):
         del context
@@ -325,36 +307,12 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             )
 
     def DownloadInferenceResult(self, request, context):
-        if self.baseline_controller is None:
-            return _baseline_inference_reply(
-                request,
-                success=False,
-                message="baseline controller is not configured",
-            )
-        try:
-            result = self.baseline_controller.download_inference_result(
-                run_id=request.run_id,
-                baseline_method=request.baseline_method,
-                edge_id=int(request.edge_id),
-                frame_id=int(request.frame_id),
-            )
-            if result is None:
-                return _baseline_inference_reply(
-                    request,
-                    success=False,
-                    message="inference result not found",
-                )
-            return _baseline_inference_reply(
-                request,
-                success=True,
-                message="inference result found",
-                cloud_prediction_json=json_dumps(result.get("cloud_prediction", {})),
-                confidence=float(result.get("confidence", 0.0) or 0.0),
-                timestamp_ms=int(result.get("timestamp_ms", 0) or 0),
-            )
-        except Exception as exc:
-            self._log_failure("DownloadInferenceResult", exc)
-            return _baseline_inference_reply(request, success=False, message=str(exc))
+        del context
+        return _baseline_inference_reply(
+            request,
+            success=False,
+            message="baseline cloud inference is not supported",
+        )
 
 def _baseline_frame_from_request(request) -> BaselineFramePayload:
     return BaselineFramePayload(

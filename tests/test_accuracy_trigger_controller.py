@@ -364,7 +364,7 @@ def test_cloud_controller_defers_retryable_teacher_annotation_without_dropping_f
     assert frame_key in controller._accuracy_annotation_pending
     assert controller._frames[frame_key].raw_frame == b""
     assert controller._frames[frame_key].teacher_prediction == {}
-    assert controller._raw_frames[frame_key] == payload.raw_frame
+    assert controller._accuracy_annotation_pending[frame_key].raw_frame == payload.raw_frame
     assert frame_key not in controller._teacher_results
     assert backend.requests == []
 

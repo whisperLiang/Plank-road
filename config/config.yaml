@@ -21,7 +21,6 @@ baseline:
  # Plank-Road frame filter as the keyframe selector, while training
  # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
   trigger_window_size: 60
- # Ekya defaults live in config/runtime.py; add overrides here only for ablations.
 
 client:
  # the source video

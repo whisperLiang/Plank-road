@@ -281,7 +281,6 @@ The only supported baseline methods are:
 ```text
 pure_edge_local_updating
 accuracy_trigger_cloud_retraining
-ekya_style_centralized_scheduling
 ```
 
 Cloud-backed baseline updates use the shared training-job API with one generic
@@ -295,13 +294,6 @@ baseline:
   accuracy_trigger_cloud_retraining:
     training_strategy: freeze
     training_failure_backoff_sec: 30
-  ekya_style_centralized_scheduling:
-    display_source: cloud
-    wait_for_cloud_inference: true
-    cloud_inference_timeout_sec: 3.0
-    display_cloud_failure_mode: empty
-    require_micro_profiling: true
-    allow_zero_gain_training: true
   training:
     batch_size: 32
     num_epoch: 50
@@ -310,11 +302,7 @@ baseline:
 
 `accuracy_trigger_cloud_retraining` uses edge predictions only for trigger and
 evaluation metadata; cloud training targets come from the cloud teacher unless
-an explicit ablation opts into edge targets. `ekya_style_centralized_scheduling`
-uploads raw sampled frames, returns cloud inference for display, runs
-cloud-side Ekya-style microprofiling over candidate freeze configs, schedules
-formal freeze training centrally, and publishes cloud-scheduled model updates to
-the selected edge through the shared training-job API.
+an explicit ablation opts into edge targets.
 
 Accuracy-Trigger Cloud Retraining cloud:
 
@@ -340,19 +328,7 @@ Pure Edge Local Updating:
 python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --edge_id 1 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
 ```
 
-Ekya-Style Centralized Scheduling cloud:
-
-```shell
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_centralized_scheduling --listen_address "[::]:50051" --run_id baseline_ekya_001
-```
-
-Ekya edge:
-
-```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_centralized_scheduling --run_id baseline_ekya_001 --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
-```
-
-Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. Ekya disables frame filtering, uploads raw frames, receives same-frame cloud lightweight display inference results, separately caches cloud teacher annotations for scheduling/training, and schedules cloud-side frozen-ratio retraining through the same edge-affine worker pool. If a worker is still starting or its endpoint is being replaced, cloud-backed baseline triggers enter worker-infra backoff instead of recording an algorithm training failure.
+Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. If a worker is still starting or its endpoint is being replaced, cloud-backed baseline triggers enter worker-infra backoff instead of recording an algorithm training failure.
 
 ## Testing
 

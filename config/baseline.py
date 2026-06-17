@@ -5,7 +5,6 @@ from dataclasses import dataclass
 ALLOWED_BASELINE_METHODS: tuple[str, ...] = (
     "pure_edge_local_updating",
     "accuracy_trigger_cloud_retraining",
-    "ekya_style_centralized_scheduling",
 )
 
 _PLANK_ROAD_BASELINE_METHOD = "plank_road" + "_multi_device"

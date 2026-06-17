@@ -3,7 +3,6 @@ from __future__ import annotations
 from baselines.policies import (
     AccuracyTriggerCloudRetrainingPolicy,
     BaseBaselinePolicy,
-    EkyaStyleCentralizedSchedulingPolicy,
     PureEdgeLocalUpdatingPolicy,
 )
 from config.baseline import ALLOWED_BASELINE_METHODS, validate_baseline_method
@@ -11,7 +10,6 @@ from config.baseline import ALLOWED_BASELINE_METHODS, validate_baseline_method
 _REGISTRY: dict[str, type[BaseBaselinePolicy]] = {
     "pure_edge_local_updating": PureEdgeLocalUpdatingPolicy,
     "accuracy_trigger_cloud_retraining": AccuracyTriggerCloudRetrainingPolicy,
-    "ekya_style_centralized_scheduling": EkyaStyleCentralizedSchedulingPolicy,
 }
 
 

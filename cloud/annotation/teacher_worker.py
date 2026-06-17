@@ -51,9 +51,7 @@ def _is_cuda_oom(exc: BaseException) -> bool:
 
 
 def _is_retryable_annotation_error(exc: BaseException) -> bool:
-    return bool(getattr(exc, "retryable", False)) or type(exc).__name__ in {
-        "EkyaHeavyLaneBusy",
-    }
+    return bool(getattr(exc, "retryable", False))
 
 
 def _default_label_builder(

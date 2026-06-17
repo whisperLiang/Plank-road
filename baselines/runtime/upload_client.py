@@ -151,32 +151,6 @@ class BaselineUploadClient:
         if not bool(reply.success):
             raise RuntimeError(reply.message)
 
-    def request_cloud_inference(
-        self,
-        payload: BaselineFramePayload,
-        *,
-        timeout_sec: float | None = None,
-    ) -> dict[str, Any]:
-        reply = self.stub.RequestCloudInference(
-            message_transmission_pb2.BaselineInferenceRequest(
-                run_id=payload.run_id,
-                baseline_method=payload.baseline_method,
-                edge_id=payload.edge_id,
-                frame_id=payload.frame_id,
-            ),
-            timeout=float(timeout_sec) if timeout_sec is not None else None,
-        )
-        if not bool(reply.success):
-            raise RuntimeError(reply.message)
-        return {
-            "frame_id": int(reply.frame_id),
-            "cloud_prediction": json_loads(reply.cloud_prediction_json),
-            "confidence": float(reply.confidence),
-            "message": reply.message,
-            "success": bool(reply.success),
-            "timestamp_ms": int(reply.timestamp_ms or int(time.time() * 1000)),
-        }
-
     def poll_command(
         self,
         *,

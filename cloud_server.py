@@ -5,20 +5,16 @@ import json
 from contextlib import contextmanager, nullcontext
 from concurrent import futures
 from pathlib import Path
-from types import SimpleNamespace
 
 if __name__ == "__main__":
     from common.cuda_visibility import configure_default_cuda_visible_devices
 
     configure_default_cuda_visible_devices()
 
-import cv2
 import grpc
-import numpy as np
 from loguru import logger
 
 from baselines.distributed.cloud_controller import DistributedBaselineController
-from baselines.distributed.ekya import EkyaHeavyLaneBusy
 from cloud.annotation import (
     CloudBatchTeacherAnnotator,
     TeacherAnnotationService,
@@ -41,6 +37,10 @@ from grpc_server.rpc_server import MessageTransmissionServicer
 from tools.grpc_options import grpc_message_options
 
 __all__ = ["CloudServer"]
+
+
+class BaselineHeavyLaneBusy(RuntimeError):
+    retryable = True
 
 
 def __getattr__(name: str):
@@ -68,7 +68,6 @@ class CloudServer:
         self.server_id = config.server_id
         self.edge_registry = EdgeRegistry()
         self.baseline_controller = None
-        self.display_object_detection = None
         self.large_object_detection = None
         self.continual_backend = None
         self.worker_pool = None
@@ -84,7 +83,6 @@ class CloudServer:
             resolved_run_id = str(run_id or getattr(baseline_config, "run_id", "") or "")
             if not resolved_run_id:
                 resolved_run_id = default_run_id(method)
-            inference_fn = None
             teacher_annotator = None
             heavy_gpu_lease = None
             if method != "pure_edge_local_updating":
@@ -109,21 +107,12 @@ class CloudServer:
                     heavy_gpu_lease=heavy_gpu_lease,
                     log_internal_ids=self.log_internal_ids,
                 )
-                if method == "ekya_style_centralized_scheduling":
-                    self.display_object_detection = Object_Detection(
-                        _baseline_display_detector_config(config),
-                        type="small inference",
-                    )
-                    inference_fn = _ekya_cloud_inference_adapter(
-                        display_detector=self.display_object_detection,
-                    )
             self.baseline_controller = DistributedBaselineController(
                 baseline_method=method,
                 run_id=resolved_run_id,
                 results_root=str(
                     getattr(baseline_config, "results_root", "results/baselines_distributed")
                 ),
-                inference_fn=inference_fn,
                 training_backend=self.continual_backend,
                 baseline_training_config=getattr(baseline_config, "training", None),
                 baseline_method_config=getattr(baseline_config, method, None),
@@ -136,7 +125,6 @@ class CloudServer:
                 ),
                 strict_run_id=True,
                 teacher_annotator=teacher_annotator,
-                heavy_gpu_lease=heavy_gpu_lease,
             )
             self.baseline_method = method
             self.run_id = resolved_run_id
@@ -411,7 +399,7 @@ def _baseline_heavy_gpu_lease_factory(config, lease_address: str):
             )
         except JsonRpcError as exc:
             if exc.error_type == "GPU_LEASE_BUSY":
-                raise EkyaHeavyLaneBusy(str(exc)) from exc
+                raise BaselineHeavyLaneBusy(str(exc)) from exc
             raise
         with handle:
             try:
@@ -439,18 +427,6 @@ def _baseline_heavy_gpu_lease_factory(config, lease_address: str):
                     pass
 
     return lease_scope
-
-
-def _ekya_cloud_inference_adapter(*, display_detector):
-    def infer(raw_frame: bytes, *, threshold=None, purpose: str = "display") -> dict:
-        del threshold, purpose
-        frame = _decode_frame(raw_frame)
-        if frame is None:
-            return {"boxes": [], "labels": [], "scores": [], "confidence": 0.0}
-        _unused, boxes, labels, scores = display_detector.small_inference(frame)
-        return _prediction_payload(boxes, labels, scores)
-
-    return infer
 
 
 def _teacher_weights_fingerprint(config, teacher_detector) -> str:
@@ -494,66 +470,6 @@ def _teacher_num_classes(teacher_detector) -> int:
     if isinstance(class_names, (list, tuple)):
         return len(class_names)
     return 91
-
-
-def _prediction_payload(boxes, labels, scores) -> dict:
-    scores_list = _jsonable_list(scores)
-    return {
-        "boxes": _jsonable_list(boxes),
-        "labels": _jsonable_list(labels),
-        "scores": scores_list,
-        "confidence": max((_safe_float(score) for score in scores_list), default=0.0),
-    }
-
-
-def _baseline_display_detector_config(config):
-    values = dict(getattr(config, "__dict__", {}) or {})
-    extras = values.pop("_extras", {})
-    if isinstance(extras, dict):
-        values.update({key: value for key, value in extras.items() if key not in values})
-    values["lightweight"] = str(
-        getattr(config, "edge_model_name", getattr(config, "lightweight", "")) or ""
-    )
-    return SimpleNamespace(**values)
-
-
-def _decode_frame(raw_frame: bytes):
-    if not raw_frame:
-        return None
-    array = np.frombuffer(raw_frame, dtype=np.uint8)
-    if array.size == 0:
-        return None
-    return cv2.imdecode(array, cv2.IMREAD_COLOR)
-
-
-def _safe_float(value: object, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _jsonable_list(value: object) -> list:
-    if value is None:
-        return []
-    if hasattr(value, "tolist"):
-        value = value.tolist()
-    if not isinstance(value, (list, tuple)):
-        return [value]
-    return [_jsonable_item(item) for item in value]
-
-
-def _jsonable_item(value: object):
-    if hasattr(value, "tolist"):
-        return value.tolist()
-    if isinstance(value, (list, tuple)):
-        return [_jsonable_item(item) for item in value]
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except (TypeError, ValueError):
-            return value
-    return value
 
 
 def _parse_bool(value: str) -> bool:

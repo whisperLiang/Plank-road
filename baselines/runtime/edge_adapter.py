@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import inspect
 import threading
 import time
 from queue import Empty, Queue
 from typing import Any
 
-import grpc
 from loguru import logger
 
 from baselines.distributed.messages import BaselineFramePayload, now_ms
@@ -48,19 +46,10 @@ class BaselineEdgeAdapter:
         baseline_cfg = getattr(config, "baseline", None)
         method_cfg = getattr(baseline_cfg, self.baseline_method, None)
         self.policy = create_policy(self.baseline_method, method_cfg)
-        self._is_ekya = self.baseline_method == "ekya_style_centralized_scheduling"
         self.training_strategy = validate_baseline_training_strategy(
             getattr(self.policy, "training_strategy", "freeze")
         )
         self.trainable_param_ratio = _trainable_param_ratio(method_cfg)
-        self.display_source = str(getattr(method_cfg, "display_source", "local") or "local")
-        self.cloud_inference_timeout_sec = max(
-            0.001,
-            _safe_float(getattr(method_cfg, "cloud_inference_timeout_sec", 3.0), 3.0),
-        )
-        self.display_cloud_failure_mode = str(
-            getattr(method_cfg, "display_cloud_failure_mode", "empty") or "empty"
-        )
         self.metrics = DistributedMetricsWriter(
             results_root=str(
                 getattr(baseline_cfg, "results_root", "results/baselines_distributed")
@@ -77,7 +66,6 @@ class BaselineEdgeAdapter:
         self._closed = threading.Event()
         self._queue: Queue[BaselineFramePayload] = Queue()
         self._worker: threading.Thread | None = None
-        self._latest_cloud_visual: dict[str, Any] | None = None
         self._cloud_scheduled_active_job: BaselineActiveTrainingJob | None = None
         self._known_cloud_scheduled_job_ids: set[str] = set()
         self._acked_command_ids: set[str] = set()
@@ -171,7 +159,7 @@ class BaselineEdgeAdapter:
             video_source=self.video_path,
             upload_mode=decision.upload_mode,
             is_keyframe=decision.is_keyframe,
-            edge_prediction=edge_prediction if decision.upload_prediction or self._is_ekya else {},
+            edge_prediction=edge_prediction if decision.upload_prediction else {},
             confidence=edge_prediction["confidence"],
             entropy=edge_prediction["entropy"],
             quality_metadata=quality_metadata,
@@ -186,30 +174,14 @@ class BaselineEdgeAdapter:
             training_strategy=self.training_strategy,
             result_source=edge_prediction["result_source"],
         )
-        if decision.upload_frame and self.transport is not None and self._is_ekya:
-            self._process_ekya_payload_sync(payload, edge_prediction=edge_prediction)
-        elif decision.upload_frame and self.transport is not None:
+        if decision.upload_frame and self.transport is not None:
             self._queue.put(payload)
 
     def on_unsampled_frame(self, *, frame, frame_index: int, latest_visual: dict[str, Any]) -> None:
         del frame, frame_index, latest_visual
 
     def display_visual(self, local_visual: dict[str, Any]) -> dict[str, Any]:
-        if (
-            self.baseline_method != "ekya_style_centralized_scheduling"
-            or self.display_source != "cloud"
-        ):
-            return local_visual
-        cloud = self._latest_cloud_visual
-        local_frame = int(local_visual.get("frame_index", -1) or -1)
-        cloud_frame = int(cloud.get("frame_index", -2) or -2) if cloud is not None else -2
-        if cloud is None or (local_frame >= 0 and cloud_frame != local_frame):
-            return _cloud_failure_visual(
-                local_visual,
-                mode="CloudFailed",
-                failure_mode=self.display_cloud_failure_mode,
-            )
-        return _merge_display_metadata(dict(cloud), local_visual)
+        return local_visual
 
     def close(self) -> None:
         self._closed.set()
@@ -248,100 +220,8 @@ class BaselineEdgeAdapter:
         self.transport.upload_frame(payload)
         self.metrics.record("frame_uploaded", frame_id=int(payload.frame_id))
 
-    def _process_ekya_payload_sync(
-        self,
-        payload: BaselineFramePayload,
-        *,
-        edge_prediction: dict[str, Any],
-    ) -> None:
-        if self.transport is None:
-            return
-        try:
-            if not self._registered and hasattr(self.transport, "register_edge"):
-                self.transport.register_edge(payload=payload)
-                self._registered = True
-            self.transport.upload_frame(payload)
-            self.metrics.record("frame_uploaded", frame_id=int(payload.frame_id))
-            if not hasattr(self.transport, "request_cloud_inference"):
-                raise RuntimeError("transport does not support request_cloud_inference")
-            cloud_result = self._request_cloud_inference(payload)
-        except Exception as exc:
-            timeout = _is_deadline_exceeded(exc)
-            mode = "CloudTimeout" if timeout else "CloudFailed"
-            logger.warning(
-                "[BaselineAdapter] Ekya cloud inference failed frame={} mode={} error={}",
-                int(payload.frame_id),
-                mode,
-                exc,
-            )
-            self._latest_cloud_visual = _cloud_failure_visual(
-                {
-                    "boxes": [list(box) for box in edge_prediction.get("boxes", [])],
-                    "labels": list(edge_prediction.get("labels", [])),
-                    "scores": [
-                        float(score)
-                        for score in list(edge_prediction.get("scores", []) or [])
-                    ],
-                    "mode": "Local",
-                    "latency_ms": None,
-                    "ref": None,
-                    "frame_index": int(payload.frame_id),
-                    "frame": None,
-                },
-                mode=mode,
-                failure_mode=self.display_cloud_failure_mode,
-            )
-            self.metrics.record(
-                "cloud_inference_failed",
-                frame_id=int(payload.frame_id),
-                mode=mode,
-                message=str(exc),
-            )
-            return
-        prediction = dict(cloud_result.get("cloud_prediction", {}) or {})
-        self._latest_cloud_visual = {
-            "boxes": [list(box) for box in prediction.get("boxes", [])],
-            "labels": list(prediction.get("labels", [])),
-            "scores": [float(score) for score in list(prediction.get("scores", []) or [])],
-            "mode": "Cloud",
-            "latency_ms": _optional_float(cloud_result.get("latency_ms")),
-            "ref": None,
-            "frame_index": int(cloud_result.get("frame_id", payload.frame_id)),
-            "frame": None,
-        }
-        self.metrics.record(
-            "cloud_inference_result",
-            frame_id=int(payload.frame_id),
-            result=cloud_result,
-        )
-
-    def _request_cloud_inference(self, payload: BaselineFramePayload) -> dict[str, Any]:
-        if self.transport is None or not hasattr(self.transport, "request_cloud_inference"):
-            raise RuntimeError("transport does not support request_cloud_inference")
-        request = getattr(self.transport, "request_cloud_inference")
-        try:
-            signature = inspect.signature(request)
-            parameters = signature.parameters
-            supports_timeout = "timeout_sec" in parameters or any(
-                item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
-            )
-        except (TypeError, ValueError):
-            supports_timeout = True
-        if supports_timeout:
-            return dict(
-                request(
-                    payload,
-                    timeout_sec=self.cloud_inference_timeout_sec,
-                )
-                or {}
-            )
-        return dict(request(payload) or {})
-
     def _poll_active_training(self) -> None:
-        if self.baseline_method in {
-            "ekya_style_centralized_scheduling",
-            "accuracy_trigger_cloud_retraining",
-        }:
+        if self.baseline_method == "accuracy_trigger_cloud_retraining":
             self._discover_cloud_scheduled_training()
             self._poll_cloud_scheduled_training()
             return
@@ -442,21 +322,7 @@ class BaselineEdgeAdapter:
             job_id = str(command.get("job_id", "") or "")
             if not job_id:
                 continue
-            if (
-                self.baseline_method == "accuracy_trigger_cloud_retraining"
-                and not self._valid_accuracy_trigger_command(command)
-            ):
-                self.metrics.record(
-                    "cloud_scheduled_training_command_rejected",
-                    command_id=command_id,
-                    job_id=job_id,
-                    reason="identity_or_lineage_mismatch",
-                )
-                continue
-            if (
-                self.baseline_method == "ekya_style_centralized_scheduling"
-                and not self._valid_ekya_command(command)
-            ):
+            if not self._valid_accuracy_trigger_command(command):
                 self.metrics.record(
                     "cloud_scheduled_training_command_rejected",
                     command_id=command_id,
@@ -501,30 +367,8 @@ class BaselineEdgeAdapter:
                     job_id=job_id,
                     window_id=str(command.get("window_id", "") or ""),
                 )
-            if (
-                command_id
-                and adopted_or_known
-                and self.baseline_method == "ekya_style_centralized_scheduling"
-            ):
-                self._ack_cloud_command(command_id)
 
     def _valid_accuracy_trigger_command(self, command: dict[str, Any]) -> bool:
-        if str(command.get("run_id", "") or "") != self.run_id:
-            return False
-        if str(command.get("baseline_method", "") or "") != self.baseline_method:
-            return False
-        try:
-            if int(command.get("edge_id", -1)) != self.edge_id:
-                return False
-        except (TypeError, ValueError):
-            return False
-        if not str(command.get("job_id", "") or ""):
-            return False
-        base_model_version = str(command.get("base_model_version", "0") or "0")
-        current_version = str(getattr(self._edge, "model_version", "0") or "0")
-        return base_model_version == current_version
-
-    def _valid_ekya_command(self, command: dict[str, Any]) -> bool:
         if str(command.get("run_id", "") or "") != self.run_id:
             return False
         if str(command.get("baseline_method", "") or "") != self.baseline_method:
@@ -677,60 +521,6 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _optional_float(value: object) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_deadline_exceeded(exc: Exception) -> bool:
-    if isinstance(exc, TimeoutError):
-        return True
-    if isinstance(exc, grpc.RpcError):
-        try:
-            return exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED
-        except Exception:
-            return False
-    return "deadline" in str(exc).lower() or "timeout" in str(exc).lower()
-
-
-def _cloud_failure_visual(
-    local_visual: dict[str, Any],
-    *,
-    mode: str,
-    failure_mode: str,
-) -> dict[str, Any]:
-    if str(failure_mode or "empty") == "local":
-        visual = dict(local_visual)
-        visual["mode"] = f"{mode}Local"
-        return visual
-    return {
-        "boxes": [],
-        "labels": [],
-        "scores": [],
-        "mode": mode,
-        "latency_ms": local_visual.get("latency_ms"),
-        "ref": local_visual.get("ref"),
-        "frame_index": int(local_visual.get("frame_index", -1) or -1),
-        "frame": local_visual.get("frame"),
-    }
-
-
-def _merge_display_metadata(
-    visual: dict[str, Any],
-    local_visual: dict[str, Any],
-) -> dict[str, Any]:
-    for key in ("latency_ms", "ref", "frame"):
-        if key in local_visual:
-            visual[key] = local_visual.get(key)
-    if "frame_index" in local_visual:
-        visual["frame_index"] = int(local_visual.get("frame_index", -1) or -1)
-    return visual
 
 
 def _training_config_dict(config: object | None) -> dict[str, Any]:

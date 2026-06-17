@@ -29,7 +29,6 @@ class AccuracyTriggerCloudRetrainingPolicy(BaseBaselinePolicy):
         return BaselineFrameDecision(
             upload_frame=upload,
             upload_prediction=upload,
-            request_cloud_inference=False,
             is_keyframe=bool(is_keyframe),
             upload_mode="keyframe_raw" if upload else "none",
             training_strategy=self.training_strategy,

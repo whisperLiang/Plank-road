@@ -1344,7 +1344,7 @@ def test_cloud_server_worker_pool_does_not_create_local_training_objects(
     assert isinstance(server.continual_backend, EdgeWorkerRoutedContinualLearningBackend)
 
 
-def test_cloud_server_loads_lightweight_display_detector_only_for_ekya(
+def test_cloud_server_baseline_loads_teacher_detector_only(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -1382,8 +1382,7 @@ def test_cloud_server_loads_lightweight_display_detector_only_for_ekya(
 
     class FakeDetector:
         def __init__(self, _config, type):
-            if str(type) == "small inference":
-                assert _config.lightweight == "rfdetr_nano"
+            del _config
             created_detectors.append(str(type))
 
         def small_inference(self, _frame):
@@ -1418,29 +1417,8 @@ def test_cloud_server_loads_lightweight_display_detector_only_for_ekya(
     )
     try:
         assert created_detectors == ["large inference"]
-        assert accuracy_server.display_object_detection is None
     finally:
         accuracy_server.close()
-
-    created_detectors.clear()
-    runtime = load_runtime_config("./config/config.yaml")
-    ekya_config = runtime.server
-    ekya_config.workspace_root = str(tmp_path / "ekya")
-    ekya_config.edge_affine_workers.enabled = True
-    ekya_config.edge_affine_workers.run_id = "run-ekya"
-    ekya_server = CloudServer(
-        ekya_config,
-        mode="baseline",
-        baseline_config=runtime.baseline,
-        baseline_method="ekya_style_centralized_scheduling",
-        run_id="run-ekya",
-        yaml_path="./config/config.yaml",
-    )
-    try:
-        assert created_detectors == ["large inference", "small inference"]
-        assert ekya_server.display_object_detection is not None
-    finally:
-        ekya_server.close()
 
 
 def test_cloud_server_main_requires_edge_affine_workers(tmp_path: Path) -> None:

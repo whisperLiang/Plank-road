@@ -10,7 +10,6 @@ from config.baseline import validate_baseline_method
 class BaselineFrameDecision:
     upload_frame: bool
     upload_prediction: bool = True
-    request_cloud_inference: bool = False
     is_keyframe: bool = False
     upload_mode: str = "none"
     training_strategy: str = ""
