@@ -171,6 +171,10 @@ class CloudBaselineFreezeTrainingStrategy:
         }
 
 
+def build_baseline_freeze_loss(model: torch.nn.Module):
+    return build_split_training_loss(model)
+
+
 def run_parameter_ratio_freeze_training(
     *,
     model: torch.nn.Module,

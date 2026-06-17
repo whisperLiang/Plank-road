@@ -58,9 +58,12 @@ baseline:
   use_frame_filter: false
   cloud_inference: true
   return_cloud_inference_to_edge: true
+  wait_for_cloud_inference: true
+  cloud_inference_timeout_sec: 3.0
+  display_cloud_failure_mode: empty
+  require_micro_profiling: true
   training_strategy: freeze
   display_source: cloud
-  enable_micro_profiling: true
   max_microprofile_configs: 8
   trainable_param_ratios: [0.1, 0.3, 0.5]
   sample_fractions: [0.5, 1.0]

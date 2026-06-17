@@ -31,9 +31,6 @@ service MessageTransmission {
   rpc RequestCloudInference (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
   rpc PollCommand (BaselineCommandRequest) returns (BaselineCommandReply) {}
   rpc DownloadInferenceResult (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
-  rpc RequestTraining (BaselineTrainingRequest) returns (BaselineTrainingReply) {}
-  rpc PollTrainingJob (BaselineTrainingStatusRequest) returns (BaselineTrainingStatusReply) {}
-  rpc DownloadModelUpdate (BaselineModelUpdateRequest) returns (BaselineModelUpdateReply) {}
 }
 
 enum TrainingJobType {
@@ -277,68 +274,4 @@ message BaselineCommandReply {
   bool success = 1;
   string message = 2;
   repeated string command_json = 3;
-}
-
-message BaselineTrainingRequest {
-  string run_id = 1;
-  string baseline_method = 2;
-  int64 edge_id = 3;
-  string training_strategy = 4;
-  repeated int64 frame_ids = 5;
-  string payload_json = 6;
-}
-
-message BaselineTrainingReply {
-  bool accepted = 1;
-  string job_id = 2;
-  string status = 3;
-  string message = 4;
-  string training_strategy = 5;
-  int64 queue_position = 6;
-  string protocol_version = 7;
-  string result_model_version = 8;
-}
-
-message BaselineTrainingStatusRequest {
-  string run_id = 1;
-  string baseline_method = 2;
-  int64 edge_id = 3;
-  string job_id = 4;
-}
-
-message BaselineTrainingStatusReply {
-  bool found = 1;
-  string job_id = 2;
-  string status = 3;
-  string message = 4;
-  bool result_available = 5;
-  int64 queue_position = 6;
-  int64 edge_id = 7;
-  string request_id = 8;
-  TrainingJobType job_type = 9;
-  int64 submitted_at_ms = 10;
-  int64 started_at_ms = 11;
-  int64 finished_at_ms = 12;
-  string protocol_version = 13;
-  string base_model_version = 14;
-  string result_model_version = 15;
-  string worker_id = 16;
-}
-
-message BaselineModelUpdateRequest {
-  string run_id = 1;
-  string baseline_method = 2;
-  int64 edge_id = 3;
-  string job_id = 4;
-}
-
-message BaselineModelUpdateReply {
-  bool success = 1;
-  string job_id = 2;
-  string status = 3;
-  string model_data = 4;
-  string message = 5;
-  string model_version = 6;
-  string protocol_version = 7;
-  string result_model_version = 8;
 }

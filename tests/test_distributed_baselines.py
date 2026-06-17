@@ -28,7 +28,7 @@ from baselines.method_factory import create_policy, registered_methods
 from baselines.runtime import BaselineEdgeAdapter, stable_window_id
 from baselines.runtime.upload_client import BASELINE_TRAINING_PROTOCOL_VERSION
 from config.baseline import PLANK_ROAD_BASELINE_ERROR
-from config.runtime import RuntimeConfig
+from config.runtime import RuntimeConfig, load_runtime_config
 from edge_client import (
     _configure_baseline_client_runtime,
     _resolve_baseline_run_id,
@@ -71,8 +71,11 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 use_frame_filter=False,
                 cloud_inference=True,
                 return_cloud_inference_to_edge=True,
+                wait_for_cloud_inference=True,
+                cloud_inference_timeout_sec=3.0,
+                display_cloud_failure_mode="empty",
+                require_micro_profiling=True,
                 training_strategy="freeze",
-                enable_micro_profiling=True,
                 display_source="cloud",
             ),
             edge=SimpleNamespace(split_runtime_policy="disabled"),
@@ -103,7 +106,13 @@ class RecordingTransport:
     def upload_frame(self, payload: BaselineFramePayload) -> None:
         self.uploaded.append(payload)
 
-    def request_cloud_inference(self, payload: BaselineFramePayload):
+    def request_cloud_inference(
+        self,
+        payload: BaselineFramePayload,
+        *,
+        timeout_sec: float | None = None,
+    ):
+        del timeout_sec
         self.inference_requests.append(int(payload.frame_id))
         return {
             "success": True,
@@ -116,32 +125,6 @@ class RecordingTransport:
             },
         }
 
-    def submit_training_bundle(
-        self,
-        *,
-        edge_id: int,
-        request_id: str,
-        payload_zip: bytes,
-        frame_ids: list[int],
-        base_model_version: str,
-    ):
-        self.training_requests.append(
-            {
-                "edge_id": int(edge_id),
-                "request_id": str(request_id),
-                "payload_zip": bytes(payload_zip),
-                "frame_ids": [int(value) for value in frame_ids],
-                "base_model_version": str(base_model_version),
-            }
-        )
-        return message_transmission_pb2.SubmitTrainingJobReply(
-            accepted=True,
-            job_id=f"job-{len(self.training_requests)}",
-            status="QUEUED",
-            queue_position=1,
-            message="accepted",
-        )
-
     def get_training_job_status(self, *, edge_id: int, job_id: str):
         del edge_id, job_id
         return message_transmission_pb2.TrainingJobStatusReply(
@@ -149,6 +132,30 @@ class RecordingTransport:
             status="RUNNING",
             result_available=False,
         )
+
+
+class TimeoutInferenceTransport(RecordingTransport):
+    def request_cloud_inference(
+        self,
+        payload: BaselineFramePayload,
+        *,
+        timeout_sec: float | None = None,
+    ):
+        self.inference_requests.append(int(payload.frame_id))
+        assert timeout_sec == pytest.approx(3.0)
+        raise TimeoutError("cloud inference timeout")
+
+
+class FailedInferenceTransport(RecordingTransport):
+    def request_cloud_inference(
+        self,
+        payload: BaselineFramePayload,
+        *,
+        timeout_sec: float | None = None,
+    ):
+        del timeout_sec
+        self.inference_requests.append(int(payload.frame_id))
+        raise RuntimeError("cloud inference failed")
 
 
 class FailingTrainingTransport(RecordingTransport):
@@ -212,6 +219,9 @@ class CommandTrainingTransport(RecordingTransport):
             {
                 "type": "baseline_training_job_available",
                 "command_id": "cmd-1",
+                "run_id": "ekya-run",
+                "baseline_method": "ekya_style_centralized_scheduling",
+                "edge_id": 3,
                 "job_id": "job-1",
                 "window_id": "window-1",
                 "base_model_version": "0",
@@ -425,7 +435,60 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
     assert config.baseline.accuracy_trigger_cloud_retraining.agreement_score_threshold == (
         pytest.approx(0.0)
     )
+    ekya = config.baseline.ekya_style_centralized_scheduling
+    assert ekya.upload_raw_frames is True
+    assert ekya.cloud_inference is True
+    assert ekya.wait_for_cloud_inference is True
+    assert ekya.cloud_inference_timeout_sec == pytest.approx(3.0)
+    assert ekya.display_cloud_failure_mode == "empty"
+    assert ekya.require_micro_profiling is True
+    assert ekya.trainable_param_ratios == [0.1, 0.3, 0.5]
+    assert ekya.sample_fractions == [0.5, 1.0]
     assert config.baseline.edge.split_runtime_policy == "disabled"
+
+
+def test_ekya_rejects_disabled_legacy_microprofile_switch(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  ekya_style_centralized_scheduling:
+    enable_micro_profiling: false
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="requires microprofiling"):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize(
+    ("yaml_body", "match"),
+    [
+        ("require_micro_profiling: false", "require_micro_profiling"),
+        ("wait_for_cloud_inference: false", "wait_for_cloud_inference"),
+        ("cloud_inference: false", "cloud_inference"),
+        ("display_cloud_failure_mode: stale", "display_cloud_failure_mode"),
+        ("min_inference_quality: 1.1", "min_inference_quality"),
+    ],
+)
+def test_ekya_rejects_invalid_required_centralized_config(
+    tmp_path,
+    yaml_body: str,
+    match: str,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+baseline:
+  ekya_style_centralized_scheduling:
+    {yaml_body}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=match):
+        load_runtime_config(path)
 
 
 def test_default_baseline_edge_disables_main_cl_side_effects(tmp_path) -> None:
@@ -619,42 +682,82 @@ def test_ekya_adapter_uploads_raw_frames_and_cloud_overlay_without_training(tmp_
             detection_score=[],
             latency_ms=1.0,
         )
-        _wait_until(lambda: len(transport.uploaded) == 1)
-        _wait_until(lambda: transport.inference_requests == [7])
+        assert len(transport.uploaded) == 1
+        assert transport.inference_requests == [7]
+        assert adapter._queue.empty()
 
         payload = transport.uploaded[0]
         assert payload.upload_mode == "raw_frame"
-        assert payload.edge_prediction == {}
+        assert payload.edge_prediction["boxes"] == [[1, 2, 3, 4]]
         assert payload.quality_metadata["training_strategy"] == "freeze"
+        assert payload.quality_metadata["wait_for_cloud_inference"] is True
+        assert payload.quality_metadata["require_micro_profiling"] is True
         assert transport.training_requests == []
-        visual = adapter.display_visual({"boxes": [], "labels": [], "scores": [], "mode": "Local"})
+        visual = adapter.display_visual(
+            {"boxes": [], "labels": [], "scores": [], "mode": "Local", "frame_index": 7}
+        )
         assert visual["mode"] == "Cloud"
         assert visual["boxes"] == [[2, 2, 6, 6]]
     finally:
         adapter.close()
 
 
-def test_ekya_adapter_shows_pending_before_cloud_result(tmp_path) -> None:
+def test_ekya_adapter_cloud_timeout_uses_empty_failure_visual(tmp_path) -> None:
     adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
         baseline_method="ekya_style_centralized_scheduling",
         run_id="ekya-run",
         edge_id=3,
         server_ip="127.0.0.1:1",
-        transport=RecordingTransport(),
+        transport=TimeoutInferenceTransport(),
     )
     try:
-        visual = adapter.display_visual(
-            {
-                "boxes": [[1, 1, 2, 2]],
-                "labels": [1],
-                "scores": [0.5],
-                "mode": "Local",
-                "frame_index": 9,
-            }
+        adapter.before_video_start(FakeEdge())
+        adapter.on_sampled_inference_result(
+            frame=np.zeros((8, 8, 3), dtype=np.uint8),
+            frame_index=9,
+            task=FakeTask(source="inference"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
         )
-        assert visual["mode"] == "CloudPending"
+        visual = adapter.display_visual(
+            {"boxes": [[1, 1, 2, 2]], "labels": [1], "scores": [0.5], "frame_index": 9}
+        )
+        assert visual["mode"] == "CloudTimeout"
         assert visual["boxes"] == []
+    finally:
+        adapter.close()
+
+
+def test_ekya_adapter_cloud_failure_can_use_local_visual(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.ekya_style_centralized_scheduling.display_cloud_failure_mode = "local"
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        edge_id=3,
+        server_ip="127.0.0.1:1",
+        transport=FailedInferenceTransport(),
+    )
+    try:
+        adapter.before_video_start(FakeEdge())
+        adapter.on_sampled_inference_result(
+            frame=np.zeros((8, 8, 3), dtype=np.uint8),
+            frame_index=10,
+            task=FakeTask(source="inference"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+        visual = adapter.display_visual(
+            {"boxes": [[1, 2, 3, 4]], "labels": [5], "scores": [0.9], "frame_index": 10}
+        )
+        assert visual["mode"] == "CloudFailedLocal"
+        assert visual["boxes"] == [[1, 2, 3, 4]]
     finally:
         adapter.close()
 
@@ -707,6 +810,9 @@ def test_ekya_adapter_defers_command_ack_while_cloud_job_active(tmp_path) -> Non
             {
                 "type": "baseline_training_job_available",
                 "command_id": "cmd-2",
+                "run_id": "ekya-run",
+                "baseline_method": "ekya_style_centralized_scheduling",
+                "edge_id": 3,
                 "job_id": "job-2",
                 "window_id": "window-2",
                 "base_model_version": "0",
@@ -944,6 +1050,11 @@ def test_ekya_poll_command_delivery_ack_and_timeout() -> None:
         )
         assert len(first) == 1
         command_id = first[0]["command_id"]
+        assert first[0]["type"] == "baseline_training_job_available"
+        assert first[0]["run_id"] == "ekya-run"
+        assert first[0]["baseline_method"] == "ekya_style_centralized_scheduling"
+        assert first[0]["edge_id"] == 1
+        assert first[0]["base_model_version"] == "0"
         assert controller.poll_command(
             run_id="ekya-run",
             baseline_method="ekya_style_centralized_scheduling",
@@ -1038,6 +1149,8 @@ def test_ekya_formal_training_request_has_shared_job_api_fields() -> None:
         estimated_inference_penalty=0.0,
         estimated_window_average_quality=0.4,
         score=0.3,
+        result_id="microprofile-1",
+        base_model_version="0",
     )
     try:
         job_id = controller._submit_ekya_training(window, result)
@@ -1056,6 +1169,9 @@ def test_ekya_formal_training_request_has_shared_job_api_fields() -> None:
         assert manifest["training_config"]["batch_size"] == 4
         assert manifest["training_config"]["num_epoch"] == 3
         assert manifest["training_config"]["learning_rate"] == pytest.approx(0.01)
+        assert manifest["microprofile_result_id"] == "microprofile-1"
+        assert manifest["config_id"] == "config-1"
+        assert manifest["score"] == pytest.approx(0.3)
         assert manifest["frames"][0]["teacher_prediction"]["boxes"] == [[1, 1, 4, 4]]
     finally:
         controller.close()
@@ -1136,7 +1252,7 @@ def test_ekya_training_skips_when_nonzero_base_update_is_missing() -> None:
         training_backend=backend,
     )
     window = _ekya_ready_window(model_version="1")
-    result = _microprofile_result()
+    result = _microprofile_result(base_model_version="1")
     try:
         assert controller._ekya_profile_window(window) == []
         assert controller._submit_ekya_training(window, result) is None
@@ -1280,7 +1396,31 @@ def test_ekya_scheduler_rejects_service_quality_violation() -> None:
     )
 
     assert scheduler.run_once() is None
-    assert skipped == [("window-1", "no_candidate_improves_window_quality")]
+    assert skipped == [("window-1", "service_quality_constraint_failed")]
+
+
+def test_ekya_scheduler_uses_microprofile_skip_reason_for_empty_results() -> None:
+    window = EkyaReadyWindow(
+        edge_id=1,
+        window_id="window-1",
+        run_id="run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        samples=tuple(),
+    )
+    skipped: list[tuple[str, str]] = []
+    scheduler = EkyaCentralScheduler(
+        ready_windows=lambda: [window],
+        profile_window=lambda _window: [],
+        submit_training=lambda _window, _result: "job",
+        mark_skip=lambda item, reason: skipped.append((item.window_id, reason)),
+        profile_skip_reason=lambda _window: "teacher_labels_unavailable",
+    )
+
+    assert scheduler.run_once() is None
+    assert skipped == [("window-1", "teacher_labels_unavailable")]
 
 
 def test_teacher_agreement_does_not_reward_empty_empty_frames() -> None:
@@ -1336,6 +1476,7 @@ def test_ekya_microprofile_skips_when_teacher_objects_are_too_low() -> None:
     candidate = profiler.candidate_configs(window_sample_count=1)[0]
 
     assert profiler.profile_candidate(window, candidate) is None
+    assert profiler.skip_reason(window) == "proxy_metric_unavailable"
 
 
 def test_ekya_microprofile_runs_short_training_and_epoch_proxy_eval() -> None:
@@ -1437,6 +1578,12 @@ def test_production_code_has_no_old_baseline_training_fallbacks() -> None:
         "frozen_ratio_training",
         "BaselineEdgeRuntime",
         "CloudTorchLensFreezeTrainingStrategy",
+        "CloudPending",
+        "submit_training_bundle",
+        "BaselineTrainingRequest",
+        "RequestTraining",
+        "PollTrainingJob",
+        "DownloadModelUpdate",
     ]
     for path in _iter_text_files(roots):
         text = path.read_text(encoding="utf-8")
@@ -1503,7 +1650,7 @@ def _ekya_ready_window(*, model_version: str = "0") -> EkyaReadyWindow:
     )
 
 
-def _microprofile_result() -> MicroProfileResult:
+def _microprofile_result(*, base_model_version: str = "0") -> MicroProfileResult:
     return MicroProfileResult(
         edge_id=1,
         window_id="window-1",
@@ -1526,6 +1673,8 @@ def _microprofile_result() -> MicroProfileResult:
         estimated_inference_penalty=0.0,
         estimated_window_average_quality=0.4,
         score=0.3,
+        result_id="microprofile-1",
+        base_model_version=str(base_model_version),
     )
 
 

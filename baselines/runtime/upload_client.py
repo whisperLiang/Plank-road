@@ -151,14 +151,20 @@ class BaselineUploadClient:
         if not bool(reply.success):
             raise RuntimeError(reply.message)
 
-    def request_cloud_inference(self, payload: BaselineFramePayload) -> dict[str, Any]:
+    def request_cloud_inference(
+        self,
+        payload: BaselineFramePayload,
+        *,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
         reply = self.stub.RequestCloudInference(
             message_transmission_pb2.BaselineInferenceRequest(
                 run_id=payload.run_id,
                 baseline_method=payload.baseline_method,
                 edge_id=payload.edge_id,
                 frame_id=payload.frame_id,
-            )
+            ),
+            timeout=float(timeout_sec) if timeout_sec is not None else None,
         )
         if not bool(reply.success):
             raise RuntimeError(reply.message)
@@ -218,28 +224,6 @@ class BaselineUploadClient:
         if not bool(reply.success):
             raise RuntimeError(reply.message)
 
-    def submit_training_bundle(
-        self,
-        *,
-        edge_id: int,
-        request_id: str,
-        payload_zip: bytes,
-        frame_ids: list[int],
-        base_model_version: str,
-    ):
-        request = message_transmission_pb2.SubmitTrainingJobRequest(
-            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
-            edge_id=int(edge_id),
-            request_id=str(request_id),
-            job_type=_baseline_training_job_type(),
-            cache_path=f"edge_{int(edge_id)}/baseline_training",
-            send_low_conf_features=False,
-            frame_indices=[int(frame_id) for frame_id in frame_ids],
-            payload_zip=bytes(payload_zip or b""),
-            base_model_version=str(base_model_version or "0"),
-        )
-        return self.stub.submit_training_job(request)
-
     def get_training_job_status(self, *, edge_id: int, job_id: str):
         return self.stub.get_training_job_status(
             message_transmission_pb2.TrainingJobStatusRequest(
@@ -255,11 +239,6 @@ class BaselineUploadClient:
                 job_id=str(job_id),
             )
         )
-
-
-def _baseline_training_job_type() -> int:
-    return int(getattr(message_transmission_pb2, "TRAINING_JOB_TYPE_BASELINE_TRAINING", 4))
-
 
 def _frame_payload_to_proto(payload: BaselineFramePayload):
     return message_transmission_pb2.BaselineFrameRequest(

@@ -25,11 +25,11 @@ from cloud.training.strategies.baseline_freeze import (
     _build_optimizer,
     _forward_full_model,
     _prepare_raw_batch_for_full_forward,
+    build_baseline_freeze_loss,
     run_parameter_ratio_freeze_microprofile,
 )
 from model_management.model_delta_payload import require_state_dict_delta_payload
 from model_management.model_zoo import build_detection_model
-from model_management.split_model_adapters import build_split_training_loss
 
 
 @dataclass(frozen=True)
@@ -99,6 +99,8 @@ class MicroProfileResult:
     score: float
     diagnostic_loss_before: float | None = None
     diagnostic_loss_after: float | None = None
+    result_id: str = ""
+    base_model_version: str = "0"
 
 
 @dataclass
@@ -110,6 +112,7 @@ class CloudScheduledEkyaJob:
     request_id: str
     base_model_version: str
     frame_ids: tuple[int, ...]
+    microprofile_result_id: str = ""
     status: str = "QUEUED"
     result_model_version: str = ""
     model_data: str = ""
@@ -120,6 +123,8 @@ class CloudScheduledEkyaJob:
 @dataclass
 class EkyaCommandRecord:
     command_id: str
+    run_id: str
+    baseline_method: str
     edge_id: int
     job_id: str
     window_id: str
@@ -138,6 +143,9 @@ class EkyaCommandRecord:
             "command_id": self.command_id,
             "job_id": self.job_id,
             "window_id": self.window_id,
+            "run_id": self.run_id,
+            "baseline_method": self.baseline_method,
+            "edge_id": int(self.edge_id),
             "base_model_version": self.base_model_version,
             "result_model_version": self.result_model_version,
             "expires_at_ms": int(self.expires_at_ms),
@@ -161,7 +169,8 @@ class EkyaMicroProfiler:
         self.model_weights_path = str(model_weights_path or "")
         self.tinynext_input_size = tinynext_input_size
         self.model_builder = model_builder or build_detection_model
-        self.loss_builder = loss_builder or build_split_training_loss
+        self.loss_builder = loss_builder or build_baseline_freeze_loss
+        self._window_skip_reasons: dict[tuple[int, str], list[str]] = {}
 
     def candidate_configs(self, *, window_sample_count: int) -> list[EkyaCandidateConfig]:
         ratios = _float_list(self.ekya_config.get("trainable_param_ratios"), [0.1, 0.3, 0.5])
@@ -220,17 +229,43 @@ class EkyaMicroProfiler:
         *,
         base_model_update_model_data: str = "",
     ) -> list[MicroProfileResult]:
+        self._window_skip_reasons[(int(window.edge_id), str(window.window_id))] = []
         results: list[MicroProfileResult] = []
         candidates = self.candidate_configs(window_sample_count=len(window.samples))
         for candidate in candidates:
-            result = self.profile_candidate(
-                window,
-                candidate,
-                base_model_update_model_data=base_model_update_model_data,
-            )
+            try:
+                result = self.profile_candidate(
+                    window,
+                    candidate,
+                    base_model_update_model_data=base_model_update_model_data,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ekya_schedule_skip edge={} window={} config={} "
+                    "reason=microprofile_failed error={}",
+                    window.edge_id,
+                    window.window_id,
+                    candidate.config_id,
+                    exc,
+                )
+                self._record_skip_reason(window, "microprofile_failed")
+                continue
             if result is not None:
                 results.append(result)
         return results
+
+    def skip_reason(self, window: EkyaReadyWindow) -> str:
+        reasons = self._window_skip_reasons.get((int(window.edge_id), str(window.window_id)), [])
+        priority = {
+            "insufficient_samples": 0,
+            "teacher_labels_unavailable": 1,
+            "proxy_metric_unavailable": 2,
+            "microprofile_failed": 3,
+        }
+        valid = [reason for reason in reasons if reason in priority]
+        if not valid:
+            return ""
+        return min(valid, key=lambda reason: priority[reason])
 
     def profile_candidate(
         self,
@@ -239,6 +274,14 @@ class EkyaMicroProfiler:
         *,
         base_model_update_model_data: str = "",
     ) -> MicroProfileResult | None:
+        if not window.samples:
+            logger.info(
+                "ekya_schedule_skip edge={} window={} reason=insufficient_samples",
+                window.edge_id,
+                window.window_id,
+            )
+            self._record_skip_reason(window, "insufficient_samples")
+            return None
         selected_window_samples = select_window_samples(
             window.samples,
             sample_count=candidate.sample_count,
@@ -253,6 +296,22 @@ class EkyaMicroProfiler:
             sample_count=min(len(selected_window_samples), max_microprofile_samples),
             seed=f"{window.window_id}:{candidate.config_id}:microprofile",
         )
+        if not microprofile_samples or not any(sample.raw_frame for sample in microprofile_samples):
+            logger.info(
+                "ekya_schedule_skip edge={} window={} reason=insufficient_samples",
+                window.edge_id,
+                window.window_id,
+            )
+            self._record_skip_reason(window, "insufficient_samples")
+            return None
+        if not any(sample.teacher_prediction for sample in microprofile_samples):
+            logger.info(
+                "ekya_schedule_skip edge={} window={} reason=teacher_labels_unavailable",
+                window.edge_id,
+                window.window_id,
+            )
+            self._record_skip_reason(window, "teacher_labels_unavailable")
+            return None
         teacher_objects = count_teacher_objects(microprofile_samples)
         min_teacher_objects = max(1, int(self.ekya_config.get("min_teacher_objects", 1) or 1))
         if teacher_objects < min_teacher_objects:
@@ -261,6 +320,7 @@ class EkyaMicroProfiler:
                 window.edge_id,
                 window.window_id,
             )
+            self._record_skip_reason(window, "proxy_metric_unavailable")
             return None
 
         training_samples = [
@@ -306,6 +366,7 @@ class EkyaMicroProfiler:
                 window.edge_id,
                 window.window_id,
             )
+            self._record_skip_reason(window, "proxy_metric_unavailable")
             return None
 
         epochs = max(1, int(self.training_config.get("microprofile_epochs", 1) or 1))
@@ -366,6 +427,7 @@ class EkyaMicroProfiler:
                 window.edge_id,
                 window.window_id,
             )
+            self._record_skip_reason(window, "proxy_metric_unavailable")
             return None
         final_observed = float(after_values[-1])
         estimated_final = _estimate_final_metric(
@@ -412,6 +474,8 @@ class EkyaMicroProfiler:
             score=score,
             diagnostic_loss_before=_optional_float(metrics.get("loss_before")),
             diagnostic_loss_after=_optional_float(metrics.get("final_loss")),
+            result_id=microprofile_result_id(window, candidate),
+            base_model_version=str(window.model_version or "0"),
         )
         logger.info(
             "ekya_microprofile_done edge={} window={} config={} "
@@ -443,6 +507,10 @@ class EkyaMicroProfiler:
         model.to(device)
         return model
 
+    def _record_skip_reason(self, window: EkyaReadyWindow, reason: str) -> None:
+        key = (int(window.edge_id), str(window.window_id))
+        self._window_skip_reasons.setdefault(key, []).append(str(reason))
+
 
 class EkyaCentralScheduler:
     def __init__(
@@ -452,6 +520,7 @@ class EkyaCentralScheduler:
         profile_window: Callable[[EkyaReadyWindow], list[MicroProfileResult]],
         submit_training: Callable[[EkyaReadyWindow, MicroProfileResult], str | None],
         mark_skip: Callable[[EkyaReadyWindow, str], None] | None = None,
+        profile_skip_reason: Callable[[EkyaReadyWindow], str] | None = None,
         active_training_count: Callable[[], int] | None = None,
         service_state: Callable[[], Mapping[str, float]] | None = None,
         ekya_config: object | Mapping[str, Any] | None = None,
@@ -460,6 +529,7 @@ class EkyaCentralScheduler:
         self.profile_window = profile_window
         self.submit_training = submit_training
         self.mark_skip = mark_skip or (lambda _window, _reason: None)
+        self.profile_skip_reason = profile_skip_reason or (lambda _window: "")
         self.active_training_count = active_training_count or (lambda: 0)
         self.service_state = service_state or (lambda: {})
         self.ekya_config = _config_dict(ekya_config)
@@ -469,13 +539,31 @@ class EkyaCentralScheduler:
             return None
         candidates: list[tuple[EkyaReadyWindow, MicroProfileResult]] = []
         for window in list(self.ready_windows()):
-            results = self.profile_window(window)
-            if not results:
-                self.mark_skip(window, "proxy_metric_unavailable")
+            try:
+                results = self.profile_window(window)
+            except Exception as exc:
+                logger.warning(
+                    "ekya_schedule_skip edge={} window={} reason=microprofile_failed error={}",
+                    window.edge_id,
+                    window.window_id,
+                    exc,
+                )
+                self.mark_skip(window, "microprofile_failed")
                 continue
-            viable = [result for result in results if self._is_viable(result)]
+            if not results:
+                reason = self.profile_skip_reason(window) or "proxy_metric_unavailable"
+                self.mark_skip(window, reason)
+                continue
+            evaluated = [(result, self._viability_reason(window, result)) for result in results]
+            viable = [result for result, reason in evaluated if reason == ""]
             if not viable:
-                self.mark_skip(window, "no_candidate_improves_window_quality")
+                reasons = {reason for _result, reason in evaluated if reason}
+                if "service_quality_constraint_failed" in reasons:
+                    self.mark_skip(window, "service_quality_constraint_failed")
+                elif "microprofile_failed" in reasons:
+                    self.mark_skip(window, "microprofile_failed")
+                else:
+                    self.mark_skip(window, "no_candidate_improves_window_quality")
                 continue
             best = max(
                 viable,
@@ -509,21 +597,31 @@ class EkyaCentralScheduler:
         )
         return selected_result
 
-    def _is_viable(self, result: MicroProfileResult) -> bool:
+    def _viability_reason(self, window: EkyaReadyWindow, result: MicroProfileResult) -> str:
+        if int(result.edge_id) != int(window.edge_id):
+            return "microprofile_failed"
+        if str(result.window_id) != str(window.window_id):
+            return "microprofile_failed"
+        if str(result.training_strategy) != "freeze":
+            return "microprofile_failed"
+        if str(result.proxy_metric_name) != "teacher_agreement_f1":
+            return "proxy_metric_unavailable"
+        if str(result.base_model_version or "0") != str(window.model_version or "0"):
+            return "microprofile_failed"
         if result.score <= 0.0:
-            return False
+            return "no_candidate_improves_window_quality"
         min_quality = float(self.ekya_config.get("min_inference_quality", 0.0) or 0.0)
         if min_quality > 0.0 and result.estimated_window_average_quality < min_quality:
-            return False
+            return "service_quality_constraint_failed"
         state = self.service_state()
         max_latency = float(self.ekya_config.get("max_cloud_inference_latency_ms", 0.0) or 0.0)
         observed_latency = float(state.get("cloud_inference_latency_ms", 0.0) or 0.0)
         if max_latency > 0.0 and observed_latency > max_latency:
-            return False
+            return "service_quality_constraint_failed"
         min_fps = float(self.ekya_config.get("min_cloud_inference_fps", 0.0) or 0.0)
         if min_fps > 0.0 and float(state.get("cloud_inference_fps", 0.0) or 0.0) < min_fps:
-            return False
-        return True
+            return "service_quality_constraint_failed"
+        return ""
 
 
 def select_window_samples(
@@ -539,6 +637,13 @@ def select_window_samples(
     rng = random.Random(str(seed))
     indices = sorted(rng.sample(range(len(sample_list)), count))
     return [sample_list[index] for index in indices]
+
+
+def microprofile_result_id(window: EkyaReadyWindow, candidate: EkyaCandidateConfig) -> str:
+    return (
+        f"ekya-microprofile:{window.run_id}:{window.edge_id}:"
+        f"{window.window_id}:{candidate.config_id}:{window.model_version or '0'}"
+    )
 
 
 def count_teacher_objects(samples: Iterable[EkyaWindowSample]) -> int:

@@ -356,40 +356,6 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             self._log_failure("DownloadInferenceResult", exc)
             return _baseline_inference_reply(request, success=False, message=str(exc))
 
-    def RequestTraining(self, request, context):
-        del context
-        return message_transmission_pb2.BaselineTrainingReply(
-            accepted=False,
-            job_id="",
-            status="DISABLED",
-            message="legacy baseline training RPC is disabled; use submit_training_job",
-            training_strategy=request.training_strategy,
-        )
-
-    def PollTrainingJob(self, request, context):
-        del context
-        return message_transmission_pb2.BaselineTrainingStatusReply(
-            found=False,
-            job_id=request.job_id,
-            status="DISABLED",
-            message="legacy baseline training RPC is disabled; use get_training_job_status",
-            result_available=False,
-            queue_position=-1,
-            edge_id=int(request.edge_id),
-        )
-
-    def DownloadModelUpdate(self, request, context):
-        del context
-        return message_transmission_pb2.BaselineModelUpdateReply(
-            success=False,
-            job_id=request.job_id,
-            status="DISABLED",
-            model_data="",
-            message="legacy baseline model update RPC is disabled; use download_trained_model",
-            model_version="",
-        )
-
-
 def _baseline_frame_from_request(request) -> BaselineFramePayload:
     return BaselineFramePayload(
         run_id=request.run_id,

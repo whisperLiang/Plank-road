@@ -270,9 +270,12 @@ class EkyaStyleBaselineConfig(ConfigSection):
     use_frame_filter: bool = False
     cloud_inference: bool = True
     return_cloud_inference_to_edge: bool = True
+    wait_for_cloud_inference: bool = True
+    cloud_inference_timeout_sec: float = 3.0
+    display_cloud_failure_mode: str = "empty"
+    require_micro_profiling: bool = True
     training_strategy: str = "freeze"
     display_source: str = "cloud"
-    enable_micro_profiling: bool = True
     max_microprofile_configs: int = 8
     trainable_param_ratios: list[float] = field(default_factory=lambda: [0.1, 0.3, 0.5])
     sample_fractions: list[float] = field(default_factory=lambda: [0.5, 1.0])
@@ -814,6 +817,45 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "baseline.ekya_style_centralized_scheduling.display_source must be cloud or local"
         )
+    legacy_enable_micro = ekya._extras.get("enable_micro_profiling")
+    if legacy_enable_micro is not None and not bool(legacy_enable_micro):
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.enable_micro_profiling=false "
+            "is no longer supported; Ekya requires microprofiling"
+        )
+    if not bool(getattr(ekya, "require_micro_profiling", True)):
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.require_micro_profiling must be true"
+        )
+    if not bool(getattr(ekya, "wait_for_cloud_inference", True)):
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.wait_for_cloud_inference must be true"
+        )
+    if not bool(getattr(ekya, "cloud_inference", True)):
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.cloud_inference must be true"
+        )
+    if not bool(getattr(ekya, "upload_raw_frames", True)):
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.upload_raw_frames must be true"
+        )
+    if not bool(getattr(ekya, "return_cloud_inference_to_edge", True)):
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.return_cloud_inference_to_edge "
+            "must be true"
+        )
+    failure_mode = str(
+        getattr(ekya, "display_cloud_failure_mode", "empty") or "empty"
+    ).strip()
+    if failure_mode not in {"empty", "local"}:
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.display_cloud_failure_mode "
+            "must be empty or local"
+        )
+    _validate_positive(
+        "baseline.ekya_style_centralized_scheduling.cloud_inference_timeout_sec",
+        float(getattr(ekya, "cloud_inference_timeout_sec", 3.0)),
+    )
     _validate_positive(
         "baseline.ekya_style_centralized_scheduling.max_microprofile_configs",
         int(getattr(ekya, "max_microprofile_configs", 8)),
@@ -868,11 +910,21 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         float(getattr(ekya, "teacher_agreement_iou_threshold", 0.5)),
         allow_zero=True,
     )
+    if float(getattr(ekya, "teacher_agreement_iou_threshold", 0.5)) > 1.0:
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.teacher_agreement_iou_threshold "
+            "must be <= 1"
+        )
     _validate_positive(
         "baseline.ekya_style_centralized_scheduling.teacher_agreement_confidence_threshold",
         float(getattr(ekya, "teacher_agreement_confidence_threshold", 0.0)),
         allow_zero=True,
     )
+    if float(getattr(ekya, "teacher_agreement_confidence_threshold", 0.0)) > 1.0:
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling."
+            "teacher_agreement_confidence_threshold must be <= 1"
+        )
     for name in (
         "min_inference_quality",
         "max_cloud_inference_latency_ms",
@@ -882,6 +934,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             f"baseline.ekya_style_centralized_scheduling.{name}",
             float(getattr(ekya, name, 0.0)),
             allow_zero=True,
+        )
+    if float(getattr(ekya, "min_inference_quality", 0.0)) > 1.0:
+        raise ValueError(
+            "baseline.ekya_style_centralized_scheduling.min_inference_quality must be <= 1"
         )
     feature_upload = config.client.feature_upload
     if str(feature_upload.storage_format).strip().lower() not in {

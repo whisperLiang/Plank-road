@@ -131,6 +131,7 @@ class DistributedBaselineController:
                 profile_window=self._ekya_profile_window,
                 submit_training=self._submit_ekya_training,
                 mark_skip=self._mark_ekya_skip,
+                profile_skip_reason=self._ekya_profile_skip_reason,
                 active_training_count=self._ekya_active_training_count,
                 service_state=self._ekya_service_state,
                 ekya_config=baseline_method_config,
@@ -638,7 +639,7 @@ class DistributedBaselineController:
         if cached is not None:
             return list(cached)
         if not base_available:
-            self._mark_ekya_skip(window, "base_model_update_unavailable")
+            self._mark_ekya_skip(window, "microprofile_failed")
             return []
         if self._ekya_microprofiler is None:
             return []
@@ -650,12 +651,20 @@ class DistributedBaselineController:
             self._ekya_microprofile_results[cache_key] = list(results)
         return results
 
+    def _ekya_profile_skip_reason(self, window: EkyaReadyWindow) -> str:
+        if self._ekya_microprofiler is None:
+            return ""
+        return self._ekya_microprofiler.skip_reason(window)
+
     def _submit_ekya_training(
         self,
         window: EkyaReadyWindow,
         result: MicroProfileResult,
     ) -> str | None:
         if self.training_backend is None:
+            return None
+        if not _valid_ekya_microprofile_result(window, result):
+            self._mark_ekya_skip(window, "microprofile_failed")
             return None
         selected_samples = select_window_samples(
             window.samples,
@@ -693,7 +702,7 @@ class DistributedBaselineController:
                 model_version=str(window.model_version or "0"),
             )
         if not base_available:
-            self._mark_ekya_skip(window, "base_model_update_unavailable")
+            self._mark_ekya_skip(window, "microprofile_failed")
             return None
         payload_zip = build_baseline_training_bundle(
             run_id=window.run_id,
@@ -708,6 +717,12 @@ class DistributedBaselineController:
             weights_path=self.model_weights_path,
             tinynext_input_size=self.tinynext_input_size,
             base_model_update_model_data=base_model_update,
+            trigger_metadata={
+                "microprofile_result_id": str(result.result_id),
+                "config_id": str(result.config_id),
+                "window_id": str(window.window_id),
+                "score": float(result.score),
+            },
         )
         request_id = f"ekya:{window.run_id}:{window.edge_id}:{window.window_id}:{result.config_id}"
         request = message_transmission_pb2.SubmitTrainingJobRequest(
@@ -742,6 +757,7 @@ class DistributedBaselineController:
                 request_id=request_id,
                 base_model_version=str(window.model_version or "0"),
                 frame_ids=tuple(int(sample.frame_id) for sample in selected_samples),
+                microprofile_result_id=str(result.result_id),
                 status=str(getattr(reply, "status", "") or "QUEUED"),
                 submitted_at_ms=now_ms(),
             )
@@ -864,6 +880,8 @@ class DistributedBaselineController:
         self._ekya_commands_by_job[job.job_id] = command_id
         self._ekya_commands[command_id] = EkyaCommandRecord(
             command_id=command_id,
+            run_id=self.run_id,
+            baseline_method=self.baseline_method,
             edge_id=int(job.edge_id),
             job_id=str(job.job_id),
             window_id=str(job.window_id),
@@ -973,6 +991,27 @@ def _merge_model_update_payloads(
             "checkpoint_model_version": payload["result_model_version"],
         }
     return _encode_model_update_payload(payload)
+
+
+def _valid_ekya_microprofile_result(
+    window: EkyaReadyWindow,
+    result: MicroProfileResult,
+) -> bool:
+    if not str(getattr(result, "result_id", "") or ""):
+        return False
+    if int(result.edge_id) != int(window.edge_id):
+        return False
+    if str(result.window_id) != str(window.window_id):
+        return False
+    if str(result.training_strategy) != "freeze":
+        return False
+    if str(result.config_id or "") == "":
+        return False
+    if str(result.base_model_version or "0") != str(window.model_version or "0"):
+        return False
+    if str(result.proxy_metric_name) != "teacher_agreement_f1":
+        return False
+    return float(result.score) > 0.0
 
 
 def _decode_model_update_payload(model_data: str) -> Mapping[str, Any]:

@@ -124,21 +124,6 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.BaselineInferenceReply.FromString,
                 _registered_method=True)
-        self.RequestTraining = channel.unary_unary(
-                '/MessageTransmission/RequestTraining',
-                request_serializer=message__transmission__pb2.BaselineTrainingRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.BaselineTrainingReply.FromString,
-                _registered_method=True)
-        self.PollTrainingJob = channel.unary_unary(
-                '/MessageTransmission/PollTrainingJob',
-                request_serializer=message__transmission__pb2.BaselineTrainingStatusRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.BaselineTrainingStatusReply.FromString,
-                _registered_method=True)
-        self.DownloadModelUpdate = channel.unary_unary(
-                '/MessageTransmission/DownloadModelUpdate',
-                request_serializer=message__transmission__pb2.BaselineModelUpdateRequest.SerializeToString,
-                response_deserializer=message__transmission__pb2.BaselineModelUpdateReply.FromString,
-                _registered_method=True)
 
 
 class MessageTransmissionServicer(object):
@@ -264,24 +249,6 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def RequestTraining(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def PollTrainingJob(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def DownloadModelUpdate(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
 
 def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -374,21 +341,6 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.DownloadInferenceResult,
                     request_deserializer=message__transmission__pb2.BaselineInferenceRequest.FromString,
                     response_serializer=message__transmission__pb2.BaselineInferenceReply.SerializeToString,
-            ),
-            'RequestTraining': grpc.unary_unary_rpc_method_handler(
-                    servicer.RequestTraining,
-                    request_deserializer=message__transmission__pb2.BaselineTrainingRequest.FromString,
-                    response_serializer=message__transmission__pb2.BaselineTrainingReply.SerializeToString,
-            ),
-            'PollTrainingJob': grpc.unary_unary_rpc_method_handler(
-                    servicer.PollTrainingJob,
-                    request_deserializer=message__transmission__pb2.BaselineTrainingStatusRequest.FromString,
-                    response_serializer=message__transmission__pb2.BaselineTrainingStatusReply.SerializeToString,
-            ),
-            'DownloadModelUpdate': grpc.unary_unary_rpc_method_handler(
-                    servicer.DownloadModelUpdate,
-                    request_deserializer=message__transmission__pb2.BaselineModelUpdateRequest.FromString,
-                    response_serializer=message__transmission__pb2.BaselineModelUpdateReply.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -877,87 +829,6 @@ class MessageTransmission(object):
             '/MessageTransmission/DownloadInferenceResult',
             message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
             message__transmission__pb2.BaselineInferenceReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def RequestTraining(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/MessageTransmission/RequestTraining',
-            message__transmission__pb2.BaselineTrainingRequest.SerializeToString,
-            message__transmission__pb2.BaselineTrainingReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def PollTrainingJob(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/MessageTransmission/PollTrainingJob',
-            message__transmission__pb2.BaselineTrainingStatusRequest.SerializeToString,
-            message__transmission__pb2.BaselineTrainingStatusReply.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def DownloadModelUpdate(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/MessageTransmission/DownloadModelUpdate',
-            message__transmission__pb2.BaselineModelUpdateRequest.SerializeToString,
-            message__transmission__pb2.BaselineModelUpdateReply.FromString,
             options,
             channel_credentials,
             insecure,
