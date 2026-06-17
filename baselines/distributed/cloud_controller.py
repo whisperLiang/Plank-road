@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import nullcontext
 import inspect
 import io
 import json
@@ -9,6 +10,7 @@ import time
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import torch
@@ -18,8 +20,22 @@ from baselines.distributed.ekya import (
     CloudScheduledEkyaJob,
     EkyaCentralScheduler,
     EkyaCommandRecord,
+    EKYA_FAILURE_STAGE_MICROPROFILE,
+    EKYA_FAILURE_STAGE_TEACHER_ANNOTATION,
+    EKYA_FAILURE_STAGE_TRAINING_SUBMISSION,
+    EKYA_STATUS_FAILED,
+    EKYA_STATUS_LABEL_PENDING,
+    EKYA_STATUS_LABELED,
+    EKYA_STATUS_LABELING,
+    EKYA_STATUS_MICROPROFILING,
+    EKYA_STATUS_SKIPPED,
+    EKYA_STATUS_SUCCEEDED,
+    EKYA_STATUS_TRAINING,
+    EKYA_TERMINAL_WINDOW_STATUSES,
+    EkyaHeavyLaneBusy,
     EkyaMicroProfiler,
     EkyaReadyWindow,
+    EkyaWindowState,
     EkyaWindowSample,
     MicroProfileResult,
     select_window_samples,
@@ -34,6 +50,7 @@ from cloud.baselines.accuracy_trigger_controller import (
     AccuracyTriggerController,
     AccuracyTriggerSubmission,
 )
+from cloud.annotation import RawFrameAnnotationSample, TeacherAnnotationRetryableError
 from config.baseline import validate_baseline_method
 from grpc_server import message_transmission_pb2
 from model_management.model_delta_payload import (
@@ -74,6 +91,8 @@ class DistributedBaselineController:
         model_weights_path: str = "",
         tinynext_input_size: int | None = None,
         strict_run_id: bool = True,
+        teacher_annotator: Any | None = None,
+        heavy_gpu_lease: Callable[..., Any] | None = None,
     ) -> None:
         self.baseline_method = validate_baseline_method(baseline_method)
         self.run_id = str(run_id)
@@ -85,6 +104,8 @@ class DistributedBaselineController:
         self.model_weights_path = str(model_weights_path or "")
         self.tinynext_input_size = tinynext_input_size
         self.strict_run_id = bool(strict_run_id)
+        self.teacher_annotator = teacher_annotator
+        self.heavy_gpu_lease = heavy_gpu_lease
 
         self._lock = threading.RLock()
         self._states: dict[tuple[str, str, int], EdgeBaselineState] = {}
@@ -100,9 +121,13 @@ class DistributedBaselineController:
             else None
         )
         self._teacher_results: dict[tuple[str, str, int, int], dict[str, Any]] = {}
+        self._accuracy_annotation_pending: dict[
+            tuple[str, str, int, int], BaselineFramePayload
+        ] = {}
         self._ekya_windows: dict[tuple[str, str, int], deque[EkyaWindowSample]] = {}
+        self._ekya_window_snapshots: dict[tuple[int, str], EkyaReadyWindow] = {}
+        self._ekya_window_states: dict[tuple[int, str], EkyaWindowState] = {}
         self._ekya_window_status: dict[tuple[int, str], str] = {}
-        self._ekya_ready_logged: set[tuple[int, str]] = set()
         self._ekya_microprofile_results: dict[tuple[int, str], list[MicroProfileResult]] = {}
         self._ekya_jobs: dict[str, CloudScheduledEkyaJob] = {}
         self._ekya_commands: dict[str, EkyaCommandRecord] = {}
@@ -127,7 +152,9 @@ class DistributedBaselineController:
                 tinynext_input_size=self.tinynext_input_size,
             )
             self._ekya_scheduler = EkyaCentralScheduler(
-                ready_windows=self._ekya_ready_windows,
+                ready_windows=self._ekya_labeled_windows,
+                label_pending_windows=self._ekya_label_pending_windows,
+                annotate_window=self._ekya_annotate_window,
                 profile_window=self._ekya_profile_window,
                 submit_training=self._submit_ekya_training,
                 mark_skip=self._mark_ekya_skip,
@@ -151,13 +178,20 @@ class DistributedBaselineController:
             thread = self._ekya_scheduler_thread
             if thread is not None and thread.is_alive():
                 thread.join(timeout=5.0)
+        close_annotator = getattr(self.teacher_annotator, "close", None)
+        if callable(close_annotator):
+            close_annotator()
         with self._lock:
             self._states.clear()
             self._frames.clear()
             self._raw_frames.clear()
             self._inference_results.clear()
             self._teacher_results.clear()
+            self._accuracy_annotation_pending.clear()
             self._ekya_windows.clear()
+            self._ekya_window_snapshots.clear()
+            self._ekya_window_states.clear()
+            self._ekya_window_status.clear()
             self._ekya_microprofile_results.clear()
             self._ekya_jobs.clear()
             self._ekya_commands.clear()
@@ -202,26 +236,23 @@ class DistributedBaselineController:
                 edge_id=int(edge_id),
                 metrics_json=metrics_json,
             )
+            self._retry_accuracy_annotation_pending(edge_id=int(edge_id))
 
     def upload_frame(self, payload: BaselineFramePayload) -> dict[str, Any]:
         key = self._state_key(payload.run_id, payload.baseline_method, payload.edge_id)
         is_ekya = payload.baseline_method == _EKYA_METHOD
         is_accuracy_trigger = payload.baseline_method == _ACCURACY_TRIGGER_METHOD
+        if is_accuracy_trigger:
+            self._validate_accuracy_teacher_annotation_payload(payload)
         inference_result = (
             {}
             if is_accuracy_trigger
             else self._infer_payload_if_available(payload, key, purpose="display")
         )
-        teacher_result = (
-            self._infer_payload_if_available(payload, key, purpose="annotation")
-            if is_ekya or is_accuracy_trigger
-            else {}
-        )
-        teacher_prediction = (
-            dict(teacher_result.get("cloud_prediction", {}) or {})
-            if teacher_result
-            else dict(payload.teacher_prediction)
-        )
+        if is_accuracy_trigger or is_ekya:
+            teacher_prediction = {}
+        else:
+            teacher_prediction = dict(payload.teacher_prediction)
         stored_payload = replace(
             payload,
             raw_frame=b"",
@@ -231,7 +262,6 @@ class DistributedBaselineController:
             teacher_prediction=teacher_prediction,
         )
         frame_key = (*key, int(payload.frame_id))
-        accuracy_submission: AccuracyTriggerSubmission | None = None
         with self._lock:
             state = self.register_edge(
                 run_id=payload.run_id,
@@ -246,8 +276,6 @@ class DistributedBaselineController:
                 self._raw_frames[frame_key] = bytes(payload.raw_frame)
             if inference_result:
                 self._inference_results[frame_key] = inference_result
-            if teacher_result:
-                self._teacher_results[frame_key] = teacher_result
             state.upload_queue.append(int(payload.frame_id))
             state.recent_quality.append(dict(payload.quality_metadata))
             if is_ekya:
@@ -256,16 +284,16 @@ class DistributedBaselineController:
                     key,
                     payload=payload,
                     inference_result=inference_result,
-                    teacher_result=teacher_result,
+                    teacher_result={},
                 )
                 self._ekya_condition.notify_all()
-            if is_accuracy_trigger and self._accuracy_trigger_controller is not None:
-                accuracy_submission = self._accuracy_trigger_controller.add_frame(
-                    payload,
-                    teacher_prediction=teacher_prediction,
-                )
-        if accuracy_submission is not None:
-            self._submit_accuracy_trigger_training(accuracy_submission)
+            if is_accuracy_trigger:
+                self._accuracy_annotation_pending[frame_key] = payload
+        if is_accuracy_trigger:
+            self._retry_accuracy_annotation_pending(
+                edge_id=int(payload.edge_id),
+                raise_frame_key=frame_key,
+            )
         return {
             "accepted": True,
             "message": "frame accepted",
@@ -323,6 +351,7 @@ class DistributedBaselineController:
         self._state_key(run_id, baseline_method, edge_id)
         if not self._ekya_enabled:
             if self._accuracy_trigger_controller is not None:
+                self._retry_accuracy_annotation_pending(edge_id=int(edge_id))
                 return self._accuracy_trigger_controller.poll_commands(
                     run_id=run_id,
                     edge_id=int(edge_id),
@@ -353,6 +382,92 @@ class DistributedBaselineController:
             return None
         self._poll_ekya_jobs()
         return self._ekya_scheduler.run_once()
+
+    def _retry_accuracy_annotation_pending(
+        self,
+        *,
+        edge_id: int | None = None,
+        raise_frame_key: tuple[str, str, int, int] | None = None,
+    ) -> None:
+        if self._accuracy_trigger_controller is None:
+            return
+        with self._lock:
+            pending_items = sorted(
+                (
+                    (frame_key, payload)
+                    for frame_key, payload in self._accuracy_annotation_pending.items()
+                    if edge_id is None or int(frame_key[2]) == int(edge_id)
+                ),
+                key=lambda item: item[0],
+            )
+        blocked_edges: set[tuple[str, str, int]] = set()
+        for frame_key, payload in pending_items:
+            edge_key = frame_key[:3]
+            if edge_key in blocked_edges:
+                continue
+            with self._lock:
+                if frame_key not in self._accuracy_annotation_pending:
+                    continue
+            try:
+                teacher_prediction = self._teacher_prediction_for_accuracy_payload(payload)
+            except TeacherAnnotationRetryableError as exc:
+                blocked_edges.add(edge_key)
+                logger.info(
+                    "accuracy_trigger_teacher_annotation_deferred edge={} frame={} reason={}",
+                    payload.edge_id,
+                    payload.frame_id,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                with self._lock:
+                    self._accuracy_annotation_pending.pop(frame_key, None)
+                if frame_key == raise_frame_key:
+                    raise
+                logger.warning(
+                    "accuracy_trigger_teacher_annotation_failed edge={} frame={} reason={}",
+                    payload.edge_id,
+                    payload.frame_id,
+                    exc,
+                )
+                continue
+            submission = self._complete_accuracy_annotation(
+                frame_key=frame_key,
+                payload=payload,
+                teacher_prediction=teacher_prediction,
+            )
+            if submission is not None:
+                self._submit_accuracy_trigger_training(submission)
+
+    def _complete_accuracy_annotation(
+        self,
+        *,
+        frame_key: tuple[str, str, int, int],
+        payload: BaselineFramePayload,
+        teacher_prediction: dict[str, Any],
+    ) -> AccuracyTriggerSubmission | None:
+        if self._accuracy_trigger_controller is None:
+            return None
+        teacher_result = self._accuracy_teacher_result(
+            key=frame_key[:3],
+            payload=payload,
+            teacher_prediction=teacher_prediction,
+        )
+        with self._lock:
+            if frame_key not in self._accuracy_annotation_pending:
+                return None
+            self._accuracy_annotation_pending.pop(frame_key, None)
+            stored_payload = self._frames.get(frame_key)
+            if stored_payload is not None:
+                self._frames[frame_key] = replace(
+                    stored_payload,
+                    teacher_prediction=dict(teacher_prediction),
+                )
+            self._teacher_results[frame_key] = teacher_result
+        return self._accuracy_trigger_controller.add_frame(
+            payload,
+            teacher_prediction=teacher_prediction,
+        )
 
     def _submit_accuracy_trigger_training(
         self,
@@ -439,6 +554,57 @@ class DistributedBaselineController:
                 submission.window_id,
                 str(getattr(reply, "message", "") or "training job rejected"),
             )
+
+    def _accuracy_teacher_result(
+        self,
+        *,
+        key: tuple[str, str, int],
+        payload: BaselineFramePayload,
+        teacher_prediction: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "run_id": key[0],
+            "baseline_method": key[1],
+            "edge_id": key[2],
+            "frame_id": int(payload.frame_id),
+            "cloud_prediction": dict(teacher_prediction),
+            "confidence": _safe_float(teacher_prediction.get("confidence", 0.0)),
+            "timestamp_ms": now_ms(),
+            "purpose": "annotation",
+        }
+
+    def _validate_accuracy_teacher_annotation_payload(
+        self,
+        payload: BaselineFramePayload,
+    ) -> None:
+        if self.teacher_annotator is None:
+            raise RuntimeError("shared teacher annotator is required")
+        if not payload.raw_frame:
+            raise RuntimeError("raw frame bytes are required for teacher annotation")
+
+    def _teacher_prediction_for_accuracy_payload(
+        self,
+        payload: BaselineFramePayload,
+    ) -> dict[str, Any]:
+        self._validate_accuracy_teacher_annotation_payload(payload)
+        sample_id = str(int(payload.frame_id))
+        labels = self.teacher_annotator.annotate_raw_frames(
+            [
+                RawFrameAnnotationSample(
+                    sample_id=sample_id,
+                    edge_id=int(payload.edge_id),
+                    model_id=str(payload.model_name or ""),
+                    raw_frame=bytes(payload.raw_frame or b""),
+                    metadata={"include_empty": True},
+                )
+            ],
+            threshold=self._teacher_annotation_threshold(),
+        )
+        return dict(labels.get(sample_id, {}) or {})
+
+    def _teacher_annotation_threshold(self) -> float | None:
+        threshold = _config_value(self.baseline_method_config, "teacher_annotation_threshold", None)
+        return None if threshold is None else float(threshold)
 
     def _state_key(
         self,
@@ -539,7 +705,7 @@ class DistributedBaselineController:
         prediction = dict(result.get("cloud_prediction", {}) or {})
         detections = len(list(prediction.get("boxes") or []))
         logger.info(
-            "ekya_cloud_inference_done edge={} frame={} detections={} latency_ms={}",
+            "ekya_upload_display_done edge={} frame={} detections={} latency_ms={}",
             result.get("edge_id"),
             result.get("frame_id"),
             detections,
@@ -559,78 +725,167 @@ class DistributedBaselineController:
             int(_config_value(self.baseline_training_config, "training_window_size", 8)),
         )
         samples = self._ekya_windows.setdefault(key, deque(maxlen=training_window_size))
-        samples.append(
-            EkyaWindowSample(
-                run_id=key[0],
-                baseline_method=key[1],
-                edge_id=key[2],
-                frame_id=int(payload.frame_id),
-                timestamp_ms=int(payload.timestamp_ms),
-                model_name=str(payload.model_name or ""),
-                model_version=str(payload.model_version or "0"),
-                video_source=str(payload.video_source or ""),
-                raw_frame=bytes(payload.raw_frame or b""),
-                edge_prediction=dict(payload.edge_prediction),
-                cloud_prediction=dict(inference_result.get("cloud_prediction", {}) or {}),
-                teacher_prediction=dict(teacher_result.get("cloud_prediction", {}) or {}),
-                quality_metadata=dict(payload.quality_metadata),
-                is_keyframe=bool(payload.is_keyframe),
-            )
+        sample = EkyaWindowSample(
+            run_id=key[0],
+            baseline_method=key[1],
+            edge_id=key[2],
+            frame_id=int(payload.frame_id),
+            timestamp_ms=int(payload.timestamp_ms),
+            model_name=str(payload.model_name or ""),
+            model_version=str(payload.model_version or "0"),
+            video_source=str(payload.video_source or ""),
+            raw_frame=bytes(payload.raw_frame or b""),
+            edge_prediction=dict(payload.edge_prediction),
+            cloud_prediction=dict(inference_result.get("cloud_prediction", {}) or {}),
+            teacher_prediction=dict(teacher_result.get("cloud_prediction", {}) or {}),
+            quality_metadata=dict(payload.quality_metadata),
+            is_keyframe=bool(payload.is_keyframe),
+        )
+        samples.append(sample)
+        logger.info(
+            "ekya_window_sample_appended edge={} frame={} labeled={} window_samples={}",
+            key[2],
+            int(payload.frame_id),
+            bool(sample.teacher_prediction),
+            len(samples),
+        )
+        if len(samples) < training_window_size:
+            return
+        window = _ekya_window_from_samples(key, tuple(samples))
+        state_key = (int(window.edge_id), str(window.window_id))
+        if state_key in self._ekya_window_states:
+            return
+        self._ekya_window_snapshots[state_key] = window
+        self._set_ekya_window_state_locked(
+            window,
+            EKYA_STATUS_LABEL_PENDING,
+        )
+        logger.info(
+            "ekya_window_label_pending edge={} window={} samples={}",
+            window.edge_id,
+            window.window_id,
+            len(window.samples),
         )
 
-    def _ekya_ready_windows(self) -> list[EkyaReadyWindow]:
+    def _ekya_label_pending_windows(self) -> list[EkyaReadyWindow]:
         if self.training_backend is None:
             return []
-        min_samples = max(
-            1,
-            int(_config_value(self.baseline_training_config, "min_training_samples", 1)),
-        )
-        windows: list[EkyaReadyWindow] = []
         with self._lock:
-            for key, samples_deque in self._ekya_windows.items():
-                samples = list(samples_deque)
-                if len(samples) < min_samples:
-                    continue
-                edge_id = key[2]
-                model_version = str(samples[-1].model_version or "0")
-                frame_ids = [sample.frame_id for sample in samples]
-                window_id = stable_window_id(
-                    run_id=key[0],
-                    baseline_method=key[1],
-                    training_strategy="freeze",
-                    trainable_param_ratio=1.0,
-                    edge_id=edge_id,
-                    model_version=model_version,
-                    frame_ids=frame_ids,
+            return self._ekya_windows_with_status_locked(EKYA_STATUS_LABEL_PENDING)
+
+    def _ekya_labeled_windows(self) -> list[EkyaReadyWindow]:
+        if self.training_backend is None:
+            return []
+        with self._lock:
+            return self._ekya_windows_with_status_locked(EKYA_STATUS_LABELED)
+
+    def _ekya_windows_with_status_locked(self, status: str) -> list[EkyaReadyWindow]:
+        windows = [
+            window
+            for key, window in self._ekya_window_snapshots.items()
+            if self._ekya_window_states.get(key, EkyaWindowState("")).status == status
+        ]
+        return sorted(windows, key=lambda item: (int(item.edge_id), str(item.window_id)))
+
+    def _ekya_annotate_window(self, window: EkyaReadyWindow) -> bool:
+        state_key = (int(window.edge_id), str(window.window_id))
+        with self._lock:
+            state = self._ekya_window_states.get(state_key)
+            if state is None or state.status != EKYA_STATUS_LABEL_PENDING:
+                return False
+            self._set_ekya_window_state_locked(window, EKYA_STATUS_LABELING)
+        logger.info(
+            "ekya_teacher_annotation_start edge={} window={} samples={}",
+            window.edge_id,
+            window.window_id,
+            len(window.samples),
+        )
+        try:
+            if self.teacher_annotator is None:
+                raise RuntimeError("teacher annotator is not configured")
+            scope = (
+                nullcontext()
+                if bool(getattr(self.teacher_annotator, "manages_gpu_lease", False))
+                else self._heavy_gpu_scope(
+                    edge_id=int(window.edge_id),
+                    job_id=f"ekya-teacher:{window.window_id}",
+                    stage=EKYA_FAILURE_STAGE_TEACHER_ANNOTATION,
+                    model_name="rtdetr_x",
+                    batch_size=len(window.samples),
+                    train_samples=len(window.samples),
                 )
-                status = self._ekya_window_status.get((edge_id, window_id), "")
-                if status in {"RUNNING", "SUCCEEDED", "SUBMITTED"}:
-                    continue
-                if (edge_id, window_id) not in self._ekya_ready_logged:
-                    self._ekya_ready_logged.add((edge_id, window_id))
-                    logger.info(
-                        "ekya_window_ready edge={} window={} samples={}",
-                        edge_id,
-                        window_id,
-                        len(samples),
-                    )
-                windows.append(
-                    EkyaReadyWindow(
-                        edge_id=edge_id,
-                        window_id=window_id,
-                        run_id=key[0],
-                        baseline_method=key[1],
-                        model_name=str(samples[-1].model_name or ""),
-                        model_version=model_version,
-                        video_source=str(samples[-1].video_source or ""),
-                        samples=tuple(samples),
-                    )
+            )
+            with scope:
+                labels = self.teacher_annotator.annotate_raw_frames(
+                    [
+                        RawFrameAnnotationSample(
+                            sample_id=str(int(sample.frame_id)),
+                            edge_id=int(sample.edge_id),
+                            model_id=str(sample.model_name or window.model_name or ""),
+                            raw_frame=bytes(sample.raw_frame or b""),
+                            metadata={"include_empty": True},
+                        )
+                        for sample in window.samples
+                    ],
+                    threshold=self._teacher_annotation_threshold(),
                 )
-        return windows
+            labeled_samples = []
+            missing: list[str] = []
+            for sample in window.samples:
+                sample_id = str(int(sample.frame_id))
+                label = dict(labels.get(sample_id, {}) or {})
+                if not label:
+                    missing.append(sample_id)
+                labeled_samples.append(replace(sample, teacher_prediction=label))
+            if missing:
+                raise RuntimeError(
+                    "teacher annotation missing labels for "
+                    f"{len(missing)} sample(s)"
+                )
+            labeled_window = replace(window, samples=tuple(labeled_samples))
+            with self._lock:
+                self._ekya_window_snapshots[state_key] = labeled_window
+                self._set_ekya_window_state_locked(labeled_window, EKYA_STATUS_LABELED)
+            logger.info(
+                "ekya_teacher_annotation_done edge={} window={} samples={}",
+                window.edge_id,
+                window.window_id,
+                len(labeled_samples),
+            )
+            return True
+        except (EkyaHeavyLaneBusy, TeacherAnnotationRetryableError) as exc:
+            with self._lock:
+                state = self._ekya_window_states.get(state_key)
+                if state is not None and state.status == EKYA_STATUS_LABELING:
+                    self._set_ekya_window_state_locked(window, EKYA_STATUS_LABEL_PENDING)
+            logger.info(
+                "ekya_teacher_annotation_deferred edge={} window={} reason={}",
+                window.edge_id,
+                window.window_id,
+                exc,
+            )
+            return False
+        except Exception as exc:
+            with self._lock:
+                self._mark_ekya_window_failed_locked(
+                    window,
+                    failure_stage=EKYA_FAILURE_STAGE_TEACHER_ANNOTATION,
+                    reason=str(exc),
+                )
+            logger.warning(
+                "ekya_teacher_annotation_failed edge={} window={} reason={}",
+                window.edge_id,
+                window.window_id,
+                exc,
+            )
+            return False
 
     def _ekya_profile_window(self, window: EkyaReadyWindow) -> list[MicroProfileResult]:
         cache_key = (int(window.edge_id), str(window.window_id))
         with self._lock:
+            state = self._ekya_window_states.get(cache_key)
+            if state is None or state.status != EKYA_STATUS_LABELED:
+                return []
             cached = self._ekya_microprofile_results.get(cache_key)
             base_available, base_update = self._ekya_base_update_locked(
                 edge_id=int(window.edge_id),
@@ -639,16 +894,70 @@ class DistributedBaselineController:
         if cached is not None:
             return list(cached)
         if not base_available:
-            self._mark_ekya_skip(window, "microprofile_failed")
+            with self._lock:
+                self._mark_ekya_window_failed_locked(
+                    window,
+                    failure_stage=EKYA_FAILURE_STAGE_MICROPROFILE,
+                    reason="base model update missing",
+                )
             return []
         if self._ekya_microprofiler is None:
             return []
-        results = self._ekya_microprofiler.profile_window(
-            window,
-            base_model_update_model_data=base_update,
+        with self._lock:
+            self._set_ekya_window_state_locked(window, EKYA_STATUS_MICROPROFILING)
+        logger.info(
+            "ekya_microprofile_start edge={} window={} samples={}",
+            window.edge_id,
+            window.window_id,
+            len(window.samples),
         )
+        try:
+            with self._heavy_gpu_scope(
+                edge_id=int(window.edge_id),
+                job_id=f"ekya-microprofile:{window.window_id}",
+                stage=EKYA_FAILURE_STAGE_MICROPROFILE,
+                model_name=str(window.model_name or ""),
+                batch_size=int(_config_value(self.baseline_training_config, "batch_size", 0) or 0),
+                train_samples=len(window.samples),
+            ):
+                results = self._ekya_microprofiler.profile_window(
+                    window,
+                    base_model_update_model_data=base_update,
+                )
+        except EkyaHeavyLaneBusy as exc:
+            with self._lock:
+                state = self._ekya_window_states.get(cache_key)
+                if state is not None and state.status == EKYA_STATUS_MICROPROFILING:
+                    self._set_ekya_window_state_locked(window, EKYA_STATUS_LABELED)
+            logger.info(
+                "ekya_microprofile_deferred edge={} window={} reason={}",
+                window.edge_id,
+                window.window_id,
+                exc,
+            )
+            raise
+        except Exception as exc:
+            with self._lock:
+                self._mark_ekya_window_failed_locked(
+                    window,
+                    failure_stage=EKYA_FAILURE_STAGE_MICROPROFILE,
+                    reason=str(exc),
+                )
+            logger.warning(
+                "ekya_microprofile_failed edge={} window={} reason={}",
+                window.edge_id,
+                window.window_id,
+                exc,
+            )
+            return []
         with self._lock:
             self._ekya_microprofile_results[cache_key] = list(results)
+        logger.info(
+            "ekya_microprofile_done edge={} window={} candidates={}",
+            window.edge_id,
+            window.window_id,
+            len(results),
+        )
         return results
 
     def _ekya_profile_skip_reason(self, window: EkyaReadyWindow) -> str:
@@ -656,12 +965,24 @@ class DistributedBaselineController:
             return ""
         return self._ekya_microprofiler.skip_reason(window)
 
+    def _ekya_mark_microprofile_failed(self, window: EkyaReadyWindow, reason: str) -> None:
+        with self._lock:
+            state = self._ekya_window_states.get((int(window.edge_id), str(window.window_id)))
+            if state is not None and state.status in EKYA_TERMINAL_WINDOW_STATUSES:
+                return
+            self._mark_ekya_window_failed_locked(
+                window,
+                failure_stage=EKYA_FAILURE_STAGE_MICROPROFILE,
+                reason=str(reason or "microprofile_failed"),
+            )
+
     def _submit_ekya_training(
         self,
         window: EkyaReadyWindow,
         result: MicroProfileResult,
     ) -> str | None:
         if self.training_backend is None:
+            self._mark_ekya_skip(window, "training_job_rejected")
             return None
         if not _valid_ekya_microprofile_result(
             window,
@@ -674,8 +995,13 @@ class DistributedBaselineController:
                 )
             ),
         ):
-            self._mark_ekya_skip(window, "microprofile_failed")
+            self._ekya_mark_microprofile_failed(window, "microprofile_failed")
             return None
+        with self._lock:
+            state = self._ekya_window_states.get((int(window.edge_id), str(window.window_id)))
+            if state is not None and state.status != EKYA_STATUS_MICROPROFILING:
+                self._ekya_mark_microprofile_failed(window, "microprofile_failed")
+                return None
         selected_samples = select_window_samples(
             window.samples,
             sample_count=result.sample_count,
@@ -712,7 +1038,7 @@ class DistributedBaselineController:
                 model_version=str(window.model_version or "0"),
             )
         if not base_available:
-            self._mark_ekya_skip(window, "microprofile_failed")
+            self._ekya_mark_microprofile_failed(window, "microprofile_failed")
             return None
         payload_zip = build_baseline_training_bundle(
             run_id=window.run_id,
@@ -728,6 +1054,11 @@ class DistributedBaselineController:
             tinynext_input_size=self.tinynext_input_size,
             base_model_update_model_data=base_model_update,
             trigger_metadata={
+                "baseline_method": str(window.baseline_method),
+                "edge_id": int(window.edge_id),
+                "base_model_version": str(window.model_version or "0"),
+                "ekya_window_id": str(window.window_id),
+                "selected_microprofile_config": str(result.config_id),
                 "microprofile_result_id": str(result.result_id),
                 "config_id": str(result.config_id),
                 "window_id": str(window.window_id),
@@ -735,7 +1066,7 @@ class DistributedBaselineController:
             },
         )
         request_id = f"ekya:{window.run_id}:{window.edge_id}:{window.window_id}:{result.config_id}"
-        request = message_transmission_pb2.SubmitTrainingJobRequest(
+        request = SimpleNamespace(
             protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
             edge_id=int(window.edge_id),
             request_id=request_id,
@@ -745,20 +1076,18 @@ class DistributedBaselineController:
             frame_indices=[int(sample.frame_id) for sample in selected_samples],
             payload_zip=payload_zip,
             base_model_version=str(window.model_version or "0"),
+            exclusive_gpu_lease=True,
         )
         reply = self.training_backend.submit_training_job(request)
         if not bool(getattr(reply, "accepted", False)):
-            logger.info(
-                "ekya_schedule_skip edge={} window={} reason=training_job_rejected",
-                window.edge_id,
-                window.window_id,
-            )
+            self._mark_ekya_skip(window, "training_job_rejected")
             return None
         job_id = str(getattr(reply, "job_id", "") or "")
         if not job_id:
+            self._mark_ekya_skip(window, "training_job_rejected")
             return None
         with self._lock:
-            self._ekya_window_status[(int(window.edge_id), window.window_id)] = "RUNNING"
+            self._set_ekya_window_state_locked(window, EKYA_STATUS_TRAINING)
             self._ekya_jobs[job_id] = CloudScheduledEkyaJob(
                 edge_id=int(window.edge_id),
                 window_id=window.window_id,
@@ -772,7 +1101,7 @@ class DistributedBaselineController:
                 submitted_at_ms=now_ms(),
             )
         logger.info(
-            "ekya_training_job_submitted edge={} window={} config={} job_id={}",
+            "ekya_formal_training_submitted edge={} window={} config={} job_id={}",
             window.edge_id,
             window.window_id,
             result.config_id,
@@ -867,7 +1196,16 @@ class DistributedBaselineController:
                 active.finished_at_ms = now_ms()
                 active.result_model_version = result_model_version
                 active.model_data = model_data
-                self._ekya_window_status[(active.edge_id, active.window_id)] = status
+                window = self._ekya_window_snapshots.get((active.edge_id, active.window_id))
+                if window is not None:
+                    if status == "SUCCEEDED":
+                        self._set_ekya_window_state_locked(window, EKYA_STATUS_SUCCEEDED)
+                    else:
+                        self._mark_ekya_window_failed_locked(
+                            window,
+                            failure_stage=EKYA_FAILURE_STAGE_TRAINING_SUBMISSION,
+                            reason=str(getattr(status_reply, "message", "") or status),
+                        )
                 if status == "SUCCEEDED" and model_data and result_model_version:
                     self._cache_ekya_model_update_locked(
                         active,
@@ -950,11 +1288,81 @@ class DistributedBaselineController:
         }
 
     def _mark_ekya_skip(self, window: EkyaReadyWindow, reason: str) -> None:
+        with self._lock:
+            state = self._ekya_window_states.get((int(window.edge_id), str(window.window_id)))
+            if state is not None and state.status in EKYA_TERMINAL_WINDOW_STATUSES:
+                return
+            self._set_ekya_window_state_locked(
+                window,
+                EKYA_STATUS_SKIPPED,
+                failure_stage=_ekya_failure_stage_for_reason(reason),
+                failure_reason=str(reason),
+            )
         logger.info(
-            "ekya_schedule_skip edge={} window={} reason={}",
+            "ekya_window_skipped edge={} window={} reason={}",
             window.edge_id,
             window.window_id,
             reason,
+        )
+
+    def _set_ekya_window_state_locked(
+        self,
+        window: EkyaReadyWindow,
+        status: str,
+        *,
+        failure_stage: str = "",
+        failure_reason: str = "",
+    ) -> None:
+        key = (int(window.edge_id), str(window.window_id))
+        self._ekya_window_states[key] = EkyaWindowState(
+            status=str(status),
+            failure_stage=str(failure_stage or ""),
+            failure_reason=str(failure_reason or ""),
+            updated_at_ms=now_ms(),
+        )
+        self._ekya_window_status[key] = str(status)
+
+    def _mark_ekya_window_failed_locked(
+        self,
+        window: EkyaReadyWindow,
+        *,
+        failure_stage: str,
+        reason: str,
+    ) -> None:
+        self._set_ekya_window_state_locked(
+            window,
+            EKYA_STATUS_FAILED,
+            failure_stage=failure_stage,
+            failure_reason=reason,
+        )
+        logger.warning(
+            "ekya_window_failed edge={} window={} failure_stage={} reason={}",
+            window.edge_id,
+            window.window_id,
+            failure_stage,
+            reason,
+        )
+
+    def _heavy_gpu_scope(
+        self,
+        *,
+        edge_id: int,
+        job_id: str,
+        stage: str,
+        model_name: str = "",
+        batch_size: int = 0,
+        train_samples: int = 0,
+    ):
+        if self.heavy_gpu_lease is None:
+            return nullcontext()
+        return self.heavy_gpu_lease(
+            edge_id=int(edge_id),
+            job_id=str(job_id),
+            stage=str(stage),
+            model_name=str(model_name or ""),
+            batch_size=int(batch_size or 0),
+            train_samples=int(train_samples or 0),
+            exclusive=True,
         )
 
     def _ekya_scheduler_loop(self) -> None:
@@ -1001,6 +1409,44 @@ def _merge_model_update_payloads(
             "checkpoint_model_version": payload["result_model_version"],
         }
     return _encode_model_update_payload(payload)
+
+
+def _ekya_window_from_samples(
+    key: tuple[str, str, int],
+    samples: tuple[EkyaWindowSample, ...],
+) -> EkyaReadyWindow:
+    if not samples:
+        raise RuntimeError("Ekya window snapshot requires at least one sample")
+    model_version = str(samples[-1].model_version or "0")
+    frame_ids = [int(sample.frame_id) for sample in samples]
+    window_id = stable_window_id(
+        run_id=key[0],
+        baseline_method=key[1],
+        training_strategy="freeze",
+        trainable_param_ratio=1.0,
+        edge_id=key[2],
+        model_version=model_version,
+        frame_ids=frame_ids,
+    )
+    return EkyaReadyWindow(
+        edge_id=key[2],
+        window_id=window_id,
+        run_id=key[0],
+        baseline_method=key[1],
+        model_name=str(samples[-1].model_name or ""),
+        model_version=model_version,
+        video_source=str(samples[-1].video_source or ""),
+        samples=tuple(samples),
+    )
+
+
+def _ekya_failure_stage_for_reason(reason: str) -> str:
+    text = str(reason or "")
+    if "teacher" in text or "label" in text:
+        return EKYA_FAILURE_STAGE_TEACHER_ANNOTATION
+    if "training" in text or "job" in text:
+        return EKYA_FAILURE_STAGE_TRAINING_SUBMISSION
+    return EKYA_FAILURE_STAGE_MICROPROFILE
 
 
 def _valid_ekya_microprofile_result(

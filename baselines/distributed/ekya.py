@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import gc
 import io
 import math
 import random
@@ -32,6 +33,32 @@ from model_management.model_delta_payload import require_state_dict_delta_payloa
 from model_management.model_zoo import build_detection_model
 from model_management.split_model_adapters import postprocess_split_runtime_output
 
+EKYA_STATUS_COLLECTING = "COLLECTING"
+EKYA_STATUS_LABEL_PENDING = "LABEL_PENDING"
+EKYA_STATUS_LABELING = "LABELING"
+EKYA_STATUS_LABELED = "LABELED"
+EKYA_STATUS_MICROPROFILING = "MICROPROFILING"
+EKYA_STATUS_TRAINING = "TRAINING"
+EKYA_STATUS_SUCCEEDED = "SUCCEEDED"
+EKYA_STATUS_FAILED = "FAILED"
+EKYA_STATUS_SKIPPED = "SKIPPED"
+
+EKYA_TERMINAL_WINDOW_STATUSES = {
+    EKYA_STATUS_SUCCEEDED,
+    EKYA_STATUS_FAILED,
+    EKYA_STATUS_SKIPPED,
+}
+
+EKYA_FAILURE_STAGE_TEACHER_ANNOTATION = "teacher_annotation"
+EKYA_FAILURE_STAGE_MICROPROFILE = "microprofile"
+EKYA_FAILURE_STAGE_TRAINING_SUBMISSION = "training_submission"
+
+
+class EkyaHeavyLaneBusy(RuntimeError):
+    """Raised when shared heavy-GPU work should be retried by the scheduler."""
+
+    retryable = True
+
 
 @dataclass(frozen=True)
 class EkyaCandidateConfig:
@@ -61,6 +88,14 @@ class EkyaWindowSample:
     teacher_prediction: dict[str, Any]
     quality_metadata: dict[str, Any]
     is_keyframe: bool = True
+
+
+@dataclass(frozen=True)
+class EkyaWindowState:
+    status: str
+    failure_stage: str = ""
+    failure_reason: str = ""
+    updated_at_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -241,15 +276,20 @@ class EkyaMicroProfiler:
                     base_model_update_model_data=base_model_update_model_data,
                 )
             except Exception as exc:
+                reason = "microprofile_failed"
+                if _is_cuda_oom(exc):
+                    reason = "microprofile_oom"
                 logger.warning(
                     "ekya_schedule_skip edge={} window={} config={} "
-                    "reason=microprofile_failed error={}",
+                    "reason={} error={}",
                     window.edge_id,
                     window.window_id,
                     candidate.config_id,
+                    reason,
                     exc,
                 )
                 self._record_skip_reason(window, "microprofile_failed")
+                _release_cuda_cache()
                 continue
             if result is not None:
                 results.append(result)
@@ -333,55 +373,26 @@ class EkyaMicroProfiler:
             for sample in microprofile_samples
         ]
         device = resolve_training_device(self.training_config.get("device", "auto"))
-        model = self._build_model(window.model_name, device=device)
-        _load_base_model_update(model, base_model_update_model_data, device=device)
-        trainable_module = unwrap_trainable_module(model, model_name=window.model_name)
-        trainable_module.to(device)
-        freeze_summary = apply_parameter_ratio_freeze(
-            trainable_module,
-            candidate.trainable_param_ratio,
-        )
-        selected = selected_trainable_parameters(freeze_summary)
-        optimizer = _build_optimizer(
-            [parameter for _name, parameter in selected],
-            learning_rate=candidate.learning_rate,
-            optimizer_name=str(self.training_config.get("optimizer_name", "adam") or "adam"),
-            weight_decay=float(self.training_config.get("weight_decay", 0.0) or 0.0),
-        )
-        loss_fn = self.loss_builder(model)
-        proxy_before = evaluate_teacher_agreement_f1(
-            model,
-            trainable_module,
-            training_samples,
-            batch_size=candidate.batch_size,
-            device=device,
-            iou_threshold=float(self.ekya_config.get("teacher_agreement_iou_threshold", 0.5)),
-            confidence_threshold=float(
-                self.ekya_config.get("teacher_agreement_confidence_threshold", 0.0)
-            ),
-            min_teacher_objects=min_teacher_objects,
-        )
-        if proxy_before is None:
-            logger.info(
-                "ekya_schedule_skip edge={} window={} reason=proxy_metric_unavailable",
-                window.edge_id,
-                window.window_id,
+        model = trainable_module = optimizer = loss_fn = None
+        metrics: dict[str, Any] = {}
+        try:
+            model = self._build_model(window.model_name, device=device)
+            _load_base_model_update(model, base_model_update_model_data, device=device)
+            trainable_module = unwrap_trainable_module(model, model_name=window.model_name)
+            trainable_module.to(device)
+            freeze_summary = apply_parameter_ratio_freeze(
+                trainable_module,
+                candidate.trainable_param_ratio,
             )
-            self._record_skip_reason(window, "proxy_metric_unavailable")
-            return None
-
-        epochs = max(1, int(self.training_config.get("microprofile_epochs", 1) or 1))
-        logger.info(
-            "ekya_microprofile_start edge={} window={} config={} samples={} epochs={}",
-            window.edge_id,
-            window.window_id,
-            candidate.config_id,
-            len(microprofile_samples),
-            epochs,
-        )
-
-        def evaluate_epoch(epoch: int) -> float | None:
-            value = evaluate_teacher_agreement_f1(
+            selected = selected_trainable_parameters(freeze_summary)
+            optimizer = _build_optimizer(
+                [parameter for _name, parameter in selected],
+                learning_rate=candidate.learning_rate,
+                optimizer_name=str(self.training_config.get("optimizer_name", "adam") or "adam"),
+                weight_decay=float(self.training_config.get("weight_decay", 0.0) or 0.0),
+            )
+            loss_fn = self.loss_builder(model)
+            proxy_before = evaluate_teacher_agreement_f1(
                 model,
                 trainable_module,
                 training_samples,
@@ -393,104 +404,144 @@ class EkyaMicroProfiler:
                 ),
                 min_teacher_objects=min_teacher_objects,
             )
-            if value is not None:
+            if proxy_before is None:
                 logger.info(
-                    "ekya_microprofile_epoch edge={} window={} config={} epoch={} "
-                    "proxy_metric=teacher_agreement_f1 value={}",
+                    "ekya_schedule_skip edge={} window={} reason=proxy_metric_unavailable",
                     window.edge_id,
                     window.window_id,
-                    candidate.config_id,
-                    epoch,
-                    value,
                 )
-            return value
+                self._record_skip_reason(window, "proxy_metric_unavailable")
+                return None
 
-        metrics = run_parameter_ratio_freeze_microprofile(
-            model=model,
-            trainable_module=trainable_module,
-            samples=training_samples,
-            batch_size=candidate.batch_size,
-            epochs=epochs,
-            device=device,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            evaluate_epoch=evaluate_epoch,
-        )
-        elapsed_ms = float(metrics.get("microprofile_time_sec", 0.0) or 0.0) * 1000.0
-        after_values = [
-            float(value)
-            for value in list(metrics.get("proxy_metric_after_by_epoch", []) or [])
-            if value is not None
-        ]
-        if not after_values:
+            epochs = max(1, int(self.training_config.get("microprofile_epochs", 1) or 1))
             logger.info(
-                "ekya_schedule_skip edge={} window={} reason=proxy_metric_unavailable",
+                "ekya_microprofile_start edge={} window={} config={} samples={} epochs={}",
                 window.edge_id,
                 window.window_id,
+                candidate.config_id,
+                len(microprofile_samples),
+                epochs,
             )
-            self._record_skip_reason(window, "proxy_metric_unavailable")
-            return None
-        final_observed = float(after_values[-1])
-        estimated_final = _estimate_final_metric(
-            proxy_before,
-            final_observed,
-            microprofile_epochs=epochs,
-            formal_epochs=candidate.formal_num_epoch,
-        )
-        gain = estimated_final - proxy_before
-        epoch_time_ms = elapsed_ms / max(1, epochs)
-        estimated_full_training_time_ms = estimate_full_training_time_ms(
-            epoch_time_ms=epoch_time_ms,
-            formal_epochs=candidate.formal_num_epoch,
-            formal_sample_count=candidate.sample_count,
-            microprofile_sample_count=len(microprofile_samples),
-        )
-        inference_penalty = estimate_inference_penalty(
-            estimated_full_training_time_ms=estimated_full_training_time_ms,
-            window_samples=len(window.samples),
-        )
-        estimated_window_average_quality = max(0.0, min(1.0, estimated_final - inference_penalty))
-        score = estimated_window_average_quality - proxy_before
-        result = MicroProfileResult(
-            edge_id=window.edge_id,
-            window_id=window.window_id,
-            config_id=candidate.config_id,
-            training_strategy=candidate.training_strategy,
-            trainable_param_ratio=candidate.trainable_param_ratio,
-            sample_count=candidate.sample_count,
-            microprofile_epochs=epochs,
-            formal_num_epoch=candidate.formal_num_epoch,
-            batch_size=candidate.batch_size,
-            learning_rate=candidate.learning_rate,
-            proxy_metric_name="teacher_agreement_f1",
-            proxy_metric_before=proxy_before,
-            proxy_metric_after_by_epoch=after_values,
-            estimated_final_proxy_metric=estimated_final,
-            proxy_metric_gain=gain,
-            elapsed_ms=elapsed_ms,
-            epoch_time_ms_at_full_gpu=epoch_time_ms,
-            estimated_full_training_time_ms=estimated_full_training_time_ms,
-            estimated_inference_penalty=inference_penalty,
-            estimated_window_average_quality=estimated_window_average_quality,
-            score=score,
-            diagnostic_loss_before=_optional_float(metrics.get("loss_before")),
-            diagnostic_loss_after=_optional_float(metrics.get("final_loss")),
-            result_id=microprofile_result_id(window, candidate),
-            base_model_version=str(window.model_version or "0"),
-        )
-        logger.info(
-            "ekya_microprofile_done edge={} window={} config={} "
-            "estimated_final_proxy_metric={} estimated_full_training_time_ms={} "
-            "estimated_window_average_quality={} score={}",
-            window.edge_id,
-            window.window_id,
-            candidate.config_id,
-            result.estimated_final_proxy_metric,
-            result.estimated_full_training_time_ms,
-            result.estimated_window_average_quality,
-            result.score,
-        )
-        return result
+
+            def evaluate_epoch(epoch: int) -> float | None:
+                value = evaluate_teacher_agreement_f1(
+                    model,
+                    trainable_module,
+                    training_samples,
+                    batch_size=candidate.batch_size,
+                    device=device,
+                    iou_threshold=float(
+                        self.ekya_config.get("teacher_agreement_iou_threshold", 0.5)
+                    ),
+                    confidence_threshold=float(
+                        self.ekya_config.get("teacher_agreement_confidence_threshold", 0.0)
+                    ),
+                    min_teacher_objects=min_teacher_objects,
+                )
+                if value is not None:
+                    logger.info(
+                        "ekya_microprofile_epoch edge={} window={} config={} epoch={} "
+                        "proxy_metric=teacher_agreement_f1 value={}",
+                        window.edge_id,
+                        window.window_id,
+                        candidate.config_id,
+                        epoch,
+                        value,
+                    )
+                return value
+
+            metrics = run_parameter_ratio_freeze_microprofile(
+                model=model,
+                trainable_module=trainable_module,
+                samples=training_samples,
+                batch_size=candidate.batch_size,
+                epochs=epochs,
+                device=device,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                evaluate_epoch=evaluate_epoch,
+            )
+            elapsed_ms = float(metrics.get("microprofile_time_sec", 0.0) or 0.0) * 1000.0
+            after_values = [
+                float(value)
+                for value in list(metrics.get("proxy_metric_after_by_epoch", []) or [])
+                if value is not None
+            ]
+            if not after_values:
+                logger.info(
+                    "ekya_schedule_skip edge={} window={} reason=proxy_metric_unavailable",
+                    window.edge_id,
+                    window.window_id,
+                )
+                self._record_skip_reason(window, "proxy_metric_unavailable")
+                return None
+            final_observed = float(after_values[-1])
+            estimated_final = _estimate_final_metric(
+                proxy_before,
+                final_observed,
+                microprofile_epochs=epochs,
+                formal_epochs=candidate.formal_num_epoch,
+            )
+            gain = estimated_final - proxy_before
+            epoch_time_ms = elapsed_ms / max(1, epochs)
+            estimated_full_training_time_ms = estimate_full_training_time_ms(
+                epoch_time_ms=epoch_time_ms,
+                formal_epochs=candidate.formal_num_epoch,
+                formal_sample_count=candidate.sample_count,
+                microprofile_sample_count=len(microprofile_samples),
+            )
+            inference_penalty = estimate_inference_penalty(
+                estimated_full_training_time_ms=estimated_full_training_time_ms,
+                window_samples=len(window.samples),
+            )
+            estimated_window_average_quality = max(
+                0.0,
+                min(1.0, estimated_final - inference_penalty),
+            )
+            score = estimated_window_average_quality - proxy_before
+            result = MicroProfileResult(
+                edge_id=window.edge_id,
+                window_id=window.window_id,
+                config_id=candidate.config_id,
+                training_strategy=candidate.training_strategy,
+                trainable_param_ratio=candidate.trainable_param_ratio,
+                sample_count=candidate.sample_count,
+                microprofile_epochs=epochs,
+                formal_num_epoch=candidate.formal_num_epoch,
+                batch_size=candidate.batch_size,
+                learning_rate=candidate.learning_rate,
+                proxy_metric_name="teacher_agreement_f1",
+                proxy_metric_before=proxy_before,
+                proxy_metric_after_by_epoch=after_values,
+                estimated_final_proxy_metric=estimated_final,
+                proxy_metric_gain=gain,
+                elapsed_ms=elapsed_ms,
+                epoch_time_ms_at_full_gpu=epoch_time_ms,
+                estimated_full_training_time_ms=estimated_full_training_time_ms,
+                estimated_inference_penalty=inference_penalty,
+                estimated_window_average_quality=estimated_window_average_quality,
+                score=score,
+                diagnostic_loss_before=_optional_float(metrics.get("loss_before")),
+                diagnostic_loss_after=_optional_float(metrics.get("final_loss")),
+                result_id=microprofile_result_id(window, candidate),
+                base_model_version=str(window.model_version or "0"),
+            )
+            logger.info(
+                "ekya_microprofile_done edge={} window={} config={} "
+                "estimated_final_proxy_metric={} estimated_full_training_time_ms={} "
+                "estimated_window_average_quality={} score={}",
+                window.edge_id,
+                window.window_id,
+                candidate.config_id,
+                result.estimated_final_proxy_metric,
+                result.estimated_full_training_time_ms,
+                result.estimated_window_average_quality,
+                result.score,
+            )
+            return result
+        finally:
+            del metrics
+            _cleanup_microprofile_objects(model, trainable_module, optimizer, loss_fn)
 
     def _build_model(self, model_name: str, *, device: torch.device) -> torch.nn.Module:
         kwargs: dict[str, Any] = {}
@@ -520,6 +571,8 @@ class EkyaCentralScheduler:
         ready_windows: Callable[[], Iterable[EkyaReadyWindow]],
         profile_window: Callable[[EkyaReadyWindow], list[MicroProfileResult]],
         submit_training: Callable[[EkyaReadyWindow, MicroProfileResult], str | None],
+        label_pending_windows: Callable[[], Iterable[EkyaReadyWindow]] | None = None,
+        annotate_window: Callable[[EkyaReadyWindow], bool] | None = None,
         mark_skip: Callable[[EkyaReadyWindow, str], None] | None = None,
         profile_skip_reason: Callable[[EkyaReadyWindow], str] | None = None,
         active_training_count: Callable[[], int] | None = None,
@@ -529,6 +582,8 @@ class EkyaCentralScheduler:
         self.ready_windows = ready_windows
         self.profile_window = profile_window
         self.submit_training = submit_training
+        self.label_pending_windows = label_pending_windows or (lambda: [])
+        self.annotate_window = annotate_window
         self.mark_skip = mark_skip or (lambda _window, _reason: None)
         self.profile_skip_reason = profile_skip_reason or (lambda _window: "")
         self.active_training_count = active_training_count or (lambda: 0)
@@ -538,50 +593,58 @@ class EkyaCentralScheduler:
     def run_once(self) -> MicroProfileResult | None:
         if int(self.active_training_count()) > 0:
             return None
-        candidates: list[tuple[EkyaReadyWindow, MicroProfileResult]] = []
-        for window in list(self.ready_windows()):
-            try:
-                results = self.profile_window(window)
-            except Exception as exc:
-                logger.warning(
-                    "ekya_schedule_skip edge={} window={} reason=microprofile_failed error={}",
-                    window.edge_id,
-                    window.window_id,
-                    exc,
-                )
-                self.mark_skip(window, "microprofile_failed")
-                continue
-            if not results:
-                reason = self.profile_skip_reason(window) or "proxy_metric_unavailable"
-                self.mark_skip(window, reason)
-                continue
-            evaluated = [(result, self._viability_reason(window, result)) for result in results]
-            viable = [result for result, reason in evaluated if reason == ""]
-            if not viable:
-                reasons = {reason for _result, reason in evaluated if reason}
-                if "service_quality_constraint_failed" in reasons:
-                    self.mark_skip(window, "service_quality_constraint_failed")
-                elif "microprofile_failed" in reasons:
-                    self.mark_skip(window, "microprofile_failed")
-                else:
-                    self.mark_skip(window, "no_candidate_improves_window_quality")
-                continue
-            best = max(
-                viable,
-                key=lambda result: (
-                    result.score,
-                    result.estimated_window_average_quality,
-                ),
-            )
-            candidates.append((window, best))
-        if not candidates:
+
+        pending_windows = list(self.label_pending_windows())
+        if pending_windows and self.annotate_window is not None:
+            self.annotate_window(pending_windows[0])
             return None
-        selected_window, selected_result = max(
-            candidates,
-            key=lambda item: (
-                item[1].score,
-                item[1].estimated_window_average_quality,
-                -item[0].edge_id,
+
+        windows = list(self.ready_windows())
+        if not windows:
+            return None
+        selected_window = windows[0]
+        try:
+            results = self.profile_window(selected_window)
+        except EkyaHeavyLaneBusy as exc:
+            logger.info(
+                "ekya_schedule_defer edge={} window={} reason=heavy_gpu_lease_busy error={}",
+                selected_window.edge_id,
+                selected_window.window_id,
+                exc,
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "ekya_schedule_skip edge={} window={} reason=microprofile_failed error={}",
+                selected_window.edge_id,
+                selected_window.window_id,
+                exc,
+            )
+            self.mark_skip(selected_window, "microprofile_failed")
+            return None
+        if not results:
+            reason = self.profile_skip_reason(selected_window) or "proxy_metric_unavailable"
+            self.mark_skip(selected_window, reason)
+            return None
+        evaluated = [
+            (result, self._viability_reason(selected_window, result))
+            for result in results
+        ]
+        viable = [result for result, reason in evaluated if reason == ""]
+        if not viable:
+            reasons = {reason for _result, reason in evaluated if reason}
+            if "service_quality_constraint_failed" in reasons:
+                self.mark_skip(selected_window, "service_quality_constraint_failed")
+            elif "microprofile_failed" in reasons:
+                self.mark_skip(selected_window, "microprofile_failed")
+            else:
+                self.mark_skip(selected_window, "no_candidate_improves_window_quality")
+            return None
+        selected_result = max(
+            viable,
+            key=lambda result: (
+                result.score,
+                result.estimated_window_average_quality,
             ),
         )
         job_id = self.submit_training(selected_window, selected_result)
@@ -804,30 +867,31 @@ def _predict_samples(
     predictions: list[dict[str, list]] = []
     model.eval()
     trainable_module.eval()
-    for batch in _batches(samples, max(1, int(batch_size))):
-        prepared = _prepare_raw_batch_for_full_forward(
-            model,
-            trainable_module,
-            batch,
-            device=device,
-        )
-        outputs = _forward_full_model(model, trainable_module, prepared)
-        batch_predictions = _batched_predictions_from_model_output(
-            outputs,
-            batch_size=len(batch),
-            threshold_low=0.0,
-            threshold_high=0.0,
-        )
-        if _looks_like_raw_detection_output(outputs):
-            postprocessed = _postprocess_raw_detection_output(
+    with torch.inference_mode():
+        for batch in _batches(samples, max(1, int(batch_size))):
+            prepared = _prepare_raw_batch_for_full_forward(
                 model,
-                outputs,
-                prepared=prepared,
-                batch=batch,
+                trainable_module,
+                batch,
+                device=device,
             )
-            if postprocessed is not None:
-                batch_predictions = postprocessed
-        predictions.extend(batch_predictions)
+            outputs = _forward_full_model(model, trainable_module, prepared)
+            batch_predictions = _batched_predictions_from_model_output(
+                outputs,
+                batch_size=len(batch),
+                threshold_low=0.0,
+                threshold_high=0.0,
+            )
+            if _looks_like_raw_detection_output(outputs):
+                postprocessed = _postprocess_raw_detection_output(
+                    model,
+                    outputs,
+                    prepared=prepared,
+                    batch=batch,
+                )
+                if postprocessed is not None:
+                    batch_predictions = postprocessed
+            predictions.extend(batch_predictions)
     return predictions
 
 
@@ -937,6 +1001,32 @@ def _load_base_model_update(
         )
     )
     model.load_state_dict(dict(payload["state_dict"]), strict=False)
+
+
+def _cleanup_microprofile_objects(*objects: object) -> None:
+    for item in objects:
+        try:
+            if hasattr(item, "zero_grad"):
+                item.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+    gc.collect()
+    _release_cuda_cache()
+
+
+def _release_cuda_cache() -> None:
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text and ("cuda" in text or "gpu" in text)
 
 
 def _boxes(value: object) -> list[list[float]]:

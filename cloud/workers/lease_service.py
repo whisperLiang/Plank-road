@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from cloud.workers.gpu_lease_manager import GpuLeaseManager, LeaseRequest
-from cloud.workers.worker_protocol import JsonRpcServer
+from cloud.workers.worker_protocol import JsonRpcError, JsonRpcServer
 
 
 class GpuLeaseService:
@@ -28,21 +28,30 @@ class GpuLeaseService:
         self.server.shutdown()
 
     def _acquire(self, payload: dict[str, Any]) -> dict[str, Any]:
-        lease = self.manager.acquire(
-            LeaseRequest(
-                edge_id=int(payload.get("edge_id", 0) or 0),
-                worker_id=str(payload.get("worker_id", "")),
-                job_id=str(payload.get("job_id", "")),
-                model_name=str(payload.get("model_name", "")),
-                split_key=str(payload.get("split_key", "")),
-                batch_size=int(payload.get("batch_size", 0) or 0),
-                train_samples=int(payload.get("train_samples", 0) or 0),
-                estimated_peak_memory_gb=float(
-                    payload.get("estimated_peak_memory_gb", 0.0) or 0.0
+        timeout_sec = payload.get("timeout_sec", None)
+        try:
+            lease = self.manager.acquire(
+                LeaseRequest(
+                    edge_id=int(payload.get("edge_id", 0) or 0),
+                    worker_id=str(payload.get("worker_id", "")),
+                    job_id=str(payload.get("job_id", "")),
+                    model_name=str(payload.get("model_name", "")),
+                    split_key=str(payload.get("split_key", "")),
+                    batch_size=int(payload.get("batch_size", 0) or 0),
+                    train_samples=int(payload.get("train_samples", 0) or 0),
+                    estimated_peak_memory_gb=float(
+                        payload.get("estimated_peak_memory_gb", 0.0) or 0.0
+                    ),
+                    exclusive=bool(payload.get("exclusive", False)),
                 ),
-                exclusive=bool(payload.get("exclusive", False)),
+                timeout_sec=None if timeout_sec is None else float(timeout_sec),
             )
-        )
+        except TimeoutError as exc:
+            raise JsonRpcError(
+                str(exc),
+                error_type="GPU_LEASE_BUSY",
+                status=409,
+            ) from exc
         return {
             "success": True,
             "lease_id": lease.lease_id,

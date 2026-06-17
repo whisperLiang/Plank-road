@@ -1,5 +1,8 @@
 import argparse
 import os
+import hashlib
+import json
+from contextlib import contextmanager, nullcontext
 from concurrent import futures
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,12 +18,21 @@ import numpy as np
 from loguru import logger
 
 from baselines.distributed.cloud_controller import DistributedBaselineController
+from baselines.distributed.ekya import EkyaHeavyLaneBusy
+from cloud.annotation import (
+    CloudBatchTeacherAnnotator,
+    TeacherAnnotationService,
+    TeacherAnnotationWorker,
+    TeacherLabelCache,
+)
 from cloud.edge_registry import EdgeRegistry
 from cloud.workers.assignment_store import EdgeAssignmentStore
 from cloud.workers.edge_worker_pool import EdgeWorkerPool
-from cloud.workers.gpu_lease_manager import GpuLeaseManager
+from cloud.workers.gpu_lease_manager import GpuLeaseManager, LeaseRequest
 from cloud.workers.lease_service import GpuLeaseService
 from cloud.workers.mps_runtime import ensure_mps_runtime
+from cloud.workers.worker_client import GpuLeaseHttpClient
+from cloud.workers.worker_protocol import JsonRpcError
 from common.logging_sanitizer import log_diagnostic_debug
 from config import default_run_id, load_runtime_config, validate_baseline_method
 from grpc_server import message_transmission_pb2_grpc
@@ -73,6 +85,8 @@ class CloudServer:
             if not resolved_run_id:
                 resolved_run_id = default_run_id(method)
             inference_fn = None
+            teacher_annotator = None
+            heavy_gpu_lease = None
             if method != "pure_edge_local_updating":
                 edge_affine = getattr(config, "edge_affine_workers", None)
                 if edge_affine is None or not bool(getattr(edge_affine, "enabled", False)):
@@ -85,6 +99,16 @@ class CloudServer:
                 from model_management.object_detection import Object_Detection
 
                 self.large_object_detection = Object_Detection(config, type="large inference")
+                heavy_gpu_lease = _baseline_heavy_gpu_lease_factory(
+                    config,
+                    self.gpu_lease_service.listen_address if self.gpu_lease_service else "",
+                )
+                teacher_annotator = _build_baseline_teacher_annotator(
+                    config,
+                    self.large_object_detection,
+                    heavy_gpu_lease=heavy_gpu_lease,
+                    log_internal_ids=self.log_internal_ids,
+                )
                 if method == "ekya_style_centralized_scheduling":
                     self.display_object_detection = Object_Detection(
                         _baseline_display_detector_config(config),
@@ -92,11 +116,6 @@ class CloudServer:
                     )
                     inference_fn = _ekya_cloud_inference_adapter(
                         display_detector=self.display_object_detection,
-                        teacher_detector=self.large_object_detection,
-                    )
-                else:
-                    inference_fn = _teacher_annotation_inference_adapter(
-                        self.large_object_detection,
                     )
             self.baseline_controller = DistributedBaselineController(
                 baseline_method=method,
@@ -111,6 +130,8 @@ class CloudServer:
                 model_weights_path=str(getattr(config, "weights_path", "") or ""),
                 tinynext_input_size=getattr(config, "tinynext_input_size", None),
                 strict_run_id=True,
+                teacher_annotator=teacher_annotator,
+                heavy_gpu_lease=heavy_gpu_lease,
             )
             self.baseline_method = method
             self.run_id = resolved_run_id
@@ -271,30 +292,203 @@ class CloudServer:
             training_job_manager.close()
 
 
-def _ekya_cloud_inference_adapter(*, display_detector, teacher_detector):
+def _build_baseline_teacher_annotator(
+    config,
+    teacher_detector,
+    *,
+    heavy_gpu_lease,
+    log_internal_ids: bool,
+):
+    cl_cfg = getattr(config, "continual_learning", None)
+    teacher_cfg = getattr(cl_cfg, "teacher_annotation", None) if cl_cfg is not None else None
+    if not bool(getattr(teacher_cfg, "cache_enabled", True)):
+        raise ValueError(
+            "server.continual_learning.teacher_annotation.cache_enabled must be true "
+            "for baseline teacher annotation"
+        )
+    cache = TeacherLabelCache(
+        str(getattr(teacher_cfg, "cache_root_dir", "./cache/teacher_label_cache")),
+        enabled=True,
+        log_internal_ids=bool(log_internal_ids),
+    )
+    teacher_model_name = str(getattr(config, "golden", "") or "rtdetr_x")
+    worker_batch_size = int(getattr(teacher_cfg, "worker_batch_size", 16))
+
+    @contextmanager
+    def teacher_scope(stage_label: str, *, sample_count: int | None = None):
+        if heavy_gpu_lease is None:
+            with nullcontext():
+                yield
+            return
+        with heavy_gpu_lease(
+            edge_id=0,
+            job_id=f"teacher-annotation:{stage_label}",
+            stage="teacher_annotation",
+            model_name=teacher_model_name,
+            batch_size=int(sample_count or worker_batch_size),
+            train_samples=int(sample_count or 0),
+            exclusive=True,
+        ):
+            yield
+
+    worker = TeacherAnnotationWorker(
+        label_cache=cache,
+        batch_inference=getattr(teacher_detector, "large_inference_batch", None),
+        single_inference=getattr(teacher_detector, "large_inference", None),
+        teacher_scope=teacher_scope,
+        max_queue_size=int(getattr(teacher_cfg, "worker_max_queue_size", 4096)),
+        worker_batch_size=worker_batch_size,
+        max_retries=int(getattr(teacher_cfg, "worker_max_retries", 2)),
+        oom_retry_enabled=bool(getattr(teacher_cfg, "oom_retry_enabled", True)),
+        min_worker_batch_size=int(getattr(teacher_cfg, "min_worker_batch_size", 1)),
+        log_internal_ids=bool(log_internal_ids),
+    )
+    service = TeacherAnnotationService(
+        label_cache=cache,
+        worker=worker,
+        log_internal_ids=bool(log_internal_ids),
+    )
+    return CloudBatchTeacherAnnotator(
+        service=service,
+        teacher_model_name=teacher_model_name,
+        teacher_weights_fingerprint=_teacher_weights_fingerprint(config, teacher_detector),
+        teacher_label_schema=_teacher_label_schema(teacher_detector),
+        teacher_num_classes=_teacher_num_classes(teacher_detector),
+        teacher_annotation_threshold=float(
+            getattr(cl_cfg, "teacher_annotation_threshold", 0.5) if cl_cfg is not None else 0.5
+        ),
+        wait_timeout_sec=float(getattr(teacher_cfg, "wait_timeout_sec", 0.5)),
+        owned_worker=worker,
+        manages_gpu_lease=heavy_gpu_lease is not None,
+    )
+
+
+def _baseline_heavy_gpu_lease_factory(config, lease_address: str):
+    if not str(lease_address or ""):
+        return None
+    lease_cfg = getattr(getattr(config, "edge_affine_workers", None), "gpu_lease", None)
+    worker_cfg = getattr(getattr(config, "edge_affine_workers", None), "worker", None)
+    client = GpuLeaseHttpClient(
+        str(lease_address),
+        timeout_sec=float(getattr(worker_cfg, "request_timeout_sec", 600.0)),
+        heartbeat_interval_sec=float(getattr(lease_cfg, "heartbeat_interval_sec", 10.0)),
+    )
+    estimate = float(getattr(lease_cfg, "default_estimated_job_memory_gb", 18.0))
+    acquire_timeout_sec = float(
+        getattr(lease_cfg, "baseline_heavy_acquire_timeout_sec", 0.0) or 0.0
+    )
+
+    @contextmanager
+    def lease_scope(
+        *,
+        edge_id: int,
+        job_id: str,
+        stage: str,
+        model_name: str = "",
+        batch_size: int = 0,
+        train_samples: int = 0,
+        exclusive: bool = True,
+    ):
+        try:
+            handle = client.acquire(
+                LeaseRequest(
+                    edge_id=int(edge_id),
+                    worker_id="cloud-baseline-scheduler",
+                    job_id=str(job_id),
+                    model_name=str(model_name or ""),
+                    split_key=str(stage or "baseline_heavy"),
+                    batch_size=int(batch_size or 0),
+                    train_samples=int(train_samples or 0),
+                    estimated_peak_memory_gb=estimate,
+                    exclusive=bool(exclusive),
+                ),
+                wait_timeout_sec=acquire_timeout_sec,
+            )
+        except JsonRpcError as exc:
+            if exc.error_type == "GPU_LEASE_BUSY":
+                raise EkyaHeavyLaneBusy(str(exc)) from exc
+            raise
+        with handle:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+                yield
+            except Exception as exc:
+                try:
+                    client.mark_oom(job_id=str(job_id), message=str(exc))
+                except Exception:
+                    pass
+                raise
+            finally:
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        handle.observed_peak_memory_gb = torch.cuda.max_memory_reserved() / (
+                            1024.0**3
+                        )
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+    return lease_scope
+
+
+def _ekya_cloud_inference_adapter(*, display_detector):
     def infer(raw_frame: bytes, *, threshold=None, purpose: str = "display") -> dict:
+        del threshold, purpose
         frame = _decode_frame(raw_frame)
         if frame is None:
             return {"boxes": [], "labels": [], "scores": [], "confidence": 0.0}
-        if str(purpose or "display") == "annotation":
-            boxes, labels, scores = teacher_detector.large_inference(frame, threshold=threshold)
-        else:
-            _unused, boxes, labels, scores = display_detector.small_inference(frame)
+        _unused, boxes, labels, scores = display_detector.small_inference(frame)
         return _prediction_payload(boxes, labels, scores)
 
     return infer
 
 
-def _teacher_annotation_inference_adapter(teacher_detector):
-    def infer(raw_frame: bytes, *, threshold=None, purpose: str = "annotation") -> dict:
-        del purpose
-        frame = _decode_frame(raw_frame)
-        if frame is None:
-            return {"boxes": [], "labels": [], "scores": [], "confidence": 0.0}
-        boxes, labels, scores = teacher_detector.large_inference(frame, threshold=threshold)
-        return _prediction_payload(boxes, labels, scores)
+def _teacher_weights_fingerprint(config, teacher_detector) -> str:
+    model_name = str(getattr(config, "golden", "") or getattr(teacher_detector, "model_name", ""))
+    model = getattr(teacher_detector, "model", None)
+    payload = {
+        "teacher_model_name": model_name or "rtdetr_x",
+        "label_schema": _teacher_label_schema(teacher_detector),
+        "num_classes": _teacher_num_classes(teacher_detector),
+        "model_type": type(model).__name__ if model is not None else "",
+    }
+    for attr_name in ("weights_path", "ckpt_path", "checkpoint_path"):
+        value = getattr(model, attr_name, None)
+        if value and os.path.exists(str(value)) and os.path.isfile(str(value)):
+            try:
+                with open(str(value), "rb") as handle:
+                    return hashlib.sha1(handle.read()).hexdigest()
+            except OSError:
+                continue
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
-    return infer
+
+def _teacher_label_schema(teacher_detector) -> str:
+    model = getattr(teacher_detector, "model", None)
+    return str(getattr(model, "label_schema", "coco_91") or "coco_91")
+
+
+def _teacher_num_classes(teacher_detector) -> int:
+    model = getattr(teacher_detector, "model", None)
+    for attr_name in ("num_classes", "nc"):
+        value = getattr(model, attr_name, None)
+        try:
+            if value is not None and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    class_names = getattr(model, "class_names", None)
+    if isinstance(class_names, dict):
+        return len(class_names)
+    if isinstance(class_names, (list, tuple)):
+        return len(class_names)
+    return 91
 
 
 def _prediction_payload(boxes, labels, scores) -> dict:

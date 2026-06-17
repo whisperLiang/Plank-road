@@ -228,11 +228,14 @@ class GpuLeaseHttpClient:
         self.timeout_sec = float(timeout_sec)
         self.heartbeat_interval_sec = float(heartbeat_interval_sec)
 
-    def acquire(self, request: LeaseRequest):
+    def acquire(self, request: LeaseRequest, *, wait_timeout_sec: float | None = None):
+        payload = asdict(request)
+        if wait_timeout_sec is not None:
+            payload["timeout_sec"] = float(wait_timeout_sec)
         result = post_json(
             self.endpoint,
             "/gpu_lease/acquire",
-            asdict(request),
+            payload,
             timeout=self.timeout_sec,
         )
         if not bool(result.get("success", False)):

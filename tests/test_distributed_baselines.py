@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import io
 import json
 import time
@@ -17,7 +18,13 @@ import torch
 from baselines.distributed.cloud_controller import DistributedBaselineController
 from baselines.distributed.ekya import (
     CloudScheduledEkyaJob,
+    EKYA_FAILURE_STAGE_MICROPROFILE,
+    EKYA_FAILURE_STAGE_TEACHER_ANNOTATION,
+    EKYA_STATUS_FAILED,
+    EKYA_STATUS_LABEL_PENDING,
+    EKYA_STATUS_LABELED,
     EkyaCentralScheduler,
+    EkyaHeavyLaneBusy,
     EkyaMicroProfiler,
     EkyaReadyWindow,
     EkyaWindowSample,
@@ -1050,7 +1057,7 @@ def test_cloud_controller_infers_then_strips_raw_frame_bytes() -> None:
     assert controller._frames[frame_key].raw_frame == b""
 
 
-def test_cloud_controller_separates_display_and_teacher_annotation_cache() -> None:
+def test_cloud_controller_ekya_upload_runs_display_only_and_appends_unlabeled_sample() -> None:
     calls: list[dict[str, object]] = []
 
     def infer(raw, *, threshold=None, purpose="display"):
@@ -1078,7 +1085,15 @@ def test_cloud_controller_separates_display_and_teacher_annotation_cache() -> No
         frame_key = ("ekya-run", "ekya_style_centralized_scheduling", 1, 4)
 
         assert controller._inference_results[frame_key]["cloud_prediction"]["scores"] == [0.8]
-        assert controller._teacher_results[frame_key]["cloud_prediction"]["scores"] == [0.55]
+        assert frame_key not in controller._teacher_results
+        samples = list(
+            controller._ekya_windows[
+                ("ekya-run", "ekya_style_centralized_scheduling", 1)
+            ]
+        )
+        assert len(samples) == 1
+        assert samples[0].raw_frame == b"frame-bytes"
+        assert samples[0].teacher_prediction == {}
         display_result = controller.request_cloud_inference(
             run_id="ekya-run",
             baseline_method="ekya_style_centralized_scheduling",
@@ -1088,13 +1103,12 @@ def test_cloud_controller_separates_display_and_teacher_annotation_cache() -> No
         assert display_result["cloud_prediction"]["scores"] == [0.8]
         assert calls == [
             {"threshold": None, "purpose": "display", "bytes": len(b"frame-bytes")},
-            {"threshold": 0.4, "purpose": "annotation", "bytes": len(b"frame-bytes")},
         ]
     finally:
         controller.close()
 
 
-def test_baseline_cloud_inference_adapter_routes_display_and_teacher_models() -> None:
+def test_baseline_cloud_inference_adapter_is_ekya_display_only() -> None:
     from cloud_server import _ekya_cloud_inference_adapter
 
     calls: list[tuple[str, float | None]] = []
@@ -1114,33 +1128,293 @@ def test_baseline_cloud_inference_adapter_routes_display_and_teacher_models() ->
 
     infer = _ekya_cloud_inference_adapter(
         display_detector=FakeDetector("display-lightweight", 0.2),
-        teacher_detector=FakeDetector("teacher", 0.9),
     )
 
     display = infer(_jpeg_bytes(), purpose="display")
     annotation = infer(_jpeg_bytes(), purpose="annotation", threshold=0.4)
 
     assert display["scores"] == [0.2]
-    assert annotation["scores"] == [0.9]
-    assert calls == [("display-lightweight:small", None), ("teacher:large", 0.4)]
+    assert annotation["scores"] == [0.2]
+    assert calls == [
+        ("display-lightweight:small", None),
+        ("display-lightweight:small", None),
+    ]
 
 
-def test_teacher_annotation_inference_adapter_uses_only_teacher_model() -> None:
-    from cloud_server import _teacher_annotation_inference_adapter
+def test_ekya_annotation_failure_marks_terminal_and_is_not_rescheduled() -> None:
+    class FailingAnnotator:
+        def __init__(self) -> None:
+            self.calls = 0
 
-    calls: list[tuple[str, float | None]] = []
+        def annotate_raw_frames(self, samples, *, threshold=None):
+            del samples, threshold
+            self.calls += 1
+            raise RuntimeError("annotation boom")
 
-    class FakeTeacher:
-        def large_inference(self, _frame, *, threshold=None):
-            calls.append(("teacher:large", threshold))
-            return [[0, 0, 4, 4]], [1], [0.9]
+    annotator = FailingAnnotator()
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        teacher_annotator=annotator,
+        baseline_training_config=SimpleNamespace(training_window_size=1),
+    )
+    try:
+        controller.upload_frame(
+            BaselineFramePayload(
+                run_id="ekya-run",
+                baseline_method="ekya_style_centralized_scheduling",
+                edge_id=1,
+                frame_id=4,
+                raw_frame=_jpeg_bytes(),
+                upload_mode="raw_frame",
+            )
+        )
+        state_key, window = next(iter(controller._ekya_window_snapshots.items()))
+        assert controller._ekya_window_states[state_key].status == EKYA_STATUS_LABEL_PENDING
 
-    infer = _teacher_annotation_inference_adapter(FakeTeacher())
+        assert controller._ekya_annotate_window(window) is False
+        state = controller._ekya_window_states[state_key]
+        assert state.status == EKYA_STATUS_FAILED
+        assert state.failure_stage == EKYA_FAILURE_STAGE_TEACHER_ANNOTATION
+        assert "annotation boom" in state.failure_reason
 
-    result = infer(_jpeg_bytes(), purpose="display", threshold=0.4)
+        assert controller._ekya_annotate_window(window) is False
+        assert annotator.calls == 1
+    finally:
+        controller.close()
 
-    assert result["scores"] == [0.9]
-    assert calls == [("teacher:large", 0.4)]
+
+def test_ekya_microprofile_failure_marks_terminal_and_is_not_rescheduled() -> None:
+    class FailingProfiler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def profile_window(self, window, *, base_model_update_model_data=""):
+            del window, base_model_update_model_data
+            self.calls += 1
+            raise RuntimeError("CUDA out of memory during microprofile")
+
+        def skip_reason(self, window):
+            del window
+            return "microprofile_oom"
+
+    profiler = FailingProfiler()
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+    )
+    window = _ekya_ready_window()
+    state_key = (int(window.edge_id), str(window.window_id))
+    try:
+        controller._ekya_microprofiler = profiler
+        with controller._lock:
+            controller._ekya_window_snapshots[state_key] = window
+            controller._set_ekya_window_state_locked(window, EKYA_STATUS_LABELED)
+
+        assert controller._ekya_profile_window(window) == []
+        state = controller._ekya_window_states[state_key]
+        assert state.status == EKYA_STATUS_FAILED
+        assert state.failure_stage == EKYA_FAILURE_STAGE_MICROPROFILE
+        assert "out of memory" in state.failure_reason
+
+        assert controller._ekya_profile_window(window) == []
+        assert profiler.calls == 1
+    finally:
+        controller.close()
+
+
+def test_ekya_annotation_and_microprofile_use_shared_heavy_gpu_lease() -> None:
+    class SuccessfulAnnotator:
+        manages_gpu_lease = False
+
+        def annotate_raw_frames(self, samples, *, threshold=None):
+            del threshold
+            label = {"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.9]}
+            return {str(getattr(sample, "sample_id")): dict(label) for sample in samples}
+
+    class SuccessfulProfiler:
+        def __init__(self, result: MicroProfileResult) -> None:
+            self.result = result
+
+        def profile_window(self, window, *, base_model_update_model_data=""):
+            del window, base_model_update_model_data
+            return [self.result]
+
+        def skip_reason(self, window):
+            del window
+            return ""
+
+    lease_calls: list[dict[str, object]] = []
+
+    @contextmanager
+    def lease(**kwargs):
+        lease_calls.append(dict(kwargs))
+        yield
+
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        teacher_annotator=SuccessfulAnnotator(),
+        heavy_gpu_lease=lease,
+    )
+    unlabeled_window = replace(
+        _ekya_ready_window(),
+        samples=tuple(
+            replace(sample, teacher_prediction={})
+            for sample in _ekya_ready_window().samples
+        ),
+    )
+    state_key = (int(unlabeled_window.edge_id), str(unlabeled_window.window_id))
+    try:
+        with controller._lock:
+            controller._ekya_window_snapshots[state_key] = unlabeled_window
+            controller._set_ekya_window_state_locked(
+                unlabeled_window,
+                EKYA_STATUS_LABEL_PENDING,
+            )
+
+        assert controller._ekya_annotate_window(unlabeled_window) is True
+        labeled_window = controller._ekya_window_snapshots[state_key]
+        result = _microprofile_result()
+        controller._ekya_microprofiler = SuccessfulProfiler(result)
+
+        assert controller._ekya_profile_window(labeled_window) == [result]
+        assert [call["stage"] for call in lease_calls] == [
+            EKYA_FAILURE_STAGE_TEACHER_ANNOTATION,
+            EKYA_FAILURE_STAGE_MICROPROFILE,
+        ]
+        assert [call["exclusive"] for call in lease_calls] == [True, True]
+    finally:
+        controller.close()
+
+
+def test_ekya_heavy_gpu_lease_busy_defers_without_terminal_window_state() -> None:
+    class SuccessfulAnnotator:
+        manages_gpu_lease = False
+
+        def annotate_raw_frames(self, samples, *, threshold=None):
+            del threshold
+            label = {"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.9]}
+            return {str(getattr(sample, "sample_id")): dict(label) for sample in samples}
+
+    class SuccessfulProfiler:
+        def profile_window(self, window, *, base_model_update_model_data=""):
+            del window, base_model_update_model_data
+            return [_microprofile_result()]
+
+        def skip_reason(self, window):
+            del window
+            return ""
+
+    @contextmanager
+    def busy_lease(**kwargs):
+        del kwargs
+        raise EkyaHeavyLaneBusy("heavy lane busy")
+        yield
+
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        teacher_annotator=SuccessfulAnnotator(),
+        heavy_gpu_lease=busy_lease,
+    )
+    window = _ekya_ready_window()
+    state_key = (int(window.edge_id), str(window.window_id))
+    try:
+        unlabeled = replace(
+            window,
+            samples=tuple(replace(sample, teacher_prediction={}) for sample in window.samples),
+        )
+        with controller._lock:
+            controller._ekya_window_snapshots[state_key] = unlabeled
+            controller._set_ekya_window_state_locked(unlabeled, EKYA_STATUS_LABEL_PENDING)
+
+        assert controller._ekya_annotate_window(unlabeled) is False
+        assert controller._ekya_window_states[state_key].status == EKYA_STATUS_LABEL_PENDING
+        assert controller._ekya_window_states[state_key].failure_stage == ""
+
+        controller._ekya_microprofiler = SuccessfulProfiler()
+        with controller._lock:
+            controller._ekya_window_snapshots[state_key] = window
+            controller._set_ekya_window_state_locked(window, EKYA_STATUS_LABELED)
+        skipped: list[str] = []
+        scheduler = EkyaCentralScheduler(
+            ready_windows=lambda: [window],
+            profile_window=controller._ekya_profile_window,
+            submit_training=lambda _window, _result: "job",
+            mark_skip=lambda _window, reason: skipped.append(reason),
+        )
+
+        assert scheduler.run_once() is None
+        assert skipped == []
+        assert controller._ekya_window_states[state_key].status == EKYA_STATUS_LABELED
+        assert controller._ekya_window_states[state_key].failure_stage == ""
+    finally:
+        controller.close()
+
+
+def test_baseline_teacher_annotator_uses_configured_wait_timeout(tmp_path) -> None:
+    from cloud_server import _build_baseline_teacher_annotator
+
+    class FakeTeacherDetector:
+        def large_inference(self, _frame, threshold=None):
+            del threshold
+            return [[1, 1, 4, 4]], [1], [0.9]
+
+    config = SimpleNamespace(
+        golden="rtdetr_x",
+        continual_learning=SimpleNamespace(
+            teacher_annotation_threshold=0.6,
+            teacher_annotation=SimpleNamespace(
+                cache_root_dir=str(tmp_path / "teacher-cache"),
+                cache_enabled=True,
+                wait_timeout_sec=0.25,
+                worker_batch_size=1,
+                worker_max_queue_size=8,
+                worker_max_retries=0,
+                oom_retry_enabled=True,
+                min_worker_batch_size=1,
+            ),
+        ),
+    )
+
+    annotator = _build_baseline_teacher_annotator(
+        config,
+        FakeTeacherDetector(),
+        heavy_gpu_lease=None,
+        log_internal_ids=False,
+    )
+    try:
+        assert annotator.wait_timeout_sec == pytest.approx(0.25)
+    finally:
+        annotator.close()
+
+
+def test_baseline_teacher_annotator_rejects_disabled_cache(tmp_path) -> None:
+    from cloud_server import _build_baseline_teacher_annotator
+
+    config = SimpleNamespace(
+        golden="rtdetr_x",
+        continual_learning=SimpleNamespace(
+            teacher_annotation_threshold=0.6,
+            teacher_annotation=SimpleNamespace(
+                cache_root_dir=str(tmp_path / "teacher-cache"),
+                cache_enabled=False,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="cache_enabled must be true"):
+        _build_baseline_teacher_annotator(
+            config,
+            object(),
+            heavy_gpu_lease=None,
+            log_internal_ids=False,
+        )
 
 
 def test_ekya_poll_command_delivery_ack_and_timeout() -> None:
@@ -1286,7 +1560,13 @@ def test_ekya_formal_training_request_has_shared_job_api_fields() -> None:
         assert request.payload_zip
         assert request.cache_path == "edge_1/baseline_training"
         assert request.request_id.startswith("ekya:ekya-run:1:window-1:config-1")
+        assert request.exclusive_gpu_lease is True
         manifest = _manifest_from_bundle(request.payload_zip)
+        assert manifest["baseline_method"] == "ekya_style_centralized_scheduling"
+        assert manifest["edge_id"] == 1
+        assert manifest["base_model_version"] == "0"
+        assert manifest["ekya_window_id"] == "window-1"
+        assert manifest["selected_microprofile_config"] == "config-1"
         assert manifest["training_config"]["trainable_param_ratio"] == pytest.approx(0.1)
         assert manifest["training_config"]["batch_size"] == 4
         assert manifest["training_config"]["num_epoch"] == 3
@@ -1445,7 +1725,26 @@ def test_ekya_candidate_grid_limits_lightweight_configs_first() -> None:
     assert [config.formal_num_epoch for config in configs] == [1, 1, 5]
 
 
-def test_ekya_scheduler_selects_highest_window_average_quality() -> None:
+def test_ekya_scheduler_labels_pending_windows_before_microprofile() -> None:
+    annotated: list[str] = []
+    profiled: list[str] = []
+    submitted: list[str] = []
+    window = _ekya_ready_window()
+    scheduler = EkyaCentralScheduler(
+        label_pending_windows=lambda: [window],
+        annotate_window=lambda item: annotated.append(item.window_id) or True,
+        ready_windows=lambda: [window],
+        profile_window=lambda item: profiled.append(item.window_id) or [_microprofile_result()],
+        submit_training=lambda item, _selected: submitted.append(item.window_id) or "job",
+    )
+
+    assert scheduler.run_once() is None
+    assert annotated == ["window-1"]
+    assert profiled == []
+    assert submitted == []
+
+
+def test_ekya_scheduler_profiles_oldest_labeled_window_once_per_run() -> None:
     submitted: list[tuple[str, str]] = []
     skipped: list[tuple[str, str]] = []
     first = EkyaReadyWindow(
@@ -1509,8 +1808,8 @@ def test_ekya_scheduler_selects_highest_window_average_quality() -> None:
     selected = scheduler.run_once()
 
     assert selected is not None
-    assert selected.edge_id == 2
-    assert submitted == [("window-2", "config-2")]
+    assert selected.edge_id == 1
+    assert submitted == [("window-1", "config-1")]
     assert skipped == []
 
 
@@ -1876,6 +2175,7 @@ def test_production_code_has_no_old_baseline_training_fallbacks() -> None:
         PROJECT_ROOT / "baselines",
         PROJECT_ROOT / "config",
         PROJECT_ROOT / "grpc_server",
+        PROJECT_ROOT / "cloud_server.py",
         PROJECT_ROOT / "edge_client.py",
     ]
     banned = [
@@ -1892,6 +2192,7 @@ def test_production_code_has_no_old_baseline_training_fallbacks() -> None:
         "RequestTraining",
         "PollTrainingJob",
         "DownloadModelUpdate",
+        "_teacher_annotation_inference_adapter",
     ]
     for path in _iter_text_files(roots):
         text = path.read_text(encoding="utf-8")

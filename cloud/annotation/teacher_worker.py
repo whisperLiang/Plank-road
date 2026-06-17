@@ -50,6 +50,12 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return "out of memory" in text and ("cuda" in text or "gpu" in text)
 
 
+def _is_retryable_annotation_error(exc: BaseException) -> bool:
+    return bool(getattr(exc, "retryable", False)) or type(exc).__name__ in {
+        "EkyaHeavyLaneBusy",
+    }
+
+
 def _default_label_builder(
     request: TeacherAnnotationRequest,
     frame: np.ndarray,
@@ -118,6 +124,7 @@ class TeacherAnnotationWorker:
         self._queue: deque[_QueueEntry] = deque()
         self._active_keys: set[str] = set()
         self._failed: dict[str, str] = {}
+        self._retryable_failures: dict[str, str] = {}
         self._stopped = False
         self._thread: threading.Thread | None = None
         self._stats: dict[str, int] = {
@@ -211,6 +218,8 @@ class TeacherAnnotationWorker:
                     continue
                 self._queue.append(_QueueEntry(request=request))
                 self._active_keys.add(cache_key)
+                self._failed.pop(cache_key, None)
+                self._retryable_failures.pop(cache_key, None)
                 submitted += 1
                 results.append(
                     TeacherAnnotationResult(
@@ -262,6 +271,21 @@ class TeacherAnnotationWorker:
                 self._condition.wait(timeout=remaining)
         return time.perf_counter() - started
 
+    def retryable_failure_reasons(
+        self,
+        requests: Sequence[TeacherAnnotationRequest],
+    ) -> dict[str, str]:
+        reasons: dict[str, str] = {}
+        with self._condition:
+            for request in list(requests or []):
+                cache_key = request.cache_key().digest
+                reason = self._retryable_failures.get(cache_key)
+                if not reason and cache_key in self._active_keys:
+                    reason = "teacher annotation still pending"
+                if reason:
+                    reasons[str(request.sample_id)] = str(reason)
+        return reasons
+
     def process_pending_once(self) -> int:
         entries = self._drain_queue()
         if not entries:
@@ -303,6 +327,10 @@ class TeacherAnnotationWorker:
             try:
                 self._annotate_chunk(chunk)
             except Exception as exc:
+                if _is_retryable_annotation_error(exc):
+                    self._mark_retryable(chunk, str(exc) or type(exc).__name__)
+                    index += actual_size
+                    continue
                 if _is_cuda_oom(exc) and self.oom_retry_enabled:
                     with self._condition:
                         self._stats["oom_retry_count"] += 1
@@ -451,6 +479,7 @@ class TeacherAnnotationWorker:
         with self._condition:
             self._active_keys.discard(cache_key)
             self._failed.pop(cache_key, None)
+            self._retryable_failures.pop(cache_key, None)
             self._condition.notify_all()
 
     def _mark_failed(self, request: TeacherAnnotationRequest, error: str) -> None:
@@ -458,6 +487,7 @@ class TeacherAnnotationWorker:
         with self._condition:
             self._active_keys.discard(cache_key)
             self._failed[cache_key] = str(error)
+            self._retryable_failures.pop(cache_key, None)
             self._stats["failed_count"] += 1
             self._condition.notify_all()
         logger.warning(
@@ -472,4 +502,18 @@ class TeacherAnnotationWorker:
                 "cache_key": cache_key,
                 "error": error,
             },
+        )
+
+    def _mark_retryable(self, chunk: Sequence[_QueueEntry], error: str) -> None:
+        with self._condition:
+            for entry in chunk:
+                cache_key = entry.request.cache_key().digest
+                self._active_keys.discard(cache_key)
+                self._failed.pop(cache_key, None)
+                self._retryable_failures[cache_key] = str(error)
+            self._condition.notify_all()
+        logger.info(
+            "[TeacherAnnotation][Worker] annotation deferred: samples={} reason={}.",
+            len(chunk),
+            safe_error_summary(error),
         )

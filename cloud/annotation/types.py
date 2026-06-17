@@ -8,6 +8,10 @@ from enum import Enum
 from typing import Any
 
 
+class TeacherAnnotationRetryableError(RuntimeError):
+    """Raised when annotation should be retried by the caller later."""
+
+
 def _stable_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -191,6 +195,7 @@ class TeacherAnnotationEnsureResult:
     batch_fallback_count: int = 0
     oom_retry_count: int = 0
     failed_count: int = 0
+    retryable_errors_by_sample_id: dict[str, str] = field(default_factory=dict)
     results: list[TeacherAnnotationResult] = field(default_factory=list)
     unresolved_requests: list[TeacherAnnotationRequest] = field(default_factory=list)
 
@@ -205,3 +210,7 @@ class TeacherAnnotationEnsureResult:
     @property
     def unresolved_sample_ids(self) -> list[str]:
         return [str(request.sample_id) for request in self.unresolved_requests]
+
+    @property
+    def retryable_count(self) -> int:
+        return len(self.retryable_errors_by_sample_id)

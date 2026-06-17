@@ -985,7 +985,8 @@ def test_routed_backend_forwards_main_rpc_calls() -> None:
             self.calls.append("sync_samples")
             return message_transmission_pb2.SampleSyncReply(success=True)
 
-        def submit_training_job(self, request):
+        def submit_training_job(self, request, *, exclusive_gpu_lease: bool = False):
+            del exclusive_gpu_lease
             self.calls.append("submit_training_job")
             return message_transmission_pb2.SubmitTrainingJobReply(accepted=True, job_id="j")
 
@@ -1046,7 +1047,8 @@ def test_routed_backend_materializes_uploaded_bundle_for_worker(tmp_path: Path) 
         def __init__(self) -> None:
             self.request = None
 
-        def submit_training_job(self, request):
+        def submit_training_job(self, request, *, exclusive_gpu_lease: bool = False):
+            del exclusive_gpu_lease
             self.request = request
             return message_transmission_pb2.SubmitTrainingJobReply(
                 accepted=True,
@@ -1083,12 +1085,55 @@ def test_routed_backend_materializes_uploaded_bundle_for_worker(tmp_path: Path) 
     assert bundle_path.read_bytes() == b"bundle-bytes"
 
 
+def test_routed_backend_forwards_exclusive_gpu_lease_flag() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.exclusive_flags: list[bool] = []
+
+        def submit_training_job(self, request, *, exclusive_gpu_lease: bool = False):
+            del request
+            self.exclusive_flags.append(bool(exclusive_gpu_lease))
+            return message_transmission_pb2.SubmitTrainingJobReply(
+                accepted=True,
+                job_id="exclusive-job",
+                status="QUEUED",
+            )
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.client = FakeClient()
+
+        def client_for_edge(self, edge_id: int):
+            assert edge_id == 1
+            return self.client
+
+    pool = FakePool()
+    backend = EdgeWorkerRoutedContinualLearningBackend(worker_pool=pool)
+    backend.submit_training_job(
+        SimpleNamespace(
+            protocol_version="v1",
+            edge_id=1,
+            request_id="req-exclusive",
+            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
+            cache_path="/tmp/cache",
+            send_low_conf_features=False,
+            frame_indices=[1],
+            payload_zip=b"",
+            base_model_version="0",
+            exclusive_gpu_lease=True,
+        )
+    )
+
+    assert pool.client.exclusive_flags == [True]
+
+
 def test_routed_backend_reports_expired_lease_as_retryable_failure() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.status_calls = 0
 
-        def submit_training_job(self, request):
+        def submit_training_job(self, request, *, exclusive_gpu_lease: bool = False):
+            del request, exclusive_gpu_lease
             return message_transmission_pb2.SubmitTrainingJobReply(
                 accepted=True,
                 job_id="expired-job",

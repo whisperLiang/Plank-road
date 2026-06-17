@@ -440,7 +440,14 @@ class EdgeWorkerRoutedContinualLearningBackend:
 
     def submit_training_job(self, request) -> message_transmission_pb2.SubmitTrainingJobReply:
         routed_request = self._materialize_payload_bundle(request)
-        reply = self._client(routed_request.edge_id).submit_training_job(routed_request)
+        exclusive_gpu_lease = bool(
+            getattr(routed_request, "exclusive_gpu_lease", False)
+            or getattr(request, "exclusive_gpu_lease", False)
+        )
+        reply = self._client(routed_request.edge_id).submit_training_job(
+            routed_request,
+            exclusive_gpu_lease=exclusive_gpu_lease,
+        )
         if reply.accepted and reply.job_id:
             self._submitted_jobs[(int(routed_request.edge_id), str(reply.job_id))] = (
                 _SubmitRequestSnapshot.from_request(routed_request)

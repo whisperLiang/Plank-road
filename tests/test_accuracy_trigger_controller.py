@@ -14,6 +14,7 @@ from baselines.distributed.messages import BaselineFramePayload
 from baselines.runtime.upload_client import BASELINE_TRAINING_PROTOCOL_VERSION
 from cloud.baselines.accuracy_trigger_controller import AccuracyTriggerController
 from cloud.baselines.detection_agreement import teacher_f1
+from cloud.annotation import TeacherAnnotationRetryableError
 from grpc_server import message_transmission_pb2
 
 
@@ -240,17 +241,18 @@ def test_controller_terminal_failure_keeps_buffer_for_retraining() -> None:
 
 def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -> None:
     backend = RecordingTrainingBackend()
-    teacher = PurposeTeacher([_box(), _box(), _box()])
+    annotator = RecordingSharedAnnotator([_box(), _box(), _box()])
+
     controller = DistributedBaselineController(
         baseline_method="accuracy_trigger_cloud_retraining",
         run_id="run-a",
         results_root=str(tmp_path),
-        inference_fn=teacher,
         training_backend=backend,
         baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
         baseline_method_config=_accuracy_config(),
         model_weights_path="weights.pt",
         tinynext_input_size=None,
+        teacher_annotator=annotator,
     )
 
     controller.upload_frame(_payload(1, edge_prediction=_box()))
@@ -274,7 +276,8 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
     assert "split_plan" not in serialized
     assert "runtime_contract" not in serialized
     assert "feature_shard" not in serialized
-    assert teacher.purposes == ["annotation", "annotation", "annotation"]
+    assert annotator.sample_ids == [["1"], ["2"], ["3"]]
+    assert annotator.thresholds == [None, None, None]
 
     commands = controller.poll_command(
         run_id="run-a",
@@ -286,6 +289,116 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
     assert commands[0]["edge_id"] == 1
     assert commands[0]["baseline_method"] == "accuracy_trigger_cloud_retraining"
     assert commands[0]["job_id"] == "job-1"
+
+
+def test_cloud_controller_defers_retryable_teacher_annotation_without_dropping_frame(
+    tmp_path,
+) -> None:
+    backend = RecordingTrainingBackend()
+    annotator = RetryOnceSharedAnnotator([_box()])
+    controller = DistributedBaselineController(
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="run-a",
+        results_root=str(tmp_path),
+        training_backend=backend,
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_method_config=_accuracy_config(),
+        model_weights_path="weights.pt",
+        tinynext_input_size=None,
+        teacher_annotator=annotator,
+    )
+    payload = _payload(1, edge_prediction=_box())
+    frame_key = ("run-a", "accuracy_trigger_cloud_retraining", 1, 1)
+
+    response = controller.upload_frame(payload)
+
+    assert response["accepted"] is True
+    assert frame_key in controller._accuracy_annotation_pending
+    assert controller._frames[frame_key].raw_frame == b""
+    assert controller._frames[frame_key].teacher_prediction == {}
+    assert controller._raw_frames[frame_key] == payload.raw_frame
+    assert frame_key not in controller._teacher_results
+    assert backend.requests == []
+
+    controller.heartbeat(
+        run_id="run-a",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        edge_id=1,
+    )
+
+    assert frame_key not in controller._accuracy_annotation_pending
+    assert controller._teacher_results[frame_key]["cloud_prediction"]["boxes"] == [[1, 1, 4, 4]]
+    assert controller._frames[frame_key].teacher_prediction["boxes"] == [[1, 1, 4, 4]]
+    snapshot = controller._accuracy_trigger_controller.snapshot(
+        run_id="run-a",
+        edge_id=1,
+        model_name="tiny",
+        model_version="0",
+    )
+    assert snapshot["history"] == pytest.approx([1.0])
+    assert annotator.sample_ids == [["1"], ["1"]]
+    assert annotator.thresholds == [None, None]
+
+
+def test_cloud_controller_retries_pending_accuracy_annotations_without_duplicate_training(
+    tmp_path,
+) -> None:
+    backend = RecordingTrainingBackend()
+    annotator = BlockingSharedAnnotator([_box(), _box(), _box(), _box()])
+    controller = DistributedBaselineController(
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="run-a",
+        results_root=str(tmp_path),
+        training_backend=backend,
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_method_config=_accuracy_config(),
+        model_weights_path="weights.pt",
+        tinynext_input_size=None,
+        teacher_annotator=annotator,
+    )
+
+    for frame_id, edge_prediction in (
+        (1, _box()),
+        (2, _box()),
+        (3, _empty()),
+        (4, _empty()),
+    ):
+        response = controller.upload_frame(_payload(frame_id, edge_prediction=edge_prediction))
+        assert response["accepted"] is True
+
+    assert len(controller._accuracy_annotation_pending) == 4
+    assert backend.requests == []
+
+    annotator.blocked = False
+    controller.heartbeat(
+        run_id="run-a",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        edge_id=1,
+    )
+
+    assert controller._accuracy_annotation_pending == {}
+    assert len(backend.requests) == 1
+    request = backend.requests[0]
+    assert list(request.frame_indices) == [1, 2, 3]
+    manifest = _manifest_from_bundle(request.payload_zip)
+    assert manifest["trigger_window_frame_ids"] == [3]
+    assert manifest["training_frame_ids"] == [1, 2, 3]
+
+
+def test_cloud_controller_requires_shared_teacher_annotator(tmp_path) -> None:
+    controller = DistributedBaselineController(
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="run-a",
+        results_root=str(tmp_path),
+        training_backend=RecordingTrainingBackend(),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_method_config=_accuracy_config(),
+        model_weights_path="weights.pt",
+        tinynext_input_size=None,
+    )
+
+    with pytest.raises(RuntimeError, match="shared teacher annotator"):
+        controller.upload_frame(_payload(1, edge_prediction=_box()))
 
 
 class RecordingTrainingBackend:
@@ -303,17 +416,58 @@ class RecordingTrainingBackend:
         )
 
 
-class PurposeTeacher:
+class RecordingSharedAnnotator:
     def __init__(self, annotations: list[dict]) -> None:
         self.annotations = list(annotations)
-        self.purposes: list[str] = []
+        self.sample_ids: list[list[str]] = []
+        self.thresholds: list[float | None] = []
 
-    def __call__(self, raw_frame: bytes, *, purpose: str = "", threshold=None):
-        del raw_frame, threshold
-        self.purposes.append(str(purpose))
-        if purpose == "annotation":
-            return self.annotations.pop(0)
-        return {}
+    def annotate_raw_frames(self, samples, *, threshold=None):
+        sample_list = list(samples)
+        self.sample_ids.append([str(getattr(sample, "sample_id")) for sample in sample_list])
+        self.thresholds.append(threshold)
+        return {
+            str(getattr(sample, "sample_id")): self.annotations.pop(0)
+            for sample in sample_list
+        }
+
+
+class RetryOnceSharedAnnotator:
+    def __init__(self, annotations: list[dict]) -> None:
+        self.annotations = list(annotations)
+        self.calls = 0
+        self.sample_ids: list[list[str]] = []
+        self.thresholds: list[float | None] = []
+
+    def annotate_raw_frames(self, samples, *, threshold=None):
+        sample_list = list(samples)
+        self.calls += 1
+        self.sample_ids.append([str(getattr(sample, "sample_id")) for sample in sample_list])
+        self.thresholds.append(threshold)
+        if self.calls == 1:
+            raise TeacherAnnotationRetryableError("teacher annotation still pending")
+        return {
+            str(getattr(sample, "sample_id")): self.annotations.pop(0)
+            for sample in sample_list
+        }
+
+
+class BlockingSharedAnnotator:
+    def __init__(self, annotations: list[dict]) -> None:
+        self.annotations = list(annotations)
+        self.blocked = True
+        self.sample_ids: list[list[str]] = []
+
+    def annotate_raw_frames(self, samples, *, threshold=None):
+        del threshold
+        sample_list = list(samples)
+        self.sample_ids.append([str(getattr(sample, "sample_id")) for sample in sample_list])
+        if self.blocked:
+            raise TeacherAnnotationRetryableError("teacher annotation still pending")
+        return {
+            str(getattr(sample, "sample_id")): self.annotations.pop(0)
+            for sample in sample_list
+        }
 
 
 def _trigger_submission(controller: AccuracyTriggerController):

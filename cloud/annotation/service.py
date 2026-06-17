@@ -179,6 +179,11 @@ class TeacherAnnotationService:
         unresolved_requests = [
             request for request in requested if str(request.sample_id) not in resolved_ids
         ]
+        retryable_errors_by_sample_id = (
+            self.worker.retryable_failure_reasons(unresolved_requests)
+            if self.worker is not None
+            else {}
+        )
         unresolved_results = [
             TeacherAnnotationResult(
                 request=request,
@@ -216,6 +221,7 @@ class TeacherAnnotationService:
             batch_fallback_count=int(stats_delta.get("batch_fallback_count", 0) or 0),
             oom_retry_count=int(stats_delta.get("oom_retry_count", 0) or 0),
             failed_count=int(stats_delta.get("failed_count", 0) or 0),
+            retryable_errors_by_sample_id=retryable_errors_by_sample_id,
             results=results,
             unresolved_requests=unresolved_requests,
         )
