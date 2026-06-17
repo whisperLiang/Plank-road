@@ -12,75 +12,16 @@ baseline:
  method: accuracy_trigger_cloud_retraining
  run_id: null
  results_root: results/baselines_distributed
- edge:
-  split_runtime_policy: disabled
  training:
-  batch_size: 32
-  num_epoch: 50
-  learning_rate: 1.0e-3
-  optimizer_name: adam
-  weight_decay: 0
-  min_training_samples: 1
-  training_window_size: 8
-  microprofile_epochs: 1
-  microprofile_max_samples: 16
-  device: auto
-  worker_infra_failure_backoff_sec: 10.0
-  training_failure_backoff_sec: 10.0
- pure_edge_local_updating:
-  label_source: pseudo_label
-  local_metrics: true
-  upload_metrics_to_cloud: false
-  upload_frames_to_cloud: false
-  use_cloud_teacher: false
+  min_training_samples: 60
+  training_window_size: 60
+  microprofile_epochs: 5
  accuracy_trigger_cloud_retraining:
   # Engineering variant for this refactor: this reuses the existing
-  # Plank-Road frame filter as the keyframe selector, while training
-  # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
-  reuse_plank_road_frame_filter: true
-  upload_keyframes_only: true
-  trigger_on_cloud_comparison: true
-  training_strategy: freeze
-  trainable_param_ratio: 0.3
-  training_failure_backoff_sec: 30.0
-  return_model_update: true
-  trigger_window_size: 8
-  min_history_windows: 2
-  accuracy_drop_sigma: 1.0
-  history_decay: 0.9
-  buffer_max_windows: 8
-  buffer_max_samples: 64
-  metric: teacher_f1
-  agreement_iou_threshold: 0.5
-  agreement_score_threshold: 0.0
- ekya_style_centralized_scheduling:
-  upload_raw_frames: true
-  use_frame_filter: false
-  cloud_inference: true
-  return_cloud_inference_to_edge: true
-  wait_for_cloud_inference: true
-  cloud_inference_timeout_sec: 3.0
-  display_cloud_failure_mode: empty
-  require_micro_profiling: true
-  # RF-DETR proxy F1 can stay exactly 0 during one-epoch microprofiling even
-  # when formal training should still run; allow zero-gain candidates so Ekya
-  # does not starve before the first model update.
-  allow_zero_gain_training: true
-  training_strategy: freeze
-  display_source: cloud
-  max_microprofile_configs: 8
-  trainable_param_ratios: [0.1, 0.3, 0.5]
-  sample_fractions: [0.5, 1.0]
-  batch_sizes: []
-  formal_num_epochs: []
-  learning_rates: []
-  min_teacher_objects: 1
-  teacher_annotation_threshold: null
-  teacher_agreement_iou_threshold: 0.5
-  teacher_agreement_confidence_threshold: 0.0
-  min_inference_quality: 0.0
-  max_cloud_inference_latency_ms: 0.0
-  min_cloud_inference_fps: 0.0
+ # Plank-Road frame filter as the keyframe selector, while training
+ # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
+  trigger_window_size: 60
+ # Ekya defaults live in config/runtime.py; add overrides here only for ablations.
 
 client:
  # the source video

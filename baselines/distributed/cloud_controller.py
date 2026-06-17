@@ -90,6 +90,7 @@ class DistributedBaselineController:
         baseline_method_config: object | dict[str, Any] | None = None,
         model_weights_path: str = "",
         tinynext_input_size: int | None = None,
+        sample_pool_max_samples: int | None = None,
         strict_run_id: bool = True,
         teacher_annotator: Any | None = None,
         heavy_gpu_lease: Callable[..., Any] | None = None,
@@ -103,6 +104,10 @@ class DistributedBaselineController:
         self.baseline_method_config = baseline_method_config
         self.model_weights_path = str(model_weights_path or "")
         self.tinynext_input_size = tinynext_input_size
+        self.sample_pool_max_samples = _baseline_sample_pool_max_samples(
+            sample_pool_max_samples,
+            baseline_method=self.baseline_method,
+        )
         self.strict_run_id = bool(strict_run_id)
         self.teacher_annotator = teacher_annotator
         self.heavy_gpu_lease = heavy_gpu_lease
@@ -116,7 +121,10 @@ class DistributedBaselineController:
         self._ekya_enabled = self.baseline_method == _EKYA_METHOD
         self._accuracy_trigger_enabled = self.baseline_method == _ACCURACY_TRIGGER_METHOD
         self._accuracy_trigger_controller = (
-            AccuracyTriggerController(baseline_method_config)
+            AccuracyTriggerController(
+                baseline_method_config,
+                sample_pool_max_samples=int(self.sample_pool_max_samples),
+            )
             if self._accuracy_trigger_enabled
             else None
         )
@@ -702,15 +710,59 @@ class DistributedBaselineController:
         with self._lock:
             self._ekya_inference_latencies_ms.append(latency_ms)
             self._ekya_inference_timestamps_ms.append(int(result.get("timestamp_ms", now_ms())))
-        prediction = dict(result.get("cloud_prediction", {}) or {})
-        detections = len(list(prediction.get("boxes") or []))
-        logger.info(
-            "ekya_upload_display_done edge={} frame={} detections={} latency_ms={}",
-            result.get("edge_id"),
-            result.get("frame_id"),
-            detections,
-            latency_ms,
+
+    def _ekya_training_window_size(self) -> int:
+        return max(
+            1,
+            int(_config_value(self.baseline_training_config, "training_window_size", 8)),
         )
+
+    def _ekya_buffer_max_samples(self) -> int:
+        return max(1, int(self.sample_pool_max_samples))
+
+    def _trim_ekya_buffer_locked(self, samples: deque[EkyaWindowSample]) -> None:
+        max_samples = self._ekya_buffer_max_samples()
+        if len(samples) <= max_samples:
+            return
+        kept = _select_ekya_buffer_samples(samples, max_samples=max_samples)
+        samples.clear()
+        samples.extend(kept)
+
+    def _has_active_ekya_window_locked(self, *, edge_id: int) -> bool:
+        for (window_edge_id, _window_id), state in self._ekya_window_states.items():
+            if int(window_edge_id) != int(edge_id):
+                continue
+            if state.status not in EKYA_TERMINAL_WINDOW_STATUSES:
+                return True
+        return False
+
+    def _update_ekya_buffer_labels_locked(
+        self,
+        window: EkyaReadyWindow,
+        labeled_samples: list[EkyaWindowSample],
+    ) -> None:
+        labels_by_frame = {
+            int(sample.frame_id): dict(sample.teacher_prediction)
+            for sample in labeled_samples
+            if sample.teacher_prediction
+        }
+        if not labels_by_frame:
+            return
+        key = (str(window.run_id), str(window.baseline_method), int(window.edge_id))
+        samples = self._ekya_windows.get(key)
+        if not samples:
+            return
+        updated: deque[EkyaWindowSample] = deque()
+        changed = False
+        for sample in samples:
+            label = labels_by_frame.get(int(sample.frame_id))
+            if label is not None and dict(sample.teacher_prediction) != label:
+                sample = replace(sample, teacher_prediction=dict(label))
+                changed = True
+            updated.append(sample)
+        if changed:
+            samples.clear()
+            samples.extend(updated)
 
     def _append_ekya_window_sample_locked(
         self,
@@ -720,11 +772,8 @@ class DistributedBaselineController:
         inference_result: dict[str, Any],
         teacher_result: dict[str, Any],
     ) -> None:
-        training_window_size = max(
-            1,
-            int(_config_value(self.baseline_training_config, "training_window_size", 8)),
-        )
-        samples = self._ekya_windows.setdefault(key, deque(maxlen=training_window_size))
+        training_window_size = self._ekya_training_window_size()
+        samples = self._ekya_windows.setdefault(key, deque())
         sample = EkyaWindowSample(
             run_id=key[0],
             baseline_method=key[1],
@@ -742,14 +791,10 @@ class DistributedBaselineController:
             is_keyframe=bool(payload.is_keyframe),
         )
         samples.append(sample)
-        logger.info(
-            "ekya_window_sample_appended edge={} frame={} labeled={} window_samples={}",
-            key[2],
-            int(payload.frame_id),
-            bool(sample.teacher_prediction),
-            len(samples),
-        )
+        self._trim_ekya_buffer_locked(samples)
         if len(samples) < training_window_size:
+            return
+        if self._has_active_ekya_window_locked(edge_id=key[2]):
             return
         window = _ekya_window_from_samples(key, tuple(samples))
         state_key = (int(window.edge_id), str(window.window_id))
@@ -759,12 +804,6 @@ class DistributedBaselineController:
         self._set_ekya_window_state_locked(
             window,
             EKYA_STATUS_LABEL_PENDING,
-        )
-        logger.info(
-            "ekya_window_label_pending edge={} window={} samples={}",
-            window.edge_id,
-            window.window_id,
-            len(window.samples),
         )
 
     def _ekya_label_pending_windows(self) -> list[EkyaReadyWindow]:
@@ -845,6 +884,7 @@ class DistributedBaselineController:
             labeled_window = replace(window, samples=tuple(labeled_samples))
             with self._lock:
                 self._ekya_window_snapshots[state_key] = labeled_window
+                self._update_ekya_buffer_labels_locked(labeled_window, labeled_samples)
                 self._set_ekya_window_state_locked(labeled_window, EKYA_STATUS_LABELED)
             logger.info(
                 "ekya_teacher_annotation_done edge={} window={} samples={}",
@@ -1500,6 +1540,169 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _baseline_sample_pool_max_samples(
+    value: object,
+    *,
+    baseline_method: str,
+) -> int:
+    if str(baseline_method) in {_ACCURACY_TRIGGER_METHOD, _EKYA_METHOD}:
+        if value in (None, "", 0):
+            raise ValueError(
+                "sample_pool_max_samples is required for cloud baseline buffers"
+            )
+        return max(1, int(value))
+    return 0
+
+
+def _ekya_prediction_labels(prediction: Mapping[str, Any]) -> list[str]:
+    raw_labels: object = []
+    for key in ("labels", "detection_class", "classes"):
+        value = prediction.get(key)
+        if value is not None:
+            raw_labels = value
+            break
+    if torch.is_tensor(raw_labels):
+        raw_labels = raw_labels.detach().cpu().tolist()
+    if isinstance(raw_labels, (str, bytes)):
+        raw_values = [raw_labels]
+    else:
+        try:
+            raw_values = list(raw_labels)
+        except TypeError:
+            raw_values = [raw_labels]
+    return [str(label) for label in raw_values if label not in (None, "")]
+
+
+def _ekya_sample_class_counts(sample: EkyaWindowSample) -> dict[str, int]:
+    for prediction in (
+        sample.teacher_prediction,
+        sample.cloud_prediction,
+        sample.edge_prediction,
+    ):
+        if not prediction:
+            continue
+        counts: dict[str, int] = {}
+        for label in _ekya_prediction_labels(prediction):
+            counts[label] = counts.get(label, 0) + 1
+        if counts:
+            return counts
+    return {}
+
+
+def _ekya_prediction_confidence(prediction: Mapping[str, Any]) -> float:
+    candidates = [
+        prediction.get("confidence"),
+        prediction.get("score"),
+    ]
+    for key in ("scores", "confidences"):
+        values = prediction.get(key)
+        if torch.is_tensor(values):
+            values = values.detach().cpu().tolist()
+        try:
+            candidates.extend(list([] if values is None else values))
+        except TypeError:
+            candidates.append(values)
+    return max((_safe_float(value, 0.0) for value in candidates), default=0.0)
+
+
+def _ekya_sample_confidence(sample: EkyaWindowSample) -> float:
+    return max(
+        _ekya_prediction_confidence(sample.teacher_prediction),
+        _ekya_prediction_confidence(sample.cloud_prediction),
+        _ekya_prediction_confidence(sample.edge_prediction),
+    )
+
+
+def _ekya_sample_in_drift_window(sample: EkyaWindowSample) -> bool:
+    metadata = dict(sample.quality_metadata or {})
+    return any(
+        bool(metadata.get(key))
+        for key in (
+            "in_drift_window",
+            "drift_window",
+            "drift_detected",
+            "is_drift_window",
+        )
+    )
+
+
+def _ekya_sample_keep_score(
+    sample: EkyaWindowSample,
+    *,
+    rarity_by_class: Mapping[str, float],
+    newest_timestamp_ms: int,
+) -> float:
+    class_counts = _ekya_sample_class_counts(sample)
+    class_rarity_score = 0.0
+    if class_counts:
+        class_rarity_score = max(
+            float(rarity_by_class.get(str(label), 0.0))
+            for label in class_counts
+        )
+    timestamp_ms = max(0, int(sample.timestamp_ms))
+    recency_score = (
+        0.0
+        if newest_timestamp_ms <= 0
+        else min(1.0, float(timestamp_ms) / float(newest_timestamp_ms))
+    )
+    return (
+        2.0 * (1.0 if sample.teacher_prediction else 0.0)
+        + 1.5 * (1.0 if _ekya_sample_in_drift_window(sample) else 0.0)
+        + 0.8 * class_rarity_score
+        + 0.3 * recency_score
+        + 0.05 * _ekya_sample_confidence(sample)
+    )
+
+
+def _select_ekya_buffer_samples(
+    samples: deque[EkyaWindowSample],
+    *,
+    max_samples: int,
+) -> list[EkyaWindowSample]:
+    sample_list = list(samples)
+    if len(sample_list) <= max_samples:
+        return sample_list
+
+    aggregate_counts: dict[str, int] = {}
+    for sample in sample_list:
+        for label, count in _ekya_sample_class_counts(sample).items():
+            aggregate_counts[str(label)] = aggregate_counts.get(str(label), 0) + int(count)
+    rarity_by_class = {
+        label: 1.0 / float(max(1, count)) for label, count in aggregate_counts.items()
+    }
+    newest_timestamp_ms = max((int(sample.timestamp_ms) for sample in sample_list), default=0)
+
+    best_by_frame: dict[int, tuple[float, int, EkyaWindowSample]] = {}
+    for index, sample in enumerate(sample_list):
+        score = _ekya_sample_keep_score(
+            sample,
+            rarity_by_class=rarity_by_class,
+            newest_timestamp_ms=newest_timestamp_ms,
+        )
+        current = best_by_frame.get(int(sample.frame_id))
+        if current is None or (score, int(sample.timestamp_ms), index) > (
+            current[0],
+            int(current[2].timestamp_ms),
+            current[1],
+        ):
+            best_by_frame[int(sample.frame_id)] = (score, index, sample)
+
+    selected = sorted(
+        best_by_frame.values(),
+        key=lambda item: (
+            -item[0],
+            -int(item[2].timestamp_ms),
+            int(item[2].frame_id),
+        ),
+    )[: int(max_samples)]
+    kept_indices = {index for _score, index, _sample in selected}
+    return [
+        sample
+        for index, sample in enumerate(sample_list)
+        if index in kept_indices
+    ]
+
+
 def _config_value(config: object | dict[str, Any] | None, name: str, default: Any) -> Any:
     if isinstance(config, dict):
         return config.get(name, default)
@@ -1518,7 +1721,6 @@ def _training_config_dict(config: object | dict[str, Any] | None) -> dict[str, A
         "min_training_samples",
         "training_window_size",
         "microprofile_epochs",
-        "microprofile_max_samples",
         "device",
         "training_failure_backoff_sec",
     )

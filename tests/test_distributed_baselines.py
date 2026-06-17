@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import pytest
 import torch
+from loguru import logger
 
 from baselines.distributed.cloud_controller import DistributedBaselineController
 from baselines.distributed.ekya import (
@@ -23,6 +24,7 @@ from baselines.distributed.ekya import (
     EKYA_STATUS_FAILED,
     EKYA_STATUS_LABEL_PENDING,
     EKYA_STATUS_LABELED,
+    EKYA_STATUS_SUCCEEDED,
     EkyaCentralScheduler,
     EkyaHeavyLaneBusy,
     EkyaMicroProfiler,
@@ -47,6 +49,29 @@ from edge_client import (
 from grpc_server import message_transmission_pb2
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _ekya_payload(
+    frame_id: int,
+    *,
+    quality_metadata: dict[str, object] | None = None,
+    edge_prediction: dict[str, object] | None = None,
+) -> BaselineFramePayload:
+    return BaselineFramePayload(
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        edge_id=1,
+        frame_id=int(frame_id),
+        timestamp_ms=int(frame_id),
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        upload_mode="raw_frame",
+        raw_frame=f"frame-{frame_id}".encode("ascii"),
+        edge_prediction=dict(edge_prediction or {}),
+        quality_metadata=dict(quality_metadata or {}),
+        is_keyframe=True,
+    )
 
 
 def _config(tmp_path: Path) -> SimpleNamespace:
@@ -437,8 +462,6 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
         1.0
     )
     assert config.baseline.accuracy_trigger_cloud_retraining.history_decay == pytest.approx(0.9)
-    assert config.baseline.accuracy_trigger_cloud_retraining.buffer_max_windows == 8
-    assert config.baseline.accuracy_trigger_cloud_retraining.buffer_max_samples == 64
     assert config.baseline.accuracy_trigger_cloud_retraining.metric == "teacher_f1"
     assert config.baseline.accuracy_trigger_cloud_retraining.agreement_iou_threshold == (
         pytest.approx(0.5)
@@ -502,6 +525,37 @@ baseline:
     )
 
     with pytest.raises(ValueError, match=match):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize(
+    "yaml_body",
+    [
+        """
+sample_pool:
+  max_samples: 8
+baseline:
+  training:
+    training_window_size: 9
+  accuracy_trigger_cloud_retraining:
+    trigger_window_size: 8
+""",
+        """
+sample_pool:
+  max_samples: 8
+baseline:
+  training:
+    training_window_size: 8
+  accuracy_trigger_cloud_retraining:
+    trigger_window_size: 9
+""",
+    ],
+)
+def test_sample_pool_capacity_must_cover_baseline_windows(tmp_path, yaml_body: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml_body, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sample_pool.max_samples"):
         load_runtime_config(path)
 
 
@@ -1021,6 +1075,7 @@ def test_cloud_controller_no_longer_exposes_training_state_machine() -> None:
         baseline_method="accuracy_trigger_cloud_retraining",
         run_id="run-a",
         results_root="unused",
+        sample_pool_max_samples=64,
         strict_run_id=False,
     )
     assert not hasattr(controller, "request_training")
@@ -1034,6 +1089,7 @@ def test_cloud_controller_infers_then_strips_raw_frame_bytes() -> None:
         run_id="ekya-run",
         results_root="unused",
         inference_fn=lambda raw: {"scores": [0.7], "confidence": 0.7, "bytes": len(raw)},
+        sample_pool_max_samples=64,
     )
     payload = BaselineFramePayload(
         run_id="ekya-run",
@@ -1071,6 +1127,7 @@ def test_cloud_controller_ekya_upload_runs_display_only_and_appends_unlabeled_sa
         results_root="unused",
         inference_fn=infer,
         baseline_method_config=SimpleNamespace(teacher_annotation_threshold=0.4),
+        sample_pool_max_samples=64,
     )
     try:
         payload = BaselineFramePayload(
@@ -1104,6 +1161,166 @@ def test_cloud_controller_ekya_upload_runs_display_only_and_appends_unlabeled_sa
         assert calls == [
             {"threshold": None, "purpose": "display", "bytes": len(b"frame-bytes")},
         ]
+    finally:
+        controller.close()
+
+
+def test_ekya_buffer_accumulates_to_sample_pool_capacity_and_serializes_windows() -> None:
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda message: messages.append(str(message)),
+        format="{message}",
+        level="INFO",
+    )
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        baseline_training_config=SimpleNamespace(training_window_size=3),
+        sample_pool_max_samples=5,
+    )
+    key = ("ekya-run", "ekya_style_centralized_scheduling", 1)
+    try:
+        for frame_id in range(1, 7):
+            controller.upload_frame(_ekya_payload(frame_id))
+
+        samples = list(controller._ekya_windows[key])
+        assert [sample.frame_id for sample in samples] == [2, 3, 4, 5, 6]
+        assert len(samples) == 5
+        assert len(controller._ekya_window_snapshots) == 1
+        state_key, first_window = next(iter(controller._ekya_window_snapshots.items()))
+        assert controller._ekya_window_states[state_key].status == EKYA_STATUS_LABEL_PENDING
+        assert [sample.frame_id for sample in first_window.samples] == [1, 2, 3]
+        assert not any("ekya_window_label_pending" in message for message in messages)
+
+        with controller._lock:
+            controller._set_ekya_window_state_locked(first_window, EKYA_STATUS_SUCCEEDED)
+        controller.upload_frame(_ekya_payload(7))
+
+        assert len(controller._ekya_window_snapshots) == 2
+        pending_windows = [
+            window
+            for key_, window in controller._ekya_window_snapshots.items()
+            if controller._ekya_window_states[key_].status == EKYA_STATUS_LABEL_PENDING
+        ]
+        assert len(pending_windows) == 1
+        assert [sample.frame_id for sample in controller._ekya_windows[key]] == [
+            3,
+            4,
+            5,
+            6,
+            7,
+        ]
+        assert [sample.frame_id for sample in pending_windows[0].samples] == [
+            3,
+            4,
+            5,
+            6,
+            7,
+        ]
+    finally:
+        controller.close()
+        logger.remove(sink_id)
+
+
+def test_ekya_buffer_capacity_selection_prefers_teacher_drift_rare_and_best_duplicate() -> None:
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        baseline_training_config=SimpleNamespace(training_window_size=99),
+        sample_pool_max_samples=4,
+    )
+    key = ("ekya-run", "ekya_style_centralized_scheduling", 1)
+    try:
+        entries = [
+            (
+                _ekya_payload(1),
+                {"cloud_prediction": {"labels": [1], "scores": [0.9]}},
+                {"cloud_prediction": {"labels": [1], "scores": [0.9]}},
+            ),
+            (
+                _ekya_payload(2, quality_metadata={"in_drift_window": True}),
+                {"cloud_prediction": {"labels": [1], "scores": [0.9]}},
+                {},
+            ),
+            (
+                _ekya_payload(3),
+                {"cloud_prediction": {"labels": [99], "scores": [0.9]}},
+                {},
+            ),
+            (
+                _ekya_payload(3),
+                {"cloud_prediction": {"labels": [1], "scores": [0.1]}},
+                {},
+            ),
+            (
+                _ekya_payload(4),
+                {"cloud_prediction": {"labels": [1], "scores": [0.9]}},
+                {},
+            ),
+            (
+                _ekya_payload(5),
+                {"cloud_prediction": {"labels": [1], "scores": [0.9]}},
+                {},
+            ),
+            (
+                _ekya_payload(6),
+                {"cloud_prediction": {"labels": [1], "scores": [0.9]}},
+                {},
+            ),
+        ]
+        with controller._lock:
+            for payload, inference_result, teacher_result in entries:
+                controller._append_ekya_window_sample_locked(
+                    key,
+                    payload=payload,
+                    inference_result=inference_result,
+                    teacher_result=teacher_result,
+                )
+
+        samples = list(controller._ekya_windows[key])
+        assert [sample.frame_id for sample in samples] == [1, 2, 3, 6]
+        assert samples[0].teacher_prediction["labels"] == [1]
+        assert samples[1].quality_metadata["in_drift_window"] is True
+        assert samples[2].cloud_prediction["labels"] == [99]
+    finally:
+        controller.close()
+
+
+def test_ekya_annotation_writes_teacher_labels_back_to_cumulative_buffer() -> None:
+    class SuccessfulAnnotator:
+        manages_gpu_lease = True
+
+        def annotate_raw_frames(self, samples, *, threshold=None):
+            del threshold
+            return {
+                str(getattr(sample, "sample_id")): {
+                    "boxes": [[1, 1, 4, 4]],
+                    "labels": [int(getattr(sample, "sample_id"))],
+                    "scores": [0.9],
+                }
+                for sample in samples
+            }
+
+    controller = DistributedBaselineController(
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        results_root="unused",
+        teacher_annotator=SuccessfulAnnotator(),
+        baseline_training_config=SimpleNamespace(training_window_size=2),
+        sample_pool_max_samples=5,
+    )
+    key = ("ekya-run", "ekya_style_centralized_scheduling", 1)
+    try:
+        controller.upload_frame(_ekya_payload(1))
+        controller.upload_frame(_ekya_payload(2))
+        state_key, window = next(iter(controller._ekya_window_snapshots.items()))
+
+        assert controller._ekya_annotate_window(window) is True
+        assert controller._ekya_window_states[state_key].status == EKYA_STATUS_LABELED
+        samples = list(controller._ekya_windows[key])
+        assert [sample.teacher_prediction["labels"] for sample in samples] == [[1], [2]]
     finally:
         controller.close()
 
@@ -1158,6 +1375,7 @@ def test_ekya_annotation_failure_marks_terminal_and_is_not_rescheduled() -> None
         results_root="unused",
         teacher_annotator=annotator,
         baseline_training_config=SimpleNamespace(training_window_size=1),
+        sample_pool_max_samples=64,
     )
     try:
         controller.upload_frame(
@@ -1204,6 +1422,7 @@ def test_ekya_microprofile_failure_marks_terminal_and_is_not_rescheduled() -> No
         baseline_method="ekya_style_centralized_scheduling",
         run_id="ekya-run",
         results_root="unused",
+        sample_pool_max_samples=64,
     )
     window = _ekya_ready_window()
     state_key = (int(window.edge_id), str(window.window_id))
@@ -1259,6 +1478,7 @@ def test_ekya_annotation_and_microprofile_use_shared_heavy_gpu_lease() -> None:
         results_root="unused",
         teacher_annotator=SuccessfulAnnotator(),
         heavy_gpu_lease=lease,
+        sample_pool_max_samples=64,
     )
     unlabeled_window = replace(
         _ekya_ready_window(),
@@ -1321,6 +1541,7 @@ def test_ekya_heavy_gpu_lease_busy_defers_without_terminal_window_state() -> Non
         results_root="unused",
         teacher_annotator=SuccessfulAnnotator(),
         heavy_gpu_lease=busy_lease,
+        sample_pool_max_samples=64,
     )
     window = _ekya_ready_window()
     state_key = (int(window.edge_id), str(window.window_id))
@@ -1423,6 +1644,7 @@ def test_ekya_poll_command_delivery_ack_and_timeout() -> None:
         run_id="ekya-run",
         results_root="unused",
         baseline_method_config=SimpleNamespace(command_timeout_ms=10),
+        sample_pool_max_samples=64,
     )
     try:
         job = CloudScheduledEkyaJob(
@@ -1493,10 +1715,10 @@ def test_ekya_formal_training_request_has_shared_job_api_fields() -> None:
             min_training_samples=1,
             training_window_size=8,
             microprofile_epochs=1,
-            microprofile_max_samples=2,
             device="cpu",
         ),
         baseline_method_config=SimpleNamespace(teacher_annotation_threshold=0.25),
+        sample_pool_max_samples=64,
     )
     sample = EkyaWindowSample(
         run_id="ekya-run",
@@ -1593,13 +1815,13 @@ def test_ekya_formal_training_accepts_zero_gain_when_configured() -> None:
             min_training_samples=1,
             training_window_size=8,
             microprofile_epochs=1,
-            microprofile_max_samples=2,
             device="cpu",
         ),
         baseline_method_config=SimpleNamespace(
             allow_zero_gain_training=True,
             teacher_annotation_threshold=None,
         ),
+        sample_pool_max_samples=64,
     )
     window = _ekya_ready_window()
     zero_gain = replace(
@@ -1625,6 +1847,7 @@ def test_ekya_model_update_cache_builds_cumulative_base_delta() -> None:
         baseline_method="ekya_style_centralized_scheduling",
         run_id="ekya-run",
         results_root="unused",
+        sample_pool_max_samples=64,
     )
     first_update = _encoded_model_delta(
         {"head.weight": torch.tensor([1.0])},
@@ -1693,6 +1916,7 @@ def test_ekya_training_skips_when_nonzero_base_update_is_missing() -> None:
         run_id="ekya-run",
         results_root="unused",
         training_backend=backend,
+        sample_pool_max_samples=64,
     )
     window = _ekya_ready_window(model_version="1")
     result = _microprofile_result(base_model_version="1")
@@ -1985,7 +2209,6 @@ def test_ekya_microprofile_skips_when_teacher_objects_are_too_low() -> None:
             num_epoch=1,
             learning_rate=1e-3,
             microprofile_epochs=1,
-            microprofile_max_samples=1,
         ),
         ekya_config=SimpleNamespace(min_teacher_objects=2),
         model_builder=fail_build_model,
@@ -2019,6 +2242,99 @@ def test_ekya_microprofile_skips_when_teacher_objects_are_too_low() -> None:
 
     assert profiler.profile_candidate(window, candidate) is None
     assert profiler.skip_reason(window) == "proxy_metric_unavailable"
+
+
+def test_ekya_microprofile_uses_full_window_buffer(monkeypatch) -> None:
+    captured_sample_counts: list[int] = []
+
+    def build_model(*args, **kwargs):
+        del args, kwargs
+        return TinyMicroprofileDetectionModel()
+
+    def build_loss(_model):
+        return lambda _outputs, _targets: torch.tensor(0.0, requires_grad=True)
+
+    def fake_microprofile(
+        *,
+        model,
+        trainable_module,
+        samples,
+        batch_size,
+        epochs,
+        device,
+        loss_fn,
+        optimizer,
+        evaluate_epoch,
+    ):
+        del model, trainable_module, batch_size, epochs, device, loss_fn, optimizer
+        captured_sample_counts.append(len(samples))
+        return {
+            "microprofile_time_sec": 0.001,
+            "proxy_metric_after_by_epoch": [evaluate_epoch(1)],
+            "loss_before": 0.5,
+            "final_loss": 0.4,
+        }
+
+    monkeypatch.setattr(
+        "baselines.distributed.ekya.run_parameter_ratio_freeze_microprofile",
+        fake_microprofile,
+    )
+    profiler = EkyaMicroProfiler(
+        training_config=SimpleNamespace(
+            batch_size=2,
+            num_epoch=2,
+            learning_rate=0.1,
+            microprofile_epochs=1,
+            device="cpu",
+        ),
+        ekya_config=SimpleNamespace(
+            max_microprofile_configs=1,
+            min_teacher_objects=1,
+            trainable_param_ratios=[1.0],
+            sample_fractions=[1 / 3],
+            batch_sizes=[2],
+            formal_num_epochs=[2],
+            learning_rates=[0.1],
+            teacher_agreement_iou_threshold=0.5,
+            teacher_agreement_confidence_threshold=0.0,
+        ),
+        model_builder=build_model,
+        loss_builder=build_loss,
+    )
+    samples = tuple(
+        EkyaWindowSample(
+            run_id="ekya-run",
+            baseline_method="ekya_style_centralized_scheduling",
+            edge_id=1,
+            frame_id=frame_id,
+            timestamp_ms=frame_id,
+            model_name="tiny",
+            model_version="0",
+            video_source="video",
+            raw_frame=_jpeg_bytes(),
+            edge_prediction={},
+            cloud_prediction={},
+            teacher_prediction={"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.9]},
+            quality_metadata={},
+        )
+        for frame_id in (1, 2, 3)
+    )
+    window = EkyaReadyWindow(
+        edge_id=1,
+        window_id="window-1",
+        run_id="ekya-run",
+        baseline_method="ekya_style_centralized_scheduling",
+        model_name="tiny",
+        model_version="0",
+        video_source="video",
+        samples=samples,
+    )
+
+    results = profiler.profile_window(window)
+
+    assert captured_sample_counts == [3]
+    assert len(results) == 1
+    assert results[0].sample_count == 1
 
 
 def test_ekya_proxy_eval_postprocesses_raw_detection_outputs(monkeypatch) -> None:
@@ -2110,7 +2426,6 @@ def test_ekya_microprofile_runs_short_training_and_epoch_proxy_eval() -> None:
             num_epoch=2,
             learning_rate=0.1,
             microprofile_epochs=2,
-            microprofile_max_samples=1,
             device="cpu",
         ),
         ekya_config=SimpleNamespace(

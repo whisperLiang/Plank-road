@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import threading
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -167,14 +166,20 @@ class AccuracyTriggerCommandRecord:
 class _ModelAccuracyState:
     current_window: list[AccuracyTriggerFrame] = field(default_factory=list)
     history: list[float] = field(default_factory=list)
-    buffer_windows: deque[AccuracyTriggerWindow] = field(default_factory=deque)
+    buffer_samples: list[AccuracyTriggerFrame] = field(default_factory=list)
+    buffer_sample_windows: dict[int, str] = field(default_factory=dict)
     pending_jobs: dict[str, AccuracyTriggerPendingJob] = field(default_factory=dict)
     last_decision: AccuracyTriggerWindow | None = None
     last_failure_message: str = ""
 
 
 class AccuracyTriggerController:
-    def __init__(self, config: object | Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: object | Mapping[str, Any] | None = None,
+        *,
+        sample_pool_max_samples: int,
+    ) -> None:
         self.config = config
         self.trigger_window_size = max(
             1,
@@ -186,8 +191,7 @@ class AccuracyTriggerController:
         )
         self.accuracy_drop_sigma = float(_config_value(config, "accuracy_drop_sigma", 1.0))
         self.history_decay = float(_config_value(config, "history_decay", 0.9))
-        self.buffer_max_windows = max(1, int(_config_value(config, "buffer_max_windows", 8)))
-        self.buffer_max_samples = max(1, int(_config_value(config, "buffer_max_samples", 64)))
+        self.sample_pool_max_samples = _normalise_required_max_samples(sample_pool_max_samples)
         self.metric = str(_config_value(config, "metric", "teacher_f1") or "teacher_f1")
         self.agreement_iou_threshold = float(
             _config_value(config, "agreement_iou_threshold", 0.5)
@@ -391,12 +395,8 @@ class AccuracyTriggerController:
                 }
             return {
                 "history": list(state.history),
-                "buffer_window_count": len(state.buffer_windows),
-                "buffer_frame_ids": [
-                    int(sample.frame_id)
-                    for window in state.buffer_windows
-                    for sample in window.samples
-                ],
+                "buffer_window_count": _buffer_window_count(state),
+                "buffer_frame_ids": [int(sample.frame_id) for sample in state.buffer_samples],
                 "pending_jobs": {
                     job_id: pending.status for job_id, pending in state.pending_jobs.items()
                 },
@@ -448,16 +448,13 @@ class AccuracyTriggerController:
             accuracy_drop_threshold=threshold,
             triggered=triggered,
         )
-        prior_buffered_window_count = len(state.buffer_windows)
+        prior_buffered_window_count = _buffer_window_count(state)
         state.history.append(float(accuracy))
-        state.buffer_windows.append(window)
-        self._trim_buffer_locked(state)
+        self._append_buffer_samples_locked(state, window)
         state.last_decision = window
         if not triggered:
             return None
-        training_samples = tuple(
-            sample for buffered in state.buffer_windows for sample in buffered.samples
-        )
+        training_samples = tuple(state.buffer_samples)
         return AccuracyTriggerSubmission(
             model_key=key,
             run_id=key[0],
@@ -489,14 +486,26 @@ class AccuracyTriggerController:
         ]
         return float(sum(scores) / len(scores))
 
-    def _trim_buffer_locked(self, state: _ModelAccuracyState) -> None:
-        while len(state.buffer_windows) > self.buffer_max_windows:
-            state.buffer_windows.popleft()
-        while (
-            len(state.buffer_windows) > 1
-            and _buffer_sample_count(state) > self.buffer_max_samples
-        ):
-            state.buffer_windows.popleft()
+    def _append_buffer_samples_locked(
+        self,
+        state: _ModelAccuracyState,
+        window: AccuracyTriggerWindow,
+    ) -> None:
+        state.buffer_samples.extend(window.samples)
+        for sample in window.samples:
+            state.buffer_sample_windows[int(sample.frame_id)] = str(window.window_id)
+        if len(state.buffer_samples) <= self.sample_pool_max_samples:
+            return
+        state.buffer_samples = _select_accuracy_buffer_samples(
+            state.buffer_samples,
+            max_samples=self.sample_pool_max_samples,
+        )
+        kept_frame_ids = {int(sample.frame_id) for sample in state.buffer_samples}
+        state.buffer_sample_windows = {
+            frame_id: window_id
+            for frame_id, window_id in state.buffer_sample_windows.items()
+            if int(frame_id) in kept_frame_ids
+        }
 
     def _resolve_command_locked(
         self,
@@ -538,8 +547,160 @@ def _model_key(
     return (str(run_id), int(edge_id), str(model_name or ""), str(model_version or "0"))
 
 
-def _buffer_sample_count(state: _ModelAccuracyState) -> int:
-    return sum(len(window.samples) for window in state.buffer_windows)
+def _normalise_required_max_samples(value: object) -> int:
+    if value in (None, "", 0):
+        raise ValueError("sample_pool_max_samples is required for Accuracy-Trigger buffer")
+    return max(1, int(value))
+
+
+def _buffer_window_count(state: _ModelAccuracyState) -> int:
+    frame_ids = {int(sample.frame_id) for sample in state.buffer_samples}
+    return len(
+        {
+            window_id
+            for frame_id, window_id in state.buffer_sample_windows.items()
+            if int(frame_id) in frame_ids
+        }
+    )
+
+
+def _prediction_labels(prediction: Mapping[str, Any]) -> list[str]:
+    raw_labels: object = []
+    for key in ("labels", "detection_class", "classes"):
+        value = prediction.get(key)
+        if value is not None:
+            raw_labels = value
+            break
+    if isinstance(raw_labels, (str, bytes)):
+        raw_values = [raw_labels]
+    else:
+        try:
+            raw_values = list(raw_labels)
+        except TypeError:
+            raw_values = [raw_labels]
+    return [str(label) for label in raw_values if label not in (None, "")]
+
+
+def _sample_class_counts(sample: AccuracyTriggerFrame) -> dict[str, int]:
+    for prediction in (sample.teacher_prediction, sample.edge_prediction):
+        if not prediction:
+            continue
+        counts: dict[str, int] = {}
+        for label in _prediction_labels(prediction):
+            counts[label] = counts.get(label, 0) + 1
+        if counts:
+            return counts
+    return {}
+
+
+def _prediction_confidence(prediction: Mapping[str, Any]) -> float:
+    candidates = [prediction.get("confidence"), prediction.get("score")]
+    for key in ("scores", "confidences"):
+        values = prediction.get(key)
+        try:
+            candidates.extend(list([] if values is None else values))
+        except TypeError:
+            candidates.append(values)
+    return max((_safe_float(value, 0.0) for value in candidates), default=0.0)
+
+
+def _sample_confidence(sample: AccuracyTriggerFrame) -> float:
+    return max(
+        _prediction_confidence(sample.teacher_prediction),
+        _prediction_confidence(sample.edge_prediction),
+    )
+
+
+def _sample_in_drift_window(sample: AccuracyTriggerFrame) -> bool:
+    metadata = dict(sample.quality_metadata or {})
+    return any(
+        bool(metadata.get(key))
+        for key in (
+            "in_drift_window",
+            "drift_window",
+            "drift_detected",
+            "is_drift_window",
+        )
+    )
+
+
+def _sample_keep_score(
+    sample: AccuracyTriggerFrame,
+    *,
+    rarity_by_class: Mapping[str, float],
+    newest_timestamp_ms: int,
+) -> float:
+    class_counts = _sample_class_counts(sample)
+    class_rarity_score = 0.0
+    if class_counts:
+        class_rarity_score = max(
+            float(rarity_by_class.get(str(label), 0.0))
+            for label in class_counts
+        )
+    timestamp_ms = max(0, int(sample.timestamp_ms))
+    recency_score = (
+        0.0
+        if newest_timestamp_ms <= 0
+        else min(1.0, float(timestamp_ms) / float(newest_timestamp_ms))
+    )
+    return (
+        2.0 * (1.0 if sample.teacher_prediction else 0.0)
+        + 1.5 * (1.0 if _sample_in_drift_window(sample) else 0.0)
+        + 0.8 * class_rarity_score
+        + 0.3 * recency_score
+        + 0.05 * _sample_confidence(sample)
+    )
+
+
+def _select_accuracy_buffer_samples(
+    samples: list[AccuracyTriggerFrame],
+    *,
+    max_samples: int,
+) -> list[AccuracyTriggerFrame]:
+    if len(samples) <= max_samples:
+        return list(samples)
+
+    aggregate_counts: dict[str, int] = {}
+    for sample in samples:
+        for label, count in _sample_class_counts(sample).items():
+            aggregate_counts[str(label)] = aggregate_counts.get(str(label), 0) + int(count)
+    rarity_by_class = {
+        label: 1.0 / float(max(1, count)) for label, count in aggregate_counts.items()
+    }
+    newest_timestamp_ms = max((int(sample.timestamp_ms) for sample in samples), default=0)
+
+    best_by_frame: dict[int, tuple[float, int, AccuracyTriggerFrame]] = {}
+    for index, sample in enumerate(samples):
+        score = _sample_keep_score(
+            sample,
+            rarity_by_class=rarity_by_class,
+            newest_timestamp_ms=newest_timestamp_ms,
+        )
+        current = best_by_frame.get(int(sample.frame_id))
+        if current is None or (score, int(sample.timestamp_ms), index) > (
+            current[0],
+            int(current[2].timestamp_ms),
+            current[1],
+        ):
+            best_by_frame[int(sample.frame_id)] = (score, index, sample)
+
+    selected = sorted(
+        best_by_frame.values(),
+        key=lambda item: (
+            -item[0],
+            -int(item[2].timestamp_ms),
+            int(item[2].frame_id),
+        ),
+    )[: int(max_samples)]
+    kept_indices = {index for _score, index, _sample in selected}
+    return [sample for index, sample in enumerate(samples) if index in kept_indices]
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _weighted_stats(values: list[float], *, decay: float) -> tuple[float, float]:

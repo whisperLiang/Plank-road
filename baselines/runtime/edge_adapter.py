@@ -744,7 +744,6 @@ def _training_config_dict(config: object | None) -> dict[str, Any]:
         "min_training_samples",
         "training_window_size",
         "microprofile_epochs",
-        "microprofile_max_samples",
         "device",
         "training_failure_backoff_sec",
     ):

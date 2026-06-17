@@ -239,6 +239,52 @@ def test_controller_terminal_failure_keeps_buffer_for_retraining() -> None:
     assert retrigger.training_frame_ids == (1, 2, 3, 4)
 
 
+def test_controller_buffer_accumulates_until_sample_pool_capacity() -> None:
+    controller = _controller(sample_pool_max_samples=5)
+
+    for frame_id in range(1, 7):
+        controller.add_frame(_payload(frame_id, edge_prediction=_box()), teacher_prediction=_box())
+
+    snapshot = controller.snapshot(
+        run_id="run-a",
+        edge_id=1,
+        model_name="tiny",
+        model_version="0",
+    )
+    assert snapshot["buffer_frame_ids"] == [2, 3, 4, 5, 6]
+    assert snapshot["buffer_window_count"] == 5
+
+
+def test_controller_buffer_capacity_selection_prefers_drift_rare_and_recency() -> None:
+    controller = _controller(sample_pool_max_samples=4)
+
+    frames = [
+        (1, _box(label=1), {}),
+        (2, _box(label=1), {"in_drift_window": True}),
+        (3, _box(label=99), {}),
+        (4, _box(label=1), {}),
+        (5, _box(label=1), {}),
+        (6, _box(label=1), {}),
+    ]
+    for frame_id, teacher_prediction, quality_metadata in frames:
+        controller.add_frame(
+            _payload(
+                frame_id,
+                edge_prediction=teacher_prediction,
+                quality_metadata=quality_metadata,
+            ),
+            teacher_prediction=teacher_prediction,
+        )
+
+    snapshot = controller.snapshot(
+        run_id="run-a",
+        edge_id=1,
+        model_name="tiny",
+        model_version="0",
+    )
+    assert snapshot["buffer_frame_ids"] == [2, 3, 5, 6]
+
+
 def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -> None:
     backend = RecordingTrainingBackend()
     annotator = RecordingSharedAnnotator([_box(), _box(), _box()])
@@ -250,6 +296,7 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
         training_backend=backend,
         baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
         baseline_method_config=_accuracy_config(),
+        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -303,6 +350,7 @@ def test_cloud_controller_defers_retryable_teacher_annotation_without_dropping_f
         training_backend=backend,
         baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
         baseline_method_config=_accuracy_config(),
+        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -352,6 +400,7 @@ def test_cloud_controller_retries_pending_accuracy_annotations_without_duplicate
         training_backend=backend,
         baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
         baseline_method_config=_accuracy_config(),
+        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -393,6 +442,7 @@ def test_cloud_controller_requires_shared_teacher_annotator(tmp_path) -> None:
         training_backend=RecordingTrainingBackend(),
         baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
         baseline_method_config=_accuracy_config(),
+        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
     )
@@ -477,8 +527,12 @@ def _trigger_submission(controller: AccuracyTriggerController):
 
 
 def _controller(**overrides) -> AccuracyTriggerController:
+    sample_pool_max_samples = int(overrides.pop("sample_pool_max_samples", 64))
     config = _accuracy_config(**overrides)
-    return AccuracyTriggerController(config)
+    return AccuracyTriggerController(
+        config,
+        sample_pool_max_samples=sample_pool_max_samples,
+    )
 
 
 def _accuracy_config(**overrides):
@@ -487,8 +541,6 @@ def _accuracy_config(**overrides):
         "min_history_windows": 2,
         "accuracy_drop_sigma": 0.0,
         "history_decay": 1.0,
-        "buffer_max_windows": 8,
-        "buffer_max_samples": 64,
         "metric": "teacher_f1",
         "agreement_iou_threshold": 0.5,
         "agreement_score_threshold": 0.0,
@@ -507,25 +559,27 @@ def _payload(
     model_name: str = "tiny",
     model_version: str = "0",
     edge_prediction: dict | None = None,
+    quality_metadata: dict | None = None,
 ) -> BaselineFramePayload:
     return BaselineFramePayload(
         run_id=run_id,
         baseline_method="accuracy_trigger_cloud_retraining",
         edge_id=edge_id,
         frame_id=int(frame_id),
+        timestamp_ms=int(frame_id),
         model_name=model_name,
         model_version=model_version,
         video_source="video.mp4",
         upload_mode="keyframe_raw",
         is_keyframe=True,
         edge_prediction=dict(edge_prediction or {}),
-        quality_metadata={"training_strategy": "freeze"},
+        quality_metadata={"training_strategy": "freeze", **dict(quality_metadata or {})},
         raw_frame=_jpeg_bytes(),
     )
 
 
-def _box() -> dict:
-    return {"boxes": [[1, 1, 4, 4]], "labels": [1], "scores": [0.9]}
+def _box(*, label: int = 1) -> dict:
+    return {"boxes": [[1, 1, 4, 4]], "labels": [int(label)], "scores": [0.9]}
 
 
 def _empty() -> dict:

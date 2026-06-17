@@ -323,20 +323,7 @@ class EkyaMicroProfiler:
             )
             self._record_skip_reason(window, "insufficient_samples")
             return None
-        selected_window_samples = select_window_samples(
-            window.samples,
-            sample_count=candidate.sample_count,
-            seed=f"{window.window_id}:{candidate.config_id}:formal",
-        )
-        max_microprofile_samples = max(
-            1,
-            int(self.training_config.get("microprofile_max_samples", 16) or 16),
-        )
-        microprofile_samples = select_window_samples(
-            selected_window_samples,
-            sample_count=min(len(selected_window_samples), max_microprofile_samples),
-            seed=f"{window.window_id}:{candidate.config_id}:microprofile",
-        )
+        microprofile_samples = list(window.samples)
         if not microprofile_samples or not any(sample.raw_frame for sample in microprofile_samples):
             logger.info(
                 "ekya_schedule_skip edge={} window={} reason=insufficient_samples",

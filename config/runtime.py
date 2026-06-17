@@ -257,8 +257,6 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     min_history_windows: int = 2
     accuracy_drop_sigma: float = 1.0
     history_decay: float = 0.9
-    buffer_max_windows: int = 8
-    buffer_max_samples: int = 64
     metric: str = "teacher_f1"
     agreement_iou_threshold: float = 0.5
     agreement_score_threshold: float = 0.0
@@ -310,7 +308,6 @@ class BaselineTrainingConfig(ConfigSection):
     min_training_samples: int = 1
     training_window_size: int = 8
     microprofile_epochs: int = 1
-    microprofile_max_samples: int = 16
     device: str = "auto"
     worker_infra_failure_backoff_sec: float = 10.0
     training_failure_backoff_sec: float = 10.0
@@ -713,10 +710,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         int(baseline_training.microprofile_epochs),
     )
     _validate_positive(
-        "baseline.training.microprofile_max_samples",
-        int(baseline_training.microprofile_max_samples),
-    )
-    _validate_positive(
         "baseline.training.worker_infra_failure_backoff_sec",
         float(baseline_training.worker_infra_failure_backoff_sec),
         allow_zero=True,
@@ -755,6 +748,17 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "baseline.accuracy_trigger_cloud_retraining.trigger_window_size",
         int(accuracy_cfg.trigger_window_size),
     )
+    max_baseline_buffer_samples = max(
+        int(baseline_training.training_window_size),
+        int(accuracy_cfg.trigger_window_size),
+    )
+    if int(config.sample_pool.max_samples) < max_baseline_buffer_samples:
+        raise ValueError(
+            "sample_pool.max_samples must be >= max("
+            "baseline.training.training_window_size, "
+            "baseline.accuracy_trigger_cloud_retraining.trigger_window_size"
+            ") for cloud baseline buffers"
+        )
     _validate_positive(
         "baseline.accuracy_trigger_cloud_retraining.min_history_windows",
         int(accuracy_cfg.min_history_windows),
@@ -772,14 +776,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "baseline.accuracy_trigger_cloud_retraining.history_decay must be <= 1"
         )
-    _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.buffer_max_windows",
-        int(accuracy_cfg.buffer_max_windows),
-    )
-    _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.buffer_max_samples",
-        int(accuracy_cfg.buffer_max_samples),
-    )
     if str(accuracy_cfg.metric or "").strip() != "teacher_f1":
         raise ValueError(
             "baseline.accuracy_trigger_cloud_retraining.metric must be teacher_f1"
