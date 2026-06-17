@@ -1089,7 +1089,7 @@ def test_cloud_controller_separates_display_and_teacher_annotation_cache() -> No
 
 
 def test_baseline_cloud_inference_adapter_routes_display_and_teacher_models() -> None:
-    from cloud_server import _baseline_cloud_inference_adapter
+    from cloud_server import _ekya_cloud_inference_adapter
 
     calls: list[tuple[str, float | None]] = []
 
@@ -1098,13 +1098,17 @@ def test_baseline_cloud_inference_adapter_routes_display_and_teacher_models() ->
             self.name = name
             self.score = score
 
+        def small_inference(self, _frame):
+            calls.append((f"{self.name}:small", None))
+            return None, [[0, 0, 4, 4]], [1], [self.score]
+
         def large_inference(self, _frame, *, threshold=None):
-            calls.append((self.name, threshold))
+            calls.append((f"{self.name}:large", threshold))
             return [[0, 0, 4, 4]], [1], [self.score]
 
-    infer = _baseline_cloud_inference_adapter(
-        FakeDetector("display-lightweight", 0.2),
-        FakeDetector("teacher", 0.9),
+    infer = _ekya_cloud_inference_adapter(
+        display_detector=FakeDetector("display-lightweight", 0.2),
+        teacher_detector=FakeDetector("teacher", 0.9),
     )
 
     display = infer(_jpeg_bytes(), purpose="display")
@@ -1112,7 +1116,25 @@ def test_baseline_cloud_inference_adapter_routes_display_and_teacher_models() ->
 
     assert display["scores"] == [0.2]
     assert annotation["scores"] == [0.9]
-    assert calls == [("display-lightweight", None), ("teacher", 0.4)]
+    assert calls == [("display-lightweight:small", None), ("teacher:large", 0.4)]
+
+
+def test_teacher_annotation_inference_adapter_uses_only_teacher_model() -> None:
+    from cloud_server import _teacher_annotation_inference_adapter
+
+    calls: list[tuple[str, float | None]] = []
+
+    class FakeTeacher:
+        def large_inference(self, _frame, *, threshold=None):
+            calls.append(("teacher:large", threshold))
+            return [[0, 0, 4, 4]], [1], [0.9]
+
+    infer = _teacher_annotation_inference_adapter(FakeTeacher())
+
+    result = infer(_jpeg_bytes(), purpose="display", threshold=0.4)
+
+    assert result["scores"] == [0.9]
+    assert calls == [("teacher:large", 0.4)]
 
 
 def test_ekya_poll_command_delivery_ack_and_timeout() -> None:

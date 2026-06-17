@@ -85,17 +85,19 @@ class CloudServer:
                 from model_management.object_detection import Object_Detection
 
                 self.large_object_detection = Object_Detection(config, type="large inference")
-                display_detector = self.large_object_detection
                 if method == "ekya_style_centralized_scheduling":
                     self.display_object_detection = Object_Detection(
                         _baseline_display_detector_config(config),
                         type="small inference",
                     )
-                    display_detector = self.display_object_detection
-                inference_fn = _baseline_cloud_inference_adapter(
-                    display_detector,
-                    self.large_object_detection,
-                )
+                    inference_fn = _ekya_cloud_inference_adapter(
+                        display_detector=self.display_object_detection,
+                        teacher_detector=self.large_object_detection,
+                    )
+                else:
+                    inference_fn = _teacher_annotation_inference_adapter(
+                        self.large_object_detection,
+                    )
             self.baseline_controller = DistributedBaselineController(
                 baseline_method=method,
                 run_id=resolved_run_id,
@@ -117,8 +119,8 @@ class CloudServer:
             if edge_affine is None or not bool(getattr(edge_affine, "enabled", False)):
                 raise ValueError(
                     "Main-mode cloud continual learning requires "
-                    "server.edge_affine_workers.enabled=true. The fixed-split "
-                    "fallback has been removed."
+                    "server.edge_affine_workers.enabled=true; the fixed-split "
+                    "runtime path is no longer supported."
                 )
             self._init_edge_affine_backend(edge_affine)
 
@@ -269,26 +271,40 @@ class CloudServer:
             training_job_manager.close()
 
 
-def _baseline_cloud_inference_adapter(display_detector, teacher_detector=None):
+def _ekya_cloud_inference_adapter(*, display_detector, teacher_detector):
     def infer(raw_frame: bytes, *, threshold=None, purpose: str = "display") -> dict:
         frame = _decode_frame(raw_frame)
         if frame is None:
             return {"boxes": [], "labels": [], "scores": [], "confidence": 0.0}
-        detector = (
-            teacher_detector
-            if str(purpose or "display") == "annotation" and teacher_detector is not None
-            else display_detector
-        )
-        boxes, labels, scores = detector.large_inference(frame, threshold=threshold)
-        scores_list = _jsonable_list(scores)
-        return {
-            "boxes": _jsonable_list(boxes),
-            "labels": _jsonable_list(labels),
-            "scores": scores_list,
-            "confidence": max((_safe_float(score) for score in scores_list), default=0.0),
-        }
+        if str(purpose or "display") == "annotation":
+            boxes, labels, scores = teacher_detector.large_inference(frame, threshold=threshold)
+        else:
+            _unused, boxes, labels, scores = display_detector.small_inference(frame)
+        return _prediction_payload(boxes, labels, scores)
 
     return infer
+
+
+def _teacher_annotation_inference_adapter(teacher_detector):
+    def infer(raw_frame: bytes, *, threshold=None, purpose: str = "annotation") -> dict:
+        del purpose
+        frame = _decode_frame(raw_frame)
+        if frame is None:
+            return {"boxes": [], "labels": [], "scores": [], "confidence": 0.0}
+        boxes, labels, scores = teacher_detector.large_inference(frame, threshold=threshold)
+        return _prediction_payload(boxes, labels, scores)
+
+    return infer
+
+
+def _prediction_payload(boxes, labels, scores) -> dict:
+    scores_list = _jsonable_list(scores)
+    return {
+        "boxes": _jsonable_list(boxes),
+        "labels": _jsonable_list(labels),
+        "scores": scores_list,
+        "confidence": max((_safe_float(score) for score in scores_list), default=0.0),
+    }
 
 
 def _baseline_display_detector_config(config):

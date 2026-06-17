@@ -1341,6 +1341,9 @@ def test_cloud_server_loads_lightweight_display_detector_only_for_ekya(
                 assert _config.lightweight == "rfdetr_nano"
             created_detectors.append(str(type))
 
+        def small_inference(self, _frame):
+            return None, [], [], []
+
         def large_inference(self, _frame, *, threshold=None):
             del threshold
             return [], [], []
