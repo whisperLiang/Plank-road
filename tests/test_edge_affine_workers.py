@@ -1337,6 +1337,8 @@ def test_cloud_server_loads_lightweight_display_detector_only_for_ekya(
 
     class FakeDetector:
         def __init__(self, _config, type):
+            if str(type) == "small inference":
+                assert _config.lightweight == "rfdetr_nano"
             created_detectors.append(str(type))
 
         def large_inference(self, _frame, *, threshold=None):

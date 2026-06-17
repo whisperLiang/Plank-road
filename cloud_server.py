@@ -2,6 +2,7 @@ import argparse
 import os
 from concurrent import futures
 from pathlib import Path
+from types import SimpleNamespace
 
 if __name__ == "__main__":
     from common.cuda_visibility import configure_default_cuda_visible_devices
@@ -87,7 +88,7 @@ class CloudServer:
                 display_detector = self.large_object_detection
                 if method == "ekya_style_centralized_scheduling":
                     self.display_object_detection = Object_Detection(
-                        config,
+                        _baseline_display_detector_config(config),
                         type="small inference",
                     )
                     display_detector = self.display_object_detection
@@ -288,6 +289,17 @@ def _baseline_cloud_inference_adapter(display_detector, teacher_detector=None):
         }
 
     return infer
+
+
+def _baseline_display_detector_config(config):
+    values = dict(getattr(config, "__dict__", {}) or {})
+    extras = values.pop("_extras", {})
+    if isinstance(extras, dict):
+        values.update({key: value for key, value in extras.items() if key not in values})
+    values["lightweight"] = str(
+        getattr(config, "edge_model_name", getattr(config, "lightweight", "")) or ""
+    )
+    return SimpleNamespace(**values)
 
 
 def _decode_frame(raw_frame: bytes):
