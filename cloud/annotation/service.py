@@ -39,14 +39,6 @@ class TeacherAnnotationService:
             1 for result in results if result.status == TeacherAnnotationStatus.CACHE_HIT
         )
         cache_misses = len(results) - cache_hits
-        logger.info(
-            "[TeacherAnnotation][CacheHit] requested_samples={} cache_hits={} "
-            "cache_misses={} cache_read_time={:.3f}s",
-            len(requested),
-            cache_hits,
-            cache_misses,
-            cache_read_time,
-        )
         if cache_misses:
             logger.info(
                 "[TeacherAnnotation][CacheMiss] requested_samples={} cache_misses={}",
@@ -98,16 +90,17 @@ class TeacherAnnotationService:
             for result in lookup.results
             if result.status == TeacherAnnotationStatus.CACHE_HIT
         ] + worker_results
-        logger.info(
-            "[TeacherAnnotation][Submit] requested_samples={} cache_hits={} cache_misses={} "
-            "submitted={} duplicate={} failed_count={}",
-            len(requested),
-            lookup.cache_hits,
-            lookup.cache_misses,
-            submitted,
-            duplicate,
-            failed_count,
-        )
+        if lookup.cache_misses or submitted or failed_count:
+            logger.info(
+                "[TeacherAnnotation][Submit] requested_samples={} cache_hits={} cache_misses={} "
+                "submitted={} duplicate={} failed_count={}",
+                len(requested),
+                lookup.cache_hits,
+                lookup.cache_misses,
+                submitted,
+                duplicate,
+                failed_count,
+            )
         return TeacherAnnotationSubmitResult(
             requested_samples=len(requested),
             cache_hits=lookup.cache_hits,
@@ -225,27 +218,34 @@ class TeacherAnnotationService:
             results=results,
             unresolved_requests=unresolved_requests,
         )
-        logger.info(
-            "[TeacherAnnotation][Ensure] requested={} cache_hits={} cache_misses={} "
-            "submitted={} waited_sec={:.3f} unresolved={} "
-            "teacher_batch_size={} teacher_batches={} batch_fallback_count={} "
-            "oom_retry_count={} failed_count={} annotation_time={:.3f}s "
-            "cache_read_time={:.3f}s cache_write_time={:.3f}s",
-            ensure_result.requested_samples,
-            ensure_result.cache_hits,
-            ensure_result.cache_misses,
-            ensure_result.submitted,
-            ensure_result.waited_sec,
-            ensure_result.unresolved_count,
-            ensure_result.teacher_batch_size,
-            ensure_result.teacher_batches,
-            ensure_result.batch_fallback_count,
-            ensure_result.oom_retry_count,
-            ensure_result.failed_count,
-            ensure_result.annotation_time,
-            ensure_result.cache_read_time,
-            ensure_result.cache_write_time,
-        )
+        if (
+            ensure_result.cache_misses
+            or ensure_result.submitted
+            or ensure_result.unresolved_count
+            or ensure_result.failed_count
+            or ensure_result.oom_retry_count
+        ):
+            logger.info(
+                "[TeacherAnnotation][Ensure] requested={} cache_hits={} cache_misses={} "
+                "submitted={} waited_sec={:.3f} unresolved={} "
+                "teacher_batch_size={} teacher_batches={} batch_fallback_count={} "
+                "oom_retry_count={} failed_count={} annotation_time={:.3f}s "
+                "cache_read_time={:.3f}s cache_write_time={:.3f}s",
+                ensure_result.requested_samples,
+                ensure_result.cache_hits,
+                ensure_result.cache_misses,
+                ensure_result.submitted,
+                ensure_result.waited_sec,
+                ensure_result.unresolved_count,
+                ensure_result.teacher_batch_size,
+                ensure_result.teacher_batches,
+                ensure_result.batch_fallback_count,
+                ensure_result.oom_retry_count,
+                ensure_result.failed_count,
+                ensure_result.annotation_time,
+                ensure_result.cache_read_time,
+                ensure_result.cache_write_time,
+            )
         if ensure_result.unresolved_count:
             logger.warning(
                 "[TeacherAnnotation][Ensure] unresolved_count={}.",

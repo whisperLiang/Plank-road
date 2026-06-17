@@ -3,7 +3,13 @@ import subprocess
 import psutil
 from loguru import logger
 
-from baselines.distributed.messages import BaselineFramePayload, json_dumps, json_loads
+from baselines.distributed.messages import (
+    BaselineFramePayload,
+    BaselineWindowPayload,
+    BaselineWindowSample,
+    json_dumps,
+    json_loads,
+)
 from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from grpc_server.continual_backends import DisabledContinualLearningBackend
@@ -240,6 +246,22 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
     def UploadKeyFrame(self, request, context):
         return self._upload_baseline_frame(request, expected_keyframe=True)
 
+    def UploadAccuracyTriggerWindow(self, request, context):
+        del context
+        if self.baseline_controller is None:
+            return self._baseline_not_configured()
+        try:
+            result = self.baseline_controller.upload_accuracy_trigger_window(
+                _baseline_window_from_request(request)
+            )
+            return message_transmission_pb2.BaselineAck(
+                success=bool(result.get("accepted", True)),
+                message=str(result.get("message", "window accepted")),
+            )
+        except Exception as exc:
+            self._log_failure("UploadAccuracyTriggerWindow", exc)
+            return message_transmission_pb2.BaselineAck(success=False, message=str(exc))
+
     def UploadPrediction(self, request, context):
         if self.baseline_controller is None:
             return self._baseline_not_configured()
@@ -337,6 +359,35 @@ def _baseline_frame_from_request(request) -> BaselineFramePayload:
         feature_ref=json_loads(request.feature_ref_json),
         metrics_ref=request.metrics_ref,
         job_id=request.job_id,
+    )
+
+
+def _baseline_window_from_request(request) -> BaselineWindowPayload:
+    return BaselineWindowPayload(
+        run_id=request.run_id,
+        baseline_method=request.baseline_method,
+        edge_id=int(request.edge_id),
+        model_name=request.model_name,
+        model_version=request.model_version,
+        video_source=request.video_source,
+        window_id=request.window_id,
+        window_start_frame_id=int(request.window_start_frame_id),
+        window_end_frame_id=int(request.window_end_frame_id),
+        timestamp_ms=int(request.timestamp_ms),
+        selected_samples=tuple(
+            BaselineWindowSample(
+                frame_id=int(sample.frame_id),
+                timestamp_ms=int(sample.timestamp_ms),
+                raw_frame=bytes(sample.raw_frame or b""),
+                edge_prediction=json_loads(sample.edge_prediction_json),
+                confidence=float(sample.confidence),
+                entropy=float(sample.entropy),
+                quality_metadata=json_loads(sample.quality_metadata_json),
+                upload_mode=sample.upload_mode,
+                is_keyframe=bool(sample.is_keyframe),
+            )
+            for sample in list(request.selected_samples)
+        ),
     )
 
 

@@ -66,6 +66,7 @@ class CloudBatchTeacherAnnotator:
         ) / "raw_frame_inputs"
         self._owned_worker = owned_worker
         self.manages_gpu_lease = bool(manages_gpu_lease)
+        self.last_ensure_result = None
 
     def close(self) -> None:
         stop = getattr(self._owned_worker, "stop", None)
@@ -81,6 +82,7 @@ class CloudBatchTeacherAnnotator:
         sample_list = [_coerce_sample(sample) for sample in list(samples or [])]
         sample_list = [sample for sample in sample_list if sample.raw_frame]
         if not sample_list:
+            self.last_ensure_result = None
             return {}
 
         annotation_threshold = (
@@ -91,12 +93,14 @@ class CloudBatchTeacherAnnotator:
             threshold=annotation_threshold,
         )
         if not requests:
+            self.last_ensure_result = None
             return {}
         result = self.service.ensure_many(
             requests,
             wait=True,
             timeout_sec=self.wait_timeout_sec,
         )
+        self.last_ensure_result = result
         labels = {
             str(sample_id): dict(value)
             for sample_id, value in result.labels_by_sample_id.items()

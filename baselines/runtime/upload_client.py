@@ -10,7 +10,12 @@ from typing import Any, Iterable, Mapping
 import cv2
 import grpc
 
-from baselines.distributed.messages import BaselineFramePayload, json_dumps, json_loads
+from baselines.distributed.messages import (
+    BaselineFramePayload,
+    BaselineWindowPayload,
+    json_dumps,
+    json_loads,
+)
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from tools.grpc_options import grpc_message_options
 
@@ -151,6 +156,11 @@ class BaselineUploadClient:
         if not bool(reply.success):
             raise RuntimeError(reply.message)
 
+    def upload_accuracy_trigger_window(self, payload: BaselineWindowPayload) -> None:
+        reply = self.stub.UploadAccuracyTriggerWindow(_window_payload_to_proto(payload))
+        if not bool(reply.success):
+            raise RuntimeError(reply.message)
+
     def poll_command(
         self,
         *,
@@ -214,6 +224,7 @@ class BaselineUploadClient:
             )
         )
 
+
 def _frame_payload_to_proto(payload: BaselineFramePayload):
     return message_transmission_pb2.BaselineFrameRequest(
         run_id=payload.run_id,
@@ -237,4 +248,33 @@ def _frame_payload_to_proto(payload: BaselineFramePayload):
         feature_ref_json=json_dumps(payload.feature_ref),
         metrics_ref=payload.metrics_ref,
         job_id=payload.job_id,
+    )
+
+
+def _window_payload_to_proto(payload: BaselineWindowPayload):
+    return message_transmission_pb2.BaselineWindowRequest(
+        run_id=payload.run_id,
+        baseline_method=payload.baseline_method,
+        edge_id=int(payload.edge_id),
+        model_name=payload.model_name,
+        model_version=payload.model_version,
+        video_source=payload.video_source,
+        window_id=payload.window_id,
+        window_start_frame_id=int(payload.window_start_frame_id),
+        window_end_frame_id=int(payload.window_end_frame_id),
+        timestamp_ms=int(payload.timestamp_ms),
+        selected_samples=[
+            message_transmission_pb2.BaselineWindowSample(
+                frame_id=int(sample.frame_id),
+                timestamp_ms=int(sample.timestamp_ms),
+                raw_frame=bytes(sample.raw_frame or b""),
+                edge_prediction_json=json_dumps(sample.edge_prediction),
+                confidence=float(sample.confidence),
+                entropy=float(sample.entropy),
+                quality_metadata_json=json_dumps(sample.quality_metadata),
+                upload_mode=str(sample.upload_mode or ""),
+                is_keyframe=bool(sample.is_keyframe),
+            )
+            for sample in payload.selected_samples
+        ],
     )

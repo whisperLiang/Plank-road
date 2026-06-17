@@ -7,7 +7,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from baselines.distributed.messages import BaselineFramePayload, now_ms
+from loguru import logger
+
+from baselines.distributed.messages import BaselineWindowPayload, BaselineWindowSample, now_ms
 from baselines.runtime.training_state import stable_window_id
 from cloud.baselines.detection_agreement import teacher_f1
 
@@ -32,9 +34,10 @@ class AccuracyTriggerFrame:
     is_keyframe: bool
 
     @classmethod
-    def from_payload(
+    def from_window_sample(
         cls,
-        payload: BaselineFramePayload,
+        payload: BaselineWindowPayload,
+        sample: BaselineWindowSample,
         *,
         teacher_prediction: Mapping[str, Any],
     ) -> "AccuracyTriggerFrame":
@@ -42,16 +45,16 @@ class AccuracyTriggerFrame:
             run_id=str(payload.run_id),
             baseline_method=str(payload.baseline_method),
             edge_id=int(payload.edge_id),
-            frame_id=int(payload.frame_id),
-            timestamp_ms=int(payload.timestamp_ms),
+            frame_id=int(sample.frame_id),
+            timestamp_ms=int(sample.timestamp_ms),
             model_name=str(payload.model_name or ""),
             model_version=str(payload.model_version or "0"),
             video_source=str(payload.video_source or ""),
-            raw_frame=bytes(payload.raw_frame or b""),
-            edge_prediction=dict(payload.edge_prediction or {}),
+            raw_frame=bytes(sample.raw_frame or b""),
+            edge_prediction=dict(sample.edge_prediction or {}),
             teacher_prediction=dict(teacher_prediction or {}),
-            quality_metadata=dict(payload.quality_metadata or {}),
-            is_keyframe=bool(payload.is_keyframe),
+            quality_metadata=dict(sample.quality_metadata or {}),
+            is_keyframe=bool(sample.is_keyframe),
         )
 
     def to_training_sample(self) -> dict[str, Any]:
@@ -164,7 +167,6 @@ class AccuracyTriggerCommandRecord:
 
 @dataclass
 class _ModelAccuracyState:
-    current_window: list[AccuracyTriggerFrame] = field(default_factory=list)
     history: list[float] = field(default_factory=list)
     buffer_samples: list[AccuracyTriggerFrame] = field(default_factory=list)
     buffer_sample_windows: dict[int, str] = field(default_factory=dict)
@@ -212,27 +214,50 @@ class AccuracyTriggerController:
         self._commands: dict[str, AccuracyTriggerCommandRecord] = {}
         self._command_by_job: dict[str, str] = {}
 
-    def add_frame(
+    def add_window(
         self,
-        payload: BaselineFramePayload,
+        payload: BaselineWindowPayload,
         *,
-        teacher_prediction: Mapping[str, Any],
+        teacher_predictions: Mapping[str, Mapping[str, Any]],
     ) -> AccuracyTriggerSubmission | None:
-        if str(payload.baseline_method) != _METHOD or not payload.raw_frame:
+        if str(payload.baseline_method) != _METHOD:
             return None
-        frame = AccuracyTriggerFrame.from_payload(
-            payload,
-            teacher_prediction=teacher_prediction,
+        frames = tuple(
+            AccuracyTriggerFrame.from_window_sample(
+                payload,
+                sample,
+                teacher_prediction=teacher_predictions.get(str(int(sample.frame_id)), {}),
+            )
+            for sample in payload.selected_samples
+            if sample.raw_frame
         )
-        key = _model_key(frame.run_id, frame.edge_id, frame.model_name, frame.model_version)
+        if not frames:
+            return None
+        key = _model_key(
+            payload.run_id,
+            int(payload.edge_id),
+            payload.model_name,
+            payload.model_version,
+        )
+        window_id = str(payload.window_id or "")
+        if not window_id:
+            window_id = stable_window_id(
+                run_id=key[0],
+                baseline_method=_METHOD,
+                training_strategy=self.training_strategy,
+                trainable_param_ratio=self.trainable_param_ratio,
+                edge_id=key[1],
+                model_version=key[3],
+                frame_ids=[sample.frame_id for sample in frames],
+            )
         with self._lock:
             state = self._states.setdefault(key, _ModelAccuracyState())
-            state.current_window.append(frame)
-            if len(state.current_window) < self.trigger_window_size:
-                return None
-            window_samples = tuple(state.current_window[: self.trigger_window_size])
-            state.current_window = state.current_window[self.trigger_window_size :]
-            return self._close_window_locked(key, state, window_samples)
+            return self._close_window_locked(
+                key,
+                state,
+                frames,
+                window_id=window_id,
+            )
 
     def record_submission_result(
         self,
@@ -260,18 +285,73 @@ class AccuracyTriggerController:
                 submitted_at_ms=now_ms(),
             )
             state.pending_jobs[str(job_id)] = pending
-            command_id = f"accuracy-trigger-{submission.edge_id}-{job_id}"
-            self._command_by_job[str(job_id)] = command_id
-            self._commands[command_id] = AccuracyTriggerCommandRecord(
-                command_id=command_id,
-                run_id=str(submission.run_id),
-                edge_id=int(submission.edge_id),
-                job_id=str(job_id),
-                window_id=str(submission.window_id),
-                base_model_version=str(submission.model_version or "0"),
-                frame_ids=tuple(int(value) for value in submission.training_frame_ids),
-                created_at_ms=now_ms(),
+            logger.info(
+                "accuracy_trigger_training_update edge={} window={} status=submitted "
+                "job_id={}",
+                submission.edge_id,
+                submission.window_id,
+                job_id,
             )
+
+    def pending_training_jobs(
+        self,
+        *,
+        edge_id: int | None = None,
+    ) -> tuple[AccuracyTriggerPendingJob, ...]:
+        with self._lock:
+            pending_jobs: list[AccuracyTriggerPendingJob] = []
+            for state in self._states.values():
+                for pending in state.pending_jobs.values():
+                    if edge_id is not None and int(pending.model_key[1]) != int(edge_id):
+                        continue
+                    status = str(pending.status or "").upper()
+                    if status in _TERMINAL_FAILURES | {"SUCCEEDED"}:
+                        continue
+                    pending_jobs.append(pending)
+            return tuple(pending_jobs)
+
+    def record_training_job_status(
+        self,
+        *,
+        edge_id: int,
+        job_id: str,
+        status: str,
+        result_available: bool = False,
+        result_model_version: str = "",
+        message: str = "",
+    ) -> None:
+        normalized = str(status or "").upper()
+        with self._lock:
+            pending = self._resolve_pending_locked(command=None, job_id=job_id)
+            if pending is None or int(pending.model_key[1]) != int(edge_id):
+                return
+            if normalized in {"", "QUEUED", "RUNNING"}:
+                pending.status = normalized or pending.status
+                pending.message = str(message or "")
+                return
+            if normalized == "SUCCEEDED" and bool(result_available):
+                pending.status = "UPDATE_READY"
+                pending.result_model_version = str(result_model_version or "")
+                pending.message = str(message or "")
+                pending.finished_at_ms = now_ms()
+                logger.info(
+                    "accuracy_trigger_training_update edge={} window={} status=succeeded "
+                    "job_id={} model_version={}",
+                    edge_id,
+                    pending.window_id,
+                    job_id,
+                    pending.result_model_version,
+                )
+                self._create_model_update_command_locked(pending)
+                return
+            if normalized == "SUCCEEDED":
+                pending.status = "SUCCEEDED_WAITING_RESULT"
+                pending.message = str(message or "")
+                return
+            if normalized in _TERMINAL_FAILURES:
+                pending.status = normalized
+                pending.message = str(message or "")
+                pending.finished_at_ms = now_ms()
 
     def poll_commands(self, *, run_id: str, edge_id: int) -> list[dict[str, Any]]:
         current_ms = now_ms()
@@ -345,6 +425,14 @@ class AccuracyTriggerController:
             pending.status = "SUCCEEDED"
             pending.result_model_version = str(result_model_version or "")
             pending.finished_at_ms = now_ms()
+            logger.info(
+                "accuracy_trigger_training_update edge={} window={} status=applied "
+                "job_id={} model_version={}",
+                edge_id,
+                pending.window_id,
+                pending.job_id,
+                pending.result_model_version,
+            )
             self._states.pop(pending.model_key, None)
 
     def mark_job_terminal(
@@ -420,6 +508,8 @@ class AccuracyTriggerController:
         key: tuple[str, int, str, str],
         state: _ModelAccuracyState,
         samples: tuple[AccuracyTriggerFrame, ...],
+        *,
+        window_id: str,
     ) -> AccuracyTriggerSubmission | None:
         accuracy = self._window_accuracy(samples)
         mean, std = _weighted_stats(state.history, decay=self.history_decay)
@@ -430,15 +520,6 @@ class AccuracyTriggerController:
             for pending in state.pending_jobs.values()
         )
         triggered = bool(history_ready and not active_pending and threshold > accuracy)
-        window_id = stable_window_id(
-            run_id=key[0],
-            baseline_method=_METHOD,
-            training_strategy=self.training_strategy,
-            trainable_param_ratio=self.trainable_param_ratio,
-            edge_id=key[1],
-            model_version=key[3],
-            frame_ids=[sample.frame_id for sample in samples],
-        )
         window = AccuracyTriggerWindow(
             window_id=window_id,
             samples=samples,
@@ -452,6 +533,17 @@ class AccuracyTriggerController:
         state.history.append(float(accuracy))
         self._append_buffer_samples_locked(state, window)
         state.last_decision = window
+        logger.info(
+            "accuracy_trigger_window_decision edge={} window={} accuracy={:.4f} "
+            "history_mean={:.4f} threshold={:.4f} triggered={} buffer_size={}",
+            key[1],
+            window_id,
+            accuracy,
+            mean,
+            threshold,
+            triggered,
+            len(state.buffer_samples),
+        )
         if not triggered:
             return None
         training_samples = tuple(state.buffer_samples)
@@ -470,6 +562,34 @@ class AccuracyTriggerController:
             history_std_accuracy=std,
             accuracy_drop_threshold=threshold,
             buffered_window_count=prior_buffered_window_count,
+        )
+
+    def _create_model_update_command_locked(
+        self,
+        pending: AccuracyTriggerPendingJob,
+    ) -> None:
+        if str(pending.job_id) in self._command_by_job:
+            return
+        command_id = f"accuracy-trigger-{pending.model_key[1]}-{pending.job_id}"
+        self._command_by_job[str(pending.job_id)] = command_id
+        self._commands[command_id] = AccuracyTriggerCommandRecord(
+            command_id=command_id,
+            run_id=str(pending.model_key[0]),
+            edge_id=int(pending.model_key[1]),
+            job_id=str(pending.job_id),
+            window_id=str(pending.window_id),
+            base_model_version=str(pending.base_model_version or "0"),
+            frame_ids=tuple(int(value) for value in pending.frame_ids),
+            result_model_version=str(pending.result_model_version or ""),
+            created_at_ms=now_ms(),
+        )
+        logger.info(
+            "accuracy_trigger_training_update edge={} window={} status=command_created "
+            "job_id={} model_version={}",
+            pending.model_key[1],
+            pending.window_id,
+            pending.job_id,
+            pending.result_model_version,
         )
 
     def _window_accuracy(self, samples: tuple[AccuracyTriggerFrame, ...]) -> float:

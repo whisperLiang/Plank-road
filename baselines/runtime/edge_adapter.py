@@ -7,12 +7,13 @@ from typing import Any
 
 from loguru import logger
 
-from baselines.distributed.messages import BaselineFramePayload, now_ms
+from baselines.distributed.messages import BaselineFramePayload, BaselineWindowPayload, now_ms
 from baselines.distributed.metrics import DistributedMetricsWriter
 from baselines.runtime.policies import create_policy
 from baselines.runtime.training_state import (
     BaselineActiveTrainingJob,
     BaselineTrainingState,
+    stable_window_id,
 )
 from baselines.runtime.upload_client import (
     BaselineUploadClient,
@@ -64,14 +65,26 @@ class BaselineEdgeAdapter:
         self._edge = None
         self._registered = False
         self._closed = threading.Event()
-        self._queue: Queue[BaselineFramePayload] = Queue()
+        self._queue: Queue[BaselineFramePayload | BaselineWindowPayload] = Queue()
         self._worker: threading.Thread | None = None
+        self._accuracy_window_buffer: list[BaselineFramePayload] = []
+        self._accuracy_window_lock = threading.Lock()
         self._cloud_scheduled_active_job: BaselineActiveTrainingJob | None = None
         self._known_cloud_scheduled_job_ids: set[str] = set()
         self._acked_command_ids: set[str] = set()
         self._last_command_poll_at = 0.0
         self._training_config = _training_config_dict(getattr(baseline_cfg, "training", None))
         self._training_config["trainable_param_ratio"] = self.trainable_param_ratio
+        self._accuracy_window_size = max(
+            1,
+            int(
+                getattr(
+                    method_cfg,
+                    "trigger_window_size",
+                    self._training_config.get("training_window_size", 8),
+                )
+            ),
+        )
         self._training_state = BaselineTrainingState(
             run_id=self.run_id,
             baseline_method=self.baseline_method,
@@ -175,7 +188,10 @@ class BaselineEdgeAdapter:
             result_source=edge_prediction["result_source"],
         )
         if decision.upload_frame and self.transport is not None:
-            self._queue.put(payload)
+            if self.baseline_method == "accuracy_trigger_cloud_retraining":
+                self._buffer_accuracy_trigger_payload(payload)
+            else:
+                self._queue.put(payload)
 
     def on_unsampled_frame(self, *, frame, frame_index: int, latest_visual: dict[str, Any]) -> None:
         del frame, frame_index, latest_visual
@@ -184,8 +200,18 @@ class BaselineEdgeAdapter:
         return local_visual
 
     def close(self) -> None:
-        self._closed.set()
         worker = self._worker
+        if self.baseline_method == "accuracy_trigger_cloud_retraining":
+            self._flush_accuracy_trigger_window_buffer(
+                inline=not (worker is not None and worker.is_alive())
+            )
+        if (
+            worker is not None
+            and worker.is_alive()
+            and threading.current_thread() is not worker
+        ):
+            self._queue.join()
+        self._closed.set()
         if worker is not None and worker.is_alive():
             worker.join(timeout=5.0)
         if self.transport is not None and hasattr(self.transport, "close"):
@@ -202,11 +228,12 @@ class BaselineEdgeAdapter:
                 self._process_payload(payload)
             except Exception as exc:
                 logger.warning("[BaselineAdapter] async payload handling failed: {}", exc)
-                self.metrics.record(
-                    "async_payload_failed",
-                    frame_id=int(payload.frame_id),
-                    message=str(exc),
-                )
+                failure_metadata: dict[str, Any] = {"message": str(exc)}
+                if isinstance(payload, BaselineWindowPayload):
+                    failure_metadata["window_id"] = payload.window_id
+                else:
+                    failure_metadata["frame_id"] = int(payload.frame_id)
+                self.metrics.record("async_payload_failed", **failure_metadata)
             finally:
                 self._queue.task_done()
             self._poll_active_training()
@@ -217,8 +244,70 @@ class BaselineEdgeAdapter:
         if not self._registered and hasattr(self.transport, "register_edge"):
             self.transport.register_edge(payload=payload)
             self._registered = True
+        if isinstance(payload, BaselineWindowPayload):
+            if not hasattr(self.transport, "upload_accuracy_trigger_window"):
+                raise RuntimeError("transport does not support Accuracy-Trigger window upload")
+            self.transport.upload_accuracy_trigger_window(payload)
+            self.metrics.record(
+                "accuracy_trigger_window_uploaded",
+                window_id=payload.window_id,
+                selected_count=len(payload.selected_samples),
+                window_start_frame_id=int(payload.window_start_frame_id),
+                window_end_frame_id=int(payload.window_end_frame_id),
+            )
+            return
         self.transport.upload_frame(payload)
         self.metrics.record("frame_uploaded", frame_id=int(payload.frame_id))
+
+    def _buffer_accuracy_trigger_payload(self, payload: BaselineFramePayload) -> None:
+        ready_windows: list[tuple[BaselineFramePayload, ...]] = []
+        with self._accuracy_window_lock:
+            if self._accuracy_window_buffer and not _same_accuracy_window_lineage(
+                self._accuracy_window_buffer[0],
+                payload,
+            ):
+                ready_windows.append(tuple(self._accuracy_window_buffer))
+                self._accuracy_window_buffer.clear()
+            self._accuracy_window_buffer.append(payload)
+            if len(self._accuracy_window_buffer) >= self._accuracy_window_size:
+                ready_windows.append(
+                    tuple(self._accuracy_window_buffer[: self._accuracy_window_size])
+                )
+                del self._accuracy_window_buffer[: self._accuracy_window_size]
+        for ready_payloads in ready_windows:
+            self._queue.put(self._accuracy_window_payload(ready_payloads))
+
+    def _flush_accuracy_trigger_window_buffer(self, *, inline: bool) -> None:
+        with self._accuracy_window_lock:
+            if not self._accuracy_window_buffer:
+                return
+            payloads = tuple(self._accuracy_window_buffer)
+            self._accuracy_window_buffer.clear()
+        window_payload = self._accuracy_window_payload(payloads)
+        if inline:
+            self._process_payload(window_payload)
+        else:
+            self._queue.put(window_payload)
+
+    def _accuracy_window_payload(
+        self,
+        payloads: tuple[BaselineFramePayload, ...],
+    ) -> BaselineWindowPayload:
+        frame_ids = [int(payload.frame_id) for payload in payloads]
+        first = payloads[0]
+        window_id = stable_window_id(
+            run_id=first.run_id,
+            baseline_method=first.baseline_method,
+            training_strategy=self.training_strategy,
+            trainable_param_ratio=self.trainable_param_ratio,
+            edge_id=int(first.edge_id),
+            model_version=str(first.model_version or "0"),
+            frame_ids=frame_ids,
+        )
+        return BaselineWindowPayload.from_frame_payloads(
+            window_id=window_id,
+            payloads=payloads,
+        )
 
     def _poll_active_training(self) -> None:
         if self.baseline_method == "accuracy_trigger_cloud_retraining":
@@ -521,6 +610,20 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _same_accuracy_window_lineage(
+    left: BaselineFramePayload,
+    right: BaselineFramePayload,
+) -> bool:
+    return (
+        str(left.run_id) == str(right.run_id)
+        and str(left.baseline_method) == str(right.baseline_method)
+        and int(left.edge_id) == int(right.edge_id)
+        and str(left.model_name or "") == str(right.model_name or "")
+        and str(left.model_version or "0") == str(right.model_version or "0")
+        and str(left.video_source or "") == str(right.video_source or "")
+    )
 
 
 def _training_config_dict(config: object | None) -> dict[str, Any]:

@@ -7,6 +7,7 @@ from dataclasses import replace
 import cv2
 import numpy as np
 import pytest
+from loguru import logger
 
 from cloud.annotation import (
     CloudBatchTeacherAnnotator,
@@ -68,6 +69,28 @@ def test_cache_hit_does_not_submit_to_worker(tmp_path) -> None:
     assert result.cache_hits == 1
     assert result.submitted == 0
     assert result.labels_by_sample_id["sample-1"] == {"boxes": [], "labels": []}
+
+
+def test_cache_hit_does_not_emit_info_log(tmp_path) -> None:
+    cache = TeacherLabelCache(str(tmp_path / "cache"))
+    req = _request(tmp_path)
+    cache.write(req, {"boxes": [], "labels": []}, source="test")
+    service = TeacherAnnotationService(label_cache=cache)
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda message: messages.append(str(message)),
+        level="INFO",
+        format="{message}",
+    )
+    try:
+        result = service.ensure_many([req], wait=True, timeout_sec=0.01)
+    finally:
+        logger.remove(sink_id)
+
+    assert result.cache_hits == 1
+    combined = "\n".join(messages)
+    assert "[TeacherAnnotation][CacheHit]" not in combined
+    assert "[TeacherAnnotation][Ensure]" not in combined
 
 
 def test_cache_miss_submits_worker_and_stays_unresolved_until_worker_finishes(tmp_path) -> None:

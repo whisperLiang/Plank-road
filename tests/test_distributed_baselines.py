@@ -67,6 +67,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
 class RecordingTransport:
     def __init__(self) -> None:
         self.uploaded: list[BaselineFramePayload] = []
+        self.uploaded_windows: list[object] = []
         self.inference_requests: list[int] = []
         self.training_requests: list[dict[str, object]] = []
         self.registered: BaselineFramePayload | None = None
@@ -79,6 +80,9 @@ class RecordingTransport:
 
     def upload_frame(self, payload: BaselineFramePayload) -> None:
         self.uploaded.append(payload)
+
+    def upload_accuracy_trigger_window(self, payload) -> None:
+        self.uploaded_windows.append(payload)
 
     def get_training_job_status(self, *, edge_id: int, job_id: str):
         del edge_id, job_id
@@ -396,27 +400,104 @@ def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_pa
             detection_score=[],
             latency_ms=1.0,
         )
-        _wait_until(lambda: len(transport.uploaded) == 1)
+        time.sleep(0.1)
 
-        payload = transport.uploaded[0]
-        assert payload.frame_id == 2
-        assert payload.edge_prediction["boxes"] == [[1, 2, 3, 4]]
-        assert payload.confidence == pytest.approx(0.9)
-        assert payload.entropy == pytest.approx(0.25)
-        assert payload.quality_metadata["training_strategy"] == "freeze"
+        assert transport.uploaded == []
+        assert transport.uploaded_windows == []
+        adapter.close()
+        assert len(transport.uploaded_windows) == 1
+        window = transport.uploaded_windows[0]
+        assert [sample.frame_id for sample in window.selected_samples] == [2]
+        sample = window.selected_samples[0]
+        assert sample.edge_prediction["boxes"] == [[1, 2, 3, 4]]
+        assert sample.confidence == pytest.approx(0.9)
+        assert sample.entropy == pytest.approx(0.25)
+        assert sample.quality_metadata["training_strategy"] == "freeze"
         assert transport.training_requests == []
+    finally:
+        adapter.close()
 
+
+def test_accuracy_adapter_flushes_buffer_on_model_version_change(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 8
+    transport = RecordingTransport()
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="acc-run",
+        edge_id=2,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    try:
+        adapter.before_video_start(FakeEdge())
         adapter.on_sampled_inference_result(
             frame=frame,
-            frame_index=2,
+            frame_index=1,
             task=FakeTask(source="inference", model_version="0"),
             detection_boxes=[],
             detection_class=[],
             detection_score=[],
             latency_ms=1.0,
         )
-        time.sleep(0.1)
-        assert transport.training_requests == []
+        adapter.on_sampled_inference_result(
+            frame=frame,
+            frame_index=2,
+            task=FakeTask(source="inference", model_version="1"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+
+        _wait_until(lambda: len(transport.uploaded_windows) == 1)
+        first = transport.uploaded_windows[0]
+        assert first.model_version == "0"
+        assert [sample.frame_id for sample in first.selected_samples] == [1]
+
+        adapter.close()
+        assert len(transport.uploaded_windows) == 2
+        second = transport.uploaded_windows[1]
+        assert second.model_version == "1"
+        assert [sample.frame_id for sample in second.selected_samples] == [2]
+    finally:
+        adapter.close()
+
+
+def test_accuracy_adapter_close_drains_queued_windows_before_partial_flush(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 2
+    transport = RecordingTransport()
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="acc-run",
+        edge_id=2,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    try:
+        adapter.before_video_start(FakeEdge())
+        for frame_index in (1, 2, 3):
+            adapter.on_sampled_inference_result(
+                frame=frame,
+                frame_index=frame_index,
+                task=FakeTask(source="inference", model_version="0"),
+                detection_boxes=[],
+                detection_class=[],
+                detection_score=[],
+                latency_ms=1.0,
+            )
+
+        adapter.close()
+
+        assert [
+            [sample.frame_id for sample in window.selected_samples]
+            for window in transport.uploaded_windows
+        ] == [[1, 2], [3]]
     finally:
         adapter.close()
 
@@ -424,6 +505,7 @@ def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_pa
 def test_accuracy_adapter_never_enters_local_training_backoff(tmp_path) -> None:
     config = _config(tmp_path)
     config.baseline.training.training_window_size = 1
+    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 1
     config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec = 30.0
     transport = FailingTrainingTransport()
     adapter = BaselineEdgeAdapter(
@@ -446,7 +528,7 @@ def test_accuracy_adapter_never_enters_local_training_backoff(tmp_path) -> None:
             detection_score=[],
             latency_ms=1.0,
         )
-        _wait_until(lambda: len(transport.uploaded) == 1)
+        _wait_until(lambda: len(transport.uploaded_windows) == 1)
         time.sleep(0.1)
         assert transport.training_requests == []
         assert adapter._training_state.active_job is None

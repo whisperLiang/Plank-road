@@ -104,6 +104,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.BaselineFrameRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.BaselineAck.FromString,
                 _registered_method=True)
+        self.UploadAccuracyTriggerWindow = channel.unary_unary(
+                '/MessageTransmission/UploadAccuracyTriggerWindow',
+                request_serializer=message__transmission__pb2.BaselineWindowRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.BaselineAck.FromString,
+                _registered_method=True)
         self.UploadPrediction = channel.unary_unary(
                 '/MessageTransmission/UploadPrediction',
                 request_serializer=message__transmission__pb2.BaselineFrameRequest.SerializeToString,
@@ -225,6 +230,12 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def UploadAccuracyTriggerWindow(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def UploadPrediction(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -320,6 +331,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
             'UploadKeyFrame': grpc.unary_unary_rpc_method_handler(
                     servicer.UploadKeyFrame,
                     request_deserializer=message__transmission__pb2.BaselineFrameRequest.FromString,
+                    response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
+            ),
+            'UploadAccuracyTriggerWindow': grpc.unary_unary_rpc_method_handler(
+                    servicer.UploadAccuracyTriggerWindow,
+                    request_deserializer=message__transmission__pb2.BaselineWindowRequest.FromString,
                     response_serializer=message__transmission__pb2.BaselineAck.SerializeToString,
             ),
             'UploadPrediction': grpc.unary_unary_rpc_method_handler(
@@ -720,6 +736,33 @@ class MessageTransmission(object):
             target,
             '/MessageTransmission/UploadKeyFrame',
             message__transmission__pb2.BaselineFrameRequest.SerializeToString,
+            message__transmission__pb2.BaselineAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UploadAccuracyTriggerWindow(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/UploadAccuracyTriggerWindow',
+            message__transmission__pb2.BaselineWindowRequest.SerializeToString,
             message__transmission__pb2.BaselineAck.FromString,
             options,
             channel_credentials,

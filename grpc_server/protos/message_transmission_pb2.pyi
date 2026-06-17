@@ -2,7 +2,7 @@ from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from collections.abc import Iterable as _Iterable
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
@@ -353,6 +353,54 @@ class BaselineFrameRequest(_message.Message):
     metrics_ref: str
     job_id: str
     def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., frame_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ..., model_name: _Optional[str] = ..., model_version: _Optional[str] = ..., video_source: _Optional[str] = ..., upload_mode: _Optional[str] = ..., is_keyframe: bool = ..., edge_prediction_json: _Optional[str] = ..., cloud_prediction_json: _Optional[str] = ..., teacher_prediction_json: _Optional[str] = ..., confidence: _Optional[float] = ..., entropy: _Optional[float] = ..., quality_metadata_json: _Optional[str] = ..., raw_frame: _Optional[bytes] = ..., raw_frame_ref: _Optional[str] = ..., feature_ref_json: _Optional[str] = ..., metrics_ref: _Optional[str] = ..., job_id: _Optional[str] = ...) -> None: ...
+
+class BaselineWindowSample(_message.Message):
+    __slots__ = ("frame_id", "timestamp_ms", "raw_frame", "edge_prediction_json", "confidence", "entropy", "quality_metadata_json", "upload_mode", "is_keyframe")
+    FRAME_ID_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_MS_FIELD_NUMBER: _ClassVar[int]
+    RAW_FRAME_FIELD_NUMBER: _ClassVar[int]
+    EDGE_PREDICTION_JSON_FIELD_NUMBER: _ClassVar[int]
+    CONFIDENCE_FIELD_NUMBER: _ClassVar[int]
+    ENTROPY_FIELD_NUMBER: _ClassVar[int]
+    QUALITY_METADATA_JSON_FIELD_NUMBER: _ClassVar[int]
+    UPLOAD_MODE_FIELD_NUMBER: _ClassVar[int]
+    IS_KEYFRAME_FIELD_NUMBER: _ClassVar[int]
+    frame_id: int
+    timestamp_ms: int
+    raw_frame: bytes
+    edge_prediction_json: str
+    confidence: float
+    entropy: float
+    quality_metadata_json: str
+    upload_mode: str
+    is_keyframe: bool
+    def __init__(self, frame_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ..., raw_frame: _Optional[bytes] = ..., edge_prediction_json: _Optional[str] = ..., confidence: _Optional[float] = ..., entropy: _Optional[float] = ..., quality_metadata_json: _Optional[str] = ..., upload_mode: _Optional[str] = ..., is_keyframe: bool = ...) -> None: ...
+
+class BaselineWindowRequest(_message.Message):
+    __slots__ = ("run_id", "baseline_method", "edge_id", "model_name", "model_version", "video_source", "window_id", "window_start_frame_id", "window_end_frame_id", "timestamp_ms", "selected_samples")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    BASELINE_METHOD_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
+    MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    VIDEO_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    WINDOW_ID_FIELD_NUMBER: _ClassVar[int]
+    WINDOW_START_FRAME_ID_FIELD_NUMBER: _ClassVar[int]
+    WINDOW_END_FRAME_ID_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_MS_FIELD_NUMBER: _ClassVar[int]
+    SELECTED_SAMPLES_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    baseline_method: str
+    edge_id: int
+    model_name: str
+    model_version: str
+    video_source: str
+    window_id: str
+    window_start_frame_id: int
+    window_end_frame_id: int
+    timestamp_ms: int
+    selected_samples: _containers.RepeatedCompositeFieldContainer[BaselineWindowSample]
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., model_name: _Optional[str] = ..., model_version: _Optional[str] = ..., video_source: _Optional[str] = ..., window_id: _Optional[str] = ..., window_start_frame_id: _Optional[int] = ..., window_end_frame_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ..., selected_samples: _Optional[_Iterable[_Union[BaselineWindowSample, _Mapping]]] = ...) -> None: ...
 
 class BaselineInferenceRequest(_message.Message):
     __slots__ = ("run_id", "baseline_method", "edge_id", "frame_id")

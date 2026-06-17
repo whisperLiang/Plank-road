@@ -10,8 +10,8 @@ from cloud.annotation.teacher_worker import TeacherAnnotationWorker
 from cloud.annotation.types import (
     TeacherAnnotationEnsureResult,
     TeacherAnnotationRequest,
-    TeacherAnnotationRetryableError,
     TeacherAnnotationResult,
+    TeacherAnnotationRetryableError,
     TeacherAnnotationStatus,
     TeacherAnnotationSubmitResult,
     TeacherLabelCacheKey,

@@ -1,23 +1,28 @@
 from __future__ import annotations
 
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from loguru import logger
 
-from baselines.distributed.messages import BaselineFramePayload, baseline_state_key, now_ms
+from baselines.distributed.messages import (
+    BaselineFramePayload,
+    BaselineWindowPayload,
+    BaselineWindowSample,
+    baseline_state_key,
+    now_ms,
+)
 from baselines.runtime.upload_client import (
     BASELINE_TRAINING_PROTOCOL_VERSION,
     build_baseline_training_bundle,
 )
+from cloud.annotation import RawFrameAnnotationSample, TeacherAnnotationRetryableError
 from cloud.baselines.accuracy_trigger_controller import (
     AccuracyTriggerController,
     AccuracyTriggerSubmission,
 )
-from cloud.annotation import RawFrameAnnotationSample, TeacherAnnotationRetryableError
 from config.baseline import validate_baseline_method
 from grpc_server import message_transmission_pb2
 
@@ -82,8 +87,8 @@ class DistributedBaselineController:
             else None
         )
         self._teacher_results: dict[tuple[str, str, int, int], dict[str, Any]] = {}
-        self._accuracy_annotation_pending: dict[
-            tuple[str, str, int, int], BaselineFramePayload
+        self._accuracy_window_pending: dict[
+            tuple[str, str, int, str], BaselineWindowPayload
         ] = {}
 
     def close(self) -> None:
@@ -94,7 +99,7 @@ class DistributedBaselineController:
             self._states.clear()
             self._frames.clear()
             self._teacher_results.clear()
-            self._accuracy_annotation_pending.clear()
+            self._accuracy_window_pending.clear()
 
     def register_edge(
         self,
@@ -132,17 +137,17 @@ class DistributedBaselineController:
                 edge_id=int(edge_id),
                 metrics_json=metrics_json,
             )
-            self._retry_accuracy_annotation_pending(edge_id=int(edge_id))
+            self._retry_accuracy_window_pending(edge_id=int(edge_id))
+            self._refresh_accuracy_trigger_training_jobs(edge_id=int(edge_id))
 
     def upload_frame(self, payload: BaselineFramePayload) -> dict[str, Any]:
         key = self._state_key(payload.run_id, payload.baseline_method, payload.edge_id)
         is_accuracy_trigger = payload.baseline_method == _ACCURACY_TRIGGER_METHOD
         if is_accuracy_trigger:
-            self._validate_accuracy_teacher_annotation_payload(payload)
-        if is_accuracy_trigger:
-            teacher_prediction = {}
-        else:
-            teacher_prediction = dict(payload.teacher_prediction)
+            raise RuntimeError(
+                "Accuracy-Trigger frames must be uploaded via UploadAccuracyTriggerWindow"
+            )
+        teacher_prediction = dict(payload.teacher_prediction)
         stored_payload = replace(
             payload,
             raw_frame=b"",
@@ -162,13 +167,6 @@ class DistributedBaselineController:
             self._frames[frame_key] = stored_payload
             state.upload_queue.append(int(payload.frame_id))
             state.recent_quality.append(dict(payload.quality_metadata))
-            if is_accuracy_trigger:
-                self._accuracy_annotation_pending[frame_key] = payload
-        if is_accuracy_trigger:
-            self._retry_accuracy_annotation_pending(
-                edge_id=int(payload.edge_id),
-                raise_frame_key=frame_key,
-            )
         return {
             "accepted": True,
             "message": "frame accepted",
@@ -188,98 +186,155 @@ class DistributedBaselineController:
     ) -> list[dict[str, Any]]:
         self._state_key(run_id, baseline_method, edge_id)
         if self._accuracy_trigger_controller is not None:
-            self._retry_accuracy_annotation_pending(edge_id=int(edge_id))
+            self._retry_accuracy_window_pending(edge_id=int(edge_id))
+            self._refresh_accuracy_trigger_training_jobs(edge_id=int(edge_id))
             return self._accuracy_trigger_controller.poll_commands(
                 run_id=run_id,
                 edge_id=int(edge_id),
             )
         return []
 
-    def _retry_accuracy_annotation_pending(
+    def upload_accuracy_trigger_window(
         self,
-        *,
-        edge_id: int | None = None,
-        raise_frame_key: tuple[str, str, int, int] | None = None,
-    ) -> None:
+        payload: BaselineWindowPayload,
+    ) -> dict[str, Any]:
         if self._accuracy_trigger_controller is None:
-            return
+            raise RuntimeError("Accuracy-Trigger controller is not configured")
+        self._validate_accuracy_window_payload(payload)
+        key = self._state_key(payload.run_id, payload.baseline_method, payload.edge_id)
+        selected_samples = tuple(payload.selected_samples)
+        frame_ids = [int(sample.frame_id) for sample in selected_samples]
+        logger.info(
+            "accuracy_trigger_window_uploaded edge={} window={} selected_count={} "
+            "frame_range={}-{}",
+            payload.edge_id,
+            payload.window_id,
+            len(selected_samples),
+            payload.window_start_frame_id,
+            payload.window_end_frame_id,
+        )
+        try:
+            self._process_accuracy_trigger_window(payload, key=key)
+        except TeacherAnnotationRetryableError:
+            with self._lock:
+                self._accuracy_window_pending[_accuracy_window_key(payload)] = payload
+            return {
+                "accepted": True,
+                "message": "window annotation pending",
+                "window_id": payload.window_id,
+                "selected_count": len(selected_samples),
+                "frame_ids": frame_ids,
+            }
+        return {
+            "accepted": True,
+            "message": "window accepted",
+            "window_id": payload.window_id,
+            "selected_count": len(selected_samples),
+            "frame_ids": frame_ids,
+        }
+
+    def _process_accuracy_trigger_window(
+        self,
+        payload: BaselineWindowPayload,
+        *,
+        key: tuple[str, str, int] | None = None,
+    ) -> None:
+        key = key or self._state_key(payload.run_id, payload.baseline_method, payload.edge_id)
+        selected_samples = tuple(payload.selected_samples)
+        annotation_samples = [
+            RawFrameAnnotationSample(
+                sample_id=str(int(sample.frame_id)),
+                edge_id=int(payload.edge_id),
+                model_id=str(payload.model_name or ""),
+                raw_frame=bytes(sample.raw_frame or b""),
+                metadata={
+                    "include_empty": True,
+                    "window_id": str(payload.window_id),
+                    "frame_id": int(sample.frame_id),
+                },
+            )
+            for sample in selected_samples
+        ]
+        labels = self.teacher_annotator.annotate_raw_frames(
+            annotation_samples,
+            threshold=self._teacher_annotation_threshold(),
+        )
+        annotation_result = getattr(self.teacher_annotator, "last_ensure_result", None)
+        logger.info(
+            "accuracy_trigger_annotation_done edge={} window={} requested={} "
+            "cache_misses={} submitted={} unresolved={} failed={}",
+            payload.edge_id,
+            payload.window_id,
+            int(getattr(annotation_result, "requested_samples", len(annotation_samples))),
+            int(getattr(annotation_result, "cache_misses", 0)),
+            int(getattr(annotation_result, "submitted", 0)),
+            int(getattr(annotation_result, "unresolved_count", 0)),
+            int(getattr(annotation_result, "failed_count", 0)),
+        )
+
+        teacher_predictions = {
+            str(int(sample.frame_id)): dict(labels.get(str(int(sample.frame_id)), {}) or {})
+            for sample in selected_samples
+        }
+        with self._lock:
+            state = self.register_edge(
+                run_id=payload.run_id,
+                baseline_method=payload.baseline_method,
+                edge_id=payload.edge_id,
+                model_name=payload.model_name,
+                model_version=payload.model_version,
+                video_source=payload.video_source,
+            )
+            for sample in selected_samples:
+                frame_key = (*key, int(sample.frame_id))
+                teacher_prediction = teacher_predictions[str(int(sample.frame_id))]
+                self._frames[frame_key] = _frame_payload_from_window_sample(
+                    payload,
+                    sample,
+                    teacher_prediction=teacher_prediction,
+                )
+                self._teacher_results[frame_key] = self._accuracy_teacher_result(
+                    key=key,
+                    payload=payload,
+                    sample=sample,
+                    teacher_prediction=teacher_prediction,
+                )
+                state.upload_queue.append(int(sample.frame_id))
+                state.recent_quality.append(dict(sample.quality_metadata))
+        submission = self._accuracy_trigger_controller.add_window(
+            payload,
+            teacher_predictions=teacher_predictions,
+        )
+        if submission is not None:
+            self._submit_accuracy_trigger_training(submission)
+
+    def _retry_accuracy_window_pending(self, *, edge_id: int | None = None) -> None:
         with self._lock:
             pending_items = sorted(
                 (
-                    (frame_key, payload)
-                    for frame_key, payload in self._accuracy_annotation_pending.items()
-                    if edge_id is None or int(frame_key[2]) == int(edge_id)
+                    (window_key, payload)
+                    for window_key, payload in self._accuracy_window_pending.items()
+                    if edge_id is None or int(window_key[2]) == int(edge_id)
                 ),
                 key=lambda item: item[0],
             )
-        blocked_edges: set[tuple[str, str, int]] = set()
-        for frame_key, payload in pending_items:
-            edge_key = frame_key[:3]
-            if edge_key in blocked_edges:
-                continue
-            with self._lock:
-                if frame_key not in self._accuracy_annotation_pending:
-                    continue
+        for window_key, payload in pending_items:
             try:
-                teacher_prediction = self._teacher_prediction_for_accuracy_payload(payload)
-            except TeacherAnnotationRetryableError as exc:
-                blocked_edges.add(edge_key)
-                logger.info(
-                    "accuracy_trigger_teacher_annotation_deferred edge={} frame={} reason={}",
-                    payload.edge_id,
-                    payload.frame_id,
-                    exc,
-                )
+                self._process_accuracy_trigger_window(payload, key=window_key[:3])
+            except TeacherAnnotationRetryableError:
                 continue
             except Exception as exc:
                 with self._lock:
-                    self._accuracy_annotation_pending.pop(frame_key, None)
-                if frame_key == raise_frame_key:
-                    raise
+                    self._accuracy_window_pending.pop(window_key, None)
                 logger.warning(
-                    "accuracy_trigger_teacher_annotation_failed edge={} frame={} reason={}",
+                    "accuracy_trigger_window_annotation_failed edge={} window={} reason={}",
                     payload.edge_id,
-                    payload.frame_id,
+                    payload.window_id,
                     exc,
                 )
                 continue
-            submission = self._complete_accuracy_annotation(
-                frame_key=frame_key,
-                payload=payload,
-                teacher_prediction=teacher_prediction,
-            )
-            if submission is not None:
-                self._submit_accuracy_trigger_training(submission)
-
-    def _complete_accuracy_annotation(
-        self,
-        *,
-        frame_key: tuple[str, str, int, int],
-        payload: BaselineFramePayload,
-        teacher_prediction: dict[str, Any],
-    ) -> AccuracyTriggerSubmission | None:
-        if self._accuracy_trigger_controller is None:
-            return None
-        teacher_result = self._accuracy_teacher_result(
-            key=frame_key[:3],
-            payload=payload,
-            teacher_prediction=teacher_prediction,
-        )
-        with self._lock:
-            if frame_key not in self._accuracy_annotation_pending:
-                return None
-            self._accuracy_annotation_pending.pop(frame_key, None)
-            stored_payload = self._frames.get(frame_key)
-            if stored_payload is not None:
-                self._frames[frame_key] = replace(
-                    stored_payload,
-                    teacher_prediction=dict(teacher_prediction),
-                )
-            self._teacher_results[frame_key] = teacher_result
-        return self._accuracy_trigger_controller.add_frame(
-            payload,
-            teacher_prediction=teacher_prediction,
-        )
+            with self._lock:
+                self._accuracy_window_pending.pop(window_key, None)
 
     def _submit_accuracy_trigger_training(
         self,
@@ -348,71 +403,79 @@ class DistributedBaselineController:
             status=str(getattr(reply, "status", "") or ""),
             message=str(getattr(reply, "message", "") or ""),
         )
-        if accepted and job_id:
-            logger.info(
-                "accuracy_trigger_training_job_submitted edge={} window={} job_id={} "
-                "samples={} accuracy={:.4f} threshold={:.4f}",
-                submission.edge_id,
-                submission.window_id,
-                job_id,
-                len(submission.training_samples),
-                submission.window_accuracy,
-                submission.accuracy_drop_threshold,
+
+    def _refresh_accuracy_trigger_training_jobs(self, *, edge_id: int | None = None) -> None:
+        if self._accuracy_trigger_controller is None or self.training_backend is None:
+            return
+        for pending in self._accuracy_trigger_controller.pending_training_jobs(edge_id=edge_id):
+            request = message_transmission_pb2.TrainingJobStatusRequest(
+                edge_id=int(pending.model_key[1]),
+                job_id=str(pending.job_id),
             )
-        else:
-            logger.info(
-                "accuracy_trigger_training_job_rejected edge={} window={} reason={}",
-                submission.edge_id,
-                submission.window_id,
-                str(getattr(reply, "message", "") or "training job rejected"),
+            try:
+                reply = self.training_backend.get_training_job_status(request)
+            except Exception as exc:
+                logger.warning(
+                    "accuracy_trigger_training_status_poll_failed edge={} window={} "
+                    "job_id={} reason={}",
+                    pending.model_key[1],
+                    pending.window_id,
+                    pending.job_id,
+                    exc,
+                )
+                continue
+            if reply is None or not bool(getattr(reply, "found", False)):
+                continue
+            self._accuracy_trigger_controller.record_training_job_status(
+                edge_id=int(getattr(reply, "edge_id", pending.model_key[1])),
+                job_id=str(getattr(reply, "job_id", pending.job_id) or pending.job_id),
+                status=str(getattr(reply, "status", "") or ""),
+                result_available=bool(getattr(reply, "result_available", False)),
+                result_model_version=str(getattr(reply, "result_model_version", "") or ""),
+                message=str(getattr(reply, "message", "") or ""),
             )
 
     def _accuracy_teacher_result(
         self,
         *,
         key: tuple[str, str, int],
-        payload: BaselineFramePayload,
+        payload: BaselineWindowPayload,
+        sample: BaselineWindowSample,
         teacher_prediction: dict[str, Any],
     ) -> dict[str, Any]:
         return {
             "run_id": key[0],
             "baseline_method": key[1],
             "edge_id": key[2],
-            "frame_id": int(payload.frame_id),
+            "frame_id": int(sample.frame_id),
             "cloud_prediction": dict(teacher_prediction),
             "confidence": _safe_float(teacher_prediction.get("confidence", 0.0)),
             "timestamp_ms": now_ms(),
             "purpose": "annotation",
         }
 
-    def _validate_accuracy_teacher_annotation_payload(
+    def _validate_accuracy_window_payload(
         self,
-        payload: BaselineFramePayload,
+        payload: BaselineWindowPayload,
     ) -> None:
+        if payload.baseline_method != _ACCURACY_TRIGGER_METHOD:
+            raise RuntimeError("window upload is only supported for Accuracy-Trigger")
         if self.teacher_annotator is None:
             raise RuntimeError("shared teacher annotator is required")
-        if not payload.raw_frame:
-            raise RuntimeError("raw frame bytes are required for teacher annotation")
-
-    def _teacher_prediction_for_accuracy_payload(
-        self,
-        payload: BaselineFramePayload,
-    ) -> dict[str, Any]:
-        self._validate_accuracy_teacher_annotation_payload(payload)
-        sample_id = str(int(payload.frame_id))
-        labels = self.teacher_annotator.annotate_raw_frames(
-            [
-                RawFrameAnnotationSample(
-                    sample_id=sample_id,
-                    edge_id=int(payload.edge_id),
-                    model_id=str(payload.model_name or ""),
-                    raw_frame=bytes(payload.raw_frame or b""),
-                    metadata={"include_empty": True},
-                )
-            ],
-            threshold=self._teacher_annotation_threshold(),
-        )
-        return dict(labels.get(sample_id, {}) or {})
+        if not str(payload.window_id or ""):
+            raise RuntimeError("window_id is required")
+        if not payload.selected_samples:
+            raise RuntimeError("selected_samples must be non-empty")
+        missing = [
+            int(sample.frame_id)
+            for sample in payload.selected_samples
+            if not bytes(sample.raw_frame or b"")
+        ]
+        if missing:
+            raise RuntimeError(
+                "raw frame bytes are required for teacher annotation: "
+                + ",".join(str(frame_id) for frame_id in missing[:10])
+            )
 
     def _teacher_annotation_threshold(self) -> float | None:
         threshold = _config_value(self.baseline_method_config, "teacher_annotation_threshold", None)
@@ -442,6 +505,41 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _frame_payload_from_window_sample(
+    payload: BaselineWindowPayload,
+    sample: BaselineWindowSample,
+    *,
+    teacher_prediction: dict[str, Any],
+) -> BaselineFramePayload:
+    return BaselineFramePayload(
+        run_id=payload.run_id,
+        baseline_method=payload.baseline_method,
+        edge_id=int(payload.edge_id),
+        frame_id=int(sample.frame_id),
+        timestamp_ms=int(sample.timestamp_ms),
+        model_name=payload.model_name,
+        model_version=payload.model_version,
+        video_source=payload.video_source,
+        upload_mode=sample.upload_mode,
+        is_keyframe=bool(sample.is_keyframe),
+        edge_prediction=dict(sample.edge_prediction or {}),
+        teacher_prediction=dict(teacher_prediction or {}),
+        confidence=float(sample.confidence),
+        entropy=float(sample.entropy),
+        quality_metadata=dict(sample.quality_metadata or {}),
+        raw_frame=b"",
+    )
+
+
+def _accuracy_window_key(payload: BaselineWindowPayload) -> tuple[str, str, int, str]:
+    return (
+        str(payload.run_id),
+        str(payload.baseline_method),
+        int(payload.edge_id),
+        str(payload.window_id),
+    )
 
 
 def _baseline_sample_pool_max_samples(

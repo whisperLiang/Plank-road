@@ -27,6 +27,7 @@ service MessageTransmission {
   rpc Heartbeat (BaselineHeartbeatRequest) returns (BaselineAck) {}
   rpc UploadFrame (BaselineFrameRequest) returns (BaselineAck) {}
   rpc UploadKeyFrame (BaselineFrameRequest) returns (BaselineAck) {}
+  rpc UploadAccuracyTriggerWindow (BaselineWindowRequest) returns (BaselineAck) {}
   rpc UploadPrediction (BaselineFrameRequest) returns (BaselineAck) {}
   rpc RequestCloudInference (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
   rpc PollCommand (BaselineCommandRequest) returns (BaselineCommandReply) {}
@@ -242,6 +243,32 @@ message BaselineFrameRequest {
   string feature_ref_json = 19;
   string metrics_ref = 20;
   string job_id = 21;
+}
+
+message BaselineWindowSample {
+  int64 frame_id = 1;
+  int64 timestamp_ms = 2;
+  bytes raw_frame = 3;
+  string edge_prediction_json = 4;
+  double confidence = 5;
+  double entropy = 6;
+  string quality_metadata_json = 7;
+  string upload_mode = 8;
+  bool is_keyframe = 9;
+}
+
+message BaselineWindowRequest {
+  string run_id = 1;
+  string baseline_method = 2;
+  int64 edge_id = 3;
+  string model_name = 4;
+  string model_version = 5;
+  string video_source = 6;
+  string window_id = 7;
+  int64 window_start_frame_id = 8;
+  int64 window_end_frame_id = 9;
+  int64 timestamp_ms = 10;
+  repeated BaselineWindowSample selected_samples = 11;
 }
 
 message BaselineInferenceRequest {
