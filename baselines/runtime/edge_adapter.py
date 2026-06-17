@@ -209,7 +209,7 @@ class BaselineEdgeAdapter:
                 mode="CloudFailed",
                 failure_mode=self.display_cloud_failure_mode,
             )
-        return dict(cloud)
+        return _merge_display_metadata(dict(cloud), local_visual)
 
     def close(self) -> None:
         self._closed.set()
@@ -719,6 +719,18 @@ def _cloud_failure_visual(
         "frame_index": int(local_visual.get("frame_index", -1) or -1),
         "frame": local_visual.get("frame"),
     }
+
+
+def _merge_display_metadata(
+    visual: dict[str, Any],
+    local_visual: dict[str, Any],
+) -> dict[str, Any]:
+    for key in ("latency_ms", "ref", "frame"):
+        if key in local_visual:
+            visual[key] = local_visual.get(key)
+    if "frame_index" in local_visual:
+        visual["frame_index"] = int(local_visual.get("frame_index", -1) or -1)
+    return visual
 
 
 def _training_config_dict(config: object | None) -> dict[str, Any]:

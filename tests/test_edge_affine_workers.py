@@ -1299,6 +1299,100 @@ def test_cloud_server_worker_pool_does_not_create_local_training_objects(
     assert isinstance(server.continual_backend, EdgeWorkerRoutedContinualLearningBackend)
 
 
+def test_cloud_server_loads_lightweight_display_detector_only_for_ekya(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from cloud_server import CloudServer
+
+    class FakeLeaseManager:
+        max_active_gpu_workers = 2
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def close(self):
+            pass
+
+    class FakeLeaseService:
+        listen_address = "127.0.0.1:55555"
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def start(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+    class FakePool:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def close(self):
+            pass
+
+    created_detectors: list[str] = []
+
+    class FakeDetector:
+        def __init__(self, _config, type):
+            created_detectors.append(str(type))
+
+        def large_inference(self, _frame, *, threshold=None):
+            del threshold
+            return [], [], []
+
+    monkeypatch.setattr("cloud_server.GpuLeaseManager", FakeLeaseManager)
+    monkeypatch.setattr("cloud_server.GpuLeaseService", FakeLeaseService)
+    monkeypatch.setattr("cloud_server.EdgeWorkerPool", FakePool)
+    monkeypatch.setattr("model_management.object_detection.Object_Detection", FakeDetector)
+    monkeypatch.setattr(
+        "cloud_server.ensure_mps_runtime",
+        lambda *_args, **_kwargs: MpsEnvironment("0", "/tmp/mps", "/tmp/log", "50"),
+    )
+
+    runtime = load_runtime_config("./config/config.yaml")
+
+    accuracy_config = runtime.server
+    accuracy_config.workspace_root = str(tmp_path / "accuracy")
+    accuracy_config.edge_affine_workers.enabled = True
+    accuracy_config.edge_affine_workers.run_id = "run-accuracy"
+    accuracy_server = CloudServer(
+        accuracy_config,
+        mode="baseline",
+        baseline_config=runtime.baseline,
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="run-accuracy",
+        yaml_path="./config/config.yaml",
+    )
+    try:
+        assert created_detectors == ["large inference"]
+        assert accuracy_server.display_object_detection is None
+    finally:
+        accuracy_server.close()
+
+    created_detectors.clear()
+    runtime = load_runtime_config("./config/config.yaml")
+    ekya_config = runtime.server
+    ekya_config.workspace_root = str(tmp_path / "ekya")
+    ekya_config.edge_affine_workers.enabled = True
+    ekya_config.edge_affine_workers.run_id = "run-ekya"
+    ekya_server = CloudServer(
+        ekya_config,
+        mode="baseline",
+        baseline_config=runtime.baseline,
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="run-ekya",
+        yaml_path="./config/config.yaml",
+    )
+    try:
+        assert created_detectors == ["large inference", "small inference"]
+        assert ekya_server.display_object_detection is not None
+    finally:
+        ekya_server.close()
+
+
 def test_cloud_server_main_requires_edge_affine_workers(tmp_path: Path) -> None:
     from cloud_server import CloudServer
 

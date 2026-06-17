@@ -55,6 +55,7 @@ class CloudServer:
         self.server_id = config.server_id
         self.edge_registry = EdgeRegistry()
         self.baseline_controller = None
+        self.display_object_detection = None
         self.large_object_detection = None
         self.continual_backend = None
         self.worker_pool = None
@@ -83,7 +84,17 @@ class CloudServer:
                 from model_management.object_detection import Object_Detection
 
                 self.large_object_detection = Object_Detection(config, type="large inference")
-                inference_fn = _baseline_cloud_inference_adapter(self.large_object_detection)
+                display_detector = self.large_object_detection
+                if method == "ekya_style_centralized_scheduling":
+                    self.display_object_detection = Object_Detection(
+                        config,
+                        type="small inference",
+                    )
+                    display_detector = self.display_object_detection
+                inference_fn = _baseline_cloud_inference_adapter(
+                    display_detector,
+                    self.large_object_detection,
+                )
             self.baseline_controller = DistributedBaselineController(
                 baseline_method=method,
                 run_id=resolved_run_id,
@@ -257,12 +268,16 @@ class CloudServer:
             training_job_manager.close()
 
 
-def _baseline_cloud_inference_adapter(detector):
+def _baseline_cloud_inference_adapter(display_detector, teacher_detector=None):
     def infer(raw_frame: bytes, *, threshold=None, purpose: str = "display") -> dict:
-        del purpose
         frame = _decode_frame(raw_frame)
         if frame is None:
             return {"boxes": [], "labels": [], "scores": [], "confidence": 0.0}
+        detector = (
+            teacher_detector
+            if str(purpose or "display") == "annotation" and teacher_detector is not None
+            else display_detector
+        )
         boxes, labels, scores = detector.large_inference(frame, threshold=threshold)
         scores_list = _jsonable_list(scores)
         return {

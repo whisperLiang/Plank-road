@@ -442,6 +442,7 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
     assert ekya.cloud_inference_timeout_sec == pytest.approx(3.0)
     assert ekya.display_cloud_failure_mode == "empty"
     assert ekya.require_micro_profiling is True
+    assert ekya.display_source == "cloud"
     assert ekya.trainable_param_ratios == [0.1, 0.3, 0.5]
     assert ekya.sample_fractions == [0.5, 1.0]
     assert config.baseline.edge.split_runtime_policy == "disabled"
@@ -694,10 +695,62 @@ def test_ekya_adapter_uploads_raw_frames_and_cloud_overlay_without_training(tmp_
         assert payload.quality_metadata["require_micro_profiling"] is True
         assert transport.training_requests == []
         visual = adapter.display_visual(
-            {"boxes": [], "labels": [], "scores": [], "mode": "Local", "frame_index": 7}
+            {
+                "boxes": [],
+                "labels": [],
+                "scores": [],
+                "mode": "Local",
+                "frame_index": 7,
+                "latency_ms": 12.5,
+                "ref": 6,
+            }
         )
         assert visual["mode"] == "Cloud"
         assert visual["boxes"] == [[2, 2, 6, 6]]
+        assert visual["latency_ms"] == pytest.approx(12.5)
+        assert visual["ref"] == 6
+    finally:
+        adapter.close()
+
+
+def test_ekya_adapter_explicit_local_display_keeps_local_visual(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.ekya_style_centralized_scheduling.display_source = "local"
+    transport = RecordingTransport()
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="ekya_style_centralized_scheduling",
+        run_id="ekya-run",
+        edge_id=3,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    try:
+        adapter.before_video_start(FakeEdge())
+        adapter.on_sampled_inference_result(
+            frame=np.zeros((8, 8, 3), dtype=np.uint8),
+            frame_index=8,
+            task=FakeTask(source="inference"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+        local_visual = {
+            "boxes": [[1, 2, 3, 4]],
+            "labels": [5],
+            "scores": [0.9],
+            "mode": "Inference",
+            "frame_index": 8,
+            "latency_ms": 9.5,
+        }
+        visual = adapter.display_visual(local_visual)
+
+        assert transport.inference_requests == [8]
+        assert visual is local_visual
+        assert visual["mode"] == "Inference"
+        assert visual["boxes"] == [[1, 2, 3, 4]]
+        assert visual["latency_ms"] == pytest.approx(9.5)
     finally:
         adapter.close()
 
@@ -723,10 +776,17 @@ def test_ekya_adapter_cloud_timeout_uses_empty_failure_visual(tmp_path) -> None:
             latency_ms=1.0,
         )
         visual = adapter.display_visual(
-            {"boxes": [[1, 1, 2, 2]], "labels": [1], "scores": [0.5], "frame_index": 9}
+            {
+                "boxes": [[1, 1, 2, 2]],
+                "labels": [1],
+                "scores": [0.5],
+                "frame_index": 9,
+                "latency_ms": 8.0,
+            }
         )
         assert visual["mode"] == "CloudTimeout"
         assert visual["boxes"] == []
+        assert visual["latency_ms"] == pytest.approx(8.0)
     finally:
         adapter.close()
 
@@ -1013,12 +1073,46 @@ def test_cloud_controller_separates_display_and_teacher_annotation_cache() -> No
 
         assert controller._inference_results[frame_key]["cloud_prediction"]["scores"] == [0.8]
         assert controller._teacher_results[frame_key]["cloud_prediction"]["scores"] == [0.55]
+        display_result = controller.request_cloud_inference(
+            run_id="ekya-run",
+            baseline_method="ekya_style_centralized_scheduling",
+            edge_id=1,
+            frame_id=4,
+        )
+        assert display_result["cloud_prediction"]["scores"] == [0.8]
         assert calls == [
             {"threshold": None, "purpose": "display", "bytes": len(b"frame-bytes")},
             {"threshold": 0.4, "purpose": "annotation", "bytes": len(b"frame-bytes")},
         ]
     finally:
         controller.close()
+
+
+def test_baseline_cloud_inference_adapter_routes_display_and_teacher_models() -> None:
+    from cloud_server import _baseline_cloud_inference_adapter
+
+    calls: list[tuple[str, float | None]] = []
+
+    class FakeDetector:
+        def __init__(self, name: str, score: float) -> None:
+            self.name = name
+            self.score = score
+
+        def large_inference(self, _frame, *, threshold=None):
+            calls.append((self.name, threshold))
+            return [[0, 0, 4, 4]], [1], [self.score]
+
+    infer = _baseline_cloud_inference_adapter(
+        FakeDetector("display-lightweight", 0.2),
+        FakeDetector("teacher", 0.9),
+    )
+
+    display = infer(_jpeg_bytes(), purpose="display")
+    annotation = infer(_jpeg_bytes(), purpose="annotation", threshold=0.4)
+
+    assert display["scores"] == [0.2]
+    assert annotation["scores"] == [0.9]
+    assert calls == [("display-lightweight", None), ("teacher", 0.4)]
 
 
 def test_ekya_poll_command_delivery_ack_and_timeout() -> None:
