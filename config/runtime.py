@@ -260,6 +260,9 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     metric: str = "teacher_f1"
     agreement_iou_threshold: float = 0.5
     agreement_score_threshold: float = 0.0
+    agreement_empty_empty_policy: str = "exclude"
+    warmup_accuracy_drop: float = 0.04
+    absolute_accuracy_floor: float | None = None
 
 
 @dataclass
@@ -766,6 +769,29 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         if value > 1.0:
             raise ValueError(
                 f"baseline.accuracy_trigger_cloud_retraining.{name} must be <= 1"
+            )
+    empty_policy = str(accuracy_cfg.agreement_empty_empty_policy or "").strip().lower()
+    if empty_policy not in {"score_one", "exclude", "score_zero"}:
+        raise ValueError(
+            "baseline.accuracy_trigger_cloud_retraining.agreement_empty_empty_policy "
+            "must be one of score_one, exclude, score_zero"
+        )
+    accuracy_cfg.agreement_empty_empty_policy = empty_policy
+    _validate_positive(
+        "baseline.accuracy_trigger_cloud_retraining.warmup_accuracy_drop",
+        float(accuracy_cfg.warmup_accuracy_drop),
+        allow_zero=True,
+    )
+    if accuracy_cfg.absolute_accuracy_floor is not None:
+        _validate_positive(
+            "baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor",
+            float(accuracy_cfg.absolute_accuracy_floor),
+            allow_zero=True,
+        )
+        if float(accuracy_cfg.absolute_accuracy_floor) > 1.0:
+            raise ValueError(
+                "baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor "
+                "must be <= 1"
             )
     allowed_baseline_training = {"freeze"}
     accuracy_strategy = str(

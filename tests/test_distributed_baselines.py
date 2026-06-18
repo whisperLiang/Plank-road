@@ -263,6 +263,14 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
     assert config.baseline.accuracy_trigger_cloud_retraining.agreement_score_threshold == (
         pytest.approx(0.0)
     )
+    assert (
+        config.baseline.accuracy_trigger_cloud_retraining.agreement_empty_empty_policy
+        == "exclude"
+    )
+    assert config.baseline.accuracy_trigger_cloud_retraining.warmup_accuracy_drop == (
+        pytest.approx(0.04)
+    )
+    assert config.baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor is None
     assert config.baseline.edge.split_runtime_policy == "disabled"
 
 
@@ -298,6 +306,21 @@ def test_sample_pool_capacity_must_cover_baseline_windows(tmp_path, yaml_body: s
     path.write_text(yaml_body, encoding="utf-8")
 
     with pytest.raises(ValueError, match="sample_pool.max_samples"):
+        load_runtime_config(path)
+
+
+def test_accuracy_trigger_agreement_policy_is_validated(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  accuracy_trigger_cloud_retraining:
+    agreement_empty_empty_policy: background_bonus
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="agreement_empty_empty_policy"):
         load_runtime_config(path)
 
 

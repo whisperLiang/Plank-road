@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -23,6 +24,7 @@ from cloud.baselines.accuracy_trigger_controller import (
     AccuracyTriggerController,
     AccuracyTriggerSubmission,
 )
+from cloud.baselines.detection_agreement import normalize_detection_prediction
 from config.baseline import validate_baseline_method
 from grpc_server import message_transmission_pb2
 
@@ -276,6 +278,11 @@ class DistributedBaselineController:
             str(int(sample.frame_id)): dict(labels.get(str(int(sample.frame_id)), {}) or {})
             for sample in selected_samples
         }
+        self._warn_accuracy_prediction_schema_issues(
+            payload=payload,
+            selected_samples=selected_samples,
+            teacher_predictions=teacher_predictions,
+        )
         with self._lock:
             state = self.register_edge(
                 run_id=payload.run_id,
@@ -466,6 +473,7 @@ class DistributedBaselineController:
             raise RuntimeError("window_id is required")
         if not payload.selected_samples:
             raise RuntimeError("selected_samples must be non-empty")
+        seen_frame_ids: set[int] = set()
         missing = [
             int(sample.frame_id)
             for sample in payload.selected_samples
@@ -475,6 +483,43 @@ class DistributedBaselineController:
             raise RuntimeError(
                 "raw frame bytes are required for teacher annotation: "
                 + ",".join(str(frame_id) for frame_id in missing[:10])
+            )
+        for sample in payload.selected_samples:
+            frame_id = int(sample.frame_id)
+            if frame_id < 0:
+                raise RuntimeError("stable non-negative frame_id is required")
+            if frame_id in seen_frame_ids:
+                raise RuntimeError("selected sample frame_id values must be unique")
+            seen_frame_ids.add(frame_id)
+            if not isinstance(sample.edge_prediction, Mapping):
+                raise RuntimeError("edge prediction must be a mapping for every selected sample")
+
+    def _warn_accuracy_prediction_schema_issues(
+        self,
+        *,
+        payload: BaselineWindowPayload,
+        selected_samples: tuple[BaselineWindowSample, ...],
+        teacher_predictions: dict[str, dict[str, Any]],
+    ) -> None:
+        missing_edge_prediction_count = 0
+        missing_teacher_prediction_count = 0
+        for sample in selected_samples:
+            edge_prediction = normalize_detection_prediction(sample.edge_prediction)
+            teacher_prediction = normalize_detection_prediction(
+                teacher_predictions.get(str(int(sample.frame_id)), {})
+            )
+            if not edge_prediction.valid:
+                missing_edge_prediction_count += 1
+            if not teacher_prediction.valid:
+                missing_teacher_prediction_count += 1
+        if missing_edge_prediction_count or missing_teacher_prediction_count:
+            logger.warning(
+                "accuracy_trigger_prediction_schema_warning edge={} window={} "
+                "missing_edge_prediction_count={} missing_teacher_prediction_count={}",
+                payload.edge_id,
+                payload.window_id,
+                missing_edge_prediction_count,
+                missing_teacher_prediction_count,
             )
 
     def _teacher_annotation_threshold(self) -> float | None:

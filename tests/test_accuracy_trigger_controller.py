@@ -15,7 +15,11 @@ from baselines.distributed.messages import BaselineFramePayload, BaselineWindowP
 from baselines.runtime.upload_client import BASELINE_TRAINING_PROTOCOL_VERSION
 from cloud.annotation import TeacherAnnotationRetryableError
 from cloud.baselines.accuracy_trigger_controller import AccuracyTriggerController
-from cloud.baselines.detection_agreement import teacher_f1
+from cloud.baselines.detection_agreement import (
+    detection_agreement_stats,
+    normalize_detection_prediction,
+    teacher_f1,
+)
 from grpc_server import message_transmission_pb2
 
 
@@ -50,6 +54,78 @@ def test_teacher_f1_metric_matches_classes_iou_scores_and_empty_cases() -> None:
     ) == pytest.approx(2.0 / 3.0)
 
 
+def test_detection_agreement_stats_classifies_foreground_and_empty_samples() -> None:
+    stats = detection_agreement_stats(
+        [
+            (_empty(), _empty()),
+            (_empty(), _box()),
+            (_box(), _empty()),
+            (_box(), _box()),
+            (_shifted_box(), _box()),
+        ],
+        empty_empty_policy="exclude",
+    )
+
+    assert stats.total_samples == 5
+    assert stats.evaluated_samples == 4
+    assert stats.empty_empty_count == 1
+    assert stats.teacher_only_count == 1
+    assert stats.edge_only_count == 1
+    assert stats.both_non_empty_count == 2
+    assert stats.avg_teacher_boxes == pytest.approx(0.6)
+    assert stats.avg_edge_boxes == pytest.approx(0.6)
+    assert stats.mean_f1 == pytest.approx(0.25)
+    assert stats.foreground_mean_f1 == pytest.approx(0.25)
+
+
+def test_detection_agreement_empty_empty_policy_controls_window_score() -> None:
+    pairs = [(_empty(), _empty()), (_box(), _box())]
+
+    score_one = detection_agreement_stats(pairs, empty_empty_policy="score_one")
+    exclude = detection_agreement_stats(pairs, empty_empty_policy="exclude")
+    score_zero = detection_agreement_stats(pairs, empty_empty_policy="score_zero")
+    all_empty_excluded = detection_agreement_stats(
+        [(_empty(), _empty())],
+        empty_empty_policy="exclude",
+    )
+
+    assert score_one.evaluated_samples == 2
+    assert score_one.mean_f1 == pytest.approx(1.0)
+    assert exclude.evaluated_samples == 1
+    assert exclude.mean_f1 == pytest.approx(1.0)
+    assert score_zero.evaluated_samples == 2
+    assert score_zero.mean_f1 == pytest.approx(0.5)
+    assert all_empty_excluded.evaluated_samples == 0
+    assert all_empty_excluded.mean_f1 == pytest.approx(0.0)
+
+
+def test_detection_prediction_normalizer_accepts_alternate_keys_and_rejects_malformed() -> None:
+    alternate = {
+        "detection_boxes": [[1, 1, 4, 4]],
+        "detection_class": [1],
+        "detection_score": [0.8],
+    }
+    normalized = normalize_detection_prediction(alternate)
+
+    assert normalized.valid is True
+    assert normalized.prediction == {
+        "boxes": [[1.0, 1.0, 4.0, 4.0]],
+        "labels": [1],
+        "scores": [0.8],
+    }
+    assert detection_agreement_stats([(alternate, _box())]).mean_f1 == pytest.approx(1.0)
+
+    malformed = {"boxes": [["bad"]], "labels": [1], "scores": [0.8]}
+    malformed_stats = detection_agreement_stats(
+        [(malformed, _empty())],
+        empty_empty_policy="score_one",
+    )
+    assert normalize_detection_prediction(malformed).valid is False
+    assert malformed_stats.total_samples == 1
+    assert malformed_stats.evaluated_samples == 0
+    assert malformed_stats.mean_f1 == pytest.approx(0.0)
+
+
 def test_controller_uses_prior_history_and_returns_buffer_plus_current() -> None:
     controller = _controller()
 
@@ -75,7 +151,8 @@ def test_controller_uses_prior_history_and_returns_buffer_plus_current() -> None
     assert submission.history_mean_accuracy == pytest.approx(1.0)
     assert submission.history_std_accuracy == pytest.approx(0.0)
     assert submission.accuracy_drop_threshold == pytest.approx(1.0)
-    assert submission.trigger_metadata()["trigger_reason"] == "accuracy_drop"
+    assert submission.trigger_metadata()["trigger_reason"] == "adaptive_drop"
+    assert submission.trigger_metadata()["agreement_stats"]["teacher_only_count"] == 1
 
     snapshot = controller.snapshot(
         run_id="run-a",
@@ -88,7 +165,7 @@ def test_controller_uses_prior_history_and_returns_buffer_plus_current() -> None
 
 
 def test_controller_does_not_trigger_before_min_history_or_on_normal_accuracy() -> None:
-    cold = _controller(min_history_windows=3)
+    cold = _controller(min_history_windows=3, warmup_accuracy_drop=0.0)
     _add_window(cold, _payload(1, edge_prediction=_box()), teacher_prediction=_box())
     _add_window(cold, _payload(2, edge_prediction=_box()), teacher_prediction=_box())
     assert (
@@ -119,6 +196,111 @@ def test_controller_does_not_trigger_before_min_history_or_on_normal_accuracy() 
     )
     assert stable_snapshot["last_decision"]["triggered"] is False
     assert stable_snapshot["buffer_frame_ids"] == [1, 2, 3]
+
+
+def test_controller_does_not_trigger_or_update_history_when_all_samples_empty_excluded() -> None:
+    controller = _controller()
+
+    assert (
+        _add_window(controller, _payload(1, edge_prediction=_empty()), teacher_prediction=_empty())
+        is None
+    )
+
+    snapshot = controller.snapshot(
+        run_id="run-a",
+        edge_id=1,
+        model_name="tiny",
+        model_version="0",
+    )
+    assert snapshot["history"] == []
+    assert snapshot["buffer_frame_ids"] == [1]
+    assert snapshot["last_decision"]["accuracy"] == pytest.approx(0.0)
+    assert snapshot["last_decision"]["agreement_stats"]["evaluated_samples"] == 0
+    assert snapshot["last_decision"]["triggered"] is False
+    assert snapshot["last_decision"]["trigger_reason"] == "none"
+
+
+def test_controller_triggers_on_warmup_drop_before_min_history() -> None:
+    controller = _controller(min_history_windows=3, warmup_accuracy_drop=0.04)
+
+    _add_window(controller, _payload(1, edge_prediction=_box()), teacher_prediction=_box())
+    submission = _add_window(
+        controller,
+        _payload(2, edge_prediction=_empty()),
+        teacher_prediction=_box(),
+    )
+
+    assert submission is not None
+    assert submission.trigger_reason == "warmup_drop"
+    assert submission.history_len == 1
+    assert submission.history_ready is False
+    assert submission.window_accuracy == pytest.approx(0.0)
+
+
+def test_controller_does_not_warmup_trigger_when_disabled() -> None:
+    controller = _controller(min_history_windows=3, warmup_accuracy_drop=0.0)
+
+    _add_window(controller, _payload(1, edge_prediction=_box()), teacher_prediction=_box())
+    submission = _add_window(
+        controller,
+        _payload(2, edge_prediction=_empty()),
+        teacher_prediction=_box(),
+    )
+
+    assert submission is None
+    snapshot = controller.snapshot(
+        run_id="run-a",
+        edge_id=1,
+        model_name="tiny",
+        model_version="0",
+    )
+    assert snapshot["history"] == pytest.approx([1.0, 0.0])
+    assert snapshot["last_decision"]["trigger_reason"] == "none"
+
+
+def test_controller_absolute_accuracy_floor_is_debug_trigger() -> None:
+    controller = _controller(
+        min_history_windows=5,
+        warmup_accuracy_drop=0.0,
+        absolute_accuracy_floor=0.5,
+    )
+
+    submission = _add_window(
+        controller,
+        _payload(1, edge_prediction=_empty()),
+        teacher_prediction=_box(),
+    )
+
+    assert submission is not None
+    assert submission.trigger_reason == "absolute_floor"
+    assert submission.history_len == 0
+
+
+def test_controller_active_pending_suppresses_additional_trigger() -> None:
+    controller = _controller()
+    submission = _trigger_submission(controller)
+    assert submission is not None
+    controller.record_submission_result(
+        submission,
+        accepted=True,
+        job_id="job-1",
+        status="QUEUED",
+        message="accepted",
+    )
+
+    assert (
+        _add_window(controller, _payload(4, edge_prediction=_empty()), teacher_prediction=_box())
+        is None
+    )
+    snapshot = controller.snapshot(
+        run_id="run-a",
+        edge_id=1,
+        model_name="tiny",
+        model_version="0",
+    )
+    assert snapshot["last_decision"]["active_pending"] is True
+    assert snapshot["last_decision"]["triggered"] is False
+    assert snapshot["last_decision"]["trigger_reason"] == "none"
 
 
 def test_controller_rejected_submission_retains_buffer_and_can_retrigger() -> None:
@@ -342,10 +524,11 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
     serialized = json.dumps(manifest, sort_keys=True)
     assert manifest["protocol_version"] == BASELINE_TRAINING_PROTOCOL_VERSION
     assert manifest["training_strategy"] == "freeze"
-    assert manifest["trigger_reason"] == "accuracy_drop"
+    assert manifest["trigger_reason"] == "adaptive_drop"
     assert manifest["trigger_window_frame_ids"] == [5, 6]
     assert manifest["training_frame_ids"] == [1, 2, 3, 4, 5, 6]
     assert manifest["buffered_window_count"] == 2
+    assert manifest["agreement_stats"]["teacher_only_count"] == 2
     assert manifest["frames"][0]["teacher_prediction"]["boxes"] == [[1, 1, 4, 4]]
     assert manifest["teacher_predictions"]["6"]["boxes"] == [[1, 1, 4, 4]]
     assert "split_plan" not in serialized
@@ -520,6 +703,76 @@ def test_cloud_controller_window_annotation_log_reports_batch_request(tmp_path) 
     assert "requested=1" not in combined
 
 
+def test_cloud_controller_logs_prediction_schema_warning_once_per_window(tmp_path) -> None:
+    backend = RecordingTrainingBackend()
+    annotator = RecordingSharedAnnotator([{}])
+    controller = DistributedBaselineController(
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="run-a",
+        results_root=str(tmp_path),
+        training_backend=backend,
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_method_config=_accuracy_config(),
+        sample_pool_max_samples=64,
+        model_weights_path="weights.pt",
+        tinynext_input_size=None,
+        teacher_annotator=annotator,
+    )
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda message: messages.append(str(message)),
+        level="WARNING",
+        format="{message}",
+    )
+    try:
+        controller.upload_accuracy_trigger_window(
+            _window_payload(
+                [
+                    _payload(
+                        1,
+                        edge_prediction={"boxes": [[1, 1, 4, 4]], "scores": [0.8]},
+                    )
+                ]
+            )
+        )
+    finally:
+        logger.remove(sink_id)
+
+    combined = "\n".join(messages)
+    assert combined.count("accuracy_trigger_prediction_schema_warning") == 1
+    assert "missing_edge_prediction_count=1" in combined
+    assert "missing_teacher_prediction_count=1" in combined
+
+
+def test_cloud_controller_validates_accuracy_window_frame_contract(tmp_path) -> None:
+    controller = DistributedBaselineController(
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="run-a",
+        results_root=str(tmp_path),
+        training_backend=RecordingTrainingBackend(),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_method_config=_accuracy_config(),
+        sample_pool_max_samples=64,
+        model_weights_path="weights.pt",
+        tinynext_input_size=None,
+        teacher_annotator=RecordingSharedAnnotator([_box()]),
+    )
+
+    with pytest.raises(RuntimeError, match="raw frame bytes"):
+        controller.upload_accuracy_trigger_window(
+            _window_payload([_payload(1, edge_prediction=_box(), raw_frame=b"")])
+        )
+    with pytest.raises(RuntimeError, match="frame_id values must be unique"):
+        controller.upload_accuracy_trigger_window(
+            _window_payload(
+                [
+                    _payload(2, edge_prediction=_box()),
+                    _payload(2, edge_prediction=_box()),
+                ]
+            )
+        )
+
+
 def test_cloud_controller_requires_shared_teacher_annotator(tmp_path) -> None:
     controller = DistributedBaselineController(
         baseline_method="accuracy_trigger_cloud_retraining",
@@ -648,6 +901,9 @@ def _accuracy_config(**overrides):
         "metric": "teacher_f1",
         "agreement_iou_threshold": 0.5,
         "agreement_score_threshold": 0.0,
+        "agreement_empty_empty_policy": "exclude",
+        "warmup_accuracy_drop": 0.04,
+        "absolute_accuracy_floor": None,
         "training_strategy": "freeze",
         "trainable_param_ratio": 0.3,
     }
@@ -664,6 +920,7 @@ def _payload(
     model_version: str = "0",
     edge_prediction: dict | None = None,
     quality_metadata: dict | None = None,
+    raw_frame: bytes | None = None,
 ) -> BaselineFramePayload:
     return BaselineFramePayload(
         run_id=run_id,
@@ -678,7 +935,7 @@ def _payload(
         is_keyframe=True,
         edge_prediction=dict(edge_prediction or {}),
         quality_metadata={"training_strategy": "freeze", **dict(quality_metadata or {})},
-        raw_frame=_jpeg_bytes(),
+        raw_frame=_jpeg_bytes() if raw_frame is None else bytes(raw_frame),
     )
 
 
@@ -688,6 +945,10 @@ def _box(*, label: int = 1) -> dict:
 
 def _empty() -> dict:
     return {"boxes": [], "labels": [], "scores": []}
+
+
+def _shifted_box() -> dict:
+    return {"boxes": [[10, 10, 14, 14]], "labels": [1], "scores": [0.9]}
 
 
 def _jpeg_bytes() -> bytes:

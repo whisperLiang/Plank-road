@@ -11,7 +11,12 @@ from loguru import logger
 
 from baselines.distributed.messages import BaselineWindowPayload, BaselineWindowSample, now_ms
 from baselines.runtime.training_state import stable_window_id
-from cloud.baselines.detection_agreement import teacher_f1
+from cloud.baselines.detection_agreement import (
+    EMPTY_EMPTY_POLICIES,
+    DetectionAgreementStats,
+    detection_agreement_stats,
+    normalize_detection_prediction,
+)
 
 _METHOD = "accuracy_trigger_cloud_retraining"
 _TERMINAL_FAILURES = {"FAILED", "STALE", "CANCELLED"}
@@ -41,6 +46,8 @@ class AccuracyTriggerFrame:
         *,
         teacher_prediction: Mapping[str, Any],
     ) -> "AccuracyTriggerFrame":
+        edge_prediction = normalize_detection_prediction(sample.edge_prediction)
+        normalized_teacher = normalize_detection_prediction(teacher_prediction)
         return cls(
             run_id=str(payload.run_id),
             baseline_method=str(payload.baseline_method),
@@ -51,8 +58,16 @@ class AccuracyTriggerFrame:
             model_version=str(payload.model_version or "0"),
             video_source=str(payload.video_source or ""),
             raw_frame=bytes(sample.raw_frame or b""),
-            edge_prediction=dict(sample.edge_prediction or {}),
-            teacher_prediction=dict(teacher_prediction or {}),
+            edge_prediction=(
+                dict(edge_prediction.prediction)
+                if edge_prediction.valid
+                else dict(sample.edge_prediction or {})
+            ),
+            teacher_prediction=(
+                dict(normalized_teacher.prediction)
+                if normalized_teacher.valid
+                else dict(teacher_prediction or {})
+            ),
             quality_metadata=dict(sample.quality_metadata or {}),
             is_keyframe=bool(sample.is_keyframe),
         )
@@ -73,10 +88,17 @@ class AccuracyTriggerWindow:
     window_id: str
     samples: tuple[AccuracyTriggerFrame, ...]
     accuracy: float
+    foreground_accuracy: float
+    agreement_stats: DetectionAgreementStats
+    history_len: int
+    history_ready: bool
     history_mean_accuracy: float
     history_std_accuracy: float
     accuracy_drop_threshold: float
+    accuracy_gap: float
+    active_pending: bool
     triggered: bool
+    trigger_reason: str
 
     @property
     def frame_ids(self) -> tuple[int, ...]:
@@ -95,9 +117,16 @@ class AccuracyTriggerSubmission:
     trigger_window_frame_ids: tuple[int, ...]
     training_samples: tuple[AccuracyTriggerFrame, ...]
     window_accuracy: float
+    foreground_accuracy: float
+    agreement_stats: DetectionAgreementStats
+    history_len: int
+    history_ready: bool
     history_mean_accuracy: float
     history_std_accuracy: float
     accuracy_drop_threshold: float
+    accuracy_gap: float
+    active_pending: bool
+    trigger_reason: str
     buffered_window_count: int
 
     @property
@@ -106,11 +135,17 @@ class AccuracyTriggerSubmission:
 
     def trigger_metadata(self) -> dict[str, Any]:
         return {
-            "trigger_reason": "accuracy_drop",
+            "trigger_reason": str(self.trigger_reason or "none"),
             "window_accuracy": float(self.window_accuracy),
+            "foreground_accuracy": float(self.foreground_accuracy),
+            "agreement_stats": self.agreement_stats.as_dict(),
+            "history_len": int(self.history_len),
+            "history_ready": bool(self.history_ready),
             "history_mean_accuracy": float(self.history_mean_accuracy),
             "history_std_accuracy": float(self.history_std_accuracy),
             "accuracy_drop_threshold": float(self.accuracy_drop_threshold),
+            "accuracy_gap": float(self.accuracy_gap),
+            "active_pending": bool(self.active_pending),
             "buffered_window_count": int(self.buffered_window_count),
             "trigger_window_frame_ids": [int(v) for v in self.trigger_window_frame_ids],
             "training_frame_ids": [int(v) for v in self.training_frame_ids],
@@ -124,6 +159,7 @@ class AccuracyTriggerPendingJob:
     window_id: str
     base_model_version: str
     frame_ids: tuple[int, ...]
+    trigger_reason: str = "adaptive_drop"
     status: str = "QUEUED"
     message: str = ""
     result_model_version: str = ""
@@ -140,6 +176,7 @@ class AccuracyTriggerCommandRecord:
     window_id: str
     base_model_version: str
     frame_ids: tuple[int, ...]
+    trigger_reason: str = "adaptive_drop"
     result_model_version: str = ""
     state: str = "pending"
     created_at_ms: int = 0
@@ -160,7 +197,7 @@ class AccuracyTriggerCommandRecord:
             "base_model_version": self.base_model_version,
             "result_model_version": self.result_model_version,
             "training_frame_ids": [int(value) for value in self.frame_ids],
-            "trigger_reason": "accuracy_drop",
+            "trigger_reason": str(self.trigger_reason or "adaptive_drop"),
             "expires_at_ms": int(self.expires_at_ms),
         }
 
@@ -200,6 +237,19 @@ class AccuracyTriggerController:
         )
         self.agreement_score_threshold = float(
             _config_value(config, "agreement_score_threshold", 0.0)
+        )
+        self.agreement_empty_empty_policy = str(
+            _config_value(config, "agreement_empty_empty_policy", "exclude") or "exclude"
+        ).strip().lower()
+        if self.agreement_empty_empty_policy not in EMPTY_EMPTY_POLICIES:
+            raise ValueError(
+                "agreement_empty_empty_policy must be one of "
+                + ", ".join(sorted(EMPTY_EMPTY_POLICIES))
+            )
+        self.warmup_accuracy_drop = float(_config_value(config, "warmup_accuracy_drop", 0.04))
+        absolute_floor = _config_value(config, "absolute_accuracy_floor", None)
+        self.absolute_accuracy_floor = (
+            None if absolute_floor in (None, "") else float(absolute_floor)
         )
         self.training_strategy = str(_config_value(config, "training_strategy", "freeze"))
         self.trainable_param_ratio = float(_config_value(config, "trainable_param_ratio", 0.3))
@@ -280,6 +330,7 @@ class AccuracyTriggerController:
                 window_id=str(submission.window_id),
                 base_model_version=str(submission.model_version or "0"),
                 frame_ids=tuple(int(value) for value in submission.training_frame_ids),
+                trigger_reason=str(submission.trigger_reason or "adaptive_drop"),
                 status=normalized_status,
                 message=str(message or ""),
                 submitted_at_ms=now_ms(),
@@ -492,10 +543,17 @@ class AccuracyTriggerController:
                     {
                         "window_id": state.last_decision.window_id,
                         "accuracy": state.last_decision.accuracy,
+                        "foreground_accuracy": state.last_decision.foreground_accuracy,
+                        "agreement_stats": state.last_decision.agreement_stats.as_dict(),
+                        "history_len": state.last_decision.history_len,
+                        "history_ready": state.last_decision.history_ready,
                         "history_mean_accuracy": state.last_decision.history_mean_accuracy,
                         "history_std_accuracy": state.last_decision.history_std_accuracy,
                         "accuracy_drop_threshold": state.last_decision.accuracy_drop_threshold,
+                        "accuracy_gap": state.last_decision.accuracy_gap,
+                        "active_pending": state.last_decision.active_pending,
                         "triggered": state.last_decision.triggered,
+                        "trigger_reason": state.last_decision.trigger_reason,
                         "frame_ids": list(state.last_decision.frame_ids),
                     }
                     if state.last_decision is not None
@@ -511,38 +569,101 @@ class AccuracyTriggerController:
         *,
         window_id: str,
     ) -> AccuracyTriggerSubmission | None:
-        accuracy = self._window_accuracy(samples)
+        agreement_stats = detection_agreement_stats(
+            (
+                (sample.edge_prediction, sample.teacher_prediction)
+                for sample in samples
+            ),
+            empty_empty_policy=self.agreement_empty_empty_policy,
+            iou_threshold=self.agreement_iou_threshold,
+            score_threshold=self.agreement_score_threshold,
+        )
+        accuracy = float(agreement_stats.mean_f1)
+        foreground_accuracy = float(agreement_stats.foreground_mean_f1)
+        history_len = len(state.history)
         mean, std = _weighted_stats(state.history, decay=self.history_decay)
         threshold = mean - (float(self.accuracy_drop_sigma) * std)
-        history_ready = len(state.history) >= self.min_history_windows
+        history_ready = history_len >= self.min_history_windows
         active_pending = any(
             str(pending.status).upper() not in _TERMINAL_FAILURES | {"SUCCEEDED"}
             for pending in state.pending_jobs.values()
         )
-        triggered = bool(history_ready and not active_pending and threshold > accuracy)
+        accuracy_gap = float(threshold - accuracy)
+        trigger_reason = "none"
+        evaluated = int(agreement_stats.evaluated_samples)
+        if evaluated > 0 and not active_pending:
+            adaptive_drop = bool(history_ready and threshold > accuracy)
+            warmup_drop = bool(
+                not history_ready
+                and history_len >= 1
+                and float(self.warmup_accuracy_drop) > 0.0
+                and (mean - accuracy) >= float(self.warmup_accuracy_drop)
+            )
+            absolute_floor = bool(
+                self.absolute_accuracy_floor is not None
+                and accuracy < float(self.absolute_accuracy_floor)
+            )
+            if adaptive_drop:
+                trigger_reason = "adaptive_drop"
+            elif warmup_drop:
+                trigger_reason = "warmup_drop"
+            elif absolute_floor:
+                trigger_reason = "absolute_floor"
+        triggered = trigger_reason != "none"
         window = AccuracyTriggerWindow(
             window_id=window_id,
             samples=samples,
             accuracy=accuracy,
+            foreground_accuracy=foreground_accuracy,
+            agreement_stats=agreement_stats,
+            history_len=history_len,
+            history_ready=history_ready,
             history_mean_accuracy=mean,
             history_std_accuracy=std,
             accuracy_drop_threshold=threshold,
+            accuracy_gap=accuracy_gap,
+            active_pending=active_pending,
             triggered=triggered,
+            trigger_reason=trigger_reason,
         )
         prior_buffered_window_count = _buffer_window_count(state)
-        state.history.append(float(accuracy))
+        if evaluated > 0:
+            state.history.append(float(accuracy))
         self._append_buffer_samples_locked(state, window)
         state.last_decision = window
         logger.info(
             "accuracy_trigger_window_decision edge={} window={} accuracy={:.4f} "
-            "history_mean={:.4f} threshold={:.4f} triggered={} buffer_size={}",
+            "foreground_accuracy={:.4f} history_len={} history_ready={} "
+            "history_mean={:.4f} history_std={:.4f} threshold={:.4f} "
+            "accuracy_gap={:.4f} active_pending={} triggered={} trigger_reason={} "
+            "buffer_size={} total_samples={} evaluated_samples={} empty_empty={} "
+            "teacher_only={} edge_only={} both_non_empty={} avg_teacher_boxes={:.4f} "
+            "avg_edge_boxes={:.4f} f1_p10={:.4f} f1_p50={:.4f} f1_p90={:.4f}",
             key[1],
             window_id,
             accuracy,
+            foreground_accuracy,
+            history_len,
+            history_ready,
             mean,
+            std,
             threshold,
+            accuracy_gap,
+            active_pending,
             triggered,
+            trigger_reason,
             len(state.buffer_samples),
+            agreement_stats.total_samples,
+            agreement_stats.evaluated_samples,
+            agreement_stats.empty_empty_count,
+            agreement_stats.teacher_only_count,
+            agreement_stats.edge_only_count,
+            agreement_stats.both_non_empty_count,
+            agreement_stats.avg_teacher_boxes,
+            agreement_stats.avg_edge_boxes,
+            agreement_stats.f1_p10,
+            agreement_stats.f1_p50,
+            agreement_stats.f1_p90,
         )
         if not triggered:
             return None
@@ -558,9 +679,16 @@ class AccuracyTriggerController:
             trigger_window_frame_ids=tuple(int(sample.frame_id) for sample in samples),
             training_samples=training_samples,
             window_accuracy=accuracy,
+            foreground_accuracy=foreground_accuracy,
+            agreement_stats=agreement_stats,
+            history_len=history_len,
+            history_ready=history_ready,
             history_mean_accuracy=mean,
             history_std_accuracy=std,
             accuracy_drop_threshold=threshold,
+            accuracy_gap=accuracy_gap,
+            active_pending=active_pending,
+            trigger_reason=trigger_reason,
             buffered_window_count=prior_buffered_window_count,
         )
 
@@ -580,6 +708,7 @@ class AccuracyTriggerController:
             window_id=str(pending.window_id),
             base_model_version=str(pending.base_model_version or "0"),
             frame_ids=tuple(int(value) for value in pending.frame_ids),
+            trigger_reason=str(pending.trigger_reason or "adaptive_drop"),
             result_model_version=str(pending.result_model_version or ""),
             created_at_ms=now_ms(),
         )
@@ -591,20 +720,6 @@ class AccuracyTriggerController:
             pending.job_id,
             pending.result_model_version,
         )
-
-    def _window_accuracy(self, samples: tuple[AccuracyTriggerFrame, ...]) -> float:
-        if not samples:
-            return 0.0
-        scores = [
-            teacher_f1(
-                sample.edge_prediction,
-                sample.teacher_prediction,
-                iou_threshold=self.agreement_iou_threshold,
-                score_threshold=self.agreement_score_threshold,
-            )
-            for sample in samples
-        ]
-        return float(sum(scores) / len(scores))
 
     def _append_buffer_samples_locked(
         self,

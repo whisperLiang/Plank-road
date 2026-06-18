@@ -18,9 +18,12 @@ baseline:
   microprofile_epochs: 5
  accuracy_trigger_cloud_retraining:
   # Engineering variant for this refactor: this reuses the existing
- # Plank-Road frame filter as the keyframe selector, while training
- # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
+  # Plank-Road frame filter as the keyframe selector, while training
+  # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
   trigger_window_size: 60
+  agreement_empty_empty_policy: exclude
+  warmup_accuracy_drop: 0.04
+  absolute_accuracy_floor: null
 
 client:
  # the source video
