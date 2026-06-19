@@ -115,7 +115,7 @@ class Object_Detection:
                         and isinstance(splitter_input[0], torch.Tensor)
                     ):
                         input_tensor_shape = [int(dim) for dim in splitter_input[0].shape]
-                    add_timing("preprocess", started)
+                    add_timing("split_preprocess_ms", started)
 
                     replay_profile: dict[str, float] = {}
                     replayed, split_payload = splitter.replay_inference(
@@ -123,10 +123,13 @@ class Object_Detection:
                         return_split_output=True,
                         profile=replay_profile,
                     )
-                    for name in ("split_prefix", "split_suffix"):
-                        if name in replay_profile:
-                            timing_ms[name] = timing_ms.get(name, 0.0) + float(
-                                replay_profile[name]
+                    for source_name, timing_name in (
+                        ("split_prefix", "split_prefix_ms"),
+                        ("split_suffix", "split_suffix_ms"),
+                    ):
+                        if source_name in replay_profile:
+                            timing_ms[timing_name] = timing_ms.get(timing_name, 0.0) + float(
+                                replay_profile[source_name]
                             )
 
                     started = time.perf_counter()
@@ -136,7 +139,7 @@ class Object_Detection:
                         split_payload,
                         include_feature_spectral_entropy=False,
                     )
-                    add_timing("observables", started)
+                    add_timing("observables_ms", started)
 
                     started = time.perf_counter()
                     replayed = postprocess_split_runtime_output(
@@ -146,14 +149,14 @@ class Object_Detection:
                         model_input=splitter_input,
                         orig_image=img,
                     )
-                    add_timing("postprocess", started)
+                    add_timing("postprocess_ms", started)
 
                     started = time.perf_counter()
                     pred_boxes, pred_class, pred_score = self._parse_prediction_output(
                         replayed,
                         self.threshold_low,
                     )
-                    add_timing("parse_filter", started)
+                    add_timing("parse_filter_ms", started)
                 else:
                     pred_boxes, pred_class, pred_score = self.get_model_prediction(
                         img,
@@ -204,7 +207,7 @@ class Object_Detection:
                 detection_score,
                 threshold=float(final_detection_threshold),
             )
-        add_timing("parse_filter", started)
+        add_timing("parse_filter_ms", started)
 
         return InferenceArtifacts(
             intermediate=split_payload,

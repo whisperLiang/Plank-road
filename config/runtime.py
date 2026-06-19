@@ -380,6 +380,9 @@ class ClientConfig(ConfigSection):
     diff_flag: bool = True
     diff_thresh: float = 0.0004
     local_queue_maxsize: int = 10
+    strict_sample_collection: bool = False
+    flush_every_n_frames: int = 30
+    performance_log_every_n_frames: int = 30
     wait_thresh: int = 100
     frame_cache_maxsize: int = 100
     lightweight: str = "yolo26n"
@@ -838,6 +841,19 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         )
     _validate_positive("client.interval", int(config.client.interval))
     _validate_positive("client.local_queue_maxsize", int(config.client.local_queue_maxsize))
+    if not isinstance(config.client.strict_sample_collection, bool):
+        raise ValueError(
+            "client.strict_sample_collection must be a boolean, "
+            f"got {config.client.strict_sample_collection!r}"
+        )
+    _validate_positive(
+        "client.flush_every_n_frames",
+        int(config.client.flush_every_n_frames),
+    )
+    _validate_positive(
+        "client.performance_log_every_n_frames",
+        int(config.client.performance_log_every_n_frames),
+    )
     _validate_positive("client.wait_thresh", int(config.client.wait_thresh))
     _validate_positive("client.frame_cache_maxsize", int(config.client.frame_cache_maxsize))
     _validate_positive(

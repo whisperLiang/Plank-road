@@ -57,7 +57,21 @@ def _write_task_result(handle, task: Task) -> None:
         },
     }
     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    handle.flush()
+
+
+def _write_buffered_task_result(
+    handle,
+    task: Task,
+    *,
+    unflushed_count: int,
+    flush_every_n_frames: int,
+) -> int:
+    _write_task_result(handle, task)
+    pending = int(unflushed_count) + 1
+    if pending >= max(1, int(flush_every_n_frames)):
+        handle.flush()
+        return 0
+    return pending
 
 
 def _resolve_display_label_config(config, edge: EdgeWorker):
@@ -313,6 +327,11 @@ def _run_video_loop(
         baseline_adapter.before_video_start(edge)
 
     with result_path.open("w", encoding="utf-8") as result_file:
+        flush_every_n_frames = max(
+            1,
+            int(getattr(config, "flush_every_n_frames", 30)),
+        )
+        unflushed_result_count = 0
         with VideoProcessor(config.source) as video:
             video_fps = float(video.fps or 0.0)
             if video_fps <= 0:
@@ -393,7 +412,12 @@ def _run_video_loop(
                         "frame_index": index,
                         "frame": frame.copy(),
                     }
-                    _write_task_result(result_file, task)
+                    unflushed_result_count = _write_buffered_task_result(
+                        result_file,
+                        task,
+                        unflushed_count=unflushed_result_count,
+                        flush_every_n_frames=flush_every_n_frames,
+                    )
                     if baseline_adapter is not None:
                         baseline_adapter.on_sampled_inference_result(
                             frame=frame,
@@ -491,6 +515,7 @@ def _run_video_loop(
                     if key in (27, ord("q")):
                         logger.info("Video display stopped by user.")
                         break
+        result_file.flush()
 
     logger.info("Saved local inference results: records_file={}.", result_path.name)
     log_diagnostic_debug(

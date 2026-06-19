@@ -45,6 +45,13 @@ client:
  diff_thresh: 0.0004
  # the queue maxsize
  local_queue_maxsize: 10
+ # Default online mode drops CL samples when async queues are full.
+ # Enable only for strict offline experiments that may block after task completion.
+ strict_sample_collection: false
+ # Batch JSONL flushes to keep per-frame display latency free of fsync-style overhead.
+ flush_every_n_frames: 30
+ # Emit detailed performance logs periodically; JSONL still records every sampled frame.
+ performance_log_every_n_frames: 30
  # the max wait time
  wait_thresh: 100
  frame_cache_maxsize: 100
