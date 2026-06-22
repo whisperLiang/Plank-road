@@ -184,11 +184,8 @@ client:
    validation_batches: [1]
    max_boundary_count: 8
    max_payload_bytes: 33554432
-   # CPU-only suffix replay can be faster with fewer Torch threads than the
-   # library default. Use auto to benchmark a few candidates at startup, an
-   # integer to force a value, or 0/off/default to leave Torch unchanged.
-   suffix_num_threads: auto
-   suffix_thread_tuning_iterations: 4
+   # This 16-core deployment benchmarks most consistently at 12 threads.
+   inference_num_threads: 12
    privacy_leakage_epsilon: 1.0e-12
 
 server:

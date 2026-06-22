@@ -29,6 +29,10 @@ from model_management.split_runtime import (
     prepare_boundary_for_runtime,
     prepare_split_runtime,
 )
+from model_management.torchlens_optimized_replay import (
+    TorchScriptSplitReplay,
+    build_torchscript_split_replay,
+)
 
 AUTO_TRACE_PROBE_BOUNDARY = "50%"
 
@@ -585,12 +589,51 @@ class UniversalModelSplitter:
         self.graph: str | None = None
         self.history = None
         self.trace_timings: dict[str, float] = {}
-        self.trace_used_output_fallback = False
         self.trainability_loss_fn = None
         self.model_name: str | None = None
         self.model_family: str | None = None
         self._trace_sample_input: Any = None
         self._last_replay_validation: dict[str, Any] | None = None
+        self._inference_replay_runner: TorchScriptSplitReplay | None = None
+
+    def _clear_inference_replay(self) -> None:
+        self._inference_replay_runner = None
+
+    def prepare_inference_replay(self, sample_input: Any) -> None:
+        self._clear_inference_replay()
+        runtime = self._ensure_runtime()
+        inputs = _runtime_args(sample_input)
+        runner = build_torchscript_split_replay(runtime, inputs)
+        with torch.inference_mode():
+            reference_payload = self.edge_forward(sample_input)
+            reference_output = _run_suffix_segment(
+                runtime,
+                reference_payload,
+                trusted=True,
+            )
+            replay_payload = runner.run_prefix(*inputs)
+            replay_output = runner.run_suffix(replay_payload)
+        boundary_equivalent, boundary_max_diff = compare_outputs(
+            reference_payload.tensors,
+            replay_payload.tensors,
+        )
+        output_equivalent, output_max_diff = compare_outputs(
+            reference_output,
+            replay_output,
+        )
+        if not boundary_equivalent or not output_equivalent:
+            raise RuntimeError(
+                "Optimized split replay validation failed "
+                f"(boundary_max_diff={boundary_max_diff:.6g}, "
+                f"output_max_diff={output_max_diff:.6g})."
+            )
+        self._inference_replay_runner = runner
+        logger.info(
+            "[EdgeCL] TorchScript split replay ready "
+            "boundary_max_diff={:.6g} output_max_diff={:.6g}.",
+            float(boundary_max_diff),
+            float(output_max_diff),
+        )
 
     def trace(
         self,
@@ -656,6 +699,7 @@ class UniversalModelSplitter:
             self.split_spec,
             mode=self.split_spec.mode,
         )
+        self._clear_inference_replay()
         if requested_boundary == "auto":
             logger.info(
                 "[FixedSplit] TorchLens trace probe runtime completed in {:.3f}s "
@@ -694,6 +738,7 @@ class UniversalModelSplitter:
         self.candidates = [self.current_candidate]
         self._trace_sample_input = None
         self._last_replay_validation = None
+        self._clear_inference_replay()
         return self
 
     def bind_graph(
@@ -733,6 +778,7 @@ class UniversalModelSplitter:
             exact_spec,
             mode=exact_spec.mode,
         )
+        self._clear_inference_replay()
         self.split_spec = exact_spec
         self.graph = _runtime_trace_signature(self.runtime)
         self.current_candidate = _candidate_from_runtime(self.runtime, exact_spec)
@@ -898,18 +944,6 @@ class UniversalModelSplitter:
             optimizer=optimizer,
         )
 
-    def train_suffix_fast(
-        self,
-        boundary: BoundaryPayload,
-        targets: Any,
-        *,
-        loss_fn=None,
-        optimizer=None,
-        profile: dict[str, float] | None = None,
-    ):
-        del profile
-        return self.train_suffix(boundary, targets, loss_fn=loss_fn, optimizer=optimizer)
-
     def replay_inference(
         self,
         sample_input: Any,
@@ -917,28 +951,24 @@ class UniversalModelSplitter:
         return_split_output: bool = False,
         profile: dict[str, float] | None = None,
     ):
+        inputs = _runtime_args(sample_input)
+        runner = self._inference_replay_runner
+        if runner is None:
+            raise RuntimeError("TorchScript inference replay has not been prepared.")
         started = time.perf_counter()
-        payload = self.edge_forward(sample_input)
+        payload = runner.run_prefix(*inputs)
         if profile is not None:
             profile["split_prefix"] = profile.get("split_prefix", 0.0) + (
                 time.perf_counter() - started
             ) * 1000.0
 
-        runtime = self._ensure_runtime()
         started = time.perf_counter()
-        outputs = _run_suffix_segment(runtime, payload, trusted=True)
+        outputs = runner.run_suffix(payload)
         if profile is not None:
             profile["split_suffix"] = profile.get("split_suffix", 0.0) + (
                 time.perf_counter() - started
             ) * 1000.0
         return (outputs, payload) if return_split_output else outputs
-
-    def full_forward(self, *args: Any, **kwargs: Any) -> Any:
-        if self.model is None:
-            raise RuntimeError("No model is bound.")
-        return self.model(*args, **kwargs)
-
-    full_replay = full_forward
 
     def validate_candidate(
         self,

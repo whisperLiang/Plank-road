@@ -14,6 +14,9 @@ from model_management.split_runtime import (
 from model_management.split_runtime.torchlens_native_runtime import (
     require_torchlens_native_split_api,
 )
+from model_management.torchlens_optimized_replay import (
+    build_torchscript_split_replay,
+)
 from model_management.universal_model_split import UniversalModelSplitter
 
 
@@ -126,7 +129,7 @@ def test_universal_splitter_suffix_fast_path_preserves_validation(monkeypatch) -
     assert torch.allclose(replayed, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_replay_inference_trusted_suffix_fast_path_skips_revalidation(monkeypatch) -> None:
+def test_torchscript_replay_skips_eager_suffix_and_boundary_validation(monkeypatch) -> None:
     torch.manual_seed(17)
     model = TinyRuntimeModel().eval()
     example = torch.randn(2, 4)
@@ -136,6 +139,7 @@ def test_replay_inference_trusted_suffix_fast_path_skips_revalidation(monkeypatc
         make_split_spec("percent:50", dynamic_batch=(1, 4), trainable=True),
     )
     splitter = UniversalModelSplitter(device="cpu").bind_runtime(runtime, model=model)
+    splitter.prepare_inference_replay(example)
     validate_calls = {"count": 0}
     run_suffix_calls = {"count": 0}
 
@@ -158,6 +162,72 @@ def test_replay_inference_trusted_suffix_fast_path_skips_revalidation(monkeypatc
     assert run_suffix_calls["count"] == 0
     assert set(boundary.tensors)
     assert torch.allclose(replayed, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_torchscript_split_replay_preserves_boundary_output_and_live_parameters() -> None:
+    torch.manual_seed(23)
+    model = TinyRuntimeModel().eval()
+    example = torch.randn(1, 4)
+    runtime = prepare_split_runtime(
+        model,
+        example,
+        make_split_spec("percent:50", dynamic_batch=(1, 4), trainable=True),
+    )
+
+    runner = build_torchscript_split_replay(runtime, (example,))
+    with torch.inference_mode():
+        expected_boundary = runtime.run_prefix(example)
+        expected_output = runtime.run_suffix(expected_boundary)
+        actual_boundary = runner.run_prefix(example)
+        actual_output = runner.run_suffix(actual_boundary)
+
+    assert expected_boundary.tensors.keys() == actual_boundary.tensors.keys()
+    assert all(
+        torch.equal(expected_boundary.tensors[label], actual_boundary.tensors[label])
+        for label in expected_boundary.tensors
+    )
+    assert torch.equal(expected_output, actual_output)
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(0.125)
+    with torch.inference_mode():
+        expected_after_update = model(example)
+
+    def fail_full_forward(_inputs):
+        raise AssertionError("optimized split replay must not invoke full model forward")
+
+    model.forward = fail_full_forward
+    with torch.inference_mode():
+        actual_after_update = runner.run_suffix(runner.run_prefix(example))
+
+    assert torch.allclose(
+        actual_after_update,
+        expected_after_update,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_torchscript_split_replay_accepts_dynamic_batch() -> None:
+    torch.manual_seed(29)
+    model = TinyRuntimeModel().eval()
+    example = torch.randn(1, 4)
+    runtime = prepare_split_runtime(
+        model,
+        example,
+        make_split_spec("percent:50", dynamic_batch=(1, 4), trainable=True),
+    )
+    runner = build_torchscript_split_replay(runtime, (example,))
+    dynamic_input = torch.randn(3, 4)
+
+    with torch.inference_mode():
+        boundary = runner.run_prefix(dynamic_input)
+        actual = runner.run_suffix(boundary)
+        expected = model(dynamic_input)
+
+    assert boundary.batch_size == 3
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_runtime_cache_key_ignores_device_for_split_abi() -> None:

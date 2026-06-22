@@ -161,6 +161,27 @@ def test_feature_entropy_is_deterministic() -> None:
     assert first == second
 
 
+def test_cpu_feature_entropy_samples_before_full_tensor_abs(monkeypatch) -> None:
+    classifier = _classifier(feature_max_elements=32)
+    tensor = torch.arange(4096, dtype=torch.float32)
+    observed_sizes: list[int] = []
+    original_abs = np.abs
+
+    def tracking_abs(values):
+        observed_sizes.append(int(values.size))
+        return original_abs(values)
+
+    monkeypatch.setattr(np, "abs", tracking_abs)
+
+    first = classifier._tensor_activation_entropy(tensor)
+    cached_indices = classifier._feature_sample_indices[tensor.numel()]
+    second = classifier._tensor_activation_entropy(tensor)
+
+    assert first == second
+    assert observed_sizes == [32, 32]
+    assert classifier._feature_sample_indices[tensor.numel()] is cached_indices
+
+
 def test_output_entropy_threshold_adapts_from_prior_window() -> None:
     classifier = _classifier(output_percentile=25.0)
     for value in [0.10, 0.20, 0.30, 0.40]:

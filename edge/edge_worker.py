@@ -55,6 +55,30 @@ _QUEUE_STOP = object()
 _QUEUE_POLL_TIMEOUT_SECONDS = 0.05
 
 
+class _FixedSplitRuntimeError(RuntimeError):
+    pass
+
+
+def _lower_current_thread_priority() -> bool:
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            get_current_thread = kernel32.GetCurrentThread
+            get_current_thread.restype = ctypes.c_void_p
+            set_thread_priority = kernel32.SetThreadPriority
+            set_thread_priority.argtypes = (ctypes.c_void_p, ctypes.c_int)
+            set_thread_priority.restype = ctypes.c_int
+            return bool(set_thread_priority(get_current_thread(), -1))
+        if hasattr(os, "setpriority") and hasattr(os, "PRIO_PROCESS"):
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 5)
+            return True
+    except (AttributeError, OSError):
+        return False
+    return False
+
+
 def _timeout_deadline(timeout: float | None) -> float | None:
     return None if timeout is None else time.monotonic() + max(0.0, float(timeout))
 
@@ -71,64 +95,6 @@ def _coerce_positive_int(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
-
-
-def _suffix_thread_candidates(
-    value: object,
-    *,
-    current_threads: int,
-    cpu_count: int | None = None,
-) -> tuple[str, list[int]]:
-    if isinstance(value, bool):
-        if not value:
-            return "off", []
-        text = "auto"
-    elif value is None:
-        text = "auto"
-    else:
-        text = str(value).strip().lower()
-    if text in {"", "auto"}:
-        limit = max(1, int(cpu_count or current_threads or 1))
-        auto_limit = min(12, limit)
-        candidates = [
-            min(int(current_threads), limit),
-            min(8, auto_limit),
-            min(12, auto_limit),
-            min(max(1, int(current_threads) // 2), auto_limit),
-            4,
-            2,
-            1,
-        ]
-        seen: set[int] = set()
-        resolved: list[int] = []
-        for threads in candidates:
-            if threads <= 0 or threads > limit or threads in seen:
-                continue
-            seen.add(threads)
-            resolved.append(threads)
-        return "auto", resolved
-    if text in {"0", "off", "false", "none", "default", "disabled"}:
-        return "off", []
-    parsed = _coerce_positive_int(value)
-    if parsed is not None:
-        return "fixed", [parsed]
-    return "invalid", []
-
-
-def _percentile(values: list[float], percentile: float) -> float:
-    if not values:
-        return 0.0
-    sorted_values = sorted(float(value) for value in values)
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    position = (len(sorted_values) - 1) * max(0.0, min(100.0, float(percentile))) / 100.0
-    lower = int(position)
-    upper = min(lower + 1, len(sorted_values) - 1)
-    if lower == upper:
-        return sorted_values[lower]
-    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (
-        position - lower
-    )
 
 
 def _first_tensor_batch_size(value: object) -> int | None:
@@ -332,6 +298,7 @@ class AsyncSampleCollector:
         return flushed and not self._thread.is_alive()
 
     def _run(self) -> None:
+        _lower_current_thread_priority()
         while True:
             try:
                 item = self._queue.get(block=True, timeout=_QUEUE_POLL_TIMEOUT_SECONDS)
@@ -459,6 +426,7 @@ class AsyncSampleWriter:
         return flushed and not any(thread.is_alive() for thread in self._threads)
 
     def _run(self) -> None:
+        _lower_current_thread_priority()
         while True:
             try:
                 item = self._queue.get(block=True, timeout=_QUEUE_POLL_TIMEOUT_SECONDS)
@@ -639,8 +607,14 @@ class EdgeWorker:
         self._pending_model_update_lock = threading.Lock()
         self.pending_model_update: PendingModelUpdate | None = None
         self.edge_session_id = uuid.uuid4().hex
+        feature_upload_cfg = getattr(self.config, "feature_upload", None)
         self.sample_store = EdgeSampleStore(
-            os.path.join(self.config.retrain.cache_path, "sample_store")
+            os.path.join(self.config.retrain.cache_path, "sample_store"),
+            feature_storage_format=str(
+                getattr(feature_upload_cfg, "storage_format", "safetensors_shard")
+                or "safetensors_shard"
+            ),
+            feature_shard_dtype=getattr(feature_upload_cfg, "shard_dtype", None),
         )
         self._pending_sample_stats_lock = threading.Lock()
         self._pending_sample_stats = SampleStatsDelta(total_samples=0)
@@ -803,7 +777,8 @@ class EdgeWorker:
             )
             self.universal_split_enabled = True
             self.split_trace_image_size = tuple(int(value) for value in trace_image_size)
-            self._configure_suffix_replay_threads(sample_input)
+            self.universal_splitter.prepare_inference_replay(sample_input)
+            self._configure_inference_replay_threads(sample_input)
             logger.info("Warming up fixed split runtime.")
             self._warmup_fixed_split_runtime(sample_input)
             logger.info(
@@ -824,14 +799,14 @@ class EdgeWorker:
                 runtime=True,
             )
         except RuntimeError as exc:
-            logger.warning(
-                "Fixed split plan unavailable for model={}: {}.",
+            logger.error(
+                "Fixed split runtime initialisation failed for model={}: {}.",
                 self.model_id,
                 safe_error_summary(exc),
             )
-            self.split_learning_disable_reason = str(exc)
-            self.split_learning_enabled = False
-            self._reset_split_runtime_state()
+            raise _FixedSplitRuntimeError(
+                "Fixed split runtime initialisation failed."
+            ) from exc
         except Exception as exc:
             logger.error(
                 "Failed to initialise fixed split plan: {}.",
@@ -846,9 +821,9 @@ class EdgeWorker:
                 },
                 runtime=True,
             )
-            self.split_learning_disable_reason = str(exc)
-            self.split_learning_enabled = False
-            self._reset_split_runtime_state()
+            raise _FixedSplitRuntimeError(
+                "Failed to initialise fixed split runtime."
+            ) from exc
 
     def _init_baseline_split_runtime(
         self,
@@ -877,112 +852,36 @@ class EdgeWorker:
         if warmup_iterations <= 0 or self.universal_splitter is None:
             return
         warmup_started = time.perf_counter()
-        try:
-            with torch.inference_mode():
-                for _ in range(warmup_iterations):
-                    self.universal_splitter.replay_inference(
-                        sample_input,
-                        return_split_output=True,
-                    )
-        except Exception as exc:
-            logger.warning(
-                "Fixed split warmup failed; continuing without warm cache: {}.",
-                safe_error_summary(exc),
-            )
-            return
+        with torch.inference_mode():
+            for _ in range(warmup_iterations):
+                self.universal_splitter.replay_inference(
+                    sample_input,
+                    return_split_output=True,
+                )
         logger.info(
             "Fixed split warmup completed (iterations={}, elapsed={:.3f}s).",
             warmup_iterations,
             time.perf_counter() - warmup_started,
         )
 
-    def _configure_suffix_replay_threads(self, sample_input) -> None:
-        if torch.cuda.is_available() or self.universal_splitter is None:
+    def _configure_inference_replay_threads(self, sample_input) -> None:
+        del sample_input
+        if self.universal_splitter is None:
+            return
+        replay_device = torch.device(getattr(self.universal_splitter, "device", "cpu"))
+        if replay_device.type != "cpu":
             return
         sl_cfg = getattr(self.config, "split_learning", None)
         fixed_split_cfg = getattr(sl_cfg, "fixed_split", None) if sl_cfg else None
+        threads = int(getattr(fixed_split_cfg, "inference_num_threads", 12))
+        if threads <= 0:
+            raise ValueError("fixed_split.inference_num_threads must be positive.")
         current_threads = int(torch.get_num_threads())
-        mode, candidates = _suffix_thread_candidates(
-            getattr(fixed_split_cfg, "suffix_num_threads", "auto"),
-            current_threads=current_threads,
-            cpu_count=os.cpu_count(),
-        )
-        if mode == "off":
-            logger.info(
-                "CPU suffix replay thread tuning disabled; using torch_num_threads={}.",
-                current_threads,
-            )
-            return
-        if mode == "invalid" or not candidates:
-            logger.warning(
-                "Invalid fixed_split.suffix_num_threads={!r}; using torch_num_threads={}.",
-                getattr(fixed_split_cfg, "suffix_num_threads", None),
-                current_threads,
-            )
-            return
-        if mode == "fixed":
-            torch.set_num_threads(int(candidates[0]))
-            logger.info(
-                "Configured CPU suffix replay torch_num_threads={} (previous={}).",
-                int(candidates[0]),
-                current_threads,
-            )
-            return
-
-        iterations = max(
-            1,
-            int(getattr(fixed_split_cfg, "suffix_thread_tuning_iterations", 4) or 4),
-        )
-        try:
-            with torch.inference_mode():
-                results: list[tuple[float, float, int]] = []
-                for threads in candidates:
-                    torch.set_num_threads(int(threads))
-                    self.universal_splitter.replay_inference(sample_input)
-                    timings: list[float] = []
-                    for _ in range(iterations):
-                        started = time.perf_counter()
-                        self.universal_splitter.replay_inference(sample_input)
-                        timings.append((time.perf_counter() - started) * 1000.0)
-                    median = _percentile(timings, 50)
-                    tail = _percentile(timings, 95)
-                    results.append((float(tail), float(median), int(threads)))
-        except Exception as exc:
-            torch.set_num_threads(current_threads)
-            logger.warning(
-                "CPU suffix replay thread tuning failed; restored torch_num_threads={}: {}.",
-                current_threads,
-                safe_error_summary(exc),
-            )
-            return
-
-        if not results:
-            torch.set_num_threads(current_threads)
-            return
-        best_tail, best_median, best_threads = min(
-            results,
-            key=lambda item: (item[0], item[1], item[2]),
-        )
-        torch.set_num_threads(best_threads)
-        median_summary = {
-            str(threads): round(median_ms, 2)
-            for _tail_ms, median_ms, threads in results
-        }
-        tail_summary = {
-            str(threads): round(tail_ms, 2)
-            for tail_ms, _median_ms, threads in results
-        }
+        torch.set_num_threads(threads)
         logger.info(
-            "CPU suffix replay thread tuning selected torch_num_threads={} "
-            "(previous={}, iterations={}, best_p95_ms={}, best_median_ms={}, "
-            "p95_ms_by_threads={}, median_ms_by_threads={}).",
-            best_threads,
+            "Configured CPU inference replay torch_num_threads={} (previous={}).",
+            threads,
             current_threads,
-            iterations,
-            round(best_tail, 2),
-            round(best_median, 2),
-            tail_summary,
-            median_summary,
         )
 
     def ensure_fixed_split_runtime(
@@ -1510,12 +1409,6 @@ class EdgeWorker:
             ),
         )
 
-    def _reset_split_runtime_state(self) -> None:
-        self.universal_split_enabled = False
-        self.universal_splitter = None
-        self.fixed_split_plan = None
-        self.split_trace_image_size = None
-
     def _reset_pending_training_cycle(self) -> None:
         self.pending_training_decision = None
         self.retrain_flag = False
@@ -1765,6 +1658,10 @@ class EdgeWorker:
             self.ensure_fixed_split_runtime(current_frame, frame_image_size)
 
         active_splitter = self.universal_splitter if self.universal_split_enabled else None
+        if self.split_learning_enabled and active_splitter is None:
+            raise _FixedSplitRuntimeError(
+                "Split learning is enabled but its runtime is unavailable."
+            )
         effective_image_size = tuple(int(value) for value in frame_image_size)
         if (
             active_splitter is None
@@ -1773,18 +1670,10 @@ class EdgeWorker:
         ):
             return active_splitter
 
-        logger.warning(
-            "Split runtime disabled because frame size changed from {} to {}.",
-            self.split_trace_image_size,
-            effective_image_size,
+        raise _FixedSplitRuntimeError(
+            "Split runtime input size changed "
+            f"from {self.split_trace_image_size} to {effective_image_size}."
         )
-        self.split_learning_enabled = False
-        self.universal_split_enabled = False
-        self.collect_flag = False
-        self.split_learning_disable_reason = (
-            f"frame size changed from {self.split_trace_image_size} to {effective_image_size}"
-        )
-        return None
 
     def _update_resource_probe_cache(
         self,
@@ -2400,6 +2289,31 @@ class EdgeWorker:
         task.local_queue_enqueued_perf = time.perf_counter()
         self.local_queue.put(task, block=True)
 
+    def _stop_after_fatal_inference_error(self) -> None:
+        self._stop_event.set()
+        retrain_requested = getattr(self, "_retrain_requested", None)
+        if retrain_requested is not None:
+            retrain_requested.set()
+        for queue_name in ("frame_cache", "local_queue"):
+            queue_obj = getattr(self, queue_name, None)
+            if queue_obj is None:
+                continue
+            while True:
+                try:
+                    pending = queue_obj.get_nowait()
+                except Empty:
+                    break
+                if pending is not _QUEUE_STOP:
+                    self._set_task_terminal_state(
+                        pending,
+                        TASK_STATE.TIMEOUT,
+                        result_source="inference_error",
+                    )
+            try:
+                queue_obj.put_nowait(_QUEUE_STOP)
+            except Full:
+                pass
+
     def close(self, *, timeout: float = 5.0) -> None:
         if self._closed:
             return
@@ -2524,16 +2438,45 @@ class EdgeWorker:
             task.set_timing("local_queue_wait", (time.perf_counter() - local_enqueued) * 1000.0)
             current_frame = task.frame_edge
             frame_image_size = tuple(int(value) for value in current_frame.shape[:2])
-            split_resolve_started = time.perf_counter()
-            active_splitter = self._resolve_active_splitter(current_frame, frame_image_size)
-            task.set_timing(
-                "split_resolve",
-                (time.perf_counter() - split_resolve_started) * 1000.0,
-            )
-            inference = self.small_object_detection.infer_sample(
-                current_frame,
-                splitter=active_splitter,
-            )
+            try:
+                split_resolve_started = time.perf_counter()
+                active_splitter = self._resolve_active_splitter(
+                    current_frame,
+                    frame_image_size,
+                )
+                task.set_timing(
+                    "split_resolve",
+                    (time.perf_counter() - split_resolve_started) * 1000.0,
+                )
+                inference = self.small_object_detection.infer_sample(
+                    current_frame,
+                    splitter=active_splitter,
+                )
+            except _FixedSplitRuntimeError as exc:
+                logger.error(
+                    "Fatal fixed split inference failure for frame={}: {}.",
+                    task.frame_index,
+                    safe_error_summary(exc),
+                )
+                self._set_task_terminal_state(
+                    task,
+                    TASK_STATE.TIMEOUT,
+                    result_source="inference_error",
+                )
+                self._stop_after_fatal_inference_error()
+                return
+            except Exception as exc:
+                logger.error(
+                    "Edge inference failed for frame={}: {}.",
+                    task.frame_index,
+                    safe_error_summary(exc),
+                )
+                self._set_task_terminal_state(
+                    task,
+                    TASK_STATE.TIMEOUT,
+                    result_source="inference_error",
+                )
+                continue
             for name, value in dict(getattr(inference, "timing_ms", {}) or {}).items():
                 task.record_timing(name, value)
 

@@ -120,8 +120,7 @@ class FixedSplitConfig(ConfigSection):
     validate_candidates: bool = True
     configured_training_batch: int | None = None
     validation_batches: list[int] | None = None
-    suffix_num_threads: int | str | None = "auto"
-    suffix_thread_tuning_iterations: int = 4
+    inference_num_threads: int = 12
     # Deprecated compatibility field; fixed split planning validates all candidates.
     max_candidates: int = 0
     max_boundary_count: int = 8
@@ -618,6 +617,14 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "cloud training epochs are controlled by "
             "server.continual_learning.num_epoch."
         ),
+        "client.split_learning.fixed_split.suffix_num_threads": (
+            "client.split_learning.fixed_split.suffix_num_threads has been removed; "
+            "use client.split_learning.fixed_split.inference_num_threads."
+        ),
+        "client.split_learning.fixed_split.suffix_thread_tuning_iterations": (
+            "client.split_learning.fixed_split.suffix_thread_tuning_iterations "
+            "has been removed because inference thread auto-tuning is no longer used."
+        ),
         "rebuild_batch_size": (
             "server.continual_learning.rebuild_batch_size has been removed; "
             "use server.continual_learning.batch_size for the shared "
@@ -638,6 +645,27 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(removed_fields["client.retrain.num_epoch"])
 
     fixed_split_cfg = config.client.split_learning.fixed_split
+    fixed_split_extras = set(getattr(fixed_split_cfg, "_extras", {}) or {})
+    for field_name in (
+        "suffix_num_threads",
+        "suffix_thread_tuning_iterations",
+    ):
+        if field_name in fixed_split_extras:
+            raise ValueError(
+                removed_fields[f"client.split_learning.fixed_split.{field_name}"]
+            )
+    if (
+        isinstance(fixed_split_cfg.inference_num_threads, bool)
+        or not isinstance(fixed_split_cfg.inference_num_threads, int)
+    ):
+        raise ValueError(
+            "client.split_learning.fixed_split.inference_num_threads "
+            "must be a positive integer."
+        )
+    _validate_positive(
+        "client.split_learning.fixed_split.inference_num_threads",
+        fixed_split_cfg.inference_num_threads,
+    )
     if fixed_split_cfg.configured_training_batch is not None:
         _validate_positive(
             "client.split_learning.fixed_split.configured_training_batch",

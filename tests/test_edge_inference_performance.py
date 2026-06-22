@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import threading
 import time
 from queue import Full, Queue
@@ -19,7 +20,8 @@ from edge.edge_worker import (
     SampleCollectionJob,
     SampleStatsDelta,
     SampleWriteJob,
-    _suffix_thread_candidates,
+    _FixedSplitRuntimeError,
+    _lower_current_thread_priority,
 )
 from edge.info import TASK_STATE
 from edge.task import Task
@@ -28,6 +30,8 @@ from model_management import object_detection as object_detection_module
 from model_management.detectors import legacy_split_model_adapters as split_adapters
 from model_management.inference.artifacts import InferenceArtifacts
 from model_management.object_detection import Object_Detection
+from model_management.payload import boundary_payload_from_tensors
+from model_management.universal_model_split import UniversalModelSplitter
 
 
 def _collection_job(sample_id: str = "sample-1") -> SampleCollectionJob:
@@ -124,34 +128,88 @@ def test_buffered_task_result_flushes_every_configured_frame() -> None:
     assert pending == 0
 
 
-def test_suffix_thread_candidate_resolution() -> None:
-    mode, candidates = _suffix_thread_candidates(
-        "auto",
-        current_threads=16,
-        cpu_count=16,
+def test_fixed_inference_threads_use_replay_device_not_global_cuda(monkeypatch) -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.config = SimpleNamespace(
+        split_learning=SimpleNamespace(
+            fixed_split=SimpleNamespace(inference_num_threads=6),
+        ),
     )
-    assert mode == "auto"
-    assert max(candidates) <= 16
-    assert 16 in candidates
-    assert 8 in candidates
-    assert 12 in candidates
-    assert len(candidates) == len(set(candidates))
+    worker.universal_splitter = SimpleNamespace(device=torch.device("cpu"))
+    configured: list[int] = []
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 16)
+    monkeypatch.setattr(torch, "set_num_threads", configured.append)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
-    true_mode, true_candidates = _suffix_thread_candidates(
-        True,
-        current_threads=16,
-        cpu_count=16,
-    )
-    assert true_mode == "auto"
-    assert true_candidates == candidates
+    worker._configure_inference_replay_threads(torch.ones(1))
 
-    assert _suffix_thread_candidates(6, current_threads=16, cpu_count=16) == ("fixed", [6])
-    assert _suffix_thread_candidates(False, current_threads=16, cpu_count=16) == ("off", [])
-    assert _suffix_thread_candidates("off", current_threads=16, cpu_count=16) == ("off", [])
-    assert _suffix_thread_candidates("nope", current_threads=16, cpu_count=16) == (
-        "invalid",
-        [],
+    assert configured == [6]
+
+
+def test_inference_threads_reject_non_positive_value() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.config = SimpleNamespace(
+        split_learning=SimpleNamespace(
+            fixed_split=SimpleNamespace(inference_num_threads=0),
+        ),
     )
+    worker.universal_splitter = SimpleNamespace(device=torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="must be positive"):
+        worker._configure_inference_replay_threads(torch.ones(1))
+
+
+def test_background_thread_priority_is_best_effort(monkeypatch) -> None:
+    monkeypatch.setattr("edge.edge_worker.os.name", "posix")
+    monkeypatch.setattr("edge.edge_worker.os.PRIO_PROCESS", 0, raising=False)
+    calls: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(
+        "edge.edge_worker.os.setpriority",
+        lambda which, who, priority: calls.append((which, who, priority)),
+        raising=False,
+    )
+    monkeypatch.setattr("edge.edge_worker.threading.get_native_id", lambda: 17)
+
+    assert _lower_current_thread_priority()
+    assert calls == [(0, 17, 5)]
+
+
+def test_windows_background_thread_priority_uses_pointer_sized_handle(monkeypatch) -> None:
+    calls: list[tuple[object, int]] = []
+
+    class Function:
+        def __init__(self, result):
+            self.result = result
+            self.restype = None
+            self.argtypes = None
+
+        def __call__(self, *args):
+            if args:
+                calls.append((args[0], args[1]))
+            return self.result
+
+    get_current_thread = Function(-2)
+    set_thread_priority = Function(1)
+    fake_ctypes = SimpleNamespace(
+        c_void_p=object(),
+        c_int=object(),
+        windll=SimpleNamespace(
+            kernel32=SimpleNamespace(
+                GetCurrentThread=get_current_thread,
+                SetThreadPriority=set_thread_priority,
+            )
+        ),
+    )
+    monkeypatch.setattr("edge.edge_worker.os.name", "nt")
+    monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
+
+    assert _lower_current_thread_priority()
+    assert get_current_thread.restype is fake_ctypes.c_void_p
+    assert set_thread_priority.argtypes == (
+        fake_ctypes.c_void_p,
+        fake_ctypes.c_int,
+    )
+    assert calls == [(-2, -1)]
 
 
 def test_split_observables_can_skip_feature_spectral_entropy(monkeypatch) -> None:
@@ -388,6 +446,163 @@ def test_split_inference_summarizes_observables_once_without_second_replay(monke
     assert artifacts.logit_entropy == pytest.approx(0.25)
     assert artifacts.timing_ms["split_prefix_ms"] == pytest.approx(1.0)
     assert artifacts.timing_ms["split_suffix_ms"] == pytest.approx(2.0)
+
+
+def test_prepare_inference_replay_installs_validated_torchscript_runner(
+    monkeypatch,
+) -> None:
+    payload = boundary_payload_from_tensors(
+        {"boundary": torch.tensor([[1.0]])},
+        split_id="after:test",
+        graph_signature="test",
+        batch_size=1,
+    )
+
+    class Runtime:
+        segments = SimpleNamespace(
+            suffix=lambda boundary: {"output": boundary.tensors["boundary"] + 1.0}
+        )
+
+    class OptimizedRunner:
+        def run_prefix(self, _sample_input):
+            return payload
+
+        def run_suffix(self, boundary):
+            return {"output": boundary.tensors["boundary"] + 1.0}
+
+    splitter = UniversalModelSplitter()
+    splitter.runtime = Runtime()
+    splitter.edge_forward = lambda _sample_input: payload
+    monkeypatch.setattr(
+        "model_management.universal_model_split.build_torchscript_split_replay",
+        lambda _runtime, _inputs: OptimizedRunner(),
+    )
+
+    splitter.prepare_inference_replay(torch.tensor([[1.0]]))
+    outputs, returned_payload = splitter.replay_inference(
+        torch.tensor([[1.0]]),
+        return_split_output=True,
+    )
+
+    assert outputs["output"].item() == pytest.approx(2.0)
+    assert returned_payload is payload
+
+
+def test_prepare_inference_replay_rejects_output_mismatch(monkeypatch) -> None:
+    payload = boundary_payload_from_tensors(
+        {"boundary": torch.tensor([[1.0]])},
+        split_id="after:test",
+        graph_signature="test",
+        batch_size=1,
+    )
+
+    class Runtime:
+        segments = SimpleNamespace(
+            suffix=lambda boundary: {"output": boundary.tensors["boundary"] + 1.0}
+        )
+
+    class MismatchedRunner:
+        def run_prefix(self, _sample_input):
+            return payload
+
+        def run_suffix(self, boundary):
+            return {"output": boundary.tensors["boundary"] + 2.0}
+
+    splitter = UniversalModelSplitter()
+    splitter.runtime = Runtime()
+    splitter.edge_forward = lambda _sample_input: payload
+    monkeypatch.setattr(
+        "model_management.universal_model_split.build_torchscript_split_replay",
+        lambda _runtime, _inputs: MismatchedRunner(),
+    )
+
+    with pytest.raises(RuntimeError, match="validation failed"):
+        splitter.prepare_inference_replay(torch.tensor([[1.0]]))
+
+    with pytest.raises(RuntimeError, match="has not been prepared"):
+        splitter.replay_inference(torch.tensor([[1.0]]))
+
+
+def test_inference_replay_propagates_runner_failure() -> None:
+    class FailingRunner:
+        def run_prefix(self, _sample_input):
+            raise RuntimeError("runner failed")
+
+    splitter = UniversalModelSplitter()
+    splitter.runtime = object()
+    splitter._inference_replay_runner = FailingRunner()
+
+    with pytest.raises(RuntimeError, match="runner failed"):
+        splitter.replay_inference(torch.tensor([[1.0]]))
+
+
+def test_enabled_split_runtime_never_falls_back_when_unavailable() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.split_learning_enabled = True
+    worker._fixed_split_init_attempted = True
+    worker.universal_split_enabled = False
+    worker.universal_splitter = None
+
+    with pytest.raises(RuntimeError, match="runtime is unavailable"):
+        worker._resolve_active_splitter(None, (4, 4))
+
+
+def test_split_runtime_rejects_frame_size_change_without_disabling_split() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.split_learning_enabled = True
+    worker._fixed_split_init_attempted = True
+    worker.universal_split_enabled = True
+    worker.universal_splitter = object()
+    worker.split_trace_image_size = (4, 4)
+
+    with pytest.raises(RuntimeError, match="input size changed"):
+        worker._resolve_active_splitter(None, (8, 8))
+
+    assert worker.split_learning_enabled is True
+    assert worker.universal_split_enabled is True
+
+
+def test_local_worker_stops_after_fatal_split_failure() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker._stop_event = threading.Event()
+    worker.local_queue = Queue()
+    worker.config = SimpleNamespace(wait_thresh=100)
+    worker.model_version = "0"
+    worker._resolve_active_splitter = lambda *_args: (_ for _ in ()).throw(
+        _FixedSplitRuntimeError("split failed")
+    )
+    worker.small_object_detection = SimpleNamespace(
+        infer_sample=lambda *_args, **_kwargs: pytest.fail(
+            "full inference fallback must not run"
+        ),
+    )
+    task = Task(
+        1,
+        1,
+        np.zeros((4, 4, 3), dtype=np.uint8),
+        time.time(),
+        (4, 4, 3),
+    )
+    task.local_queue_enqueued_perf = time.perf_counter()
+    pending_task = Task(
+        2,
+        2,
+        np.zeros((4, 4, 3), dtype=np.uint8),
+        time.time(),
+        (4, 4, 3),
+    )
+    worker.local_queue.put(task)
+    worker.local_queue.put(pending_task)
+
+    worker.local_worker()
+
+    assert task.state == TASK_STATE.TIMEOUT
+    assert task.result_source == "inference_error"
+    assert task.done_event.is_set()
+    assert pending_task.state == TASK_STATE.TIMEOUT
+    assert pending_task.result_source == "inference_error"
+    assert pending_task.done_event.is_set()
+    assert worker._stop_event.is_set()
 
 
 def test_local_worker_marks_task_done_before_sample_collection() -> None:

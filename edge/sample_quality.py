@@ -221,6 +221,7 @@ class EntropyQualityClassifier:
         self.persist_debug_stats = bool(persist_debug_stats)
         self._output_windows: dict[tuple[str, str, str], deque[float]] = {}
         self._feature_states: dict[tuple[str, str, str], _FeatureEntropyState] = {}
+        self._feature_sample_indices: dict[int, np.ndarray] = {}
 
     @classmethod
     def from_config(cls, config: object | None) -> "EntropyQualityClassifier":
@@ -514,28 +515,38 @@ class EntropyQualityClassifier:
         self,
         tensor: torch.Tensor,
     ) -> tuple[float | None, int]:
-        values = tensor.detach().numpy()
-        flat = np.abs(values.astype(np.float32, copy=False)).reshape(-1)
-        if flat.size > self.feature_max_elements:
-            indices = np.unique(
-                np.rint(
+        detached = tensor.detach()
+        try:
+            array = detached.numpy()
+        except TypeError:
+            array = detached.float().numpy()
+        value_count = int(array.size)
+        if value_count > self.feature_max_elements:
+            indices = self._feature_sample_indices.get(value_count)
+            if indices is None:
+                indices = np.rint(
                     np.linspace(
                         0,
-                        flat.size - 1,
+                        value_count - 1,
                         num=self.feature_max_elements,
                         dtype=np.float64,
                     )
                 ).astype(np.int64)
-            )
-            flat = flat[indices]
-        sample_count = int(flat.size)
+                indices.setflags(write=False)
+                self._feature_sample_indices[value_count] = indices
+            flat = array.flat[indices]
+        else:
+            flat = array.reshape(-1)
+        values = np.abs(flat.astype(np.float32, copy=False))
+        sample_count = int(values.size)
         if sample_count <= 1:
             return 0.0, sample_count
-        total = float(flat.sum())
+        total = float(values.sum())
         if total <= self.eps:
             return 0.0, sample_count
-        probs = flat / total
-        entropy = -np.sum(probs * np.log(np.maximum(probs, float(self.eps))))
+        probabilities = values / total
+        log_probabilities = np.log(np.maximum(probabilities, float(self.eps)))
+        entropy = -np.dot(probabilities, log_probabilities)
         entropy = float(entropy) / max(math.log(sample_count), self.eps)
         return entropy, sample_count
 

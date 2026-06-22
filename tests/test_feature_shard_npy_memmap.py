@@ -159,3 +159,25 @@ def test_npy_memmap_writer_keeps_temporary_paths_short(tmp_path, monkeypatch) ->
     assert all(not os.path.exists(path) for path in tmp_dirs)
     assert json_tmp_names
     assert all(name.startswith(".json-") and len(name) <= 32 for name in json_tmp_names)
+
+
+def test_single_sample_shard_does_not_call_torch_stack(tmp_path, monkeypatch) -> None:
+    store = FeatureShardStore(
+        str(tmp_path),
+        storage_format="npy_memmap_shard",
+        shard_max_samples=1,
+    )
+
+    def fail_stack(*_args, **_kwargs):
+        raise AssertionError("single-sample shard must not copy tensors through torch.stack")
+
+    monkeypatch.setattr(torch, "stack", fail_stack)
+
+    written = store.write_entries(
+        make_entries(1),
+        runtime_context=runtime_context(),
+        generation="single",
+        source="test",
+    )
+
+    assert len(written) == 1

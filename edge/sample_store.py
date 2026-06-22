@@ -23,7 +23,7 @@ def _atomic_json_dump(path: str, payload: dict[str, Any]) -> None:
     os.makedirs(directory, exist_ok=True)
     tmp_path = f"{path}.tmp-{threading.get_ident()}"
     with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
+        json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
     os.replace(tmp_path, path)
 
 
@@ -272,14 +272,20 @@ class _SampleStoreCounters:
 
 
 class EdgeSampleStore:
-    def __init__(self, root_dir: str) -> None:
+    def __init__(
+        self,
+        root_dir: str,
+        *,
+        feature_storage_format: str = "npy_memmap_shard",
+        feature_shard_dtype: str | None = None,
+    ) -> None:
         self.root_dir = os.path.abspath(root_dir)
         self.feature_shard_dir = os.path.join(self.root_dir, "feature_shards")
         self.feature_store = FeatureShardStore(
             self.feature_shard_dir,
-            storage_format="npy_memmap_shard",
+            storage_format=str(feature_storage_format or "npy_memmap_shard"),
             shard_max_samples=1,
-            shard_dtype=None,
+            shard_dtype=feature_shard_dtype,
         )
         self.results_dir = os.path.join(self.root_dir, "results")
         self.metadata_dir = os.path.join(self.root_dir, "metadata")
@@ -342,7 +348,13 @@ class EdgeSampleStore:
 
     def _append_index(self, bucket: str, record: StoredSampleRecord) -> None:
         with open(self._index_path(bucket), "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record.to_dict(), sort_keys=True))
+            handle.write(
+                json.dumps(
+                    record.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
             handle.write("\n")
 
     def _existing_record_unlocked(self, sample_id: str) -> StoredSampleRecord | None:

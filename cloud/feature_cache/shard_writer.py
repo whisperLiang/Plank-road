@@ -44,7 +44,12 @@ def _atomic_json_dump(path: str, payload: Mapping[str, Any]) -> None:
         fd, tmp_path = tempfile.mkstemp(prefix=".json-", suffix=".tmp", dir=fs_path(directory))
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = None
-            json.dump(dict(payload), handle, indent=2, sort_keys=True)
+            json.dump(
+                dict(payload),
+                handle,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             handle.write("\n")
         os.replace(tmp_path, fs_path(path))
     except Exception:
@@ -353,7 +358,7 @@ class FeatureShardWriter:
                 raise ValueError("Shard entries in one bucket have different dtype/shape bucket.")
         if len(entries) == 1:
             stacked = {
-                leaf_key: entries[0]["_feature_tensors"][label].unsqueeze(0).contiguous()
+                leaf_key: entries[0]["_feature_tensors"][label].unsqueeze(0)
                 for leaf_key, label in zip(leaf_keys, original_labels, strict=True)
             }
         else:
@@ -541,7 +546,13 @@ class FeatureShardWriter:
         meta_path = os.path.join(base_dir, f"{shard_id}.meta.json")
         os.makedirs(fs_path(base_dir), exist_ok=True)
         tmp_path = f"{shard_path}.tmp-{threading.get_ident()}-{int(time.time() * 1000000)}"
-        save_file(dict(tensors), fs_path(tmp_path))
+        save_file(
+            {
+                key: tensor if tensor.is_contiguous() else tensor.contiguous()
+                for key, tensor in tensors.items()
+            },
+            fs_path(tmp_path),
+        )
         os.replace(fs_path(tmp_path), fs_path(shard_path))
         payload = metadata.to_dict()
         payload["shard_path"] = shard_path

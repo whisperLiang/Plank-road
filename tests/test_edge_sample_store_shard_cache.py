@@ -44,3 +44,34 @@ def test_edge_sample_store_caches_features_as_shard_refs(tmp_path) -> None:
 
     loaded = store.load_intermediate(record)
     assert torch.equal(loaded.tensors["boundary"], payload.tensors["boundary"])
+
+
+def test_edge_sample_store_supports_safetensors_for_online_single_samples(tmp_path) -> None:
+    store = EdgeSampleStore(
+        str(tmp_path / "edge_store"),
+        feature_storage_format="safetensors_shard",
+    )
+    payload = boundary_payload_from_tensors(
+        {"boundary": torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)},
+        split_id="after:test",
+        graph_signature="edge-store-test",
+        batch_size=1,
+    )
+
+    record = store.store_sample(
+        sample_id="sample-1",
+        frame_index=1,
+        confidence=0.9,
+        split_config_id="split-a",
+        model_id="yolo26n",
+        model_version="v1",
+        quality_bucket=HIGH_QUALITY,
+        inference_result={"boxes": [], "labels": [], "scores": []},
+        intermediate=payload,
+    )
+
+    assert record.feature_ref is not None
+    assert record.feature_ref["storage_format"] == "safetensors_shard"
+    assert record.feature_ref["shard_path"].endswith(".safetensors")
+    loaded = store.load_intermediate(record)
+    assert torch.equal(loaded.tensors["boundary"], payload.tensors["boundary"])

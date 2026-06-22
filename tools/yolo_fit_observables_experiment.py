@@ -264,6 +264,7 @@ def _trace_split_runtime(
     sample_input = prepare_split_runtime_input(model, trace_frame, device=device)
     splitter.trace(runtime_model, sample_input)
     candidate = apply_split_plan(splitter, SplitPlan.from_dict(manifest["split_plan"]))
+    splitter.prepare_inference_replay(sample_input)
     return splitter, candidate
 
 
