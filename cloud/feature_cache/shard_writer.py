@@ -351,13 +351,19 @@ class FeatureShardWriter:
                 raise ValueError("Shard entries in one bucket have different leaf order.")
             if str(entry["_dtype"]) != dtype or str(entry["_shape_bucket"]) != shape_bucket:
                 raise ValueError("Shard entries in one bucket have different dtype/shape bucket.")
-        stacked = {
-            leaf_key: torch.stack(
-                [entry["_feature_tensors"][label] for entry in entries],
-                dim=0,
-            ).contiguous()
-            for leaf_key, label in zip(leaf_keys, original_labels, strict=True)
-        }
+        if len(entries) == 1:
+            stacked = {
+                leaf_key: entries[0]["_feature_tensors"][label].unsqueeze(0).contiguous()
+                for leaf_key, label in zip(leaf_keys, original_labels, strict=True)
+            }
+        else:
+            stacked = {
+                leaf_key: torch.stack(
+                    [entry["_feature_tensors"][label] for entry in entries],
+                    dim=0,
+                ).contiguous()
+                for leaf_key, label in zip(leaf_keys, original_labels, strict=True)
+            }
         shard_id = stable_digest(
             {
                 "format": self.storage_format,

@@ -131,8 +131,8 @@ def test_suffix_thread_candidate_resolution() -> None:
         cpu_count=16,
     )
     assert mode == "auto"
-    assert max(candidates) <= 12
-    assert 16 not in candidates
+    assert max(candidates) <= 16
+    assert 16 in candidates
     assert 8 in candidates
     assert 12 in candidates
     assert len(candidates) == len(set(candidates))

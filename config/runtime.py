@@ -381,6 +381,7 @@ class ClientConfig(ConfigSection):
     diff_thresh: float = 0.0004
     local_queue_maxsize: int = 10
     strict_sample_collection: bool = False
+    opencv_num_threads: int = 1
     flush_every_n_frames: int = 30
     performance_log_every_n_frames: int = 30
     wait_thresh: int = 100
@@ -846,6 +847,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "client.strict_sample_collection must be a boolean, "
             f"got {config.client.strict_sample_collection!r}"
         )
+    _validate_positive(
+        "client.opencv_num_threads",
+        int(config.client.opencv_num_threads),
+    )
     _validate_positive(
         "client.flush_every_n_frames",
         int(config.client.flush_every_n_frames),

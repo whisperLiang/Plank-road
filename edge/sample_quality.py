@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 
 from model_management.payload import BoundaryPayload
@@ -481,6 +482,8 @@ class EntropyQualityClassifier:
     def _tensor_activation_entropy(self, tensor: torch.Tensor) -> tuple[float | None, int]:
         if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
             return None, 0
+        if tensor.device.type == "cpu":
+            return self._cpu_tensor_activation_entropy(tensor)
         flat = tensor.detach().float().abs().flatten()
         if flat.numel() > self.feature_max_elements:
             indices = (
@@ -506,6 +509,35 @@ class EntropyQualityClassifier:
         entropy = -(probs * torch.log(probs.clamp_min(float(self.eps)))).sum()
         entropy = entropy / max(math.log(sample_count), self.eps)
         return float(entropy.item()), sample_count
+
+    def _cpu_tensor_activation_entropy(
+        self,
+        tensor: torch.Tensor,
+    ) -> tuple[float | None, int]:
+        values = tensor.detach().numpy()
+        flat = np.abs(values.astype(np.float32, copy=False)).reshape(-1)
+        if flat.size > self.feature_max_elements:
+            indices = np.unique(
+                np.rint(
+                    np.linspace(
+                        0,
+                        flat.size - 1,
+                        num=self.feature_max_elements,
+                        dtype=np.float64,
+                    )
+                ).astype(np.int64)
+            )
+            flat = flat[indices]
+        sample_count = int(flat.size)
+        if sample_count <= 1:
+            return 0.0, sample_count
+        total = float(flat.sum())
+        if total <= self.eps:
+            return 0.0, sample_count
+        probs = flat / total
+        entropy = -np.sum(probs * np.log(np.maximum(probs, float(self.eps))))
+        entropy = float(entropy) / max(math.log(sample_count), self.eps)
+        return entropy, sample_count
 
     @staticmethod
     def _predictions_empty(predictions: object) -> bool:

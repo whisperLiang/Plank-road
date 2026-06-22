@@ -48,6 +48,9 @@ client:
  # Default online mode drops CL samples when async queues are full.
  # Enable only for strict offline experiments that may block after task completion.
  strict_sample_collection: false
+ # Keep OpenCV's JPEG/diff workers from oversubscribing the CPU alongside
+ # Torch split inference. The library default used 22 threads on a 16-core host.
+ opencv_num_threads: 1
  # Batch JSONL flushes to keep per-frame display latency free of fsync-style overhead.
  flush_every_n_frames: 30
  # Emit detailed performance logs periodically; JSONL still records every sampled frame.

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Mapping
 
+import cv2
 import grpc
 import torch
 from loguru import logger
@@ -90,7 +91,7 @@ def _suffix_thread_candidates(
         limit = max(1, int(cpu_count or current_threads or 1))
         auto_limit = min(12, limit)
         candidates = [
-            min(int(current_threads), auto_limit),
+            min(int(current_threads), limit),
             min(8, auto_limit),
             min(12, auto_limit),
             min(max(1, int(current_threads) // 2), auto_limit),
@@ -559,6 +560,11 @@ class EdgeWorker:
     def __init__(self, config):
         self.config = config
         self.edge_id = config.edge_id
+        self.opencv_num_threads = max(
+            1,
+            int(getattr(config, "opencv_num_threads", 1)),
+        )
+        cv2.setNumThreads(self.opencv_num_threads)
         self.log_internal_ids = bool(
             getattr(getattr(config, "continual_learning", None), "log_internal_ids", False)
         )
@@ -953,15 +959,9 @@ class EdgeWorker:
         if not results:
             torch.set_num_threads(current_threads)
             return
-        best_tail = min(tail_ms for tail_ms, _median_ms, _threads in results)
-        near_best = [
-            item
-            for item in results
-            if item[0] <= best_tail * 1.10 + 1.0
-        ]
         best_tail, best_median, best_threads = min(
-            near_best,
-            key=lambda item: (item[2], item[0], item[1]),
+            results,
+            key=lambda item: (item[0], item[1], item[2]),
         )
         torch.set_num_threads(best_threads)
         median_summary = {
