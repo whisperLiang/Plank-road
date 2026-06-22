@@ -1,0 +1,82 @@
+comparison_id: exp_plank_road_vs_baselines_001
+
+methods:
+  - plank_road
+  - pure_edge_local_updating
+  - accuracy_trigger_cloud_retraining
+
+student_model: rfdetr_nano
+teacher_model: rtdetr_x
+
+edge_ids:
+  - 1
+  - 2
+
+scenarios:
+  - name: road_normal_to_drift
+    video_source: ./video_data/road.mp4
+    notes: ""
+
+# Every run has an explicit identity and explicit raw-log locations. Paths are
+# resolved relative to the comparison directory passed to the normalizer.
+runs:
+  - run_id: plank_road_road_n2_r1
+    method: plank_road
+    scenario_name: road_normal_to_drift
+    edge_ids: [1, 2]
+    raw_logs:
+      cloud: raw_logs/plank_road/cloud/plank_road_road_n2_r1
+      edges:
+        "1": raw_logs/plank_road/edge_1/plank_road_road_n2_r1
+        "2": raw_logs/plank_road/edge_2/plank_road_road_n2_r1
+
+  - run_id: pure_edge_road_n2_r1
+    method: pure_edge_local_updating
+    scenario_name: road_normal_to_drift
+    edge_ids: [1, 2]
+    raw_logs:
+      edges:
+        "1": raw_logs/pure_edge_local_updating/edge_1/pure_edge_road_n2_r1
+        "2": raw_logs/pure_edge_local_updating/edge_2/pure_edge_road_n2_r1
+
+  - run_id: accuracy_trigger_road_n2_r1
+    method: accuracy_trigger_cloud_retraining
+    scenario_name: road_normal_to_drift
+    edge_ids: [1, 2]
+    raw_logs:
+      cloud: raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy_trigger_road_n2_r1
+      edges:
+        "1": raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy_trigger_road_n2_r1
+        "2": raw_logs/accuracy_trigger_cloud_retraining/edge_2/accuracy_trigger_road_n2_r1
+
+hardware:
+  cloud:
+    gpu: RTX_A6000
+    gpu_count: 1
+    mps_enabled: true
+  edge:
+    device_type: cpu_edge
+
+runtime:
+  plank_road:
+    mode: main
+    split_learning_enabled: true
+    resource_aware_trigger_enabled: true
+    sample_quality_enabled: true
+  pure_edge_local_updating:
+    mode: baseline
+    baseline_method: pure_edge_local_updating
+  accuracy_trigger_cloud_retraining:
+    mode: baseline
+    baseline_method: accuracy_trigger_cloud_retraining
+
+metrics:
+  # Optional CSV or JSONL containing only precomputed, measured metrics.
+  accuracy_file: null
+  # Provenance only. The post-processor does not evaluate detections from GT.
+  ground_truth_file: null
+  allow_missing_accuracy: true
+
+notes:
+  - Ekya is not included in this comparison yet.
+  - Ekya results will be imported later from an external repository.

@@ -281,7 +281,6 @@ The supported baseline methods are:
 ```text
 pure_edge_local_updating
 accuracy_trigger_cloud_retraining
-ekya
 ```
 
 Cloud-backed baseline updates use the shared training-job API with one generic
@@ -333,12 +332,88 @@ python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baselin
 
 Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. If a worker is still starting or its endpoint is being replaced, cloud-backed baseline triggers enter worker-infra backoff instead of recording an algorithm training failure.
 
-#### Ekya Baseline
+Ekya is not implemented or run in this repository. Real Ekya measurements may
+be imported from an external repository for optional summary-level comparison;
+they are never generated or simulated here.
 
-Ekya is a continual learning system for edge video analytics. Refer to the following repositories for deployment details:
+## Experiment Post-processing and Figures
 
-- [Nier4Ryu/ekya_mod](https://github.com/Nier4Ryu/ekya_mod) — Modified version of Ekya, updated for use in other projects
-- [edge-video-services/ekya](https://github.com/edge-video-services/ekya) — Original Ekya source code and datasets
+The experiment post-processing framework compares:
+
+```text
+plank_road
+pure_edge_local_updating
+accuracy_trigger_cloud_retraining
+```
+
+`plank_road` is the result label for the normal `main` path and is not
+registered as a baseline. Experiment tools only consume existing logs and
+metrics; they do not launch edge/cloud processes or modify runtime behavior.
+
+Start from
+[configs/experiments/plank_road_baselines_manifest.example.yaml](./configs/experiments/plank_road_baselines_manifest.example.yaml).
+Each manifest `runs` entry explicitly maps a run ID to its method, scenario,
+edge IDs, and raw-log directories.
+
+```text
+results/experiments/{comparison_id}/
+  manifest.yaml
+  raw_logs/
+    plank_road/
+    pure_edge_local_updating/
+    accuracy_trigger_cloud_retraining/
+  normalized/
+  figures/
+```
+
+Normalize existing logs:
+
+```shell
+python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml
+```
+
+Generate PDF and PNG figures:
+
+```shell
+python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{comparison_id}/normalized --figure_dir results/experiments/{comparison_id}/figures
+```
+
+The framework produces these figures when their required measured data exists:
+
+| Figure | Experimental question |
+|---|---|
+| Fig. 1 — Accuracy Over Time | How quickly does accuracy recover after drift and model updates? |
+| Fig. 2 — Adaptation Timeline | How long do trigger, upload, annotation, training, and update stages take? |
+| Fig. 3 — Accuracy/Latency/Upload Tradeoff | How does each method balance accuracy, adaptation latency, and communication? |
+| Fig. 4 — Upload Breakdown | How much communication comes from raw frames, features, metadata, and model downloads? |
+| Fig. 5 — Adaptation Latency Breakdown | Which adaptation stages dominate response time? |
+| Fig. 6 — Multi-edge Scalability | How do metrics change as the number of edge devices increases? |
+| Fig. 7 — Resource Timeline | How are upload, GPU waiting, annotation, training, and update stages scheduled? |
+| Fig. 8 — Component-style Summary | What is the overall accuracy, latency, and upload comparison? |
+
+Missing values remain empty. The tools never substitute detection count for
+accuracy, estimate unavailable byte components, create random data, or draw
+placeholder curves. A skipped or partial figure is explained in
+`figures/plot_report.json`.
+
+Frame-level F1 and mAP must come from a real precomputed accuracy CSV or JSONL
+referenced by `metrics.accuracy_file` in the manifest. Accuracy-Trigger teacher
+agreement remains a window-level trigger metric and is not presented as
+ground-truth F1 or mAP.
+
+External Ekya data uses
+[configs/experiments/external_ekya_schema.example.csv](./configs/experiments/external_ekya_schema.example.csv)
+and is excluded from default plots. Import it explicitly with:
+
+```shell
+python tools/experiments/merge_external_ekya_results.py --plank_road_summary results/experiments/{comparison_id}/normalized/summary.csv --ekya_csv path/to/external_ekya_results.csv --output results/experiments/{comparison_id}/normalized/summary_with_external_ekya.csv
+```
+
+Detailed specifications:
+
+- [Experiment design](./docs/experiments/plank_road_baselines_experiment_design.md)
+- [Figure specification](./docs/experiments/plank_road_baselines_plot_spec.md)
+- [External Ekya schema](./docs/experiments/external_ekya_data_schema.md)
 
 ## Testing
 
@@ -349,6 +424,12 @@ pytest
 ```
 
 Core coverage includes cloud contracts/orchestration, feature shard and cache handling, fixed-split runtime and retraining, teacher annotation, baseline metrics, and edge/cloud gRPC behavior.
+
+Run the experiment post-processing tests without starting edge/cloud services:
+
+```shell
+pytest -q tests/experiments
+```
 
 Focused validation command:
 
