@@ -326,12 +326,16 @@ def _parse_log_file(
     uploads: list[dict[str, Any]],
     latency: list[dict[str, Any]],
     resources: list[dict[str, Any]],
+    log_timezone: str,
 ) -> None:
     current_latency: dict[str, Any] | None = None
     training_success_times: dict[int, list[int]] = defaultdict(list)
     pending_upload: dict[int, dict[str, Any]] = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        timestamp_ms, message = parse_log_timestamp_ms(line)
+        timestamp_ms, message = parse_log_timestamp_ms(
+            line,
+            timezone_name=log_timezone,
+        )
         if _parse_accuracy_decision(
             message,
             comparison_id=comparison_id,
@@ -1060,6 +1064,7 @@ def normalize(comparison_dir: Path, manifest_path: Path) -> dict[str, Any]:
                         uploads=uploads,
                         latency=latency,
                         resources=resources,
+                        log_timezone=str(manifest["log_timezone"]),
                     )
                     parsed_files.append(str(path))
                 elif path.suffix.lower() in JSONL_EXTENSIONS:

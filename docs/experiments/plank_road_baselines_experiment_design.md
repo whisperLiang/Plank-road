@@ -80,6 +80,13 @@ edges, and raw-log directories. The normalizer does not guess a run from a
 filename and has no legacy-layout fallback. Add another complete set of three
 run entries for every repeat, scenario, or edge-count setting.
 
+The required `log_timezone` field must name the IANA timezone used by the
+machines that generated the Loguru text logs, for example `Asia/Shanghai`.
+Text logs do not contain a UTC offset, while JSONL metrics use epoch
+timestamps; this declaration keeps cross-file event correlation independent
+of the machine running the post-processor. Missing, empty, or unknown timezone
+names make the manifest invalid.
+
 Relevant raw outputs include:
 
 - `latest_inference_results*.jsonl` from the shared edge inference loop.

@@ -353,7 +353,10 @@ metrics; they do not launch edge/cloud processes or modify runtime behavior.
 Start from
 [configs/experiments/plank_road_baselines_manifest.example.yaml](./configs/experiments/plank_road_baselines_manifest.example.yaml).
 Each manifest `runs` entry explicitly maps a run ID to its method, scenario,
-edge IDs, and raw-log directories.
+edge IDs, and raw-log directories. The required `log_timezone` field must name
+the IANA timezone used by the machines that generated the text logs so those
+timestamps can be correlated with epoch-based JSONL metrics on any
+post-processing host.
 
 ```text
 results/experiments/{comparison_id}/

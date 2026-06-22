@@ -4,9 +4,10 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
-from tools.experiments.experiment_common import CSV_SCHEMAS, read_csv
+from tools.experiments.experiment_common import CSV_SCHEMAS, ManifestError, read_csv
 from tools.experiments.normalize_plank_road_baseline_logs import normalize
 
 
@@ -51,6 +52,7 @@ def _manifest(comparison_dir: Path, *, accuracy_file: str | None = None) -> Path
     ]
     payload = {
         "comparison_id": "comparison-test",
+        "log_timezone": "Asia/Shanghai",
         "methods": [
             "plank_road",
             "pure_edge_local_updating",
@@ -89,6 +91,20 @@ def _minimal_frame(frame_index: int) -> dict:
             "scores": [0.8],
         },
     }
+
+
+def test_manifest_requires_log_timezone(tmp_path: Path) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    del payload["log_timezone"]
+    manifest_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(
+        ManifestError,
+        match="log_timezone must be a non-empty IANA timezone name",
+    ):
+        normalize(comparison_dir, manifest_path)
 
 
 def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path: Path) -> None:

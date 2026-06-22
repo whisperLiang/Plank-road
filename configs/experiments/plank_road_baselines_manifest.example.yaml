@@ -1,5 +1,10 @@
 comparison_id: exp_plank_road_vs_baselines_001
 
+# Loguru text logs do not contain an offset. Declare the timezone used by the
+# machines that produced those logs so text timestamps can be correlated with
+# epoch-based JSONL timestamps independently of the post-processing host.
+log_timezone: Asia/Shanghai
+
 methods:
   - plank_road
   - pure_edge_local_updating

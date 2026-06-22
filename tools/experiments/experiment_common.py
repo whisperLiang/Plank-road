@@ -7,6 +7,7 @@ import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -270,6 +271,15 @@ def load_manifest(path: Path) -> dict[str, Any]:
     comparison_id = str(manifest.get("comparison_id", "") or "").strip()
     if not comparison_id:
         raise ManifestError("comparison_id must be non-empty")
+    raw_log_timezone = manifest.get("log_timezone")
+    if not isinstance(raw_log_timezone, str) or not raw_log_timezone.strip():
+        raise ManifestError("log_timezone must be a non-empty IANA timezone name")
+    log_timezone = raw_log_timezone.strip()
+    try:
+        ZoneInfo(log_timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ManifestError(f"unknown log_timezone: {log_timezone!r}") from exc
+    manifest["log_timezone"] = log_timezone
     methods = list(manifest.get("methods") or [])
     if methods != list(METHODS):
         raise ManifestError(f"methods must be exactly: {', '.join(METHODS)}")
@@ -505,7 +515,11 @@ def percentile(values: Iterable[Any], quantile: float) -> float | None:
     return numbers[lower] + (numbers[upper] - numbers[lower]) * fraction
 
 
-def parse_log_timestamp_ms(line: str) -> tuple[int | None, str]:
+def parse_log_timestamp_ms(
+    line: str,
+    *,
+    timezone_name: str = "UTC",
+) -> tuple[int | None, str]:
     match = LOG_LINE_RE.match(line)
     if not match:
         return None, line.strip()
@@ -514,7 +528,7 @@ def parse_log_timestamp_ms(line: str) -> tuple[int | None, str]:
     timestamp = datetime.strptime(
         f"{match.group('date')} {match.group('time')}",
         "%Y-%m-%d %H:%M:%S.%f",
-    )
+    ).replace(tzinfo=ZoneInfo(timezone_name))
     return int(timestamp.timestamp() * 1000), match.group("message").strip()
 
 
