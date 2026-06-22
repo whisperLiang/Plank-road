@@ -276,11 +276,12 @@ echo quit | nvidia-cuda-mps-control
 
 Baselines are deployed using the same physical edge-cloud topology as Plank-Road, but they are separate comparison methods. Plank-Road itself is not registered as a `baseline_method`. For cloud-backed baselines, the cloud and every edge device must use the same explicit `run_id`.
 
-The only supported baseline methods are:
+The supported baseline methods are:
 
 ```text
 pure_edge_local_updating
 accuracy_trigger_cloud_retraining
+ekya
 ```
 
 Cloud-backed baseline updates use the shared training-job API with one generic
@@ -304,7 +305,9 @@ baseline:
 evaluation metadata; cloud training targets come from the cloud teacher unless
 an explicit ablation opts into edge targets.
 
-Accuracy-Trigger Cloud Retraining cloud:
+#### Accuracy-Trigger Cloud Retraining
+
+Cloud:
 
 ```shell
 python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --listen_address "[::]:50051" --run_id baseline_acc_trigger_001
@@ -322,13 +325,20 @@ Accuracy-Trigger edge device 2:
 python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --run_id baseline_acc_trigger_001 --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
 ```
 
-Pure Edge Local Updating:
+#### Pure Edge Local Updating
 
 ```shell
 python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --edge_id 1 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
 ```
 
 Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. If a worker is still starting or its endpoint is being replaced, cloud-backed baseline triggers enter worker-infra backoff instead of recording an algorithm training failure.
+
+#### Ekya Baseline
+
+Ekya is a continual learning system for edge video analytics. Refer to the following repositories for deployment details:
+
+- [Nier4Ryu/ekya_mod](https://github.com/Nier4Ryu/ekya_mod) — Modified version of Ekya, updated for use in other projects
+- [edge-video-services/ekya](https://github.com/edge-video-services/ekya) — Original Ekya source code and datasets
 
 ## Testing
 
