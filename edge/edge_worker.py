@@ -234,6 +234,7 @@ class PendingModelUpdate:
     prepared_at: float = field(default_factory=time.time)
     applied_event: threading.Event = field(default_factory=threading.Event)
     applied_version: str | None = None
+    apply_elapsed_ms: float | None = None
     error: BaseException | None = None
 
 
@@ -1563,6 +1564,7 @@ class EdgeWorker:
             )
         self.model_version = update.next_model_version
         update.applied_version = self.model_version
+        update.apply_elapsed_ms = (time.perf_counter() - apply_started) * 1000.0
         weight_keys = [
             name
             for name in update.state_dict
@@ -1618,6 +1620,7 @@ class EdgeWorker:
             "model_update_applied",
             job_id=update.job_id,
             model_version=str(update.applied_version),
+            model_apply_ms=update.apply_elapsed_ms,
             message=update.message,
         )
 
@@ -2139,12 +2142,7 @@ class EdgeWorker:
                         "Timed out while syncing high-quality samples before "
                         "continual learning upload."
                     )
-                self._record_experiment_metric(
-                    "bundle_upload_started",
-                    model_version=str(self.model_version),
-                    send_low_conf_features=bool(decision.send_low_conf_features),
-                    bundle_cap_bytes=int(decision.bundle_cap_bytes or 0),
-                )
+                upload_metrics: dict[str, Any] = {}
                 accepted, job_id, msg = submit_continual_learning_job(
                     self.config.server_ip,
                     edge_id=self.edge_id,
@@ -2160,6 +2158,7 @@ class EdgeWorker:
                     bandwidth_mbps=decision.bandwidth_mbps,
                     channel=training_channel,
                     log_internal_ids=self.log_internal_ids,
+                    metrics_callback=upload_metrics.update,
                 )
                 if not accepted or not job_id:
                     logger.error(
@@ -2173,11 +2172,29 @@ class EdgeWorker:
                     "bundle_built",
                     job_id=job_id,
                     model_version=str(self.model_version),
+                    timestamp_ms=upload_metrics.get("upload_started_at_ms")
+                    or int(time.time() * 1000),
+                )
+                self._record_experiment_metric(
+                    "bundle_upload_started",
+                    job_id=job_id,
+                    model_version=str(self.model_version),
+                    timestamp_ms=upload_metrics.get("upload_started_at_ms")
+                    or int(time.time() * 1000),
+                    send_low_conf_features=bool(decision.send_low_conf_features),
+                    bundle_cap_bytes=int(decision.bundle_cap_bytes or 0),
                 )
                 self._record_experiment_metric(
                     "bundle_upload_done",
                     job_id=job_id,
                     model_version=str(self.model_version),
+                    timestamp_ms=upload_metrics.get("upload_done_at_ms")
+                    or int(time.time() * 1000),
+                    **{
+                        key: value
+                        for key, value in upload_metrics.items()
+                        if key not in {"upload_started_at_ms", "upload_done_at_ms"}
+                    },
                 )
                 self._record_experiment_metric(
                     "training_job_submitted",
@@ -2262,6 +2279,10 @@ class EdgeWorker:
                         if status == "RUNNING":
                             self._record_experiment_metric(
                                 "training_job_started",
+                                timestamp_ms=int(
+                                    getattr(reply, "started_at_ms", 0)
+                                    or time.time() * 1000
+                                ),
                                 job_id=job_id,
                                 status=status,
                             )
@@ -2274,25 +2295,43 @@ class EdgeWorker:
                     if status == "SUCCEEDED":
                         self._record_experiment_metric(
                             "training_job_succeeded",
+                            timestamp_ms=int(
+                                getattr(reply, "finished_at_ms", 0)
+                                or time.time() * 1000
+                            ),
                             job_id=job_id,
                             status=status,
                         )
+                        download_started = time.perf_counter()
                         success, model_b64, terminal_message = download_trained_model(
                             self.config.server_ip,
                             edge_id=self.edge_id,
                             job_id=job_id,
                             channel=training_channel,
                         )
+                        model_update_download_ms = (
+                            time.perf_counter() - download_started
+                        ) * 1000.0
                         if not success:
                             logger.error(
                                 "[EdgeCL] model update download failed: reason={}.",
                                 safe_error_summary(terminal_message),
                             )
                         else:
+                            try:
+                                model_update_download_bytes = len(
+                                    base64.b64decode(model_b64, validate=True)
+                                )
+                            except (TypeError, ValueError):
+                                model_update_download_bytes = len(
+                                    str(model_b64).encode("utf-8")
+                                )
                             self._record_experiment_metric(
                                 "model_update_downloaded",
                                 job_id=job_id,
                                 model_version=str(self.model_version),
+                                model_update_download_bytes=model_update_download_bytes,
+                                model_update_download_ms=model_update_download_ms,
                             )
                         break
 

@@ -69,7 +69,12 @@ def test_write_task_result_includes_latency_and_timing() -> None:
     task.add_result([[1, 2, 3, 4]], [5], [0.9])
 
     handle = io.StringIO()
-    _write_task_result(handle, task)
+    _write_task_result(
+        handle,
+        task,
+        model_name="rfdetr_nano",
+        model_version="2",
+    )
 
     payload = json.loads(handle.getvalue())
     assert payload["frame_index"] == 7
@@ -78,6 +83,8 @@ def test_write_task_result_includes_latency_and_timing() -> None:
         "split_prefix_ms": 12.5,
         "task_complete_ms": 125.0,
     }
+    assert payload["model_name"] == "rfdetr_nano"
+    assert payload["model_version"] == "2"
     assert payload["result"] == {
         "labels": [5],
         "boxes": [[1, 2, 3, 4]],

@@ -57,6 +57,7 @@ class BaselineActiveTrainingJob:
     command_id: str = ""
     run_id: str = ""
     baseline_method: str = ""
+    last_status: str = ""
 
 
 @dataclass(frozen=True)

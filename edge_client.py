@@ -40,7 +40,13 @@ def _task_state_name(task: Task) -> str:
     return "Finished"
 
 
-def _write_task_result(handle, task: Task) -> None:
+def _write_task_result(
+    handle,
+    task: Task,
+    *,
+    model_name: str = "",
+    model_version: str = "",
+) -> None:
     detection_boxes, detection_class, detection_score = task.get_result()
     latency_ms = None
     if task.end_time is not None:
@@ -58,6 +64,8 @@ def _write_task_result(handle, task: Task) -> None:
         "state": _task_state_name(task),
         "result_source": task.result_source,
         "ref": int(task.ref) if task.ref is not None else None,
+        "model_name": str(model_name or ""),
+        "model_version": str(model_version or ""),
         "result": {
             "labels": list(detection_class),
             "boxes": [list(box) for box in detection_boxes],
@@ -73,8 +81,15 @@ def _write_buffered_task_result(
     *,
     unflushed_count: int,
     flush_every_n_frames: int,
+    model_name: str = "",
+    model_version: str = "",
 ) -> int:
-    _write_task_result(handle, task)
+    _write_task_result(
+        handle,
+        task,
+        model_name=model_name,
+        model_version=model_version,
+    )
     pending = int(unflushed_count) + 1
     if pending >= max(1, int(flush_every_n_frames)):
         handle.flush()
@@ -428,6 +443,8 @@ def _run_video_loop(
                         task,
                         unflushed_count=unflushed_result_count,
                         flush_every_n_frames=flush_every_n_frames,
+                        model_name=str(getattr(config, "lightweight", "") or ""),
+                        model_version=str(getattr(edge, "model_version", "0") or "0"),
                     )
                     if experiment_metrics is not None:
                         experiment_metrics.write(

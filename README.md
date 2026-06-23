@@ -76,6 +76,9 @@ python edge_client.py --headless --mode main \
 After all three methods for a scenario have uploaded their results:
 
 ```shell
+python tools/experiments/evaluate_plank_road_baseline_accuracy.py \
+  --comparison_dir results/experiments/comparison-001 \
+  --ground_truth path/to/road_ground_truth.json
 python tools/experiments/normalize_plank_road_baseline_logs.py \
   --comparison_dir results/experiments/comparison-001
 python tools/experiments/plot_plank_road_baseline_figures.py \
@@ -415,6 +418,7 @@ results/experiments/{comparison_id}/
 Normalize existing logs:
 
 ```shell
+python tools/experiments/evaluate_plank_road_baseline_accuracy.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml --ground_truth path/to/ground_truth.json --output results/experiments/{comparison_id}/accuracy.jsonl
 python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml
 ```
 
@@ -446,6 +450,22 @@ Frame-level F1 and mAP must come from a real precomputed accuracy CSV or JSONL
 referenced by `metrics.accuracy_file` in the manifest. Accuracy-Trigger teacher
 agreement remains a window-level trigger metric and is not presented as
 ground-truth F1 or mAP.
+
+`evaluate_plank_road_baseline_accuracy.py` builds that file from the archived
+per-frame predictions and real annotations. It accepts a one-scenario JSON
+frame mapping, JSONL rows containing `scenario_name`, `frame_id`, `boxes`, and
+`labels`, or COCO detection JSON when `--coco_category_id_map` provides an
+explicit mapping from COCO `category_id` values to model label indices. It
+computes class-aware per-frame F1 with an explicit IoU threshold and leaves mAP
+empty. Frames without annotations are reported and omitted rather than assigned
+a value. On success it updates the manifest and experiment index to reference
+the generated accuracy file and annotation provenance.
+
+Future runs also record measured application-payload bytes for compressed raw
+shards, feature shards, prediction/protocol metadata, and model downloads.
+Upload, download, and model-apply latency use measured runtime durations when
+available; otherwise the normalizer falls back to paired event timestamps.
+Offline result archival remains excluded from these communication metrics.
 
 External Ekya data uses
 [configs/experiments/external_ekya_schema.example.csv](./configs/experiments/external_ekya_schema.example.csv)

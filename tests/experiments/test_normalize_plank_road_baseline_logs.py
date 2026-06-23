@@ -405,3 +405,197 @@ def test_events_are_deduplicated_and_cross_file_latency_is_derived(
     latencies = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
     teacher = next(row for row in latencies if row["teacher_annotation_ms"] == "1000.0")
     assert teacher["edge_id"] == ""
+
+
+def test_structured_events_capture_bytes_and_derive_stage_latency(tmp_path: Path) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    for path in (
+        "raw_logs/plank_road/cloud/main-r1",
+        "raw_logs/plank_road/edge_1/main-r1",
+        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+    ):
+        (comparison_dir / path).mkdir(parents=True, exist_ok=True)
+    _write_jsonl(
+        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge_metrics.jsonl",
+        [
+            {
+                "event": "resource_trigger_decision",
+                "timestamp_ms": 1000,
+                "frame_id": 10,
+                "window_id": "w1",
+                "trigger_decision": True,
+            },
+            {"event": "bundle_upload_started", "timestamp_ms": 1100},
+            {
+                "event": "bundle_upload_done",
+                "timestamp_ms": 1300,
+                "job_id": "job-1",
+                "raw_frame_bytes": 70,
+                "feature_bytes": 20,
+                "prediction_metadata_bytes": 10,
+                "total_upload_bytes": 100,
+                "raw_sample_count": 7,
+                "feature_sample_count": 2,
+            },
+            {
+                "event": "training_job_started",
+                "timestamp_ms": 1400,
+                "job_id": "job-1",
+            },
+            {
+                "event": "training_job_succeeded",
+                "timestamp_ms": 2400,
+                "job_id": "job-1",
+            },
+            {
+                "event": "model_update_downloaded",
+                "timestamp_ms": 2500,
+                "job_id": "job-1",
+                "model_update_download_bytes": 40,
+            },
+            {
+                "event": "model_update_applied",
+                "timestamp_ms": 2600,
+                "job_id": "job-1",
+            },
+        ],
+    )
+
+    normalize(comparison_dir, manifest_path)
+
+    uploads = read_csv(comparison_dir / "normalized/upload_breakdown.csv")
+    measured = next(
+        row
+        for row in uploads
+        if row["run_id"] == "main-r1" and row["total_upload_bytes"] == "100"
+    )
+    assert measured["raw_frame_bytes"] == "70"
+    assert measured["feature_bytes"] == "20"
+    assert measured["prediction_metadata_bytes"] == "10"
+    download = next(
+        row
+        for row in uploads
+        if row["run_id"] == "main-r1"
+        and row["model_update_download_bytes"] == "40"
+    )
+    assert download["total_upload_bytes"] == ""
+
+    latency = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
+    assert any(row["upload_ms"] == "200" for row in latency)
+    assert any(row["training_ms"] == "1000" for row in latency)
+    assert any(row["model_update_download_ms"] == "100" for row in latency)
+    assert any(row["model_apply_ms"] == "100" for row in latency)
+    assert any(row["total_adaptation_ms"] == "1600" for row in latency)
+
+
+def test_stage_latency_keeps_existing_total_without_total_pair(tmp_path: Path) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    for path in (
+        "raw_logs/plank_road/cloud/main-r1",
+        "raw_logs/plank_road/edge_1/main-r1",
+        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+    ):
+        (comparison_dir / path).mkdir(parents=True, exist_ok=True)
+    (comparison_dir / "raw_logs/plank_road/cloud/main-r1/cloud.log").write_text(
+        "2026-06-01 10:00:00.000 | INFO | x - "
+        "[FixedSplitCL] total round time took 3.000s.\n",
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge_metrics.jsonl",
+        [
+            {
+                "event": "bundle_upload_started",
+                "timestamp_ms": 1000,
+                "edge_id": 1,
+                "window_id": "w1",
+            },
+            {
+                "event": "bundle_upload_done",
+                "timestamp_ms": 1200,
+                "edge_id": 1,
+                "window_id": "w1",
+            },
+        ],
+    )
+
+    normalize(comparison_dir, manifest_path)
+
+    latency = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
+    assert any(row["upload_ms"] == "200" for row in latency)
+    assert any(row["total_adaptation_ms"] == "3000.0" for row in latency)
+
+
+def test_structured_latency_prefers_payload_values_and_matching_ids(
+    tmp_path: Path,
+) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    for path in (
+        "raw_logs/plank_road/cloud/main-r1",
+        "raw_logs/plank_road/edge_1/main-r1",
+        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+    ):
+        (comparison_dir / path).mkdir(parents=True, exist_ok=True)
+    _write_jsonl(
+        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge_metrics.jsonl",
+        [
+            {
+                "event": "training_job_succeeded",
+                "timestamp_ms": 1000,
+                "edge_id": 1,
+                "job_id": "job-a",
+            },
+            {
+                "event": "model_update_downloaded",
+                "timestamp_ms": 6000,
+                "edge_id": 1,
+                "job_id": "job-a",
+                "model_update_download_ms": 123.0,
+            },
+            {
+                "event": "model_update_applied",
+                "timestamp_ms": 10000,
+                "edge_id": 1,
+                "job_id": "job-a",
+                "model_apply_ms": 77.0,
+            },
+        ],
+    )
+    _write_jsonl(
+        comparison_dir
+        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        [
+            {
+                "event": "training_job_succeeded",
+                "timestamp_ms": 1000,
+                "edge_id": 1,
+                "job_id": "job-a",
+            },
+            {
+                "event": "model_update_downloaded",
+                "timestamp_ms": 2000,
+                "edge_id": 1,
+                "job_id": "job-b",
+            },
+        ],
+    )
+
+    normalize(comparison_dir, manifest_path)
+
+    latency = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
+    main_latency = [row for row in latency if row["run_id"] == "main-r1"]
+    accuracy_latency = [row for row in latency if row["run_id"] == "accuracy-r1"]
+    assert any(row["model_update_download_ms"] == "123.0" for row in main_latency)
+    assert not any(row["model_update_download_ms"] == "5000" for row in main_latency)
+    assert any(row["model_apply_ms"] == "77.0" for row in main_latency)
+    assert not any(row["model_apply_ms"] == "4000" for row in main_latency)
+    assert not any(row["model_update_download_ms"] == "1000" for row in accuracy_latency)

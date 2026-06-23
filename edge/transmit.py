@@ -9,7 +9,7 @@ import zipfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import grpc
 from loguru import logger
@@ -37,6 +37,29 @@ def _format_bytes(num_bytes: int | float) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024.0
     return f"{value:.1f} GiB"
+
+
+def measure_trigger_bundle_payload(payload_zip: bytes) -> dict[str, int]:
+    raw_frame_bytes = 0
+    feature_bytes = 0
+    with zipfile.ZipFile(io.BytesIO(payload_zip), "r") as archive:
+        for item in archive.infolist():
+            name = str(item.filename)
+            if name.startswith("raw_shards/"):
+                raw_frame_bytes += int(item.compress_size)
+            elif name.startswith("feature_shards/"):
+                feature_bytes += int(item.compress_size)
+    total_upload_bytes = len(payload_zip)
+    prediction_metadata_bytes = max(
+        0,
+        total_upload_bytes - raw_frame_bytes - feature_bytes,
+    )
+    return {
+        "raw_frame_bytes": raw_frame_bytes,
+        "feature_bytes": feature_bytes,
+        "prediction_metadata_bytes": prediction_metadata_bytes,
+        "total_upload_bytes": total_upload_bytes,
+    }
 
 
 def _quality_sort_key(record) -> tuple[float, str, str]:
@@ -773,6 +796,7 @@ def submit_continual_learning_job(
     request_id: str | None = None,
     channel=None,
     log_internal_ids: bool = False,
+    metrics_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ):
     resolved_request_id: str | None = None
     try:
@@ -802,6 +826,7 @@ def submit_continual_learning_job(
             shard_size=trigger_shard_size,
         )
         zip_payload_bytes = len(payload_zip)
+        payload_metrics = measure_trigger_bundle_payload(payload_zip)
         selection_policy = dict(manifest.get("selection_policy", {}) or {})
         estimated_upload_sec = None
         if bandwidth_mbps > 0.0 and zip_payload_bytes > 0:
@@ -820,6 +845,7 @@ def submit_continual_learning_job(
             _format_bytes(zip_payload_bytes),
             (f"{estimated_upload_sec:.3f}s" if estimated_upload_sec is not None else "unknown"),
         )
+        upload_started_at_ms = int(time.time() * 1000)
         upload_started = time.perf_counter()
         resolved_request_id = str(request_id or uuid.uuid4().hex)
         reply = submit_training_job(
@@ -835,6 +861,24 @@ def submit_continual_learning_job(
             log_internal_ids=log_internal_ids,
         )
         upload_elapsed = time.perf_counter() - upload_started
+        upload_done_at_ms = int(time.time() * 1000)
+        if metrics_callback is not None:
+            metrics_callback(
+                {
+                    **payload_metrics,
+                    "upload_ms": upload_elapsed * 1000.0,
+                    "upload_started_at_ms": upload_started_at_ms,
+                    "upload_done_at_ms": upload_done_at_ms,
+                    "raw_sample_count": sum(
+                        int(item.get("sample_count", 0) or 0)
+                        for item in list(manifest.get("raw_shards", []) or [])
+                    ),
+                    "feature_sample_count": sum(
+                        int(item.get("sample_count", 0) or 0)
+                        for item in list(manifest.get("feature_shards", []) or [])
+                    ),
+                }
+            )
         upload_mbps = (
             zip_payload_bytes * 8.0 / upload_elapsed / 1_000_000.0
             if upload_elapsed > 0.0 and zip_payload_bytes > 0

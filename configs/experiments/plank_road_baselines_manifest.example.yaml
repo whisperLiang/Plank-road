@@ -76,10 +76,10 @@ runtime:
     baseline_method: accuracy_trigger_cloud_retraining
 
 metrics:
-  # Optional CSV or JSONL containing only precomputed, measured metrics.
-  accuracy_file: null
-  # Provenance only. The post-processor does not evaluate detections from GT.
-  ground_truth_file: null
+  # Generated before normalization by evaluate_plank_road_baseline_accuracy.py.
+  accuracy_file: accuracy.jsonl
+  # Real annotation provenance used by the explicit accuracy evaluator.
+  ground_truth_file: path/to/ground_truth.json
   allow_missing_accuracy: true
 
 notes:

@@ -99,6 +99,12 @@ Relevant raw outputs include:
 Normalize and plot:
 
 ```bash
+python tools/experiments/evaluate_plank_road_baseline_accuracy.py \
+  --comparison_dir results/experiments/{comparison_id} \
+  --manifest results/experiments/{comparison_id}/manifest.yaml \
+  --ground_truth path/to/ground_truth.json \
+  --output results/experiments/{comparison_id}/accuracy.jsonl
+
 python tools/experiments/normalize_plank_road_baseline_logs.py \
   --comparison_dir results/experiments/{comparison_id} \
   --manifest results/experiments/{comparison_id}/manifest.yaml
@@ -121,6 +127,20 @@ It contains metrics computed by a real evaluation pipeline. The
 not choose an IoU threshold, category mapping, or mAP convention.
 Accuracy-Trigger teacher agreement is stored as `window_accuracy`, not as
 ground-truth F1 or mAP.
+
+The bundled `evaluate_plank_road_baseline_accuracy.py` command provides the
+explicit evaluation step for detection F1. Ground truth may be a one-scenario
+frame-id JSON mapping, JSONL with `scenario_name`, `frame_id`, `boxes`, and
+`labels`, or COCO detection JSON when `--coco_category_id_map` supplies the
+explicit mapping from COCO `category_id` values to model label indices. The
+command records its IoU and score thresholds in a report next to the generated
+accuracy file, then updates `metrics.accuracy_file` and
+`metrics.ground_truth_file`.
+
+Experiment metrics record compressed application-payload bytes for raw shards,
+feature shards, metadata/archive overhead, and model downloads. Adaptation
+stage latency uses measured runtime durations when available and paired event
+timestamps as the compatibility fallback; absent event pairs remain empty.
 
 ## Aggregation and missing data
 

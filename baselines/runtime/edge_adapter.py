@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import threading
 import time
 from queue import Empty, Queue
@@ -18,6 +19,7 @@ from baselines.runtime.training_state import (
 from baselines.runtime.upload_client import (
     BaselineUploadClient,
     encode_frame,
+    measure_accuracy_trigger_window_upload,
     validate_baseline_training_strategy,
 )
 from common.experiment_results import edge_run_dir
@@ -270,7 +272,26 @@ class BaselineEdgeAdapter:
         if isinstance(payload, BaselineWindowPayload):
             if not hasattr(self.transport, "upload_accuracy_trigger_window"):
                 raise RuntimeError("transport does not support Accuracy-Trigger window upload")
+            upload_metrics = measure_accuracy_trigger_window_upload(payload)
+            self.metrics.record(
+                "bundle_upload_started",
+                window_id=payload.window_id,
+                raw_sample_count=len(payload.selected_samples),
+            )
+            upload_started = time.perf_counter()
             self.transport.upload_accuracy_trigger_window(payload)
+            upload_ms = (time.perf_counter() - upload_started) * 1000.0
+            self.metrics.record(
+                "bundle_upload_done",
+                window_id=payload.window_id,
+                upload_ms=upload_ms,
+                raw_frame_bytes=upload_metrics.raw_frame_bytes,
+                feature_bytes=upload_metrics.feature_bytes,
+                prediction_metadata_bytes=upload_metrics.prediction_metadata_bytes,
+                total_upload_bytes=upload_metrics.total_upload_bytes,
+                raw_sample_count=len(payload.selected_samples),
+                feature_sample_count=0,
+            )
             self.metrics.record(
                 "accuracy_trigger_window_uploaded",
                 window_id=payload.window_id,
@@ -355,17 +376,28 @@ class BaselineEdgeAdapter:
         terminal_message = str(getattr(reply, "message", "") or "")
         try:
             if status == "SUCCEEDED" and bool(getattr(reply, "result_available", False)):
+                download_started = time.perf_counter()
                 download = self.transport.download_trained_model(
                     edge_id=self.edge_id,
                     job_id=active.job_id,
                 )
+                download_ms = (time.perf_counter() - download_started) * 1000.0
                 if bool(getattr(download, "success", False)) and getattr(
                     download,
                     "model_data",
                     "",
                 ):
+                    model_data = str(download.model_data)
+                    self.metrics.record(
+                        "model_update_downloaded",
+                        window_id=active.window_id,
+                        job_id=active.job_id,
+                        model_update_download_bytes=_base64_payload_bytes(model_data),
+                        model_update_download_ms=download_ms,
+                    )
+                    apply_started = time.perf_counter()
                     self._edge.apply_model_update(
-                        str(download.model_data),
+                        model_data,
                         submitted_model_version=active.model_version,
                         result_model_version=str(
                             getattr(download, "result_model_version", "") or ""
@@ -374,6 +406,7 @@ class BaselineEdgeAdapter:
                         message=str(getattr(download, "message", "") or ""),
                         log_prefix="[BaselineAdapter]",
                     )
+                    model_apply_ms = (time.perf_counter() - apply_started) * 1000.0
                     logger.info(
                         "[BaselineAdapter] model update applied edge={} version={}",
                         self.edge_id,
@@ -384,6 +417,7 @@ class BaselineEdgeAdapter:
                         window_id=active.window_id,
                         job_id=active.job_id,
                         result_model_version=str(getattr(self._edge, "model_version", "")),
+                        model_apply_ms=model_apply_ms,
                     )
             else:
                 self.metrics.record(
@@ -479,6 +513,18 @@ class BaselineEdgeAdapter:
                     job_id=job_id,
                     window_id=str(command.get("window_id", "") or ""),
                 )
+                self.metrics.record(
+                    "accuracy_trigger_decision",
+                    timestamp_ms=int(
+                        command.get("created_at_ms", 0) or now_ms()
+                    ),
+                    job_id=job_id,
+                    window_id=str(command.get("window_id", "") or ""),
+                    trigger_decision=True,
+                    trigger_reason=str(
+                        command.get("trigger_reason", "") or "cloud_accuracy_drop"
+                    ),
+                )
 
     def _valid_accuracy_trigger_command(self, command: dict[str, Any]) -> bool:
         if str(command.get("run_id", "") or "") != self.run_id:
@@ -541,24 +587,66 @@ class BaselineEdgeAdapter:
         if reply is None or not bool(getattr(reply, "found", False)):
             return
         status = str(getattr(reply, "status", "") or "").upper()
+        if status and status != active.last_status:
+            active.last_status = status
+            if status == "RUNNING":
+                self.metrics.record(
+                    "cloud_scheduled_training_job_started",
+                    timestamp_ms=int(
+                        getattr(reply, "started_at_ms", 0) or now_ms()
+                    ),
+                    window_id=active.window_id,
+                    job_id=active.job_id,
+                    status=status,
+                )
         if status in {"", "QUEUED", "RUNNING"}:
             return
         terminal_message = str(getattr(reply, "message", "") or "")
         update_applied = False
         result_model_version = str(getattr(reply, "result_model_version", "") or "")
         try:
+            started_at_ms = int(getattr(reply, "started_at_ms", 0) or 0)
+            if started_at_ms > 0:
+                self.metrics.record(
+                    "cloud_scheduled_training_job_started",
+                    timestamp_ms=started_at_ms,
+                    window_id=active.window_id,
+                    job_id=active.job_id,
+                    status="RUNNING",
+                )
+            self.metrics.record(
+                "cloud_scheduled_training_job_terminal",
+                timestamp_ms=int(
+                    getattr(reply, "finished_at_ms", 0) or now_ms()
+                ),
+                window_id=active.window_id,
+                job_id=active.job_id,
+                status=status,
+                message=terminal_message,
+            )
             if status == "SUCCEEDED" and bool(getattr(reply, "result_available", False)):
+                download_started = time.perf_counter()
                 download = self.transport.download_trained_model(
                     edge_id=self.edge_id,
                     job_id=active.job_id,
                 )
+                download_ms = (time.perf_counter() - download_started) * 1000.0
                 if bool(getattr(download, "success", False)) and getattr(
                     download,
                     "model_data",
                     "",
                 ):
+                    model_data = str(download.model_data)
+                    self.metrics.record(
+                        "model_update_downloaded",
+                        window_id=active.window_id,
+                        job_id=active.job_id,
+                        model_update_download_bytes=_base64_payload_bytes(model_data),
+                        model_update_download_ms=download_ms,
+                    )
+                    apply_started = time.perf_counter()
                     self._edge.apply_model_update(
-                        str(download.model_data),
+                        model_data,
                         submitted_model_version=active.model_version,
                         result_model_version=str(
                             getattr(download, "result_model_version", "") or ""
@@ -567,6 +655,7 @@ class BaselineEdgeAdapter:
                         message=str(getattr(download, "message", "") or ""),
                         log_prefix="[BaselineAdapter]",
                     )
+                    model_apply_ms = (time.perf_counter() - apply_started) * 1000.0
                     update_applied = True
                     result_model_version = str(
                         getattr(download, "result_model_version", "") or result_model_version
@@ -582,15 +671,8 @@ class BaselineEdgeAdapter:
                         window_id=active.window_id,
                         job_id=active.job_id,
                         result_model_version=str(getattr(self._edge, "model_version", "")),
+                        model_apply_ms=model_apply_ms,
                     )
-            else:
-                self.metrics.record(
-                    "cloud_scheduled_training_job_terminal",
-                    window_id=active.window_id,
-                    job_id=active.job_id,
-                    status=status,
-                    message=terminal_message,
-                )
         except Exception as exc:
             logger.warning("[BaselineAdapter] cloud-scheduled update handling failed: {}", exc)
             self.metrics.record(
@@ -633,6 +715,16 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _base64_payload_bytes(value: str) -> int:
+    payload = str(value or "")
+    if not payload:
+        return 0
+    try:
+        return len(base64.b64decode(payload, validate=True))
+    except (ValueError, TypeError):
+        return len(payload.encode("utf-8"))
 
 
 def _same_accuracy_window_lineage(

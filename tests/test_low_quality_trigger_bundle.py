@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import zipfile
 from types import SimpleNamespace
@@ -15,11 +16,32 @@ from edge.sample_quality import LOW_QUALITY
 from edge.sample_store import EdgeSampleStore
 from edge.transmit import (
     _select_low_quality_trigger_records,
+    measure_trigger_bundle_payload,
     pack_low_quality_trigger_bundle_to_file,
 )
 from model_management.fixed_split import SplitPlan
 from model_management.payload import boundary_payload_from_tensors
 from model_management.split_contract import build_runtime_contract
+
+
+def test_trigger_bundle_payload_measurement_accounts_for_all_bytes() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("raw_shards/raw.tar", b"raw" * 100)
+        archive.writestr("feature_shards/features.bin", b"feature" * 100)
+        archive.writestr("trigger_manifest.json", b'{"version": 1}')
+
+    metrics = measure_trigger_bundle_payload(buffer.getvalue())
+
+    assert metrics["raw_frame_bytes"] > 0
+    assert metrics["feature_bytes"] > 0
+    assert metrics["prediction_metadata_bytes"] > 0
+    assert (
+        metrics["raw_frame_bytes"]
+        + metrics["feature_bytes"]
+        + metrics["prediction_metadata_bytes"]
+        == metrics["total_upload_bytes"]
+    )
 
 
 def _runtime_contract() -> dict[str, object]:

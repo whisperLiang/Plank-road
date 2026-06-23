@@ -55,9 +55,11 @@ MANIFEST_NAMES = {"trigger_manifest.json"}
 
 BASELINE_EVENT_MAP = {
     "accuracy_trigger_window_uploaded": "window_uploaded",
+    "accuracy_trigger_decision": "trigger_decision",
     "training_model_update_applied": "model_update_applied",
     "cloud_scheduled_model_update_applied": "model_update_applied",
     "cloud_scheduled_training_job_adopted": "training_job_submitted",
+    "cloud_scheduled_training_job_started": "training_job_started",
 }
 STRUCTURED_EVENT_MAP = {
     "resource_trigger_decision": "trigger_decision",
@@ -70,6 +72,12 @@ STRUCTURED_EVENT_MAP = {
     "model_update_downloaded": "model_update_downloaded",
     "model_update_applied": "model_update_applied",
 }
+EVENT_LATENCY_FIELDS = (
+    "upload_ms",
+    "training_ms",
+    "model_update_download_ms",
+    "model_apply_ms",
+)
 
 
 def _frame_row(
@@ -146,7 +154,7 @@ def _adaptation_event(
     payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     data = dict(payload or {})
-    return empty_row(
+    row = empty_row(
         ADAPTATION_FIELDS,
         **canonical_base(comparison_id=comparison_id, run=run, edge_id=edge_id),
         event_name=event_name,
@@ -158,6 +166,11 @@ def _adaptation_event(
         result_model_version=data.get("result_model_version"),
         message=message or data.get("message"),
     )
+    for field in EVENT_LATENCY_FIELDS:
+        value = optional_float(data.get(field))
+        if value is not None:
+            row[field] = value
+    return row
 
 
 def _parse_baseline_metric(
@@ -202,13 +215,19 @@ def _parse_baseline_metric(
     raw_bytes = optional_int(payload.get("raw_frame_bytes"))
     feature_bytes = optional_int(payload.get("feature_bytes"))
     metadata_bytes = optional_int(payload.get("prediction_metadata_bytes"))
-    if any(value is not None for value in (raw_bytes, feature_bytes, metadata_bytes)):
+    download_bytes = optional_int(payload.get("model_update_download_bytes"))
+    if any(
+        value is not None
+        for value in (raw_bytes, feature_bytes, metadata_bytes, download_bytes)
+    ):
         components = [raw_bytes, feature_bytes, metadata_bytes]
-        total = (
-            sum(value or 0 for value in components)
-            if all(value is not None for value in components)
-            else None
+        total = optional_int(payload.get("total_upload_bytes"))
+        if total is None and all(value is not None for value in components):
+            total = sum(value or 0 for value in components)
+        raw_count = optional_int(
+            first_value(payload, ("raw_sample_count", "selected_count"))
         )
+        feature_count = optional_int(payload.get("feature_sample_count"))
         uploads.append(
             empty_row(
                 UPLOAD_FIELDS,
@@ -217,9 +236,15 @@ def _parse_baseline_metric(
                 raw_frame_bytes=raw_bytes,
                 feature_bytes=feature_bytes,
                 prediction_metadata_bytes=metadata_bytes,
+                model_update_download_bytes=download_bytes,
                 total_upload_bytes=total,
-                raw_sample_count=payload.get("raw_sample_count"),
-                feature_sample_count=payload.get("feature_sample_count"),
+                raw_exposure_ratio=(
+                    raw_count / max(raw_count + (feature_count or 0), 1)
+                    if raw_count is not None
+                    else None
+                ),
+                raw_sample_count=raw_count,
+                feature_sample_count=feature_count,
             )
         )
 
@@ -978,7 +1003,23 @@ def _coalesce_adaptation_events(
         incoming_time = optional_int(row.get("event_time_ms"))
         if incoming_time is not None and (existing_time is None or incoming_time < existing_time):
             target["event_time_ms"] = incoming_time
+        for field in EVENT_LATENCY_FIELDS:
+            incoming = row.get(field)
+            if target.get(field) in (None, "") and incoming not in (None, ""):
+                target[field] = incoming
     return merged
+
+
+def _event_identity(row: Mapping[str, Any]) -> str:
+    return str(row.get("job_id", "") or row.get("window_id", "") or "")
+
+
+def _can_pair_by_time(start: Mapping[str, Any], end: Mapping[str, Any]) -> bool:
+    start_identity = _event_identity(start)
+    end_identity = _event_identity(end)
+    if not start_identity or not end_identity:
+        return True
+    return start_identity == end_identity
 
 
 def _derive_adaptation_latency(
@@ -998,8 +1039,88 @@ def _derive_adaptation_latency(
             )
         ].append(event)
     derived: list[dict[str, Any]] = []
-    derived_runs: set[str] = set()
+    derived_total_runs: set[str] = set()
     for (run_id, method, edge_id), group in groups.items():
+        group.sort(key=lambda row: optional_int(row.get("event_time_ms")) or 0)
+        stage_pairs = (
+            ("bundle_upload_started", "bundle_upload_done", "upload_ms"),
+            ("training_job_started", "training_job_succeeded", "training_ms"),
+            (
+                "training_job_succeeded",
+                "model_update_downloaded",
+                "model_update_download_ms",
+            ),
+            ("model_update_downloaded", "model_update_applied", "model_apply_ms"),
+        )
+        for start_name, end_name, field in stage_pairs:
+            unused_starts = [
+                row for row in group if row.get("event_name") == start_name
+            ]
+            ends = [row for row in group if row.get("event_name") == end_name]
+            for end in ends:
+                end_time = optional_int(end.get("event_time_ms"))
+                if end_time is None:
+                    continue
+                exact_value = optional_float(end.get(field))
+                if exact_value is not None:
+                    derived.append(
+                        empty_row(
+                            LATENCY_FIELDS,
+                            comparison_id=end.get("comparison_id"),
+                            run_id=run_id,
+                            method=method,
+                            edge_id=edge_id,
+                            scenario_name=end.get("scenario_name"),
+                            window_id=end.get("window_id"),
+                            **{field: exact_value},
+                        )
+                    )
+                    continue
+                end_identity = _event_identity(end)
+                candidate_index = next(
+                    (
+                        index
+                        for index, start in enumerate(unused_starts)
+                        if end_identity
+                        and end_identity
+                        in {
+                            str(start.get("job_id", "") or ""),
+                            str(start.get("window_id", "") or ""),
+                        }
+                        and (optional_int(start.get("event_time_ms")) or end_time + 1)
+                        <= end_time
+                    ),
+                    None,
+                )
+                if candidate_index is None:
+                    candidate_index = next(
+                        (
+                            index
+                            for index, start in enumerate(unused_starts)
+                            if _can_pair_by_time(start, end)
+                            and (optional_int(start.get("event_time_ms")) or end_time + 1)
+                            <= end_time
+                        ),
+                        None,
+                    )
+                if candidate_index is None:
+                    continue
+                start = unused_starts.pop(candidate_index)
+                start_time = optional_int(start.get("event_time_ms"))
+                if start_time is None:
+                    continue
+                derived.append(
+                    empty_row(
+                        LATENCY_FIELDS,
+                        comparison_id=end.get("comparison_id"),
+                        run_id=run_id,
+                        method=method,
+                        edge_id=edge_id,
+                        scenario_name=end.get("scenario_name"),
+                        window_id=end.get("window_id") or start.get("window_id"),
+                        **{field: end_time - start_time},
+                    )
+                )
         triggers = sorted(
             [row for row in group if row.get("event_name") == "trigger_decision"],
             key=lambda row: optional_int(row.get("event_time_ms")) or 0,
@@ -1030,7 +1151,11 @@ def _derive_adaptation_latency(
                     (
                         index
                         for index, trigger in enumerate(unused)
-                        if (optional_int(trigger.get("event_time_ms")) or update_time + 1)
+                        if (
+                            not update_window
+                            or not str(trigger.get("window_id", "") or "")
+                        )
+                        and (optional_int(trigger.get("event_time_ms")) or update_time + 1)
                         <= update_time
                     ),
                     None,
@@ -1053,10 +1178,10 @@ def _derive_adaptation_latency(
                     total_adaptation_ms=update_time - trigger_time,
                 )
             )
-            derived_runs.add(run_id)
-    if derived_runs:
+            derived_total_runs.add(run_id)
+    if derived_total_runs:
         for row in latency:
-            if str(row.get("run_id", "")) in derived_runs:
+            if str(row.get("run_id", "")) in derived_total_runs:
                 row["total_adaptation_ms"] = ""
     latency.extend(derived)
 
@@ -1179,16 +1304,14 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
                             recognized = True
                             continue
                         if "event" in payload and "timestamp_ms" in payload and edge_id is not None:
-                            if _parse_structured_experiment_event(
+                            _parse_structured_experiment_event(
                                 payload,
                                 comparison_id=str(manifest["comparison_id"]),
                                 run=run,
                                 edge_id=edge_id,
                                 windows=windows,
                                 events=events,
-                            ):
-                                recognized = True
-                                continue
+                            )
                             _parse_baseline_metric(
                                 payload,
                                 comparison_id=str(manifest["comparison_id"]),

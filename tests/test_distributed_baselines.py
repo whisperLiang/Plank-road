@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -437,6 +438,16 @@ def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_pa
         assert sample.entropy == pytest.approx(0.25)
         assert sample.quality_metadata["training_strategy"] == "freeze"
         assert transport.training_requests == []
+        metric_rows = [
+            json.loads(line)
+            for line in Path(adapter.metrics_path).read_text(encoding="utf-8").splitlines()
+        ]
+        upload = next(row for row in metric_rows if row["event"] == "bundle_upload_done")
+        assert upload["raw_frame_bytes"] > 0
+        assert upload["feature_bytes"] == 0
+        assert upload["prediction_metadata_bytes"] > 0
+        assert upload["total_upload_bytes"] >= upload["raw_frame_bytes"]
+        assert upload["upload_ms"] >= 0
     finally:
         adapter.close()
 

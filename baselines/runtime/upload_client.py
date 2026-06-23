@@ -5,6 +5,7 @@ import io
 import json
 import time
 import zipfile
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 import cv2
@@ -23,11 +24,40 @@ BASELINE_TRAINING_PROTOCOL_VERSION = "baseline-training-trigger.v1"
 ALLOWED_BASELINE_TRAINING_STRATEGIES = {"freeze"}
 
 
+@dataclass(frozen=True)
+class BaselineUploadMetrics:
+    raw_frame_bytes: int
+    feature_bytes: int
+    prediction_metadata_bytes: int
+    total_upload_bytes: int
+
+
 def encode_frame(frame: object | None) -> bytes:
     if frame is None:
         return b""
     ok, encoded = cv2.imencode(".jpg", frame)
     return bytes(encoded.tobytes()) if ok else b""
+
+
+def measure_accuracy_trigger_window_upload(
+    payload: BaselineWindowPayload,
+) -> BaselineUploadMetrics:
+    request = _window_payload_to_proto(payload)
+    raw_frame_bytes = sum(
+        len(bytes(sample.raw_frame or b"")) for sample in payload.selected_samples
+    )
+    if hasattr(request, "ByteSize"):
+        total_upload_bytes = int(request.ByteSize())
+    elif hasattr(request, "SerializeToString"):
+        total_upload_bytes = len(request.SerializeToString())
+    else:
+        total_upload_bytes = len(json_dumps(payload.to_json()).encode("utf-8"))
+    return BaselineUploadMetrics(
+        raw_frame_bytes=raw_frame_bytes,
+        feature_bytes=0,
+        prediction_metadata_bytes=max(0, total_upload_bytes - raw_frame_bytes),
+        total_upload_bytes=total_upload_bytes,
+    )
 
 
 def build_baseline_training_bundle(
