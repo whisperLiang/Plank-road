@@ -305,6 +305,22 @@ class BaselineConfig(ConfigSection):
 
 
 @dataclass
+class ExperimentResultsConfig(ConfigSection):
+    enabled: bool = True
+    comparison_id: str = "exp_plank_road_vs_baselines_001"
+    root_dir: str = "results/experiments"
+    local_root_dir: str = "cache/experiment_results"
+    upload_to_cloud: bool = True
+    upload_on_shutdown: bool = True
+    include_inference_results: bool = True
+    include_baseline_metrics: bool = True
+    include_edge_summary: bool = True
+    include_trigger_manifest: bool = True
+    include_runtime_logs: bool = False
+    max_artifact_bytes: int = 268435456
+
+
+@dataclass
 class DASConfig(ConfigSection):
     enabled: bool = False
     bn_only: bool = False
@@ -404,6 +420,9 @@ class ClientConfig(ConfigSection):
     continual_learning: ClientContinualLearningConfig = field(
         default_factory=ClientContinualLearningConfig
     )
+    experiment_results: ExperimentResultsConfig = field(
+        default_factory=ExperimentResultsConfig
+    )
 
 
 @dataclass
@@ -421,6 +440,9 @@ class ServerConfig(ConfigSection):
     workspace_root: str = "./cache/server_workspace"
     sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
     edge_affine_workers: EdgeAffineWorkersConfig = field(default_factory=EdgeAffineWorkersConfig)
+    experiment_results: ExperimentResultsConfig = field(
+        default_factory=ExperimentResultsConfig
+    )
 
 
 @dataclass
@@ -429,10 +451,15 @@ class RuntimeConfig(ConfigSection):
     server: ServerConfig = field(default_factory=ServerConfig)
     sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
     baseline: BaselineConfig = field(default_factory=BaselineConfig)
+    experiment_results: ExperimentResultsConfig = field(
+        default_factory=ExperimentResultsConfig
+    )
 
     def __post_init__(self) -> None:
         self.client.sample_pool = self.sample_pool
         self.server.sample_pool = self.sample_pool
+        self.client.experiment_results = self.experiment_results
+        self.server.experiment_results = self.experiment_results
 
 
 def _section(section_cls, value: Mapping[str, Any] | None):
@@ -498,6 +525,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             SplitLearningConfig,
             known.get("split_learning"),
         )
+        known["experiment_results"] = _section(
+            ExperimentResultsConfig,
+            known.get("experiment_results"),
+        )
     elif section_cls is ServerConfig:
         known["sample_pool"] = _section(SamplePoolConfig, known.get("sample_pool"))
         known["continual_learning"] = _section(
@@ -508,6 +539,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["edge_affine_workers"] = _section(
             EdgeAffineWorkersConfig,
             known.get("edge_affine_workers"),
+        )
+        known["experiment_results"] = _section(
+            ExperimentResultsConfig,
+            known.get("experiment_results"),
         )
     elif section_cls is EdgeAffineWorkersConfig:
         known["edge_workers"] = _section(EdgeWorkerConfig, known.get("edge_workers"))
@@ -533,11 +568,18 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         )
     elif section_cls is RuntimeConfig:
         sample_pool = _section(SamplePoolConfig, known.get("sample_pool"))
+        experiment_results = _section(
+            ExperimentResultsConfig,
+            known.get("experiment_results"),
+        )
         client_data = dict(known.get("client") or {})
         client_data["sample_pool"] = sample_pool
+        client_data["experiment_results"] = experiment_results
         server_data = dict(known.get("server") or {})
         server_data["sample_pool"] = sample_pool
+        server_data["experiment_results"] = experiment_results
         known["sample_pool"] = sample_pool
+        known["experiment_results"] = experiment_results
         known["client"] = _section(ClientConfig, client_data)
         known["server"] = _section(ServerConfig, server_data)
         known["baseline"] = _section(BaselineConfig, known.get("baseline"))
@@ -685,6 +727,37 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             raise ValueError(message)
 
     _validate_sample_pool_config("sample_pool", config.sample_pool)
+    experiment_results = config.experiment_results
+    for name in (
+        "enabled",
+        "upload_to_cloud",
+        "upload_on_shutdown",
+        "include_inference_results",
+        "include_baseline_metrics",
+        "include_edge_summary",
+        "include_trigger_manifest",
+        "include_runtime_logs",
+    ):
+        if not isinstance(getattr(experiment_results, name), bool):
+            raise ValueError(f"experiment_results.{name} must be a boolean")
+    for name in ("comparison_id", "root_dir", "local_root_dir"):
+        if not str(getattr(experiment_results, name) or "").strip():
+            raise ValueError(f"experiment_results.{name} must be non-empty")
+    from common.experiment_results import sanitize_component
+
+    sanitize_component(experiment_results.comparison_id)
+    _validate_positive(
+        "experiment_results.max_artifact_bytes",
+        int(experiment_results.max_artifact_bytes),
+    )
+    if (
+        experiment_results.enabled
+        and experiment_results.upload_to_cloud
+        and not experiment_results.include_edge_summary
+    ):
+        raise ValueError(
+            "experiment_results.include_edge_summary must be true when cloud upload is enabled"
+        )
     validate_baseline_method(config.baseline.method)
     removed_baseline_sections = {"ekya_style_centralized_scheduling"}
     stale_sections = removed_baseline_sections.intersection(

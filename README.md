@@ -45,6 +45,49 @@ python edge_client.py --headless
 
 Runtime defaults come from [config/config.yaml](./config/config.yaml), including video source, model choices, split-learning settings, resource trigger budgets, cloud workspace paths, and gRPC addresses.
 
+### Centralized Experiment Results
+
+Formal experiment runs are archived through a shutdown-only side channel under:
+
+```text
+results/experiments/{comparison_id}/
+  manifest.yaml
+  experiment_index.json
+  raw_logs/
+    plank_road/{cloud,edge_*}/{run_id}/
+    pure_edge_local_updating/edge_*/{run_id}/
+    accuracy_trigger_cloud_retraining/{cloud,edge_*}/{run_id}/
+  normalized/
+  figures/
+```
+
+`experiment_results.root_dir` is the cloud repository and
+`experiment_results.local_root_dir` is the edge staging directory. Use the same
+`--comparison_id` and `--run_id` on participating processes. Edge overrides use
+`--experiment_results_root` for the local staging root; cloud overrides use it
+for the final repository root.
+
+```shell
+python cloud_server.py --run_id main-road-r1 --comparison_id comparison-001
+python edge_client.py --headless --mode main \
+  --run_id main-road-r1 --comparison_id comparison-001
+```
+
+After all three methods for a scenario have uploaded their results:
+
+```shell
+python tools/experiments/normalize_plank_road_baseline_logs.py \
+  --comparison_dir results/experiments/comparison-001
+python tools/experiments/plot_plank_road_baseline_figures.py \
+  --normalized_dir results/experiments/comparison-001/normalized \
+  --figure_dir results/experiments/comparison-001/figures
+```
+
+Experiment artifact upload is offline archival traffic. It does not enter
+sample ingestion, teacher annotation, retraining, or `upload_breakdown.csv`.
+Pure Edge therefore remains a zero-cloud-communication method for experiment
+metrics even though its result files can be archived after shutdown.
+
 Generated gRPC files are committed under [grpc_server/](./grpc_server/). Rebuild them only after changing [grpc_server/protos/message_transmission.proto](./grpc_server/protos/message_transmission.proto):
 
 ```shell

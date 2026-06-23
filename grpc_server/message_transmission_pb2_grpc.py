@@ -129,6 +129,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.BaselineInferenceReply.FromString,
                 _registered_method=True)
+        self.UploadExperimentResult = channel.unary_unary(
+                '/MessageTransmission/UploadExperimentResult',
+                request_serializer=message__transmission__pb2.UploadExperimentResultRequest.SerializeToString,
+                response_deserializer=message__transmission__pb2.UploadExperimentResultResponse.FromString,
+                _registered_method=True)
 
 
 class MessageTransmissionServicer(object):
@@ -260,6 +265,13 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def UploadExperimentResult(self, request, context):
+        """Offline experiment artifact archival. This is not method communication.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MessageTransmissionServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -357,6 +369,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.DownloadInferenceResult,
                     request_deserializer=message__transmission__pb2.BaselineInferenceRequest.FromString,
                     response_serializer=message__transmission__pb2.BaselineInferenceReply.SerializeToString,
+            ),
+            'UploadExperimentResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.UploadExperimentResult,
+                    request_deserializer=message__transmission__pb2.UploadExperimentResultRequest.FromString,
+                    response_serializer=message__transmission__pb2.UploadExperimentResultResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -872,6 +889,33 @@ class MessageTransmission(object):
             '/MessageTransmission/DownloadInferenceResult',
             message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
             message__transmission__pb2.BaselineInferenceReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UploadExperimentResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/MessageTransmission/UploadExperimentResult',
+            message__transmission__pb2.UploadExperimentResultRequest.SerializeToString,
+            message__transmission__pb2.UploadExperimentResultResponse.FromString,
             options,
             channel_credentials,
             insecure,

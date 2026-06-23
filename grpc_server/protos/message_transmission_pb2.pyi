@@ -457,3 +457,51 @@ class BaselineCommandReply(_message.Message):
     message: str
     command_json: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, success: bool = ..., message: _Optional[str] = ..., command_json: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class ExperimentResultArtifact(_message.Message):
+    __slots__ = ("comparison_id", "run_id", "method", "edge_id", "relative_path", "content", "size_bytes", "sha256", "content_type", "is_final")
+    COMPARISON_ID_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    RELATIVE_PATH_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_TYPE_FIELD_NUMBER: _ClassVar[int]
+    IS_FINAL_FIELD_NUMBER: _ClassVar[int]
+    comparison_id: str
+    run_id: str
+    method: str
+    edge_id: int
+    relative_path: str
+    content: bytes
+    size_bytes: int
+    sha256: str
+    content_type: str
+    is_final: bool
+    def __init__(self, comparison_id: _Optional[str] = ..., run_id: _Optional[str] = ..., method: _Optional[str] = ..., edge_id: _Optional[int] = ..., relative_path: _Optional[str] = ..., content: _Optional[bytes] = ..., size_bytes: _Optional[int] = ..., sha256: _Optional[str] = ..., content_type: _Optional[str] = ..., is_final: bool = ...) -> None: ...
+
+class UploadExperimentResultRequest(_message.Message):
+    __slots__ = ("comparison_id", "run_id", "method", "edge_id", "artifacts")
+    COMPARISON_ID_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACTS_FIELD_NUMBER: _ClassVar[int]
+    comparison_id: str
+    run_id: str
+    method: str
+    edge_id: int
+    artifacts: _containers.RepeatedCompositeFieldContainer[ExperimentResultArtifact]
+    def __init__(self, comparison_id: _Optional[str] = ..., run_id: _Optional[str] = ..., method: _Optional[str] = ..., edge_id: _Optional[int] = ..., artifacts: _Optional[_Iterable[_Union[ExperimentResultArtifact, _Mapping]]] = ...) -> None: ...
+
+class UploadExperimentResultResponse(_message.Message):
+    __slots__ = ("accepted", "message", "stored_paths")
+    ACCEPTED_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    STORED_PATHS_FIELD_NUMBER: _ClassVar[int]
+    accepted: bool
+    message: str
+    stored_paths: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, accepted: bool = ..., message: _Optional[str] = ..., stored_paths: _Optional[_Iterable[str]] = ...) -> None: ...

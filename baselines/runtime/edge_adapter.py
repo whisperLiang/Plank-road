@@ -20,6 +20,7 @@ from baselines.runtime.upload_client import (
     encode_frame,
     validate_baseline_training_strategy,
 )
+from common.experiment_results import edge_run_dir
 from config.baseline import default_run_id, validate_baseline_method
 
 
@@ -51,6 +52,27 @@ class BaselineEdgeAdapter:
             getattr(self.policy, "training_strategy", "freeze")
         )
         self.trainable_param_ratio = _trainable_param_ratio(method_cfg)
+        experiment_results = getattr(config, "experiment_results", None)
+        mirror_path = None
+        if experiment_results is not None and bool(
+            getattr(experiment_results, "enabled", False)
+        ):
+            mirror_path = (
+                edge_run_dir(
+                    str(
+                        getattr(
+                            experiment_results,
+                            "local_root_dir",
+                            "cache/experiment_results",
+                        )
+                    ),
+                    str(getattr(experiment_results, "comparison_id", "")),
+                    self.baseline_method,
+                    self.edge_id,
+                    self.run_id,
+                )
+                / "metrics.jsonl"
+            )
         self.metrics = DistributedMetricsWriter(
             results_root=str(
                 getattr(baseline_cfg, "results_root", "results/baselines_distributed")
@@ -58,6 +80,7 @@ class BaselineEdgeAdapter:
             run_id=self.run_id,
             baseline_method=self.baseline_method,
             edge_id=self.edge_id,
+            mirror_path=mirror_path,
         )
         self.transport = transport
         if self.transport is None and self.policy.requires_cloud:
@@ -108,7 +131,7 @@ class BaselineEdgeAdapter:
 
     @property
     def metrics_path(self):
-        return self.metrics.path
+        return self.metrics.mirror_path or self.metrics.path
 
     def before_video_start(self, edge) -> None:
         self._edge = edge

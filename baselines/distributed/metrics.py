@@ -15,6 +15,7 @@ class DistributedMetricsWriter:
         run_id: str,
         baseline_method: str,
         edge_id: int,
+        mirror_path: str | Path | None = None,
     ) -> None:
         self.path = (
             Path(results_root)
@@ -24,6 +25,13 @@ class DistributedMetricsWriter:
             / "metrics.jsonl"
         )
         self._writer = JsonlResultWriter(self.path)
+        self.mirror_path = Path(mirror_path) if mirror_path is not None else None
+        self._mirror_writer = (
+            JsonlResultWriter(self.mirror_path) if self.mirror_path is not None else None
+        )
 
     def record(self, event: str, **payload: Any) -> None:
-        self._writer.write({"event": event, "timestamp_ms": now_ms(), **payload})
+        record = {"event": event, "timestamp_ms": now_ms(), **payload}
+        self._writer.write(record)
+        if self._mirror_writer is not None:
+            self._mirror_writer.write(record)

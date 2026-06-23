@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -56,6 +58,17 @@ BASELINE_EVENT_MAP = {
     "training_model_update_applied": "model_update_applied",
     "cloud_scheduled_model_update_applied": "model_update_applied",
     "cloud_scheduled_training_job_adopted": "training_job_submitted",
+}
+STRUCTURED_EVENT_MAP = {
+    "resource_trigger_decision": "trigger_decision",
+    "bundle_built": "bundle_built",
+    "bundle_upload_started": "bundle_upload_started",
+    "bundle_upload_done": "bundle_upload_done",
+    "training_job_submitted": "training_job_submitted",
+    "training_job_started": "training_job_started",
+    "training_job_succeeded": "training_job_succeeded",
+    "model_update_downloaded": "model_update_downloaded",
+    "model_update_applied": "model_update_applied",
 }
 
 
@@ -209,6 +222,60 @@ def _parse_baseline_metric(
                 feature_sample_count=payload.get("feature_sample_count"),
             )
         )
+
+
+def _parse_structured_experiment_event(
+    payload: Mapping[str, Any],
+    *,
+    comparison_id: str,
+    run: Mapping[str, Any],
+    edge_id: int | None,
+    windows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> bool:
+    raw_event = str(payload.get("event", "") or "")
+    mapped = STRUCTURED_EVENT_MAP.get(raw_event)
+    if mapped is None:
+        return False
+    timestamp_ms = optional_int(payload.get("timestamp_ms"))
+    resolved_edge_id = optional_int(payload.get("edge_id"))
+    if resolved_edge_id is None:
+        resolved_edge_id = edge_id
+    if raw_event == "resource_trigger_decision":
+        trigger_decision = first_value(payload, ("trigger_decision", "train_now"))
+        windows.append(
+            empty_row(
+                WINDOW_FIELDS,
+                **canonical_base(
+                    comparison_id=comparison_id,
+                    run=run,
+                    edge_id=resolved_edge_id,
+                ),
+                window_id=payload.get("window_id"),
+                window_start_frame=payload.get("frame_id"),
+                window_end_frame=payload.get("frame_id"),
+                drift_detected=payload.get("drift_detected"),
+                trigger_decision=trigger_decision,
+                trigger_reason=payload.get("trigger_reason"),
+                bandwidth_mbps=payload.get("bandwidth_mbps"),
+                cloud_compute_pressure=payload.get("cloud_compute_pressure"),
+                send_low_conf_features=payload.get("send_low_conf_features"),
+            )
+        )
+        if optional_bool(trigger_decision) is not True:
+            return True
+    events.append(
+        _adaptation_event(
+            mapped,
+            comparison_id=comparison_id,
+            run=run,
+            edge_id=resolved_edge_id,
+            timestamp_ms=timestamp_ms,
+            message=raw_event,
+            payload=payload,
+        )
+    )
+    return True
 
 
 def _parse_accuracy_decision(
@@ -994,7 +1061,36 @@ def _derive_adaptation_latency(
     latency.extend(derived)
 
 
-def normalize(comparison_dir: Path, manifest_path: Path) -> dict[str, Any]:
+def _resolve_manifest_path(comparison_dir: Path, manifest_path: Path | None) -> Path:
+    comparison_dir = comparison_dir.resolve()
+    requested = (
+        manifest_path.resolve()
+        if manifest_path is not None
+        else comparison_dir / "manifest.yaml"
+    )
+    if requested.is_file():
+        return requested
+    index_path = comparison_dir / "experiment_index.json"
+    if not index_path.is_file():
+        raise ManifestError(
+            f"Neither manifest nor experiment index exists: {requested}, {index_path}"
+        )
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"Experiment index is not valid JSON: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ManifestError("Experiment index root must be a mapping")
+    generated = comparison_dir / "manifest.yaml"
+    generated.write_text(
+        yaml.safe_dump(dict(payload), sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return generated
+
+
+def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[str, Any]:
+    manifest_path = _resolve_manifest_path(comparison_dir, manifest_path)
     manifest = load_manifest(manifest_path)
     comparison_dir = comparison_dir.resolve()
     normalized_dir = comparison_dir / "normalized"
@@ -1083,6 +1179,16 @@ def normalize(comparison_dir: Path, manifest_path: Path) -> dict[str, Any]:
                             recognized = True
                             continue
                         if "event" in payload and "timestamp_ms" in payload and edge_id is not None:
+                            if _parse_structured_experiment_event(
+                                payload,
+                                comparison_id=str(manifest["comparison_id"]),
+                                run=run,
+                                edge_id=edge_id,
+                                windows=windows,
+                                events=events,
+                            ):
+                                recognized = True
+                                continue
                             _parse_baseline_metric(
                                 payload,
                                 comparison_id=str(manifest["comparison_id"]),
@@ -1093,6 +1199,15 @@ def normalize(comparison_dir: Path, manifest_path: Path) -> dict[str, Any]:
                                 uploads=uploads,
                             )
                             recognized = True
+                        elif "event" in payload and "timestamp_ms" in payload:
+                            recognized = _parse_structured_experiment_event(
+                                payload,
+                                comparison_id=str(manifest["comparison_id"]),
+                                run=run,
+                                edge_id=edge_id,
+                                windows=windows,
+                                events=events,
+                            ) or recognized
                     if recognized:
                         parsed_files.append(str(path))
         if run["method"] == "pure_edge_local_updating":
@@ -1215,9 +1330,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--manifest",
-        required=True,
         type=Path,
-        help="Manifest YAML describing explicit runs and raw-log paths.",
+        default=None,
+        help=(
+            "Manifest YAML describing explicit runs and raw-log paths. "
+            "Defaults to <comparison_dir>/manifest.yaml, then experiment_index.json."
+        ),
     )
     return parser
 

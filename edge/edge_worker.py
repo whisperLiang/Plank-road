@@ -471,6 +471,25 @@ class AsyncSampleWriter:
 
 
 class EdgeWorker:
+    def _record_experiment_metric(self, event: str, **payload: Any) -> None:
+        writer = getattr(self.config, "experiment_metrics_writer", None)
+        if writer is None:
+            return
+        try:
+            writer.write(
+                {
+                    "event": str(event),
+                    "timestamp_ms": int(time.time() * 1000),
+                    "edge_id": int(self.edge_id),
+                    **payload,
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                "Experiment metric recording failed: {}.",
+                safe_error_summary(exc),
+            )
+
     @staticmethod
     def _resolve_training_poll_interval(config) -> float:
         retrain_cfg = getattr(config, "retrain", None)
@@ -1595,6 +1614,12 @@ class EdgeWorker:
             f"{update.log_prefix} model update diagnostics",
             lambda: {"job_id": update.job_id, "message": update.message},
         )
+        self._record_experiment_metric(
+            "model_update_applied",
+            job_id=update.job_id,
+            model_version=str(update.applied_version),
+            message=update.message,
+        )
 
     def _queue_pending_model_update(self, update: PendingModelUpdate) -> None:
         with self._pending_model_update_lock:
@@ -2014,6 +2039,35 @@ class EdgeWorker:
                 drift_state=drift_state,
                 stats=stats,
             )
+            self._record_experiment_metric(
+                "sample_quality_summary",
+                frame_id=int(job.frame_index),
+                quality_bucket=str(quality.quality_bucket),
+                window_id=str(quality.window_id or ""),
+                in_drift_window=bool(quality.in_drift_window),
+                confidence=confidence,
+            )
+            self._record_experiment_metric(
+                "drift_window_summary",
+                frame_id=int(job.frame_index),
+                window_id=str(quality.window_id or ""),
+                drift_detected=bool(drift_state.drift_detected),
+                low_quality_count=int(stats.low_quality_count),
+                total_samples=int(stats.total_samples),
+            )
+            self._record_experiment_metric(
+                "resource_trigger_decision",
+                frame_id=int(job.frame_index),
+                window_id=str(quality.window_id or ""),
+                train_now=bool(decision.train_now),
+                trigger_decision=bool(decision.train_now),
+                trigger_reason=str(decision.reason),
+                send_low_conf_features=bool(decision.send_low_conf_features),
+                bandwidth_mbps=float(decision.bandwidth_mbps),
+                cloud_compute_pressure=float(decision.compute_pressure),
+                bandwidth_pressure=float(decision.bandwidth_pressure),
+                bundle_cap_bytes=int(decision.bundle_cap_bytes or 0),
+            )
             if decision.train_now and stats.total_samples > 0:
                 self.pending_training_decision = decision
                 self.retrain_flag = True
@@ -2085,6 +2139,12 @@ class EdgeWorker:
                         "Timed out while syncing high-quality samples before "
                         "continual learning upload."
                     )
+                self._record_experiment_metric(
+                    "bundle_upload_started",
+                    model_version=str(self.model_version),
+                    send_low_conf_features=bool(decision.send_low_conf_features),
+                    bundle_cap_bytes=int(decision.bundle_cap_bytes or 0),
+                )
                 accepted, job_id, msg = submit_continual_learning_job(
                     self.config.server_ip,
                     edge_id=self.edge_id,
@@ -2109,6 +2169,21 @@ class EdgeWorker:
                     self._reset_pending_training_cycle()
                     continue
 
+                self._record_experiment_metric(
+                    "bundle_built",
+                    job_id=job_id,
+                    model_version=str(self.model_version),
+                )
+                self._record_experiment_metric(
+                    "bundle_upload_done",
+                    job_id=job_id,
+                    model_version=str(self.model_version),
+                )
+                self._record_experiment_metric(
+                    "training_job_submitted",
+                    job_id=job_id,
+                    model_version=str(self.model_version),
+                )
                 logger.info(
                     "[EdgeCL] training accepted: edge={} model_version={}.",
                     self.edge_id,
@@ -2184,6 +2259,12 @@ class EdgeWorker:
                             lambda: {"job_id": job_id, "status": status},
                         )
                         last_status = status
+                        if status == "RUNNING":
+                            self._record_experiment_metric(
+                                "training_job_started",
+                                job_id=job_id,
+                                status=status,
+                            )
 
                     if status in {"QUEUED", "RUNNING"}:
                         if self._stop_event.wait(self.training_poll_interval_sec):
@@ -2191,6 +2272,11 @@ class EdgeWorker:
                         continue
 
                     if status == "SUCCEEDED":
+                        self._record_experiment_metric(
+                            "training_job_succeeded",
+                            job_id=job_id,
+                            status=status,
+                        )
                         success, model_b64, terminal_message = download_trained_model(
                             self.config.server_ip,
                             edge_id=self.edge_id,
@@ -2201,6 +2287,12 @@ class EdgeWorker:
                             logger.error(
                                 "[EdgeCL] model update download failed: reason={}.",
                                 safe_error_summary(terminal_message),
+                            )
+                        else:
+                            self._record_experiment_metric(
+                                "model_update_downloaded",
+                                job_id=job_id,
+                                model_version=str(self.model_version),
                             )
                         break
 

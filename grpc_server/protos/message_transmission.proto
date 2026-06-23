@@ -32,6 +32,9 @@ service MessageTransmission {
   rpc RequestCloudInference (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
   rpc PollCommand (BaselineCommandRequest) returns (BaselineCommandReply) {}
   rpc DownloadInferenceResult (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
+  // Offline experiment artifact archival. This is not method communication.
+  rpc UploadExperimentResult (UploadExperimentResultRequest)
+      returns (UploadExperimentResultResponse) {}
 }
 
 enum TrainingJobType {
@@ -301,4 +304,31 @@ message BaselineCommandReply {
   bool success = 1;
   string message = 2;
   repeated string command_json = 3;
+}
+
+message ExperimentResultArtifact {
+  string comparison_id = 1;
+  string run_id = 2;
+  string method = 3;
+  int32 edge_id = 4;
+  string relative_path = 5;
+  bytes content = 6;
+  int64 size_bytes = 7;
+  string sha256 = 8;
+  string content_type = 9;
+  bool is_final = 10;
+}
+
+message UploadExperimentResultRequest {
+  string comparison_id = 1;
+  string run_id = 2;
+  string method = 3;
+  int32 edge_id = 4;
+  repeated ExperimentResultArtifact artifacts = 5;
+}
+
+message UploadExperimentResultResponse {
+  bool accepted = 1;
+  string message = 2;
+  repeated string stored_paths = 3;
 }

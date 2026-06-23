@@ -47,3 +47,36 @@ client:
 
     with pytest.raises(ValueError, match="inference_num_threads"):
         load_runtime_config(path)
+
+
+def test_experiment_results_config_is_shared_and_validated(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+experiment_results:
+  comparison_id: comparison-a
+  root_dir: cloud-results
+  local_root_dir: edge-results
+  max_artifact_bytes: 1024
+""",
+        encoding="utf-8",
+    )
+    config = load_runtime_config(path)
+    assert config.client.experiment_results is config.experiment_results
+    assert config.server.experiment_results is config.experiment_results
+    assert config.experiment_results.local_root_dir == "edge-results"
+
+
+def test_experiment_results_upload_requires_edge_summary(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+experiment_results:
+  enabled: true
+  upload_to_cloud: true
+  include_edge_summary: false
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="include_edge_summary"):
+        load_runtime_config(path)

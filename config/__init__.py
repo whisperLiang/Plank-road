@@ -5,12 +5,18 @@ from config.baseline import (
     default_run_id,
     validate_baseline_method,
 )
-from config.runtime import RuntimeConfig, TeacherAnnotationConfig, load_runtime_config
+from config.runtime import (
+    ExperimentResultsConfig,
+    RuntimeConfig,
+    TeacherAnnotationConfig,
+    load_runtime_config,
+)
 
 __all__ = [
     "ALLOWED_BASELINE_METHODS",
     "PLANK_ROAD_BASELINE_ERROR",
     "BaselineIdentity",
+    "ExperimentResultsConfig",
     "RuntimeConfig",
     "TeacherAnnotationConfig",
     "default_run_id",

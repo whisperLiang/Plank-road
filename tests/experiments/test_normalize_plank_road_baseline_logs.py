@@ -107,6 +107,30 @@ def test_manifest_requires_log_timezone(tmp_path: Path) -> None:
         normalize(comparison_dir, manifest_path)
 
 
+def test_normalizer_materializes_manifest_from_experiment_index(tmp_path: Path) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest_path.unlink()
+    (comparison_dir / "experiment_index.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    for path in (
+        "raw_logs/plank_road/cloud/main-r1",
+        "raw_logs/plank_road/edge_1/main-r1",
+        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+    ):
+        (comparison_dir / path).mkdir(parents=True, exist_ok=True)
+
+    report = normalize(comparison_dir)
+
+    assert (comparison_dir / "manifest.yaml").is_file()
+    assert report["structural_zero_runs"] == ["pure-r1"]
+
+
 def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path: Path) -> None:
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
@@ -201,6 +225,72 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
     assert report["structural_zero_runs"] == ["pure-r1"]
     assert report["parse_errors"]
     assert "f1" in report["missing_metrics"]
+
+
+def test_normalizer_does_not_count_false_resource_decision_as_trigger(
+    tmp_path: Path,
+) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    for path in (
+        "raw_logs/plank_road/cloud/main-r1",
+        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+    ):
+        (comparison_dir / path).mkdir(parents=True, exist_ok=True)
+    _write_jsonl(
+        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge_metrics.jsonl",
+        [
+            {
+                "event": "resource_trigger_decision",
+                "timestamp_ms": 1000,
+                "edge_id": 1,
+                "frame_id": 10,
+                "window_id": "window-false",
+                "trigger_decision": False,
+                "trigger_reason": "cloud_busy",
+            },
+            {
+                "event": "resource_trigger_decision",
+                "timestamp_ms": 2000,
+                "edge_id": 1,
+                "frame_id": 20,
+                "window_id": "window-true",
+                "trigger_decision": True,
+                "trigger_reason": "drift",
+            },
+            {
+                "event": "model_update_applied",
+                "timestamp_ms": 3000,
+                "edge_id": 1,
+                "job_id": "job-a",
+                "model_version": "1",
+            },
+        ],
+    )
+
+    normalize(comparison_dir, manifest_path)
+
+    events = read_csv(comparison_dir / "normalized/adaptation_events.csv")
+    trigger_events = [
+        row
+        for row in events
+        if row["run_id"] == "main-r1" and row["event_name"] == "trigger_decision"
+    ]
+    assert len(trigger_events) == 1
+    assert trigger_events[0]["window_id"] == "window-true"
+    windows = read_csv(comparison_dir / "normalized/window_metrics.csv")
+    decisions = {
+        row["window_id"]: row["trigger_decision"]
+        for row in windows
+        if row["run_id"] == "main-r1"
+    }
+    assert decisions["window-false"] == "false"
+    assert decisions["window-true"] == "true"
+    summaries = read_csv(comparison_dir / "normalized/summary.csv")
+    main_summary = next(row for row in summaries if row["run_id"] == "main-r1")
+    assert main_summary["num_trigger_decisions"] == "1"
 
 
 def test_precomputed_accuracy_is_merged_without_detection_count_proxy(tmp_path: Path) -> None:

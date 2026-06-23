@@ -63,6 +63,10 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         baseline_controller=None,
         continual_backend=None,
         log_internal_ids: bool = False,
+        experiment_result_repository=None,
+        experiment_comparison_id: str = "",
+        experiment_method: str = "",
+        experiment_run_id: str = "",
     ):
         self.id = id
         self.workspace_root = workspace_root or "./cache/server_workspace"
@@ -70,6 +74,25 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         self.baseline_controller = baseline_controller
         self.continual_backend = continual_backend or DisabledContinualLearningBackend()
         self.log_internal_ids = bool(log_internal_ids)
+        self.experiment_result_repository = experiment_result_repository
+        self.experiment_comparison_id = str(experiment_comparison_id or "")
+        self.experiment_method = str(experiment_method or "")
+        self.experiment_run_id = str(experiment_run_id or "")
+
+    def _record_experiment_event(self, event: str, **payload) -> None:
+        repository = self.experiment_result_repository
+        if repository is None:
+            return
+        try:
+            repository.record_cloud_event(
+                comparison_id=self.experiment_comparison_id,
+                method=self.experiment_method,
+                run_id=self.experiment_run_id,
+                event=event,
+                **payload,
+            )
+        except Exception as exc:
+            logger.warning("Experiment event recording failed: {}", safe_error_summary(exc))
 
     def _log_failure(self, label: str, exc: BaseException) -> None:
         logger.error("{} failed: {}", label, safe_error_summary(exc))
@@ -142,10 +165,28 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             },
         )
 
-        return self.continual_backend.submit_training_job(request)
+        reply = self.continual_backend.submit_training_job(request)
+        if bool(getattr(reply, "accepted", False)):
+            self._record_experiment_event(
+                "training_job_submitted",
+                edge_id=int(request.edge_id),
+                job_id=str(getattr(reply, "job_id", "") or ""),
+                job_type=int(request.job_type),
+                status=str(getattr(reply, "status", "") or ""),
+            )
+        return reply
 
     def get_training_job_status(self, request, context):
-        return self.continual_backend.get_training_job_status(request)
+        reply = self.continual_backend.get_training_job_status(request)
+        status = str(getattr(reply, "status", "") or "").upper()
+        if bool(getattr(reply, "found", False)) and status in {"RUNNING", "SUCCEEDED"}:
+            self._record_experiment_event(
+                "training_job_started" if status == "RUNNING" else "training_job_succeeded",
+                edge_id=int(request.edge_id),
+                job_id=str(request.job_id),
+                status=status,
+            )
+        return reply
 
     def download_trained_model(self, request, context):
         return self.continual_backend.download_trained_model(request)
@@ -168,7 +209,15 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
 
     def report_edge_model_version(self, request, context):
         del context
-        return self.continual_backend.report_edge_model_version(request)
+        reply = self.continual_backend.report_edge_model_version(request)
+        if bool(getattr(reply, "success", False)):
+            self._record_experiment_event(
+                "model_update_applied_ack",
+                edge_id=int(request.edge_id),
+                model_id=str(request.model_id),
+                model_version=str(request.model_version),
+            )
+        return reply
 
     # ---- Resource-aware CL trigger: cloud resource query ----
 
@@ -201,6 +250,27 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         return message_transmission_pb2.BandwidthProbeReply(
             payload=request.payload,
         )
+
+    def UploadExperimentResult(self, request, context):
+        del context
+        if self.experiment_result_repository is None:
+            return message_transmission_pb2.UploadExperimentResultResponse(
+                accepted=False,
+                message="experiment result repository is not configured",
+            )
+        try:
+            stored = self.experiment_result_repository.store_artifacts(request)
+            return message_transmission_pb2.UploadExperimentResultResponse(
+                accepted=True,
+                message="experiment artifacts stored",
+                stored_paths=[str(path) for path in stored],
+            )
+        except Exception as exc:
+            self._log_failure("UploadExperimentResult", exc)
+            return message_transmission_pb2.UploadExperimentResultResponse(
+                accepted=False,
+                message=str(exc),
+            )
 
     def _baseline_not_configured(self, message: str = "baseline controller is not configured"):
         return message_transmission_pb2.BaselineAck(success=False, message=message)
@@ -235,6 +305,17 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 edge_id=int(request.edge_id),
                 metrics_json=request.metrics_json,
             )
+            metrics = json_loads(request.metrics_json)
+            applied = metrics.get("accuracy_trigger_model_update_applied")
+            if isinstance(applied, dict):
+                self._record_experiment_event(
+                    "model_update_applied_ack",
+                    edge_id=int(request.edge_id),
+                    job_id=str(applied.get("job_id", "") or ""),
+                    result_model_version=str(
+                        applied.get("result_model_version", "") or ""
+                    ),
+                )
             return message_transmission_pb2.BaselineAck(success=True, message="heartbeat recorded")
         except Exception as exc:
             self._log_failure("Heartbeat", exc)
@@ -315,6 +396,15 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
                 baseline_method=request.baseline_method,
                 edge_id=int(request.edge_id),
             )
+            for command in commands:
+                if str(command.get("type", "")) == "baseline_training_job_available":
+                    self._record_experiment_event(
+                        "model_update_command_created",
+                        edge_id=int(request.edge_id),
+                        job_id=str(command.get("job_id", "") or ""),
+                        command_id=str(command.get("command_id", "") or ""),
+                        window_id=str(command.get("window_id", "") or ""),
+                    )
             return message_transmission_pb2.BaselineCommandReply(
                 success=True,
                 message="command found" if commands else "no command",

@@ -22,6 +22,10 @@ from cloud.annotation import (
     TeacherLabelCache,
 )
 from cloud.edge_registry import EdgeRegistry
+from cloud.experiment_result_repository import (
+    CloudExperimentManifestWriter,
+    CloudExperimentResultRepository,
+)
 from cloud.workers.assignment_store import EdgeAssignmentStore
 from cloud.workers.edge_worker_pool import EdgeWorkerPool
 from cloud.workers.gpu_lease_manager import GpuLeaseManager, LeaseRequest
@@ -29,6 +33,7 @@ from cloud.workers.lease_service import GpuLeaseService
 from cloud.workers.mps_runtime import ensure_mps_runtime
 from cloud.workers.worker_client import GpuLeaseHttpClient
 from cloud.workers.worker_protocol import JsonRpcError
+from common.experiment_results import PLANK_ROAD_METHOD, cloud_run_dir
 from common.logging_sanitizer import log_diagnostic_debug
 from config import default_run_id, load_runtime_config, validate_baseline_method
 from grpc_server import message_transmission_pb2_grpc
@@ -74,6 +79,9 @@ class CloudServer:
         self.gpu_lease_manager = None
         self.gpu_lease_service = None
         self.grpc_server = None
+        self.experiment_result_repository = None
+        self.experiment_manifest_writer = None
+        self._experiment_log_sink = None
         self._closing = False
         self.log_internal_ids = False
         if self.mode == "baseline":
@@ -137,6 +145,47 @@ class CloudServer:
                     "runtime path is no longer supported."
                 )
             self._init_edge_affine_backend(edge_affine)
+            self.baseline_method = PLANK_ROAD_METHOD
+
+        experiment_config = getattr(config, "experiment_results", None)
+        if experiment_config is not None and bool(getattr(experiment_config, "enabled", False)):
+            comparison_id = str(getattr(experiment_config, "comparison_id", "") or "")
+            root_dir = str(getattr(experiment_config, "root_dir", "results/experiments"))
+            method = (
+                str(getattr(self, "baseline_method", "") or "")
+                if self.mode == "baseline"
+                else PLANK_ROAD_METHOD
+            )
+            self.experiment_manifest_writer = CloudExperimentManifestWriter(
+                root_dir=root_dir,
+                comparison_id=comparison_id,
+                student_model=str(getattr(config, "edge_model_name", "") or ""),
+                teacher_model=str(getattr(config, "golden", "") or ""),
+            )
+            self.experiment_result_repository = CloudExperimentResultRepository(
+                root_dir,
+                max_artifact_bytes=int(
+                    getattr(experiment_config, "max_artifact_bytes", 268435456)
+                ),
+                manifest_writer=self.experiment_manifest_writer,
+            )
+            self.experiment_manifest_writer.upsert_cloud_runtime(
+                method=method,
+                run_id=self.run_id,
+            )
+            if (
+                bool(getattr(experiment_config, "include_runtime_logs", False))
+                and method != "pure_edge_local_updating"
+            ):
+                cloud_log = (
+                    cloud_run_dir(root_dir, comparison_id, method, self.run_id) / "cloud.log"
+                )
+                cloud_log.parent.mkdir(parents=True, exist_ok=True)
+                self._experiment_log_sink = logger.add(
+                    str(cloud_log),
+                    level="INFO",
+                    rotation="500 MB",
+                )
 
     def _init_edge_affine_backend(self, edge_affine) -> None:
         run_id = str(getattr(edge_affine, "run_id", "") or "").strip()
@@ -228,6 +277,16 @@ class CloudServer:
             getattr(self, "baseline_method", ""),
             getattr(self, "run_id", ""),
         )
+        experiment_config = getattr(self.config, "experiment_results", None)
+        if experiment_config is not None:
+            logger.info(
+                "experiment results: comparison_id={} root={} mode={} method={} run_id={}",
+                getattr(experiment_config, "comparison_id", ""),
+                getattr(experiment_config, "root_dir", ""),
+                self.mode,
+                getattr(self, "baseline_method", PLANK_ROAD_METHOD),
+                getattr(self, "run_id", ""),
+            )
         log_diagnostic_debug(
             self.log_internal_ids,
             "cloud server startup paths",
@@ -246,6 +305,15 @@ class CloudServer:
                 baseline_controller=self.baseline_controller,
                 continual_backend=self.continual_backend,
                 log_internal_ids=self.log_internal_ids,
+                experiment_result_repository=self.experiment_result_repository,
+                experiment_comparison_id=str(
+                    getattr(experiment_config, "comparison_id", "") or ""
+                ),
+                experiment_method=str(
+                    getattr(self, "baseline_method", PLANK_ROAD_METHOD)
+                    or PLANK_ROAD_METHOD
+                ),
+                experiment_run_id=str(getattr(self, "run_id", "") or ""),
             ),
             server,
         )
@@ -257,6 +325,18 @@ class CloudServer:
             os.getpid(),
             getattr(self.config, "edge_model_name", "unknown"),
         )
+        if self.experiment_result_repository is not None:
+            self.experiment_result_repository.record_cloud_event(
+                comparison_id=str(getattr(experiment_config, "comparison_id", "") or ""),
+                method=str(
+                    getattr(self, "baseline_method", PLANK_ROAD_METHOD)
+                    or PLANK_ROAD_METHOD
+                ),
+                run_id=str(getattr(self, "run_id", "") or ""),
+                event="cloud_server_started",
+                mode=self.mode,
+                baseline_method=str(getattr(self, "baseline_method", "") or ""),
+            )
         try:
             server.wait_for_termination()
         finally:
@@ -283,6 +363,9 @@ class CloudServer:
         training_job_manager = getattr(self, "training_job_manager", None)
         if training_job_manager is not None:
             training_job_manager.close()
+        if self._experiment_log_sink is not None:
+            logger.remove(self._experiment_log_sink)
+            self._experiment_log_sink = None
 
 
 def _build_baseline_teacher_annotator(
@@ -503,6 +586,12 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
     parser.add_argument("--run_id", default=None, help="baseline run id")
+    parser.add_argument("--comparison_id", default=None, help="experiment comparison id")
+    parser.add_argument(
+        "--experiment_results_root",
+        default=None,
+        help="override cloud experiment result repository root",
+    )
     parser.add_argument(
         "--edge_affine_workers_enabled",
         type=str,
@@ -517,6 +606,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = load_runtime_config(args.yaml_path)
     server_config = config.server
+    if args.comparison_id is not None:
+        config.experiment_results.comparison_id = args.comparison_id
+    if args.experiment_results_root is not None:
+        config.experiment_results.root_dir = args.experiment_results_root
     if args.listen_address is not None:
         server_config.listen_address = args.listen_address
     if args.workspace_root is not None:

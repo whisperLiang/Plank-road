@@ -1,5 +1,6 @@
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -12,11 +13,18 @@ import cv2
 from loguru import logger
 
 from baselines.runtime import BaselineEdgeAdapter
+from common.experiment_results import (
+    PLANK_ROAD_METHOD,
+    ExperimentJsonlWriter,
+    collect_edge_artifacts,
+    edge_run_dir,
+)
 from common.logging_sanitizer import log_diagnostic_debug, summarize_path
-from config import load_runtime_config
+from config import default_run_id, load_runtime_config
 from config.baseline import validate_baseline_method
 from edge.box_motion import compensate_boxes_between_frames
 from edge.edge_worker import EdgeWorker
+from edge.experiment_result_uploader import ExperimentResultUploader
 from edge.info import TASK_STATE
 from edge.task import Task
 from model_management.utils import draw_detection
@@ -295,8 +303,9 @@ def _run_video_loop(
     *,
     headless: bool = False,
     baseline_adapter: BaselineEdgeAdapter | None = None,
-) -> None:
-    result_path = Path("log") / "client" / "latest_inference_results.jsonl"
+    result_path: Path,
+    experiment_metrics: ExperimentJsonlWriter | None = None,
+) -> int:
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
     window_name = f"Edge {config.edge_id} Inference"
@@ -326,6 +335,7 @@ def _run_video_loop(
     if baseline_adapter is not None:
         baseline_adapter.before_video_start(edge)
 
+    sampled_frame_count = 0
     with result_path.open("w", encoding="utf-8") as result_file:
         flush_every_n_frames = max(
             1,
@@ -375,6 +385,7 @@ def _run_video_loop(
                 sampled = index % config.interval == 0
 
                 if sampled:
+                    sampled_frame_count += 1
                     start_time = time.time()
                     task = Task(config.edge_id, index, frame, start_time, frame.shape)
                     edge.submit_task(task)
@@ -418,6 +429,21 @@ def _run_video_loop(
                         unflushed_count=unflushed_result_count,
                         flush_every_n_frames=flush_every_n_frames,
                     )
+                    if experiment_metrics is not None:
+                        experiment_metrics.write(
+                            {
+                                "event": "frame_inference",
+                                "timestamp_ms": int(time.time() * 1000),
+                                "frame_id": int(index),
+                                "latency_ms": latency_ms,
+                                "result_source": str(task.result_source or ""),
+                                "model_version": str(
+                                    getattr(edge, "model_version", "0") or "0"
+                                ),
+                                "num_detections": len(detection_boxes),
+                                "timing_ms": dict(getattr(task, "timing_ms", {}) or {}),
+                            }
+                        )
                     if baseline_adapter is not None:
                         baseline_adapter.on_sampled_inference_result(
                             frame=frame,
@@ -518,10 +544,113 @@ def _run_video_loop(
         result_file.flush()
 
     logger.info("Saved local inference results: records_file={}.", result_path.name)
+    compatibility_path = Path("log") / "client" / "latest_inference_results.jsonl"
+    compatibility_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(result_path, compatibility_path)
     log_diagnostic_debug(
         config,
         "edge inference result path",
         lambda: {"result_path": str(result_path)},
+    )
+    return sampled_frame_count
+
+
+def _preserve_experiment_results_cache(config, preserve: set[str]) -> bool:
+    experiment_results = getattr(config, "experiment_results", None)
+    if experiment_results is None:
+        return True
+    cache_root = Path(str(config.retrain.cache_path)).resolve()
+    local_root = Path(
+        str(getattr(experiment_results, "local_root_dir", "cache/experiment_results"))
+    ).resolve()
+    try:
+        relative = local_root.relative_to(cache_root)
+    except ValueError:
+        return True
+    if not relative.parts:
+        logger.warning(
+            "Experiment result local_root_dir equals retrain cache_path; "
+            "skipping cache cleanup to preserve archived runs."
+        )
+        return False
+    if relative.parts:
+        preserve.add(relative.parts[0])
+    return True
+
+
+def _write_edge_summary(
+    path: Path,
+    *,
+    config,
+    comparison_id: str,
+    method: str,
+    run_id: str,
+    sampled_frame_count: int,
+) -> None:
+    payload = {
+        "comparison_id": comparison_id,
+        "run_id": run_id,
+        "method": method,
+        "edge_id": int(config.edge_id),
+        "video_source": _effective_video_source(config),
+        "student_model": str(getattr(config, "lightweight", "") or ""),
+        "teacher_model": str(
+            getattr(config, "experiment_teacher_model", "") or ""
+        ),
+        "sampled_frame_count": int(sampled_frame_count),
+        "offline_result_archival": method == "pure_edge_local_updating",
+        "archive_upload_excluded_from_communication_cost": True,
+        "completed_at_ms": int(time.time() * 1000),
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_trigger_manifest_from_metrics(run_dir: Path) -> None:
+    metrics_path = run_dir / "edge_metrics.jsonl"
+    if not metrics_path.is_file():
+        return
+    decisions = []
+    with metrics_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("event") != "resource_trigger_decision":
+                continue
+            decisions.append(
+                {
+                    key: payload.get(key)
+                    for key in (
+                        "timestamp_ms",
+                        "frame_id",
+                        "window_id",
+                        "trigger_decision",
+                        "trigger_reason",
+                        "send_low_conf_features",
+                        "bandwidth_mbps",
+                        "bundle_cap_bytes",
+                    )
+                }
+            )
+    if not decisions:
+        return
+    (run_dir / "trigger_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "experiment-trigger-manifest.v1",
+                "decision_count": len(decisions),
+                "decisions": decisions,
+            },
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
 
 
@@ -568,11 +697,30 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
-    parser.add_argument("--run_id", default=None, help="baseline run id")
+    parser.add_argument("--run_id", default=None, help="experiment run id")
+    parser.add_argument("--comparison_id", default=None, help="experiment comparison id")
+    parser.add_argument(
+        "--experiment_results_root",
+        default=None,
+        help="override edge local experiment result staging root",
+    )
+    parser.add_argument(
+        "--disable_experiment_result_upload",
+        action="store_true",
+        help="disable shutdown experiment artifact upload without disabling local results",
+    )
     args = parser.parse_args()
 
     runtime_config = load_runtime_config(args.yaml_path)
     config = runtime_config.client
+    config.experiment_teacher_model = str(
+        getattr(runtime_config.server, "golden", "") or ""
+    )
+    experiment_results = runtime_config.experiment_results
+    if args.comparison_id is not None:
+        experiment_results.comparison_id = args.comparison_id
+    if args.experiment_results_root is not None:
+        experiment_results.local_root_dir = args.experiment_results_root
 
     # Apply per-edge CLI overrides for multi-edge deployment
     if args.edge_id is not None:
@@ -590,6 +738,7 @@ if __name__ == "__main__":
         config.server_ip = args.server_ip
 
     baseline_method = None
+    baseline_run_id = None
     if args.mode == "baseline":
         baseline_method = args.baseline_method or runtime_config.baseline.method
         try:
@@ -597,7 +746,6 @@ if __name__ == "__main__":
         except ValueError as exc:
             parser.error(str(exc))
 
-    baseline_run_id = None
     if args.mode == "baseline":
         try:
             baseline_run_id = _resolve_baseline_run_id(
@@ -606,6 +754,8 @@ if __name__ == "__main__":
             )
         except ValueError as exc:
             parser.error(str(exc))
+        if baseline_run_id is None:
+            baseline_run_id = default_run_id(baseline_method)
 
     require_server_ip = args.mode == "main" or _baseline_requires_cloud(baseline_method)
     try:
@@ -649,11 +799,50 @@ if __name__ == "__main__":
             rotation="500 MB",
         )
 
+    method = baseline_method if args.mode == "baseline" else PLANK_ROAD_METHOD
+    run_id = (
+        str(baseline_run_id)
+        if args.mode == "baseline"
+        else str(args.run_id or default_run_id(PLANK_ROAD_METHOD))
+    )
+    comparison_id = str(experiment_results.comparison_id)
     preserve_cache_entries = {"pytest_tmp"}
     if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
         preserve_cache_entries.add("fixed_split_plan.json")
+    clear_retrain_cache = _preserve_experiment_results_cache(
+        config,
+        preserve_cache_entries,
+    )
     _log_startup_config(config)
-    clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
+    if clear_retrain_cache:
+        clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
+
+    run_dir = edge_run_dir(
+        str(experiment_results.local_root_dir),
+        comparison_id,
+        method,
+        int(config.edge_id),
+        run_id,
+    )
+    if bool(experiment_results.enabled):
+        run_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    result_path = run_dir / "latest_inference_results.jsonl"
+    experiment_metrics = (
+        ExperimentJsonlWriter(run_dir / "edge_metrics.jsonl")
+        if method == PLANK_ROAD_METHOD and bool(experiment_results.enabled)
+        else None
+    )
+    config.experiment_metrics_writer = experiment_metrics
+    experiment_log_sink = None
+    if bool(experiment_results.include_runtime_logs):
+        experiment_log_sink = logger.add(
+            str(run_dir / "edge.log"),
+            level="INFO",
+            rotation="500 MB",
+        )
+
     edge = EdgeWorker(config)
     if args.mode == "baseline":
         baseline_adapter = BaselineEdgeAdapter(
@@ -666,12 +855,15 @@ if __name__ == "__main__":
             video_path=_effective_video_source(config),
         )
 
+    sampled_frame_count = 0
     try:
-        _run_video_loop(
+        sampled_frame_count = _run_video_loop(
             config,
             edge,
             headless=args.headless,
             baseline_adapter=baseline_adapter,
+            result_path=result_path,
+            experiment_metrics=experiment_metrics,
         )
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
@@ -679,5 +871,53 @@ if __name__ == "__main__":
         if baseline_adapter is not None:
             baseline_adapter.close()
         edge.close()
+        try:
+            if bool(experiment_results.include_trigger_manifest):
+                _write_trigger_manifest_from_metrics(run_dir)
+            if bool(experiment_results.include_edge_summary):
+                _write_edge_summary(
+                    run_dir / "edge_summary.json",
+                    config=config,
+                    comparison_id=comparison_id,
+                    method=method,
+                    run_id=run_id,
+                    sampled_frame_count=sampled_frame_count,
+                )
+            baseline_metrics_path = (
+                Path(baseline_adapter.metrics_path)
+                if baseline_adapter is not None
+                else (run_dir / "edge_metrics.jsonl")
+            )
+            if bool(experiment_results.enabled):
+                artifacts = collect_edge_artifacts(
+                    method=method,
+                    run_id=run_id,
+                    edge_id=int(config.edge_id),
+                    comparison_id=comparison_id,
+                    config=experiment_results,
+                    inference_result_path=result_path,
+                    baseline_metrics_path=baseline_metrics_path,
+                    cache_path=Path(config.retrain.cache_path),
+                )
+                uploader = ExperimentResultUploader(
+                    str(config.server_ip),
+                    enabled=bool(
+                        experiment_results.upload_to_cloud
+                        and experiment_results.upload_on_shutdown
+                        and not args.disable_experiment_result_upload
+                    ),
+                )
+                uploader.upload_run_artifacts(
+                    comparison_id=comparison_id,
+                    run_id=run_id,
+                    method=method,
+                    edge_id=int(config.edge_id),
+                    artifacts=artifacts,
+                )
+        except Exception as exc:
+            logger.warning("Experiment result archival failed during shutdown: {}", exc)
+        finally:
+            if experiment_log_sink is not None:
+                logger.remove(experiment_log_sink)
         if not args.headless:
             cv2.destroyAllWindows()

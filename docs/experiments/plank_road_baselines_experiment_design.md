@@ -154,3 +154,16 @@ result visually precise but scientifically false.
 
 The exact inputs and skip rules are listed in
 `plank_road_baselines_plot_spec.md`.
+## Centralized result repository
+
+Each formal comparison uses one `comparison_id`, and each method repetition
+uses a globally unique `run_id`. Edge processes stage immutable run artifacts
+under `experiment_results.local_root_dir`; the cloud archives them under
+`experiment_results.root_dir/{comparison_id}` and updates `manifest.yaml`.
+Scenario names are derived from the video filename stem.
+
+The archive RPC is deliberately separate from Plank-road sample bundles and
+baseline frame/window RPCs. It runs only during shutdown, never populates the
+sample pool, never invokes the teacher or training pipeline, and is excluded
+from normalized method communication costs. In particular, Pure Edge may
+archive JSON/JSONL result files without ceasing to be a pure-edge method.

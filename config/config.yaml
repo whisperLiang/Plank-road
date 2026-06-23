@@ -7,6 +7,20 @@ sample_pool:
  compact_threshold: 0.3
  enable_timing_logs: false
 
+experiment_results:
+ enabled: true
+ comparison_id: exp_plank_road_vs_baselines_001
+ root_dir: results/experiments
+ local_root_dir: cache/experiment_results
+ upload_to_cloud: true
+ upload_on_shutdown: true
+ include_inference_results: true
+ include_baseline_metrics: true
+ include_edge_summary: true
+ include_trigger_manifest: true
+ include_runtime_logs: false
+ max_artifact_bytes: 268435456
+
 baseline:
  enabled: false
  method: accuracy_trigger_cloud_retraining
