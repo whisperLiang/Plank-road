@@ -322,7 +322,7 @@ server:
   # Cloud-side teacher threshold used only for GT annotation during
   # continual learning. Lower values recover more small/far objects but
   # may introduce noisier pseudo-GT.
-  teacher_annotation_threshold: 0.6
+  teacher_annotation_threshold: 0.4
   teacher_annotation:
    async_enabled: true
    cache_enabled: true

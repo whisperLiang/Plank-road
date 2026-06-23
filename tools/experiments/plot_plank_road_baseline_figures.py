@@ -170,6 +170,28 @@ def _accuracy_label(
     return "Mean mAP" if average else "mAP"
 
 
+def _nearest_frame_for_time(
+    timestamped_frames: list[tuple[int, float]],
+    event_time_ms: float | None,
+) -> int | None:
+    if event_time_ms is None or not timestamped_frames:
+        return None
+    return min(timestamped_frames, key=lambda item: abs(item[1] - event_time_ms))[0]
+
+
+def _resolved_event_frame(
+    event: Mapping[str, Any],
+    timestamped_frames: list[tuple[int, float]],
+) -> int | None:
+    frame_id = optional_int(event.get("frame_id"))
+    if frame_id is not None:
+        return frame_id
+    return _nearest_frame_for_time(
+        timestamped_frames,
+        optional_float(event.get("event_time_ms")),
+    )
+
+
 def _plot_fig1(
     frame_rows: list[dict[str, str]],
     event_rows: list[dict[str, str]],
@@ -228,6 +250,39 @@ def _plot_fig1(
                 and (frame_id := optional_int(row.get("frame_id"))) is not None
                 and (timestamp := optional_float(row.get("timestamp_ms"))) is not None
             ]
+            method_events = [
+                row
+                for row in event_rows
+                if row.get("scenario_name") == scenario and row.get("method") == method
+            ]
+            label_prefix = METHOD_LABELS.get(method, method)
+            color = METHOD_COLORS.get(method)
+            used_event_labels: set[str] = set()
+
+            def once(label: str) -> str | None:
+                if label in used_event_labels:
+                    return None
+                used_event_labels.add(label)
+                return label
+
+            for event_name, linestyle, alpha, label_suffix in (
+                ("trigger_decision", ":", 0.45, "training trigger"),
+            ):
+                for event in method_events:
+                    if event.get("event_name") != event_name:
+                        continue
+                    frame_id = _resolved_event_frame(event, timestamped_frames)
+                    if frame_id is None:
+                        continue
+                    axis.axvline(
+                        frame_id,
+                        color=color,
+                        alpha=alpha,
+                        linestyle=linestyle,
+                        linewidth=1.3,
+                        label=once(f"{label_prefix} {label_suffix}"),
+                    )
+
             for event in event_rows:
                 if (
                     event.get("scenario_name") != scenario
@@ -239,10 +294,19 @@ def _plot_fig1(
                 event_time = optional_float(event.get("event_time_ms"))
                 if event_time is not None and timestamped_frames:
                     resolved_updates.append(
-                        min(timestamped_frames, key=lambda item: abs(item[1] - event_time))[0]
+                        _nearest_frame_for_time(timestamped_frames, event_time)
                     )
             for update in sorted(set(resolved_updates)):
-                axis.axvline(update, color=METHOD_COLORS.get(method), alpha=0.25, linestyle="--")
+                if update is None:
+                    continue
+                axis.axvline(
+                    update,
+                    color=color,
+                    alpha=0.28,
+                    linestyle="--",
+                    linewidth=1.5,
+                    label=once(f"{label_prefix} model update"),
+                )
         title = (
             "Teacher-supervised F1 over time"
             if metric == "f1" and accuracy_definition == "teacher_supervised_f1"
@@ -648,22 +712,52 @@ def _plot_fig8(
     accuracy_field = _summary_accuracy_field(aggregated)
     if accuracy_field is None:
         return [], "accuracy data missing", []
-    methods = _method_order(row.get("method", "") for row in aggregated)
-    if not all(method in methods for method in METHODS):
-        return [], "all three current methods are required", []
+    available_methods = _method_order(row.get("method", "") for row in aggregated)
+
+    def complete_methods(latency_field: str) -> list[str]:
+        result = []
+        for method in available_methods:
+            subset = [row for row in aggregated if row.get("method") == method]
+            if all(
+                mean(row.get(field) for row in subset) is not None
+                for field in (accuracy_field, latency_field, "mean_upload_bytes")
+            ):
+                result.append(method)
+        return result
+
+    latency_field = "mean_adaptation_ms"
+    latency_title = "Average adaptation latency (ms)"
+    methods = complete_methods(latency_field)
+    partial: list[str] = []
+    if len(methods) < 2:
+        fallback_methods = complete_methods("mean_latency_ms")
+        if len(fallback_methods) >= 2:
+            methods = fallback_methods
+            latency_field = "mean_latency_ms"
+            latency_title = "Average inference latency (ms)"
+            partial.append(
+                "adaptation latency incomplete; used mean inference latency for fig8"
+            )
+    if len(methods) < 2:
+        return [], "at least two methods require accuracy, latency, and upload data", partial
+    excluded = [method for method in available_methods if method not in methods]
+    if excluded:
+        partial.append(
+            "excluded incomplete method(s) from fig8: "
+            + ", ".join(METHOD_LABELS.get(method, method) for method in excluded)
+        )
+
     values = {}
     for method in methods:
         subset = [row for row in aggregated if row.get("method") == method]
         values[method] = (
             mean(row.get(accuracy_field) for row in subset),
-            mean(row.get("mean_adaptation_ms") for row in subset),
+            mean(row.get(latency_field) for row in subset),
             mean(row.get("mean_upload_bytes") for row in subset),
         )
-    if any(value is None for method_values in values.values() for value in method_values):
-        return [], "all three methods require accuracy, adaptation latency, and upload data", []
     fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.8), constrained_layout=True)
-    labels = [METHOD_LABELS[method] for method in methods]
-    colors = [METHOD_COLORS[method] for method in methods]
+    labels = [METHOD_LABELS.get(method, method) for method in methods]
+    colors = [METHOD_COLORS.get(method) for method in methods]
     panels = (
         (
             0,
@@ -673,7 +767,7 @@ def _plot_fig8(
                 average=True,
             ),
         ),
-        (1, "Average adaptation latency (ms)"),
+        (1, latency_title),
         (2, "Average upload bytes"),
     )
     for axis, (index, title) in zip(axes, panels):
@@ -681,7 +775,7 @@ def _plot_fig8(
         axis.set_title(title)
         axis.tick_params(axis="x", rotation=20)
         axis.grid(axis="y", alpha=0.25)
-    return _save(fig, figure_dir, "fig8_component_ablation_style_summary"), None, []
+    return _save(fig, figure_dir, "fig8_component_ablation_style_summary"), None, partial
 
 
 def plot_figures(
