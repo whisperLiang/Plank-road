@@ -291,6 +291,22 @@ def _resolve_baseline_run_id(baseline_method: str, run_id: str | None) -> str | 
     return value or None
 
 
+def _prepare_experiment_run_dir(run_dir: Path, *, enabled: bool) -> None:
+    if not enabled:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return
+    if run_dir.exists() or run_dir.is_symlink():
+        logger.warning(
+            "Experiment result run path already exists; overwriting local results: {}",
+            run_dir,
+        )
+        if run_dir.is_dir() and not run_dir.is_symlink():
+            shutil.rmtree(run_dir)
+        else:
+            run_dir.unlink()
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+
 def _log_startup_config(config) -> None:
     logger.info(
         "edge client effective startup config: edge_id={}, server_ip={}, "
@@ -841,10 +857,10 @@ if __name__ == "__main__":
         int(config.edge_id),
         run_id,
     )
-    if bool(experiment_results.enabled):
-        run_dir.mkdir(parents=True, exist_ok=False)
-    else:
-        run_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_experiment_run_dir(
+        run_dir,
+        enabled=bool(experiment_results.enabled),
+    )
     result_path = run_dir / "latest_inference_results.jsonl"
     experiment_metrics = (
         ExperimentJsonlWriter(run_dir / "edge_metrics.jsonl")

@@ -16,6 +16,7 @@ from config.baseline import PLANK_ROAD_BASELINE_ERROR
 from config.runtime import RuntimeConfig, load_runtime_config
 from edge_client import (
     _configure_baseline_client_runtime,
+    _prepare_experiment_run_dir,
     _resolve_baseline_run_id,
     _validate_startup_config,
 )
@@ -391,6 +392,24 @@ def test_cloud_backed_baselines_require_explicit_run_id() -> None:
         _resolve_baseline_run_id("accuracy_trigger_cloud_retraining", None)
     assert _resolve_baseline_run_id("accuracy_trigger_cloud_retraining", "run-a") == "run-a"
     assert _resolve_baseline_run_id("pure_edge_local_updating", None) is None
+
+
+def test_prepare_experiment_run_dir_overwrites_existing_enabled_run(tmp_path) -> None:
+    run_dir = tmp_path / "comparison" / "accuracy_trigger_cloud_retraining" / "edge_1" / "run-a"
+    run_dir.mkdir(parents=True)
+    (run_dir / "metrics.jsonl").write_text("old\n", encoding="utf-8")
+    nested = run_dir / "nested"
+    nested.mkdir()
+    (nested / "edge_summary.json").write_text("old\n", encoding="utf-8")
+
+    _prepare_experiment_run_dir(run_dir, enabled=True)
+
+    assert run_dir.is_dir()
+    assert list(run_dir.iterdir()) == []
+
+    (run_dir / "keep.jsonl").write_text("kept\n", encoding="utf-8")
+    _prepare_experiment_run_dir(run_dir, enabled=False)
+    assert (run_dir / "keep.jsonl").read_text(encoding="utf-8") == "kept\n"
 
 
 def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_path) -> None:
