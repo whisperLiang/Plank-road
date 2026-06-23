@@ -56,5 +56,28 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
     assert "cloud" in runs["main-r1"]["raw_logs"]
     assert "cloud" in runs["accuracy-r1"]["raw_logs"]
     assert result["scenarios"][0]["notes"] == "keep me"
+    assert result["scenarios"][0]["video_slug"] == "road"
     assert result["custom"] == {"owner": "user"}
     assert writer.index_path.is_file()
+
+
+def test_manifest_writer_redacts_remote_video_credentials(tmp_path: Path) -> None:
+    writer = CloudExperimentManifestWriter(
+        root_dir=str(tmp_path),
+        comparison_id="remote-comparison",
+        student_model="student",
+        teacher_model="teacher",
+        log_timezone="UTC",
+    )
+    writer.upsert_edge_run(
+        method="plank_road",
+        run_id="remote-r1",
+        edge_id=1,
+        summary={
+            "video_source": "https://user:secret@example.com/live?token=abc",
+            "video_slug": "north_gate",
+        },
+    )
+
+    result = yaml.safe_load(writer.manifest_path.read_text(encoding="utf-8"))
+    assert result["scenarios"][0]["video_source"] == "https://example.com/live"

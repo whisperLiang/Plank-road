@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any
 
+ArtifactContent = bytes | str | Path
+
 PLANK_ROAD_METHOD = "plank_road"
 PURE_EDGE_METHOD = "pure_edge_local_updating"
 ACCURACY_TRIGGER_METHOD = "accuracy_trigger_cloud_retraining"
@@ -175,6 +177,14 @@ def sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def content_type_for_path(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".json", ".jsonl"}:
@@ -183,6 +193,8 @@ def content_type_for_path(path: Path) -> str:
         return "text/plain"
     if suffix in {".yaml", ".yml"}:
         return "application/yaml"
+    if suffix == ".zip":
+        return "application/zip"
     return "application/octet-stream"
 
 
@@ -196,7 +208,7 @@ def collect_edge_artifacts(
     inference_result_path: Path,
     baseline_metrics_path: Path | None,
     cache_path: Path | None,
-) -> dict[str, bytes | str]:
+) -> dict[str, ArtifactContent]:
     resolved_method = sanitize_method(method)
     resolved_run_id = sanitize_component(run_id)
     resolved_comparison_id = sanitize_component(comparison_id)
@@ -239,8 +251,11 @@ def collect_edge_artifacts(
         candidates.append(("trigger_manifest.json", trigger_path, True))
     if bool(getattr(config, "include_runtime_logs", False)):
         candidates.append(("edge.log", run_dir / "edge.log", True))
+    candidates.extend(
+        (path.name, path, True) for path in sorted(run_dir.glob("replay_frames_*.zip"))
+    )
 
-    artifacts: dict[str, bytes | str] = {}
+    artifacts: dict[str, ArtifactContent] = {}
     seen: set[str] = set()
     for relative_path, source, enabled in candidates:
         if not enabled or relative_path in seen:
@@ -259,16 +274,17 @@ def collect_edge_artifacts(
                 message=f"artifact exceeds max_artifact_bytes={max_bytes}",
             )
             continue
-        content = source.read_bytes()
-        digest = sha256_bytes(content)
+        stream_from_path = source.suffix.lower() == ".zip"
+        content = None if stream_from_path else source.read_bytes()
+        digest = sha256_file(source) if stream_from_path else sha256_bytes(content or b"")
         manifest.add_file(
             relative_path=relative_path,
             source_path=source,
-            size_bytes=len(content),
+            size_bytes=size,
             sha256=digest,
             content_type=content_type_for_path(source),
         )
-        artifacts[relative_path] = content
+        artifacts[relative_path] = source if stream_from_path else (content or b"")
 
     manifest_path = run_dir / "uploaded_artifacts_manifest.json"
     manifest.write(manifest_path)

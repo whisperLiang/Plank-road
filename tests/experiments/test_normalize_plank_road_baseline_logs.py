@@ -205,6 +205,7 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
 
     frames = read_csv(comparison_dir / "normalized/frame_metrics.csv")
     assert frames[0]["method"] == "plank_road"
+    assert frames[0]["video_slug"] == "road"
     assert frames[0]["f1"] == ""
     assert frames[0]["map"] == ""
     assert frames[0]["timing_inference_ms"] == "8.0"
@@ -225,6 +226,7 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
     assert report["structural_zero_runs"] == ["pure-r1"]
     assert report["parse_errors"]
     assert "f1" in report["missing_metrics"]
+    assert report["scenarios"][0]["video_slug"] == "road"
 
 
 def test_normalizer_does_not_count_false_resource_decision_as_trigger(

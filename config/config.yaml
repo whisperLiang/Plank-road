@@ -9,7 +9,7 @@ sample_pool:
 
 experiment_results:
  enabled: true
- comparison_id: exp_plank_road_vs_baselines_001
+ comparison_id: exp_road_plankroad_vs_baselines_001
  root_dir: results/experiments
  local_root_dir: cache/experiment_results
  upload_to_cloud: true
@@ -44,12 +44,19 @@ client:
  source:
   video_path: ./video_data/road.mp4
   max_count: 1000
+  scenario_name: ""
+  video_slug: ""
   rtsp:
    flag: False
    account: your account
    password: your password
    ip_address: you camera ip
    channel: 1
+  teacher_replay:
+   save_sampled_frames: false
+   jpeg_quality: 90
+   queue_size: 64
+   archive_chunk_max_bytes: 67108864
  # the frame interval
  interval: 1
  # the difference feature (pixel, edge, area, corner).

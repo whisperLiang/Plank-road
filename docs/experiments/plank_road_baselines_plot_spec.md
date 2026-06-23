@@ -4,6 +4,10 @@ All labels and legends are English. PDF and PNG are emitted together. A
 missing required metric skips the figure and records the reason in
 `plot_report.json`; no placeholder series are drawn.
 
+When `normalization_report.json` declares
+`accuracy_definition: teacher_supervised_f1`, F1 axes and panels use the
+explicit labels “Teacher-supervised F1” and “Average teacher-supervised F1”.
+
 | Figure | Compared methods | Purpose | Input CSV | X-axis | Y-axis | Grouping | Missing-data behavior | Expected insight |
 |---|---|---|---|---|---|---|---|---|
 | Fig. 1 Accuracy Over Time | Three current methods | Show recovery after drift | `frame_metrics.csv`, `adaptation_events.csv` | Frame ID | F1 or mAP | Scenario facets; method lines | Skip if neither real F1 nor mAP exists | Plank-road restores accuracy promptly |

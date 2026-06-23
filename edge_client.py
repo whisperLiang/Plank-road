@@ -3,6 +3,7 @@ import json
 import shutil
 import time
 from pathlib import Path
+from typing import Any, Mapping
 
 if __name__ == "__main__":
     from common.cuda_visibility import configure_default_cuda_visible_devices
@@ -20,12 +21,18 @@ from common.experiment_results import (
     edge_run_dir,
 )
 from common.logging_sanitizer import log_diagnostic_debug, summarize_path
+from common.video_identity import (
+    VideoIdentity,
+    is_remote_video_source,
+    resolve_video_identity,
+)
 from config import default_run_id, load_runtime_config
 from config.baseline import validate_baseline_method
 from edge.box_motion import compensate_boxes_between_frames
 from edge.edge_worker import EdgeWorker
 from edge.experiment_result_uploader import ExperimentResultUploader
 from edge.info import TASK_STATE
+from edge.replay_frame_archiver import ReplayFrameArchiver
 from edge.task import Task
 from model_management.utils import draw_detection
 from tools.file_op import clear_folder
@@ -46,6 +53,7 @@ def _write_task_result(
     *,
     model_name: str = "",
     model_version: str = "",
+    metadata: Mapping[str, Any] | None = None,
 ) -> None:
     detection_boxes, detection_class, detection_score = task.get_result()
     latency_ms = None
@@ -55,8 +63,15 @@ def _write_task_result(
         str(name): float(value)
         for name, value in dict(getattr(task, "timing_ms", {}) or {}).items()
     }
+    extra = dict(metadata or {})
+    timestamp_ms = extra.pop("timestamp_ms", None)
+    if timestamp_ms is None:
+        timestamp_ms = getattr(task, "capture_timestamp_ms", None)
+    if timestamp_ms is None:
+        timestamp_ms = int(float(task.start_time) * 1000)
     payload = {
         "frame_index": int(task.frame_index),
+        "timestamp_ms": int(timestamp_ms),
         "start_time": float(task.start_time),
         "end_time": float(task.end_time) if task.end_time is not None else None,
         "latency_ms": latency_ms,
@@ -72,6 +87,7 @@ def _write_task_result(
             "scores": [float(score) for score in detection_score],
         },
     }
+    payload.update(extra)
     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
@@ -83,12 +99,14 @@ def _write_buffered_task_result(
     flush_every_n_frames: int,
     model_name: str = "",
     model_version: str = "",
+    metadata: Mapping[str, Any] | None = None,
 ) -> int:
     _write_task_result(
         handle,
         task,
         model_name=model_name,
         model_version=model_version,
+        metadata=metadata,
     )
     pending = int(unflushed_count) + 1
     if pending >= max(1, int(flush_every_n_frames)):
@@ -224,13 +242,16 @@ def _validate_startup_config(config, *, require_server_ip: bool = True) -> None:
 
     video_path = str(getattr(config.source, "video_path", "") or "").strip()
     if _rtsp_enabled(config):
+        _resolve_video_identity(config)
         return
     if not video_path:
         raise ValueError("client.source.video_path is required unless RTSP is enabled")
     if _is_uri_or_camera_source(video_path):
+        _resolve_video_identity(config)
         return
     if not Path(video_path).expanduser().exists():
         raise FileNotFoundError(f"video_path does not exist: {video_path}")
+    _resolve_video_identity(config)
 
 
 def _effective_video_source(config) -> str:
@@ -238,6 +259,18 @@ def _effective_video_source(config) -> str:
         rtsp = config.source.rtsp
         return f"rtsp://{getattr(rtsp, 'ip_address', '')}/channel/{getattr(rtsp, 'channel', '')}"
     return str(getattr(config.source, "video_path", "") or "").strip()
+
+
+def _resolve_video_identity(config, *, remote_frames_saved: bool | None = None) -> VideoIdentity:
+    replay_config = getattr(config.source, "teacher_replay", None)
+    if remote_frames_saved is None:
+        remote_frames_saved = bool(getattr(replay_config, "save_sampled_frames", False))
+    return resolve_video_identity(
+        _effective_video_source(config),
+        configured_video_slug=getattr(config.source, "video_slug", ""),
+        configured_scenario_name=getattr(config.source, "scenario_name", ""),
+        remote_frames_saved=bool(remote_frames_saved),
+    )
 
 
 def _split_learning_status(config) -> str:
@@ -336,12 +369,17 @@ def _run_video_loop(
     baseline_adapter: BaselineEdgeAdapter | None = None,
     result_path: Path,
     experiment_metrics: ExperimentJsonlWriter | None = None,
+    method: str = "",
+    run_id: str = "",
+    video_identity: VideoIdentity | None = None,
+    replay_archiver: ReplayFrameArchiver | None = None,
 ) -> int:
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
     window_name = f"Edge {config.edge_id} Inference"
     window_created = False
     display_class_names, display_label_schema = _resolve_display_label_config(config, edge)
+    identity = video_identity or _resolve_video_identity(config)
     if display_class_names:
         logger.info(
             "Using {} configured detection class name(s) for display.",
@@ -419,6 +457,7 @@ def _run_video_loop(
                     sampled_frame_count += 1
                     start_time = time.time()
                     task = Task(config.edge_id, index, frame, start_time, frame.shape)
+                    task.capture_timestamp_ms = int(start_time * 1000)
                     edge.submit_task(task)
                     waited = task.wait_until_done(timeout=float(config.wait_thresh) + 5.0)
                     if not waited:
@@ -454,6 +493,15 @@ def _run_video_loop(
                         "frame_index": index,
                         "frame": frame.copy(),
                     }
+                    replay_frame_path = None
+                    frame_replayable = bool(identity.frame_replayable)
+                    if is_remote_video_source(identity.video_source):
+                        replay_frame_path = (
+                            replay_archiver.enqueue(index, frame)
+                            if replay_archiver is not None
+                            else None
+                        )
+                        frame_replayable = replay_frame_path is not None
                     unflushed_result_count = _write_buffered_task_result(
                         result_file,
                         task,
@@ -461,6 +509,18 @@ def _run_video_loop(
                         flush_every_n_frames=flush_every_n_frames,
                         model_name=str(getattr(config, "lightweight", "") or ""),
                         model_version=str(getattr(edge, "model_version", "0") or "0"),
+                        metadata={
+                            "video_source": identity.video_source,
+                            "video_slug": identity.video_slug,
+                            "scenario_name": identity.scenario_name,
+                            "edge_id": int(config.edge_id),
+                            "run_id": str(run_id),
+                            "method": str(method),
+                            "frame_replayable": bool(frame_replayable),
+                            "replay_frame_path": replay_frame_path or "",
+                            "label_schema": str(display_label_schema or ""),
+                            "class_names": list(display_class_names or []),
+                        },
                     )
                     if experiment_metrics is not None:
                         experiment_metrics.write(
@@ -619,13 +679,26 @@ def _write_edge_summary(
     method: str,
     run_id: str,
     sampled_frame_count: int,
+    video_identity: VideoIdentity | None = None,
+    replay_snapshot_failures: Mapping[int, str] | None = None,
+    edge: EdgeWorker | None = None,
 ) -> None:
+    identity = video_identity or _resolve_video_identity(config)
+    class_names, label_schema = _resolve_display_label_config(
+        config,
+        edge,
+    )
     payload = {
         "comparison_id": comparison_id,
         "run_id": run_id,
         "method": method,
         "edge_id": int(config.edge_id),
-        "video_source": _effective_video_source(config),
+        "video_source": identity.video_source,
+        "video_slug": identity.video_slug,
+        "scenario_name": identity.scenario_name,
+        "frame_replayable": bool(identity.frame_replayable),
+        "label_schema": str(label_schema or ""),
+        "class_names": list(class_names or []),
         "student_model": str(getattr(config, "lightweight", "") or ""),
         "teacher_model": str(
             getattr(config, "experiment_teacher_model", "") or ""
@@ -634,6 +707,9 @@ def _write_edge_summary(
         "offline_result_archival": method == "pure_edge_local_updating",
         "archive_upload_excluded_from_communication_cost": True,
         "completed_at_ms": int(time.time() * 1000),
+        "replay_snapshot_failures": {
+            str(key): value for key, value in sorted(dict(replay_snapshot_failures or {}).items())
+        },
     }
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
@@ -839,6 +915,7 @@ if __name__ == "__main__":
         else str(args.run_id or default_run_id(PLANK_ROAD_METHOD))
     )
     comparison_id = str(experiment_results.comparison_id)
+    video_identity = _resolve_video_identity(config)
     preserve_cache_entries = {"pytest_tmp"}
     if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
         preserve_cache_entries.add("fixed_split_plan.json")
@@ -888,6 +965,17 @@ if __name__ == "__main__":
             video_path=_effective_video_source(config),
         )
 
+    replay_config = getattr(config.source, "teacher_replay", None)
+    replay_archiver = ReplayFrameArchiver(
+        run_dir,
+        enabled=bool(
+            is_remote_video_source(video_identity.video_source)
+            and getattr(replay_config, "save_sampled_frames", False)
+        ),
+        jpeg_quality=int(getattr(replay_config, "jpeg_quality", 90)),
+        queue_size=int(getattr(replay_config, "queue_size", 64)),
+        archive_chunk_max_bytes=int(getattr(replay_config, "archive_chunk_max_bytes", 67108864)),
+    )
     sampled_frame_count = 0
     try:
         sampled_frame_count = _run_video_loop(
@@ -897,10 +985,18 @@ if __name__ == "__main__":
             baseline_adapter=baseline_adapter,
             result_path=result_path,
             experiment_metrics=experiment_metrics,
+            method=method,
+            run_id=run_id,
+            video_identity=video_identity,
+            replay_archiver=replay_archiver,
         )
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
     finally:
+        try:
+            replay_archiver.close()
+        except Exception as exc:
+            logger.warning("Teacher replay snapshot archival failed: {}", exc)
         if baseline_adapter is not None:
             baseline_adapter.close()
         edge.close()
@@ -915,6 +1011,9 @@ if __name__ == "__main__":
                     method=method,
                     run_id=run_id,
                     sampled_frame_count=sampled_frame_count,
+                    video_identity=video_identity,
+                    replay_snapshot_failures=replay_archiver.failures,
+                    edge=edge,
                 )
             baseline_metrics_path = (
                 Path(baseline_adapter.metrics_path)

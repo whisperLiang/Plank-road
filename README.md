@@ -73,12 +73,15 @@ python edge_client.py --headless --mode main \
   --run_id main-road-r1 --comparison_id comparison-001
 ```
 
-After all three methods for a scenario have uploaded their results:
+After all three methods for a scenario have uploaded their results, run the
+video-aware offline teacher replay evaluation:
 
 ```shell
-python tools/experiments/evaluate_plank_road_baseline_accuracy.py \
+python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
   --comparison_dir results/experiments/comparison-001 \
-  --ground_truth path/to/road_ground_truth.json
+  --teacher_model rtdetr_x \
+  --device cuda:0 \
+  --update_manifest
 python tools/experiments/normalize_plank_road_baseline_logs.py \
   --comparison_dir results/experiments/comparison-001
 python tools/experiments/plot_plank_road_baseline_figures.py \
@@ -90,6 +93,11 @@ Experiment artifact upload is offline archival traffic. It does not enter
 sample ingestion, teacher annotation, retraining, or `upload_breakdown.csv`.
 Pure Edge therefore remains a zero-cloud-communication method for experiment
 metrics even though its result files can be archived after shutdown.
+
+Teacher replay is also offline evaluation work. `Teacher-supervised F1` uses
+teacher pseudo labels, not human ground truth, and is excluded from all online
+latency and communication metrics. See
+[the teacher replay guide](./docs/experiments/teacher_replay_accuracy.md).
 
 Generated gRPC files are committed under [grpc_server/](./grpc_server/). Rebuild them only after changing [grpc_server/protos/message_transmission.proto](./grpc_server/protos/message_transmission.proto):
 
@@ -415,10 +423,10 @@ results/experiments/{comparison_id}/
   figures/
 ```
 
-Normalize existing logs:
+Build teacher-supervised F1 and normalize existing logs:
 
 ```shell
-python tools/experiments/evaluate_plank_road_baseline_accuracy.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml --ground_truth path/to/ground_truth.json --output results/experiments/{comparison_id}/accuracy.jsonl
+python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest
 python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml
 ```
 
@@ -460,6 +468,12 @@ computes class-aware per-frame F1 with an explicit IoU threshold and leaves mAP
 empty. Frames without annotations are reported and omitted rather than assigned
 a value. On success it updates the manifest and experiment index to reference
 the generated accuracy file and annotation provenance.
+
+`evaluate_plank_road_baseline_teacher_accuracy.py` is the pseudo-label
+alternative. It reopens the logged fixed-video frame, or an explicitly
+archived RTSP/camera JPEG, runs the teacher offline, maps teacher classes into
+the student label space, and writes Teacher-supervised F1. This metric is not
+ground-truth accuracy, and teacher replay time is not an online system cost.
 
 Future runs also record measured application-payload bytes for compressed raw
 shards, feature shards, prediction/protocol metadata, and model downloads.

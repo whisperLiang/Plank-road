@@ -1,4 +1,4 @@
-comparison_id: exp_plank_road_vs_baselines_001
+comparison_id: exp_road_plankroad_vs_baselines_001
 
 # Loguru text logs do not contain an offset. Declare the timezone used by the
 # machines that produced those logs so text timestamps can be correlated with
@@ -20,6 +20,7 @@ edge_ids:
 scenarios:
   - name: road_normal_to_drift
     video_source: ./video_data/road.mp4
+    video_slug: road
     notes: ""
 
 # Every run has an explicit identity and explicit raw-log locations. Paths are
@@ -76,11 +77,11 @@ runtime:
     baseline_method: accuracy_trigger_cloud_retraining
 
 metrics:
-  # Generated before normalization by evaluate_plank_road_baseline_accuracy.py.
-  accuracy_file: accuracy.jsonl
-  # Real annotation provenance used by the explicit accuracy evaluator.
-  ground_truth_file: path/to/ground_truth.json
+  # Generated before normalization by the human-label or teacher replay evaluator.
+  accuracy_file: null
+  ground_truth_file: null
   allow_missing_accuracy: true
+  accuracy_definition: ""
 
 notes:
   - Ekya is not included in this comparison yet.

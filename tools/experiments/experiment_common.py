@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from common.video_identity import resolve_video_identity
+
 METHODS = (
     "plank_road",
     "pure_edge_local_updating",
@@ -40,6 +42,7 @@ FRAME_FIELDS = [
     "method",
     "edge_id",
     "scenario_name",
+    "video_slug",
     "video_source",
     "frame_id",
     "timestamp_ms",
@@ -65,6 +68,7 @@ WINDOW_FIELDS = [
     "method",
     "edge_id",
     "scenario_name",
+    "video_slug",
     "window_id",
     "window_start_frame",
     "window_end_frame",
@@ -94,6 +98,7 @@ ADAPTATION_FIELDS = [
     "method",
     "edge_id",
     "scenario_name",
+    "video_slug",
     "event_name",
     "event_time_ms",
     "frame_id",
@@ -109,6 +114,7 @@ UPLOAD_FIELDS = [
     "method",
     "edge_id",
     "scenario_name",
+    "video_slug",
     "window_id",
     "raw_frame_bytes",
     "feature_bytes",
@@ -127,6 +133,7 @@ LATENCY_FIELDS = [
     "method",
     "edge_id",
     "scenario_name",
+    "video_slug",
     "window_id",
     "upload_ms",
     "teacher_annotation_ms",
@@ -142,6 +149,7 @@ RESOURCE_FIELDS = [
     "method",
     "edge_id",
     "scenario_name",
+    "video_slug",
     "timestamp_ms",
     "gpu_utilization",
     "memory_utilization",
@@ -156,6 +164,7 @@ SUMMARY_FIELDS = [
     "run_id",
     "method",
     "scenario_name",
+    "video_slug",
     "edge_count",
     "student_model",
     "teacher_model",
@@ -287,18 +296,40 @@ def load_manifest(path: Path) -> dict[str, Any]:
     if not isinstance(scenarios, list) or not scenarios:
         raise ManifestError("scenarios must be a non-empty list")
     scenario_names: set[str] = set()
+    video_slugs: set[str] = set()
+    normalized_scenarios: list[dict[str, Any]] = []
     for scenario in scenarios:
         if not isinstance(scenario, Mapping):
             raise ManifestError("every scenario must be a mapping")
         name = str(scenario.get("name", "") or "").strip()
         if not name or name in scenario_names:
             raise ManifestError("scenario names must be non-empty and unique")
+        video_source = str(scenario.get("video_source", "") or "").strip()
+        try:
+            identity = resolve_video_identity(
+                video_source,
+                configured_video_slug=scenario.get("video_slug", ""),
+                configured_scenario_name=name,
+            )
+        except ValueError as exc:
+            raise ManifestError(str(exc)) from exc
+        normalized = dict(scenario)
+        normalized["name"] = name
+        normalized["video_source"] = video_source
+        normalized["video_slug"] = identity.video_slug
+        if identity.video_slug in video_slugs:
+            raise ManifestError("scenario video_slug values must be unique")
+        normalized_scenarios.append(normalized)
         scenario_names.add(name)
+        video_slugs.add(identity.video_slug)
+    manifest["scenarios"] = normalized_scenarios
+    scenario_slugs = {str(item["name"]): str(item["video_slug"]) for item in normalized_scenarios}
     runs = manifest.get("runs")
     if not isinstance(runs, list) or not runs:
         raise ManifestError("runs must be a non-empty list")
     run_ids: set[str] = set()
     seen_method_scenarios: set[tuple[str, str]] = set()
+    normalized_runs: list[dict[str, Any]] = []
     for run in runs:
         if not isinstance(run, Mapping):
             raise ManifestError("every run must be a mapping")
@@ -353,6 +384,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise ManifestError(f"run {run_id} raw_logs.edges is missing edge(s): {missing_edges}")
         if method != "pure_edge_local_updating" and not raw_logs.get("cloud"):
             raise ManifestError(f"run {run_id} must define raw_logs.cloud")
+        normalized_run = dict(run)
+        normalized_run["video_slug"] = scenario_slugs[scenario_name]
+        normalized_runs.append(normalized_run)
         run_ids.add(run_id)
         seen_method_scenarios.add((method, scenario_name))
     missing_method_scenarios = [
@@ -366,6 +400,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
             "runs must cover every method/scenario pair; missing: "
             + ", ".join(missing_method_scenarios)
         )
+    manifest["runs"] = normalized_runs
     return manifest
 
 
@@ -564,6 +599,7 @@ def canonical_base(
         "method": str(run["method"]),
         "edge_id": "" if edge_id is None else int(edge_id),
         "scenario_name": str(run["scenario_name"]),
+        "video_slug": str(run.get("video_slug", "")),
     }
 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +23,7 @@ from common.experiment_results import (
     sanitize_relative_path,
     sha256_bytes,
 )
+from common.video_identity import redact_video_source, resolve_video_identity, video_slug
 
 
 def detect_log_timezone() -> str:
@@ -39,9 +39,7 @@ def detect_log_timezone() -> str:
 
 
 def scenario_name_from_video_source(video_source: str) -> str:
-    stem = Path(str(video_source or "")).stem.strip()
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
-    return normalized or "unknown_scenario"
+    return video_slug(Path(str(video_source or "")).stem) or "unknown_scenario"
 
 
 class CloudExperimentManifestWriter:
@@ -105,12 +103,27 @@ class CloudExperimentManifestWriter:
         with self._lock:
             manifest = self._load()
             video_source = str(summary.get("video_source", "") or "")
+            configured_scenario = str(summary.get("scenario_name", "") or "")
+            configured_slug = str(summary.get("video_slug", "") or "")
             runs = list(manifest.get("runs") or [])
             existing_run = next(
                 (item for item in runs if str(item.get("run_id", "")) == run_id),
                 None,
             )
-            scenario_name = scenario_name_from_video_source(video_source) if video_source else ""
+            scenario_name = video_slug(configured_scenario)
+            resolved_video_slug = video_slug(configured_slug)
+            if video_source:
+                identity = resolve_video_identity(
+                    video_source,
+                    configured_scenario_name=scenario_name,
+                    configured_video_slug=resolved_video_slug,
+                )
+                video_source = identity.video_source
+                scenario_name = identity.scenario_name
+                resolved_video_slug = identity.video_slug
+            elif scenario_name or resolved_video_slug:
+                scenario_name = scenario_name or resolved_video_slug
+                resolved_video_slug = resolved_video_slug or scenario_name
             if (
                 not video_source
                 and existing_run is not None
@@ -127,11 +140,19 @@ class CloudExperimentManifestWriter:
                     scenario = {
                         "name": scenario_name,
                         "video_source": video_source,
+                        "video_slug": resolved_video_slug,
                         "notes": "",
                     }
                     scenarios.append(scenario)
-                elif video_source and not str(scenario.get("video_source", "") or ""):
-                    scenario["video_source"] = video_source
+                elif video_source:
+                    existing_source = str(scenario.get("video_source", "") or "")
+                    scenario["video_source"] = (
+                        redact_video_source(existing_source)
+                        if existing_source
+                        else video_source
+                    )
+                if resolved_video_slug and not str(scenario.get("video_slug", "") or ""):
+                    scenario["video_slug"] = resolved_video_slug
             manifest["scenarios"] = scenarios
 
             run = existing_run

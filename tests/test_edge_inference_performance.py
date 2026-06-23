@@ -74,6 +74,17 @@ def test_write_task_result_includes_latency_and_timing() -> None:
         task,
         model_name="rfdetr_nano",
         model_version="2",
+        metadata={
+            "video_source": "video_data/road.mp4",
+            "video_slug": "road",
+            "scenario_name": "road",
+            "edge_id": 1,
+            "run_id": "plank_road_road_001",
+            "method": "plank_road",
+            "frame_replayable": True,
+            "label_schema": "zero_based",
+            "class_names": ["car"],
+        },
     )
 
     payload = json.loads(handle.getvalue())
@@ -85,6 +96,10 @@ def test_write_task_result_includes_latency_and_timing() -> None:
     }
     assert payload["model_name"] == "rfdetr_nano"
     assert payload["model_version"] == "2"
+    assert payload["timestamp_ms"] == 10000
+    assert payload["video_slug"] == "road"
+    assert payload["run_id"] == "plank_road_road_001"
+    assert payload["frame_replayable"] is True
     assert payload["result"] == {
         "labels": [5],
         "boxes": [[1, 2, 3, 4]],

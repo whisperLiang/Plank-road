@@ -147,6 +147,48 @@ def test_uploader_failure_is_reported_without_raising(monkeypatch) -> None:
     )
 
 
+def test_uploader_reads_path_backed_artifact_when_it_is_sent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    requests = []
+
+    class _Stub:
+        def __init__(self, channel) -> None:
+            del channel
+
+        def UploadExperimentResult(self, request, timeout):
+            del timeout
+            requests.append(request)
+            return message_transmission_pb2.UploadExperimentResultResponse(
+                accepted=True,
+                message="ok",
+            )
+
+    monkeypatch.setattr(
+        experiment_result_uploader.grpc,
+        "insecure_channel",
+        lambda *args, **kwargs: _Channel(),
+    )
+    monkeypatch.setattr(
+        experiment_result_uploader.message_transmission_pb2_grpc,
+        "MessageTransmissionStub",
+        _Stub,
+    )
+    archive = tmp_path / "replay_frames_0001.zip"
+    archive.write_bytes(b"zip-content")
+
+    uploader = ExperimentResultUploader("cloud:50051", enabled=True)
+    assert uploader.upload_run_artifacts(
+        comparison_id="comparison",
+        run_id="run-1",
+        method="plank_road",
+        edge_id=1,
+        artifacts={archive.name: archive},
+    )
+    assert requests[0].artifacts[0].content == b"zip-content"
+
+
 def test_collect_artifacts_records_oversized_file_without_uploading_it(
     tmp_path: Path,
 ) -> None:

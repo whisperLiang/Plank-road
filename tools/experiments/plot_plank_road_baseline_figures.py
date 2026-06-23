@@ -157,10 +157,24 @@ def _summary_accuracy_field(rows: list[Mapping[str, Any]]) -> str | None:
     return best if coverage[best][0] > 0 else None
 
 
+def _accuracy_label(
+    metric: str,
+    accuracy_definition: str,
+    *,
+    average: bool = False,
+) -> str:
+    if metric in {"f1", "mean_f1"} and accuracy_definition == "teacher_supervised_f1":
+        return "Average teacher-supervised F1" if average else "Teacher-supervised F1"
+    if metric in {"f1", "mean_f1"}:
+        return "Mean F1" if average else "F1"
+    return "Mean mAP" if average else "mAP"
+
+
 def _plot_fig1(
     frame_rows: list[dict[str, str]],
     event_rows: list[dict[str, str]],
     figure_dir: Path,
+    accuracy_definition: str = "",
 ) -> tuple[list[str], str | None, list[str]]:
     metric = _accuracy_field(frame_rows)
     if metric is None:
@@ -229,9 +243,14 @@ def _plot_fig1(
                     )
             for update in sorted(set(resolved_updates)):
                 axis.axvline(update, color=METHOD_COLORS.get(method), alpha=0.25, linestyle="--")
-        axis.set_title(scenario)
+        title = (
+            "Teacher-supervised F1 over time"
+            if metric == "f1" and accuracy_definition == "teacher_supervised_f1"
+            else "Accuracy over time"
+        )
+        axis.set_title(title if len(scenarios) == 1 else f"{title}: {scenario}")
         axis.set_xlabel("Frame ID")
-        axis.set_ylabel("F1" if metric == "f1" else "mAP")
+        axis.set_ylabel(_accuracy_label(metric, accuracy_definition))
         axis.grid(alpha=0.25)
         axis.legend()
     return _save(fig, figure_dir, "fig1_accuracy_over_time"), None, []
@@ -301,6 +320,7 @@ def _plot_fig2(
 def _plot_fig3(
     summary_rows: list[dict[str, str]],
     figure_dir: Path,
+    accuracy_definition: str = "",
 ) -> tuple[list[str], str | None, list[str]]:
     aggregated = _aggregate_summary(summary_rows)
     accuracy_field = _summary_accuracy_field(aggregated)
@@ -333,7 +353,13 @@ def _plot_fig3(
                 linewidths=0.4,
             )
             plotted += 1
-        axis.set_ylabel("Mean F1" if accuracy_field == "mean_f1" else "Mean mAP")
+        axis.set_ylabel(
+            _accuracy_label(
+                accuracy_field,
+                accuracy_definition,
+                average=True,
+            )
+        )
         axis.set_title("Accuracy-latency-upload tradeoff")
     else:
         partial.append("accuracy unavailable; generated latency-upload tradeoff")
@@ -462,6 +488,7 @@ def _stacked_method_bars(
 def _plot_fig6(
     summary_rows: list[dict[str, str]],
     figure_dir: Path,
+    accuracy_definition: str = "",
 ) -> tuple[list[str], str | None, list[str]]:
     aggregated = _aggregate_summary(summary_rows)
     metric = next(
@@ -510,7 +537,11 @@ def _plot_fig6(
             plotted += 1
         axis.set_title(scenario)
         axis.set_xlabel("Edge count")
-        axis.set_ylabel(metric.replace("_", " ").title())
+        axis.set_ylabel(
+            _accuracy_label(metric, accuracy_definition, average=True)
+            if metric in {"mean_f1", "mean_map"}
+            else metric.replace("_", " ").title()
+        )
         axis.grid(alpha=0.25)
         handles, labels = axis.get_legend_handles_labels()
         if handles:
@@ -611,6 +642,7 @@ def _plot_fig7(
 def _plot_fig8(
     summary_rows: list[dict[str, str]],
     figure_dir: Path,
+    accuracy_definition: str = "",
 ) -> tuple[list[str], str | None, list[str]]:
     aggregated = _aggregate_summary(summary_rows)
     accuracy_field = _summary_accuracy_field(aggregated)
@@ -633,7 +665,14 @@ def _plot_fig8(
     labels = [METHOD_LABELS[method] for method in methods]
     colors = [METHOD_COLORS[method] for method in methods]
     panels = (
-        (0, "Average accuracy"),
+        (
+            0,
+            _accuracy_label(
+                accuracy_field,
+                accuracy_definition,
+                average=True,
+            ),
+        ),
         (1, "Average adaptation latency (ms)"),
         (2, "Average upload bytes"),
     )
@@ -652,6 +691,16 @@ def plot_figures(
     external_ekya_summary: Path | None = None,
     include_external_ekya: bool = False,
 ) -> dict[str, Any]:
+    normalization_report_path = normalized_dir / "normalization_report.json"
+    normalization_report: dict[str, Any] = {}
+    if normalization_report_path.is_file():
+        try:
+            loaded = json.loads(normalization_report_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, Mapping):
+                normalization_report = dict(loaded)
+        except json.JSONDecodeError:
+            normalization_report = {}
+    accuracy_definition = str(normalization_report.get("accuracy_definition", "") or "")
     inputs = {
         name: read_csv(normalized_dir / name)
         for name in (
@@ -682,10 +731,11 @@ def plot_figures(
             inputs["frame_metrics.csv"],
             inputs["adaptation_events.csv"],
             figure_dir,
+            accuracy_definition,
         ),
         "fig2_adaptation_timeline": lambda: _plot_fig2(inputs["adaptation_events.csv"], figure_dir),
         "fig3_accuracy_latency_upload_tradeoff": lambda: _plot_fig3(
-            inputs["summary.csv"], figure_dir
+            inputs["summary.csv"], figure_dir, accuracy_definition
         ),
         "fig4_upload_breakdown": lambda: _stacked_method_bars(
             inputs["upload_breakdown.csv"],
@@ -715,14 +765,20 @@ def plot_figures(
             figure_dir=figure_dir,
             stem="fig5_latency_breakdown",
         ),
-        "fig6_multi_edge_scalability": lambda: _plot_fig6(inputs["summary.csv"], figure_dir),
+        "fig6_multi_edge_scalability": lambda: _plot_fig6(
+            inputs["summary.csv"],
+            figure_dir,
+            accuracy_definition,
+        ),
         "fig7_resource_timeline": lambda: _plot_fig7(
             inputs["resource_timeline.csv"],
             inputs["adaptation_events.csv"],
             figure_dir,
         ),
         "fig8_component_ablation_style_summary": lambda: _plot_fig8(
-            inputs["summary.csv"], figure_dir
+            inputs["summary.csv"],
+            figure_dir,
+            accuracy_definition,
         ),
     }
     generated: dict[str, list[str]] = {}
@@ -748,6 +804,23 @@ def plot_figures(
         "skipped_figures": skipped,
         "partial_data": partial,
         "ekya_status": ekya_status,
+        "accuracy_definition": accuracy_definition,
+        "accuracy_labels": {
+            "f1": _accuracy_label("f1", accuracy_definition),
+            "mean_f1": _accuracy_label(
+                "mean_f1",
+                accuracy_definition,
+                average=True,
+            ),
+        },
+        "video_slugs": sorted(
+            {
+                str(row.get("video_slug", ""))
+                for rows in inputs.values()
+                for row in rows
+                if str(row.get("video_slug", ""))
+            }
+        ),
         "notes": [
             "No interpolation, random data, or placeholder curves are generated.",
             "Missing breakdown components are omitted and reported as partial data.",

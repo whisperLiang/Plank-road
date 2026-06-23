@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from pathlib import Path
 
 import grpc
 from loguru import logger
 
 from common.experiment_results import (
+    ArtifactContent,
     content_type_for_path,
     sanitize_component,
     sanitize_method,
@@ -35,7 +37,7 @@ class ExperimentResultUploader:
         run_id: str,
         method: str,
         edge_id: int,
-        artifacts: Mapping[str, bytes | str],
+        artifacts: Mapping[str, ArtifactContent],
     ) -> bool:
         if not self.enabled:
             return False
@@ -63,11 +65,12 @@ class ExperimentResultUploader:
             stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
             for index, (relative_path, raw_content) in enumerate(upload_items):
                 safe_relative_path = sanitize_relative_path(relative_path)
-                content = (
-                    raw_content.encode("utf-8")
-                    if isinstance(raw_content, str)
-                    else bytes(raw_content)
-                )
+                if isinstance(raw_content, Path):
+                    content = raw_content.read_bytes()
+                elif isinstance(raw_content, str):
+                    content = raw_content.encode("utf-8")
+                else:
+                    content = bytes(raw_content)
                 artifact = message_transmission_pb2.ExperimentResultArtifact(
                     comparison_id=resolved_comparison_id,
                     run_id=resolved_run_id,
@@ -113,10 +116,15 @@ class ExperimentResultUploader:
             channel.close()
 
 
-def _should_upload_client_manifest(content: bytes | str | None) -> bool:
+def _should_upload_client_manifest(content: ArtifactContent | None) -> bool:
     if content is None:
         return False
-    raw = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+    if isinstance(content, Path):
+        raw = content.read_bytes()
+    elif isinstance(content, str):
+        raw = content.encode("utf-8")
+    else:
+        raw = bytes(content)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):

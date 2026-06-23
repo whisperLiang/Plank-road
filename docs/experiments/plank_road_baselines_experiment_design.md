@@ -99,11 +99,12 @@ Relevant raw outputs include:
 Normalize and plot:
 
 ```bash
-python tools/experiments/evaluate_plank_road_baseline_accuracy.py \
+python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
   --comparison_dir results/experiments/{comparison_id} \
   --manifest results/experiments/{comparison_id}/manifest.yaml \
-  --ground_truth path/to/ground_truth.json \
-  --output results/experiments/{comparison_id}/accuracy.jsonl
+  --teacher_model rtdetr_x \
+  --device cuda:0 \
+  --update_manifest
 
 python tools/experiments/normalize_plank_road_baseline_logs.py \
   --comparison_dir results/experiments/{comparison_id} \
@@ -136,6 +137,13 @@ explicit mapping from COCO `category_id` values to model label indices. The
 command records its IoU and score thresholds in a report next to the generated
 accuracy file, then updates `metrics.accuracy_file` and
 `metrics.ground_truth_file`.
+
+The video-aware
+`evaluate_plank_road_baseline_teacher_accuracy.py` command instead replays
+fixed-video frames or archived remote-source JPEGs and computes
+Teacher-supervised F1 from teacher pseudo labels. It records
+`accuracy_definition: teacher_supervised_f1`, leaves mAP empty, and keeps all
+teacher replay time outside online latency and communication measurements.
 
 Experiment metrics record compressed application-payload bytes for raw shards,
 feature shards, metadata/archive overhead, and model downloads. Adaptation

@@ -113,7 +113,11 @@ def _frame_row(
     row = empty_row(
         FRAME_FIELDS,
         **canonical_base(comparison_id=comparison_id, run=run, edge_id=edge_id),
-        video_source=str(scenario.get("video_source", "") or ""),
+        video_source=str(
+            payload.get("video_source")
+            or scenario.get("video_source")
+            or ""
+        ),
         frame_id=frame_id,
         timestamp_ms=timestamp_ms,
         model_name=first_value(payload, ("model_name", "model_id")),
@@ -1432,6 +1436,16 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
         "parse_errors": errors,
         "conflicts": conflicts,
         "structural_zero_runs": structural_zero_runs,
+        "accuracy_definition": str(metrics.get("accuracy_definition", "") or ""),
+        "accuracy_file": (str(accuracy_path) if accuracy_path is not None else ""),
+        "scenarios": [
+            {
+                "scenario_name": str(item.get("name", "")),
+                "video_slug": str(item.get("video_slug", "")),
+                "video_source": str(item.get("video_source", "")),
+            }
+            for item in list(manifest.get("scenarios") or [])
+        ],
     }
     normalized_dir.mkdir(parents=True, exist_ok=True)
     (normalized_dir / "normalization_report.json").write_text(

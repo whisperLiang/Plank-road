@@ -149,6 +149,15 @@ def test_plotter_generates_all_figures_for_available_data(tmp_path: Path) -> Non
     normalized = tmp_path / "normalized"
     figures = tmp_path / "figures"
     _write_complete_normalized(normalized)
+    (normalized / "normalization_report.json").write_text(
+        json.dumps(
+            {
+                "accuracy_definition": "teacher_supervised_f1",
+                "scenarios": [{"scenario_name": "road", "video_slug": "road"}],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     report = plot_figures(normalized, figures)
 
@@ -158,6 +167,9 @@ def test_plotter_generates_all_figures_for_available_data(tmp_path: Path) -> Non
         assert len(outputs) == 2
         assert all(Path(path).exists() for path in outputs)
     assert (figures / "plot_report.json").exists()
+    assert report["accuracy_definition"] == "teacher_supervised_f1"
+    assert report["accuracy_labels"]["f1"] == "Teacher-supervised F1"
+    assert report["accuracy_labels"]["mean_f1"] == "Average teacher-supervised F1"
 
 
 def test_missing_accuracy_skips_fig1_and_downgrades_fig3(tmp_path: Path) -> None:

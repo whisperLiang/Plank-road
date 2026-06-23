@@ -32,10 +32,21 @@ class RTSPConfig(ConfigSection):
 
 
 @dataclass
+class TeacherReplaySourceConfig(ConfigSection):
+    save_sampled_frames: bool = False
+    jpeg_quality: int = 90
+    queue_size: int = 64
+    archive_chunk_max_bytes: int = 67108864
+
+
+@dataclass
 class SourceConfig(ConfigSection):
     video_path: str = "./video_data/road.mp4"
     max_count: int = 1000
+    scenario_name: str = ""
+    video_slug: str = ""
     rtsp: RTSPConfig = field(default_factory=RTSPConfig)
+    teacher_replay: TeacherReplaySourceConfig = field(default_factory=TeacherReplaySourceConfig)
 
 
 @dataclass
@@ -307,7 +318,7 @@ class BaselineConfig(ConfigSection):
 @dataclass
 class ExperimentResultsConfig(ConfigSection):
     enabled: bool = True
-    comparison_id: str = "exp_plank_road_vs_baselines_001"
+    comparison_id: str = "exp_road_plankroad_vs_baselines_001"
     root_dir: str = "results/experiments"
     local_root_dir: str = "cache/experiment_results"
     upload_to_cloud: bool = True
@@ -477,6 +488,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
 
     if section_cls is SourceConfig:
         known["rtsp"] = _section(RTSPConfig, known.get("rtsp"))
+        known["teacher_replay"] = _section(
+            TeacherReplaySourceConfig,
+            known.get("teacher_replay"),
+        )
     elif section_cls is SampleQualityConfig:
         known["output_entropy"] = _section(
             OutputEntropyConfig,
@@ -686,6 +701,20 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     if getattr(config.client.retrain, "num_epoch", None) is not None:
         raise ValueError(removed_fields["client.retrain.num_epoch"])
 
+    teacher_replay = config.client.source.teacher_replay
+    if not isinstance(teacher_replay.save_sampled_frames, bool):
+        raise ValueError("client.source.teacher_replay.save_sampled_frames must be a boolean")
+    if not 1 <= int(teacher_replay.jpeg_quality) <= 100:
+        raise ValueError("client.source.teacher_replay.jpeg_quality must be in [1, 100]")
+    _validate_positive(
+        "client.source.teacher_replay.queue_size",
+        int(teacher_replay.queue_size),
+    )
+    _validate_positive(
+        "client.source.teacher_replay.archive_chunk_max_bytes",
+        int(teacher_replay.archive_chunk_max_bytes),
+    )
+
     fixed_split_cfg = config.client.split_learning.fixed_split
     fixed_split_extras = set(getattr(fixed_split_cfg, "_extras", {}) or {})
     for field_name in (
@@ -750,6 +779,13 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "experiment_results.max_artifact_bytes",
         int(experiment_results.max_artifact_bytes),
     )
+    if bool(config.client.source.teacher_replay.save_sampled_frames) and int(
+        config.client.source.teacher_replay.archive_chunk_max_bytes
+    ) > int(experiment_results.max_artifact_bytes):
+        raise ValueError(
+            "client.source.teacher_replay.archive_chunk_max_bytes must be <= "
+            "experiment_results.max_artifact_bytes"
+        )
     if (
         experiment_results.enabled
         and experiment_results.upload_to_cloud
