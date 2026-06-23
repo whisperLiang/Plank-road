@@ -140,17 +140,32 @@ def test_repository_preserves_skipped_metadata_from_client_manifest(
     ]
 
 
-def test_repository_is_idempotent_and_preserves_conflicting_duplicate(
+def test_repository_is_idempotent_and_overwrites_conflicting_artifact(
     tmp_path: Path,
 ) -> None:
     repository = CloudExperimentResultRepository(str(tmp_path))
     original = repository.store_artifacts(_request(content=b"first"))[0]
     assert repository.store_artifacts(_request(content=b"first")) == [original]
-    duplicate = repository.store_artifacts(_request(content=b"second"))[0]
-    assert duplicate != original
-    assert ".duplicate." in duplicate.name
-    assert original.read_bytes() == b"first"
-    assert duplicate.read_bytes() == b"second"
+    overwritten = repository.store_artifacts(_request(content=b"second"))[0]
+    assert overwritten == original
+    assert original.read_bytes() == b"second"
+
+    manifest = json.loads(
+        original.with_name("uploaded_artifacts_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["artifacts"] == [
+        {
+            "relative_path": "latest_inference_results.jsonl",
+            "stored_path": "latest_inference_results.jsonl",
+            "size_bytes": len(b"second"),
+            "sha256": hashlib.sha256(b"second").hexdigest(),
+            "content_type": "application/json",
+            "is_final": True,
+            "status": "overwritten",
+        }
+    ]
 
 
 def test_repository_uses_edge_summary_to_update_manifest(tmp_path: Path) -> None:

@@ -398,20 +398,18 @@ class CloudExperimentResultRepository:
     ) -> tuple[Path, str]:
         destination = run_dir / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
+        status = "stored"
         if destination.exists():
             existing_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
             if existing_digest == digest:
                 return destination, "idempotent"
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            destination = destination.with_name(
-                f"{destination.stem}.{timestamp}.duplicate{destination.suffix}"
-            )
-            logger.warning(
-                "Experiment artifact path collision; stored duplicate at {}",
+            status = "overwritten"
+            logger.info(
+                "Experiment artifact path already exists; overwriting {}",
                 destination,
             )
         _atomic_write_bytes(destination, content)
-        return destination, "stored"
+        return destination, status
 
     @staticmethod
     def _manifest_entry(
@@ -523,16 +521,11 @@ def _atomic_write_text(path: Path, content: str) -> None:
 def _deduplicate_manifest_entries(
     entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    unique: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    unique_by_path: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for entry in entries:
-        key = (
-            str(entry.get("relative_path", "") or ""),
-            str(entry.get("sha256", "") or ""),
-            str(entry.get("stored_path", "") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(entry)
-    return unique
+        key = str(entry.get("relative_path", "") or "")
+        if key not in unique_by_path:
+            order.append(key)
+        unique_by_path[key] = entry
+    return [unique_by_path[key] for key in order]
