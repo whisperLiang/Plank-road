@@ -436,6 +436,32 @@ Generate PDF and PNG figures:
 python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{comparison_id}/normalized --figure_dir results/experiments/{comparison_id}/figures
 ```
 
+After rerunning an experiment and replacing files under `raw_logs/`, recompute
+teacher-supervised F1 before normalization when accuracy-dependent figures are
+needed. Fig. 1 and Fig. 8 require this frame-level accuracy file through
+`metrics.accuracy_file`; otherwise they are skipped or have incomplete panels.
+Then rerun normalization and point `--figure_dir` at the existing figure
+directory to overwrite the old PDF/PNG outputs in place:
+
+```shell
+python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest
+python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml
+python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{comparison_id}/normalized --figure_dir results/experiments/{comparison_id}/figures
+```
+
+Add `--overwrite_teacher_cache` to the teacher command only when the cached
+teacher labels should be regenerated, such as after changing teacher weights,
+score thresholds, IoU thresholds, or replayed frame content.
+
+For the checked-in road comparison that uses the teacher-F1 plotting manifest
+and `figures_accuracy` output directory, refresh the plots with:
+
+```shell
+python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/exp_road_plankroad_vs_baselines_001 --manifest results/experiments/exp_road_plankroad_vs_baselines_001/manifest.plot.yaml --output results/experiments/exp_road_plankroad_vs_baselines_001/teacher_accuracy_road.jsonl --teacher_model rtdetr_x --device cuda:0 --update_manifest
+python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/exp_road_plankroad_vs_baselines_001 --manifest results/experiments/exp_road_plankroad_vs_baselines_001/manifest.plot.yaml
+python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/exp_road_plankroad_vs_baselines_001/normalized --figure_dir results/experiments/exp_road_plankroad_vs_baselines_001/figures_accuracy
+```
+
 The framework produces these figures when their required measured data exists:
 
 | Figure | Experimental question |

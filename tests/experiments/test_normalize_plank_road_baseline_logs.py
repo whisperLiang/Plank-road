@@ -230,6 +230,69 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
     assert report["scenarios"][0]["video_slug"] == "road"
 
 
+def test_accuracy_trigger_decision_is_anchored_to_uploaded_window(
+    tmp_path: Path,
+) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    for path in (
+        "raw_logs/plank_road/cloud/main-r1",
+        "raw_logs/plank_road/edge_1/main-r1",
+        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+    ):
+        (comparison_dir / path).mkdir(parents=True, exist_ok=True)
+    _write_jsonl(
+        comparison_dir
+        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        [
+            {
+                "event": "accuracy_trigger_window_uploaded",
+                "timestamp_ms": 2000,
+                "window_id": "window-a",
+                "selected_count": 60,
+                "window_start_frame_id": 1,
+                "window_end_frame_id": 60,
+            },
+            {
+                "event": "cloud_scheduled_training_job_started",
+                "timestamp_ms": 2100,
+                "window_id": "window-a",
+                "job_id": "job-a",
+            },
+            {
+                "event": "accuracy_trigger_decision",
+                "timestamp_ms": 10000,
+                "window_id": "window-a",
+                "job_id": "job-a",
+                "trigger_decision": True,
+            },
+            {
+                "event": "cloud_scheduled_model_update_applied",
+                "timestamp_ms": 11000,
+                "window_id": "window-a",
+                "job_id": "job-a",
+                "result_model_version": "1",
+            },
+        ],
+    )
+
+    normalize(comparison_dir, manifest_path)
+
+    events = read_csv(comparison_dir / "normalized/adaptation_events.csv")
+    trigger = next(
+        row
+        for row in events
+        if row["run_id"] == "accuracy-r1" and row["event_name"] == "trigger_decision"
+    )
+    assert trigger["frame_id"] == "60"
+    assert trigger["event_time_ms"] == "2000"
+    summary = read_csv(comparison_dir / "normalized/summary.csv")
+    accuracy_summary = next(row for row in summary if row["run_id"] == "accuracy-r1")
+    assert accuracy_summary["mean_adaptation_ms"] == "9000.0"
+
+
 def test_normalizer_does_not_count_false_resource_decision_as_trigger(
     tmp_path: Path,
 ) -> None:

@@ -1117,6 +1117,64 @@ def _coalesce_adaptation_events(
     return merged
 
 
+def _anchor_accuracy_trigger_decisions(
+    windows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> None:
+    window_lookup = {
+        (
+            str(row.get("run_id", "")),
+            str(row.get("edge_id", "") or ""),
+            str(row.get("window_id", "") or ""),
+        ): row
+        for row in windows
+        if str(row.get("method", "")) == "accuracy_trigger_cloud_retraining"
+        and str(row.get("window_id", "") or "")
+    }
+    window_upload_times: dict[tuple[str, str, str], int] = {}
+    for row in events:
+        if (
+            str(row.get("method", "")) != "accuracy_trigger_cloud_retraining"
+            or str(row.get("event_name", "")) != "window_uploaded"
+        ):
+            continue
+        key = (
+            str(row.get("run_id", "")),
+            str(row.get("edge_id", "") or ""),
+            str(row.get("window_id", "") or ""),
+        )
+        timestamp = optional_int(row.get("event_time_ms"))
+        if not key[2] or timestamp is None:
+            continue
+        previous = window_upload_times.get(key)
+        if previous is None or timestamp < previous:
+            window_upload_times[key] = timestamp
+
+    for row in events:
+        if (
+            str(row.get("method", "")) != "accuracy_trigger_cloud_retraining"
+            or str(row.get("event_name", "")) != "trigger_decision"
+            or str(row.get("message", "")) != "accuracy_trigger_decision"
+        ):
+            continue
+        key = (
+            str(row.get("run_id", "")),
+            str(row.get("edge_id", "") or ""),
+            str(row.get("window_id", "") or ""),
+        )
+        if not key[2]:
+            continue
+        window = window_lookup.get(key)
+        if window is not None and row.get("frame_id") in (None, ""):
+            window_end = optional_int(window.get("window_end_frame"))
+            if window_end is not None:
+                row["frame_id"] = window_end
+        upload_time = window_upload_times.get(key)
+        current_time = optional_int(row.get("event_time_ms"))
+        if upload_time is not None and (current_time is None or upload_time < current_time):
+            row["event_time_ms"] = upload_time
+
+
 def _event_identity(row: Mapping[str, Any]) -> str:
     return str(row.get("job_id", "") or row.get("window_id", "") or "")
 
@@ -1492,6 +1550,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
 
     windows = _coalesce_window_rows(windows, conflicts)
     events = _coalesce_adaptation_events(events, conflicts)
+    _anchor_accuracy_trigger_decisions(windows, events)
     _derive_adaptation_latency(events, latency)
     summaries = _summary_rows(manifest, frames, events, uploads, latency)
     row_sets = {
