@@ -207,10 +207,8 @@ class DistributedBaselineController:
         selected_samples = tuple(payload.selected_samples)
         frame_ids = [int(sample.frame_id) for sample in selected_samples]
         logger.info(
-            "accuracy_trigger_window_uploaded edge={} window={} selected_count={} "
-            "frame_range={}-{}",
+            "accuracy_trigger_window_uploaded edge={} selected_count={} frame_range={}-{}",
             payload.edge_id,
-            payload.window_id,
             len(selected_samples),
             payload.window_start_frame_id,
             payload.window_end_frame_id,
@@ -263,10 +261,9 @@ class DistributedBaselineController:
         )
         annotation_result = getattr(self.teacher_annotator, "last_ensure_result", None)
         logger.info(
-            "accuracy_trigger_annotation_done edge={} window={} requested={} "
-            "cache_misses={} submitted={} unresolved={} failed={}",
+            "accuracy_trigger_annotation_done edge={} requested={} cache_misses={} "
+            "submitted={} unresolved={} failed={}",
             payload.edge_id,
-            payload.window_id,
             int(getattr(annotation_result, "requested_samples", len(annotation_samples))),
             int(getattr(annotation_result, "cache_misses", 0)),
             int(getattr(annotation_result, "submitted", 0)),
@@ -334,9 +331,8 @@ class DistributedBaselineController:
                 with self._lock:
                     self._accuracy_window_pending.pop(window_key, None)
                 logger.warning(
-                    "accuracy_trigger_window_annotation_failed edge={} window={} reason={}",
+                    "accuracy_trigger_window_annotation_failed edge={} reason={}",
                     payload.edge_id,
-                    payload.window_id,
                     exc,
                 )
                 continue
@@ -423,10 +419,8 @@ class DistributedBaselineController:
                 reply = self.training_backend.get_training_job_status(request)
             except Exception as exc:
                 logger.warning(
-                    "accuracy_trigger_training_status_poll_failed edge={} window={} "
-                    "job_id={} reason={}",
+                    "accuracy_trigger_training_status_poll_failed edge={} job_id={} reason={}",
                     pending.model_key[1],
-                    pending.window_id,
                     pending.job_id,
                     exc,
                 )
@@ -514,10 +508,9 @@ class DistributedBaselineController:
                 missing_teacher_prediction_count += 1
         if missing_edge_prediction_count or missing_teacher_prediction_count:
             logger.warning(
-                "accuracy_trigger_prediction_schema_warning edge={} window={} "
+                "accuracy_trigger_prediction_schema_warning edge={} "
                 "missing_edge_prediction_count={} missing_teacher_prediction_count={}",
                 payload.edge_id,
-                payload.window_id,
                 missing_edge_prediction_count,
                 missing_teacher_prediction_count,
             )

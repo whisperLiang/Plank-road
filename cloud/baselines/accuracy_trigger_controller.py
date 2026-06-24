@@ -336,10 +336,8 @@ class AccuracyTriggerController:
             )
             state.pending_jobs[str(job_id)] = pending
             logger.info(
-                "accuracy_trigger_training_update edge={} window={} status=submitted "
-                "job_id={}",
+                "accuracy_trigger_training_update edge={} status=submitted job_id={}",
                 submission.edge_id,
-                submission.window_id,
                 job_id,
             )
 
@@ -385,10 +383,9 @@ class AccuracyTriggerController:
                 pending.message = str(message or "")
                 pending.finished_at_ms = now_ms()
                 logger.info(
-                    "accuracy_trigger_training_update edge={} window={} status=succeeded "
+                    "accuracy_trigger_training_update edge={} status=succeeded "
                     "job_id={} model_version={}",
                     edge_id,
-                    pending.window_id,
                     job_id,
                     pending.result_model_version,
                 )
@@ -476,10 +473,9 @@ class AccuracyTriggerController:
             pending.result_model_version = str(result_model_version or "")
             pending.finished_at_ms = now_ms()
             logger.info(
-                "accuracy_trigger_training_update edge={} window={} status=applied "
+                "accuracy_trigger_training_update edge={} status=applied "
                 "job_id={} model_version={}",
                 edge_id,
-                pending.window_id,
                 pending.job_id,
                 pending.result_model_version,
             )
@@ -623,7 +619,7 @@ class AccuracyTriggerController:
         self._append_buffer_samples_locked(state, window)
         state.last_decision = window
         logger.info(
-            "accuracy_trigger_window_decision edge={} window={} accuracy={:.4f} "
+            "accuracy_trigger_window_decision edge={} accuracy={:.4f} "
             "foreground_accuracy={:.4f} history_len={} history_ready={} "
             "history_mean={:.4f} history_std={:.4f} threshold={:.4f} "
             "accuracy_gap={:.4f} active_pending={} triggered={} trigger_reason={} "
@@ -631,7 +627,6 @@ class AccuracyTriggerController:
             "teacher_only={} edge_only={} both_non_empty={} avg_teacher_boxes={:.4f} "
             "avg_edge_boxes={:.4f} f1_p10={:.4f} f1_p50={:.4f} f1_p90={:.4f}",
             key[1],
-            window_id,
             accuracy,
             foreground_accuracy,
             history_len,
@@ -704,10 +699,9 @@ class AccuracyTriggerController:
             created_at_ms=now_ms(),
         )
         logger.info(
-            "accuracy_trigger_training_update edge={} window={} status=command_created "
+            "accuracy_trigger_training_update edge={} status=command_created "
             "job_id={} model_version={}",
             pending.model_key[1],
-            pending.window_id,
             pending.job_id,
             pending.result_model_version,
         )

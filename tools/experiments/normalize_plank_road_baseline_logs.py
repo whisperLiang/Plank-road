@@ -887,6 +887,7 @@ def _coalesce_window_rows(
     rows: list[dict[str, Any]],
     conflicts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    rows = _attach_orphan_accuracy_decisions_to_uploaded_windows(rows)
     merged: list[dict[str, Any]] = []
     indexed: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for row in rows:
@@ -926,6 +927,108 @@ def _coalesce_window_rows(
                     }
                 )
     return merged
+
+
+def _attach_orphan_accuracy_decisions_to_uploaded_windows(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge decision-only cloud log rows into edge-uploaded window rows.
+
+    Current accuracy-trigger cloud logs intentionally omit long window ids for
+    readability. Edge metrics still carry the stable window id, so normalized
+    artifacts can recover the per-window row by pairing decision rows with the
+    next uploaded window for the same run/method/edge.
+    """
+    grouped: dict[tuple[str, str, str], dict[str, list[dict[str, Any]]]] = {}
+    passthrough: list[dict[str, Any]] = []
+    for row in rows:
+        if _is_orphan_accuracy_decision(row):
+            grouped.setdefault(_window_group_key(row), {"decisions": [], "windows": []})[
+                "decisions"
+            ].append(row)
+            continue
+        if _is_accuracy_uploaded_window(row):
+            grouped.setdefault(_window_group_key(row), {"decisions": [], "windows": []})[
+                "windows"
+            ].append(row)
+            continue
+        passthrough.append(row)
+
+    merged: list[dict[str, Any]] = []
+    for bucket in grouped.values():
+        windows = list(bucket["windows"])
+        decisions = list(bucket["decisions"])
+        for decision in decisions:
+            target = next(
+                (
+                    candidate
+                    for candidate in windows
+                    if not _window_has_accuracy_decision(candidate)
+                    and _window_sample_counts_match(candidate, decision)
+                ),
+                None,
+            )
+            if target is None:
+                merged.append(decision)
+                continue
+            for field in _ACCURACY_DECISION_WINDOW_FIELDS:
+                incoming = decision.get(field, "")
+                if incoming not in (None, ""):
+                    target[field] = incoming
+        merged.extend(windows)
+    return passthrough + merged
+
+
+_ACCURACY_DECISION_WINDOW_FIELDS = (
+    "raw_sample_count",
+    "trigger_decision",
+    "trigger_reason",
+    "window_accuracy",
+    "foreground_accuracy",
+    "history_mean_accuracy",
+    "accuracy_drop_threshold",
+    "accuracy_gap",
+)
+
+
+def _window_group_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row.get("run_id", "")),
+        str(row.get("method", "")),
+        str(row.get("edge_id", "")),
+    )
+
+
+def _is_orphan_accuracy_decision(row: Mapping[str, Any]) -> bool:
+    return (
+        str(row.get("window_id", "") or "") == ""
+        and str(row.get("method", "")) == "accuracy_trigger_cloud_retraining"
+        and row.get("window_accuracy") not in (None, "")
+    )
+
+
+def _is_accuracy_uploaded_window(row: Mapping[str, Any]) -> bool:
+    return (
+        str(row.get("window_id", "") or "") != ""
+        and str(row.get("method", "")) == "accuracy_trigger_cloud_retraining"
+    )
+
+
+def _window_has_accuracy_decision(row: Mapping[str, Any]) -> bool:
+    return row.get("window_accuracy") not in (None, "")
+
+
+def _window_sample_counts_match(
+    window: Mapping[str, Any],
+    decision: Mapping[str, Any],
+) -> bool:
+    window_count = optional_int(window.get("raw_sample_count"))
+    decision_count = optional_int(decision.get("raw_sample_count"))
+    return (
+        window_count is None
+        or decision_count is None
+        or int(window_count) == int(decision_count)
+    )
 
 
 def _coalesce_adaptation_events(

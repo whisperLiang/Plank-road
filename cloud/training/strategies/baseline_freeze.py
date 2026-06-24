@@ -126,13 +126,21 @@ class CloudBaselineFreezeTrainingStrategy:
             len(samples),
         )
         loss_fn = self.loss_builder(model)
+        batch_size = int(training_cfg.get("batch_size", 32) or 32)
+        epochs = int(training_cfg.get("num_epoch", 50) or 50)
+        logger.info(
+            "[BaselineTraining] training loop: samples={} epochs={} batch_size={}",
+            len(samples),
+            epochs,
+            batch_size,
+        )
         started = time.perf_counter()
         metrics = run_parameter_ratio_freeze_training(
             model=model,
             trainable_module=trainable_module,
             samples=samples,
-            batch_size=int(training_cfg.get("batch_size", 32) or 32),
-            epochs=int(training_cfg.get("num_epoch", 50) or 50),
+            batch_size=batch_size,
+            epochs=epochs,
             device=device,
             loss_fn=loss_fn,
             optimizer=optimizer,
@@ -188,10 +196,12 @@ def run_parameter_ratio_freeze_training(
 ) -> dict[str, Any]:
     sample_list = list(samples)
     losses: list[float] = []
+    epoch_losses: list[float] = []
     started = time.perf_counter()
     model.train()
     trainable_module.train()
-    for _epoch in range(int(epochs)):
+    for epoch in range(1, int(epochs) + 1):
+        epoch_losses_for_batches: list[float] = []
         for batch in _batches(sample_list, max(1, int(batch_size))):
             prepared = _prepare_raw_batch_for_full_forward(
                 model,
@@ -210,11 +220,29 @@ def run_parameter_ratio_freeze_training(
                 raise RuntimeError(f"baseline freeze loss returned {type(loss)!r}")
             loss.backward()
             optimizer.step()
-            losses.append(float(loss.detach().cpu().item()))
+            loss_value = float(loss.detach().cpu().item())
+            losses.append(loss_value)
+            epoch_losses_for_batches.append(loss_value)
+        if epoch_losses_for_batches:
+            avg_loss = sum(epoch_losses_for_batches) / float(len(epoch_losses_for_batches))
+            epoch_losses.append(avg_loss)
+            logger.info(
+                "[BaselineTraining] freeze epoch {}/{} avg_loss={:.6f}.",
+                epoch,
+                int(epochs),
+                avg_loss,
+            )
+        else:
+            logger.info(
+                "[BaselineTraining] freeze epoch {}/{} skipped: no training batches.",
+                epoch,
+                int(epochs),
+            )
     return {
         "full_train_time_sec": time.perf_counter() - started,
         "final_loss": losses[-1] if losses else None,
         "batch_count": len(losses),
+        "epoch_losses": epoch_losses,
     }
 
 

@@ -187,7 +187,7 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
     accuracy_cloud_log.parent.mkdir(parents=True, exist_ok=True)
     accuracy_cloud_log.write_text(
         "2026-06-01 10:00:00.000 | INFO | x - "
-        "accuracy_trigger_window_decision edge=1 window=window-a accuracy=0.7000 "
+        "accuracy_trigger_window_decision edge=1 accuracy=0.7000 "
         "foreground_accuracy=0.6500 history_len=2 history_ready=true "
         "history_mean=0.8000 history_std=0.0100 threshold=0.0500 "
         "accuracy_gap=0.1000 active_pending=false triggered=true "
@@ -214,6 +214,7 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
     accuracy_window = next(row for row in windows if row["window_id"] == "window-a")
     assert accuracy_window["window_accuracy"] == "0.7000"
     assert accuracy_window["trigger_decision"] == "true"
+    assert not any(row["window_id"] == "" and row["window_accuracy"] == "0.7000" for row in windows)
 
     uploads = read_csv(comparison_dir / "normalized/upload_breakdown.csv")
     pure_upload = next(row for row in uploads if row["run_id"] == "pure-r1")
@@ -372,7 +373,7 @@ def test_events_are_deduplicated_and_cross_file_latency_is_derived(
         comparison_dir / "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1/cloud.log"
     ).write_text(
         "2026-06-01 10:00:00.000 | INFO | x - "
-        "accuracy_trigger_window_decision edge=1 window=w accuracy=0.7 "
+        "accuracy_trigger_window_decision edge=1 accuracy=0.7 "
         "foreground_accuracy=0.6 history_mean=0.8 threshold=0.1 "
         "accuracy_gap=0.1 triggered=true trigger_reason=adaptive_drop "
         "total_samples=2\n",

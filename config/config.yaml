@@ -32,7 +32,7 @@ baseline:
   # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
   trigger_window_size: 60
   agreement_empty_empty_policy: exclude
-  absolute_accuracy_floor: 0.75
+  absolute_accuracy_floor: 0.85
 
 client:
  # the source video
