@@ -579,9 +579,9 @@ class AccuracyTriggerController:
         mean, std = _weighted_stats(state.history, decay=self.history_decay)
         threshold = mean - (float(self.accuracy_drop_sigma) * std)
         history_ready = history_len >= self.min_history_windows
-        active_pending = any(
-            str(pending.status).upper() not in _TERMINAL_FAILURES | {"SUCCEEDED"}
-            for pending in state.pending_jobs.values()
+        active_pending = self._has_active_pending_for_edge_locked(
+            run_id=str(key[0]),
+            edge_id=int(key[1]),
         )
         accuracy_gap = float(threshold - accuracy)
         trigger_reason = "none"
@@ -726,6 +726,16 @@ class AccuracyTriggerController:
             for frame_id, window_id in state.buffer_sample_windows.items()
             if int(frame_id) in kept_frame_ids
         }
+
+    def _has_active_pending_for_edge_locked(self, *, run_id: str, edge_id: int) -> bool:
+        terminal_statuses = _TERMINAL_FAILURES | {"SUCCEEDED"}
+        for state_key, state in self._states.items():
+            if str(state_key[0]) != str(run_id) or int(state_key[1]) != int(edge_id):
+                continue
+            for pending in state.pending_jobs.values():
+                if str(pending.status or "").upper() not in terminal_statuses:
+                    return True
+        return False
 
     def _resolve_command_locked(
         self,

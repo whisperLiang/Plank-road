@@ -299,6 +299,37 @@ def test_controller_active_pending_suppresses_additional_trigger() -> None:
     assert snapshot["last_decision"]["trigger_reason"] == "none"
 
 
+def test_controller_active_pending_suppresses_same_edge_across_model_versions() -> None:
+    controller = _controller()
+    submission = _trigger_submission(controller)
+    assert submission is not None
+    controller.record_submission_result(
+        submission,
+        accepted=True,
+        job_id="job-1",
+        status="QUEUED",
+        message="accepted",
+    )
+
+    assert (
+        _add_window(
+            controller,
+            _payload(4, model_version="1", edge_prediction=_empty()),
+            teacher_prediction=_box(),
+        )
+        is None
+    )
+    snapshot = controller.snapshot(
+        run_id="run-a",
+        edge_id=1,
+        model_name="tiny",
+        model_version="1",
+    )
+    assert snapshot["last_decision"]["active_pending"] is True
+    assert snapshot["last_decision"]["triggered"] is False
+    assert snapshot["last_decision"]["trigger_reason"] == "none"
+
+
 def test_controller_rejected_submission_retains_buffer_and_can_retrigger() -> None:
     controller = _controller()
     submission = _trigger_submission(controller)
