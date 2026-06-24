@@ -246,8 +246,7 @@ class AccuracyTriggerController:
                 "agreement_empty_empty_policy must be one of "
                 + ", ".join(sorted(EMPTY_EMPTY_POLICIES))
             )
-        self.warmup_accuracy_drop = float(_config_value(config, "warmup_accuracy_drop", 0.04))
-        absolute_floor = _config_value(config, "absolute_accuracy_floor", None)
+        absolute_floor = _config_value(config, "absolute_accuracy_floor", 0.6)
         self.absolute_accuracy_floor = (
             None if absolute_floor in (None, "") else float(absolute_floor)
         )
@@ -593,20 +592,12 @@ class AccuracyTriggerController:
         evaluated = int(agreement_stats.evaluated_samples)
         if evaluated > 0 and not active_pending:
             adaptive_drop = bool(history_ready and threshold > accuracy)
-            warmup_drop = bool(
-                not history_ready
-                and history_len >= 1
-                and float(self.warmup_accuracy_drop) > 0.0
-                and (mean - accuracy) >= float(self.warmup_accuracy_drop)
-            )
             absolute_floor = bool(
                 self.absolute_accuracy_floor is not None
                 and accuracy < float(self.absolute_accuracy_floor)
             )
             if adaptive_drop:
                 trigger_reason = "adaptive_drop"
-            elif warmup_drop:
-                trigger_reason = "warmup_drop"
             elif absolute_floor:
                 trigger_reason = "absolute_floor"
         triggered = trigger_reason != "none"

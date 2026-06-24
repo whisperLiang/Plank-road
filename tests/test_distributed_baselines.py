@@ -269,10 +269,9 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
         config.baseline.accuracy_trigger_cloud_retraining.agreement_empty_empty_policy
         == "exclude"
     )
-    assert config.baseline.accuracy_trigger_cloud_retraining.warmup_accuracy_drop == (
-        pytest.approx(0.04)
+    assert config.baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor == (
+        pytest.approx(0.6)
     )
-    assert config.baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor is None
     assert config.baseline.edge.split_runtime_policy == "disabled"
 
 

@@ -165,7 +165,7 @@ def test_controller_uses_prior_history_and_returns_buffer_plus_current() -> None
 
 
 def test_controller_does_not_trigger_before_min_history_or_on_normal_accuracy() -> None:
-    cold = _controller(min_history_windows=3, warmup_accuracy_drop=0.0)
+    cold = _controller(min_history_windows=3, absolute_accuracy_floor=None)
     _add_window(cold, _payload(1, edge_prediction=_box()), teacher_prediction=_box())
     _add_window(cold, _payload(2, edge_prediction=_box()), teacher_prediction=_box())
     assert (
@@ -220,25 +220,8 @@ def test_controller_does_not_trigger_or_update_history_when_all_samples_empty_ex
     assert snapshot["last_decision"]["trigger_reason"] == "none"
 
 
-def test_controller_triggers_on_warmup_drop_before_min_history() -> None:
-    controller = _controller(min_history_windows=3, warmup_accuracy_drop=0.04)
-
-    _add_window(controller, _payload(1, edge_prediction=_box()), teacher_prediction=_box())
-    submission = _add_window(
-        controller,
-        _payload(2, edge_prediction=_empty()),
-        teacher_prediction=_box(),
-    )
-
-    assert submission is not None
-    assert submission.trigger_reason == "warmup_drop"
-    assert submission.history_len == 1
-    assert submission.history_ready is False
-    assert submission.window_accuracy == pytest.approx(0.0)
-
-
-def test_controller_does_not_warmup_trigger_when_disabled() -> None:
-    controller = _controller(min_history_windows=3, warmup_accuracy_drop=0.0)
+def test_controller_does_not_trigger_on_drop_before_min_history_without_floor() -> None:
+    controller = _controller(min_history_windows=3, absolute_accuracy_floor=None)
 
     _add_window(controller, _payload(1, edge_prediction=_box()), teacher_prediction=_box())
     submission = _add_window(
@@ -261,7 +244,6 @@ def test_controller_does_not_warmup_trigger_when_disabled() -> None:
 def test_controller_absolute_accuracy_floor_is_debug_trigger() -> None:
     controller = _controller(
         min_history_windows=5,
-        warmup_accuracy_drop=0.0,
         absolute_accuracy_floor=0.5,
     )
 
@@ -274,6 +256,20 @@ def test_controller_absolute_accuracy_floor_is_debug_trigger() -> None:
     assert submission is not None
     assert submission.trigger_reason == "absolute_floor"
     assert submission.history_len == 0
+
+
+def test_controller_default_absolute_accuracy_floor_triggers_before_min_history() -> None:
+    controller = _controller(min_history_windows=5)
+
+    submission = _add_window(
+        controller,
+        _payload(1, edge_prediction=_empty()),
+        teacher_prediction=_box(),
+    )
+
+    assert submission is not None
+    assert submission.trigger_reason == "absolute_floor"
+    assert submission.history_ready is False
 
 
 def test_controller_active_pending_suppresses_additional_trigger() -> None:
@@ -902,8 +898,7 @@ def _accuracy_config(**overrides):
         "agreement_iou_threshold": 0.5,
         "agreement_score_threshold": 0.0,
         "agreement_empty_empty_policy": "exclude",
-        "warmup_accuracy_drop": 0.04,
-        "absolute_accuracy_floor": None,
+        "absolute_accuracy_floor": 0.75,
         "training_strategy": "freeze",
         "trainable_param_ratio": 0.3,
     }

@@ -26,18 +26,13 @@ baseline:
  method: accuracy_trigger_cloud_retraining
  run_id: null
  results_root: results/baselines_distributed
- training:
-  min_training_samples: 60
-  training_window_size: 60
-  microprofile_epochs: 5
  accuracy_trigger_cloud_retraining:
   # Engineering variant for this refactor: this reuses the existing
   # Plank-Road frame filter as the keyframe selector, while training
   # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
   trigger_window_size: 60
   agreement_empty_empty_policy: exclude
-  warmup_accuracy_drop: 0.04
-  absolute_accuracy_floor: null
+  absolute_accuracy_floor: 0.75
 
 client:
  # the source video

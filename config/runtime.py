@@ -271,8 +271,7 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     agreement_iou_threshold: float = 0.5
     agreement_score_threshold: float = 0.0
     agreement_empty_empty_policy: str = "exclude"
-    warmup_accuracy_drop: float = 0.04
-    absolute_accuracy_floor: float | None = None
+    absolute_accuracy_floor: float | None = 0.6
 
 
 @dataclass
@@ -918,11 +917,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "must be one of score_one, exclude, score_zero"
         )
     accuracy_cfg.agreement_empty_empty_policy = empty_policy
-    _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.warmup_accuracy_drop",
-        float(accuracy_cfg.warmup_accuracy_drop),
-        allow_zero=True,
-    )
     if accuracy_cfg.absolute_accuracy_floor is not None:
         _validate_positive(
             "baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor",
