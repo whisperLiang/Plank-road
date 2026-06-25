@@ -1,6 +1,6 @@
 # Plank-road Baseline Plot Specification
 
-All labels and legends are English. PDF and PNG are emitted together. A
+All labels and legends are English. SVG, PDF, TIFF, and PNG are emitted together. A
 missing required metric skips the figure and records the reason in
 `plot_report.json`; no placeholder series are drawn.
 

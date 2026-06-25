@@ -19,12 +19,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
+from matplotlib.ticker import MaxNLocator  # noqa: E402
 
 from tools.experiments.experiment_common import (  # noqa: E402
-    METHOD_COLORS,
     METHOD_LABELS,
     METHOD_ORDER,
-    METHODS,
     mean,
     optional_float,
     optional_int,
@@ -49,22 +50,62 @@ EVENT_MARKERS = {
     "training_job_succeeded": "D",
     "model_update_applied": "*",
 }
-STAGE_COLORS = {
-    "uploading": "#4c78a8",
-    "waiting_gpu_lease": "#bab0ac",
-    "teacher_annotation": "#f58518",
-    "training": "#e45756",
-    "model_update": "#72b7b2",
+EVENT_LABELS = {
+    "trigger_decision": "Trigger",
+    "bundle_upload_done": "Upload done",
+    "window_uploaded": "Window uploaded",
+    "teacher_annotation_done": "Teacher done",
+    "training_job_succeeded": "Training done",
+    "model_update_applied": "Update applied",
 }
+METHOD_COLORS = {
+    "plank_road": "#0F4D92",
+    "pure_edge_local_updating": "#767676",
+    "accuracy_trigger_cloud_retraining": "#B64342",
+    "ekya": "#42949E",
+}
+METHOD_MARKERS = {
+    "pure_edge_local_updating": "o",
+    "accuracy_trigger_cloud_retraining": "s",
+    "plank_road": "D",
+    "ekya": "^",
+}
+COMPONENT_COLORS = (
+    "#B4C0E4",
+    "#E4CCD8",
+    "#AADCA9",
+    "#F0E0D0",
+    "#D8D8D8",
+    "#E9A6A1",
+)
+COMPONENT_HATCHES = ("", "///", "\\\\\\", "...", "xx", "oo")
+STAGE_COLORS = {
+    "uploading": "#7884B4",
+    "waiting_gpu_lease": "#D8D8D8",
+    "teacher_annotation": "#AADCA9",
+    "training": "#B64342",
+    "model_update": "#42949E",
+}
+EXPORT_SUFFIXES = (".svg", ".pdf", ".tiff", ".png")
+EXPORT_DPI = 600
 
 plt.rcParams.update(
     {
-        "font.size": 10,
-        "axes.titlesize": 11,
-        "axes.labelsize": 10,
-        "legend.fontsize": 8,
-        "figure.dpi": 120,
-        "savefig.dpi": 220,
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
+        "font.size": 7,
+        "axes.titlesize": 8,
+        "axes.labelsize": 7,
+        "axes.linewidth": 0.8,
+        "axes.spines.right": False,
+        "axes.spines.top": False,
+        "xtick.labelsize": 6,
+        "ytick.labelsize": 6,
+        "legend.fontsize": 6,
+        "legend.frameon": False,
+        "figure.dpi": 160,
+        "savefig.dpi": EXPORT_DPI,
+        "svg.fonttype": "none",
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
     }
@@ -79,26 +120,249 @@ def _method_order(methods: Iterable[str]) -> list[str]:
     return ordered
 
 
+def _method_label(method: str) -> str:
+    return METHOD_LABELS.get(method, method)
+
+
+def _method_color(method: str) -> str:
+    return METHOD_COLORS.get(method, "#606060")
+
+
+def _method_marker(method: str) -> str:
+    return METHOD_MARKERS.get(method, "o")
+
+
 def _save(fig: plt.Figure, figure_dir: Path, stem: str) -> list[str]:
     figure_dir.mkdir(parents=True, exist_ok=True)
     outputs = []
-    for suffix in (".pdf", ".png"):
+    for suffix in EXPORT_SUFFIXES:
         path = figure_dir / f"{stem}{suffix}"
-        fig.savefig(path, bbox_inches="tight")
+        kwargs: dict[str, Any] = {"bbox_inches": "tight"}
+        if suffix in {".png", ".tiff"}:
+            kwargs["dpi"] = EXPORT_DPI
+        fig.savefig(path, **kwargs)
         outputs.append(str(path))
     plt.close(fig)
     return outputs
 
 
-def _subplots(count: int, *, width: float = 6.8, height: float = 3.8):
+def _subplots(count: int, *, width: float = 7.1, height: float = 2.8):
     fig, axes = plt.subplots(
         count,
         1,
-        figsize=(width, max(height, 2.8 * count)),
+        figsize=(width, max(height, 2.15 * count)),
         squeeze=False,
         constrained_layout=True,
     )
     return fig, [axes[index][0] for index in range(count)]
+
+
+def _style_axis(axis: plt.Axes, *, grid_axis: str | None = "y") -> None:
+    axis.set_axisbelow(True)
+    if grid_axis:
+        axis.grid(axis=grid_axis, color="#D8D8D8", linewidth=0.45, alpha=0.65)
+    else:
+        axis.grid(False)
+    for spine in ("left", "bottom"):
+        axis.spines[spine].set_color("#4D4D4D")
+        axis.spines[spine].set_linewidth(0.8)
+    axis.tick_params(colors="#4D4D4D", length=2.5, width=0.7)
+
+
+def _legend_unique(axis: plt.Axes, **kwargs: Any) -> None:
+    handles, labels = axis.get_legend_handles_labels()
+    unique = {
+        label: handle
+        for handle, label in zip(handles, labels)
+        if label and not label.startswith("_")
+    }
+    if unique:
+        axis.legend(unique.values(), unique.keys(), **kwargs)
+
+
+def _method_legend_handles(methods: Iterable[str]) -> list[Line2D]:
+    return [
+        Line2D(
+            [0],
+            [0],
+            color=_method_color(method),
+            marker=_method_marker(method),
+            linewidth=1.2,
+            markersize=4,
+            label=_method_label(method),
+        )
+        for method in _method_order(methods)
+    ]
+
+
+def _set_tight_ylim(axis: plt.Axes, values: Iterable[float], *, floor: float | None = None) -> None:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return
+    low = min(finite)
+    high = max(finite)
+    if math.isclose(low, high):
+        margin = max(abs(high) * 0.03, 0.01)
+    else:
+        margin = (high - low) * 0.08
+    if floor is not None:
+        low = max(floor, low - margin)
+    else:
+        low = low - margin
+    axis.set_ylim(low, high + margin)
+
+
+def _data_scale(values: Iterable[float], kind: str) -> tuple[float, str]:
+    finite = [abs(float(value)) for value in values if math.isfinite(float(value))]
+    maximum = max(finite, default=0.0)
+    if kind == "bytes":
+        if maximum >= 1_000_000_000:
+            return 1_000_000_000.0, "GB"
+        if maximum >= 1_000_000:
+            return 1_000_000.0, "MB"
+        if maximum >= 1_000:
+            return 1_000.0, "KB"
+        return 1.0, "bytes"
+    if kind == "ms":
+        if maximum >= 1_000:
+            return 1_000.0, "s"
+        return 1.0, "ms"
+    return 1.0, ""
+
+
+def _format_compact(value: float) -> str:
+    value = float(value)
+    abs_value = abs(value)
+    if abs_value >= 100:
+        return f"{value:.0f}"
+    if abs_value >= 10:
+        return f"{value:.1f}"
+    if abs_value >= 1:
+        return f"{value:.2f}"
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _annotate_bar_value(axis: plt.Axes, x: float, y: float, value: float, unit: str) -> None:
+    axis.annotate(
+        f"{_format_compact(value)} {unit}".strip(),
+        xy=(x, y),
+        xytext=(2, 0),
+        textcoords="offset points",
+        va="center",
+        ha="left",
+        fontsize=6,
+        color="#4D4D4D",
+        clip_on=False,
+    )
+
+
+def _event_group_key(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("scenario_name", "")),
+        str(row.get("method", "")),
+        str(row.get("run_id", "")),
+        str(row.get("edge_id", "")),
+    )
+
+
+def _event_origins(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str, str, str], float]:
+    grouped: dict[tuple[str, str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if optional_float(row.get("event_time_ms")) is not None:
+            grouped[_event_group_key(row)].append(row)
+    origins = {}
+    for key, group in grouped.items():
+        trigger_times = [
+            float(value)
+            for row in group
+            if row.get("event_name") in {"drift_detected", "trigger_decision"}
+            and (value := optional_float(row.get("event_time_ms"))) is not None
+        ]
+        all_times = [
+            float(value)
+            for row in group
+            if (value := optional_float(row.get("event_time_ms"))) is not None
+        ]
+        origins[key] = min(trigger_times or all_times)
+    return origins
+
+
+def _relative_event_seconds(
+    row: Mapping[str, Any],
+    origins: Mapping[tuple[str, str, str, str], float],
+) -> float | None:
+    timestamp = optional_float(row.get("event_time_ms"))
+    if timestamp is None:
+        return None
+    origin = origins.get(_event_group_key(row))
+    if origin is None:
+        return None
+    return (float(timestamp) - origin) / 1000.0
+
+
+def _relative_stage_intervals(
+    intervals: Iterable[tuple[tuple[str, str, str, str], float, float, str]],
+) -> list[tuple[tuple[str, str, str, str], float, float, str]]:
+    materialized = list(intervals)
+    origins: dict[tuple[str, str, str, str], float] = {}
+    for key, start, _, _ in materialized:
+        origins[key] = min(start, origins.get(key, start))
+    return [
+        (key, (start - origins[key]) / 1000.0, (end - origins[key]) / 1000.0, stage)
+        for key, start, end, stage in materialized
+    ]
+
+
+def _same_event_artifact(start: Mapping[str, Any], end: Mapping[str, Any]) -> bool:
+    for field in ("job_id", "window_id"):
+        start_value = str(start.get(field, "") or "")
+        if start_value:
+            return str(end.get(field, "") or "") == start_value
+    return True
+
+
+def _paired_event_intervals(
+    event_rows: Iterable[Mapping[str, Any]],
+    event_pairs: Iterable[tuple[str, str, str]],
+) -> list[tuple[tuple[str, str, str, str], float, float, str]]:
+    event_groups: dict[tuple[str, str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in event_rows:
+        if optional_float(row.get("event_time_ms")) is not None:
+            event_groups[_event_group_key(row)].append(row)
+
+    intervals: list[tuple[tuple[str, str, str, str], float, float, str]] = []
+    for key, rows in event_groups.items():
+        rows.sort(key=lambda row: optional_float(row.get("event_time_ms")) or 0.0)
+        for start_name, end_name, stage in event_pairs:
+            starts = [row for row in rows if row.get("event_name") == start_name]
+            ends = [row for row in rows if row.get("event_name") == end_name]
+            used_end_indexes: set[int] = set()
+            for start_row in starts:
+                start_time = optional_float(start_row.get("event_time_ms"))
+                if start_time is None:
+                    continue
+                matching_candidates = [
+                    (index, end_row, float(end_time))
+                    for index, end_row in enumerate(ends)
+                    if index not in used_end_indexes
+                    and (end_time := optional_float(end_row.get("event_time_ms"))) is not None
+                    and float(end_time) > start_time
+                    and _same_event_artifact(start_row, end_row)
+                ]
+                fallback_candidates = [
+                    (index, end_row, float(end_time))
+                    for index, end_row in enumerate(ends)
+                    if index not in used_end_indexes
+                    and (end_time := optional_float(end_row.get("event_time_ms"))) is not None
+                    and float(end_time) > start_time
+                ]
+                candidates = matching_candidates or fallback_candidates
+                if not candidates:
+                    continue
+                end_index, _, end_time = min(candidates, key=lambda item: item[2])
+                used_end_indexes.add(end_index)
+                intervals.append((key, start_time, end_time, stage))
+    return intervals
 
 
 def _numeric_rows(rows: Iterable[Mapping[str, Any]], field: str) -> list[Mapping[str, Any]]:
@@ -208,13 +472,15 @@ def _plot_fig1(
             if optional_float(row.get(metric)) is not None
         }
     )
-    fig, axes = _subplots(len(scenarios))
+    fig, axes = _subplots(len(scenarios), height=2.65)
     for axis, scenario in zip(axes, scenarios):
         scenario_rows = [
             row
             for row in frame_rows
             if row.get("scenario_name") == scenario and optional_float(row.get(metric)) is not None
         ]
+        plotted_values: list[float] = []
+        event_styles_used: set[str] = set()
         for method in _method_order(row.get("method", "") for row in scenario_rows):
             grouped: dict[int, list[float]] = defaultdict(list)
             for row in scenario_rows:
@@ -225,13 +491,30 @@ def _plot_fig1(
                 if frame_id is not None and value is not None:
                     grouped[frame_id].append(value)
             x_values = sorted(grouped)
+            y_values = [float(np.mean(grouped[x])) for x in x_values]
+            plotted_values.extend(y_values)
             axis.plot(
                 x_values,
-                [float(np.mean(grouped[x])) for x in x_values],
-                label=METHOD_LABELS.get(method, method),
-                color=METHOD_COLORS.get(method),
-                linewidth=1.8,
+                y_values,
+                color=_method_color(method),
+                linewidth=1.35,
+                marker=_method_marker(method),
+                markevery=[-1] if x_values else None,
+                markersize=3.4,
+                markeredgecolor="white",
+                markeredgewidth=0.35,
             )
+            if x_values:
+                axis.annotate(
+                    _method_label(method),
+                    xy=(x_values[-1], y_values[-1]),
+                    xytext=(4, 0),
+                    textcoords="offset points",
+                    va="center",
+                    fontsize=6,
+                    color=_method_color(method),
+                    clip_on=False,
+                )
             updates = [
                 optional_int(row.get("frame_id"))
                 for row in event_rows
@@ -255,15 +538,6 @@ def _plot_fig1(
                 for row in event_rows
                 if row.get("scenario_name") == scenario and row.get("method") == method
             ]
-            label_prefix = METHOD_LABELS.get(method, method)
-            color = METHOD_COLORS.get(method)
-            used_event_labels: set[str] = set()
-
-            def once(label: str) -> str | None:
-                if label in used_event_labels:
-                    return None
-                used_event_labels.add(label)
-                return label
 
             for event_name, linestyle, alpha, label_suffix in (
                 ("trigger_decision", ":", 0.45, "training trigger"),
@@ -276,12 +550,12 @@ def _plot_fig1(
                         continue
                     axis.axvline(
                         frame_id,
-                        color=color,
-                        alpha=alpha,
+                        color=_method_color(method),
+                        alpha=alpha * 0.65,
                         linestyle=linestyle,
-                        linewidth=1.3,
-                        label=once(f"{label_prefix} {label_suffix}"),
+                        linewidth=0.8,
                     )
+                    event_styles_used.add(label_suffix)
 
             for event in event_rows:
                 if (
@@ -301,12 +575,12 @@ def _plot_fig1(
                     continue
                 axis.axvline(
                     update,
-                    color=color,
-                    alpha=0.28,
+                    color=_method_color(method),
+                    alpha=0.26,
                     linestyle="--",
-                    linewidth=1.5,
-                    label=once(f"{label_prefix} model update"),
+                    linewidth=0.9,
                 )
+                event_styles_used.add("model update")
         title = (
             "Teacher-supervised F1 over time"
             if metric == "f1" and accuracy_definition == "teacher_supervised_f1"
@@ -315,8 +589,19 @@ def _plot_fig1(
         axis.set_title(title if len(scenarios) == 1 else f"{title}: {scenario}")
         axis.set_xlabel("Frame ID")
         axis.set_ylabel(_accuracy_label(metric, accuracy_definition))
-        axis.grid(alpha=0.25)
-        axis.legend()
+        _set_tight_ylim(axis, plotted_values, floor=0.0)
+        _style_axis(axis, grid_axis="both")
+        event_handles = []
+        if "training trigger" in event_styles_used:
+            event_handles.append(
+                Line2D([0], [0], color="#606060", linestyle=":", linewidth=0.9, label="Trigger")
+            )
+        if "model update" in event_styles_used:
+            event_handles.append(
+                Line2D([0], [0], color="#606060", linestyle="--", linewidth=0.9, label="Update")
+            )
+        if event_handles:
+            axis.legend(handles=event_handles, loc="lower right", ncol=2, handlelength=1.8)
     return _save(fig, figure_dir, "fig1_accuracy_over_time"), None, []
 
 
@@ -333,51 +618,62 @@ def _plot_fig2(
     if not rows:
         return [], "adaptation event timestamps missing", []
     scenarios = sorted({str(row.get("scenario_name", "")) for row in rows})
-    fig, axes = _subplots(len(scenarios), height=3.5)
+    origins = _event_origins(rows)
+    fig, axes = _subplots(len(scenarios), height=2.7)
     for axis, scenario in zip(axes, scenarios):
         subset = [row for row in rows if row.get("scenario_name") == scenario]
         methods = _method_order(row.get("method", "") for row in subset)
-        origin_candidates = [
-            optional_float(row.get("event_time_ms"))
-            for row in subset
-            if row.get("event_name") in {"drift_detected", "trigger_decision"}
-        ]
-        origin_values = [value for value in origin_candidates if value is not None]
-        if not origin_values:
-            origin_values = [
-                value
-                for row in subset
-                if (value := optional_float(row.get("event_time_ms"))) is not None
-            ]
-        origin = min(origin_values)
+        plotted_x: list[float] = []
+        event_names_seen: set[str] = set()
         for y, method in enumerate(methods):
             for event_name, marker in EVENT_MARKERS.items():
                 x_values = [
-                    (value - origin) / 1000.0
+                    value
                     for row in subset
                     if row.get("method") == method
                     and row.get("event_name") == event_name
-                    and (value := optional_float(row.get("event_time_ms"))) is not None
+                    and (value := _relative_event_seconds(row, origins)) is not None
                 ]
                 if x_values:
+                    plotted_x.extend(x_values)
+                    event_names_seen.add(event_name)
                     axis.scatter(
                         x_values,
                         [y] * len(x_values),
                         marker=marker,
-                        s=55 if marker != "*" else 90,
-                        label=event_name.replace("_", " "),
-                        color=METHOD_COLORS.get(method),
-                        edgecolors="black",
-                        linewidths=0.3,
+                        s=26 if marker != "*" else 48,
+                        color=_method_color(method),
+                        edgecolors="white",
+                        linewidths=0.35,
+                        alpha=0.9,
                     )
-        axis.set_yticks(range(len(methods)), [METHOD_LABELS.get(item, item) for item in methods])
-        axis.set_xlabel("Time since first trigger/event (s)")
+        axis.set_yticks(range(len(methods)), [_method_label(item) for item in methods])
+        axis.set_xlabel("Time since method trigger/event (s)")
         axis.set_title(scenario)
-        axis.grid(axis="x", alpha=0.25)
-        handles, labels = axis.get_legend_handles_labels()
-        unique = dict(zip(labels, handles))
-        if unique:
-            axis.legend(unique.values(), unique.keys(), ncol=3)
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        if plotted_x:
+            axis.set_xlim(left=-0.05 * max(plotted_x or [1.0]))
+        _style_axis(axis, grid_axis="x")
+        event_handles = [
+            Line2D(
+                [0],
+                [0],
+                color="#4D4D4D",
+                marker=EVENT_MARKERS[event_name],
+                linestyle="None",
+                markersize=4.2 if EVENT_MARKERS[event_name] != "*" else 6,
+                label=EVENT_LABELS[event_name],
+            )
+            for event_name in EVENT_MARKERS
+            if event_name in event_names_seen
+        ]
+        if event_handles:
+            axis.legend(
+                handles=event_handles,
+                ncol=3,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.22),
+            )
     return _save(fig, figure_dir, "fig2_adaptation_timeline"), None, []
 
 
@@ -389,33 +685,50 @@ def _plot_fig3(
     aggregated = _aggregate_summary(summary_rows)
     accuracy_field = _summary_accuracy_field(aggregated)
     partial: list[str] = []
-    fig, axis = plt.subplots(figsize=(6.8, 4.2), constrained_layout=True)
+    latency_values = [
+        float(value)
+        for row in aggregated
+        if (value := optional_float(row.get("mean_adaptation_ms"))) is not None
+    ]
+    latency_scale, latency_unit = _data_scale(latency_values, "ms")
+    fig, axis = plt.subplots(figsize=(4.8, 3.1), constrained_layout=True)
     plotted = 0
+    plotted_y: list[float] = []
     if accuracy_field:
         for row in aggregated:
-            x = optional_float(row.get("mean_adaptation_ms"))
+            x_raw = optional_float(row.get("mean_adaptation_ms"))
             y = optional_float(row.get(accuracy_field))
-            if x is None or y is None:
+            if x_raw is None or y is None:
                 continue
             upload = optional_float(row.get("mean_upload_bytes"))
             exposure = optional_float(row.get("mean_raw_exposure_ratio"))
             bubble_source = upload if upload is not None else exposure
             size = (
-                70.0
+                34.0
                 if bubble_source is None
-                else 50.0 + 180.0 * math.log10(max(bubble_source, 1.0)) / 10.0
+                else 24.0 + 86.0 * math.log10(max(bubble_source, 1.0)) / 10.0
             )
             method = str(row["method"])
+            x = x_raw / latency_scale
             axis.scatter(
                 x,
                 y,
                 s=max(40.0, size),
-                color=METHOD_COLORS.get(method),
-                label=METHOD_LABELS.get(method, method),
-                alpha=0.8,
-                edgecolors="black",
-                linewidths=0.4,
+                color=_method_color(method),
+                marker=_method_marker(method),
+                alpha=0.86,
+                edgecolors="white",
+                linewidths=0.45,
             )
+            axis.annotate(
+                _method_label(method),
+                xy=(x, y),
+                xytext=(5, 3),
+                textcoords="offset points",
+                fontsize=6,
+                color=_method_color(method),
+            )
+            plotted_y.append(y)
             plotted += 1
         axis.set_ylabel(
             _accuracy_label(
@@ -427,32 +740,58 @@ def _plot_fig3(
         axis.set_title("Accuracy-latency-upload tradeoff")
     else:
         partial.append("accuracy unavailable; generated latency-upload tradeoff")
+        upload_values = [
+            float(value)
+            for row in aggregated
+            if (value := optional_float(row.get("mean_upload_bytes"))) is not None
+        ]
+        upload_scale, upload_unit = _data_scale(upload_values, "bytes")
         for row in aggregated:
-            x = optional_float(row.get("mean_adaptation_ms"))
-            y = optional_float(row.get("mean_upload_bytes"))
-            if x is None or y is None:
+            x_raw = optional_float(row.get("mean_adaptation_ms"))
+            y_raw = optional_float(row.get("mean_upload_bytes"))
+            if x_raw is None or y_raw is None:
                 continue
             method = str(row["method"])
+            x = x_raw / latency_scale
+            y = y_raw / upload_scale
             axis.scatter(
                 x,
                 y,
-                s=80,
-                color=METHOD_COLORS.get(method),
-                label=METHOD_LABELS.get(method, method),
-                edgecolors="black",
-                linewidths=0.4,
+                s=48,
+                color=_method_color(method),
+                marker=_method_marker(method),
+                edgecolors="white",
+                linewidths=0.45,
             )
+            axis.annotate(
+                _method_label(method),
+                xy=(x, y),
+                xytext=(5, 3),
+                textcoords="offset points",
+                fontsize=6,
+                color=_method_color(method),
+            )
+            plotted_y.append(y)
             plotted += 1
-        axis.set_ylabel("Mean upload bytes")
+        axis.set_ylabel(f"Mean upload ({upload_unit})")
         axis.set_title("Latency-upload tradeoff (accuracy unavailable)")
     if not plotted:
         plt.close(fig)
         return [], "adaptation latency and tradeoff data missing", partial
-    axis.set_xlabel("Mean adaptation latency (ms)")
-    axis.grid(alpha=0.25)
-    handles, labels = axis.get_legend_handles_labels()
-    unique = dict(zip(labels, handles))
-    axis.legend(unique.values(), unique.keys())
+    axis.set_xlabel(f"Mean adaptation latency ({latency_unit})")
+    _set_tight_ylim(axis, plotted_y, floor=0.0 if accuracy_field else None)
+    _style_axis(axis, grid_axis="both")
+    if accuracy_field:
+        axis.text(
+            0.02,
+            0.03,
+            "Bubble area: upload",
+            transform=axis.transAxes,
+            fontsize=6,
+            color="#606060",
+            ha="left",
+            va="bottom",
+        )
     return (
         _save(fig, figure_dir, "fig3_accuracy_latency_upload_tradeoff"),
         None,
@@ -522,30 +861,74 @@ def _stacked_method_bars(
         for field, value in item.items()
         if value is None
     ]
-    fig, axes = _subplots(len(scenarios), width=7.2, height=4.4)
-    colors = plt.get_cmap("tab10").colors
+    raw_values = [
+        float(value)
+        for scenario_values in values.values()
+        for item in scenario_values.values()
+        for value in item.values()
+        if value is not None
+    ]
+    kind = "bytes" if "byte" in ylabel.lower() else "ms"
+    scale, unit = _data_scale(raw_values, kind)
+    xlabel = f"{title.split()[0]} ({unit})" if kind == "bytes" else f"{title} ({unit})"
+    fig, axes = _subplots(len(scenarios), width=7.1, height=2.85)
     for axis, scenario in zip(axes, scenarios):
         methods = list(values[scenario])
-        x = np.arange(len(methods))
-        bottoms = np.zeros(len(methods))
+        y = np.arange(len(methods))
+        lefts = np.zeros(len(methods))
         for index, (field, label) in enumerate(fields):
-            heights = np.array(
+            widths = np.array(
                 [
-                    values[scenario][method][field]
+                    values[scenario][method][field] / scale
                     if values[scenario][method][field] is not None
                     else 0.0
                     for method in methods
                 ]
             )
-            if not np.any(heights):
+            if not np.any(widths):
                 continue
-            axis.bar(x, heights, bottom=bottoms, label=label, color=colors[index])
-            bottoms += heights
-        axis.set_xticks(x, [METHOD_LABELS.get(method, method) for method in methods])
-        axis.set_ylabel(ylabel)
+            axis.barh(
+                y,
+                widths,
+                left=lefts,
+                height=0.56,
+                label=label,
+                color=COMPONENT_COLORS[index % len(COMPONENT_COLORS)],
+                edgecolor="white",
+                linewidth=0.55,
+                hatch=COMPONENT_HATCHES[index % len(COMPONENT_HATCHES)],
+            )
+            lefts += widths
+        for index, total in enumerate(lefts):
+            if total > 0:
+                _annotate_bar_value(axis, total, y[index], total, unit)
+        axis.set_yticks(y, [_method_label(method) for method in methods])
+        axis.invert_yaxis()
+        axis.set_xlabel(xlabel)
         axis.set_title(f"{title}: {scenario}")
-        axis.legend()
-        axis.grid(axis="y", alpha=0.25)
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        _style_axis(axis, grid_axis="x")
+        legend_handles = [
+            Patch(
+                facecolor=COMPONENT_COLORS[index % len(COMPONENT_COLORS)],
+                edgecolor="white",
+                hatch=COMPONENT_HATCHES[index % len(COMPONENT_HATCHES)],
+                label=label,
+            )
+            for index, (_, label) in enumerate(fields)
+            if any(
+                values[scenario][method][fields[index][0]] is not None
+                and values[scenario][method][fields[index][0]] > 0
+                for method in methods
+            )
+        ]
+        if legend_handles:
+            axis.legend(
+                handles=legend_handles,
+                ncol=min(3, len(legend_handles)),
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.18),
+            )
     return _save(fig, figure_dir, stem), None, partial
 
 
@@ -574,15 +957,26 @@ def _plot_fig6(
     if metric is None:
         return [], "at least two edge-count points with one common metric are required", []
     scenarios = sorted({str(row.get("scenario_name", "")) for row in aggregated})
-    fig, axes = _subplots(len(scenarios))
+    metric_values = [
+        float(value)
+        for row in aggregated
+        if (value := optional_float(row.get(metric))) is not None
+    ]
+    scale, unit = (1.0, "")
+    if metric.endswith("_bytes"):
+        scale, unit = _data_scale(metric_values, "bytes")
+    elif metric.endswith("_ms"):
+        scale, unit = _data_scale(metric_values, "ms")
+    fig, axes = _subplots(len(scenarios), height=2.65)
     plotted = 0
     for axis, scenario in zip(axes, scenarios):
         subset = [row for row in aggregated if row.get("scenario_name") == scenario]
+        plotted_values: list[float] = []
         for method in _method_order(row.get("method", "") for row in subset):
             points = sorted(
                 (
                     int(edge_count),
-                    float(value),
+                    float(value) / scale,
                 )
                 for row in subset
                 if row.get("method") == method
@@ -594,22 +988,35 @@ def _plot_fig6(
             axis.plot(
                 [item[0] for item in points],
                 [item[1] for item in points],
-                marker="o",
-                color=METHOD_COLORS.get(method),
-                label=METHOD_LABELS.get(method, method),
+                marker=_method_marker(method),
+                color=_method_color(method),
+                linewidth=1.25,
+                markersize=3.8,
+                markeredgecolor="white",
+                markeredgewidth=0.35,
+            )
+            plotted_values.extend(item[1] for item in points)
+            axis.annotate(
+                _method_label(method),
+                xy=(points[-1][0], points[-1][1]),
+                xytext=(4, 0),
+                textcoords="offset points",
+                va="center",
+                fontsize=6,
+                color=_method_color(method),
+                clip_on=False,
             )
             plotted += 1
         axis.set_title(scenario)
         axis.set_xlabel("Edge count")
-        axis.set_ylabel(
-            _accuracy_label(metric, accuracy_definition, average=True)
-            if metric in {"mean_f1", "mean_map"}
-            else metric.replace("_", " ").title()
-        )
-        axis.grid(alpha=0.25)
-        handles, labels = axis.get_legend_handles_labels()
-        if handles:
-            axis.legend(handles, labels)
+        if metric in {"mean_f1", "mean_map"}:
+            axis.set_ylabel(_accuracy_label(metric, accuracy_definition, average=True))
+            _set_tight_ylim(axis, plotted_values, floor=0.0)
+        else:
+            axis.set_ylabel(f"{metric.replace('_', ' ').title()} ({unit})")
+            _set_tight_ylim(axis, plotted_values, floor=0.0)
+        axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+        _style_axis(axis, grid_axis="both")
     if not plotted:
         plt.close(fig)
         return [], "no method has at least two edge-count points", []
@@ -646,60 +1053,47 @@ def _plot_fig7(
         ("training_job_started", "training_job_succeeded", "training"),
         ("model_update_downloaded", "model_update_applied", "model_update"),
     )
-    event_groups: dict[tuple[str, str, str, str], list[dict[str, str]]] = defaultdict(list)
-    for row in event_rows:
-        if optional_float(row.get("event_time_ms")) is None:
-            continue
-        key = (
-            str(row.get("scenario_name", "")),
-            str(row.get("method", "")),
-            str(row.get("run_id", "")),
-            str(row.get("edge_id", "")),
-        )
-        event_groups[key].append(row)
-    for key, rows in event_groups.items():
-        rows.sort(key=lambda row: optional_float(row.get("event_time_ms")) or 0.0)
-        for start_name, end_name, stage in event_pairs:
-            starts = [
-                float(value)
-                for row in rows
-                if row.get("event_name") == start_name
-                and (value := optional_float(row.get("event_time_ms"))) is not None
-            ]
-            ends = [
-                float(value)
-                for row in rows
-                if row.get("event_name") == end_name
-                and (value := optional_float(row.get("event_time_ms"))) is not None
-            ]
-            for start, end in zip(starts, ends):
-                if end > start:
-                    intervals.append((key, start, end, stage))
+    intervals.extend(_paired_event_intervals(event_rows, event_pairs))
     if not intervals:
         return [], "resource stage intervals cannot be determined from timestamps", []
+    intervals = _relative_stage_intervals(intervals)
     scenarios = sorted({item[0][0] for item in intervals})
-    fig, axes = _subplots(len(scenarios), height=4.2)
+    fig, axes = _subplots(len(scenarios), height=2.9)
     for axis, scenario in zip(axes, scenarios):
         subset = [item for item in intervals if item[0][0] == scenario]
-        labels = sorted({f"{item[0][1]} edge {item[0][3]}" for item in subset})
+        labels = sorted({f"{_method_label(item[0][1])} edge {item[0][3]}" for item in subset})
         label_y = {label: index for index, label in enumerate(labels)}
-        origin = min(item[1] for item in subset)
         for key, start, end, stage in subset:
-            label = f"{key[1]} edge {key[3]}"
+            label = f"{_method_label(key[1])} edge {key[3]}"
             axis.barh(
                 label_y[label],
-                (end - start) / 1000.0,
-                left=(start - origin) / 1000.0,
+                end - start,
+                left=start,
                 color=STAGE_COLORS[stage],
-                label=stage.replace("_", " "),
+                edgecolor="white",
+                linewidth=0.55,
+                height=0.5,
             )
         axis.set_yticks(range(len(labels)), labels)
-        axis.set_xlabel("Time (s)")
+        axis.invert_yaxis()
+        axis.set_xlabel("Time since run-stage start (s)")
         axis.set_title(scenario)
-        handles, names = axis.get_legend_handles_labels()
-        unique = dict(zip(names, handles))
-        if unique:
-            axis.legend(unique.values(), unique.keys(), ncol=3)
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        _style_axis(axis, grid_axis="x")
+        stage_names = [stage for stage in STAGE_COLORS if any(item[3] == stage for item in subset)]
+        axis.legend(
+            handles=[
+                Patch(
+                    facecolor=STAGE_COLORS[stage],
+                    edgecolor="white",
+                    label=stage.replace("_", " "),
+                )
+                for stage in stage_names
+            ],
+            ncol=min(3, max(1, len(stage_names))),
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.2),
+        )
     return _save(fig, figure_dir, "fig7_resource_timeline"), None, []
 
 
@@ -755,9 +1149,14 @@ def _plot_fig8(
             mean(row.get(latency_field) for row in subset),
             mean(row.get("mean_upload_bytes") for row in subset),
         )
-    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.8), constrained_layout=True)
-    labels = [METHOD_LABELS.get(method, method) for method in methods]
-    colors = [METHOD_COLORS.get(method) for method in methods]
+    latency_values = [value[1] for value in values.values() if value[1] is not None]
+    upload_values = [value[2] for value in values.values() if value[2] is not None]
+    latency_scale, latency_unit = _data_scale(latency_values, "ms")
+    upload_scale, upload_unit = _data_scale(upload_values, "bytes")
+    fig, axes = plt.subplots(1, 3, figsize=(7.1, 2.35), constrained_layout=True)
+    y = np.arange(len(methods))
+    labels = [_method_label(method) for method in methods]
+    colors = [_method_color(method) for method in methods]
     panels = (
         (
             0,
@@ -766,15 +1165,33 @@ def _plot_fig8(
                 accuracy_definition,
                 average=True,
             ),
+            1.0,
+            "",
         ),
-        (1, latency_title),
-        (2, "Average upload bytes"),
+        (1, latency_title.replace(" (ms)", f" ({latency_unit})"), latency_scale, latency_unit),
+        (2, f"Average upload ({upload_unit})", upload_scale, upload_unit),
     )
-    for axis, (index, title) in zip(axes, panels):
-        axis.bar(labels, [values[method][index] for method in methods], color=colors)
-        axis.set_title(title)
-        axis.tick_params(axis="x", rotation=20)
-        axis.grid(axis="y", alpha=0.25)
+    for axis, (index, label_text, scale, unit) in zip(axes, panels):
+        scaled_values = [
+            (values[method][index] or 0.0) / scale
+            for method in methods
+        ]
+        axis.barh(
+            y,
+            scaled_values,
+            color=colors,
+            height=0.56,
+            edgecolor="white",
+            linewidth=0.55,
+        )
+        for item_index, value in enumerate(scaled_values):
+            _annotate_bar_value(axis, value, y[item_index], value, unit)
+        axis.set_title(label_text)
+        axis.set_yticks(y, labels if axis is axes[0] else [])
+        axis.invert_yaxis()
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=4))
+        _style_axis(axis, grid_axis="x")
+        axis.set_xlim(left=0)
     return _save(fig, figure_dir, "fig8_component_ablation_style_summary"), None, partial
 
 
@@ -884,7 +1301,7 @@ def plot_figures(
             generated[stem] = outputs
         if reason:
             skipped[stem] = reason
-            for suffix in (".pdf", ".png"):
+            for suffix in EXPORT_SUFFIXES:
                 stale = figure_dir / f"{stem}{suffix}"
                 if stale.exists():
                     stale.unlink()

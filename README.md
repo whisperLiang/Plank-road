@@ -446,7 +446,7 @@ python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comp
 python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml
 ```
 
-Generate PDF and PNG figures:
+Generate SVG, PDF, TIFF, and PNG figures:
 
 ```shell
 python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{comparison_id}/normalized --figure_dir results/experiments/{comparison_id}/figures
@@ -457,7 +457,7 @@ teacher-supervised F1 before normalization when accuracy-dependent figures are
 needed. Fig. 1 and Fig. 8 require this frame-level accuracy file through
 `metrics.accuracy_file`; otherwise they are skipped or have incomplete panels.
 Then rerun normalization and point `--figure_dir` at the existing figure
-directory to overwrite the old PDF/PNG outputs in place:
+directory to overwrite the old SVG/PDF/TIFF/PNG outputs in place:
 
 ```shell
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest

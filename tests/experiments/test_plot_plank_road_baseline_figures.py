@@ -14,7 +14,12 @@ from tools.experiments.experiment_common import (
     write_csv,
 )
 from tools.experiments.plot_plank_road_baseline_figures import (
+    EXPORT_SUFFIXES,
     _aggregate_breakdown,
+    _event_origins,
+    _paired_event_intervals,
+    _relative_event_seconds,
+    _relative_stage_intervals,
     _summary_accuracy_field,
     plot_figures,
 )
@@ -164,8 +169,11 @@ def test_plotter_generates_all_figures_for_available_data(tmp_path: Path) -> Non
     assert len(report["generated_figures"]) == 8
     assert report["skipped_figures"] == {}
     for outputs in report["generated_figures"].values():
-        assert len(outputs) == 2
+        assert len(outputs) == len(EXPORT_SUFFIXES)
         assert all(Path(path).exists() for path in outputs)
+        assert {Path(path).suffix for path in outputs} == set(EXPORT_SUFFIXES)
+    svg_text = (figures / "fig1_accuracy_over_time.svg").read_text(encoding="utf-8")
+    assert "<text" in svg_text
     assert (figures / "plot_report.json").exists()
     assert report["accuracy_definition"] == "teacher_supervised_f1"
     assert report["accuracy_labels"]["f1"] == "Teacher-supervised F1"
@@ -197,14 +205,14 @@ def test_missing_accuracy_skips_fig1_and_downgrades_fig3(tmp_path: Path) -> None
         ],
     )
     (figures / "fig1_accuracy_over_time.pdf").parent.mkdir(parents=True, exist_ok=True)
-    (figures / "fig1_accuracy_over_time.pdf").write_text("stale", encoding="utf-8")
-    (figures / "fig1_accuracy_over_time.png").write_text("stale", encoding="utf-8")
+    for suffix in EXPORT_SUFFIXES:
+        (figures / f"fig1_accuracy_over_time{suffix}").write_text("stale", encoding="utf-8")
 
     report = plot_figures(normalized, figures)
 
     assert report["skipped_figures"]["fig1_accuracy_over_time"] == "accuracy data missing"
-    assert not (figures / "fig1_accuracy_over_time.pdf").exists()
-    assert not (figures / "fig1_accuracy_over_time.png").exists()
+    for suffix in EXPORT_SUFFIXES:
+        assert not (figures / f"fig1_accuracy_over_time{suffix}").exists()
     assert (figures / "fig3_accuracy_latency_upload_tradeoff.png").exists()
     assert (
         "accuracy unavailable" in report["partial_data"]["fig3_accuracy_latency_upload_tradeoff"][0]
@@ -298,3 +306,108 @@ def test_breakdown_averages_runs_before_repeats_and_keeps_scenarios_separate() -
 
     assert values["road"]["plank_road"]["upload_ms"] == 75.0
     assert values["city"]["plank_road"]["upload_ms"] == 20.0
+
+
+def test_event_timeline_is_zeroed_per_method_run() -> None:
+    rows = [
+        {
+            "scenario_name": "road",
+            "method": "plank_road",
+            "run_id": "plank",
+            "edge_id": "1",
+            "event_name": "trigger_decision",
+            "event_time_ms": "1000",
+        },
+        {
+            "scenario_name": "road",
+            "method": "plank_road",
+            "run_id": "plank",
+            "edge_id": "1",
+            "event_name": "model_update_applied",
+            "event_time_ms": "1500",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "trigger_decision",
+            "event_time_ms": "60000",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "model_update_applied",
+            "event_time_ms": "60500",
+        },
+    ]
+
+    origins = _event_origins(rows)
+
+    assert _relative_event_seconds(rows[1], origins) == 0.5
+    assert _relative_event_seconds(rows[3], origins) == 0.5
+
+
+def test_stage_intervals_are_zeroed_per_run_edge() -> None:
+    plank_key = ("road", "plank_road", "plank", "1")
+    trigger_key = ("road", "accuracy_trigger_cloud_retraining", "trigger", "1")
+
+    intervals = _relative_stage_intervals(
+        [
+            (plank_key, 1000.0, 1500.0, "uploading"),
+            (trigger_key, 60000.0, 61000.0, "training"),
+        ]
+    )
+
+    assert intervals == [
+        (plank_key, 0.0, 0.5, "uploading"),
+        (trigger_key, 0.0, 1.0, "training"),
+    ]
+
+
+def test_event_stage_pairing_ignores_orphan_success_before_start() -> None:
+    rows = [
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "training_job_succeeded",
+            "event_time_ms": "1000",
+            "job_id": "orphan",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "training_job_started",
+            "event_time_ms": "2000",
+            "job_id": "job-1",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "training_job_succeeded",
+            "event_time_ms": "3500",
+            "job_id": "job-1",
+        },
+    ]
+
+    intervals = _paired_event_intervals(
+        rows,
+        [("training_job_started", "training_job_succeeded", "training")],
+    )
+
+    assert intervals == [
+        (
+            ("road", "accuracy_trigger_cloud_retraining", "trigger", "1"),
+            2000.0,
+            3500.0,
+            "training",
+        )
+    ]
