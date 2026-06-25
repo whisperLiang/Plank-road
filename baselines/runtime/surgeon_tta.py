@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import threading
 import time
@@ -21,6 +22,7 @@ from edge.sample_quality import (
 )
 from edge.window_drift_detector import WindowDriftDetector
 from model_management.activation_sparsity import apply_das_to_model, compute_tgi
+from model_management.model_zoo import build_detection_model, get_model_family
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,24 @@ class _BufferedSample:
     frame: np.ndarray
     artifacts: dict[str, Any]
     latency_ms: float | None
+
+
+@dataclass(frozen=True)
+class PendingLocalTTAUpdate:
+    trigger_frame_id: int
+    trained_state_dict: dict[str, Any]
+    model_version_before: str
+    snapshot_lock_ms: float
+    batch_size: int
+    num_epoch: int
+    loss: float
+    das_enabled: bool
+    trainable_param_count: int
+    low_quality_sample_count: int
+    started_perf: float
+    shadow_train_ms: float
+    live_training_mode: bool
+    live_module_training_state: dict[str, bool]
 
 
 class _TTASkip(RuntimeError):
@@ -40,9 +60,17 @@ class _TTASkip(RuntimeError):
 class TTADetectionAdapter:
     """Small differentiable-output adapter for local detector TTA."""
 
-    def __init__(self, detector: object, *, entropy_margin_ratio: float = 0.4) -> None:
+    def __init__(
+        self,
+        detector: object,
+        *,
+        model_override: object | None = None,
+        entropy_margin_ratio: float = 0.4,
+    ) -> None:
         self.detector = detector
-        self.model = getattr(detector, "model", detector)
+        self.model = (
+            model_override if model_override is not None else getattr(detector, "model", detector)
+        )
         self.trainable_model = unwrap_trainable_module(
             self.model,
             model_name=str(getattr(detector, "model_name", "")),
@@ -294,14 +322,8 @@ class SurgeonLocalTTAUpdater:
             1,
             int(getattr(self.method_cfg, "max_local_buffer_samples", 64)),
         )
-        configured_num_epoch = getattr(self.training_cfg, "num_epoch", None)
-        legacy_tta_steps = getattr(self.method_cfg, "tta_steps", None)
-        if configured_num_epoch is not None:
-            self.num_epoch = max(1, int(configured_num_epoch))
-        elif legacy_tta_steps is not None:
-            self.num_epoch = max(1, int(legacy_tta_steps))
-        else:
-            self.num_epoch = 1
+        configured_num_epoch = getattr(self.training_cfg, "num_epoch", 1)
+        self.num_epoch = max(1, int(configured_num_epoch))
         self.consistency_weight = max(
             0.0,
             float(getattr(self.method_cfg, "consistency_weight", 0.01)),
@@ -324,6 +346,7 @@ class SurgeonLocalTTAUpdater:
         self._buffer: deque[_BufferedSample] = deque(maxlen=self.max_local_buffer_samples)
         self._lock = threading.Lock()
         self._running_thread: threading.Thread | None = None
+        self._pending_local_update: PendingLocalTTAUpdate | None = None
         self._closed = threading.Event()
         self._das_trainer = None
         self._das_model_id: int | None = None
@@ -381,6 +404,8 @@ class SurgeonLocalTTAUpdater:
                 return
             if self._running_thread is not None and self._running_thread.is_alive():
                 return
+            if self._pending_local_update is not None:
+                return
             selected = list(self._buffer)[: min(len(self._buffer), self.batch_size)]
             logger.info(
                 "[PureEdgeSURGEON] local TTA triggered: low_quality={} batch_size={} "
@@ -406,6 +431,7 @@ class SurgeonLocalTTAUpdater:
     def close(self) -> None:
         self._closed.set()
         self.wait_for_idle(timeout=10.0)
+        self.try_apply_pending_update()
 
     def wait_for_idle(self, *, timeout: float = 10.0) -> bool:
         thread = self._running_thread
@@ -513,10 +539,9 @@ class SurgeonLocalTTAUpdater:
             low_quality_sample_count=len(samples),
             batch_size=len(samples),
             num_epoch=self.num_epoch,
-            tta_steps=self.num_epoch,
         )
         try:
-            result = self._execute_tta(samples, trigger_frame_id)
+            update = self._execute_tta(samples, trigger_frame_id, started)
         except _TTASkip as exc:
             logger.info(
                 "[PureEdgeSURGEON][Train] skipped reason={} low_quality_sample_count={}",
@@ -538,36 +563,32 @@ class SurgeonLocalTTAUpdater:
                 low_quality_sample_count=len(samples),
             )
         else:
-            duration_ms = (time.perf_counter() - started) * 1000.0
-            self.metrics.record(
-                "surgeon_tta_done",
-                frame_id=int(trigger_frame_id),
-                low_quality_sample_count=len(samples),
-                batch_size=int(result["batch_size"]),
-                num_epoch=self.num_epoch,
-                tta_steps=self.num_epoch,
-                loss=float(result["loss"]),
-                duration_ms=duration_ms,
-                das_enabled=bool(result["das_enabled"]),
-                trainable_param_count=int(result["trainable_param_count"]),
-                model_version_before=str(result["model_version_before"]),
-                model_version_after=str(result["model_version_after"]),
-            )
-            logger.info(
-                "[PureEdgeSURGEON][Train] done epochs={} final_loss={:.6f} "
-                "model_version={} -> {} duration_ms={:.3f}",
-                self.num_epoch,
-                float(result["loss"]),
-                str(result["model_version_before"]),
-                str(result["model_version_after"]),
-                duration_ms,
-            )
-            self.metrics.record(
-                "local_model_update_applied",
-                frame_id=int(trigger_frame_id),
-                model_version_before=str(result["model_version_before"]),
-                model_version_after=str(result["model_version_after"]),
-            )
+            queued = False
+            with self._lock:
+                if self._pending_local_update is None:
+                    self._pending_local_update = update
+                    queued = True
+            if queued:
+                logger.info(
+                    "[PureEdgeSURGEON] shadow training done: final_loss={:.6f} "
+                    "pending_apply=true",
+                    float(update.loss),
+                )
+                self.metrics.record(
+                    "surgeon_tta_local_update_pending",
+                    frame_id=int(trigger_frame_id),
+                    batch_size=int(update.batch_size),
+                    num_epoch=int(update.num_epoch),
+                    loss=float(update.loss),
+                    model_version_before=str(update.model_version_before),
+                )
+            else:
+                self.metrics.record(
+                    "surgeon_tta_failed",
+                    frame_id=int(trigger_frame_id),
+                    message="pending_local_update_exists",
+                    low_quality_sample_count=len(samples),
+                )
         finally:
             with self._lock:
                 self._buffer = deque(
@@ -580,116 +601,418 @@ class SurgeonLocalTTAUpdater:
         self,
         samples: list[_BufferedSample],
         trigger_frame_id: int,
-    ) -> dict[str, Any]:
+        started_perf: float,
+    ) -> PendingLocalTTAUpdate:
         if self._edge is None:
             raise _TTASkip("edge_unavailable")
         detector = getattr(self._edge, "small_object_detection", None)
         if detector is None:
             raise _TTASkip("detector_unavailable")
-        adapter = TTADetectionAdapter(detector, entropy_margin_ratio=self.entropy_margin_ratio)
-        batch = adapter.build_batch([sample.frame for sample in samples])
-        trainable_model = adapter.trainable_model
+        live_model = getattr(detector, "model", detector)
         model_lock = getattr(detector, "model_lock", None)
         if model_lock is None:
             raise _TTASkip("model_lock_unavailable")
-        with model_lock:
-            previous_mode = bool(getattr(trainable_model, "training", False))
-            module_training_state = _module_training_state(trainable_model)
-            grad_state = _parameter_grad_state(trainable_model)
-            try:
-                das_trainer = self._ensure_das_trainer_locked(trainable_model)
-                self._select_trainable_parameters(trainable_model)
-                trainable_params = [
-                    param for param in trainable_model.parameters() if param.requires_grad
-                ]
-                trainable_param_count = sum(int(param.numel()) for param in trainable_params)
-                if not trainable_params:
-                    raise _TTASkip("no_trainable_parameters")
-                optimizer = self._make_optimizer(trainable_params)
-                if hasattr(trainable_model, "train"):
-                    trainable_model.train(True)
-                if das_trainer is not None:
-                    self._probe_das_locked(adapter, batch, trainable_model, das_trainer)
-                model_version_before = str(getattr(self._edge, "model_version", "0") or "0")
-                losses: list[float] = []
-                for epoch_index in range(self.num_epoch):
-                    epoch_started = time.perf_counter()
-                    epoch = epoch_index + 1
-                    optimizer.zero_grad(set_to_none=True)
-                    outputs = adapter.forward_tta_outputs(batch)
-                    entropy_loss, loss_stats = adapter.entropy_loss(outputs)
-                    loss = entropy_loss
-                    consistency_loss_value = 0.0
-                    weighted_consistency_loss_value = 0.0
-                    if self.consistency_weight > 0.0:
-                        augmented = adapter.forward_tta_outputs(batch, augment=True)
-                        consistency = adapter.consistency_loss(outputs, augmented)
-                        if consistency is not None:
-                            consistency_loss_value = float(consistency.detach().item())
-                            weighted_consistency = self.consistency_weight * consistency
-                            weighted_consistency_loss_value = float(
-                                weighted_consistency.detach().item()
-                            )
-                            loss = loss + weighted_consistency
-                    loss.backward()
-                    optimizer.step()
-                    loss_value = float(loss.detach().item())
-                    entropy_loss_value = float(entropy_loss.detach().item())
-                    epoch_ms = (time.perf_counter() - epoch_started) * 1000.0
-                    losses.append(loss_value)
-                    logger.info(
-                        "[PureEdgeSURGEON][Train] epoch={}/{} loss={:.6f} "
-                        "entropy_loss={:.6f} consistency_loss={:.6f} batch_size={} "
-                        "selected_logits={}/{} model_version={} das_enabled={} "
-                        "epoch_ms={:.3f}",
-                        epoch,
-                        self.num_epoch,
-                        loss_value,
-                        entropy_loss_value,
-                        consistency_loss_value,
-                        len(batch),
-                        int(loss_stats.get("selected_logit_count", 0)),
-                        int(loss_stats.get("logit_count", 0)),
-                        model_version_before,
-                        bool(das_trainer is not None),
-                        epoch_ms,
-                    )
-                    self.metrics.record(
-                        "surgeon_tta_epoch",
-                        frame_id=int(trigger_frame_id),
-                        epoch=int(epoch),
-                        total_epochs=int(self.num_epoch),
-                        loss=loss_value,
-                        entropy_loss=entropy_loss_value,
-                        consistency_loss=consistency_loss_value,
-                        weighted_consistency_loss=weighted_consistency_loss_value,
-                        batch_size=int(len(batch)),
-                        logit_count=int(loss_stats.get("logit_count", 0)),
-                        selected_logit_count=int(loss_stats.get("selected_logit_count", 0)),
-                        das_enabled=bool(das_trainer is not None),
-                        model_version=str(model_version_before),
-                        epoch_ms=float(epoch_ms),
-                    )
-                model_version_after = _next_surgeon_version(model_version_before)
-                self._edge.model_version = model_version_after
-                return {
-                    "batch_size": len(batch),
-                    "loss": losses[-1] if losses else 0.0,
-                    "das_enabled": das_trainer is not None,
-                    "trainable_param_count": trainable_param_count,
-                    "model_version_before": model_version_before,
-                    "model_version_after": model_version_after,
-                }
-            finally:
-                _clear_gradients(trainable_model)
-                _restore_parameter_grad_state(trainable_model, grad_state)
-                _restore_module_training_state(
-                    trainable_model,
-                    module_training_state,
-                    previous_mode,
-                )
 
-    def _ensure_das_trainer_locked(self, model: torch.nn.Module):
+        self.metrics.record(
+            "surgeon_tta_shadow_snapshot_started",
+            frame_id=int(trigger_frame_id),
+            low_quality_sample_count=len(samples),
+            batch_size=len(samples),
+        )
+        with model_lock:
+            snapshot = self._snapshot_live_model_locked(detector, live_model)
+        self.metrics.record(
+            "surgeon_tta_shadow_snapshot_done",
+            frame_id=int(trigger_frame_id),
+            snapshot_lock_ms=float(snapshot["snapshot_lock_ms"]),
+            model_version_before=str(snapshot["model_version_before"]),
+            model_class=str(snapshot["model_class"]),
+            trainable_model_class=str(snapshot["trainable_model_class"]),
+        )
+
+        shadow_model = self._build_shadow_training_model(detector, snapshot)
+        adapter = TTADetectionAdapter(
+            detector,
+            model_override=shadow_model,
+            entropy_margin_ratio=self.entropy_margin_ratio,
+        )
+        batch = adapter.build_batch([sample.frame for sample in samples])
+        train_result = self._train_shadow_model(
+            adapter=adapter,
+            batch=batch,
+            trigger_frame_id=trigger_frame_id,
+            model_version_before=str(snapshot["model_version_before"]),
+        )
+        return PendingLocalTTAUpdate(
+            trigger_frame_id=int(trigger_frame_id),
+            trained_state_dict=train_result["trained_state_dict"],
+            model_version_before=str(snapshot["model_version_before"]),
+            snapshot_lock_ms=float(snapshot["snapshot_lock_ms"]),
+            batch_size=int(train_result["batch_size"]),
+            num_epoch=int(self.num_epoch),
+            loss=float(train_result["loss"]),
+            das_enabled=bool(train_result["das_enabled"]),
+            trainable_param_count=int(train_result["trainable_param_count"]),
+            low_quality_sample_count=len(samples),
+            started_perf=float(started_perf),
+            shadow_train_ms=float(train_result["shadow_train_ms"]),
+            live_training_mode=bool(snapshot["training"]),
+            live_module_training_state=dict(snapshot["module_training_state"]),
+        )
+
+    def try_apply_pending_update(self) -> bool:
+        if self._edge is None:
+            return False
+        with self._lock:
+            update = self._pending_local_update
+        if update is None:
+            return False
+        detector = getattr(self._edge, "small_object_detection", None)
+        if detector is None:
+            self._discard_pending_update_failed(update, "detector_unavailable")
+            return False
+        model_lock = getattr(detector, "model_lock", None)
+        if model_lock is None:
+            self._discard_pending_update_failed(update, "model_lock_unavailable")
+            return False
+        if not model_lock.acquire(blocking=False):
+            return False
+        with self._lock:
+            if self._pending_local_update is not update:
+                model_lock.release()
+                return False
+        try:
+            live_model = getattr(detector, "model", detector)
+            model_version_after, apply_lock_ms = self._apply_shadow_update_locked(
+                detector,
+                live_model,
+                update.trained_state_dict,
+                update.model_version_before,
+                update.live_training_mode,
+                update.live_module_training_state,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve live inference and record metrics.
+            self.metrics.record(
+                "surgeon_tta_failed",
+                frame_id=int(update.trigger_frame_id),
+                message=str(exc),
+                low_quality_sample_count=int(update.low_quality_sample_count),
+                model_version_before=str(update.model_version_before),
+            )
+            with self._lock:
+                if self._pending_local_update is update:
+                    self._pending_local_update = None
+            return False
+        finally:
+            model_lock.release()
+
+        duration_ms = (time.perf_counter() - update.started_perf) * 1000.0
+        logger.info(
+            "[PureEdgeSURGEON] local update applied: model_version={} -> {} "
+            "apply_lock_ms={:.3f}",
+            update.model_version_before,
+            model_version_after,
+            apply_lock_ms,
+        )
+        self.metrics.record(
+            "surgeon_tta_done",
+            frame_id=int(update.trigger_frame_id),
+            low_quality_sample_count=int(update.low_quality_sample_count),
+            batch_size=int(update.batch_size),
+            num_epoch=int(update.num_epoch),
+            loss=float(update.loss),
+            duration_ms=float(duration_ms),
+            shadow_train_ms=float(update.shadow_train_ms),
+            das_enabled=bool(update.das_enabled),
+            trainable_param_count=int(update.trainable_param_count),
+            model_version_before=str(update.model_version_before),
+            model_version_after=str(model_version_after),
+            shadow_training=True,
+            live_model_lock_held_during_training=False,
+            snapshot_lock_ms=float(update.snapshot_lock_ms),
+            apply_lock_ms=float(apply_lock_ms),
+        )
+        self.metrics.record(
+            "local_model_update_applied",
+            frame_id=int(update.trigger_frame_id),
+            model_version_before=str(update.model_version_before),
+            model_version_after=str(model_version_after),
+            apply_lock_ms=float(apply_lock_ms),
+        )
+        with self._lock:
+            if self._pending_local_update is update:
+                self._pending_local_update = None
+        return True
+
+    def _discard_pending_update_failed(
+        self,
+        update: PendingLocalTTAUpdate,
+        reason: str,
+    ) -> None:
+        self.metrics.record(
+            "surgeon_tta_failed",
+            frame_id=int(update.trigger_frame_id),
+            message=str(reason),
+            low_quality_sample_count=int(update.low_quality_sample_count),
+            model_version_before=str(update.model_version_before),
+        )
+        with self._lock:
+            if self._pending_local_update is update:
+                self._pending_local_update = None
+
+    def _snapshot_live_model_locked(self, detector: object, live_model: object) -> dict[str, Any]:
+        started = time.perf_counter()
+        trainable_model = unwrap_trainable_module(
+            live_model,
+            model_name=str(getattr(detector, "model_name", "")),
+        )
+        if not hasattr(trainable_model, "state_dict"):
+            raise _TTASkip("model_state_unavailable")
+        state_dict = _clone_state_dict_to_cpu(trainable_model.state_dict())
+        snapshot_lock_ms = (time.perf_counter() - started) * 1000.0
+        return {
+            "live_model_ref": live_model,
+            "model_name": str(getattr(detector, "model_name", "") or ""),
+            "model_class": type(live_model).__name__,
+            "trainable_model_class": type(trainable_model).__name__,
+            "device": _model_device(trainable_model),
+            "state_dict": state_dict,
+            "model_version_before": str(getattr(self._edge, "model_version", "0") or "0"),
+            "training": bool(getattr(trainable_model, "training", False)),
+            "module_training_state": _module_training_state(trainable_model),
+            "snapshot_lock_ms": snapshot_lock_ms,
+        }
+
+    def _build_shadow_training_model(
+        self,
+        detector: object,
+        snapshot: dict[str, Any],
+    ) -> torch.nn.Module:
+        live_model = snapshot["live_model_ref"]
+        try:
+            shadow_model = copy.deepcopy(live_model)
+        except Exception as deepcopy_exc:  # noqa: BLE001 - fallback to model zoo below.
+            shadow_model = self._build_shadow_from_model_zoo(detector, snapshot, deepcopy_exc)
+        shadow_trainable = unwrap_trainable_module(
+            shadow_model,
+            model_name=str(snapshot.get("model_name", "")),
+        )
+        training_device = self._resolve_training_device(snapshot)
+        if isinstance(shadow_model, torch.nn.Module):
+            shadow_model.to(training_device)
+        if isinstance(shadow_trainable, torch.nn.Module):
+            shadow_trainable.to(training_device)
+        shadow_trainable.load_state_dict(
+            _state_dict_to_device(snapshot["state_dict"], training_device),
+            strict=True,
+        )
+        return shadow_model
+
+    def _build_shadow_from_model_zoo(
+        self,
+        detector: object,
+        snapshot: dict[str, Any],
+        deepcopy_exc: Exception,
+    ) -> torch.nn.Module:
+        model_name = str(snapshot.get("model_name", "") or "")
+        if not model_name:
+            raise RuntimeError(
+                "shadow model deepcopy failed and detector model_name is unavailable"
+            ) from deepcopy_exc
+        detector_config = getattr(detector, "config", None)
+        build_kwargs: dict[str, Any] = {}
+        try:
+            if get_model_family(model_name) == "tinynext":
+                configured_input_size = getattr(detector_config, "tinynext_input_size", None)
+                if configured_input_size is not None:
+                    build_kwargs["tinynext_input_size"] = int(configured_input_size)
+        except Exception:
+            pass
+        live_model = snapshot.get("live_model_ref")
+        confidence = float(getattr(live_model, "confidence", 0.01))
+        return build_detection_model(
+            model_name,
+            pretrained=False,
+            device=self._resolve_training_device(snapshot),
+            confidence=confidence,
+            **build_kwargs,
+        )
+
+    def _train_shadow_model(
+        self,
+        *,
+        adapter: TTADetectionAdapter,
+        batch: list[torch.Tensor],
+        trigger_frame_id: int,
+        model_version_before: str,
+    ) -> dict[str, Any]:
+        trainable_model = adapter.trainable_model
+        batch = _move_batch_to_device(batch, _model_device(trainable_model))
+        previous_mode = bool(getattr(trainable_model, "training", False))
+        module_training_state = _module_training_state(trainable_model)
+        grad_state = _parameter_grad_state(trainable_model)
+        train_started = time.perf_counter()
+        self.metrics.record(
+            "surgeon_tta_shadow_train_started",
+            frame_id=int(trigger_frame_id),
+            batch_size=int(len(batch)),
+            num_epoch=int(self.num_epoch),
+            model_version_before=str(model_version_before),
+        )
+        logger.info(
+            "[PureEdgeSURGEON] shadow training started: batch_size={} epochs={}",
+            int(len(batch)),
+            int(self.num_epoch),
+        )
+        try:
+            das_trainer = self._ensure_das_trainer(trainable_model)
+            self._select_trainable_parameters(trainable_model)
+            trainable_params = [
+                param for param in trainable_model.parameters() if param.requires_grad
+            ]
+            trainable_param_count = sum(int(param.numel()) for param in trainable_params)
+            if not trainable_params:
+                raise _TTASkip("no_trainable_parameters")
+            optimizer = self._make_optimizer(trainable_params)
+            if hasattr(trainable_model, "train"):
+                trainable_model.train(True)
+            if das_trainer is not None:
+                self._probe_das(adapter, batch, trainable_model, das_trainer)
+            losses: list[float] = []
+            for epoch_index in range(self.num_epoch):
+                epoch_started = time.perf_counter()
+                epoch = epoch_index + 1
+                optimizer.zero_grad(set_to_none=True)
+                outputs = adapter.forward_tta_outputs(batch)
+                entropy_loss, loss_stats = adapter.entropy_loss(outputs)
+                loss = entropy_loss
+                consistency_loss_value = 0.0
+                weighted_consistency_loss_value = 0.0
+                if self.consistency_weight > 0.0:
+                    augmented = adapter.forward_tta_outputs(batch, augment=True)
+                    consistency = adapter.consistency_loss(outputs, augmented)
+                    if consistency is not None:
+                        consistency_loss_value = float(consistency.detach().item())
+                        weighted_consistency = self.consistency_weight * consistency
+                        weighted_consistency_loss_value = float(
+                            weighted_consistency.detach().item()
+                        )
+                        loss = loss + weighted_consistency
+                loss.backward()
+                optimizer.step()
+                loss_value = float(loss.detach().item())
+                entropy_loss_value = float(entropy_loss.detach().item())
+                epoch_ms = (time.perf_counter() - epoch_started) * 1000.0
+                losses.append(loss_value)
+                logger.info(
+                    "[PureEdgeSURGEON][Train] epoch={}/{} loss={:.6f} "
+                    "entropy_loss={:.6f} consistency_loss={:.6f} batch_size={} "
+                    "selected_logits={}/{} model_version={} das_enabled={} "
+                    "epoch_ms={:.3f}",
+                    epoch,
+                    self.num_epoch,
+                    loss_value,
+                    entropy_loss_value,
+                    consistency_loss_value,
+                    len(batch),
+                    int(loss_stats.get("selected_logit_count", 0)),
+                    int(loss_stats.get("logit_count", 0)),
+                    model_version_before,
+                    bool(das_trainer is not None),
+                    epoch_ms,
+                )
+                self.metrics.record(
+                    "surgeon_tta_epoch",
+                    frame_id=int(trigger_frame_id),
+                    epoch=int(epoch),
+                    total_epochs=int(self.num_epoch),
+                    loss=loss_value,
+                    entropy_loss=entropy_loss_value,
+                    consistency_loss=consistency_loss_value,
+                    weighted_consistency_loss=weighted_consistency_loss_value,
+                    batch_size=int(len(batch)),
+                    logit_count=int(loss_stats.get("logit_count", 0)),
+                    selected_logit_count=int(loss_stats.get("selected_logit_count", 0)),
+                    das_enabled=bool(das_trainer is not None),
+                    model_version=str(model_version_before),
+                    epoch_ms=float(epoch_ms),
+                )
+            shadow_train_ms = (time.perf_counter() - train_started) * 1000.0
+            final_loss = losses[-1] if losses else 0.0
+            self.metrics.record(
+                "surgeon_tta_shadow_train_done",
+                frame_id=int(trigger_frame_id),
+                batch_size=int(len(batch)),
+                num_epoch=int(self.num_epoch),
+                loss=float(final_loss),
+                shadow_train_ms=float(shadow_train_ms),
+                model_version_before=str(model_version_before),
+                das_enabled=bool(das_trainer is not None),
+                trainable_param_count=int(trainable_param_count),
+            )
+            return {
+                "batch_size": len(batch),
+                "loss": final_loss,
+                "das_enabled": das_trainer is not None,
+                "trainable_param_count": trainable_param_count,
+                "shadow_train_ms": shadow_train_ms,
+                "trained_state_dict": _clone_state_dict_to_cpu(trainable_model.state_dict()),
+            }
+        finally:
+            _clear_gradients(trainable_model)
+            _restore_parameter_grad_state(trainable_model, grad_state)
+            _restore_module_training_state(
+                trainable_model,
+                module_training_state,
+                previous_mode,
+            )
+            if self._das_model_id == id(trainable_model):
+                self._das_trainer = None
+                self._das_model_id = None
+
+    def _apply_shadow_update_locked(
+        self,
+        detector: object,
+        live_model: object,
+        trained_state_dict: dict[str, Any],
+        model_version_before: str,
+        live_training_mode: bool,
+        live_module_training_state: dict[str, bool],
+    ) -> tuple[str, float]:
+        del detector
+        started = time.perf_counter()
+        trainable_model = unwrap_trainable_module(live_model)
+        current_version = str(getattr(self._edge, "model_version", "0") or "0")
+        if current_version != str(model_version_before):
+            raise RuntimeError(
+                "live model version changed before local SURGEON apply: "
+                f"{current_version} != {model_version_before}"
+            )
+        live_state = trainable_model.state_dict()
+        _validate_state_dict_compatible(live_state, trained_state_dict)
+        trainable_model.load_state_dict(
+            _state_dict_to_device(trained_state_dict, _model_device(trainable_model)),
+            strict=True,
+        )
+        _clear_gradients(trainable_model)
+        _restore_module_training_state(
+            trainable_model,
+            live_module_training_state,
+            bool(live_training_mode),
+        )
+        model_version_after = _next_surgeon_version(model_version_before)
+        self._edge.model_version = model_version_after
+        apply_lock_ms = (time.perf_counter() - started) * 1000.0
+        return model_version_after, apply_lock_ms
+
+    def _resolve_training_device(self, snapshot: dict[str, Any]) -> torch.device:
+        configured = str(getattr(self.training_cfg, "device", "auto") or "auto").strip().lower()
+        if configured and configured != "auto":
+            return torch.device(configured)
+        device = snapshot.get("device")
+        return device if isinstance(device, torch.device) else torch.device(str(device or "cpu"))
+
+    def _ensure_das_trainer(self, model: torch.nn.Module):
         if not bool(getattr(self.das_cfg, "enabled", False)):
             return None
         if self._das_trainer is not None and self._das_model_id == id(model):
@@ -705,7 +1028,7 @@ class SurgeonLocalTTAUpdater:
         self._das_model_id = id(model)
         return self._das_trainer
 
-    def _probe_das_locked(self, adapter, batch, model, das_trainer) -> None:
+    def _probe_das(self, adapter, batch, model, das_trainer) -> None:
         das_trainer.deactivate_sparsity()
         _clear_gradients(model)
         outputs = adapter.forward_tta_outputs(batch)
@@ -734,6 +1057,56 @@ class SurgeonLocalTTAUpdater:
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
+
+
+def _clone_state_dict_to_cpu(state_dict: dict[str, Any]) -> dict[str, Any]:
+    cloned: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            cloned[str(key)] = value.detach().clone().cpu()
+        else:
+            cloned[str(key)] = copy.deepcopy(value)
+    return cloned
+
+
+def _state_dict_to_device(state_dict: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    moved: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            moved[str(key)] = value.to(device=device)
+        else:
+            moved[str(key)] = copy.deepcopy(value)
+    return moved
+
+
+def _move_batch_to_device(batch: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
+    return [item.to(device=device) if isinstance(item, torch.Tensor) else item for item in batch]
+
+
+def _validate_state_dict_compatible(
+    live_state: dict[str, Any],
+    trained_state: dict[str, Any],
+) -> None:
+    live_keys = set(live_state)
+    trained_keys = set(trained_state)
+    if live_keys != trained_keys:
+        missing = sorted(live_keys - trained_keys)[:5]
+        unexpected = sorted(trained_keys - live_keys)[:5]
+        raise RuntimeError(
+            "trained shadow state_dict keys do not match live model "
+            f"missing={missing} unexpected={unexpected}"
+        )
+    for key, live_value in live_state.items():
+        trained_value = trained_state[key]
+        if isinstance(live_value, torch.Tensor) != isinstance(trained_value, torch.Tensor):
+            raise RuntimeError(f"trained shadow state_dict type mismatch for {key}")
+        if not isinstance(live_value, torch.Tensor):
+            continue
+        if tuple(live_value.shape) != tuple(trained_value.shape):
+            raise RuntimeError(
+                "trained shadow state_dict shape mismatch for "
+                f"{key}: {tuple(trained_value.shape)} != {tuple(live_value.shape)}"
+            )
 
 
 def _prediction_from_artifacts(artifacts: dict[str, Any]) -> dict[str, Any]:

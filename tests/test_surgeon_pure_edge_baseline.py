@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +26,6 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 use_cloud_teacher=False,
                 training_strategy="surgeon_tta",
                 quality_mode="output_only_when_no_boundary",
-                tta_steps=1,
                 trigger_low_quality_samples=2,
                 max_local_buffer_samples=8,
                 trainable_scope="norm_affine",
@@ -103,6 +103,19 @@ class ToyTTAModel(torch.nn.Module):
         return {"logits": logits}
 
 
+class BlockingToyTTAModel(ToyTTAModel):
+    entered_event: threading.Event | None = None
+    release_event: threading.Event | None = None
+
+    def forward_tta_outputs(self, images, *, augment: bool = False):
+        event = type(self).entered_event
+        release = type(self).release_event
+        if event is not None and release is not None and not event.is_set():
+            event.set()
+            assert release.wait(timeout=5.0)
+        return super().forward_tta_outputs(images, augment=augment)
+
+
 class FakeDetector:
     def __init__(self, model: torch.nn.Module) -> None:
         self.model = model
@@ -174,6 +187,54 @@ def _metrics(adapter: BaselineEdgeAdapter) -> list[dict[str, object]]:
     ]
 
 
+def _clone_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+
+def _states_equal(left: dict[str, torch.Tensor], right: dict[str, torch.Tensor]) -> bool:
+    return left.keys() == right.keys() and all(torch.equal(left[key], right[key]) for key in left)
+
+
+def _states_differ(left: dict[str, torch.Tensor], right: dict[str, torch.Tensor]) -> bool:
+    return left.keys() == right.keys() and any(
+        not torch.equal(left[key], right[key]) for key in left
+    )
+
+
+def _finish_pending_tta(adapter: BaselineEdgeAdapter) -> None:
+    assert adapter._surgeon_tta is not None
+    assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+    assert adapter._surgeon_tta.try_apply_pending_update()
+
+
+def test_das_shadow_training_releases_cached_trainer(tmp_path) -> None:
+    model = ToyTTAModel()
+    model.eval()
+    edge = FakeEdge(model)
+    config = _config(tmp_path)
+    config.das.enabled = True
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="pure_edge_local_updating",
+        run_id="pure-surgeon-das-test",
+        edge_id=1,
+        transport=None,
+    )
+    try:
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        assert adapter._surgeon_tta._pending_local_update is not None
+        assert adapter._surgeon_tta._das_trainer is None
+        assert adapter._surgeon_tta._das_model_id is None
+        assert adapter._surgeon_tta.try_apply_pending_update()
+        assert edge.model_version == "surgeon_1"
+    finally:
+        adapter.close()
+
+
 class RFDETRLikeWrapper(torch.nn.Module):
     def __init__(self, inner: ToyTTAModel) -> None:
         super().__init__()
@@ -237,8 +298,7 @@ def test_tta_selects_inner_trainable_module_for_detector_wrappers(tmp_path) -> N
         adapter.before_video_start(edge)
         _sample(adapter, 1)
         _sample(adapter, 2)
-        assert adapter._surgeon_tta is not None
-        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        _finish_pending_tta(adapter)
 
         rows = _metrics(adapter)
         done = next(row for row in rows if row["event"] == "surgeon_tta_done")
@@ -256,11 +316,16 @@ def test_low_quality_samples_trigger_local_tta_and_update_model_version(tmp_path
     edge = FakeEdge(model)
     adapter = _adapter(tmp_path)
     try:
+        before = _clone_state(model)
         adapter.before_video_start(edge)
         _sample(adapter, 1)
         _sample(adapter, 2)
         assert adapter._surgeon_tta is not None
         assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        assert adapter._surgeon_tta._pending_local_update is not None
+        assert edge.model_version == "0"
+        assert _states_equal(before, _clone_state(model))
+        assert adapter._surgeon_tta.try_apply_pending_update()
 
         rows = _metrics(adapter)
         events = [row["event"] for row in rows]
@@ -269,6 +334,11 @@ def test_low_quality_samples_trigger_local_tta_and_update_model_version(tmp_path
         done = next(row for row in rows if row["event"] == "surgeon_tta_done")
         assert "surgeon_tta_triggered" in events
         assert "surgeon_tta_started" in events
+        assert "surgeon_tta_shadow_snapshot_started" in events
+        assert "surgeon_tta_shadow_snapshot_done" in events
+        assert "surgeon_tta_shadow_train_started" in events
+        assert "surgeon_tta_shadow_train_done" in events
+        assert "surgeon_tta_local_update_pending" in events
         assert "local_model_update_applied" in events
         assert started["num_epoch"] == 3
         assert len(epochs) == 3
@@ -285,10 +355,113 @@ def test_low_quality_samples_trigger_local_tta_and_update_model_version(tmp_path
         assert done["num_epoch"] == 3
         assert done["model_version_before"] == "0"
         assert done["model_version_after"] == "surgeon_1"
+        assert done["shadow_training"] is True
+        assert done["live_model_lock_held_during_training"] is False
+        assert done["snapshot_lock_ms"] >= 0
+        assert done["apply_lock_ms"] >= 0
         assert done["trainable_param_count"] > 0
         assert edge.model_version == "surgeon_1"
         assert edge.apply_model_update_calls == 0
+        assert _states_differ(before, _clone_state(model))
         assert model.training is False
+    finally:
+        adapter.close()
+
+
+def test_shadow_training_does_not_hold_live_model_lock(tmp_path) -> None:
+    model = BlockingToyTTAModel()
+    model.eval()
+    edge = FakeEdge(model)
+    adapter = _adapter(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    BlockingToyTTAModel.entered_event = entered
+    BlockingToyTTAModel.release_event = release
+    try:
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert entered.wait(timeout=5.0)
+        acquired = edge.small_object_detection.model_lock.acquire(blocking=False)
+        try:
+            assert acquired
+        finally:
+            if acquired:
+                edge.small_object_detection.model_lock.release()
+        release.set()
+        _finish_pending_tta(adapter)
+
+        rows = _metrics(adapter)
+        done = next(row for row in rows if row["event"] == "surgeon_tta_done")
+        assert done["live_model_lock_held_during_training"] is False
+        assert edge.model_version == "surgeon_1"
+    finally:
+        release.set()
+        BlockingToyTTAModel.entered_event = None
+        BlockingToyTTAModel.release_event = None
+        adapter.close()
+
+
+def test_pending_local_update_defers_when_model_lock_is_busy(tmp_path) -> None:
+    model = ToyTTAModel()
+    model.eval()
+    edge = FakeEdge(model)
+    adapter = _adapter(tmp_path)
+    try:
+        before = _clone_state(model)
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        assert adapter._surgeon_tta._pending_local_update is not None
+
+        edge.small_object_detection.model_lock.acquire()
+        try:
+            started = time.perf_counter()
+            assert adapter._surgeon_tta.try_apply_pending_update() is False
+            assert (time.perf_counter() - started) < 0.5
+            assert adapter._surgeon_tta._pending_local_update is not None
+            assert edge.model_version == "0"
+            assert _states_equal(before, _clone_state(model))
+        finally:
+            edge.small_object_detection.model_lock.release()
+
+        assert adapter._surgeon_tta.try_apply_pending_update() is True
+        assert adapter._surgeon_tta._pending_local_update is None
+        assert edge.model_version == "surgeon_1"
+        assert _states_differ(before, _clone_state(model))
+    finally:
+        adapter.close()
+
+
+def test_shadow_apply_failure_leaves_live_model_unchanged(tmp_path) -> None:
+    model = ToyTTAModel()
+    model.eval()
+    edge = FakeEdge(model)
+    adapter = _adapter(tmp_path)
+    try:
+        before = _clone_state(model)
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        pending = adapter._surgeon_tta._pending_local_update
+        assert pending is not None
+        first_tensor_key = next(
+            key
+            for key, value in pending.trained_state_dict.items()
+            if isinstance(value, torch.Tensor)
+        )
+        pending.trained_state_dict[first_tensor_key] = torch.zeros(1)
+
+        assert adapter._surgeon_tta.try_apply_pending_update() is False
+        assert adapter._surgeon_tta._pending_local_update is None
+        assert edge.model_version == "0"
+        assert _states_equal(before, _clone_state(model))
+        rows = _metrics(adapter)
+        assert any(row["event"] == "surgeon_tta_failed" for row in rows)
     finally:
         adapter.close()
 
@@ -303,8 +476,7 @@ def test_rfdetr_capability_fallback_does_not_require_fixed_class_name(tmp_path) 
         adapter.before_video_start(edge)
         _sample(adapter, 1)
         _sample(adapter, 2)
-        assert adapter._surgeon_tta is not None
-        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        _finish_pending_tta(adapter)
 
         rows = _metrics(adapter)
         epochs = [row for row in rows if row["event"] == "surgeon_tta_epoch"]
@@ -324,6 +496,7 @@ def test_logits_unavailable_skips_without_cloud_update_and_restores_mode(tmp_pat
     edge = FakeEdge(model)
     adapter = _adapter(tmp_path)
     try:
+        before = _clone_state(model)
         adapter.before_video_start(edge)
         _sample(adapter, 1)
         _sample(adapter, 2)
@@ -337,6 +510,7 @@ def test_logits_unavailable_skips_without_cloud_update_and_restores_mode(tmp_pat
         assert not any(row["event"] == "surgeon_tta_epoch" for row in rows)
         assert edge.model_version == "0"
         assert edge.apply_model_update_calls == 0
+        assert _states_equal(before, _clone_state(model))
         assert model.training is False
         assert sum(1 for row in rows if row["event"] == "frame_decision") >= 3
     finally:
@@ -374,6 +548,7 @@ def test_failed_tta_restores_mode_and_later_inference_continues(tmp_path) -> Non
     edge = FakeEdge(model)
     adapter = _adapter(tmp_path)
     try:
+        before = _clone_state(model)
         adapter.before_video_start(edge)
         _sample(adapter, 1)
         _sample(adapter, 2)
@@ -383,6 +558,8 @@ def test_failed_tta_restores_mode_and_later_inference_continues(tmp_path) -> Non
         _sample(adapter, 3)
         rows = _metrics(adapter)
         assert any(row["event"] == "surgeon_tta_failed" for row in rows)
+        assert edge.model_version == "0"
+        assert _states_equal(before, _clone_state(model))
         assert model.training is False
         assert sum(1 for row in rows if row["event"] == "frame_decision") >= 3
     finally:

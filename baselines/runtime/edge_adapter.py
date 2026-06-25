@@ -229,6 +229,7 @@ class BaselineEdgeAdapter:
                 artifacts,
                 latency_ms,
             )
+            self._surgeon_tta.try_apply_pending_update()
         if decision.upload_frame and self.transport is not None:
             if self.baseline_method == "accuracy_trigger_cloud_retraining":
                 self._buffer_accuracy_trigger_payload(payload)
@@ -237,6 +238,8 @@ class BaselineEdgeAdapter:
 
     def on_unsampled_frame(self, *, frame, frame_index: int, latest_visual: dict[str, Any]) -> None:
         del frame, frame_index, latest_visual
+        if self._surgeon_tta is not None:
+            self._surgeon_tta.try_apply_pending_update()
 
     def display_visual(self, local_visual: dict[str, Any]) -> dict[str, Any]:
         return local_visual
