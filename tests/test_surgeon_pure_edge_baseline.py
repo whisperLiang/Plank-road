@@ -495,18 +495,34 @@ def test_rfdetr_tta_entropy_uses_sigmoid_foreground_logits_only() -> None:
     wrapper = RFDETRCapabilityWrapper(RFDETRCapabilityCore())
     detector = FakeDetector(wrapper)
     adapter = TTADetectionAdapter(detector, entropy_margin_ratio=1.0)
-    logits = torch.tensor([[[0.0, -4.0, 8.0]]], requires_grad=True)
+    logits = torch.tensor([[[0.0, -4.0, 8.0], [-8.0, -7.0, 8.0]]], requires_grad=True)
     outputs = {
         "pred_logits": logits,
-        "pred_boxes": torch.zeros((1, 1, 4), dtype=torch.float32),
+        "pred_boxes": torch.zeros((1, 2, 4), dtype=torch.float32),
     }
 
     loss, stats = adapter.entropy_loss(outputs)
     loss.backward()
 
     assert float(loss.detach().item()) == pytest.approx(1.0)
-    assert stats["logit_count"] == 1
+    assert stats["logit_count"] == 2
+    assert stats["foreground_logit_count"] == 1
+    assert stats["selected_logit_count"] == 1
     assert float(logits.grad[0, 0, 2].item()) == pytest.approx(0.0)
+    assert float(logits.grad[0, 1].abs().sum().item()) == pytest.approx(0.0)
+
+
+def test_rfdetr_tta_entropy_skips_empty_foreground_batches() -> None:
+    wrapper = RFDETRCapabilityWrapper(RFDETRCapabilityCore())
+    detector = FakeDetector(wrapper)
+    adapter = TTADetectionAdapter(detector, entropy_margin_ratio=1.0)
+    outputs = {
+        "pred_logits": torch.tensor([[[-8.0, -7.0, 8.0]]], requires_grad=True),
+        "pred_boxes": torch.zeros((1, 1, 4), dtype=torch.float32),
+    }
+
+    with pytest.raises(RuntimeError, match="no_foreground_logits"):
+        adapter.entropy_loss(outputs)
 
 
 def test_logits_unavailable_skips_without_cloud_update_and_restores_mode(tmp_path) -> None:

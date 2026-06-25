@@ -20,6 +20,9 @@ experiment_results:
  include_trigger_manifest: true
  include_runtime_logs: false
  max_artifact_bytes: 268435456
+ pure_edge_remote_sync:
+  target: whisperliang@192.168.66.205:/home/whisperliang/Plank-road
+  timeout_sec: 300
 
 baseline:
  enabled: false

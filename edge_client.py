@@ -16,6 +16,7 @@ from loguru import logger
 from baselines.runtime import BaselineEdgeAdapter
 from common.experiment_results import (
     PLANK_ROAD_METHOD,
+    PURE_EDGE_METHOD,
     ExperimentJsonlWriter,
     collect_edge_artifacts,
     edge_run_dir,
@@ -32,6 +33,7 @@ from edge.box_motion import compensate_boxes_between_frames
 from edge.edge_worker import EdgeWorker
 from edge.experiment_result_uploader import ExperimentResultUploader
 from edge.info import TASK_STATE
+from edge.pure_edge_remote_sync import PureEdgeRemoteSyncer, PureEdgeRemoteSyncError
 from edge.replay_frame_archiver import ReplayFrameArchiver
 from edge.task import Task
 from model_management.utils import draw_detection
@@ -282,7 +284,7 @@ def _split_learning_status(config) -> str:
 
 
 def _baseline_requires_cloud(baseline_method: str) -> bool:
-    return validate_baseline_method(baseline_method) != "pure_edge_local_updating"
+    return validate_baseline_method(baseline_method) != PURE_EDGE_METHOD
 
 
 def _experiment_result_upload_enabled(
@@ -293,7 +295,7 @@ def _experiment_result_upload_enabled(
     disable_experiment_result_upload: bool,
 ) -> bool:
     pure_edge_local = (
-        str(mode) == "baseline" and str(baseline_method or "") == "pure_edge_local_updating"
+        str(mode) == "baseline" and str(baseline_method or "") == PURE_EDGE_METHOD
     )
     return bool(
         getattr(experiment_results, "upload_to_cloud", False)
@@ -333,6 +335,26 @@ def _upload_experiment_run_artifacts_if_enabled(
             edge_id=int(edge_id),
             artifacts=artifacts,
         )
+    )
+
+
+def _sync_pure_edge_results(
+    *,
+    experiment_results: object,
+    local_run_dir: Path,
+    comparison_id: str,
+    run_id: str,
+    method: str,
+    edge_id: int,
+    syncer_cls=PureEdgeRemoteSyncer,
+) -> str:
+    syncer = syncer_cls(experiment_results)
+    return syncer.sync_run_dir(
+        local_run_dir=local_run_dir,
+        comparison_id=comparison_id,
+        method=method,
+        edge_id=int(edge_id),
+        run_id=run_id,
     )
 
 
@@ -1051,6 +1073,7 @@ if __name__ == "__main__":
         if baseline_adapter is not None:
             baseline_adapter.close()
         edge.close()
+        pure_edge_sync_error: PureEdgeRemoteSyncError | None = None
         try:
             if bool(experiment_results.include_trigger_manifest):
                 _write_trigger_manifest_from_metrics(run_dir)
@@ -1094,10 +1117,24 @@ if __name__ == "__main__":
                     edge_id=int(config.edge_id),
                     artifacts=artifacts,
                 )
+                if args.mode == "baseline" and baseline_method == PURE_EDGE_METHOD:
+                    _sync_pure_edge_results(
+                        experiment_results=experiment_results,
+                        local_run_dir=run_dir,
+                        comparison_id=comparison_id,
+                        run_id=run_id,
+                        method=method,
+                        edge_id=int(config.edge_id),
+                    )
+        except PureEdgeRemoteSyncError as exc:
+            logger.error("Pure Edge experiment result upload failed: {}", exc)
+            pure_edge_sync_error = exc
         except Exception as exc:
             logger.warning("Experiment result archival failed during shutdown: {}", exc)
         finally:
             if experiment_log_sink is not None:
                 logger.remove(experiment_log_sink)
-        if not args.headless:
-            cv2.destroyAllWindows()
+            if not args.headless:
+                cv2.destroyAllWindows()
+        if pure_edge_sync_error is not None:
+            raise pure_edge_sync_error

@@ -20,6 +20,7 @@ from edge_client import (
     _experiment_result_upload_enabled,
     _prepare_experiment_run_dir,
     _resolve_baseline_run_id,
+    _sync_pure_edge_results,
     _upload_experiment_run_artifacts_if_enabled,
     _validate_startup_config,
 )
@@ -545,6 +546,35 @@ def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> N
     assert calls[0] == {"event": "init", "server_ip": "127.0.0.1:1", "enabled": True}
     assert calls[1]["event"] == "upload"
     assert calls[1]["method"] == "accuracy_trigger_cloud_retraining"
+
+
+def test_pure_edge_shutdown_sync_helper_uploads_run_dir(tmp_path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeSyncer:
+        def __init__(self, experiment_results) -> None:
+            calls.append({"event": "init", "experiment_results": experiment_results})
+
+        def sync_run_dir(self, **kwargs) -> str:
+            calls.append({"event": "sync", **kwargs})
+            return "whisperliang@192.168.66.205:/remote/run"
+
+    experiment_results = SimpleNamespace()
+    result = _sync_pure_edge_results(
+        experiment_results=experiment_results,
+        local_run_dir=tmp_path / "run",
+        comparison_id="comparison",
+        run_id="pure-run",
+        method="pure_edge_local_updating",
+        edge_id=1,
+        syncer_cls=FakeSyncer,
+    )
+
+    assert result == "whisperliang@192.168.66.205:/remote/run"
+    assert calls[0] == {"event": "init", "experiment_results": experiment_results}
+    assert calls[1]["event"] == "sync"
+    assert calls[1]["local_run_dir"] == tmp_path / "run"
+    assert calls[1]["run_id"] == "pure-run"
 
 
 def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_path) -> None:

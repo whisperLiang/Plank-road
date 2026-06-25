@@ -24,6 +24,8 @@ from edge.window_drift_detector import WindowDriftDetector
 from model_management.activation_sparsity import apply_das_to_model, compute_tgi
 from model_management.model_zoo import build_detection_model, get_model_family
 
+_SIGMOID_FOREGROUND_PROBABILITY_FLOOR = 0.5
+
 
 @dataclass(frozen=True)
 class _BufferedSample:
@@ -122,8 +124,12 @@ class TTADetectionAdapter:
         if str(mode).startswith("sigmoid"):
             probs = torch.sigmoid(rows)
             p = probs.max(dim=-1).values.clamp(1.0e-8, 1.0 - 1.0e-8)
+            foreground_mask = p.detach() >= _SIGMOID_FOREGROUND_PROBABILITY_FLOOR
+            if not bool(foreground_mask.any()):
+                raise _TTASkip("no_foreground_logits")
             entropy = -((p * torch.log(p)) + ((1.0 - p) * torch.log(1.0 - p)))
             entropy = entropy / math.log(2.0)
+            entropy = entropy[foreground_mask]
         else:
             probs = torch.softmax(rows, dim=-1)
             entropy = -(probs * torch.log(probs.clamp_min(1.0e-8))).sum(dim=-1)
@@ -139,6 +145,7 @@ class TTADetectionAdapter:
         loss = selected.mean()
         return loss, {
             "logit_count": int(rows.shape[0]),
+            "foreground_logit_count": int(entropy.numel()),
             "selected_logit_count": int(selected.numel()),
             "entropy": float(entropy.detach().mean().item()),
         }
@@ -160,6 +167,13 @@ class TTADetectionAdapter:
                 return None
             probs_a = torch.sigmoid(work_a)
             probs_b = torch.sigmoid(work_b)
+            foreground_mask = (
+                probs_a.detach().max(dim=-1).values >= _SIGMOID_FOREGROUND_PROBABILITY_FLOOR
+            )
+            if not bool(foreground_mask.any()):
+                return None
+            probs_a = probs_a[foreground_mask]
+            probs_b = probs_b[foreground_mask]
         else:
             work_a = _drop_last_background_logits(logits_a, mode_a)
             work_b = _drop_last_background_logits(logits_b, mode_b)

@@ -322,6 +322,12 @@ class BaselineConfig(ConfigSection):
 
 
 @dataclass
+class PureEdgeRemoteSyncConfig(ConfigSection):
+    target: str = ""
+    timeout_sec: float = 300.0
+
+
+@dataclass
 class ExperimentResultsConfig(ConfigSection):
     enabled: bool = True
     comparison_id: str = "exp_road_plankroad_vs_baselines_001"
@@ -335,6 +341,9 @@ class ExperimentResultsConfig(ConfigSection):
     include_trigger_manifest: bool = True
     include_runtime_logs: bool = False
     max_artifact_bytes: int = 268435456
+    pure_edge_remote_sync: PureEdgeRemoteSyncConfig = field(
+        default_factory=PureEdgeRemoteSyncConfig
+    )
 
 
 @dataclass
@@ -510,6 +519,11 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         )
     elif section_cls is SplitLearningConfig:
         known["fixed_split"] = _section(FixedSplitConfig, known.get("fixed_split"))
+    elif section_cls is ExperimentResultsConfig:
+        known["pure_edge_remote_sync"] = _section(
+            PureEdgeRemoteSyncConfig,
+            known.get("pure_edge_remote_sync"),
+        )
     elif section_cls is ContinualLearningConfig:
         known["teacher_annotation"] = _section(
             TeacherAnnotationConfig,
@@ -785,6 +799,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _validate_positive(
         "experiment_results.max_artifact_bytes",
         int(experiment_results.max_artifact_bytes),
+    )
+    remote_sync = experiment_results.pure_edge_remote_sync
+    _validate_positive(
+        "experiment_results.pure_edge_remote_sync.timeout_sec",
+        float(remote_sync.timeout_sec),
     )
     if bool(config.client.source.teacher_replay.save_sampled_frames) and int(
         config.client.source.teacher_replay.archive_chunk_max_bytes

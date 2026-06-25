@@ -58,6 +58,9 @@ experiment_results:
   root_dir: cloud-results
   local_root_dir: edge-results
   max_artifact_bytes: 1024
+  pure_edge_remote_sync:
+    target: user@example.com:/srv/plank-road
+    timeout_sec: 15
 """,
         encoding="utf-8",
     )
@@ -65,6 +68,10 @@ experiment_results:
     assert config.client.experiment_results is config.experiment_results
     assert config.server.experiment_results is config.experiment_results
     assert config.experiment_results.local_root_dir == "edge-results"
+    assert config.experiment_results.pure_edge_remote_sync.target == (
+        "user@example.com:/srv/plank-road"
+    )
+    assert config.experiment_results.pure_edge_remote_sync.timeout_sec == 15
 
 
 def test_experiment_results_upload_requires_edge_summary(tmp_path) -> None:
@@ -80,3 +87,4 @@ experiment_results:
     )
     with pytest.raises(ValueError, match="include_edge_summary"):
         load_runtime_config(path)
+
