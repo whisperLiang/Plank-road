@@ -39,6 +39,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
             ),
             training=SimpleNamespace(
                 batch_size=2,
+                num_epoch=3,
                 learning_rate=1.0e-2,
                 weight_decay=0.0,
                 optimizer_name="adam",
@@ -182,6 +183,31 @@ class RFDETRLikeWrapper(torch.nn.Module):
         return self.rfdetr.model.model.forward_tta_outputs(images, augment=augment)
 
 
+class RFDETRCapabilityCore(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bn = torch.nn.BatchNorm2d(3)
+        self.pool = torch.nn.AdaptiveAvgPool2d((1, 1))
+        self.head = torch.nn.Linear(3, 5)
+        self.box_head = torch.nn.Linear(3, 4)
+
+    def forward(self, batch):
+        features = self.pool(self.bn(batch.float())).flatten(1)
+        pred_boxes = self.box_head(features).sigmoid().unsqueeze(1)
+        pred_logits = self.head(features).unsqueeze(1)
+        return pred_boxes, pred_logits
+
+
+class RFDETRCapabilityWrapper(torch.nn.Module):
+    def __init__(self, inner: RFDETRCapabilityCore) -> None:
+        super().__init__()
+        self.rfdetr = SimpleNamespace(model=SimpleNamespace(model=inner))
+
+    def _prepare_batch(self, images):
+        sizes = [(int(image.shape[-2]), int(image.shape[-1])) for image in images]
+        return torch.stack([image.float() for image in images]), sizes
+
+
 def test_pure_edge_surgeon_keeps_transport_none_and_records_frame_decision(tmp_path) -> None:
     model = ToyTTAModel()
     adapter = _adapter(tmp_path)
@@ -238,16 +264,55 @@ def test_low_quality_samples_trigger_local_tta_and_update_model_version(tmp_path
 
         rows = _metrics(adapter)
         events = [row["event"] for row in rows]
+        started = next(row for row in rows if row["event"] == "surgeon_tta_started")
+        epochs = [row for row in rows if row["event"] == "surgeon_tta_epoch"]
         done = next(row for row in rows if row["event"] == "surgeon_tta_done")
         assert "surgeon_tta_triggered" in events
         assert "surgeon_tta_started" in events
         assert "local_model_update_applied" in events
+        assert started["num_epoch"] == 3
+        assert len(epochs) == 3
+        assert [row["epoch"] for row in epochs] == [1, 2, 3]
+        for epoch in epochs:
+            assert epoch["total_epochs"] == 3
+            assert isinstance(epoch["loss"], float)
+            assert isinstance(epoch["entropy_loss"], float)
+            assert epoch["batch_size"] == 2
+            assert "selected_logit_count" in epoch
+            assert "logit_count" in epoch
+            assert epoch["model_version"] == "0"
+            assert epoch["epoch_ms"] >= 0
+        assert done["num_epoch"] == 3
         assert done["model_version_before"] == "0"
         assert done["model_version_after"] == "surgeon_1"
         assert done["trainable_param_count"] > 0
         assert edge.model_version == "surgeon_1"
         assert edge.apply_model_update_calls == 0
         assert model.training is False
+    finally:
+        adapter.close()
+
+
+def test_rfdetr_capability_fallback_does_not_require_fixed_class_name(tmp_path) -> None:
+    inner = RFDETRCapabilityCore()
+    inner.eval()
+    wrapper = RFDETRCapabilityWrapper(inner)
+    edge = FakeEdge(wrapper)
+    adapter = _adapter(tmp_path)
+    try:
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+
+        rows = _metrics(adapter)
+        epochs = [row for row in rows if row["event"] == "surgeon_tta_epoch"]
+        done = next(row for row in rows if row["event"] == "surgeon_tta_done")
+        assert len(epochs) == 3
+        assert done["model_version_after"] == "surgeon_1"
+        assert edge.model_version == "surgeon_1"
+        assert inner.training is False
     finally:
         adapter.close()
 
@@ -269,6 +334,7 @@ def test_logits_unavailable_skips_without_cloud_update_and_restores_mode(tmp_pat
         rows = _metrics(adapter)
         skipped = next(row for row in rows if row["event"] == "surgeon_tta_skipped")
         assert skipped["reason"] == "logits_unavailable"
+        assert not any(row["event"] == "surgeon_tta_epoch" for row in rows)
         assert edge.model_version == "0"
         assert edge.apply_model_update_calls == 0
         assert model.training is False

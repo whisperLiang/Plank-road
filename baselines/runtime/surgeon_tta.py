@@ -69,14 +69,11 @@ class TTADetectionAdapter:
             return custom_forward(images, augment=augment)
 
         model = self.model
-        model_type = type(model).__name__
-        if model_type == "RFDETRDetectionModel" and hasattr(model, "_prepare_batch"):
-            batch_tensor, _ = model._prepare_batch(images)
-            outputs = model.rfdetr.model.model(batch_tensor)
-            if isinstance(outputs, tuple):
-                return {"pred_logits": outputs[1], "pred_boxes": outputs[0]}
-            return outputs
+        rfdetr_outputs = self._forward_rfdetr(model, images)
+        if rfdetr_outputs is not None:
+            return rfdetr_outputs
 
+        model_type = type(model).__name__
         if model_type in {"YOLODetectionModel", "RTDETRDetectionModel"}:
             return self._forward_ultralytics(model, images)
 
@@ -158,6 +155,77 @@ class TTADetectionAdapter:
         )
         return core(model_input)
 
+    def _forward_rfdetr(self, model: object, images: list[torch.Tensor]) -> Any | None:
+        prepare_batch = getattr(model, "_prepare_batch", None)
+        rfdetr = getattr(model, "rfdetr", None)
+        rfdetr_context = getattr(rfdetr, "model", None)
+        rfdetr_core = getattr(rfdetr_context, "model", None)
+        if rfdetr is None and not callable(prepare_batch):
+            return None
+        if not callable(prepare_batch) or not callable(rfdetr_core):
+            raise _TTASkip("logits_unavailable")
+        batch_tensor, _ = prepare_batch(images)
+        outputs = rfdetr_core(batch_tensor)
+        return _normalize_rfdetr_tta_outputs(outputs)
+
+
+def _normalize_rfdetr_tta_outputs(outputs: Any) -> dict[str, torch.Tensor]:
+    if isinstance(outputs, dict):
+        logits = outputs.get("pred_logits")
+        boxes = outputs.get("pred_boxes")
+        if (
+            isinstance(logits, torch.Tensor)
+            and isinstance(boxes, torch.Tensor)
+            and _rfdetr_prefix_matches(logits, boxes)
+            and _looks_like_rfdetr_boxes(boxes)
+        ):
+            return {"pred_logits": logits, "pred_boxes": boxes}
+        raise _TTASkip("logits_unavailable")
+
+    if hasattr(outputs, "logits") and hasattr(outputs, "pred_boxes"):
+        logits = outputs.logits
+        boxes = outputs.pred_boxes
+        if (
+            isinstance(logits, torch.Tensor)
+            and isinstance(boxes, torch.Tensor)
+            and _rfdetr_prefix_matches(logits, boxes)
+            and _looks_like_rfdetr_boxes(boxes)
+        ):
+            return {"pred_logits": logits, "pred_boxes": boxes}
+        raise _TTASkip("logits_unavailable")
+
+    if isinstance(outputs, (tuple, list)):
+        tensors = [value for value in outputs if isinstance(value, torch.Tensor)]
+        for boxes in tensors:
+            if not _looks_like_rfdetr_boxes(boxes):
+                continue
+            for logits in tensors:
+                if logits is boxes:
+                    continue
+                if (
+                    _rfdetr_prefix_matches(logits, boxes)
+                    and int(logits.shape[-1]) != 4
+                    and int(logits.shape[-1]) > 1
+                ):
+                    return {"pred_logits": logits, "pred_boxes": boxes}
+        raise _TTASkip("logits_unavailable")
+
+    raise _TTASkip("logits_unavailable")
+
+
+def _looks_like_rfdetr_boxes(value: torch.Tensor) -> bool:
+    return isinstance(value, torch.Tensor) and value.ndim >= 2 and int(value.shape[-1]) == 4
+
+
+def _rfdetr_prefix_matches(logits: torch.Tensor, boxes: torch.Tensor) -> bool:
+    return (
+        isinstance(logits, torch.Tensor)
+        and isinstance(boxes, torch.Tensor)
+        and logits.ndim >= 2
+        and boxes.ndim >= 2
+        and tuple(logits.shape[:-1]) == tuple(boxes.shape[:-1])
+    )
+
 
 class SurgeonLocalTTAUpdater:
     def __init__(self, config: object, metrics_writer: object) -> None:
@@ -226,7 +294,14 @@ class SurgeonLocalTTAUpdater:
             1,
             int(getattr(self.method_cfg, "max_local_buffer_samples", 64)),
         )
-        self.tta_steps = max(1, int(getattr(self.method_cfg, "tta_steps", 1)))
+        configured_num_epoch = getattr(self.training_cfg, "num_epoch", None)
+        legacy_tta_steps = getattr(self.method_cfg, "tta_steps", None)
+        if configured_num_epoch is not None:
+            self.num_epoch = max(1, int(configured_num_epoch))
+        elif legacy_tta_steps is not None:
+            self.num_epoch = max(1, int(legacy_tta_steps))
+        else:
+            self.num_epoch = 1
         self.consistency_weight = max(
             0.0,
             float(getattr(self.method_cfg, "consistency_weight", 0.01)),
@@ -255,6 +330,17 @@ class SurgeonLocalTTAUpdater:
 
     def attach_edge(self, edge) -> None:
         self._edge = edge
+        logger.info(
+            "[PureEdgeSURGEON] attached trigger_low_quality_samples={} "
+            "max_local_buffer_samples={} num_epoch={} batch_size={} quality_mode={} "
+            "das_enabled={}",
+            self.trigger_low_quality_samples,
+            self.max_local_buffer_samples,
+            self.num_epoch,
+            self.batch_size,
+            self.quality_mode,
+            bool(getattr(self.das_cfg, "enabled", False)),
+        )
 
     def observe_sample(
         self,
@@ -296,6 +382,13 @@ class SurgeonLocalTTAUpdater:
             if self._running_thread is not None and self._running_thread.is_alive():
                 return
             selected = list(self._buffer)[: min(len(self._buffer), self.batch_size)]
+            logger.info(
+                "[PureEdgeSURGEON] local TTA triggered: low_quality={} batch_size={} "
+                "trigger_frame={}",
+                len(self._buffer),
+                len(selected),
+                int(frame_index),
+            )
             self.metrics.record(
                 "surgeon_tta_triggered",
                 frame_id=int(frame_index),
@@ -419,11 +512,17 @@ class SurgeonLocalTTAUpdater:
             frame_id=int(trigger_frame_id),
             low_quality_sample_count=len(samples),
             batch_size=len(samples),
-            tta_steps=self.tta_steps,
+            num_epoch=self.num_epoch,
+            tta_steps=self.num_epoch,
         )
         try:
-            result = self._execute_tta(samples)
+            result = self._execute_tta(samples, trigger_frame_id)
         except _TTASkip as exc:
+            logger.info(
+                "[PureEdgeSURGEON][Train] skipped reason={} low_quality_sample_count={}",
+                exc.reason,
+                len(samples),
+            )
             self.metrics.record(
                 "surgeon_tta_skipped",
                 frame_id=int(trigger_frame_id),
@@ -445,13 +544,23 @@ class SurgeonLocalTTAUpdater:
                 frame_id=int(trigger_frame_id),
                 low_quality_sample_count=len(samples),
                 batch_size=int(result["batch_size"]),
-                tta_steps=self.tta_steps,
+                num_epoch=self.num_epoch,
+                tta_steps=self.num_epoch,
                 loss=float(result["loss"]),
                 duration_ms=duration_ms,
                 das_enabled=bool(result["das_enabled"]),
                 trainable_param_count=int(result["trainable_param_count"]),
                 model_version_before=str(result["model_version_before"]),
                 model_version_after=str(result["model_version_after"]),
+            )
+            logger.info(
+                "[PureEdgeSURGEON][Train] done epochs={} final_loss={:.6f} "
+                "model_version={} -> {} duration_ms={:.3f}",
+                self.num_epoch,
+                float(result["loss"]),
+                str(result["model_version_before"]),
+                str(result["model_version_after"]),
+                duration_ms,
             )
             self.metrics.record(
                 "local_model_update_applied",
@@ -467,7 +576,11 @@ class SurgeonLocalTTAUpdater:
                 )
                 self._running_thread = None
 
-    def _execute_tta(self, samples: list[_BufferedSample]) -> dict[str, Any]:
+    def _execute_tta(
+        self,
+        samples: list[_BufferedSample],
+        trigger_frame_id: int,
+    ) -> dict[str, Any]:
         if self._edge is None:
             raise _TTASkip("edge_unavailable")
         detector = getattr(self._edge, "small_object_detection", None)
@@ -497,20 +610,66 @@ class SurgeonLocalTTAUpdater:
                     trainable_model.train(True)
                 if das_trainer is not None:
                     self._probe_das_locked(adapter, batch, trainable_model, das_trainer)
+                model_version_before = str(getattr(self._edge, "model_version", "0") or "0")
                 losses: list[float] = []
-                for _ in range(self.tta_steps):
+                for epoch_index in range(self.num_epoch):
+                    epoch_started = time.perf_counter()
+                    epoch = epoch_index + 1
                     optimizer.zero_grad(set_to_none=True)
                     outputs = adapter.forward_tta_outputs(batch)
-                    loss, _ = adapter.entropy_loss(outputs)
+                    entropy_loss, loss_stats = adapter.entropy_loss(outputs)
+                    loss = entropy_loss
+                    consistency_loss_value = 0.0
+                    weighted_consistency_loss_value = 0.0
                     if self.consistency_weight > 0.0:
                         augmented = adapter.forward_tta_outputs(batch, augment=True)
                         consistency = adapter.consistency_loss(outputs, augmented)
                         if consistency is not None:
-                            loss = loss + (self.consistency_weight * consistency)
+                            consistency_loss_value = float(consistency.detach().item())
+                            weighted_consistency = self.consistency_weight * consistency
+                            weighted_consistency_loss_value = float(
+                                weighted_consistency.detach().item()
+                            )
+                            loss = loss + weighted_consistency
                     loss.backward()
                     optimizer.step()
-                    losses.append(float(loss.detach().item()))
-                model_version_before = str(getattr(self._edge, "model_version", "0") or "0")
+                    loss_value = float(loss.detach().item())
+                    entropy_loss_value = float(entropy_loss.detach().item())
+                    epoch_ms = (time.perf_counter() - epoch_started) * 1000.0
+                    losses.append(loss_value)
+                    logger.info(
+                        "[PureEdgeSURGEON][Train] epoch={}/{} loss={:.6f} "
+                        "entropy_loss={:.6f} consistency_loss={:.6f} batch_size={} "
+                        "selected_logits={}/{} model_version={} das_enabled={} "
+                        "epoch_ms={:.3f}",
+                        epoch,
+                        self.num_epoch,
+                        loss_value,
+                        entropy_loss_value,
+                        consistency_loss_value,
+                        len(batch),
+                        int(loss_stats.get("selected_logit_count", 0)),
+                        int(loss_stats.get("logit_count", 0)),
+                        model_version_before,
+                        bool(das_trainer is not None),
+                        epoch_ms,
+                    )
+                    self.metrics.record(
+                        "surgeon_tta_epoch",
+                        frame_id=int(trigger_frame_id),
+                        epoch=int(epoch),
+                        total_epochs=int(self.num_epoch),
+                        loss=loss_value,
+                        entropy_loss=entropy_loss_value,
+                        consistency_loss=consistency_loss_value,
+                        weighted_consistency_loss=weighted_consistency_loss_value,
+                        batch_size=int(len(batch)),
+                        logit_count=int(loss_stats.get("logit_count", 0)),
+                        selected_logit_count=int(loss_stats.get("selected_logit_count", 0)),
+                        das_enabled=bool(das_trainer is not None),
+                        model_version=str(model_version_before),
+                        epoch_ms=float(epoch_ms),
+                    )
                 model_version_after = _next_surgeon_version(model_version_before)
                 self._edge.model_version = model_version_after
                 return {

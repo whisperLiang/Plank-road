@@ -254,7 +254,6 @@ class PureEdgeBaselineConfig(ConfigSection):
     local_gt_dir: str = ""
     training_strategy: str = "surgeon_tta"
     quality_mode: str = "output_only_when_no_boundary"
-    tta_steps: int = 1
     trigger_low_quality_samples: int = 8
     max_local_buffer_samples: int = 64
     trainable_scope: str = "norm_affine"
@@ -870,10 +869,12 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "baseline.pure_edge_local_updating.trainable_scope must be norm_affine"
         )
     pure_edge.trainable_scope = trainable_scope
-    _validate_positive(
-        "baseline.pure_edge_local_updating.tta_steps",
-        int(pure_edge.tta_steps),
-    )
+    legacy_tta_steps = (getattr(pure_edge, "_extras", {}) or {}).get("tta_steps")
+    if legacy_tta_steps is not None:
+        _validate_positive(
+            "baseline.pure_edge_local_updating.tta_steps",
+            int(legacy_tta_steps),
+        )
     _validate_positive(
         "baseline.pure_edge_local_updating.trigger_low_quality_samples",
         int(pure_edge.trigger_low_quality_samples),

@@ -73,8 +73,8 @@ python edge_client.py --headless --mode main \
   --run_id main-road-r1 --comparison_id comparison-001
 ```
 
-After all three methods for a scenario have uploaded their results, run the
-video-aware offline teacher replay evaluation:
+After all three methods for a scenario have produced their staged result files,
+run the video-aware offline teacher replay evaluation:
 
 ```shell
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
@@ -92,7 +92,8 @@ python tools/experiments/plot_plank_road_baseline_figures.py \
 Experiment artifact upload is offline archival traffic. It does not enter
 sample ingestion, teacher annotation, retraining, or `upload_breakdown.csv`.
 Pure Edge therefore remains a zero-cloud-communication method for experiment
-metrics even though its result files can be archived after shutdown.
+metrics; by default it stages result files locally after shutdown and skips
+cloud artifact upload.
 
 Teacher replay is also offline evaluation work. `Teacher-supervised F1` uses
 teacher pseudo labels, not human ground truth, and is excluded from all online
@@ -338,13 +339,21 @@ accuracy_trigger_cloud_retraining
 ```
 
 Cloud-backed baseline updates use the shared training-job API with one generic
-baseline job type. The production baseline training strategy is
-`training_strategy: freeze`:
+baseline job type. The cloud-backed production baseline training strategy is
+`training_strategy: freeze`; Pure Edge uses local `surgeon_tta`:
 
 ```yaml
 baseline:
   edge:
     split_runtime_policy: disabled
+  pure_edge_local_updating:
+    training_strategy: surgeon_tta
+    quality_mode: output_only_when_no_boundary
+    trigger_low_quality_samples: 8
+    max_local_buffer_samples: 64
+    trainable_scope: norm_affine
+    consistency_weight: 0.01
+    entropy_margin_ratio: 0.4
   accuracy_trigger_cloud_retraining:
     training_strategy: freeze
     training_failure_backoff_sec: 30
@@ -352,6 +361,8 @@ baseline:
     batch_size: 32
     num_epoch: 50
     learning_rate: 1.0e-3
+    optimizer_name: adam
+    weight_decay: 0.0
 ```
 
 `accuracy_trigger_cloud_retraining` uses edge predictions only for trigger and
@@ -384,7 +395,12 @@ python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baselin
 python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --edge_id 1 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
 ```
 
-Pure Edge Local Updating writes metrics locally under `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl` and does not upload frames, metrics, or teacher requests to the cloud; its local update worker uses the same frozen-ratio trainer with pseudo labels. Accuracy-Trigger uploads only edge-selected keyframes, compares edge evidence with cloud teacher detections, and submits cloud-side frozen-ratio training jobs. If a worker is still starting or its endpoint is being replaced, cloud-backed baseline triggers enter worker-infra backoff instead of recording an algorithm training failure.
+Pure Edge Local Updating writes metrics locally under
+`results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl`
+and mirrors experiment artifacts under `cache/experiment_results/...` when
+experiment archival is enabled. It does not upload frames, metrics, teacher
+requests, or shutdown artifacts to the cloud by default, so it can run without a
+cloud server.
 
 Ekya is not implemented or run in this repository. Real Ekya measurements may
 be imported from an external repository for optional summary-level comparison;

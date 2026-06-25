@@ -12,12 +12,15 @@ from baselines.distributed.cloud_controller import DistributedBaselineController
 from baselines.distributed.messages import BaselineFramePayload
 from baselines.method_factory import create_policy, registered_methods
 from baselines.runtime import BaselineEdgeAdapter, stable_window_id
+from common.experiment_results import collect_edge_artifacts
 from config.baseline import PLANK_ROAD_BASELINE_ERROR
 from config.runtime import RuntimeConfig, load_runtime_config
 from edge_client import (
     _configure_baseline_client_runtime,
+    _experiment_result_upload_enabled,
     _prepare_experiment_run_dir,
     _resolve_baseline_run_id,
+    _upload_experiment_run_artifacts_if_enabled,
     _validate_startup_config,
 )
 from grpc_server import message_transmission_pb2
@@ -409,6 +412,139 @@ def test_prepare_experiment_run_dir_overwrites_existing_enabled_run(tmp_path) ->
     (run_dir / "keep.jsonl").write_text("kept\n", encoding="utf-8")
     _prepare_experiment_run_dir(run_dir, enabled=False)
     assert (run_dir / "keep.jsonl").read_text(encoding="utf-8") == "kept\n"
+
+
+def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_path) -> None:
+    run_dir = tmp_path / "pure-edge-run"
+    run_dir.mkdir()
+    inference_path = run_dir / "latest_inference_results.jsonl"
+    metrics_path = run_dir / "metrics.jsonl"
+    inference_path.write_text('{"frame_index": 1}\n', encoding="utf-8")
+    metrics_path.write_text('{"event": "surgeon_tta_done"}\n', encoding="utf-8")
+    (run_dir / "edge_summary.json").write_text(
+        '{"method": "pure_edge_local_updating"}\n',
+        encoding="utf-8",
+    )
+    experiment_results = SimpleNamespace(
+        upload_to_cloud=True,
+        upload_on_shutdown=True,
+        include_inference_results=True,
+        include_baseline_metrics=True,
+        include_edge_summary=True,
+        include_trigger_manifest=False,
+        include_runtime_logs=False,
+        max_artifact_bytes=1024 * 1024,
+    )
+
+    artifacts = collect_edge_artifacts(
+        method="pure_edge_local_updating",
+        run_id="pure-run",
+        edge_id=1,
+        comparison_id="comparison",
+        config=experiment_results,
+        inference_result_path=inference_path,
+        baseline_metrics_path=metrics_path,
+        cache_path=tmp_path / "cache",
+    )
+
+    assert "latest_inference_results.jsonl" in artifacts
+    assert "metrics.jsonl" in artifacts
+    assert "edge_summary.json" in artifacts
+    assert not _experiment_result_upload_enabled(
+        mode="baseline",
+        baseline_method="pure_edge_local_updating",
+        experiment_results=experiment_results,
+        disable_experiment_result_upload=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "baseline_method", "disabled", "expected"),
+    [
+        ("main", None, False, True),
+        ("baseline", "accuracy_trigger_cloud_retraining", False, True),
+        ("main", None, True, False),
+        ("baseline", "accuracy_trigger_cloud_retraining", True, False),
+        ("baseline", "pure_edge_local_updating", False, False),
+    ],
+)
+def test_shutdown_experiment_upload_enablement_preserves_non_pure_edge_modes(
+    mode: str,
+    baseline_method: str | None,
+    disabled: bool,
+    expected: bool,
+) -> None:
+    experiment_results = SimpleNamespace(upload_to_cloud=True, upload_on_shutdown=True)
+
+    assert (
+        _experiment_result_upload_enabled(
+            mode=mode,
+            baseline_method=baseline_method,
+            experiment_results=experiment_results,
+            disable_experiment_result_upload=disabled,
+        )
+        is expected
+    )
+
+
+def test_shutdown_upload_helper_does_not_call_uploader_for_pure_edge() -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeUploader:
+        def __init__(self, server_ip: str, enabled: bool) -> None:
+            calls.append({"event": "init", "server_ip": server_ip, "enabled": enabled})
+
+        def upload_run_artifacts(self, **kwargs) -> bool:
+            calls.append({"event": "upload", **kwargs})
+            return True
+
+    uploaded = _upload_experiment_run_artifacts_if_enabled(
+        server_ip="127.0.0.1:1",
+        mode="baseline",
+        baseline_method="pure_edge_local_updating",
+        experiment_results=SimpleNamespace(upload_to_cloud=True, upload_on_shutdown=True),
+        disable_experiment_result_upload=False,
+        comparison_id="comparison",
+        run_id="pure-run",
+        method="pure_edge_local_updating",
+        edge_id=1,
+        artifacts={"metrics.jsonl": "{}\n"},
+        uploader_cls=FakeUploader,
+    )
+
+    assert uploaded is False
+    assert calls == []
+
+
+def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeUploader:
+        def __init__(self, server_ip: str, enabled: bool) -> None:
+            calls.append({"event": "init", "server_ip": server_ip, "enabled": enabled})
+
+        def upload_run_artifacts(self, **kwargs) -> bool:
+            calls.append({"event": "upload", **kwargs})
+            return True
+
+    uploaded = _upload_experiment_run_artifacts_if_enabled(
+        server_ip="127.0.0.1:1",
+        mode="baseline",
+        baseline_method="accuracy_trigger_cloud_retraining",
+        experiment_results=SimpleNamespace(upload_to_cloud=True, upload_on_shutdown=True),
+        disable_experiment_result_upload=False,
+        comparison_id="comparison",
+        run_id="acc-run",
+        method="accuracy_trigger_cloud_retraining",
+        edge_id=1,
+        artifacts={"metrics.jsonl": "{}\n"},
+        uploader_cls=FakeUploader,
+    )
+
+    assert uploaded is True
+    assert calls[0] == {"event": "init", "server_ip": "127.0.0.1:1", "enabled": True}
+    assert calls[1]["event"] == "upload"
+    assert calls[1]["method"] == "accuracy_trigger_cloud_retraining"
 
 
 def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_path) -> None:

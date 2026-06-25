@@ -285,6 +285,57 @@ def _baseline_requires_cloud(baseline_method: str) -> bool:
     return validate_baseline_method(baseline_method) != "pure_edge_local_updating"
 
 
+def _experiment_result_upload_enabled(
+    *,
+    mode: str,
+    baseline_method: str | None,
+    experiment_results: object,
+    disable_experiment_result_upload: bool,
+) -> bool:
+    pure_edge_local = (
+        str(mode) == "baseline" and str(baseline_method or "") == "pure_edge_local_updating"
+    )
+    return bool(
+        getattr(experiment_results, "upload_to_cloud", False)
+        and getattr(experiment_results, "upload_on_shutdown", False)
+        and not bool(disable_experiment_result_upload)
+        and not pure_edge_local
+    )
+
+
+def _upload_experiment_run_artifacts_if_enabled(
+    *,
+    server_ip: str,
+    mode: str,
+    baseline_method: str | None,
+    experiment_results: object,
+    disable_experiment_result_upload: bool,
+    comparison_id: str,
+    run_id: str,
+    method: str,
+    edge_id: int,
+    artifacts: Mapping[str, Any],
+    uploader_cls=ExperimentResultUploader,
+) -> bool:
+    if not _experiment_result_upload_enabled(
+        mode=mode,
+        baseline_method=baseline_method,
+        experiment_results=experiment_results,
+        disable_experiment_result_upload=disable_experiment_result_upload,
+    ):
+        return False
+    uploader = uploader_cls(str(server_ip), enabled=True)
+    return bool(
+        uploader.upload_run_artifacts(
+            comparison_id=comparison_id,
+            run_id=run_id,
+            method=method,
+            edge_id=int(edge_id),
+            artifacts=artifacts,
+        )
+    )
+
+
 def _baseline_split_runtime_policy(baseline_config) -> str:
     edge_cfg = getattr(baseline_config, "edge", None)
     policy = (
@@ -1031,15 +1082,12 @@ if __name__ == "__main__":
                     baseline_metrics_path=baseline_metrics_path,
                     cache_path=Path(config.retrain.cache_path),
                 )
-                uploader = ExperimentResultUploader(
-                    str(config.server_ip),
-                    enabled=bool(
-                        experiment_results.upload_to_cloud
-                        and experiment_results.upload_on_shutdown
-                        and not args.disable_experiment_result_upload
-                    ),
-                )
-                uploader.upload_run_artifacts(
+                _upload_experiment_run_artifacts_if_enabled(
+                    server_ip=str(config.server_ip),
+                    mode=args.mode,
+                    baseline_method=baseline_method,
+                    experiment_results=experiment_results,
+                    disable_experiment_result_upload=args.disable_experiment_result_upload,
                     comparison_id=comparison_id,
                     run_id=run_id,
                     method=method,

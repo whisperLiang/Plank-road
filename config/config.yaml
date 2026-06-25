@@ -26,10 +26,15 @@ baseline:
  method: accuracy_trigger_cloud_retraining
  run_id: null
  results_root: results/baselines_distributed
+ training:
+  batch_size: 32
+  num_epoch: 50
+  learning_rate: 1e-3
+  optimizer_name: adam
+  weight_decay: 0.0
  pure_edge_local_updating:
   training_strategy: surgeon_tta
   quality_mode: output_only_when_no_boundary
-  tta_steps: 1
   trigger_low_quality_samples: 8
   max_local_buffer_samples: 64
   trainable_scope: norm_affine
