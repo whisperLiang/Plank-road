@@ -7,9 +7,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from baselines.runtime import BaselineEdgeAdapter
+from baselines.runtime.surgeon_tta import TTADetectionAdapter
 
 
 def _config(tmp_path: Path) -> SimpleNamespace:
@@ -487,6 +489,24 @@ def test_rfdetr_capability_fallback_does_not_require_fixed_class_name(tmp_path) 
         assert inner.training is False
     finally:
         adapter.close()
+
+
+def test_rfdetr_tta_entropy_uses_sigmoid_foreground_logits_only() -> None:
+    wrapper = RFDETRCapabilityWrapper(RFDETRCapabilityCore())
+    detector = FakeDetector(wrapper)
+    adapter = TTADetectionAdapter(detector, entropy_margin_ratio=1.0)
+    logits = torch.tensor([[[0.0, -4.0, 8.0]]], requires_grad=True)
+    outputs = {
+        "pred_logits": logits,
+        "pred_boxes": torch.zeros((1, 1, 4), dtype=torch.float32),
+    }
+
+    loss, stats = adapter.entropy_loss(outputs)
+    loss.backward()
+
+    assert float(loss.detach().item()) == pytest.approx(1.0)
+    assert stats["logit_count"] == 1
+    assert float(logits.grad[0, 0, 2].item()) == pytest.approx(0.0)
 
 
 def test_logits_unavailable_skips_without_cloud_update_and_restores_mode(tmp_path) -> None:

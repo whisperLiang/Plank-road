@@ -114,7 +114,7 @@ class TTADetectionAdapter:
         rows = _logit_rows(logits)
         if rows is None or rows.numel() == 0 or rows.shape[-1] <= 1:
             raise _TTASkip("logits_unavailable")
-        if mode == "softmax_bg_last" and rows.shape[-1] > 1:
+        if _background_is_last(mode) and rows.shape[-1] > 1:
             rows = rows[:, :-1]
         if rows.shape[-1] <= 1:
             raise _TTASkip("logits_unavailable")
@@ -154,11 +154,15 @@ class TTADetectionAdapter:
         ):
             return None
         if str(mode_a).startswith("sigmoid"):
-            probs_a = torch.sigmoid(logits_a.detach())
-            probs_b = torch.sigmoid(logits_b)
+            work_a = _drop_last_background_logits(logits_a.detach(), mode_a)
+            work_b = _drop_last_background_logits(logits_b, mode_b)
+            if tuple(work_a.shape) != tuple(work_b.shape) or work_a.shape[-1] <= 1:
+                return None
+            probs_a = torch.sigmoid(work_a)
+            probs_b = torch.sigmoid(work_b)
         else:
-            work_a = logits_a[..., :-1] if mode_a == "softmax_bg_last" else logits_a
-            work_b = logits_b[..., :-1] if mode_b == "softmax_bg_last" else logits_b
+            work_a = _drop_last_background_logits(logits_a, mode_a)
+            work_b = _drop_last_background_logits(logits_b, mode_b)
             if tuple(work_a.shape) != tuple(work_b.shape) or work_a.shape[-1] <= 1:
                 return None
             probs_a = torch.softmax(work_a.detach(), dim=-1)
@@ -207,7 +211,11 @@ def _normalize_rfdetr_tta_outputs(outputs: Any) -> dict[str, torch.Tensor]:
             and _rfdetr_prefix_matches(logits, boxes)
             and _looks_like_rfdetr_boxes(boxes)
         ):
-            return {"pred_logits": logits, "pred_boxes": boxes}
+            return {
+                "pred_logits": logits,
+                "pred_boxes": boxes,
+                "_tta_logit_mode": "sigmoid_bg_last",
+            }
         raise _TTASkip("logits_unavailable")
 
     if hasattr(outputs, "logits") and hasattr(outputs, "pred_boxes"):
@@ -219,7 +227,11 @@ def _normalize_rfdetr_tta_outputs(outputs: Any) -> dict[str, torch.Tensor]:
             and _rfdetr_prefix_matches(logits, boxes)
             and _looks_like_rfdetr_boxes(boxes)
         ):
-            return {"pred_logits": logits, "pred_boxes": boxes}
+            return {
+                "pred_logits": logits,
+                "pred_boxes": boxes,
+                "_tta_logit_mode": "sigmoid_bg_last",
+            }
         raise _TTASkip("logits_unavailable")
 
     if isinstance(outputs, (tuple, list)):
@@ -235,7 +247,11 @@ def _normalize_rfdetr_tta_outputs(outputs: Any) -> dict[str, torch.Tensor]:
                     and int(logits.shape[-1]) != 4
                     and int(logits.shape[-1]) > 1
                 ):
-                    return {"pred_logits": logits, "pred_boxes": boxes}
+                    return {
+                        "pred_logits": logits,
+                        "pred_boxes": boxes,
+                        "_tta_logit_mode": "sigmoid_bg_last",
+                    }
         raise _TTASkip("logits_unavailable")
 
     raise _TTASkip("logits_unavailable")
@@ -1206,6 +1222,7 @@ def _finite_float(value: object) -> float | None:
 
 def _extract_differentiable_logits(model: object, outputs: Any) -> tuple[torch.Tensor | None, str]:
     if isinstance(outputs, dict):
+        explicit_mode = _valid_tta_logit_mode(outputs.get("_tta_logit_mode"))
         for key, mode in (
             ("pred_logits", "softmax_bg_last"),
             ("logits", "softmax_bg_last"),
@@ -1214,6 +1231,11 @@ def _extract_differentiable_logits(model: object, outputs: Any) -> tuple[torch.T
         ):
             value = outputs.get(key)
             if isinstance(value, torch.Tensor):
+                if key == "pred_logits":
+                    if explicit_mode is not None:
+                        return value, explicit_mode
+                    if _looks_like_rfdetr_tta_model(model):
+                        return value, "sigmoid_bg_last"
                 return value, mode
     if hasattr(outputs, "logits") and isinstance(outputs.logits, torch.Tensor):
         return outputs.logits, "softmax_bg_last"
@@ -1223,6 +1245,30 @@ def _extract_differentiable_logits(model: object, outputs: Any) -> tuple[torch.T
         return _extract_runtime_logits(model, outputs)
     except Exception:
         return None, "sigmoid"
+
+
+def _valid_tta_logit_mode(value: object) -> str | None:
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"sigmoid", "sigmoid_bg_last", "softmax", "softmax_bg_last"} else None
+
+
+def _looks_like_rfdetr_tta_model(model: object) -> bool:
+    name = type(model).__name__.lower()
+    if "rfdetr" in name or "rf_detr" in name:
+        return True
+    if getattr(model, "rfdetr", None) is None:
+        return False
+    return callable(getattr(model, "_prepare_batch", None))
+
+
+def _background_is_last(mode: object) -> bool:
+    return str(mode or "").strip().lower().endswith("_bg_last")
+
+
+def _drop_last_background_logits(logits: torch.Tensor, mode: object) -> torch.Tensor:
+    if _background_is_last(mode) and logits.shape[-1] > 1:
+        return logits[..., :-1]
+    return logits
 
 
 def _logit_rows(logits: torch.Tensor) -> torch.Tensor | None:
