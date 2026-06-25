@@ -11,6 +11,7 @@ from loguru import logger
 from baselines.distributed.messages import BaselineFramePayload, BaselineWindowPayload, now_ms
 from baselines.distributed.metrics import DistributedMetricsWriter
 from baselines.runtime.policies import create_policy
+from baselines.runtime.surgeon_tta import SurgeonLocalTTAUpdater
 from baselines.runtime.training_state import (
     BaselineActiveTrainingJob,
     BaselineTrainingState,
@@ -50,9 +51,11 @@ class BaselineEdgeAdapter:
         baseline_cfg = getattr(config, "baseline", None)
         method_cfg = getattr(baseline_cfg, self.baseline_method, None)
         self.policy = create_policy(self.baseline_method, method_cfg)
-        self.training_strategy = validate_baseline_training_strategy(
-            getattr(self.policy, "training_strategy", "freeze")
-        )
+        policy_training_strategy = getattr(self.policy, "training_strategy", "freeze")
+        if self.policy.requires_cloud:
+            self.training_strategy = validate_baseline_training_strategy(policy_training_strategy)
+        else:
+            self.training_strategy = str(policy_training_strategy or "surgeon_tta")
         self.trainable_param_ratio = _trainable_param_ratio(method_cfg)
         experiment_results = getattr(config, "experiment_results", None)
         mirror_path = None
@@ -98,32 +101,35 @@ class BaselineEdgeAdapter:
         self._known_cloud_scheduled_job_ids: set[str] = set()
         self._acked_command_ids: set[str] = set()
         self._last_command_poll_at = 0.0
+        self._surgeon_tta: SurgeonLocalTTAUpdater | None = None
         self._training_config = _training_config_dict(getattr(baseline_cfg, "training", None))
-        self._training_config["trainable_param_ratio"] = self.trainable_param_ratio
-        self._accuracy_window_size = max(
-            1,
-            int(
-                getattr(
-                    method_cfg,
-                    "trigger_window_size",
-                    self._training_config.get("training_window_size", 8),
-                )
-            ),
-        )
-        self._training_state = BaselineTrainingState(
-            run_id=self.run_id,
-            baseline_method=self.baseline_method,
-            training_strategy=self.training_strategy,
-            trainable_param_ratio=self.trainable_param_ratio,
-            edge_id=self.edge_id,
-            max_window_size=max(1, int(self._training_config.get("training_window_size", 8))),
-            min_samples=max(1, int(self._training_config.get("min_training_samples", 1))),
-            failure_backoff_sec=_training_failure_backoff_sec(
-                method_cfg,
-                getattr(baseline_cfg, "training", None),
-            ),
-        )
+        self._accuracy_window_size = 1
+        self._training_state: BaselineTrainingState | None = None
         if self.policy.requires_cloud:
+            self._training_config["trainable_param_ratio"] = self.trainable_param_ratio
+            self._accuracy_window_size = max(
+                1,
+                int(
+                    getattr(
+                        method_cfg,
+                        "trigger_window_size",
+                        self._training_config.get("training_window_size", 8),
+                    )
+                ),
+            )
+            self._training_state = BaselineTrainingState(
+                run_id=self.run_id,
+                baseline_method=self.baseline_method,
+                training_strategy=self.training_strategy,
+                trainable_param_ratio=self.trainable_param_ratio,
+                edge_id=self.edge_id,
+                max_window_size=max(1, int(self._training_config.get("training_window_size", 8))),
+                min_samples=max(1, int(self._training_config.get("min_training_samples", 1))),
+                failure_backoff_sec=_training_failure_backoff_sec(
+                    method_cfg,
+                    getattr(baseline_cfg, "training", None),
+                ),
+            )
             self._worker = threading.Thread(
                 target=self._worker_loop,
                 name=f"baseline-adapter-edge-{self.edge_id}",
@@ -137,6 +143,9 @@ class BaselineEdgeAdapter:
 
     def before_video_start(self, edge) -> None:
         self._edge = edge
+        if self.baseline_method == "pure_edge_local_updating":
+            self._surgeon_tta = SurgeonLocalTTAUpdater(self.config, self.metrics)
+            self._surgeon_tta.attach_edge(edge)
         logger.info(
             "[BaselineAdapter] enabled method={} training_strategy={} trainable_param_ratio={}",
             self.baseline_method,
@@ -212,6 +221,14 @@ class BaselineEdgeAdapter:
             training_strategy=self.training_strategy,
             result_source=edge_prediction["result_source"],
         )
+        if self._surgeon_tta is not None:
+            self._surgeon_tta.observe_sample(
+                frame,
+                int(frame_index),
+                task,
+                artifacts,
+                latency_ms,
+            )
         if decision.upload_frame and self.transport is not None:
             if self.baseline_method == "accuracy_trigger_cloud_retraining":
                 self._buffer_accuracy_trigger_payload(payload)
@@ -226,6 +243,8 @@ class BaselineEdgeAdapter:
 
     def close(self) -> None:
         worker = self._worker
+        if self._surgeon_tta is not None:
+            self._surgeon_tta.close()
         if self.baseline_method == "accuracy_trigger_cloud_retraining":
             self._flush_accuracy_trigger_window_buffer(
                 inline=not (worker is not None and worker.is_alive())
@@ -357,6 +376,8 @@ class BaselineEdgeAdapter:
         if self.baseline_method == "accuracy_trigger_cloud_retraining":
             self._discover_cloud_scheduled_training()
             self._poll_cloud_scheduled_training()
+            return
+        if self._training_state is None:
             return
         active = self._training_state.active_job
         if active is None or self.transport is None or self._edge is None:

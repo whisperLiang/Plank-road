@@ -252,6 +252,14 @@ class PureEdgeBaselineConfig(ConfigSection):
     upload_frames_to_cloud: bool = False
     use_cloud_teacher: bool = False
     local_gt_dir: str = ""
+    training_strategy: str = "surgeon_tta"
+    quality_mode: str = "output_only_when_no_boundary"
+    tta_steps: int = 1
+    trigger_low_quality_samples: int = 8
+    max_local_buffer_samples: int = 64
+    trainable_scope: str = "norm_affine"
+    consistency_weight: float = 0.01
+    entropy_margin_ratio: float = 0.4
 
 
 @dataclass
@@ -470,6 +478,7 @@ class RuntimeConfig(ConfigSection):
         self.server.sample_pool = self.sample_pool
         self.client.experiment_results = self.experiment_results
         self.server.experiment_results = self.experiment_results
+        self.client.das = self.server.das
 
 
 def _section(section_cls, value: Mapping[str, Any] | None):
@@ -846,6 +855,45 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         )
     if bool(pure_edge.use_cloud_teacher):
         raise ValueError("baseline.pure_edge_local_updating.use_cloud_teacher must remain false")
+    if str(pure_edge.training_strategy or "").strip() != "surgeon_tta":
+        raise ValueError("baseline.pure_edge_local_updating.training_strategy must be surgeon_tta")
+    quality_mode = str(pure_edge.quality_mode or "").strip().lower()
+    if quality_mode not in {"output_only_when_no_boundary", "strict_boundary"}:
+        raise ValueError(
+            "baseline.pure_edge_local_updating.quality_mode must be one of "
+            "output_only_when_no_boundary, strict_boundary"
+        )
+    pure_edge.quality_mode = quality_mode
+    trainable_scope = str(pure_edge.trainable_scope or "").strip().lower()
+    if trainable_scope != "norm_affine":
+        raise ValueError(
+            "baseline.pure_edge_local_updating.trainable_scope must be norm_affine"
+        )
+    pure_edge.trainable_scope = trainable_scope
+    _validate_positive(
+        "baseline.pure_edge_local_updating.tta_steps",
+        int(pure_edge.tta_steps),
+    )
+    _validate_positive(
+        "baseline.pure_edge_local_updating.trigger_low_quality_samples",
+        int(pure_edge.trigger_low_quality_samples),
+    )
+    _validate_positive(
+        "baseline.pure_edge_local_updating.max_local_buffer_samples",
+        int(pure_edge.max_local_buffer_samples),
+    )
+    _validate_positive(
+        "baseline.pure_edge_local_updating.consistency_weight",
+        float(pure_edge.consistency_weight),
+        allow_zero=True,
+    )
+    _validate_positive(
+        "baseline.pure_edge_local_updating.entropy_margin_ratio",
+        float(pure_edge.entropy_margin_ratio),
+        allow_zero=True,
+    )
+    if float(pure_edge.entropy_margin_ratio) > 1.0:
+        raise ValueError("baseline.pure_edge_local_updating.entropy_margin_ratio must be <= 1")
     edge_policy = str(config.baseline.edge.split_runtime_policy or "").strip().lower()
     if edge_policy != "disabled":
         raise ValueError("baseline.edge.split_runtime_policy must be disabled")

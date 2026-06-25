@@ -26,6 +26,15 @@ baseline:
  method: accuracy_trigger_cloud_retraining
  run_id: null
  results_root: results/baselines_distributed
+ pure_edge_local_updating:
+  training_strategy: surgeon_tta
+  quality_mode: output_only_when_no_boundary
+  tta_steps: 1
+  trigger_low_quality_samples: 8
+  max_local_buffer_samples: 64
+  trainable_scope: norm_affine
+  consistency_weight: 0.01
+  entropy_margin_ratio: 0.4
  accuracy_trigger_cloud_retraining:
   # Engineering variant for this refactor: this reuses the existing
   # Plank-Road frame filter as the keyframe selector, while training

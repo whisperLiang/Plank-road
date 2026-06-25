@@ -11,6 +11,7 @@ class PureEdgeLocalUpdatingPolicy(BaseBaselinePolicy):
         self.upload_metrics_to_cloud = bool(getattr(config, "upload_metrics_to_cloud", False))
         self.upload_frames_to_cloud = bool(getattr(config, "upload_frames_to_cloud", False))
         self.use_cloud_teacher = bool(getattr(config, "use_cloud_teacher", False))
+        self._training_strategy = str(getattr(config, "training_strategy", "surgeon_tta"))
 
     @property
     def requires_cloud(self) -> bool:
@@ -18,7 +19,7 @@ class PureEdgeLocalUpdatingPolicy(BaseBaselinePolicy):
 
     @property
     def training_strategy(self) -> str:
-        return "freeze"
+        return self._training_strategy
 
     def decide_frame(self, *, frame_id: int, is_keyframe: bool) -> BaselineFrameDecision:
         del frame_id, is_keyframe
