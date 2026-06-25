@@ -19,7 +19,7 @@ Usage:
         --output-dir results/split_tradeoff/tinynext
 
 Output:
-    - split_payload_privacy_by_depth.pdf/png
+    - split_payload_privacy_by_depth.svg/pdf/tiff/png
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import json
 import math
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -807,6 +807,55 @@ def _initial_input_plot_label(record: CandidateRecord) -> str:
     return f"layer 0 input\n{record.payload_mb:.2f} MB"
 
 
+def _apply_motivation_plot_style(plt: Any) -> None:
+    plt.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
+            "svg.fonttype": "none",
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "font.size": 7,
+            "axes.titlesize": 8,
+            "axes.labelsize": 7,
+            "axes.linewidth": 0.8,
+            "axes.spines.right": False,
+            "axes.spines.top": False,
+            "xtick.labelsize": 6,
+            "ytick.labelsize": 6,
+            "legend.fontsize": 6,
+            "legend.frameon": False,
+            "figure.dpi": 160,
+            "savefig.dpi": 600,
+        }
+    )
+
+
+def _style_motivation_axis(ax: Any, *, grid_axis: str = "y") -> None:
+    ax.set_axisbelow(True)
+    ax.grid(axis=grid_axis, color="#D8D8D8", linewidth=0.45, alpha=0.65)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color("#4D4D4D")
+        ax.spines[spine].set_linewidth(0.8)
+    ax.tick_params(colors="#4D4D4D", length=2.5, width=0.7)
+
+
+def _save_motivation_figure(fig: Any, stem: Path) -> None:
+    for suffix in (".svg", ".pdf", ".tiff", ".png"):
+        kwargs: dict[str, Any] = {"bbox_inches": "tight"}
+        if suffix in {".tiff", ".png"}:
+            kwargs["dpi"] = 600
+        fig.savefig(stem.with_suffix(suffix), **kwargs)
+
+
+def _write_candidate_records(records: list[CandidateRecord], output_dir: Path) -> None:
+    payload = [asdict(record) for record in records]
+    (output_dir / "candidate_records.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def plot_payload_privacy_by_depth(
     records: list[CandidateRecord],
     output_dir: Path,
@@ -817,6 +866,8 @@ def plot_payload_privacy_by_depth(
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch
     except ImportError:
         logger.warning("matplotlib not available, skipping plotting")
         return
@@ -826,6 +877,7 @@ def plot_payload_privacy_by_depth(
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    _apply_motivation_plot_style(plt)
 
     def layer_index(record: CandidateRecord, fallback: int) -> int:
         if record.legacy_layer_index is not None:
@@ -853,64 +905,82 @@ def plot_payload_privacy_by_depth(
         idx for idx, record in enumerate(sorted_records) if _is_initial_input_record(record)
     ]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(
+        2,
+        1,
+        figsize=(7.1, 4.6),
+        sharex=True,
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": [1.05, 1]},
+    )
 
-    # Top plot: Payload
+    payload_color = "#7884B4"
+    payload_edge = "#484878"
+    input_color = "#B64342"
+    privacy_color = "#B64342"
     bar_colors = [
-        "#c2410c" if _is_initial_input_record(record) else "steelblue" for record in sorted_records
+        input_color if _is_initial_input_record(record) else payload_color
+        for record in sorted_records
     ]
     bar_edges = [
-        "#7c2d12" if _is_initial_input_record(record) else "navy" for record in sorted_records
+        "#7A2A2A" if _is_initial_input_record(record) else payload_edge
+        for record in sorted_records
     ]
-    ax1.bar(x, payload_mb, color=bar_colors, alpha=0.7, edgecolor=bar_edges, linewidth=0.5)
-    ax1.set_ylabel("Payload (MB)", fontsize=11)
-    ax1.set_title("Intermediate Feature Size", fontsize=12, fontweight="bold")
-    ax1.grid(axis="y", alpha=0.3, linestyle="--")
+    ax1.bar(x, payload_mb, color=bar_colors, alpha=0.82, edgecolor=bar_edges, linewidth=0.25)
+    ax1.set_ylabel("Payload (MB)")
+    ax1.set_title("Boundary payload size")
     ax1.set_ylim([0, max(payload_mb) * 1.2 if payload_mb else 1])
+    _style_motivation_axis(ax1)
 
-    # Bottom plot: Privacy leakage score
-    ax2.plot(x, privacy_score, marker="o", color="darkred", linewidth=1.5, markersize=4, alpha=0.8)
-    ax2.fill_between(x, privacy_score, alpha=0.2, color="darkred")
-    ax2.set_ylabel("Privacy Leakage Score", fontsize=11)
-    ax2.set_xlabel("Split Combination Index", fontsize=11)
-    ax2.set_title("Privacy Leakage Score", fontsize=12, fontweight="bold")
+    ax2.plot(
+        x,
+        privacy_score,
+        marker="o",
+        color=privacy_color,
+        linewidth=1.15,
+        markersize=2.2,
+        markeredgewidth=0,
+        alpha=0.9,
+    )
+    ax2.fill_between(x, privacy_score, alpha=0.16, color=privacy_color)
+    ax2.set_ylabel("Privacy leakage score")
+    ax2.set_xlabel("Split candidate index")
+    ax2.set_title("Privacy leakage proxy")
     ax2.set_ylim([0, 1.05])
-    ax2.grid(axis="y", alpha=0.3, linestyle="--")
+    _style_motivation_axis(ax2)
 
     for idx in initial_indices:
         record = sorted_records[idx]
         layer_x = x[idx]
-        ax1.axvline(layer_x, color="#c2410c", linestyle=":", linewidth=1.2, alpha=0.8)
-        ax2.axvline(layer_x, color="#c2410c", linestyle=":", linewidth=1.2, alpha=0.8)
+        ax1.axvline(layer_x, color=input_color, linestyle=":", linewidth=0.85, alpha=0.75)
+        ax2.axvline(layer_x, color=input_color, linestyle=":", linewidth=0.85, alpha=0.75)
         ax1.annotate(
             _initial_input_plot_label(record),
             (layer_x, payload_mb[idx]),
-            xytext=(0, 8),
+            xytext=(4, 6),
             textcoords="offset points",
-            ha="center",
+            ha="left",
             va="bottom",
-            fontsize=8,
-            fontweight="bold",
-            color="#7c2d12",
+            fontsize=6,
+            color=input_color,
         )
         ax2.scatter(
             [layer_x],
             [privacy_score[idx]],
-            s=100,
+            s=45,
             marker="*",
-            c="#c2410c",
-            edgecolors="black",
-            linewidth=0.6,
+            c=input_color,
+            edgecolors="white",
+            linewidth=0.4,
             zorder=5,
         )
         ax2.annotate(
-            "0",
+            "layer 0",
             (layer_x, privacy_score[idx]),
-            xytext=(6, -14),
+            xytext=(5, -10),
             textcoords="offset points",
-            fontsize=8,
-            fontweight="bold",
-            color="#7c2d12",
+            fontsize=6,
+            color=input_color,
         )
     if x.size:
         from matplotlib.ticker import MaxNLocator
@@ -932,16 +1002,20 @@ def plot_payload_privacy_by_depth(
             ticks.update({0, max_tick})
             ax2.set_xticks(sorted(ticks))
 
-    plt.tight_layout()
+    ax1.legend(
+        handles=[
+            Patch(facecolor=payload_color, edgecolor=payload_edge, label="Intermediate feature"),
+            Line2D([0], [0], color=input_color, linestyle=":", label="Layer-0 input"),
+        ],
+        loc="upper right",
+        ncol=2,
+    )
 
-    # Save
-    pdf_path = output_dir / "split_payload_privacy_by_depth.pdf"
-    png_path = output_dir / "split_payload_privacy_by_depth.png"
-    plt.savefig(pdf_path, dpi=150, bbox_inches="tight")
-    plt.savefig(png_path, dpi=150, bbox_inches="tight")
+    stem = output_dir / "split_payload_privacy_by_depth"
+    _save_motivation_figure(fig, stem)
     plt.close()
 
-    logger.info(f"Saved payload/privacy plot to {pdf_path} and {png_path}")
+    logger.info(f"Saved payload/privacy plot to {stem}.svg/.pdf/.tiff/.png")
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -1022,6 +1096,7 @@ def run_single_model_experiment(
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    _write_candidate_records(records, output_dir)
     plot_payload_privacy_by_depth(records, output_dir)
     return records
 

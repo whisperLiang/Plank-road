@@ -99,6 +99,56 @@ SPLIT_BUCKET_BY_BOUNDARY = {
 BUCKET_LABELS = tuple(SPLIT_BUCKET_BY_BOUNDARY[boundary] for boundary in DEFAULT_SPLIT_BOUNDARIES)
 
 
+def _apply_motivation_plot_style(plt: Any) -> None:
+    plt.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
+            "svg.fonttype": "none",
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "font.size": 7,
+            "axes.titlesize": 8,
+            "axes.labelsize": 7,
+            "axes.linewidth": 0.8,
+            "axes.spines.right": False,
+            "axes.spines.top": False,
+            "xtick.labelsize": 6,
+            "ytick.labelsize": 6,
+            "legend.fontsize": 6,
+            "legend.frameon": False,
+            "figure.dpi": 160,
+            "savefig.dpi": 600,
+        }
+    )
+
+
+def _style_motivation_axis(ax: Any, *, grid_axis: str = "y") -> None:
+    ax.set_axisbelow(True)
+    ax.grid(axis=grid_axis, color="#D8D8D8", linewidth=0.45, alpha=0.65)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color("#4D4D4D")
+        ax.spines[spine].set_linewidth(0.8)
+    ax.tick_params(colors="#4D4D4D", length=2.5, width=0.7)
+
+
+def _save_motivation_figure(fig: Any, stem: Path) -> None:
+    for suffix in (".svg", ".pdf", ".tiff", ".png"):
+        kwargs: dict[str, Any] = {"bbox_inches": "tight"}
+        if suffix in {".tiff", ".png"}:
+            kwargs["dpi"] = 600
+        fig.savefig(stem.with_suffix(suffix), **kwargs)
+
+
+def _mode_plot_label(mode: str) -> str:
+    return {
+        "raw_freeze": "Raw freeze",
+        "freeze": "TorchLens freeze",
+        "split_rebuild": "Split rebuild",
+        "split_cached": "Split cached",
+    }.get(mode, str(mode).replace("_", " ").title())
+
+
 @dataclass(frozen=True)
 class SplitChoice:
     bucket: str
@@ -1434,6 +1484,7 @@ def plot_split_time_accuracy_subplots(
     except Exception as exc:  # noqa: BLE001
         logger.warning("matplotlib is unavailable; skipping split-position subplot figure: {}", exc)
         return
+    _apply_motivation_plot_style(plt)
 
     modes = [mode for mode in DEFAULT_MODES if any(row.get("mode") == mode for row in rows)]
     if not modes:
@@ -1441,25 +1492,25 @@ def plot_split_time_accuracy_subplots(
         return
 
     n_modes = len(modes)
-    total_spread = 0.48
-    box_width = min(0.12, total_spread / max(n_modes, 1) * 0.85)
+    total_spread = 0.56
+    box_width = min(0.13, total_spread / max(n_modes, 1) * 0.82)
     offsets = np.linspace(-total_spread / 2, total_spread / 2, n_modes) if n_modes > 1 else [0.0]
     mode_offsets = {mode: float(offsets[i]) for i, mode in enumerate(modes)}
 
     mode_faces = {
-        "raw_freeze": "#d4845f",
-        "freeze": "#6aa6d8",
-        "split_rebuild": "#f2c94c",
-        "split_cached": "#65b96a",
+        "raw_freeze": "#E9A6A1",
+        "freeze": "#B4C0E4",
+        "split_rebuild": "#F0E0D0",
+        "split_cached": "#AADCA9",
     }
     mode_edges = {
-        "raw_freeze": "#7f3f25",
-        "freeze": "#24567a",
-        "split_rebuild": "#8f6b00",
-        "split_cached": "#266b32",
+        "raw_freeze": "#B64342",
+        "freeze": "#484878",
+        "split_rebuild": "#8C6D31",
+        "split_cached": "#2E7D44",
     }
-    _fallback_faces = ["#d08080", "#80d0d0", "#d0a0d0"]
-    _fallback_edges = ["#803030", "#307070", "#703070"]
+    _fallback_faces = ["#D8D8D8", "#E4CCD8", "#B4C0E4"]
+    _fallback_edges = ["#606060", "#9A4D8E", "#484878"]
     for i, mode in enumerate(modes):
         if mode not in mode_faces:
             mode_faces[mode] = _fallback_faces[i % len(_fallback_faces)]
@@ -1532,28 +1583,29 @@ def plot_split_time_accuracy_subplots(
         for patch in bp["boxes"]:
             patch.set_facecolor(mode_faces[mode])
             patch.set_edgecolor(mode_edges[mode])
-            patch.set_linewidth(1.1)
-            patch.set_alpha(0.82)
+            patch.set_linewidth(0.85)
+            patch.set_alpha(0.9)
         for key in ("whiskers", "caps"):
             for line in bp[key]:
                 line.set_color(mode_edges[mode])
-                line.set_linewidth(0.9)
+                line.set_linewidth(0.75)
         for line in bp["medians"]:
-            line.set_color(mode_edges[mode])
-            line.set_linewidth(1.6)
+            line.set_color("#272727")
+            line.set_linewidth(1.05)
         for flier in bp["fliers"]:
             flier.set_markerfacecolor(mode_faces[mode])
             flier.set_markeredgecolor(mode_edges[mode])
-            flier.set_markersize(3.0)
-            flier.set_alpha(0.7)
+            flier.set_markersize(2.4)
+            flier.set_alpha(0.65)
         return True
 
     fig, (ax_time, ax_acc) = plt.subplots(
         2,
         1,
         sharex=True,
-        figsize=(7.5, 6.0),
+        figsize=(7.1, 4.6),
         gridspec_kw={"height_ratios": [1, 1]},
+        constrained_layout=True,
     )
 
     plotted_time = False
@@ -1584,39 +1636,33 @@ def plot_split_time_accuracy_subplots(
     for ax in (ax_time, ax_acc):
         ax.set_xticks(x_ticks)
         ax.set_xlim(x_lim)
-        ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.45)
-        ax.set_axisbelow(True)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+        _style_motivation_axis(ax)
 
     ax_time.set_xticklabels([])
-    ax_time.set_ylabel("Training time (s)", fontsize=9)
+    ax_time.set_ylabel("Training time (s)")
+    ax_time.set_title("Tail-training cost")
     ax_time.set_ylim(bottom=0.0)
 
-    ax_acc.set_xticklabels(BUCKET_LABELS, fontsize=9)
-    ax_acc.set_xlabel("Split position", fontsize=9)
-    ax_acc.set_ylabel("mAP (%)", fontsize=9)
+    ax_acc.set_xticklabels(BUCKET_LABELS)
+    ax_acc.set_xlabel("Split position")
+    ax_acc.set_ylabel("mAP (%)")
+    ax_acc.set_title("Proxy detection quality")
 
     legend_handles = [
-        Patch(facecolor=mode_faces[mode], edgecolor=mode_edges[mode], label=mode) for mode in modes
+        Patch(facecolor=mode_faces[mode], edgecolor=mode_edges[mode], label=_mode_plot_label(mode))
+        for mode in modes
     ]
     ax_time.legend(
         handles=legend_handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.18),
+        bbox_to_anchor=(0.5, 1.25),
         ncol=len(modes),
-        fontsize=8,
-        frameon=True,
-        framealpha=0.9,
-        edgecolor="0.75",
     )
 
-    fig.tight_layout()
     stem = "freeze_vs_split_cached_vs_rebuild_by_position"
-    fig.savefig(plots_dir / f"{stem}.pdf", bbox_inches="tight")
-    fig.savefig(plots_dir / f"{stem}.png", dpi=220, bbox_inches="tight")
+    _save_motivation_figure(fig, plots_dir / stem)
     plt.close(fig)
-    logger.info("Saved subplot figure to {}", plots_dir / f"{stem}.pdf")
+    logger.info("Saved subplot figure to {}.svg/.pdf/.tiff/.png", plots_dir / stem)
 
 
 # ---------------------------------------------------------------------------
