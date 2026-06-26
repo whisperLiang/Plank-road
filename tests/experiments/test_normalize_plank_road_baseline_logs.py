@@ -230,6 +230,79 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
     assert report["scenarios"][0]["video_slug"] == "road"
 
 
+def test_normalizer_extracts_pure_edge_local_tta_latency(tmp_path: Path) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    for path in (
+        "raw_logs/plank_road/cloud/main-r1",
+        "raw_logs/plank_road/edge_1/main-r1",
+        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+    ):
+        (comparison_dir / path).mkdir(parents=True, exist_ok=True)
+    _write_jsonl(
+        comparison_dir / "raw_logs/pure_edge_local_updating/edge_1/pure-r1/metrics.jsonl",
+        [
+            {
+                "event": "surgeon_tta_triggered",
+                "timestamp_ms": 1000,
+                "frame_id": 8,
+                "batch_size": 8,
+            },
+            {
+                "event": "surgeon_tta_shadow_train_started",
+                "timestamp_ms": 1100,
+                "frame_id": 8,
+                "model_version_before": "0",
+            },
+            {
+                "event": "surgeon_tta_shadow_train_done",
+                "timestamp_ms": 4100,
+                "frame_id": 8,
+                "model_version_before": "0",
+                "shadow_train_ms": 3000.0,
+            },
+            {
+                "event": "surgeon_tta_done",
+                "timestamp_ms": 4200,
+                "frame_id": 8,
+                "model_version_before": "0",
+                "model_version_after": "surgeon_1",
+                "apply_lock_ms": 25.5,
+            },
+        ],
+    )
+
+    normalize(comparison_dir, manifest_path)
+
+    events = read_csv(comparison_dir / "normalized/adaptation_events.csv")
+    pure_events = [row for row in events if row["run_id"] == "pure-r1"]
+    assert [row["event_name"] for row in pure_events] == [
+        "trigger_decision",
+        "training_job_started",
+        "training_job_succeeded",
+        "model_update_applied",
+    ]
+    update = pure_events[-1]
+    assert update["frame_id"] == ""
+    assert update["result_model_version"] == "surgeon_1"
+
+    latencies = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
+    pure_latencies = [row for row in latencies if row["run_id"] == "pure-r1"]
+    assert any(row["training_ms"] == "3000.0" for row in pure_latencies)
+    assert any(row["model_apply_ms"] == "25.5" for row in pure_latencies)
+    assert any(row["total_adaptation_ms"] == "3200" for row in pure_latencies)
+
+    summary = read_csv(comparison_dir / "normalized/summary.csv")
+    pure_summary = next(row for row in summary if row["run_id"] == "pure-r1")
+    assert pure_summary["mean_training_ms"] == "3000.0"
+    assert pure_summary["mean_adaptation_ms"] == "3200.0"
+    assert pure_summary["num_trigger_decisions"] == "1"
+    assert pure_summary["num_training_jobs"] == "1"
+    assert pure_summary["num_model_updates"] == "1"
+
+
 def test_accuracy_trigger_decision_is_anchored_to_uploaded_window(
     tmp_path: Path,
 ) -> None:

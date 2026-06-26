@@ -72,6 +72,12 @@ STRUCTURED_EVENT_MAP = {
     "model_update_downloaded": "model_update_downloaded",
     "model_update_applied": "model_update_applied",
 }
+PURE_EDGE_LOCAL_EVENT_NAMES = {
+    "surgeon_tta_triggered",
+    "surgeon_tta_shadow_train_started",
+    "surgeon_tta_shadow_train_done",
+    "surgeon_tta_done",
+}
 EVENT_LATENCY_FIELDS = (
     "upload_ms",
     "training_ms",
@@ -304,6 +310,108 @@ def _parse_structured_experiment_event(
             payload=payload,
         )
     )
+    return True
+
+
+def _pure_edge_local_window_id(payload: Mapping[str, Any]) -> str:
+    frame_id = optional_int(payload.get("frame_id"))
+    return f"surgeon_tta_frame_{frame_id}" if frame_id is not None else ""
+
+
+def _parse_pure_edge_local_event(
+    payload: Mapping[str, Any],
+    *,
+    comparison_id: str,
+    run: Mapping[str, Any],
+    edge_id: int,
+    events: list[dict[str, Any]],
+    latency: list[dict[str, Any]],
+) -> bool:
+    raw_event = str(payload.get("event", "") or "")
+    if raw_event not in PURE_EDGE_LOCAL_EVENT_NAMES:
+        return False
+    timestamp_ms = optional_int(payload.get("timestamp_ms"))
+    frame_id = optional_int(payload.get("frame_id"))
+    window_id = _pure_edge_local_window_id(payload)
+    base_payload = {
+        "window_id": window_id,
+        "frame_id": frame_id,
+        "job_id": window_id,
+    }
+    if raw_event == "surgeon_tta_triggered":
+        events.append(
+            _adaptation_event(
+                "trigger_decision",
+                comparison_id=comparison_id,
+                run=run,
+                edge_id=edge_id,
+                timestamp_ms=timestamp_ms,
+                message=raw_event,
+                payload={
+                    "window_id": window_id,
+                    "frame_id": frame_id,
+                },
+            )
+        )
+    elif raw_event == "surgeon_tta_shadow_train_started":
+        events.append(
+            _adaptation_event(
+                "training_job_started",
+                comparison_id=comparison_id,
+                run=run,
+                edge_id=edge_id,
+                timestamp_ms=timestamp_ms,
+                message=raw_event,
+                payload=base_payload,
+            )
+        )
+    elif raw_event == "surgeon_tta_shadow_train_done":
+        events.append(
+            _adaptation_event(
+                "training_job_succeeded",
+                comparison_id=comparison_id,
+                run=run,
+                edge_id=edge_id,
+                timestamp_ms=timestamp_ms,
+                message=raw_event,
+                payload={
+                    **base_payload,
+                    "training_ms": payload.get("shadow_train_ms"),
+                    "model_version": payload.get("model_version_before"),
+                },
+            )
+        )
+    elif raw_event == "surgeon_tta_done":
+        events.append(
+            _adaptation_event(
+                "model_update_applied",
+                comparison_id=comparison_id,
+                run=run,
+                edge_id=edge_id,
+                timestamp_ms=timestamp_ms,
+                message=raw_event,
+                payload={
+                    "window_id": window_id,
+                    "job_id": window_id,
+                    "model_version": payload.get("model_version_before"),
+                    "result_model_version": payload.get("model_version_after"),
+                },
+            )
+        )
+        model_apply_ms = optional_float(payload.get("apply_lock_ms"))
+        if model_apply_ms is not None:
+            latency.append(
+                empty_row(
+                    LATENCY_FIELDS,
+                    **canonical_base(
+                        comparison_id=comparison_id,
+                        run=run,
+                        edge_id=edge_id,
+                    ),
+                    window_id=window_id,
+                    model_apply_ms=model_apply_ms,
+                )
+            )
     return True
 
 
@@ -1485,6 +1593,14 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
                                 windows=windows,
                                 events=events,
                                 uploads=uploads,
+                            )
+                            _parse_pure_edge_local_event(
+                                payload,
+                                comparison_id=str(manifest["comparison_id"]),
+                                run=run,
+                                edge_id=edge_id,
+                                events=events,
+                                latency=latency,
                             )
                             recognized = True
                         elif "event" in payload and "timestamp_ms" in payload:
