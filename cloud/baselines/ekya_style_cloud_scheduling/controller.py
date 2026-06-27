@@ -219,12 +219,13 @@ class EkyaStyleCloudSchedulingController:
         micro_results = []
         microprofile_time_s = 0.0
         base_state_dict = self.inference.export_state_dict()
-        micro_results, microprofile_time_s = self.microprofiler.profile(
+        micro_result, microprofile_time_s = self.microprofiler.profile(
             window=window,
             teacher_labels=teacher_labels,
             base_state_dict=base_state_dict,
             model_builder=self.inference.build_student_model_clone,
         )
+        micro_results = [micro_result]
         for result in micro_results:
             row = result.as_dict()
             row.pop("hyperparameters", None)

@@ -97,7 +97,9 @@ experiment_results:
         "cloud_inference:\n        drop_stale_display_packets: true",
         "teacher_labeling:\n        enabled: true",
         "microprofile:\n        prediction_model: simple_linear",
+        "microprofile:\n        candidate_hyperparameters: []",
         "retraining:\n        save_checkpoints: true",
+        "retraining:\n        optimizer_name: adamw",
         "logging:\n        result_schema_version: 1",
     ],
 )

@@ -414,16 +414,6 @@ class EdgeAffineWorkersConfig(ConfigSection):
 
 
 @dataclass
-class EkyaCandidateHyperparameterConfig(ConfigSection):
-    id: str = "hp_small"
-    epochs: int | None = None
-    train_batch_size: int | None = None
-    test_batch_size: int | None = None
-    learning_rate: float | None = None
-    subsample: float = 0.25
-
-
-@dataclass
 class EkyaEdgeStreamingConfig(ConfigSection):
     jpeg_quality: int = 85
     upload_queue_size: int = 8
@@ -444,22 +434,6 @@ class EkyaTeacherLabelingConfig(ConfigSection):
 @dataclass
 class EkyaMicroprofileConfig(ConfigSection):
     microprofile_epochs: int | None = None
-    candidate_hyperparameters: list[EkyaCandidateHyperparameterConfig] = field(
-        default_factory=lambda: [
-            EkyaCandidateHyperparameterConfig(
-                id="hp_small",
-                subsample=0.25,
-            ),
-            EkyaCandidateHyperparameterConfig(
-                id="hp_medium",
-                subsample=0.5,
-            ),
-            EkyaCandidateHyperparameterConfig(
-                id="hp_large",
-                subsample=1.0,
-            ),
-        ]
-    )
 
 
 @dataclass
@@ -495,8 +469,6 @@ class EkyaRetrainingConfig(ConfigSection):
     max_concurrent_train_jobs: int | None = None
     train_mode: str | None = None
     trainable_param_ratio: float | None = None
-    optimizer_name: str | None = None
-    weight_decay: float | None = None
 
 
 @dataclass
@@ -728,12 +700,6 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["evaluation"] = _section(EkyaEvaluationConfig, known.get("evaluation"))
         known["scheduler"] = _section(EkyaSchedulerConfig, known.get("scheduler"))
         known["retraining"] = _section(EkyaRetrainingConfig, known.get("retraining"))
-    elif section_cls is EkyaMicroprofileConfig:
-        if "candidate_hyperparameters" in known:
-            known["candidate_hyperparameters"] = [
-                _section(EkyaCandidateHyperparameterConfig, item)
-                for item in list(known.get("candidate_hyperparameters") or [])
-            ]
     elif section_cls is BaselineConfig:
         known["edge"] = _section(
             BaselineEdgeConfig,
@@ -853,6 +819,7 @@ def _reject_removed_ekya_config_fields(
                 "resources_per_trial",
                 "metric",
                 "prediction_model",
+                "candidate_hyperparameters",
             },
         ),
         "server.baselines.ekya_style_cloud_scheduling.evaluation": (
@@ -861,7 +828,7 @@ def _reject_removed_ekya_config_fields(
         ),
         "server.baselines.ekya_style_cloud_scheduling.retraining": (
             ekya_cfg.retraining,
-            {"enabled", "save_checkpoints", "run_async"},
+            {"enabled", "save_checkpoints", "run_async", "optimizer_name", "weight_decay"},
         ),
     }
     removed = []
@@ -1126,36 +1093,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "server.baselines.ekya_style_cloud_scheduling.num_frames must be >= window_size"
         )
-    candidates = list(ekya_cfg.microprofile.candidate_hyperparameters or [])
-    if not candidates:
-        raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.microprofile."
-            "candidate_hyperparameters must not be empty"
-        )
-    for index, candidate in enumerate(candidates):
-        if not str(candidate.id or "").strip():
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.microprofile."
-                f"candidate_hyperparameters[{index}].id must be non-empty"
-            )
-        for name in (
-            "epochs",
-            "train_batch_size",
-            "test_batch_size",
-            "learning_rate",
-        ):
-            configured = getattr(candidate, name)
-            if configured is not None:
-                _validate_positive(
-                    "server.baselines.ekya_style_cloud_scheduling.microprofile."
-                    f"candidate_hyperparameters[{index}].{name}",
-                    float(configured) if name == "learning_rate" else int(configured),
-                )
-        if float(candidate.subsample) <= 0.0 or float(candidate.subsample) > 1.0:
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.microprofile."
-                f"candidate_hyperparameters[{index}].subsample must be in (0, 1]"
-            )
     microprofile_epochs = _configured_value(
         ekya_cfg.microprofile.microprofile_epochs,
         baseline_training.microprofile_epochs,
@@ -1251,13 +1188,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         int(max_train_jobs),
     )
     optimizer_name = (
-        str(
-            _configured_value(
-                ekya_cfg.retraining.optimizer_name,
-                baseline_training.optimizer_name,
-            )
-            or ""
-        )
+        str(baseline_training.optimizer_name or "")
         .strip()
         .lower()
     )
@@ -1267,17 +1198,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "sgd",
     }:
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.retraining."
-            "optimizer_name must be adamw, adam, or sgd"
+            "baseline.training.optimizer_name must be adamw, adam, or sgd"
         )
-    weight_decay = _configured_value(
-        ekya_cfg.retraining.weight_decay,
-        baseline_training.weight_decay,
-    )
-    if float(weight_decay) < 0.0:
-        raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.retraining.weight_decay must be >= 0"
-        )
+    if float(baseline_training.weight_decay) < 0.0:
+        raise ValueError("baseline.training.weight_decay must be >= 0")
     _validate_positive(
         "baseline.training.training_window_size",
         int(baseline_training.training_window_size),

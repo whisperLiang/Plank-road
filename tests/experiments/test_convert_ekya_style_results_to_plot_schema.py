@@ -429,7 +429,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
                 "run_id": "ekya-run",
                 "task_id": 0,
                 "scheduler_name": "ekya_thief_style",
-                "selected_hp_id": "hp_small",
+                "selected_hp_id": "fixed",
                 "decision_reason": "selected",
             }
         ],

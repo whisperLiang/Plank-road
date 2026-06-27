@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -65,7 +65,6 @@ class SchedulerDecision:
     selected_lr: float = 0.0
     selected_subsample: float = 0.0
     decision_reason: str = "inference_only"
-    selected_result: MicroProfileResult | None = field(default=None, compare=False)
 
     @property
     def trains(self) -> bool:
@@ -147,38 +146,37 @@ class EkyaThiefStyleScheduler:
                 }
             )
 
-        candidates = list(microprofile_results or [])
+        results = list(microprofile_results or [])
+        if not results:
+            return SchedulerDecision(
+                **{
+                    **inference_only.as_dict(),
+                    "remaining_for_retraining_s": remaining,
+                    "decision_reason": "no_microprofile_result_inference_only",
+                }
+            )
+        result = results[0]
         if self.config.allow_inference_only_when_no_gain:
-            candidates = [
-                result
-                for result in candidates
-                if float(result.predicted_final_map) > float(result.preretrain_map)
-            ]
-        if not candidates:
+            has_positive_gain = float(result.predicted_final_map) > float(result.preretrain_map)
+            if not has_positive_gain:
+                return SchedulerDecision(
+                    **{
+                        **inference_only.as_dict(),
+                        "remaining_for_retraining_s": remaining,
+                        "decision_reason": "no_positive_gain_inference_only",
+                    }
+                )
+
+        if float(result.predicted_full_train_time_s) > float(remaining):
             return SchedulerDecision(
                 **{
                     **inference_only.as_dict(),
                     "remaining_for_retraining_s": remaining,
-                    "decision_reason": "no_positive_gain_inference_only",
+                    "decision_reason": "fixed_training_does_not_fit_window_inference_only",
                 }
             )
 
-        fitting = [
-            result
-            for result in candidates
-            if float(result.predicted_full_train_time_s) <= float(remaining)
-        ]
-        if not fitting:
-            return SchedulerDecision(
-                **{
-                    **inference_only.as_dict(),
-                    "remaining_for_retraining_s": remaining,
-                    "decision_reason": "no_candidate_fits_window_inference_only",
-                }
-            )
-
-        selected = max(fitting, key=_candidate_key)
-        hp = dict(selected.hyperparameters or {})
+        hp = dict(result.hyperparameters or {})
         training_weight = max(0.0, float(available_resource_budget) - inference_floor)
         return SchedulerDecision(
             task_id=task_id,
@@ -189,23 +187,9 @@ class EkyaThiefStyleScheduler:
             remaining_for_retraining_s=float(remaining),
             inference_resource_weight=float(inference_floor),
             training_resource_weight=float(training_weight),
-            selected_hp_id=str(selected.hp_id),
+            selected_hp_id=str(result.hp_id),
             selected_epochs=int(hp.get("epochs", 0) or 0),
             selected_lr=float(hp.get("learning_rate", 0.0) or 0.0),
-            selected_subsample=float(hp.get("subsample", selected.subsample) or 0.0),
-            decision_reason="selected_max_gain_per_second",
-            selected_result=selected,
+            selected_subsample=float(hp.get("subsample", result.subsample) or 0.0),
+            decision_reason="selected_fixed_training_config",
         )
-
-
-def _candidate_key(result: MicroProfileResult) -> tuple[float, float, float, int]:
-    train_time = max(float(result.predicted_full_train_time_s), 1e-6)
-    predicted_gain = float(result.predicted_final_map) - float(result.preretrain_map)
-    hp = dict(result.hyperparameters or {})
-    epochs = int(hp.get("epochs", result.microprofile_epochs) or 0)
-    return (
-        predicted_gain / train_time,
-        float(result.predicted_final_map),
-        -train_time,
-        -epochs,
-    )

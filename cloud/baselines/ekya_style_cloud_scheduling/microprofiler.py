@@ -8,12 +8,10 @@ import torch
 from loguru import logger
 
 from cloud.baselines.ekya_style_cloud_scheduling.config import (
-    CandidateHyperparameters,
     EkyaStyleCloudSchedulingConfig,
 )
 from cloud.baselines.ekya_style_cloud_scheduling.dataset import (
     split_train_val_samples,
-    subsample_samples,
     window_to_samples,
 )
 from cloud.baselines.ekya_style_cloud_scheduling.evaluator import evaluate_model_on_samples
@@ -37,7 +35,7 @@ class DetectionMicroProfiler:
         teacher_labels: dict[int, dict[str, Any]],
         base_state_dict: Mapping[str, torch.Tensor],
         model_builder: Callable[[], torch.nn.Module],
-    ) -> tuple[list[MicroProfileResult], float]:
+    ) -> tuple[MicroProfileResult, float]:
         started = time.perf_counter()
         samples = window_to_samples(window, teacher_labels)
         train_samples, val_samples = split_train_val_samples(
@@ -52,40 +50,31 @@ class DetectionMicroProfiler:
             min_val=int(self.config.dataset.min_val_samples),
             window_id=window.window_id,
         )
-        results: list[MicroProfileResult] = []
-        for candidate in self.config.microprofile.candidate_hyperparameters:
-            result = self._candidate_result(
-                window=window,
-                candidate=candidate,
-                train_samples=train_samples,
-                val_samples=val_samples,
-                base_state_dict=base_state_dict,
-                model_builder=model_builder,
-            )
-            results.append(result)
-        return results, time.perf_counter() - started
+        result = self._fixed_result(
+            window=window,
+            train_samples=train_samples,
+            val_samples=val_samples,
+            base_state_dict=base_state_dict,
+            model_builder=model_builder,
+        )
+        return result, time.perf_counter() - started
 
-    def _candidate_result(
+    def _fixed_result(
         self,
         *,
         window: CompletedFrameWindow,
-        candidate: CandidateHyperparameters,
         train_samples: list[Any],
         val_samples: list[Any],
         base_state_dict: Mapping[str, torch.Tensor],
         model_builder: Callable[[], torch.nn.Module],
     ) -> MicroProfileResult:
         microprofile_epochs = max(1, int(self.config.microprofile.microprofile_epochs))
-        candidate_train_samples = subsample_samples(
-            train_samples,
-            candidate.subsample,
-            seed=_seed(self.config.seed, window.task_id, candidate.id),
-            min_samples=int(self.config.dataset.min_train_samples),
-        )
-        if len(candidate_train_samples) < int(self.config.dataset.min_train_samples):
+        fixed = self.config.fixed_training
+        fixed_train_samples = list(train_samples)
+        if len(fixed_train_samples) < int(self.config.dataset.min_train_samples):
             raise RuntimeError(
                 "Ekya microprofile has too few training samples for "
-                f"window={window.window_id} hp_id={candidate.id}"
+                f"window={window.window_id} hp_id={fixed.hp_id}"
             )
 
         init_started = time.perf_counter()
@@ -94,7 +83,7 @@ class DetectionMicroProfiler:
         components = build_training_components(
             model=model,
             config=self.config.retraining,
-            learning_rate=float(candidate.learning_rate),
+            learning_rate=float(fixed.learning_rate),
         )
         init_time_s = time.perf_counter() - init_started
 
@@ -111,8 +100,8 @@ class DetectionMicroProfiler:
             epoch_train_started = time.perf_counter()
             train_loss, _metrics = run_one_training_epoch(
                 components=components,
-                samples=candidate_train_samples,
-                batch_size=int(candidate.train_batch_size),
+                samples=fixed_train_samples,
+                batch_size=int(fixed.train_batch_size),
             )
             train_time_s += time.perf_counter() - epoch_train_started
             epoch_losses.append(train_loss)
@@ -121,7 +110,7 @@ class DetectionMicroProfiler:
                     "[EkyaMicroprofile] window={} hp_id={} epoch={}/{} loss={:.4f} "
                     "metric_mode={}",
                     window.window_id,
-                    candidate.id,
+                    fixed.hp_id,
                     epoch,
                     microprofile_epochs,
                     _loss_for_log(train_loss),
@@ -140,7 +129,7 @@ class DetectionMicroProfiler:
         predicted_gain = _predicted_gain(
             observed_gain=observed_gain,
             microprofile_epochs=microprofile_epochs,
-            full_epochs=int(candidate.epochs),
+            full_epochs=int(fixed.epochs),
         )
         predicted_final = _clamp01(float(pre.map) + predicted_gain)
         final_loss = epoch_losses[-1] if epoch_losses else None
@@ -149,7 +138,7 @@ class DetectionMicroProfiler:
             "pre_map={:.4f} post_map={:.4f} gain={:.4f} predicted_final_map={:.4f} "
             "metric_mode={}",
             window.window_id,
-            candidate.id,
+            fixed.hp_id,
             microprofile_epochs,
             microprofile_epochs,
             _loss_for_log(final_loss),
@@ -161,8 +150,8 @@ class DetectionMicroProfiler:
         )
         return MicroProfileResult(
             task_id=int(window.task_id),
-            hp_id=candidate.id,
-            hyperparameters=candidate.as_dict(),
+            hp_id=fixed.hp_id,
+            hyperparameters=fixed.as_dict(),
             preretrain_map=float(pre.map),
             post_microprofile_map=float(post.map),
             map_gain=float(observed_gain),
@@ -173,10 +162,10 @@ class DetectionMicroProfiler:
             init_time_s=float(init_time_s),
             time_per_epoch_s=float(time_per_epoch_s),
             predicted_full_train_time_s=float(init_time_s)
-            + float(time_per_epoch_s) * int(candidate.epochs),
+            + float(time_per_epoch_s) * int(fixed.epochs),
             predicted_final_map=float(predicted_final),
             microprofile_epochs=int(microprofile_epochs),
-            subsample=float(candidate.subsample),
+            subsample=float(fixed.subsample),
             metric_mode=str(post.metric_mode),
         )
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from cloud.baselines.ekya_style_cloud_scheduling.config import (
-    CandidateHyperparameters,
     EkyaStyleCloudSchedulingConfig,
+    FixedTrainingConfig,
     parse_ekya_style_config,
 )
 from cloud.baselines.ekya_style_cloud_scheduling.controller import (
@@ -23,12 +23,12 @@ METHOD = "ekya_style_cloud_scheduling"
 
 __all__ = [
     "METHOD",
-    "CandidateHyperparameters",
     "DetectionResultPacket",
     "DisplayEventPacket",
     "EkyaStyleCloudSchedulingConfig",
     "EkyaStyleCloudSchedulingController",
     "EkyaThiefStyleScheduler",
+    "FixedTrainingConfig",
     "FrameUploadPacket",
     "MicroProfileResult",
     "SchedulerDecision",

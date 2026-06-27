@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -9,73 +9,32 @@ METHOD = "ekya_style_cloud_scheduling"
 
 
 @dataclass(frozen=True)
-class CandidateHyperparameters:
-    id: str
+class FixedTrainingConfig:
     epochs: int
     train_batch_size: int
     test_batch_size: int
     learning_rate: float
-    subsample: float
-
-    @classmethod
-    def from_value(
-        cls,
-        value: Mapping[str, Any] | object,
-        *,
-        defaults: Mapping[str, Any] | None = None,
-    ) -> "CandidateHyperparameters":
-        defaults = dict(defaults or {})
-
-        def resolved(key: str) -> Any:
-            raw = _get(value, key, None)
-            return defaults.get(key) if raw in (None, "") else raw
-
-        missing = [
-            key
-            for key in (
-                "id",
-                "epochs",
-                "train_batch_size",
-                "test_batch_size",
-                "learning_rate",
-                "subsample",
-            )
-            if resolved(key) in (None, "")
-        ]
-        if missing:
-            raise ValueError(
-                "ekya_style_cloud_scheduling.microprofile.candidate_hyperparameters "
-                f"entry is missing: {', '.join(missing)}"
-            )
-        candidate = cls(
-            id=str(resolved("id")),
-            epochs=int(resolved("epochs")),
-            train_batch_size=int(resolved("train_batch_size")),
-            test_batch_size=int(resolved("test_batch_size")),
-            learning_rate=float(resolved("learning_rate")),
-            subsample=float(resolved("subsample")),
-        )
-        candidate.validate()
-        return candidate
+    hp_id: str = "fixed"
+    subsample: float = 1.0
 
     def validate(self) -> None:
-        if not self.id:
-            raise ValueError("candidate hyperparameter id must be non-empty")
+        if not self.hp_id:
+            raise ValueError("fixed training hp_id must be non-empty")
         for name, value in (
             ("epochs", self.epochs),
             ("train_batch_size", self.train_batch_size),
             ("test_batch_size", self.test_batch_size),
         ):
             if int(value) <= 0:
-                raise ValueError(f"candidate {self.id}: {name} must be positive")
+                raise ValueError(f"fixed training config: {name} must be positive")
         if self.learning_rate <= 0:
-            raise ValueError(f"candidate {self.id}: learning_rate must be positive")
-        if self.subsample <= 0 or self.subsample > 1:
-            raise ValueError(f"candidate {self.id}: subsample must be in (0, 1]")
+            raise ValueError("fixed training config: learning_rate must be positive")
+        if float(self.subsample) != 1.0:
+            raise ValueError("fixed training config: subsample must be 1.0")
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id,
+            "id": self.hp_id,
             "epochs": int(self.epochs),
             "train_batch_size": int(self.train_batch_size),
             "test_batch_size": int(self.test_batch_size),
@@ -105,7 +64,6 @@ class TeacherLabelingConfig:
 @dataclass(frozen=True)
 class MicroprofileConfig:
     microprofile_epochs: int = 1
-    candidate_hyperparameters: tuple[CandidateHyperparameters, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -161,6 +119,7 @@ class EkyaStyleCloudSchedulingConfig:
     edge_streaming: EdgeStreamingConfig
     cloud_inference: CloudInferenceConfig
     teacher_labeling: TeacherLabelingConfig
+    fixed_training: FixedTrainingConfig
     microprofile: MicroprofileConfig
     dataset: DatasetConfig
     evaluation: EvaluationConfig
@@ -183,10 +142,10 @@ class EkyaStyleCloudSchedulingConfig:
             raise ValueError("ekya_style_cloud_scheduling.window_size must be positive")
         if self.num_frames < self.window_size:
             raise ValueError("ekya_style_cloud_scheduling.num_frames must be >= window_size")
-        if not self.microprofile.candidate_hyperparameters:
+        self.fixed_training.validate()
+        if self.microprofile.microprofile_epochs <= 0:
             raise ValueError(
-                "ekya_style_cloud_scheduling.microprofile.candidate_hyperparameters "
-                "must not be empty"
+                "ekya_style_cloud_scheduling.microprofile.microprofile_epochs must be positive"
             )
         if not 1 <= int(self.edge_streaming.jpeg_quality) <= 100:
             raise ValueError("ekya_style_cloud_scheduling.jpeg_quality must be in [1, 100]")
@@ -285,24 +244,7 @@ def parse_ekya_style_config(
         result_root or _get(section, "result_root", "") or "results/cloud"
     )
     output_dir = resolved_result_root / resolved_run_id / "baselines" / METHOD
-    candidate_defaults = _candidate_training_defaults(
-        server=server,
-        baseline=baseline,
-        student_model=student_model,
-    )
     microprofile_section = _get(section, "microprofile", None)
-    candidate_values = list(
-        _get(
-            microprofile_section,
-            "candidate_hyperparameters",
-            _default_candidate_search_space(),
-        )
-        or []
-    )
-    candidates = tuple(
-        CandidateHyperparameters.from_value(item, defaults=candidate_defaults)
-        for item in candidate_values
-    )
     accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
     config = EkyaStyleCloudSchedulingConfig(
         run_id=resolved_run_id,
@@ -340,10 +282,14 @@ def parse_ekya_style_config(
             _get(section, "teacher_labeling", None),
             server=server,
         ),
+        fixed_training=_fixed_training_config(
+            server=server,
+            baseline=baseline,
+            student_model=student_model,
+        ),
         microprofile=_microprofile_config(
             microprofile_section,
             baseline=baseline,
-            candidates=candidates,
         ),
         dataset=_dataset_config(_get(section, "dataset", None), server=server, baseline=baseline),
         evaluation=_evaluation_config(_get(section, "evaluation", None), baseline=baseline),
@@ -367,34 +313,42 @@ def _required_value(value: Any, name: str) -> Any:
     return value
 
 
-def _candidate_training_defaults(
+def _fixed_training_config(
     *,
     server: object,
     baseline: object | None,
     student_model: str,
-) -> dict[str, Any]:
+) -> FixedTrainingConfig:
     continual_learning = _get(server, "continual_learning", None)
     baseline_training = _get(baseline, "training", None)
     batch_size = _configured_value(
         _get(continual_learning, "batch_size", None),
         _get(baseline_training, "batch_size", 1),
     )
-    return {
-        "epochs": _configured_value(
-            _get(continual_learning, "num_epoch", None),
-            _get(baseline_training, "num_epoch", 1),
+    config = FixedTrainingConfig(
+        epochs=int(
+            _configured_value(
+                _get(continual_learning, "num_epoch", None),
+                _get(baseline_training, "num_epoch", 1),
+            )
         ),
-        "train_batch_size": batch_size,
-        "test_batch_size": batch_size,
-        "learning_rate": _candidate_learning_rate(
-            server=server,
-            baseline=baseline,
-            student_model=student_model,
+        train_batch_size=int(batch_size),
+        test_batch_size=int(batch_size),
+        learning_rate=float(
+            _fixed_training_learning_rate(
+                server=server,
+                baseline=baseline,
+                student_model=student_model,
+            )
         ),
-    }
+        hp_id="fixed",
+        subsample=1.0,
+    )
+    config.validate()
+    return config
 
 
-def _candidate_learning_rate(
+def _fixed_training_learning_rate(
     *,
     server: object,
     baseline: object | None,
@@ -426,14 +380,6 @@ def _model_family(model_name: str) -> str:
     if normalized.startswith("yolo"):
         return "yolo"
     return normalized
-
-
-def _default_candidate_search_space() -> list[dict[str, Any]]:
-    return [
-        {"id": "hp_small", "subsample": 0.25},
-        {"id": "hp_medium", "subsample": 0.5},
-        {"id": "hp_large", "subsample": 1.0},
-    ]
 
 
 def _edge_streaming_config(value: object) -> EdgeStreamingConfig:
@@ -483,7 +429,6 @@ def _microprofile_config(
     value: object,
     *,
     baseline: object | None,
-    candidates: tuple[CandidateHyperparameters, ...],
 ) -> MicroprofileConfig:
     baseline_training = _get(baseline, "training", None)
     return MicroprofileConfig(
@@ -493,7 +438,6 @@ def _microprofile_config(
                 _get(baseline_training, "microprofile_epochs", 1),
             )
         ),
-        candidate_hyperparameters=candidates,
     )
 
 
@@ -586,20 +530,11 @@ def _retraining_config(
         train_mode=train_mode,
         trainable_param_ratio=None if ratio in (None, "") else float(ratio),
         optimizer_name=str(
-            _configured_value(
-                _get(value, "optimizer_name", None),
-                _get(baseline_training, "optimizer_name", "adamw"),
-            )
-            or "adamw"
+            _get(baseline_training, "optimizer_name", "adamw") or "adamw"
         )
         .strip()
         .lower(),
-        weight_decay=float(
-            _configured_value(
-                _get(value, "weight_decay", None),
-                _get(baseline_training, "weight_decay", 0.0),
-            )
-        ),
+        weight_decay=float(_get(baseline_training, "weight_decay", 0.0)),
     )
 
 

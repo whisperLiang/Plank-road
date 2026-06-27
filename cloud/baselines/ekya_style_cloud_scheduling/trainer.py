@@ -16,7 +16,6 @@ from cloud.baselines.ekya_style_cloud_scheduling.config import (
 )
 from cloud.baselines.ekya_style_cloud_scheduling.dataset import (
     split_train_val_samples,
-    subsample_samples,
     window_to_samples,
 )
 from cloud.baselines.ekya_style_cloud_scheduling.evaluator import evaluate_model_on_samples
@@ -103,9 +102,7 @@ class EkyaCloudTrainer:
         del previous_val_map
         if not decision.trains:
             raise ValueError("scheduler decision does not select a training job")
-        selected = decision.selected_result
-        if selected is None:
-            raise ValueError("scheduler decision is missing selected microprofile result")
+        fixed = self.config.fixed_training
 
         samples = window_to_samples(window, teacher_labels)
         train_samples, val_samples = split_train_val_samples(
@@ -120,21 +117,16 @@ class EkyaCloudTrainer:
             min_val=int(self.config.dataset.min_val_samples),
             window_id=window.window_id,
         )
-        hp = dict(selected.hyperparameters or {})
-        epochs = max(1, int(decision.selected_epochs))
-        batch_size = max(1, int(hp.get("train_batch_size", 1) or 1))
-        lr = float(decision.selected_lr)
-        train_samples = subsample_samples(
-            train_samples,
-            float(decision.selected_subsample or selected.subsample),
-            seed=_seed(self.config.seed, window.task_id, decision.selected_hp_id),
-            min_samples=int(self.config.dataset.min_train_samples),
-        )
+        epochs = max(1, int(fixed.epochs))
+        batch_size = max(1, int(fixed.train_batch_size))
+        lr = float(fixed.learning_rate)
+        hp_id = str(fixed.hp_id)
+        train_samples = list(train_samples)
         checkpoint_path = self.checkpoint_dir / (
-            f"task_{int(window.task_id)}_{decision.selected_hp_id}_model.pt"
+            f"task_{int(window.task_id)}_{hp_id}_model.pt"
         )
         epoch_log_path = self.checkpoint_dir / (
-            f"task_{int(window.task_id)}_{decision.selected_hp_id}_epochs.csv"
+            f"task_{int(window.task_id)}_{hp_id}_epochs.csv"
         )
 
         train_start = time.time()
@@ -195,7 +187,7 @@ class EkyaCloudTrainer:
             )
             log_args: list[Any] = [
                 window.window_id,
-                decision.selected_hp_id,
+                hp_id,
                 epoch,
                 epochs,
                 _loss_for_log(train_loss),
@@ -221,7 +213,7 @@ class EkyaCloudTrainer:
             "task_id": int(window.task_id),
             "window_id": window.window_id,
             "frame_indices": [int(value) for value in window.frame_indices],
-            "hp_id": decision.selected_hp_id,
+            "hp_id": hp_id,
             "epochs": epochs,
             "learning_rate": lr,
             "batch_size": batch_size,
@@ -246,7 +238,7 @@ class EkyaCloudTrainer:
             task_id=int(window.task_id),
             edge_id=int(window.edge_id),
             camera_id=int(window.camera_id),
-            hp_id=decision.selected_hp_id,
+            hp_id=hp_id,
             epochs=epochs,
             lr=lr,
             batch_size=batch_size,

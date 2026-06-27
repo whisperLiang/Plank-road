@@ -46,14 +46,6 @@ def _capture_info_logs(action):
 
 
 def _runtime(tmp_path: Path):
-    candidate = SimpleNamespace(
-        id="hp",
-        epochs=2,
-        train_batch_size=2,
-        test_batch_size=1,
-        learning_rate=1.0e-5,
-        subsample=0.5,
-    )
     ekya = SimpleNamespace(
         student_model="rfdetr_nano",
         teacher_model="rtdetr_x",
@@ -67,7 +59,7 @@ def _runtime(tmp_path: Path):
         ),
         cloud_inference=SimpleNamespace(score_threshold=0.3),
         teacher_labeling=SimpleNamespace(),
-        microprofile=SimpleNamespace(candidate_hyperparameters=[candidate]),
+        microprofile=SimpleNamespace(),
         scheduler=SimpleNamespace(),
         retraining=SimpleNamespace(),
         result_root=str(tmp_path),
@@ -254,16 +246,12 @@ def test_ekya_config_inherits_shared_plank_road_settings() -> None:
     assert cfg.retraining.max_concurrent_train_jobs == 4
     assert cfg.retraining.optimizer_name == "sgd"
     assert cfg.retraining.weight_decay == pytest.approx(0.01)
-    assert [candidate.id for candidate in cfg.microprofile.candidate_hyperparameters] == [
-        "hp_small",
-        "hp_medium",
-        "hp_large",
-    ]
-    first = cfg.microprofile.candidate_hyperparameters[0]
-    assert first.epochs == 9
-    assert first.train_batch_size == 5
-    assert first.test_batch_size == 5
-    assert first.learning_rate == pytest.approx(2.0e-4)
+    assert cfg.fixed_training.hp_id == "fixed"
+    assert cfg.fixed_training.epochs == 9
+    assert cfg.fixed_training.train_batch_size == 5
+    assert cfg.fixed_training.test_batch_size == 5
+    assert cfg.fixed_training.learning_rate == pytest.approx(2.0e-4)
+    assert cfg.fixed_training.subsample == pytest.approx(1.0)
 
 
 def test_ekya_protocol_json_roundtrip_preserves_bytes() -> None:
@@ -290,16 +278,17 @@ def test_ekya_protocol_json_roundtrip_preserves_bytes() -> None:
     assert restored.encoded_frame_jpeg == b"jpeg-bytes"
 
 
-def test_ekya_scheduler_selects_best_fitting_positive_gain() -> None:
+def test_ekya_scheduler_selects_fixed_config_when_gain_and_time_fit() -> None:
     cfg = parse_ekya_style_config(_runtime(Path("/tmp")), run_id="run").scheduler
     scheduler = EkyaThiefStyleScheduler(cfg)
     result = MicroProfileResult(
         task_id=1,
-        hp_id="hp",
+        hp_id="fixed",
         hyperparameters={
             "epochs": 2,
             "learning_rate": 1.0e-5,
-            "subsample": 0.5,
+            "train_batch_size": 2,
+            "subsample": 1.0,
         },
         preretrain_map=0.5,
         post_microprofile_map=0.6,
@@ -313,7 +302,7 @@ def test_ekya_scheduler_selects_best_fitting_positive_gain() -> None:
         predicted_full_train_time_s=1.0,
         predicted_final_map=0.6,
         microprofile_epochs=1,
-        subsample=0.5,
+        subsample=1.0,
     )
 
     decision = scheduler.schedule(
@@ -324,7 +313,11 @@ def test_ekya_scheduler_selects_best_fitting_positive_gain() -> None:
     )
 
     assert decision.trains
-    assert decision.selected_hp_id == "hp"
+    assert decision.selected_hp_id == "fixed"
+    assert decision.selected_epochs == 2
+    assert decision.selected_lr == pytest.approx(1.0e-5)
+    assert decision.selected_subsample == pytest.approx(1.0)
+    assert decision.decision_reason == "selected_fixed_training_config"
     assert decision.inference_resource_weight == pytest.approx(0.5)
 
 
@@ -333,8 +326,8 @@ def test_ekya_scheduler_task0_is_inference_only_by_default() -> None:
     scheduler = EkyaThiefStyleScheduler(cfg)
     result = MicroProfileResult(
         task_id=0,
-        hp_id="hp",
-        hyperparameters={"epochs": 2, "learning_rate": 1.0e-5, "subsample": 0.5},
+        hp_id="fixed",
+        hyperparameters={"epochs": 2, "learning_rate": 1.0e-5, "subsample": 1.0},
         preretrain_map=0.1,
         post_microprofile_map=0.2,
         map_gain=0.1,
@@ -347,7 +340,7 @@ def test_ekya_scheduler_task0_is_inference_only_by_default() -> None:
         predicted_full_train_time_s=0.2,
         predicted_final_map=0.2,
         microprofile_epochs=1,
-        subsample=0.5,
+        subsample=1.0,
     )
 
     decision = scheduler.schedule(
@@ -453,15 +446,13 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
 
     runtime = _runtime(tmp_path)
     runtime.server.baselines.ekya_style_cloud_scheduling.microprofile.microprofile_epochs = 1
-    runtime.server.baselines.ekya_style_cloud_scheduling.microprofile.candidate_hyperparameters[
-        0
-    ].learning_rate = 0.1
+    runtime.server.continual_learning.rfdetr_fixed_split_learning_rate = 0.1
     cfg = parse_ekya_style_config(runtime, run_id="run")
     monkeypatch.setattr(mp, "run_one_training_epoch", counting_epoch)
     monkeypatch.setattr(mp, "evaluate_model_on_samples", evaluate)
     base = TinyTrainModel().state_dict()
 
-    (results, elapsed), logs = _capture_info_logs(
+    (result, elapsed), logs = _capture_info_logs(
         lambda: DetectionMicroProfiler(cfg).profile(
             window=CompletedFrameWindow(
                 task_id=1,
@@ -480,10 +471,12 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
 
     assert calls["epochs"] == 1
     assert elapsed >= 0.0
-    assert results[0].post_microprofile_map > results[0].preretrain_map
-    assert results[0].predicted_full_train_time_s != pytest.approx(0.001 + 0.01 * 0.5 * 2)
+    assert result.hp_id == "fixed"
+    assert result.subsample == pytest.approx(1.0)
+    assert result.post_microprofile_map > result.preretrain_map
+    assert result.predicted_full_train_time_s != pytest.approx(0.001 + 0.01 * 0.5 * 2)
     assert logs.count("[EkyaMicroprofile]") == 1
-    assert "window=1:1:2 hp_id=hp epoch=1/1" in logs
+    assert "window=1:1:2 hp_id=fixed epoch=1/1" in logs
     assert "pre_map=" in logs
     assert "post_map=" in logs
     assert "predicted_final_map=" in logs
@@ -680,38 +673,12 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
         )
 
     monkeypatch.setattr(trainer_module, "evaluate_model_on_samples", evaluate)
-    cfg = parse_ekya_style_config(_runtime(tmp_path), run_id="run")
-    selected = MicroProfileResult(
-        task_id=1,
-        hp_id="hp",
-        hyperparameters={
-            "epochs": 1,
-            "learning_rate": 0.1,
-            "train_batch_size": 1,
-            "subsample": 1.0,
-        },
-        preretrain_map=0.4,
-        post_microprofile_map=0.5,
-        map_gain=0.1,
-        preretrain_ap50=0.4,
-        post_microprofile_ap50=0.5,
-        preretrain_foreground_f1=0.4,
-        post_microprofile_foreground_f1=0.5,
-        init_time_s=0.01,
-        time_per_epoch_s=0.01,
-        predicted_full_train_time_s=0.02,
-        predicted_final_map=0.5,
-        microprofile_epochs=1,
-        subsample=1.0,
-    )
-    decision = SimpleNamespace(
-        trains=True,
-        selected_result=selected,
-        selected_epochs=1,
-        selected_lr=0.1,
-        selected_hp_id="hp",
-        selected_subsample=1.0,
-    )
+    runtime = _runtime(tmp_path)
+    runtime.server.continual_learning.num_epoch = 1
+    runtime.server.continual_learning.batch_size = 1
+    runtime.server.continual_learning.rfdetr_fixed_split_learning_rate = 0.1
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+    decision = SimpleNamespace(trains=True)
 
     result, logs = _capture_info_logs(
         lambda: EkyaCloudTrainer(cfg, checkpoint_dir=tmp_path).train(
@@ -738,7 +705,11 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
     assert Path(result.epoch_log_path).exists()
     assert "train_loss" in Path(result.epoch_log_path).read_text(encoding="utf-8")
     assert logs.count("[EkyaRetraining]") == 1
-    assert "window=1:1:2 hp_id=hp epoch=1/1" in logs
+    assert result.hp_id == "fixed"
+    assert result.epochs == 1
+    assert result.batch_size == 1
+    assert result.lr == pytest.approx(0.1)
+    assert "window=1:1:2 hp_id=fixed epoch=1/1" in logs
     assert "checkpoint=" in logs
     assert "[BaselineTraining] freeze epoch" not in logs
     assert "training start" not in logs
