@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import shutil
 from pathlib import Path
 
 from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import (
@@ -23,15 +22,6 @@ from tools.convert_ekya_style_results_to_plot_schema import (
 from tools.experiments.experiment_common import CSV_SCHEMAS, read_csv, write_csv
 from tools.experiments.plot_plank_road_baseline_figures import plot_figures
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-EXISTING_NORMALIZED = (
-    PROJECT_ROOT
-    / "results"
-    / "experiments"
-    / "exp_road_plankroad_vs_baselines_001"
-    / "normalized"
-)
-
 
 def _raw_ekya_dir(tmp_path: Path) -> Path:
     return (
@@ -47,6 +37,219 @@ def _raw_ekya_dir(tmp_path: Path) -> Path:
 def _header(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return list(csv.DictReader(handle).fieldnames or [])
+
+
+def _write_existing_normalized_fixture(output_dir: Path) -> None:
+    comparison_id = "existing-normalized"
+    run_id = "plank-road-run"
+    method = "plank_road"
+    common = {
+        "comparison_id": comparison_id,
+        "run_id": run_id,
+        "method": method,
+        "edge_id": 1,
+        "scenario_name": "road",
+        "video_slug": "road",
+    }
+    window_id = "plank-window-1"
+
+    write_csv(
+        output_dir / "frame_metrics.csv",
+        CSV_SCHEMAS["frame_metrics.csv"],
+        [
+            {
+                **common,
+                "video_source": "road.mp4",
+                "frame_id": 1,
+                "timestamp_ms": 1000,
+                "model_name": "rfdetr_nano",
+                "model_version": "0",
+                "result_source": "inference",
+                "latency_ms": 90,
+                "timing_inference_ms": 8,
+                "num_detections": 2,
+                "mean_score": 0.82,
+                "f1": 0.80,
+            },
+            {
+                **common,
+                "video_source": "road.mp4",
+                "frame_id": 2,
+                "timestamp_ms": 2000,
+                "model_name": "rfdetr_nano",
+                "model_version": "1",
+                "result_source": "inference",
+                "latency_ms": 85,
+                "timing_inference_ms": 7,
+                "num_detections": 3,
+                "mean_score": 0.84,
+                "f1": 0.82,
+            },
+        ],
+    )
+    write_csv(
+        output_dir / "window_metrics.csv",
+        CSV_SCHEMAS["window_metrics.csv"],
+        [
+            {
+                **common,
+                "window_id": window_id,
+                "window_start_frame": 1,
+                "window_end_frame": 2,
+                "raw_sample_count": 2,
+                "feature_sample_count": 1,
+                "drift_detected": "true",
+                "trigger_decision": "true",
+                "trigger_reason": "drift",
+                "window_accuracy": 0.81,
+                "foreground_accuracy": 0.81,
+                "send_low_conf_features": "true",
+            }
+        ],
+    )
+    write_csv(
+        output_dir / "adaptation_events.csv",
+        CSV_SCHEMAS["adaptation_events.csv"],
+        [
+            {
+                **common,
+                "event_name": "trigger_decision",
+                "event_time_ms": 1000,
+                "frame_id": 1,
+                "window_id": window_id,
+                "job_id": "plank-job-1",
+            },
+            {
+                **common,
+                "event_name": "bundle_upload_started",
+                "event_time_ms": 1100,
+                "window_id": window_id,
+                "job_id": "plank-job-1",
+            },
+            {
+                **common,
+                "event_name": "bundle_upload_done",
+                "event_time_ms": 1200,
+                "window_id": window_id,
+                "job_id": "plank-job-1",
+            },
+            {
+                **common,
+                "event_name": "teacher_annotation_started",
+                "event_time_ms": 1200,
+                "window_id": window_id,
+                "job_id": "plank-job-1",
+            },
+            {
+                **common,
+                "event_name": "teacher_annotation_done",
+                "event_time_ms": 1300,
+                "window_id": window_id,
+                "job_id": "plank-job-1",
+            },
+            {
+                **common,
+                "event_name": "training_job_started",
+                "event_time_ms": 1300,
+                "window_id": window_id,
+                "job_id": "plank-job-1",
+            },
+            {
+                **common,
+                "event_name": "training_job_succeeded",
+                "event_time_ms": 1500,
+                "window_id": window_id,
+                "job_id": "plank-job-1",
+            },
+            {
+                **common,
+                "event_name": "model_update_applied",
+                "event_time_ms": 1600,
+                "frame_id": 2,
+                "window_id": window_id,
+                "job_id": "plank-job-1",
+                "model_version": "0",
+                "result_model_version": "1",
+            },
+        ],
+    )
+    write_csv(
+        output_dir / "upload_breakdown.csv",
+        CSV_SCHEMAS["upload_breakdown.csv"],
+        [
+            {
+                **common,
+                "window_id": window_id,
+                "raw_frame_bytes": 1024,
+                "feature_bytes": 256,
+                "prediction_metadata_bytes": 64,
+                "model_update_download_bytes": 512,
+                "total_upload_bytes": 1856,
+                "raw_exposure_ratio": 0.6,
+                "raw_sample_count": 2,
+                "feature_sample_count": 1,
+                "high_quality_count": 1,
+                "low_quality_count": 1,
+            }
+        ],
+    )
+    write_csv(
+        output_dir / "latency_breakdown.csv",
+        CSV_SCHEMAS["latency_breakdown.csv"],
+        [
+            {
+                **common,
+                "window_id": window_id,
+                "upload_ms": 100,
+                "teacher_annotation_ms": 200,
+                "feature_rebuild_ms": 30,
+                "training_ms": 500,
+                "model_update_download_ms": 40,
+                "model_apply_ms": 20,
+                "total_adaptation_ms": 890,
+            }
+        ],
+    )
+    write_csv(output_dir / "resource_timeline.csv", CSV_SCHEMAS["resource_timeline.csv"], [])
+    write_csv(
+        output_dir / "summary.csv",
+        CSV_SCHEMAS["summary.csv"],
+        [
+            {
+                "comparison_id": comparison_id,
+                "run_id": run_id,
+                "method": method,
+                "scenario_name": "road",
+                "video_slug": "road",
+                "edge_count": 1,
+                "student_model": "rfdetr_nano",
+                "teacher_model": "rtdetr_x",
+                "mean_f1": 0.81,
+                "mean_latency_ms": 87.5,
+                "p50_latency_ms": 87.5,
+                "p95_latency_ms": 89.75,
+                "mean_adaptation_ms": 890,
+                "mean_upload_bytes": 1856,
+                "mean_raw_exposure_ratio": 0.6,
+                "mean_training_ms": 500,
+                "num_training_jobs": 1,
+                "num_model_updates": 1,
+                "num_trigger_decisions": 1,
+            }
+        ],
+    )
+    (output_dir / "normalization_report.json").write_text(
+        json.dumps(
+            {
+                "accuracy_definition": "teacher_supervised_f1",
+                "source": "test fixture",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_raw_ekya_fixture(raw_dir: Path) -> None:
@@ -595,13 +798,7 @@ def test_ekya_schema_contract_appends_to_existing_normalized_and_plots(
     _write_raw_ekya_fixture(raw_dir)
     convert_ekya_style_results(raw_dir=raw_dir, output_dir=ekya_normalized)
 
-    combined.mkdir(parents=True)
-    for filename in CSV_SCHEMAS:
-        shutil.copy2(EXISTING_NORMALIZED / filename, combined / filename)
-    shutil.copy2(
-        EXISTING_NORMALIZED / "normalization_report.json",
-        combined / "normalization_report.json",
-    )
+    _write_existing_normalized_fixture(combined)
 
     append_ekya_style_to_normalized_dir(
         ekya_normalized_dir=ekya_normalized,
@@ -610,7 +807,9 @@ def test_ekya_schema_contract_appends_to_existing_normalized_and_plots(
 
     for filename, fields in CSV_SCHEMAS.items():
         assert _header(combined / filename) == fields
-    assert any(row["method"] == "ekya" for row in read_csv(combined / "summary.csv"))
+    summary_rows = read_csv(combined / "summary.csv")
+    assert any(row["method"] == "plank_road" for row in summary_rows)
+    assert any(row["method"] == "ekya" for row in summary_rows)
 
     report = plot_figures(combined, figures)
     assert (figures / "plot_report.json").exists()
