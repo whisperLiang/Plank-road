@@ -416,76 +416,46 @@ class EdgeAffineWorkersConfig(ConfigSection):
 @dataclass
 class EkyaCandidateHyperparameterConfig(ConfigSection):
     id: str = "hp_small"
-    epochs: int = 1
-    train_batch_size: int = 2
-    test_batch_size: int = 1
-    learning_rate: float = 1.0e-5
+    epochs: int | None = None
+    train_batch_size: int | None = None
+    test_batch_size: int | None = None
+    learning_rate: float | None = None
     subsample: float = 0.25
 
 
 @dataclass
 class EkyaEdgeStreamingConfig(ConfigSection):
-    enabled: bool = True
-    upload_format: str = "jpeg"
     jpeg_quality: int = 85
-    max_inflight_frames: int = 4
     upload_queue_size: int = 8
-    result_queue_size: int = 8
-    drop_stale_results: bool = True
-    display_cloud_results_only: bool = True
 
 
 @dataclass
 class EkyaCloudInferenceConfig(ConfigSection):
-    score_threshold: float = 0.3
+    score_threshold: float | None = None
     batch_size: int = 1
-    high_priority: bool = True
-    async_result_return: bool = True
-    result_queue_size: int = 8
-    drop_stale_display_packets: bool = True
 
 
 @dataclass
 class EkyaTeacherLabelingConfig(ConfigSection):
-    enabled: bool = True
-    batch_size: int = 1
-    score_threshold: float = 0.3
-    cache_labels: bool = True
-    run_async: bool = True
+    batch_size: int | None = None
+    score_threshold: float | None = None
 
 
 @dataclass
 class EkyaMicroprofileConfig(ConfigSection):
-    enabled: bool = True
-    microprofile_epochs: int = 1
-    microprofile_subsample_rate: float = 0.25
-    resources_per_trial: float = 0.25
-    metric: str = "map"
-    prediction_model: str = "simple_linear"
+    microprofile_epochs: int | None = None
     candidate_hyperparameters: list[EkyaCandidateHyperparameterConfig] = field(
         default_factory=lambda: [
             EkyaCandidateHyperparameterConfig(
                 id="hp_small",
-                epochs=1,
-                train_batch_size=2,
-                test_batch_size=1,
-                learning_rate=1.0e-5,
                 subsample=0.25,
             ),
             EkyaCandidateHyperparameterConfig(
                 id="hp_medium",
-                epochs=2,
-                train_batch_size=2,
-                test_batch_size=1,
-                learning_rate=1.0e-5,
                 subsample=0.5,
             ),
             EkyaCandidateHyperparameterConfig(
                 id="hp_large",
-                epochs=3,
-                train_batch_size=2,
-                test_batch_size=1,
-                learning_rate=5.0e-6,
                 subsample=1.0,
             ),
         ]
@@ -494,16 +464,15 @@ class EkyaMicroprofileConfig(ConfigSection):
 
 @dataclass
 class EkyaDatasetConfig(ConfigSection):
-    train_val_split: float = 0.75
-    min_train_samples: int = 1
-    min_val_samples: int = 1
+    train_val_split: float | None = None
+    min_train_samples: int | None = None
+    min_val_samples: int | None = None
 
 
 @dataclass
 class EkyaEvaluationConfig(ConfigSection):
-    metric_mode: str = "teacher_proxy"
-    score_threshold: float = 0.3
-    iou_threshold: float = 0.5
+    score_threshold: float | None = None
+    iou_threshold: float | None = None
 
 
 @dataclass
@@ -521,34 +490,22 @@ class EkyaSchedulerConfig(ConfigSection):
 
 @dataclass
 class EkyaRetrainingConfig(ConfigSection):
-    enabled: bool = True
     adopt_only_if_improved: bool = True
     min_map_gain_to_adopt: float = 0.0
-    max_concurrent_train_jobs: int = 1
-    save_checkpoints: bool = True
-    run_async: bool = True
-    train_mode: str = "full"
+    max_concurrent_train_jobs: int | None = None
+    train_mode: str | None = None
     trainable_param_ratio: float | None = None
-    optimizer_name: str = "adamw"
-    weight_decay: float = 0.0
-
-
-@dataclass
-class EkyaLoggingConfig(ConfigSection):
-    result_schema_version: int = 1
-    log_internal_ids: bool = False
-    diagnostics: bool = False
+    optimizer_name: str | None = None
+    weight_decay: float | None = None
 
 
 @dataclass
 class EkyaStyleCloudSchedulingServerConfig(ConfigSection):
-    enabled: bool = True
-    student_model: str = "rfdetr_nano"
-    teacher_model: str = "rtdetr_x"
-    video_path: str = "./video_data/road.mp4"
-    offline_cloud_video_debug: bool = False
-    num_frames: int = 512
-    window_size: int = 64
+    student_model: str | None = None
+    teacher_model: str | None = None
+    video_path: str | None = None
+    num_frames: int | None = None
+    window_size: int | None = None
     seed: int = 42
     allow_model_override: bool = False
     edge_streaming: EkyaEdgeStreamingConfig = field(default_factory=EkyaEdgeStreamingConfig)
@@ -559,7 +516,6 @@ class EkyaStyleCloudSchedulingServerConfig(ConfigSection):
     evaluation: EkyaEvaluationConfig = field(default_factory=EkyaEvaluationConfig)
     scheduler: EkyaSchedulerConfig = field(default_factory=EkyaSchedulerConfig)
     retraining: EkyaRetrainingConfig = field(default_factory=EkyaRetrainingConfig)
-    logging: EkyaLoggingConfig = field(default_factory=EkyaLoggingConfig)
 
 
 @dataclass
@@ -611,7 +567,7 @@ class ClientConfig(ConfigSection):
 class ServerConfig(ConfigSection):
     server_id: int = 0
     golden: str = "rtdetr_x"
-    edge_model_name: str = "yolo26n"
+    edge_model_name: str = "rfdetr_nano"
     weights_path: str | None = None
     tinynext_input_size: int = 320
     local_queue_maxsize: int = 10
@@ -772,7 +728,6 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["evaluation"] = _section(EkyaEvaluationConfig, known.get("evaluation"))
         known["scheduler"] = _section(EkyaSchedulerConfig, known.get("scheduler"))
         known["retraining"] = _section(EkyaRetrainingConfig, known.get("retraining"))
-        known["logging"] = _section(EkyaLoggingConfig, known.get("logging"))
     elif section_cls is EkyaMicroprofileConfig:
         if "candidate_hyperparameters" in known:
             known["candidate_hyperparameters"] = [
@@ -852,6 +807,73 @@ def _validate_positive(name: str, value: int | float, *, allow_zero: bool = Fals
         return
     if value <= 0:
         raise ValueError(f"{name} must be > 0, got {value!r}")
+
+
+def _configured_value(value: Any, default: Any) -> Any:
+    return default if value is None or value == "" else value
+
+
+def _reject_removed_ekya_config_fields(
+    ekya_cfg: EkyaStyleCloudSchedulingServerConfig,
+) -> None:
+    removed_by_section = {
+        "server.baselines.ekya_style_cloud_scheduling": (
+            ekya_cfg,
+            {"enabled", "offline_cloud_video_debug", "logging"},
+        ),
+        "server.baselines.ekya_style_cloud_scheduling.edge_streaming": (
+            ekya_cfg.edge_streaming,
+            {
+                "enabled",
+                "upload_format",
+                "max_inflight_frames",
+                "result_queue_size",
+                "drop_stale_results",
+                "display_cloud_results_only",
+            },
+        ),
+        "server.baselines.ekya_style_cloud_scheduling.cloud_inference": (
+            ekya_cfg.cloud_inference,
+            {
+                "high_priority",
+                "async_result_return",
+                "result_queue_size",
+                "drop_stale_display_packets",
+            },
+        ),
+        "server.baselines.ekya_style_cloud_scheduling.teacher_labeling": (
+            ekya_cfg.teacher_labeling,
+            {"enabled", "cache_labels", "run_async"},
+        ),
+        "server.baselines.ekya_style_cloud_scheduling.microprofile": (
+            ekya_cfg.microprofile,
+            {
+                "enabled",
+                "microprofile_subsample_rate",
+                "resources_per_trial",
+                "metric",
+                "prediction_model",
+            },
+        ),
+        "server.baselines.ekya_style_cloud_scheduling.evaluation": (
+            ekya_cfg.evaluation,
+            {"metric_mode"},
+        ),
+        "server.baselines.ekya_style_cloud_scheduling.retraining": (
+            ekya_cfg.retraining,
+            {"enabled", "save_checkpoints", "run_async"},
+        ),
+    }
+    removed = []
+    for section_path, (section, fields) in removed_by_section.items():
+        extras = set(getattr(section, "_extras", {}) or {})
+        removed.extend(f"{section_path}.{name}" for name in sorted(extras & fields))
+    if removed:
+        names = ", ".join(removed)
+        raise ValueError(
+            f"Ekya-style cloud scheduling no longer supports these config fields: {names}. "
+            "The corresponding behavior is fixed by the baseline implementation."
+        )
 
 
 def _validate_sample_pool_config(name: str, value: SamplePoolConfig) -> None:
@@ -1042,115 +1064,220 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         int(baseline_training.min_training_samples),
     )
     ekya_cfg = config.server.baselines.ekya_style_cloud_scheduling
-    if bool(ekya_cfg.enabled):
-        if not bool(ekya_cfg.allow_model_override):
-            if str(ekya_cfg.student_model) != "rfdetr_nano":
-                raise ValueError(
-                    "server.baselines.ekya_style_cloud_scheduling.student_model "
-                    "must be rfdetr_nano unless allow_model_override=true"
-                )
-            if str(ekya_cfg.teacher_model) != "rtdetr_x":
-                raise ValueError(
-                    "server.baselines.ekya_style_cloud_scheduling.teacher_model "
-                    "must be rtdetr_x unless allow_model_override=true"
-                )
-        if not bool(ekya_cfg.edge_streaming.enabled):
+    _reject_removed_ekya_config_fields(ekya_cfg)
+    accuracy_cfg = config.baseline.accuracy_trigger_cloud_retraining
+    continual_learning = config.server.continual_learning
+    resolved_student_model = str(
+        _configured_value(ekya_cfg.student_model, config.server.edge_model_name)
+    )
+    resolved_teacher_model = str(
+        _configured_value(ekya_cfg.teacher_model, config.server.golden)
+    )
+    if not bool(ekya_cfg.allow_model_override):
+        if resolved_student_model != "rfdetr_nano":
             raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.edge_streaming.enabled "
-                "must be true"
+                "server.baselines.ekya_style_cloud_scheduling.student_model "
+                "must be rfdetr_nano unless allow_model_override=true"
             )
-        if not bool(ekya_cfg.edge_streaming.display_cloud_results_only):
+        if resolved_teacher_model != "rtdetr_x":
             raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.edge_streaming."
-                "display_cloud_results_only must be true"
+                "server.baselines.ekya_style_cloud_scheduling.teacher_model "
+                "must be rtdetr_x unless allow_model_override=true"
             )
-        _validate_positive(
-            "server.baselines.ekya_style_cloud_scheduling.window_size",
-            int(ekya_cfg.window_size),
+    cloud_score_threshold = _configured_value(
+        ekya_cfg.cloud_inference.score_threshold,
+        config.client.final_detection_threshold,
+    )
+    _validate_positive(
+        "server.baselines.ekya_style_cloud_scheduling.cloud_inference.score_threshold",
+        float(cloud_score_threshold),
+        allow_zero=True,
+    )
+    teacher_batch_size = _configured_value(
+        ekya_cfg.teacher_labeling.batch_size,
+        continual_learning.teacher_batch_size,
+    )
+    teacher_threshold = _configured_value(
+        ekya_cfg.teacher_labeling.score_threshold,
+        continual_learning.teacher_annotation_threshold,
+    )
+    _validate_positive(
+        "server.baselines.ekya_style_cloud_scheduling.teacher_labeling.batch_size",
+        int(teacher_batch_size),
+    )
+    _validate_positive(
+        "server.baselines.ekya_style_cloud_scheduling.teacher_labeling.score_threshold",
+        float(teacher_threshold),
+        allow_zero=True,
+    )
+    resolved_window_size = _configured_value(
+        ekya_cfg.window_size,
+        accuracy_cfg.trigger_window_size,
+    )
+    resolved_num_frames = _configured_value(
+        ekya_cfg.num_frames,
+        config.client.source.max_count,
+    )
+    _validate_positive(
+        "server.baselines.ekya_style_cloud_scheduling.window_size",
+        int(resolved_window_size),
+    )
+    if int(resolved_num_frames) < int(resolved_window_size):
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.num_frames must be >= window_size"
         )
-        if int(ekya_cfg.num_frames) < int(ekya_cfg.window_size):
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.num_frames must be "
-                ">= window_size"
-            )
-        if not list(ekya_cfg.microprofile.candidate_hyperparameters):
+    candidates = list(ekya_cfg.microprofile.candidate_hyperparameters or [])
+    if not candidates:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.microprofile."
+            "candidate_hyperparameters must not be empty"
+        )
+    for index, candidate in enumerate(candidates):
+        if not str(candidate.id or "").strip():
             raise ValueError(
                 "server.baselines.ekya_style_cloud_scheduling.microprofile."
-                "candidate_hyperparameters must not be empty"
+                f"candidate_hyperparameters[{index}].id must be non-empty"
             )
-        if float(ekya_cfg.dataset.train_val_split) <= 0.0 or float(
-            ekya_cfg.dataset.train_val_split
-        ) >= 1.0:
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.dataset."
-                "train_val_split must be in (0, 1)"
-            )
-        _validate_positive(
-            "server.baselines.ekya_style_cloud_scheduling.dataset.min_train_samples",
-            int(ekya_cfg.dataset.min_train_samples),
-        )
-        _validate_positive(
-            "server.baselines.ekya_style_cloud_scheduling.dataset.min_val_samples",
-            int(ekya_cfg.dataset.min_val_samples),
-        )
-        if str(ekya_cfg.evaluation.metric_mode) != "teacher_proxy":
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.evaluation."
-                "metric_mode must be teacher_proxy"
-            )
-        if float(ekya_cfg.evaluation.score_threshold) < 0.0:
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.evaluation."
-                "score_threshold must be non-negative"
-            )
-        if float(ekya_cfg.evaluation.iou_threshold) <= 0.0 or float(
-            ekya_cfg.evaluation.iou_threshold
-        ) > 1.0:
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.evaluation."
-                "iou_threshold must be in (0, 1]"
-            )
-        ekya_train_mode = str(ekya_cfg.retraining.train_mode or "").strip().lower()
-        if ekya_train_mode not in {"full", "freeze"}:
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.retraining."
-                "train_mode must be full or freeze"
-            )
-        if ekya_train_mode == "freeze" and ekya_cfg.retraining.trainable_param_ratio is None:
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.retraining."
-                "trainable_param_ratio is required when train_mode=freeze"
-            )
-        if ekya_cfg.retraining.trainable_param_ratio is not None:
-            _validate_positive(
-                "server.baselines.ekya_style_cloud_scheduling.retraining."
-                "trainable_param_ratio",
-                float(ekya_cfg.retraining.trainable_param_ratio),
-            )
-            if float(ekya_cfg.retraining.trainable_param_ratio) > 1.0:
-                raise ValueError(
-                    "server.baselines.ekya_style_cloud_scheduling.retraining."
-                    "trainable_param_ratio must be <= 1"
+        for name in (
+            "epochs",
+            "train_batch_size",
+            "test_batch_size",
+            "learning_rate",
+        ):
+            configured = getattr(candidate, name)
+            if configured is not None:
+                _validate_positive(
+                    "server.baselines.ekya_style_cloud_scheduling.microprofile."
+                    f"candidate_hyperparameters[{index}].{name}",
+                    float(configured) if name == "learning_rate" else int(configured),
                 )
-        if str(ekya_cfg.retraining.optimizer_name or "").strip().lower() not in {
-            "adamw",
-            "adam",
-            "sgd",
-        }:
+        if float(candidate.subsample) <= 0.0 or float(candidate.subsample) > 1.0:
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.microprofile."
+                f"candidate_hyperparameters[{index}].subsample must be in (0, 1]"
+            )
+    microprofile_epochs = _configured_value(
+        ekya_cfg.microprofile.microprofile_epochs,
+        baseline_training.microprofile_epochs,
+    )
+    _validate_positive(
+        "server.baselines.ekya_style_cloud_scheduling.microprofile.microprofile_epochs",
+        int(microprofile_epochs),
+    )
+    train_val_split = _configured_value(
+        ekya_cfg.dataset.train_val_split,
+        1.0 - float(continual_learning.proxy_eval_validation_fraction),
+    )
+    if float(train_val_split) <= 0.0 or float(train_val_split) >= 1.0:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.dataset."
+            "train_val_split must be in (0, 1)"
+        )
+    min_train_samples = _configured_value(
+        ekya_cfg.dataset.min_train_samples,
+        baseline_training.min_training_samples,
+    )
+    min_val_samples = _configured_value(ekya_cfg.dataset.min_val_samples, 1)
+    _validate_positive(
+        "server.baselines.ekya_style_cloud_scheduling.dataset.min_train_samples",
+        int(min_train_samples),
+    )
+    _validate_positive(
+        "server.baselines.ekya_style_cloud_scheduling.dataset.min_val_samples",
+        int(min_val_samples),
+    )
+    evaluation_score_threshold = _configured_value(
+        ekya_cfg.evaluation.score_threshold,
+        accuracy_cfg.agreement_score_threshold,
+    )
+    evaluation_iou_threshold = _configured_value(
+        ekya_cfg.evaluation.iou_threshold,
+        accuracy_cfg.agreement_iou_threshold,
+    )
+    if float(evaluation_score_threshold) < 0.0:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.evaluation."
+            "score_threshold must be non-negative"
+        )
+    if float(evaluation_iou_threshold) <= 0.0 or float(evaluation_iou_threshold) > 1.0:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.evaluation."
+            "iou_threshold must be in (0, 1]"
+        )
+    ekya_train_mode = (
+        str(
+            _configured_value(
+                ekya_cfg.retraining.train_mode,
+                accuracy_cfg.training_strategy,
+            )
+            or ""
+        )
+        .strip()
+        .lower()
+    )
+    if ekya_train_mode not in {"full", "freeze"}:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.retraining."
+            "train_mode must be full or freeze"
+        )
+    trainable_param_ratio = (
+        ekya_cfg.retraining.trainable_param_ratio
+        if ekya_cfg.retraining.trainable_param_ratio is not None
+        else accuracy_cfg.trainable_param_ratio
+        if ekya_train_mode == "freeze"
+        else None
+    )
+    if ekya_train_mode == "freeze" and trainable_param_ratio is None:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.retraining."
+            "trainable_param_ratio is required when train_mode=freeze"
+        )
+    if trainable_param_ratio is not None:
+        _validate_positive(
+            "server.baselines.ekya_style_cloud_scheduling.retraining.trainable_param_ratio",
+            float(trainable_param_ratio),
+        )
+        if float(trainable_param_ratio) > 1.0:
             raise ValueError(
                 "server.baselines.ekya_style_cloud_scheduling.retraining."
-                "optimizer_name must be adamw, adam, or sgd"
+                "trainable_param_ratio must be <= 1"
             )
-        if float(ekya_cfg.retraining.weight_decay) < 0.0:
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.retraining."
-                "weight_decay must be >= 0"
+    max_train_jobs = _configured_value(
+        ekya_cfg.retraining.max_concurrent_train_jobs,
+        continual_learning.max_concurrent_jobs,
+    )
+    _validate_positive(
+        "server.baselines.ekya_style_cloud_scheduling.retraining.max_concurrent_train_jobs",
+        int(max_train_jobs),
+    )
+    optimizer_name = (
+        str(
+            _configured_value(
+                ekya_cfg.retraining.optimizer_name,
+                baseline_training.optimizer_name,
             )
-        if not bool(ekya_cfg.retraining.save_checkpoints):
-            raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.retraining."
-                "save_checkpoints must be true"
-            )
+            or ""
+        )
+        .strip()
+        .lower()
+    )
+    if optimizer_name not in {
+        "adamw",
+        "adam",
+        "sgd",
+    }:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.retraining."
+            "optimizer_name must be adamw, adam, or sgd"
+        )
+    weight_decay = _configured_value(
+        ekya_cfg.retraining.weight_decay,
+        baseline_training.weight_decay,
+    )
+    if float(weight_decay) < 0.0:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.retraining.weight_decay must be >= 0"
+        )
     _validate_positive(
         "baseline.training.training_window_size",
         int(baseline_training.training_window_size),

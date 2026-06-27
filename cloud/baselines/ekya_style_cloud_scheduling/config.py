@@ -18,7 +18,18 @@ class CandidateHyperparameters:
     subsample: float
 
     @classmethod
-    def from_value(cls, value: Mapping[str, Any] | object) -> "CandidateHyperparameters":
+    def from_value(
+        cls,
+        value: Mapping[str, Any] | object,
+        *,
+        defaults: Mapping[str, Any] | None = None,
+    ) -> "CandidateHyperparameters":
+        defaults = dict(defaults or {})
+
+        def resolved(key: str) -> Any:
+            raw = _get(value, key, None)
+            return defaults.get(key) if raw in (None, "") else raw
+
         missing = [
             key
             for key in (
@@ -29,7 +40,7 @@ class CandidateHyperparameters:
                 "learning_rate",
                 "subsample",
             )
-            if _get(value, key, None) in (None, "")
+            if resolved(key) in (None, "")
         ]
         if missing:
             raise ValueError(
@@ -37,12 +48,12 @@ class CandidateHyperparameters:
                 f"entry is missing: {', '.join(missing)}"
             )
         candidate = cls(
-            id=str(_get(value, "id")),
-            epochs=int(_get(value, "epochs")),
-            train_batch_size=int(_get(value, "train_batch_size")),
-            test_batch_size=int(_get(value, "test_batch_size")),
-            learning_rate=float(_get(value, "learning_rate")),
-            subsample=float(_get(value, "subsample")),
+            id=str(resolved("id")),
+            epochs=int(resolved("epochs")),
+            train_batch_size=int(resolved("train_batch_size")),
+            test_batch_size=int(resolved("test_batch_size")),
+            learning_rate=float(resolved("learning_rate")),
+            subsample=float(resolved("subsample")),
         )
         candidate.validate()
         return candidate
@@ -75,46 +86,26 @@ class CandidateHyperparameters:
 
 @dataclass(frozen=True)
 class EdgeStreamingConfig:
-    enabled: bool = True
-    upload_format: str = "jpeg"
     jpeg_quality: int = 85
-    max_inflight_frames: int = 4
     upload_queue_size: int = 8
-    result_queue_size: int = 8
-    drop_stale_results: bool = True
-    display_cloud_results_only: bool = True
 
 
 @dataclass(frozen=True)
 class CloudInferenceConfig:
     score_threshold: float = 0.3
     batch_size: int = 1
-    high_priority: bool = True
-    async_result_return: bool = True
-    result_queue_size: int = 8
-    drop_stale_display_packets: bool = True
 
 
 @dataclass(frozen=True)
 class TeacherLabelingConfig:
-    enabled: bool = True
     batch_size: int = 1
     score_threshold: float = 0.3
-    cache_labels: bool = True
-    run_async: bool = True
 
 
 @dataclass(frozen=True)
 class MicroprofileConfig:
-    enabled: bool = True
     microprofile_epochs: int = 1
-    microprofile_subsample_rate: float = 0.25
-    resources_per_trial: float = 0.25
-    metric: str = "map"
-    prediction_model: str = "simple_linear"
-    candidate_hyperparameters: tuple[CandidateHyperparameters, ...] = field(
-        default_factory=tuple
-    )
+    candidate_hyperparameters: tuple[CandidateHyperparameters, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -126,7 +117,6 @@ class DatasetConfig:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    metric_mode: str = "teacher_proxy"
     score_threshold: float = 0.3
     iou_threshold: float = 0.5
 
@@ -146,12 +136,9 @@ class SchedulerConfig:
 
 @dataclass(frozen=True)
 class RetrainingConfig:
-    enabled: bool = True
     adopt_only_if_improved: bool = True
     min_map_gain_to_adopt: float = 0.0
     max_concurrent_train_jobs: int = 1
-    save_checkpoints: bool = True
-    run_async: bool = True
     train_mode: str = "full"
     trainable_param_ratio: float | None = None
     optimizer_name: str = "adamw"
@@ -159,21 +146,12 @@ class RetrainingConfig:
 
 
 @dataclass(frozen=True)
-class LoggingConfig:
-    result_schema_version: int = 1
-    log_internal_ids: bool = False
-    diagnostics: bool = False
-
-
-@dataclass(frozen=True)
 class EkyaStyleCloudSchedulingConfig:
-    enabled: bool
     run_id: str
     student_model: str
     teacher_model: str
     video_path: str
     video_name: str
-    offline_cloud_video_debug: bool
     num_frames: int
     window_size: int
     seed: int
@@ -188,7 +166,6 @@ class EkyaStyleCloudSchedulingConfig:
     evaluation: EvaluationConfig
     scheduler: SchedulerConfig
     retraining: RetrainingConfig
-    logging: LoggingConfig
     allow_model_override: bool = False
 
     def validate(self) -> None:
@@ -202,28 +179,14 @@ class EkyaStyleCloudSchedulingConfig:
                 "ekya_style_cloud_scheduling.teacher_model must be rtdetr_x "
                 "unless allow_model_override=true"
             )
-        if not self.edge_streaming.enabled:
-            raise ValueError("ekya_style_cloud_scheduling.edge_streaming.enabled must be true")
-        if not self.edge_streaming.display_cloud_results_only:
-            raise ValueError(
-                "ekya_style_cloud_scheduling.edge_streaming.display_cloud_results_only "
-                "must be true"
-            )
         if self.window_size <= 0:
             raise ValueError("ekya_style_cloud_scheduling.window_size must be positive")
         if self.num_frames < self.window_size:
-            raise ValueError(
-                "ekya_style_cloud_scheduling.num_frames must be >= window_size"
-            )
+            raise ValueError("ekya_style_cloud_scheduling.num_frames must be >= window_size")
         if not self.microprofile.candidate_hyperparameters:
             raise ValueError(
                 "ekya_style_cloud_scheduling.microprofile.candidate_hyperparameters "
                 "must not be empty"
-            )
-        if self.edge_streaming.upload_format != "jpeg":
-            raise ValueError(
-                "ekya_style_cloud_scheduling.edge_streaming.upload_format currently "
-                "supports only jpeg"
             )
         if not 1 <= int(self.edge_streaming.jpeg_quality) <= 100:
             raise ValueError("ekya_style_cloud_scheduling.jpeg_quality must be in [1, 100]")
@@ -234,10 +197,6 @@ class EkyaStyleCloudSchedulingConfig:
         if self.dataset.min_train_samples <= 0 or self.dataset.min_val_samples <= 0:
             raise ValueError(
                 "ekya_style_cloud_scheduling.dataset min sample counts must be positive"
-            )
-        if self.evaluation.metric_mode != "teacher_proxy":
-            raise ValueError(
-                "ekya_style_cloud_scheduling.evaluation.metric_mode must be teacher_proxy"
             )
         if self.evaluation.score_threshold < 0.0:
             raise ValueError(
@@ -274,8 +233,6 @@ class EkyaStyleCloudSchedulingConfig:
             )
         if self.retraining.weight_decay < 0.0:
             raise ValueError("ekya_style_cloud_scheduling.retraining.weight_decay must be >= 0")
-        if not self.retraining.save_checkpoints:
-            raise ValueError("ekya_style_cloud_scheduling.retraining.save_checkpoints must be true")
 
 
 def parse_ekya_style_config(
@@ -287,145 +244,294 @@ def parse_ekya_style_config(
 ) -> EkyaStyleCloudSchedulingConfig:
     server = _get(runtime_config, "server", runtime_config)
     client = _get(runtime_config, "client", None)
+    baseline = _get(runtime_config, "baseline", None)
     server_baselines = _get(server, "baselines", None)
     section = _get(server_baselines, METHOD, None)
     if section is None:
-        baseline = _get(runtime_config, "baseline", None)
-        section = _get(baseline, METHOD, None)
-    section = section or {}
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling is required for "
+            "ekya_style_cloud_scheduling"
+        )
 
-    resolved_run_id = str(
-        run_id or _get(_get(runtime_config, "baseline", None), "run_id", "") or ""
-    )
+    resolved_run_id = str(run_id or _get(baseline, "run_id", "") or "")
     if not resolved_run_id:
         raise ValueError("run_id must be non-empty for ekya_style_cloud_scheduling")
 
     source = _get(client, "source", None)
-    resolved_video_path = str(
-        video_path
-        or _get(section, "video_path", "")
-        or _get(source, "video_path", "")
-        or "./video_data/road.mp4"
-    )
-    resolved_result_root = Path(
-        result_root
-        or _get(section, "result_root", "")
-        or _get(section, "results_root", "")
-        or "results/cloud"
-    )
-    output_dir = resolved_result_root / resolved_run_id / "baselines" / METHOD
-    candidates = tuple(
-        CandidateHyperparameters.from_value(item)
-        for item in list(
-            _get(
-                _get(section, "microprofile", None),
-                "candidate_hyperparameters",
-                _default_candidates(),
-            )
-            or []
+    student_model = str(
+        _required_value(
+            _configured_value(
+                _get(section, "student_model", None), _get(server, "edge_model_name", None)
+            ),
+            "ekya_style_cloud_scheduling.student_model",
         )
     )
+    teacher_model = str(
+        _required_value(
+            _configured_value(_get(section, "teacher_model", None), _get(server, "golden", None)),
+            "ekya_style_cloud_scheduling.teacher_model",
+        )
+    )
+    resolved_video_path = str(
+        _required_value(
+            video_path
+            or _configured_value(
+                _get(section, "video_path", None), _get(source, "video_path", None)
+            ),
+            "ekya_style_cloud_scheduling.video_path",
+        )
+    )
+    resolved_result_root = Path(
+        result_root or _get(section, "result_root", "") or "results/cloud"
+    )
+    output_dir = resolved_result_root / resolved_run_id / "baselines" / METHOD
+    candidate_defaults = _candidate_training_defaults(
+        server=server,
+        baseline=baseline,
+        student_model=student_model,
+    )
+    microprofile_section = _get(section, "microprofile", None)
+    candidate_values = list(
+        _get(
+            microprofile_section,
+            "candidate_hyperparameters",
+            _default_candidate_search_space(),
+        )
+        or []
+    )
+    candidates = tuple(
+        CandidateHyperparameters.from_value(item, defaults=candidate_defaults)
+        for item in candidate_values
+    )
+    accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
     config = EkyaStyleCloudSchedulingConfig(
-        enabled=bool(_get(section, "enabled", True)),
         run_id=resolved_run_id,
-        student_model=str(
-            _get(section, "student_model", "")
-            or _get(server, "edge_model_name", "")
-            or "rfdetr_nano"
-        ),
-        teacher_model=str(
-            _get(section, "teacher_model", "") or _get(server, "golden", "") or "rtdetr_x"
-        ),
+        student_model=student_model,
+        teacher_model=teacher_model,
         video_path=resolved_video_path,
         video_name=Path(resolved_video_path).name,
-        offline_cloud_video_debug=bool(_get(section, "offline_cloud_video_debug", False)),
-        num_frames=int(_get(section, "num_frames", 512)),
-        window_size=int(_get(section, "window_size", 64)),
+        num_frames=int(
+            _required_value(
+                _configured_value(
+                    _get(section, "num_frames", None), _get(source, "max_count", None)
+                ),
+                "ekya_style_cloud_scheduling.num_frames",
+            )
+        ),
+        window_size=int(
+            _required_value(
+                _configured_value(
+                    _get(section, "window_size", None),
+                    _get(accuracy_cfg, "trigger_window_size", None),
+                ),
+                "ekya_style_cloud_scheduling.window_size",
+            )
+        ),
         seed=int(_get(section, "seed", 42)),
         class_names=tuple(str(value) for value in list(_get(client, "class_names", []) or [])),
         result_root=resolved_result_root,
         output_dir=output_dir,
         edge_streaming=_edge_streaming_config(_get(section, "edge_streaming", None)),
-        cloud_inference=_cloud_inference_config(_get(section, "cloud_inference", None)),
-        teacher_labeling=_teacher_labeling_config(_get(section, "teacher_labeling", None)),
+        cloud_inference=_cloud_inference_config(
+            _get(section, "cloud_inference", None),
+            client=client,
+        ),
+        teacher_labeling=_teacher_labeling_config(
+            _get(section, "teacher_labeling", None),
+            server=server,
+        ),
         microprofile=_microprofile_config(
-            _get(section, "microprofile", None),
+            microprofile_section,
+            baseline=baseline,
             candidates=candidates,
         ),
-        dataset=_dataset_config(_get(section, "dataset", None)),
-        evaluation=_evaluation_config(_get(section, "evaluation", None)),
+        dataset=_dataset_config(_get(section, "dataset", None), server=server, baseline=baseline),
+        evaluation=_evaluation_config(_get(section, "evaluation", None), baseline=baseline),
         scheduler=_scheduler_config(_get(section, "scheduler", None)),
-        retraining=_retraining_config(_get(section, "retraining", None)),
-        logging=_logging_config(_get(section, "logging", None)),
+        retraining=_retraining_config(
+            _get(section, "retraining", None), server=server, baseline=baseline
+        ),
         allow_model_override=bool(_get(section, "allow_model_override", False)),
     )
     config.validate()
     return config
 
 
+def _configured_value(value: Any, default: Any) -> Any:
+    return default if value is None or value == "" else value
+
+
+def _required_value(value: Any, name: str) -> Any:
+    if value is None or value == "":
+        raise ValueError(f"{name} must be configured")
+    return value
+
+
+def _candidate_training_defaults(
+    *,
+    server: object,
+    baseline: object | None,
+    student_model: str,
+) -> dict[str, Any]:
+    continual_learning = _get(server, "continual_learning", None)
+    baseline_training = _get(baseline, "training", None)
+    batch_size = _configured_value(
+        _get(continual_learning, "batch_size", None),
+        _get(baseline_training, "batch_size", 1),
+    )
+    return {
+        "epochs": _configured_value(
+            _get(continual_learning, "num_epoch", None),
+            _get(baseline_training, "num_epoch", 1),
+        ),
+        "train_batch_size": batch_size,
+        "test_batch_size": batch_size,
+        "learning_rate": _candidate_learning_rate(
+            server=server,
+            baseline=baseline,
+            student_model=student_model,
+        ),
+    }
+
+
+def _candidate_learning_rate(
+    *,
+    server: object,
+    baseline: object | None,
+    student_model: str,
+) -> float:
+    continual_learning = _get(server, "continual_learning", None)
+    baseline_training = _get(baseline, "training", None)
+    family = _model_family(student_model)
+    family_field = {
+        "rfdetr": "rfdetr_fixed_split_learning_rate",
+        "tinynext": "tinynext_fixed_split_learning_rate",
+    }.get(family)
+    if family_field:
+        value = _get(continual_learning, family_field, None)
+        if value not in (None, ""):
+            return float(value)
+    value = _get(continual_learning, "split_learning_rate", None)
+    if value not in (None, ""):
+        return float(value)
+    return float(_get(baseline_training, "learning_rate", 1.0e-3))
+
+
+def _model_family(model_name: str) -> str:
+    normalized = str(model_name or "").strip().lower()
+    if normalized.startswith("rfdetr") or normalized.startswith("rf-detr"):
+        return "rfdetr"
+    if normalized.startswith("tinynext"):
+        return "tinynext"
+    if normalized.startswith("yolo"):
+        return "yolo"
+    return normalized
+
+
+def _default_candidate_search_space() -> list[dict[str, Any]]:
+    return [
+        {"id": "hp_small", "subsample": 0.25},
+        {"id": "hp_medium", "subsample": 0.5},
+        {"id": "hp_large", "subsample": 1.0},
+    ]
+
+
 def _edge_streaming_config(value: object) -> EdgeStreamingConfig:
     return EdgeStreamingConfig(
-        enabled=bool(_get(value, "enabled", True)),
-        upload_format=str(_get(value, "upload_format", "jpeg") or "jpeg").lower(),
         jpeg_quality=int(_get(value, "jpeg_quality", 85)),
-        max_inflight_frames=int(_get(value, "max_inflight_frames", 4)),
         upload_queue_size=int(_get(value, "upload_queue_size", 8)),
-        result_queue_size=int(_get(value, "result_queue_size", 8)),
-        drop_stale_results=bool(_get(value, "drop_stale_results", True)),
-        display_cloud_results_only=bool(_get(value, "display_cloud_results_only", True)),
     )
 
 
-def _cloud_inference_config(value: object) -> CloudInferenceConfig:
+def _cloud_inference_config(value: object, *, client: object | None) -> CloudInferenceConfig:
     return CloudInferenceConfig(
-        score_threshold=float(_get(value, "score_threshold", 0.3)),
+        score_threshold=float(
+            _configured_value(
+                _get(value, "score_threshold", None),
+                _get(client, "final_detection_threshold", 0.0),
+            )
+        ),
         batch_size=int(_get(value, "batch_size", 1)),
-        high_priority=bool(_get(value, "high_priority", True)),
-        async_result_return=bool(_get(value, "async_result_return", True)),
-        result_queue_size=int(_get(value, "result_queue_size", 8)),
-        drop_stale_display_packets=bool(_get(value, "drop_stale_display_packets", True)),
     )
 
 
-def _teacher_labeling_config(value: object) -> TeacherLabelingConfig:
+def _teacher_labeling_config(value: object, *, server: object) -> TeacherLabelingConfig:
+    continual_learning = _get(server, "continual_learning", None)
     return TeacherLabelingConfig(
-        enabled=bool(_get(value, "enabled", True)),
-        batch_size=int(_get(value, "batch_size", 1)),
-        score_threshold=float(_get(value, "score_threshold", 0.3)),
-        cache_labels=bool(_get(value, "cache_labels", True)),
-        run_async=bool(_get(value, "run_async", True)),
+        batch_size=int(
+            _required_value(
+                _configured_value(
+                    _get(value, "batch_size", None),
+                    _get(continual_learning, "teacher_batch_size", None),
+                ),
+                "ekya_style_cloud_scheduling.teacher_labeling.batch_size",
+            )
+        ),
+        score_threshold=float(
+            _required_value(
+                _configured_value(
+                    _get(value, "score_threshold", None),
+                    _get(continual_learning, "teacher_annotation_threshold", None),
+                ),
+                "ekya_style_cloud_scheduling.teacher_labeling.score_threshold",
+            )
+        ),
     )
 
 
 def _microprofile_config(
     value: object,
     *,
+    baseline: object | None,
     candidates: tuple[CandidateHyperparameters, ...],
 ) -> MicroprofileConfig:
+    baseline_training = _get(baseline, "training", None)
     return MicroprofileConfig(
-        enabled=bool(_get(value, "enabled", True)),
-        microprofile_epochs=int(_get(value, "microprofile_epochs", 1)),
-        microprofile_subsample_rate=float(_get(value, "microprofile_subsample_rate", 0.25)),
-        resources_per_trial=float(_get(value, "resources_per_trial", 0.25)),
-        metric=str(_get(value, "metric", "map") or "map"),
-        prediction_model=str(_get(value, "prediction_model", "simple_linear") or "simple_linear"),
+        microprofile_epochs=int(
+            _configured_value(
+                _get(value, "microprofile_epochs", None),
+                _get(baseline_training, "microprofile_epochs", 1),
+            )
+        ),
         candidate_hyperparameters=candidates,
     )
 
 
-def _dataset_config(value: object) -> DatasetConfig:
+def _dataset_config(value: object, *, server: object, baseline: object | None) -> DatasetConfig:
+    continual_learning = _get(server, "continual_learning", None)
+    baseline_training = _get(baseline, "training", None)
+    default_train_val_split = 1.0 - float(
+        _get(continual_learning, "proxy_eval_validation_fraction", 0.25)
+    )
     return DatasetConfig(
-        train_val_split=float(_get(value, "train_val_split", 0.75)),
-        min_train_samples=int(_get(value, "min_train_samples", 1)),
-        min_val_samples=int(_get(value, "min_val_samples", 1)),
+        train_val_split=float(
+            _configured_value(_get(value, "train_val_split", None), default_train_val_split)
+        ),
+        min_train_samples=int(
+            _configured_value(
+                _get(value, "min_train_samples", None),
+                _get(baseline_training, "min_training_samples", 1),
+            )
+        ),
+        min_val_samples=int(_configured_value(_get(value, "min_val_samples", None), 1)),
     )
 
 
-def _evaluation_config(value: object) -> EvaluationConfig:
+def _evaluation_config(value: object, *, baseline: object | None) -> EvaluationConfig:
+    accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
     return EvaluationConfig(
-        metric_mode=str(_get(value, "metric_mode", "teacher_proxy") or "teacher_proxy"),
-        score_threshold=float(_get(value, "score_threshold", 0.3)),
-        iou_threshold=float(_get(value, "iou_threshold", 0.5)),
+        score_threshold=float(
+            _configured_value(
+                _get(value, "score_threshold", None),
+                _get(accuracy_cfg, "agreement_score_threshold", 0.0),
+            )
+        ),
+        iou_threshold=float(
+            _configured_value(
+                _get(value, "iou_threshold", None),
+                _get(accuracy_cfg, "agreement_iou_threshold", 0.5),
+            )
+        ),
     )
 
 
@@ -445,57 +551,56 @@ def _scheduler_config(value: object) -> SchedulerConfig:
     )
 
 
-def _retraining_config(value: object) -> RetrainingConfig:
+def _retraining_config(
+    value: object,
+    *,
+    server: object,
+    baseline: object | None,
+) -> RetrainingConfig:
+    continual_learning = _get(server, "continual_learning", None)
+    baseline_training = _get(baseline, "training", None)
+    accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
+    train_mode = (
+        str(
+            _configured_value(
+                _get(value, "train_mode", None),
+                _get(accuracy_cfg, "training_strategy", "full"),
+            )
+            or "full"
+        )
+        .strip()
+        .lower()
+    )
     ratio = _get(value, "trainable_param_ratio", None)
+    if ratio in (None, "") and train_mode == "freeze":
+        ratio = _get(accuracy_cfg, "trainable_param_ratio", None)
     return RetrainingConfig(
-        enabled=bool(_get(value, "enabled", True)),
         adopt_only_if_improved=bool(_get(value, "adopt_only_if_improved", True)),
         min_map_gain_to_adopt=float(_get(value, "min_map_gain_to_adopt", 0.0)),
-        max_concurrent_train_jobs=int(_get(value, "max_concurrent_train_jobs", 1)),
-        save_checkpoints=bool(_get(value, "save_checkpoints", True)),
-        run_async=bool(_get(value, "run_async", True)),
-        train_mode=str(_get(value, "train_mode", "full") or "full").strip().lower(),
+        max_concurrent_train_jobs=int(
+            _configured_value(
+                _get(value, "max_concurrent_train_jobs", None),
+                _get(continual_learning, "max_concurrent_jobs", 1),
+            )
+        ),
+        train_mode=train_mode,
         trainable_param_ratio=None if ratio in (None, "") else float(ratio),
-        optimizer_name=str(_get(value, "optimizer_name", "adamw") or "adamw").strip().lower(),
-        weight_decay=float(_get(value, "weight_decay", 0.0)),
+        optimizer_name=str(
+            _configured_value(
+                _get(value, "optimizer_name", None),
+                _get(baseline_training, "optimizer_name", "adamw"),
+            )
+            or "adamw"
+        )
+        .strip()
+        .lower(),
+        weight_decay=float(
+            _configured_value(
+                _get(value, "weight_decay", None),
+                _get(baseline_training, "weight_decay", 0.0),
+            )
+        ),
     )
-
-
-def _logging_config(value: object) -> LoggingConfig:
-    return LoggingConfig(
-        result_schema_version=int(_get(value, "result_schema_version", 1)),
-        log_internal_ids=bool(_get(value, "log_internal_ids", False)),
-        diagnostics=bool(_get(value, "diagnostics", False)),
-    )
-
-
-def _default_candidates() -> list[dict[str, Any]]:
-    return [
-        {
-            "id": "hp_small",
-            "epochs": 1,
-            "train_batch_size": 2,
-            "test_batch_size": 1,
-            "learning_rate": 0.00001,
-            "subsample": 0.25,
-        },
-        {
-            "id": "hp_medium",
-            "epochs": 2,
-            "train_batch_size": 2,
-            "test_batch_size": 1,
-            "learning_rate": 0.00001,
-            "subsample": 0.5,
-        },
-        {
-            "id": "hp_large",
-            "epochs": 3,
-            "train_batch_size": 2,
-            "test_batch_size": 1,
-            "learning_rate": 0.000005,
-            "subsample": 1.0,
-        },
-    ]
 
 
 def _get(value: object, name: str, default: Any = None) -> Any:

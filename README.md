@@ -251,19 +251,16 @@ optionally adopts retrained student checkpoints.
 server:
   baselines:
     ekya_style_cloud_scheduling:
-      enabled: true
-      student_model: rfdetr_nano
-      teacher_model: rtdetr_x
-      num_frames: 512
-      window_size: 64
       edge_streaming:
-        enabled: true
-        upload_format: jpeg
         jpeg_quality: 85
-        display_cloud_results_only: true
       retraining:
-        max_concurrent_train_jobs: 1
+        min_map_gain_to_adopt: 0.0
 ```
+
+The baseline inherits shared experiment settings from the main Plank-Road
+configuration: `server.edge_model_name`, `server.golden`, `client.source`,
+`server.continual_learning`, `baseline.training`, and
+`baseline.accuracy_trigger_cloud_retraining`.
 
 ## Usage
 
@@ -445,7 +442,7 @@ python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseli
 Ekya-style edge:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --run_id ekya_style_001 --edge_id 1 --server_ip 192.168.66.205:50051 --video_path ./video_data/road.mp4 --display_cloud_results_only --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --run_id ekya_style_001 --edge_id 1 --server_ip 192.168.66.205:50051 --video_path ./video_data/road.mp4 --headless
 ```
 
 Cloud-side raw logs are written under

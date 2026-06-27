@@ -62,7 +62,7 @@ class EkyaStyleCloudSchedulingController:
             teacher_model=config.teacher_model,
             window_size=config.window_size,
             num_frames=config.num_frames,
-            result_schema_version=config.logging.result_schema_version,
+            result_schema_version=1,
         )
         self.frame_buffer = CloudFrameBuffer(
             window_size=config.window_size,
@@ -70,7 +70,7 @@ class EkyaStyleCloudSchedulingController:
         )
         self.frame_receiver = CloudFrameReceiver(
             frame_buffer=self.frame_buffer,
-            drop_stale=bool(config.cloud_inference.drop_stale_display_packets),
+            drop_stale=True,
         )
         self.inference = CloudInferenceEngine(
             config,
@@ -174,22 +174,15 @@ class EkyaStyleCloudSchedulingController:
         self.logger.write_summary()
 
     def _launch_window_pipeline(self, window: CompletedFrameWindow) -> None:
-        if (
-            self.config.teacher_labeling.run_async
-            or self.config.microprofile.enabled
-            or self.config.retraining.run_async
-        ):
-            thread = threading.Thread(
-                target=self._run_window_pipeline_guarded,
-                args=(window,),
-                name=f"ekya-window-{window.window_id}",
-                daemon=True,
-            )
-            with self._window_threads_lock:
-                self._background_threads.append(thread)
-            thread.start()
-        else:
-            self._run_window_pipeline_guarded(window)
+        thread = threading.Thread(
+            target=self._run_window_pipeline_guarded,
+            args=(window,),
+            name=f"ekya-window-{window.window_id}",
+            daemon=True,
+        )
+        with self._window_threads_lock:
+            self._background_threads.append(thread)
+        thread.start()
 
     def _run_window_pipeline_guarded(self, window: CompletedFrameWindow) -> None:
         try:
@@ -211,37 +204,33 @@ class EkyaStyleCloudSchedulingController:
         )
         teacher_labels: dict[int, dict[str, Any]] = {}
         teacher_labeling_time_s = 0.0
-        if self.config.teacher_labeling.enabled:
-            teacher_labels, teacher_labeling_time_s = self.teacher_labeler.label_window(window)
-            with self._summary_lock:
-                self._total_teacher_labeling_time_s += float(teacher_labeling_time_s)
-                total_teacher_labeling_time_s = self._total_teacher_labeling_time_s
-            self.logger.update_summary_extra(
-                total_teacher_labeling_time_s=total_teacher_labeling_time_s
-            )
-            for record in window.records:
-                labels = teacher_labels.get(int(record.frame_idx), {})
-                self.frame_buffer.update_teacher_labels(record, labels)
+        teacher_labels, teacher_labeling_time_s = self.teacher_labeler.label_window(window)
+        with self._summary_lock:
+            self._total_teacher_labeling_time_s += float(teacher_labeling_time_s)
+            total_teacher_labeling_time_s = self._total_teacher_labeling_time_s
+        self.logger.update_summary_extra(
+            total_teacher_labeling_time_s=total_teacher_labeling_time_s
+        )
+        for record in window.records:
+            labels = teacher_labels.get(int(record.frame_idx), {})
+            self.frame_buffer.update_teacher_labels(record, labels)
 
         frame_scores = self._update_frame_quality(window, teacher_labels)
         micro_results = []
         microprofile_time_s = 0.0
-        base_state_dict = None
-        if self.config.microprofile.enabled or self.config.retraining.enabled:
-            base_state_dict = self.inference.export_state_dict()
-        if self.config.microprofile.enabled:
-            micro_results, microprofile_time_s = self.microprofiler.profile(
-                window=window,
-                teacher_labels=teacher_labels,
-                base_state_dict=base_state_dict,
-                model_builder=self.inference.build_student_model_clone,
-            )
-            for result in micro_results:
-                row = result.as_dict()
-                row.pop("hyperparameters", None)
-                row["edge_id"] = int(window.edge_id)
-                row["camera_id"] = int(window.camera_id)
-                self.logger.append_microprofile_event(row)
+        base_state_dict = self.inference.export_state_dict()
+        micro_results, microprofile_time_s = self.microprofiler.profile(
+            window=window,
+            teacher_labels=teacher_labels,
+            base_state_dict=base_state_dict,
+            model_builder=self.inference.build_student_model_clone,
+        )
+        for result in micro_results:
+            row = result.as_dict()
+            row.pop("hyperparameters", None)
+            row["edge_id"] = int(window.edge_id)
+            row["camera_id"] = int(window.camera_id)
+            self.logger.append_microprofile_event(row)
 
         decision = self.scheduler.schedule(
             task_id=int(window.task_id),
@@ -258,7 +247,7 @@ class EkyaStyleCloudSchedulingController:
         )
         training_result: TrainingResult | None = None
         adopted = False
-        if self.config.retraining.enabled and decision.trains:
+        if decision.trains:
             training_result = self.trainer.train(
                 window=window,
                 decision=decision,
@@ -293,7 +282,12 @@ class EkyaStyleCloudSchedulingController:
         scores = []
         for record in window.records:
             teacher = teacher_labels.get(int(record.frame_idx), {})
-            f1 = teacher_f1(record.prediction, teacher, iou_threshold=0.5, score_threshold=0.0)
+            f1 = teacher_f1(
+                record.prediction,
+                teacher,
+                iou_threshold=float(self.config.evaluation.iou_threshold),
+                score_threshold=float(self.config.evaluation.score_threshold),
+            )
             score = {"foreground_f1": f1, "map50": f1, "map": f1}
             scores.append(score)
             self.logger.update_frame_metrics(

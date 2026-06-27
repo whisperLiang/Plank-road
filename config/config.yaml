@@ -202,7 +202,7 @@ client:
   bundle_max_bytes: 134217728
   bundle_min_bytes: 8388608
   bundle_target_upload_sec: 45.0
- # Split learning for continual learning 
+ # Split learning for continual learning
  # When enabled, backbone features are extracted and cached on the edge.
  # Only drift-moment samples are annotated by the cloud's large model;
  # non-drift samples use edge pseudo-labels for training.
@@ -237,70 +237,12 @@ server:
  workspace_root: "./cache/server_workspace"
  baselines:
   ekya_style_cloud_scheduling:
-   enabled: true
-   student_model: rfdetr_nano
-   teacher_model: rtdetr_x
-   video_path: ./video_data/road.mp4
-   offline_cloud_video_debug: false
-   num_frames: 512
-   window_size: 64
    seed: 42
    edge_streaming:
-    enabled: true
-    upload_format: jpeg
     jpeg_quality: 85
-    max_inflight_frames: 4
     upload_queue_size: 8
-    result_queue_size: 8
-    drop_stale_results: true
-    display_cloud_results_only: true
    cloud_inference:
-    score_threshold: 0.3
     batch_size: 1
-    high_priority: true
-    async_result_return: true
-    result_queue_size: 8
-    drop_stale_display_packets: true
-   teacher_labeling:
-    enabled: true
-    batch_size: 1
-    score_threshold: 0.3
-    cache_labels: true
-    run_async: true
-   microprofile:
-    enabled: true
-    microprofile_epochs: 1
-    microprofile_subsample_rate: 0.25
-    resources_per_trial: 0.25
-    metric: map
-    prediction_model: simple_linear
-    candidate_hyperparameters:
-     - id: hp_small
-       epochs: 1
-       train_batch_size: 2
-       test_batch_size: 1
-       learning_rate: 0.00001
-       subsample: 0.25
-     - id: hp_medium
-       epochs: 2
-       train_batch_size: 2
-       test_batch_size: 1
-       learning_rate: 0.00001
-       subsample: 0.5
-     - id: hp_large
-       epochs: 3
-       train_batch_size: 2
-       test_batch_size: 1
-       learning_rate: 0.000005
-       subsample: 1.0
-   dataset:
-    train_val_split: 0.75
-    min_train_samples: 1
-    min_val_samples: 1
-   evaluation:
-    metric_mode: teacher_proxy
-    score_threshold: 0.3
-    iou_threshold: 0.5
    scheduler:
     name: ekya_thief_style
     retraining_period_s: 64
@@ -311,20 +253,8 @@ server:
     fail_on_microprofile_overrun: false
     protect_inference_from_training: true
    retraining:
-    enabled: true
     adopt_only_if_improved: true
     min_map_gain_to_adopt: 0.0
-    max_concurrent_train_jobs: 1
-    save_checkpoints: true
-    run_async: true
-    train_mode: full
-    trainable_param_ratio: null
-    optimizer_name: adamw
-    weight_decay: 0.0
-   logging:
-    result_schema_version: 1
-    log_internal_ids: false
-    diagnostics: false
  edge_affine_workers:
   enabled: true
   run_id: null
@@ -409,7 +339,6 @@ server:
    feature_rebuild_batch_size: 16
    gc_enabled: false
    gc_dry_run: true
-  teacher_batch_size: 32
   proxy_eval_interval_rounds: 10
   proxy_eval_patience: 2
   proxy_eval_min_delta: 0.002

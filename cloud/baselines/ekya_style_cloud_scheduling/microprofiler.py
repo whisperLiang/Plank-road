@@ -117,7 +117,7 @@ class DetectionMicroProfiler:
             val_samples,
             score_threshold=float(self.config.evaluation.score_threshold),
             iou_threshold=float(self.config.evaluation.iou_threshold),
-            metric_mode=self.config.evaluation.metric_mode,
+            metric_mode="teacher_proxy",
         )
         train_started = time.perf_counter()
         for _epoch in range(1, microprofile_epochs + 1):
@@ -132,7 +132,7 @@ class DetectionMicroProfiler:
             val_samples,
             score_threshold=float(self.config.evaluation.score_threshold),
             iou_threshold=float(self.config.evaluation.iou_threshold),
-            metric_mode=self.config.evaluation.metric_mode,
+            metric_mode="teacher_proxy",
         )
 
         time_per_epoch_s = train_time_s / float(microprofile_epochs)

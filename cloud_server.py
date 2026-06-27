@@ -69,8 +69,10 @@ class CloudServer:
         baseline_method: str = "",
         run_id: str = "",
         yaml_path: str = "./config/config.yaml",
+        runtime_config=None,
     ):
         self.config = config
+        self.runtime_config = runtime_config
         self.yaml_path = str(yaml_path)
         self.mode = str(mode or "main")
         self.server_id = config.server_id
@@ -101,7 +103,7 @@ class CloudServer:
                 )
 
                 ekya_config = parse_ekya_style_config(
-                    SimpleNamespace(server=config, baseline=baseline_config),
+                    runtime_config or SimpleNamespace(server=config, baseline=baseline_config),
                     run_id=resolved_run_id,
                 )
                 self.baseline_controller = EkyaStyleCloudSchedulingController(
@@ -188,9 +190,7 @@ class CloudServer:
             )
             self.experiment_result_repository = CloudExperimentResultRepository(
                 root_dir,
-                max_artifact_bytes=int(
-                    getattr(experiment_config, "max_artifact_bytes", 268435456)
-                ),
+                max_artifact_bytes=int(getattr(experiment_config, "max_artifact_bytes", 268435456)),
                 manifest_writer=self.experiment_manifest_writer,
             )
             self.experiment_manifest_writer.upsert_cloud_runtime(
@@ -330,12 +330,9 @@ class CloudServer:
                 continual_backend=self.continual_backend,
                 log_internal_ids=self.log_internal_ids,
                 experiment_result_repository=self.experiment_result_repository,
-                experiment_comparison_id=str(
-                    getattr(experiment_config, "comparison_id", "") or ""
-                ),
+                experiment_comparison_id=str(getattr(experiment_config, "comparison_id", "") or ""),
                 experiment_method=str(
-                    getattr(self, "baseline_method", PLANK_ROAD_METHOD)
-                    or PLANK_ROAD_METHOD
+                    getattr(self, "baseline_method", PLANK_ROAD_METHOD) or PLANK_ROAD_METHOD
                 ),
                 experiment_run_id=str(getattr(self, "run_id", "") or ""),
             ),
@@ -353,8 +350,7 @@ class CloudServer:
             self.experiment_result_repository.record_cloud_event(
                 comparison_id=str(getattr(experiment_config, "comparison_id", "") or ""),
                 method=str(
-                    getattr(self, "baseline_method", PLANK_ROAD_METHOD)
-                    or PLANK_ROAD_METHOD
+                    getattr(self, "baseline_method", PLANK_ROAD_METHOD) or PLANK_ROAD_METHOD
                 ),
                 run_id=str(getattr(self, "run_id", "") or ""),
                 event="cloud_server_started",
@@ -610,14 +606,6 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
     parser.add_argument("--run_id", default=None, help="baseline run id")
-    parser.add_argument(
-        "--ekya_offline_cloud_video_debug",
-        action="store_true",
-        help=(
-            "Ekya-style baseline debug only: allow offline cloud video settings. "
-            "Default operation streams frames from the edge."
-        ),
-    )
     parser.add_argument("--comparison_id", default=None, help="experiment comparison id")
     parser.add_argument(
         "--experiment_results_root",
@@ -649,13 +637,9 @@ if __name__ == "__main__":
     if args.grpc_max_workers is not None:
         server_config.grpc_max_workers = args.grpc_max_workers
     if args.edge_affine_workers_enabled is not None:
-        server_config.edge_affine_workers.enabled = _parse_bool(
-            args.edge_affine_workers_enabled
-        )
+        server_config.edge_affine_workers.enabled = _parse_bool(args.edge_affine_workers_enabled)
     if args.edge_affine_worker_mode is not None:
         server_config.edge_affine_workers.mode = args.edge_affine_worker_mode
-    if args.ekya_offline_cloud_video_debug:
-        server_config.baselines.ekya_style_cloud_scheduling.offline_cloud_video_debug = True
     if args.run_id is not None and args.mode == "main":
         server_config.edge_affine_workers.run_id = args.run_id
     baseline_method = args.baseline_method or config.baseline.method
@@ -672,5 +656,6 @@ if __name__ == "__main__":
         baseline_method=baseline_method,
         run_id=args.run_id or "",
         yaml_path=args.yaml_path,
+        runtime_config=config,
     )
     cloud_server.start_server()

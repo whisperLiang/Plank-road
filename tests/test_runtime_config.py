@@ -88,3 +88,30 @@ experiment_results:
     with pytest.raises(ValueError, match="include_edge_summary"):
         load_runtime_config(path)
 
+
+@pytest.mark.parametrize(
+    "ekya_yaml",
+    [
+        "enabled: true",
+        "edge_streaming:\n        display_cloud_results_only: true",
+        "cloud_inference:\n        drop_stale_display_packets: true",
+        "teacher_labeling:\n        enabled: true",
+        "microprofile:\n        prediction_model: simple_linear",
+        "retraining:\n        save_checkpoints: true",
+        "logging:\n        result_schema_version: 1",
+    ],
+)
+def test_removed_ekya_fixed_behavior_fields_are_rejected(tmp_path, ekya_yaml: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+server:
+  baselines:
+    ekya_style_cloud_scheduling:
+      {ekya_yaml}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="no longer supports"):
+        load_runtime_config(path)

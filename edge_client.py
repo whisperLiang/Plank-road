@@ -849,7 +849,6 @@ def _run_ekya_style_edge_stream(
     config,
     baseline_run_id: str,
     headless: bool,
-    display_cloud_results_only: bool,
 ) -> Path:
     from cloud.baselines.ekya_style_cloud_scheduling.config import parse_ekya_style_config
     from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import DISPLAY_FIELDS
@@ -859,10 +858,6 @@ def _run_ekya_style_edge_stream(
         run_id=baseline_run_id,
         video_path=_effective_video_source(config),
     )
-    if not display_cloud_results_only:
-        raise ValueError(
-            "ekya_style_cloud_scheduling requires --display_cloud_results_only"
-        )
     edge_output_dir = (
         Path("results")
         / "edge"
@@ -1183,11 +1178,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
-    parser.add_argument(
-        "--display_cloud_results_only",
-        action="store_true",
-        help="Ekya-style baseline: display only cloud-returned detections",
-    )
     parser.add_argument("--run_id", default=None, help="experiment run id")
     parser.add_argument("--comparison_id", default=None, help="experiment comparison id")
     parser.add_argument(
@@ -1331,18 +1321,6 @@ if __name__ == "__main__":
                 config=config,
                 baseline_run_id=run_id,
                 headless=args.headless,
-                display_cloud_results_only=bool(
-                    args.display_cloud_results_only
-                    or getattr(
-                        getattr(
-                            runtime_config.server.baselines.ekya_style_cloud_scheduling,
-                            "edge_streaming",
-                            None,
-                        ),
-                        "display_cloud_results_only",
-                        False,
-                    )
-                ),
             )
         finally:
             if not args.headless:

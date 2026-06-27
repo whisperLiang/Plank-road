@@ -10,8 +10,8 @@ import pytest
 
 from cloud.baselines.ekya_style_cloud_scheduling.cloud_frame_receiver import CloudFrameReceiver
 from cloud.baselines.ekya_style_cloud_scheduling.config import parse_ekya_style_config
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import CloudFrameBuffer
 from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import (
+    CloudFrameBuffer,
     CompletedFrameWindow,
     UploadedFrameRecord,
 )
@@ -40,7 +40,6 @@ def _runtime(tmp_path: Path):
         subsample=0.5,
     )
     ekya = SimpleNamespace(
-        enabled=True,
         student_model="rfdetr_nano",
         teacher_model="rtdetr_x",
         video_path="./video_data/road.mp4",
@@ -48,34 +47,53 @@ def _runtime(tmp_path: Path):
         window_size=2,
         seed=42,
         edge_streaming=SimpleNamespace(
-            enabled=True,
-            upload_format="jpeg",
             jpeg_quality=85,
-            max_inflight_frames=4,
             upload_queue_size=8,
-            result_queue_size=8,
-            drop_stale_results=True,
-            display_cloud_results_only=True,
         ),
         cloud_inference=SimpleNamespace(score_threshold=0.3),
-        teacher_labeling=SimpleNamespace(enabled=True),
+        teacher_labeling=SimpleNamespace(),
         microprofile=SimpleNamespace(candidate_hyperparameters=[candidate]),
         scheduler=SimpleNamespace(),
         retraining=SimpleNamespace(),
-        logging=SimpleNamespace(result_schema_version=1),
         result_root=str(tmp_path),
     )
     return SimpleNamespace(
         server=SimpleNamespace(
             edge_model_name="rfdetr_nano",
             golden="rtdetr_x",
+            continual_learning=SimpleNamespace(
+                teacher_batch_size=1,
+                teacher_annotation_threshold=0.3,
+                teacher_annotation=SimpleNamespace(
+                    cache_enabled=True,
+                    async_enabled=True,
+                ),
+                num_epoch=2,
+                batch_size=2,
+                rfdetr_fixed_split_learning_rate=1.0e-5,
+                split_learning_rate=1.0e-3,
+                proxy_eval_validation_fraction=0.25,
+                max_concurrent_jobs=1,
+            ),
             baselines=SimpleNamespace(ekya_style_cloud_scheduling=ekya),
         ),
         client=SimpleNamespace(
             source=SimpleNamespace(video_path="./video_data/road.mp4"),
+            final_detection_threshold=0.3,
             class_names=["bg", "car"],
         ),
-        baseline=SimpleNamespace(run_id="run"),
+        baseline=SimpleNamespace(
+            run_id="run",
+            training=SimpleNamespace(
+                microprofile_epochs=1,
+                min_training_samples=1,
+                batch_size=2,
+                num_epoch=2,
+                learning_rate=1.0e-5,
+                optimizer_name="adamw",
+                weight_decay=0.0,
+            ),
+        ),
     )
 
 
@@ -173,6 +191,64 @@ def test_ekya_config_validation_rejects_wrong_default_student(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="student_model"):
         parse_ekya_style_config(runtime, run_id="run")
+
+
+def test_ekya_config_inherits_shared_plank_road_settings() -> None:
+    from config.runtime import RuntimeConfig
+
+    runtime = RuntimeConfig()
+    runtime.server.edge_model_name = "rfdetr_nano"
+    runtime.server.golden = "rtdetr_x"
+    runtime.client.source.video_path = "./video_data/shared.mp4"
+    runtime.client.source.max_count = 120
+    runtime.client.final_detection_threshold = 0.42
+    runtime.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 12
+    runtime.baseline.accuracy_trigger_cloud_retraining.agreement_score_threshold = 0.11
+    runtime.baseline.accuracy_trigger_cloud_retraining.agreement_iou_threshold = 0.6
+    runtime.baseline.accuracy_trigger_cloud_retraining.training_strategy = "freeze"
+    runtime.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio = 0.25
+    runtime.baseline.training.microprofile_epochs = 3
+    runtime.baseline.training.min_training_samples = 2
+    runtime.baseline.training.optimizer_name = "sgd"
+    runtime.baseline.training.weight_decay = 0.01
+    runtime.server.continual_learning.teacher_batch_size = 7
+    runtime.server.continual_learning.teacher_annotation_threshold = 0.44
+    runtime.server.continual_learning.num_epoch = 9
+    runtime.server.continual_learning.batch_size = 5
+    runtime.server.continual_learning.rfdetr_fixed_split_learning_rate = 2.0e-4
+    runtime.server.continual_learning.proxy_eval_validation_fraction = 0.2
+    runtime.server.continual_learning.max_concurrent_jobs = 4
+
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+
+    assert cfg.student_model == "rfdetr_nano"
+    assert cfg.teacher_model == "rtdetr_x"
+    assert cfg.video_path == "./video_data/shared.mp4"
+    assert cfg.num_frames == 120
+    assert cfg.window_size == 12
+    assert cfg.cloud_inference.score_threshold == pytest.approx(0.42)
+    assert cfg.teacher_labeling.batch_size == 7
+    assert cfg.teacher_labeling.score_threshold == pytest.approx(0.44)
+    assert cfg.microprofile.microprofile_epochs == 3
+    assert cfg.dataset.train_val_split == pytest.approx(0.8)
+    assert cfg.dataset.min_train_samples == 2
+    assert cfg.evaluation.score_threshold == pytest.approx(0.11)
+    assert cfg.evaluation.iou_threshold == pytest.approx(0.6)
+    assert cfg.retraining.train_mode == "freeze"
+    assert cfg.retraining.trainable_param_ratio == pytest.approx(0.25)
+    assert cfg.retraining.max_concurrent_train_jobs == 4
+    assert cfg.retraining.optimizer_name == "sgd"
+    assert cfg.retraining.weight_decay == pytest.approx(0.01)
+    assert [candidate.id for candidate in cfg.microprofile.candidate_hyperparameters] == [
+        "hp_small",
+        "hp_medium",
+        "hp_large",
+    ]
+    first = cfg.microprofile.candidate_hyperparameters[0]
+    assert first.epochs == 9
+    assert first.train_batch_size == 5
+    assert first.test_batch_size == 5
+    assert first.learning_rate == pytest.approx(2.0e-4)
 
 
 def test_ekya_protocol_json_roundtrip_preserves_bytes() -> None:
@@ -275,6 +351,7 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import torch
+
     import cloud.baselines.ekya_style_cloud_scheduling.microprofiler as mp
     from cloud.baselines.ekya_style_cloud_scheduling.evaluator import DetectionEvalResult
     from cloud.baselines.ekya_style_cloud_scheduling.microprofiler import (
@@ -501,6 +578,7 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import torch
+
     import cloud.baselines.ekya_style_cloud_scheduling.trainer as trainer_module
     from cloud.baselines.ekya_style_cloud_scheduling.evaluator import DetectionEvalResult
     from cloud.baselines.ekya_style_cloud_scheduling.trainer import EkyaCloudTrainer
@@ -532,7 +610,12 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
     selected = MicroProfileResult(
         task_id=1,
         hp_id="hp",
-        hyperparameters={"epochs": 1, "learning_rate": 0.1, "train_batch_size": 1, "subsample": 1.0},
+        hyperparameters={
+            "epochs": 1,
+            "learning_rate": 0.1,
+            "train_batch_size": 1,
+            "subsample": 1.0,
+        },
         preretrain_map=0.4,
         post_microprofile_map=0.5,
         map_gain=0.1,
@@ -582,6 +665,7 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
 
 def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path: Path) -> None:
     import torch
+
     from cloud.baselines.ekya_style_cloud_scheduling.controller import (
         EkyaStyleCloudSchedulingController,
     )

@@ -166,7 +166,7 @@ class EkyaCloudTrainer:
                 val_samples,
                 score_threshold=float(self.config.evaluation.score_threshold),
                 iou_threshold=float(self.config.evaluation.iou_threshold),
-                metric_mode=self.config.evaluation.metric_mode,
+                metric_mode="teacher_proxy",
             )
             epoch_time_s = time.perf_counter() - epoch_started
             if float(validation.map) > best_val_map:
@@ -223,7 +223,7 @@ class EkyaCloudTrainer:
             "best_val_map": float(best_val_map),
             "best_val_ap50": float(best_val_ap50),
             "best_val_foreground_f1": float(best_val_foreground_f1),
-            "metric_mode": self.config.evaluation.metric_mode,
+            "metric_mode": "teacher_proxy",
             "train_mode": self.config.retraining.train_mode,
             "trainable_summary": components.trainable_summary,
         }
@@ -261,7 +261,7 @@ class EkyaCloudTrainer:
             checkpoint_path=str(checkpoint_path),
             checkpoint_adoptable=True,
             final_train_loss=final_train_loss,
-            metric_mode=self.config.evaluation.metric_mode,
+            metric_mode="teacher_proxy",
             epoch_log_path=str(epoch_log_path),
         )
 
