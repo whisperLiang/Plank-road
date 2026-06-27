@@ -19,6 +19,15 @@ def _write_jsonl(path: Path, rows: list[dict], *, bad_line: bool = False) -> Non
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _write_csv(path: Path, fields: list[str], rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def _manifest(comparison_dir: Path, *, accuracy_file: str | None = None) -> Path:
     comparison_dir.mkdir(parents=True, exist_ok=True)
     runs = [
@@ -71,6 +80,24 @@ def _manifest(comparison_dir: Path, *, accuracy_file: str | None = None) -> Path
     path = comparison_dir / "manifest.yaml"
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return path
+
+
+def _append_ekya_run(manifest_path: Path) -> None:
+    payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    payload["methods"].append("ekya")
+    payload["runs"].append(
+        {
+            "run_id": "ekya-r1",
+            "method": "ekya",
+            "scenario_name": "road",
+            "edge_ids": [1],
+            "raw_logs": {
+                "cloud": "raw_logs/ekya/cloud/ekya-r1",
+                "edges": {"1": "raw_logs/ekya/edge_1/ekya-r1"},
+            },
+        }
+    )
+    manifest_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
 def _minimal_frame(frame_index: int) -> dict:
@@ -228,6 +255,111 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
     assert report["parse_errors"]
     assert "f1" in report["missing_metrics"]
     assert report["scenarios"][0]["video_slug"] == "road"
+
+
+def test_normalizer_converts_ekya_raw_logs_from_manifest(tmp_path: Path) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    _append_ekya_run(manifest_path)
+    raw = comparison_dir / "raw_logs" / "ekya" / "cloud" / "ekya-r1"
+    raw.mkdir(parents=True)
+    (raw / "summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": "ekya-r1",
+                "student_model": "rfdetr_nano",
+                "teacher_model": "rtdetr_x",
+                "video_name": "road.mp4",
+                "num_frames": 1,
+                "evaluated_frame_keys": [
+                    {"edge_id": 1, "camera_id": 0, "frame_idx": 1},
+                ],
+                "num_retraining_jobs": 0,
+                "num_model_updates": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_csv(
+        raw / "per_frame_metrics.csv",
+        [
+            "edge_id",
+            "camera_id",
+            "frame_idx",
+            "timestamp_edge_capture",
+            "timestamp_inference_end",
+            "model_version",
+            "edge_e2e_display_latency_ms",
+            "cloud_inference_latency_ms",
+            "num_pred_boxes",
+            "foreground_f1",
+            "map",
+        ],
+        [
+            {
+                "edge_id": 1,
+                "camera_id": 0,
+                "frame_idx": 1,
+                "timestamp_edge_capture": 1.0,
+                "timestamp_inference_end": 1.1,
+                "model_version": "0",
+                "edge_e2e_display_latency_ms": 25.0,
+                "cloud_inference_latency_ms": 10.0,
+                "num_pred_boxes": 1,
+                "foreground_f1": 0.75,
+                "map": 0.75,
+            }
+        ],
+    )
+    _write_csv(
+        raw / "display_events.csv",
+        ["edge_id", "camera_id", "frame_idx", "displayed"],
+        [{"edge_id": 1, "camera_id": 0, "frame_idx": 1, "displayed": "true"}],
+    )
+    _write_csv(
+        raw / "per_window_metrics.csv",
+        [
+            "edge_id",
+            "camera_id",
+            "task_id",
+            "window_start_frame",
+            "window_end_frame",
+            "num_frames",
+            "avg_foreground_f1",
+            "training_time_s",
+            "teacher_labeling_time_s",
+            "microprofile_time_s",
+        ],
+        [
+            {
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "window_start_frame": 1,
+                "window_end_frame": 1,
+                "num_frames": 1,
+                "avg_foreground_f1": 0.75,
+                "training_time_s": 0.0,
+                "teacher_labeling_time_s": 0.01,
+                "microprofile_time_s": 0.02,
+            }
+        ],
+    )
+    _write_csv(
+        raw / "upload_events.csv",
+        ["edge_id", "camera_id", "window_id", "raw_frame_bytes"],
+        [{"edge_id": 1, "camera_id": 0, "window_id": "1:0:0:1:1", "raw_frame_bytes": 123}],
+    )
+
+    report = normalize(comparison_dir, manifest_path)
+
+    frames = read_csv(comparison_dir / "normalized" / "frame_metrics.csv")
+    summary = read_csv(comparison_dir / "normalized" / "summary.csv")
+    assert any(row["method"] == "ekya" and row["f1"] == "0.75" for row in frames)
+    assert any(
+        row["method"] == "ekya" and row["mean_upload_bytes"] == "123.0" for row in summary
+    )
+    assert report["row_counts"]["frame_metrics.csv"] >= 1
 
 
 def test_normalizer_extracts_pure_edge_local_tta_latency(tmp_path: Path) -> None:

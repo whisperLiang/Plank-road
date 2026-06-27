@@ -114,10 +114,7 @@ plt.rcParams.update(
 
 def _method_order(methods: Iterable[str]) -> list[str]:
     available = set(methods)
-    ordered = [method for method in METHOD_ORDER if method in available]
-    if "ekya" in available:
-        ordered.append("ekya")
-    return ordered
+    return [method for method in METHOD_ORDER if method in available]
 
 
 def _method_label(method: str) -> str:
@@ -1223,7 +1220,14 @@ def plot_figures(
             "summary.csv",
         )
     }
-    ekya_status = "disabled"
+    normalized_ekya_rows = sum(
+        1 for rows in inputs.values() for row in rows if row.get("method") == "ekya"
+    )
+    ekya_status = (
+        f"included {normalized_ekya_rows} normalized row(s)"
+        if normalized_ekya_rows
+        else "disabled"
+    )
     if include_external_ekya:
         if external_ekya_summary is None or not external_ekya_summary.exists():
             ekya_status = "requested but external summary missing"

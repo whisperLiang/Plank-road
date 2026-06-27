@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import threading
 import copy
+import threading
 from types import SimpleNamespace
 from typing import Any
 

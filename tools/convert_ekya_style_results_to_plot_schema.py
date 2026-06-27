@@ -42,8 +42,34 @@ def convert_ekya_style_results(
     video_slug: str = "road",
     plot_method: str = PLOT_METHOD,
 ) -> dict[str, Any]:
+    row_sets, report = build_ekya_style_row_sets(
+        raw_dir=raw_dir,
+        comparison_id=comparison_id,
+        scenario_name=scenario_name,
+        video_slug=video_slug,
+        plot_method=plot_method,
+    )
+    for filename, rows in row_sets.items():
+        write_csv(output_dir / filename, CSV_SCHEMAS[filename], rows)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report = dict(report)
+    report["generated_csv"] = [str(output_dir / name) for name in CSV_SCHEMAS]
+    (output_dir / "normalization_report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
+def build_ekya_style_row_sets(
+    *,
+    raw_dir: Path,
+    comparison_id: str = "ekya_style_cloud_scheduling",
+    scenario_name: str = "road",
+    video_slug: str = "road",
+    plot_method: str = PLOT_METHOD,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     raw_dir = Path(raw_dir)
-    output_dir = Path(output_dir)
     summary = _read_summary(raw_dir / "summary.json")
     run_id = str(summary.get("run_id") or raw_dir.parents[1].name)
     scenario_name = str(summary.get("scenario_name") or scenario_name or "road")
@@ -81,15 +107,12 @@ def convert_ekya_style_results(
         "resource_timeline.csv": resource_rows,
         "summary.csv": summary_rows,
     }
-    for filename, rows in row_sets.items():
-        write_csv(output_dir / filename, CSV_SCHEMAS[filename], rows)
     missing_result_count = _missing_result_count(frame_rows)
     dropped_display_count = int(
         summary.get("dropped_display_count") or _dropped_display_count(raw_dir)
     )
     report = {
         "source_raw_dir": str(raw_dir),
-        "generated_csv": [str(output_dir / name) for name in CSV_SCHEMAS],
         "method_alias": {RAW_METHOD: plot_method},
         "evaluated_frame_count": len(frame_rows),
         "missing_result_count": missing_result_count,
@@ -98,12 +121,7 @@ def convert_ekya_style_results(
         "accuracy_definition": "teacher_supervised_detection_proxy",
         "missing_values": "empty strings; no interpolation or placeholder rows are synthesized",
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "normalization_report.json").write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return report
+    return row_sets, report
 
 
 def append_ekya_style_to_normalized_dir(
@@ -246,6 +264,17 @@ def _adaptation_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[st
                 model_version=raw.get("old_model_version"),
                 result_model_version=raw.get("new_model_version"),
                 message="adopted" if str(raw.get("adopted", "")).lower() == "true" else "skipped",
+            )
+        )
+    for raw in read_csv(raw_dir / "scheduler_events.csv"):
+        rows.append(
+            empty_row(
+                ADAPTATION_FIELDS,
+                **base_run,
+                edge_id=_edge_id(raw),
+                event_name="trigger_decision",
+                window_id=_window_id(raw),
+                message=raw.get("decision_reason") or raw.get("scheduler_name"),
             )
         )
     rows.sort(key=lambda row: (str(row.get("run_id", "")), str(row.get("event_time_ms", ""))))

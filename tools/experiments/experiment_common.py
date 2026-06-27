@@ -18,10 +18,13 @@ METHODS = (
     "pure_edge_local_updating",
     "accuracy_trigger_cloud_retraining",
 )
+OPTIONAL_METHODS = ("ekya",)
+SUPPORTED_METHODS = (*METHODS, *OPTIONAL_METHODS)
 METHOD_ORDER = (
     "pure_edge_local_updating",
     "accuracy_trigger_cloud_retraining",
     "plank_road",
+    "ekya",
 )
 METHOD_LABELS = {
     "plank_road": "Plank-road",
@@ -290,8 +293,15 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ManifestError(f"unknown log_timezone: {log_timezone!r}") from exc
     manifest["log_timezone"] = log_timezone
     methods = list(manifest.get("methods") or [])
-    if methods != list(METHODS):
-        raise ManifestError(f"methods must be exactly: {', '.join(METHODS)}")
+    if (
+        methods[: len(METHODS)] != list(METHODS)
+        or len(set(methods)) != len(methods)
+        or any(method not in SUPPORTED_METHODS for method in methods)
+    ):
+        raise ManifestError(
+            "methods must start with "
+            f"{', '.join(METHODS)} and may append: {', '.join(OPTIONAL_METHODS)}"
+        )
     scenarios = manifest.get("scenarios")
     if not isinstance(scenarios, list) or not scenarios:
         raise ManifestError("scenarios must be a non-empty list")
@@ -340,7 +350,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raw_logs = run.get("raw_logs")
         if not run_id or run_id in run_ids:
             raise ManifestError("run_id values must be non-empty and unique")
-        if method not in METHODS:
+        if method not in methods:
             raise ManifestError(f"unsupported run method: {method!r}")
         if scenario_name not in scenario_names:
             raise ManifestError(f"unknown scenario_name for run {run_id}: {scenario_name!r}")
@@ -391,7 +401,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         seen_method_scenarios.add((method, scenario_name))
     missing_method_scenarios = [
         f"{method}/{scenario}"
-        for method in METHODS
+        for method in methods
         for scenario in scenario_names
         if (method, scenario) not in seen_method_scenarios
     ]

@@ -72,11 +72,10 @@ class EkyaStyleCloudSchedulingController:
             frame_buffer=self.frame_buffer,
             drop_stale=True,
         )
-        self.inference = CloudInferenceEngine(
-            config,
-            detector=detector,
-            runtime_config=runtime_config,
-        )
+        self._inference_lock = threading.RLock()
+        self._inference_engines: dict[tuple[int, int], CloudInferenceEngine] = {}
+        self.inference = self._create_inference_engine(detector=detector)
+        self._inference_engines[(1, 0)] = self.inference
         self.teacher_labeler = TeacherLabeler(
             config,
             output_dir=self.logger.teacher_labels_dir,
@@ -94,7 +93,9 @@ class EkyaStyleCloudSchedulingController:
         self._adoption_lock = threading.Lock()
         self._summary_lock = threading.Lock()
         self._previous_val_map = 0.0
+        self._previous_val_map_by_edge: dict[tuple[int, int], float] = {}
         self._model_version = 0
+        self._model_version_by_edge: dict[tuple[int, int], int] = {}
         self._total_teacher_labeling_time_s = 0.0
         logger.info(
             "ekya_style_cloud_scheduling startup: run_id={} student={} teacher={} "
@@ -113,12 +114,13 @@ class EkyaStyleCloudSchedulingController:
     def handle_frame_upload(self, packet: FrameUploadPacket) -> DetectionResultPacket:
         if packet.method != METHOD:
             raise ValueError(f"unexpected Ekya frame method: {packet.method!r}")
+        inference = self._inference_for(packet.edge_id, packet.camera_id)
         record = self.frame_receiver.receive(packet)
         self.logger.record_frame_upload(
             packet,
             timestamp_cloud_receive=record.timestamp_cloud_receive,
         )
-        result = self.inference.infer(
+        result = inference.infer(
             packet=packet,
             frame_bgr=record.decoded_frame_bgr,
             timestamp_cloud_receive=record.timestamp_cloud_receive,
@@ -218,12 +220,13 @@ class EkyaStyleCloudSchedulingController:
         frame_scores = self._update_frame_quality(window, teacher_labels)
         micro_results = []
         microprofile_time_s = 0.0
-        base_state_dict = self.inference.export_state_dict()
+        inference = self._inference_for(window.edge_id, window.camera_id)
+        base_state_dict = inference.export_state_dict()
         micro_result, microprofile_time_s = self.microprofiler.profile(
             window=window,
             teacher_labels=teacher_labels,
             base_state_dict=base_state_dict,
-            model_builder=self.inference.build_student_model_clone,
+            model_builder=inference.build_student_model_clone,
         )
         micro_results = [micro_result]
         for result in micro_results:
@@ -253,9 +256,12 @@ class EkyaStyleCloudSchedulingController:
                 window=window,
                 decision=decision,
                 teacher_labels=teacher_labels,
-                previous_val_map=self._previous_val_map_snapshot(),
+                previous_val_map=self._previous_val_map_snapshot(
+                    window.edge_id,
+                    window.camera_id,
+                ),
                 base_state_dict=base_state_dict or {},
-                model_builder=self.inference.build_student_model_clone,
+                model_builder=inference.build_student_model_clone,
             )
             self.logger.append_training_event(training_result.as_event_row())
             adopted = self._maybe_adopt(training_result)
@@ -302,24 +308,57 @@ class EkyaStyleCloudSchedulingController:
             )
         return scores
 
-    def _previous_val_map_snapshot(self) -> float:
+    def _create_inference_engine(self, *, detector: Any | None = None) -> CloudInferenceEngine:
+        return CloudInferenceEngine(
+            self.config,
+            detector=detector,
+            runtime_config=self.runtime_config,
+        )
+
+    def _inference_for(self, edge_id: int, camera_id: int) -> CloudInferenceEngine:
+        key = (int(edge_id), int(camera_id))
+        with self._inference_lock:
+            engine = self._inference_engines.get(key)
+            if engine is None:
+                engine = self._create_inference_engine()
+                self._inference_engines[key] = engine
+            return engine
+
+    def _previous_val_map_snapshot(self, edge_id: int, camera_id: int) -> float:
+        key = (int(edge_id), int(camera_id))
         with self._adoption_lock:
-            return float(self._previous_val_map)
+            if key == (1, 0):
+                return float(self._previous_val_map)
+            return float(self._previous_val_map_by_edge.get(key, 0.0))
 
     def _maybe_adopt(self, result: TrainingResult) -> bool:
+        key = (int(result.edge_id), int(result.camera_id))
+        inference = self._inference_for(result.edge_id, result.camera_id)
         with self._adoption_lock:
-            previous_val_map = float(self._previous_val_map)
+            previous_val_map = float(
+                self._previous_val_map
+                if key == (1, 0)
+                else self._previous_val_map_by_edge.get(key, 0.0)
+            )
             gain = float(result.best_val_map) - previous_val_map
             threshold = float(self.config.retraining.min_map_gain_to_adopt)
             adopted = bool(result.checkpoint_adoptable) and gain >= threshold
             if self.config.retraining.adopt_only_if_improved:
                 adopted = bool(result.checkpoint_adoptable) and gain > threshold
-            old_version = str(self._model_version)
-            new_version = str(self._model_version + 1)
+            current_version = (
+                self._model_version
+                if key == (1, 0)
+                else self._model_version_by_edge.get(key, 0)
+            )
+            old_version = str(current_version)
+            new_version = str(current_version + 1)
             if adopted:
-                self.inference.adopt_checkpoint(result.checkpoint_path, model_version=new_version)
-                self._model_version += 1
-                self._previous_val_map = float(result.best_val_map)
+                inference.adopt_checkpoint(result.checkpoint_path, model_version=new_version)
+                self._model_version_by_edge[key] = current_version + 1
+                self._previous_val_map_by_edge[key] = float(result.best_val_map)
+                if key == (1, 0):
+                    self._model_version = current_version + 1
+                    self._previous_val_map = float(result.best_val_map)
         self.logger.append_model_update_event(
             {
                 "task_id": int(result.task_id),

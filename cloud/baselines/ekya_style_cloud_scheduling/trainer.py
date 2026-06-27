@@ -122,11 +122,15 @@ class EkyaCloudTrainer:
         lr = float(fixed.learning_rate)
         hp_id = str(fixed.hp_id)
         train_samples = list(train_samples)
+        checkpoint_prefix = (
+            f"edge_{int(window.edge_id)}_camera_{int(window.camera_id)}_"
+            f"task_{int(window.task_id)}_{hp_id}"
+        )
         checkpoint_path = self.checkpoint_dir / (
-            f"task_{int(window.task_id)}_{hp_id}_model.pt"
+            f"{checkpoint_prefix}_model.pt"
         )
         epoch_log_path = self.checkpoint_dir / (
-            f"task_{int(window.task_id)}_{hp_id}_epochs.csv"
+            f"{checkpoint_prefix}_epochs.csv"
         )
 
         train_start = time.time()
@@ -210,6 +214,8 @@ class EkyaCloudTrainer:
             "method": "ekya_style_cloud_scheduling",
             "student_model": self.config.student_model,
             "teacher_model": self.config.teacher_model,
+            "edge_id": int(window.edge_id),
+            "camera_id": int(window.camera_id),
             "task_id": int(window.task_id),
             "window_id": window.window_id,
             "frame_indices": [int(value) for value in window.frame_indices],

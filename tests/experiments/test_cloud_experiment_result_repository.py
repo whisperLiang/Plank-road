@@ -51,6 +51,7 @@ def _request(
         "plank_road",
         "pure_edge_local_updating",
         "accuracy_trigger_cloud_retraining",
+        "ekya",
     ],
 )
 def test_repository_stores_all_supported_methods(tmp_path: Path, method: str) -> None:

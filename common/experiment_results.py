@@ -13,10 +13,15 @@ ArtifactContent = bytes | str | Path
 PLANK_ROAD_METHOD = "plank_road"
 PURE_EDGE_METHOD = "pure_edge_local_updating"
 ACCURACY_TRIGGER_METHOD = "accuracy_trigger_cloud_retraining"
+EKYA_METHOD = "ekya"
 EXPERIMENT_METHODS: tuple[str, ...] = (
     PLANK_ROAD_METHOD,
     PURE_EDGE_METHOD,
     ACCURACY_TRIGGER_METHOD,
+)
+SUPPORTED_EXPERIMENT_METHODS: tuple[str, ...] = (
+    *EXPERIMENT_METHODS,
+    EKYA_METHOD,
 )
 
 
@@ -35,9 +40,10 @@ def sanitize_component(value: str) -> str:
 
 def sanitize_method(method: str) -> str:
     value = sanitize_component(method)
-    if value not in EXPERIMENT_METHODS:
+    if value not in SUPPORTED_EXPERIMENT_METHODS:
         raise ValueError(
-            f"unknown experiment method {value!r}; expected one of {', '.join(EXPERIMENT_METHODS)}"
+            "unknown experiment method "
+            f"{value!r}; expected one of {', '.join(SUPPORTED_EXPERIMENT_METHODS)}"
         )
     return value
 
@@ -193,6 +199,8 @@ def content_type_for_path(path: Path) -> str:
         return "text/plain"
     if suffix in {".yaml", ".yml"}:
         return "application/yaml"
+    if suffix == ".csv":
+        return "text/csv"
     if suffix == ".zip":
         return "application/zip"
     return "application/octet-stream"
@@ -232,6 +240,14 @@ def collect_edge_artifacts(
         ),
     ]
     run_dir = Path(inference_result_path).parent
+    if resolved_method == EKYA_METHOD:
+        candidates.append(
+            (
+                "display_events.csv",
+                run_dir / "display_events.csv",
+                bool(getattr(config, "include_baseline_metrics", True)),
+            )
+        )
     candidates.append(
         (
             "edge_summary.json",

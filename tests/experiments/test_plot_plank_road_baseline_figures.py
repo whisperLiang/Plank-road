@@ -256,6 +256,37 @@ def test_external_ekya_is_excluded_unless_enabled(tmp_path: Path) -> None:
     assert enabled_report["ekya_status"] == "included 1 external row(s)"
 
 
+def test_normalized_ekya_is_reported_without_external_flag(tmp_path: Path) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    write_csv(normalized / "frame_metrics.csv", FRAME_FIELDS, [])
+    write_csv(normalized / "adaptation_events.csv", ADAPTATION_FIELDS, [])
+    write_csv(normalized / "upload_breakdown.csv", UPLOAD_FIELDS, [])
+    write_csv(normalized / "latency_breakdown.csv", LATENCY_FIELDS, [])
+    write_csv(normalized / "resource_timeline.csv", RESOURCE_FIELDS, [])
+    write_csv(
+        normalized / "summary.csv",
+        SUMMARY_FIELDS,
+        [
+            empty_row(
+                SUMMARY_FIELDS,
+                comparison_id="c",
+                run_id="ekya-1",
+                method="ekya",
+                scenario_name="road",
+                edge_count=1,
+                mean_f1=0.5,
+                mean_latency_ms=10,
+                mean_upload_bytes=300,
+            )
+        ],
+    )
+
+    report = plot_figures(normalized, figures)
+
+    assert report["ekya_status"] == "included 1 normalized row(s)"
+
+
 def test_summary_accuracy_uses_the_metric_with_broader_method_coverage() -> None:
     rows = [
         {"method": "plank_road", "mean_f1": "0.8", "mean_map": "0.7"},

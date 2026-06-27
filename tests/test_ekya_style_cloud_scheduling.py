@@ -609,7 +609,13 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
     config = runtime.server
     config.server_id = "server-1"
     config.edge_affine_workers = SimpleNamespace(enabled=False)
-    config.experiment_results = SimpleNamespace(enabled=True)
+    config.experiment_results = SimpleNamespace(
+        enabled=True,
+        comparison_id="comparison",
+        root_dir=str(tmp_path / "experiments"),
+        max_artifact_bytes=1024 * 1024,
+        include_runtime_logs=False,
+    )
     baseline_config = SimpleNamespace(
         method="ekya_style_cloud_scheduling",
         run_id="run",
@@ -624,20 +630,24 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
     )
 
     assert isinstance(server.baseline_controller, EkyaStyleCloudSchedulingController)
-    assert server.experiment_result_repository is None
+    assert server.experiment_result_repository is not None
+    assert server.baseline_controller.output_dir == (
+        tmp_path / "experiments" / "comparison" / "raw_logs" / "ekya" / "cloud" / "run"
+    )
 
 
-def test_ekya_edge_route_exits_before_edge_worker_construction() -> None:
+def test_ekya_edge_route_archives_before_edge_worker_construction() -> None:
     source = (PROJECT_ROOT / "edge_client.py").read_text(encoding="utf-8")
 
     ekya_branch = source.index(
         'if args.mode == "baseline" and baseline_method == EKYA_STYLE_METHOD:'
     )
-    stream_call = source.index("_run_ekya_style_edge_stream(", ekya_branch)
     run_dir_call = source.index("run_dir = edge_run_dir(", ekya_branch)
+    stream_call = source.index("_run_ekya_style_edge_stream(", ekya_branch)
+    upload_call = source.index("_upload_experiment_run_artifacts_if_enabled(", ekya_branch)
     edge_worker_call = source.index("edge = EdgeWorker(config)", ekya_branch)
 
-    assert ekya_branch < stream_call < run_dir_call < edge_worker_call
+    assert ekya_branch < run_dir_call < stream_call < upload_call < edge_worker_call
 
 
 def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
@@ -777,6 +787,68 @@ def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path
     assert updates[-1]["new_model_version"] == "1"
     assert "[EkyaModelUpdate]" in logs
     assert "task_id=1 hp_id=hp adopted=true old_version=0 new_version=1" in logs
+
+
+def test_controller_keeps_model_updates_per_edge(tmp_path: Path) -> None:
+    import torch
+
+    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+        EkyaStyleCloudSchedulingController,
+    )
+    from cloud.baselines.ekya_style_cloud_scheduling.trainer import TrainingResult
+
+    class TinyTrainModel(torch.nn.Module):
+        def __init__(self, value: float = 0.0) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([value]))
+
+        def forward(self, inputs):
+            batch_size = len(inputs) if isinstance(inputs, list) else int(inputs.shape[0])
+            return self.weight.reshape(1, 1).repeat(batch_size, 1)
+
+    edge1_detector = SimpleNamespace(model=TinyTrainModel(1.0))
+    edge2_detector = SimpleNamespace(model=TinyTrainModel(2.0))
+    checkpoint_path = tmp_path / "edge2.pt"
+    torch.save(
+        {
+            "state_dict": TinyTrainModel(5.0).state_dict(),
+            "metadata": {"method": "ekya_style_cloud_scheduling"},
+        },
+        checkpoint_path,
+    )
+    controller = EkyaStyleCloudSchedulingController(
+        parse_ekya_style_config(_runtime(tmp_path), run_id="run"),
+        detector=edge1_detector,
+    )
+    controller._inference_engines[(2, 0)] = controller._create_inference_engine(
+        detector=edge2_detector
+    )
+    result = TrainingResult(
+        task_id=1,
+        edge_id=2,
+        camera_id=0,
+        hp_id="hp",
+        epochs=1,
+        lr=1.0e-5,
+        batch_size=2,
+        num_samples=2,
+        train_start_time=1.0,
+        train_end_time=2.0,
+        train_duration_s=1.0,
+        best_epoch=1,
+        best_val_map=0.9,
+        best_val_ap50=0.9,
+        best_val_foreground_f1=0.9,
+        checkpoint_path=str(checkpoint_path),
+        checkpoint_adoptable=True,
+    )
+
+    assert controller._maybe_adopt(result)
+
+    assert controller.inference.model_version == "0"
+    assert controller._inference_for(2, 0).model_version == "1"
+    assert float(edge1_detector.model.weight.detach().item()) == pytest.approx(1.0)
+    assert float(edge2_detector.model.weight.detach().item()) == pytest.approx(5.0)
 
 
 def test_controller_model_update_log_reports_not_adopted_reason(tmp_path: Path) -> None:

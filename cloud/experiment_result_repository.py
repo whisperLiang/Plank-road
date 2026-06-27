@@ -42,6 +42,16 @@ def scenario_name_from_video_source(video_source: str) -> str:
     return video_slug(Path(str(video_source or "")).stem) or "unknown_scenario"
 
 
+def _ordered_methods(methods: object) -> list[str]:
+    incoming = list(methods or EXPERIMENT_METHODS) if isinstance(methods, list) else []
+    ordered = list(EXPERIMENT_METHODS)
+    for method in incoming:
+        value = str(method)
+        if value not in ordered:
+            ordered.append(value)
+    return ordered
+
+
 class CloudExperimentManifestWriter:
     def __init__(
         self,
@@ -169,6 +179,10 @@ class CloudExperimentManifestWriter:
                 raise ValueError(
                     f"run_id {run_id!r} is already assigned to method {run.get('method')!r}"
                 )
+            methods = _ordered_methods(manifest.get("methods"))
+            if method not in methods:
+                methods.append(method)
+            manifest["methods"] = methods
             if scenario_name and (
                 video_source or run.get("scenario_name") in {"", "unknown_scenario"}
             ):
@@ -211,7 +225,7 @@ class CloudExperimentManifestWriter:
         manifest["log_timezone"] = str(
             manifest.get("log_timezone") or self.log_timezone or "UTC"
         )
-        manifest["methods"] = list(EXPERIMENT_METHODS)
+        manifest["methods"] = _ordered_methods(manifest.get("methods"))
         manifest.setdefault("student_model", self.student_model)
         manifest.setdefault("teacher_model", self.teacher_model)
         manifest.setdefault("scenarios", [])

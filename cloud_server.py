@@ -34,7 +34,7 @@ from cloud.workers.lease_service import GpuLeaseService
 from cloud.workers.mps_runtime import ensure_mps_runtime
 from cloud.workers.worker_client import GpuLeaseHttpClient
 from cloud.workers.worker_protocol import JsonRpcError
-from common.experiment_results import PLANK_ROAD_METHOD, cloud_run_dir
+from common.experiment_results import EKYA_METHOD, PLANK_ROAD_METHOD, cloud_run_dir
 from common.logging_sanitizer import log_diagnostic_debug
 from config import default_run_id, load_runtime_config, validate_baseline_method
 from grpc_server import message_transmission_pb2_grpc
@@ -102,9 +102,21 @@ class CloudServer:
                     parse_ekya_style_config,
                 )
 
+                ekya_output_dir = None
+                experiment_config = getattr(config, "experiment_results", None)
+                if experiment_config is not None and bool(
+                    getattr(experiment_config, "enabled", False)
+                ):
+                    ekya_output_dir = cloud_run_dir(
+                        str(getattr(experiment_config, "root_dir", "results/experiments")),
+                        str(getattr(experiment_config, "comparison_id", "") or ""),
+                        EKYA_METHOD,
+                        resolved_run_id,
+                    )
                 ekya_config = parse_ekya_style_config(
                     runtime_config or SimpleNamespace(server=config, baseline=baseline_config),
                     run_id=resolved_run_id,
+                    output_dir=ekya_output_dir,
                 )
                 self.baseline_controller = EkyaStyleCloudSchedulingController(
                     ekya_config,
@@ -112,6 +124,7 @@ class CloudServer:
                 )
                 self.baseline_method = method
                 self.run_id = resolved_run_id
+                self._init_experiment_results_if_enabled(method=EKYA_METHOD)
                 return
             teacher_annotator = None
             heavy_gpu_lease = None
@@ -169,47 +182,45 @@ class CloudServer:
             self._init_edge_affine_backend(edge_affine)
             self.baseline_method = PLANK_ROAD_METHOD
 
-        experiment_config = getattr(config, "experiment_results", None)
+        method = (
+            str(getattr(self, "baseline_method", "") or "")
+            if self.mode == "baseline"
+            else PLANK_ROAD_METHOD
+        )
+        self._init_experiment_results_if_enabled(method=method)
+
+    def _init_experiment_results_if_enabled(self, *, method: str) -> None:
+        experiment_config = getattr(self.config, "experiment_results", None)
+        if experiment_config is None or not bool(getattr(experiment_config, "enabled", False)):
+            return
+        comparison_id = str(getattr(experiment_config, "comparison_id", "") or "")
+        root_dir = str(getattr(experiment_config, "root_dir", "results/experiments"))
+        self.experiment_manifest_writer = CloudExperimentManifestWriter(
+            root_dir=root_dir,
+            comparison_id=comparison_id,
+            student_model=str(getattr(self.config, "edge_model_name", "") or ""),
+            teacher_model=str(getattr(self.config, "golden", "") or ""),
+        )
+        self.experiment_result_repository = CloudExperimentResultRepository(
+            root_dir,
+            max_artifact_bytes=int(getattr(experiment_config, "max_artifact_bytes", 268435456)),
+            manifest_writer=self.experiment_manifest_writer,
+        )
+        self.experiment_manifest_writer.upsert_cloud_runtime(
+            method=method,
+            run_id=self.run_id,
+        )
         if (
-            experiment_config is not None
-            and bool(getattr(experiment_config, "enabled", False))
-            and getattr(self, "baseline_method", "") != EKYA_STYLE_METHOD
+            bool(getattr(experiment_config, "include_runtime_logs", False))
+            and method != "pure_edge_local_updating"
         ):
-            comparison_id = str(getattr(experiment_config, "comparison_id", "") or "")
-            root_dir = str(getattr(experiment_config, "root_dir", "results/experiments"))
-            method = (
-                str(getattr(self, "baseline_method", "") or "")
-                if self.mode == "baseline"
-                else PLANK_ROAD_METHOD
+            cloud_log = cloud_run_dir(root_dir, comparison_id, method, self.run_id) / "cloud.log"
+            cloud_log.parent.mkdir(parents=True, exist_ok=True)
+            self._experiment_log_sink = logger.add(
+                str(cloud_log),
+                level="INFO",
+                rotation="500 MB",
             )
-            self.experiment_manifest_writer = CloudExperimentManifestWriter(
-                root_dir=root_dir,
-                comparison_id=comparison_id,
-                student_model=str(getattr(config, "edge_model_name", "") or ""),
-                teacher_model=str(getattr(config, "golden", "") or ""),
-            )
-            self.experiment_result_repository = CloudExperimentResultRepository(
-                root_dir,
-                max_artifact_bytes=int(getattr(experiment_config, "max_artifact_bytes", 268435456)),
-                manifest_writer=self.experiment_manifest_writer,
-            )
-            self.experiment_manifest_writer.upsert_cloud_runtime(
-                method=method,
-                run_id=self.run_id,
-            )
-            if (
-                bool(getattr(experiment_config, "include_runtime_logs", False))
-                and method != "pure_edge_local_updating"
-            ):
-                cloud_log = (
-                    cloud_run_dir(root_dir, comparison_id, method, self.run_id) / "cloud.log"
-                )
-                cloud_log.parent.mkdir(parents=True, exist_ok=True)
-                self._experiment_log_sink = logger.add(
-                    str(cloud_log),
-                    level="INFO",
-                    rotation="500 MB",
-                )
 
     def _init_edge_affine_backend(self, edge_affine) -> None:
         run_id = str(getattr(edge_affine, "run_id", "") or "").strip()

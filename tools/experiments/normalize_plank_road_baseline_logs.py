@@ -16,6 +16,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from tools.convert_ekya_style_results_to_plot_schema import (  # noqa: E402
+    RAW_METHOD as EKYA_RAW_METHOD,
+)
+from tools.convert_ekya_style_results_to_plot_schema import (
+    build_ekya_style_row_sets,
+)
 from tools.experiments.experiment_common import (  # noqa: E402
     ACCURACY_FIELDS,
     ADAPTATION_FIELDS,
@@ -1314,6 +1320,8 @@ def _derive_adaptation_latency(
     derived: list[dict[str, Any]] = []
     derived_total_runs: set[str] = set()
     for (run_id, method, edge_id), group in groups.items():
+        if method == "ekya":
+            continue
         group.sort(key=lambda row: optional_int(row.get("event_time_ms")) or 0)
         stage_pairs = (
             ("bundle_upload_started", "bundle_upload_done", "upload_ms"),
@@ -1487,6 +1495,16 @@ def _resolve_manifest_path(comparison_dir: Path, manifest_path: Path | None) -> 
     return generated
 
 
+def _resolve_ekya_raw_dir(path: Path) -> Path | None:
+    direct = Path(path)
+    if (direct / "summary.json").is_file():
+        return direct
+    nested = direct / "baselines" / EKYA_RAW_METHOD
+    if (nested / "summary.json").is_file():
+        return nested
+    return None
+
+
 def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[str, Any]:
     manifest_path = _resolve_manifest_path(comparison_dir, manifest_path)
     manifest = load_manifest(manifest_path)
@@ -1510,6 +1528,35 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
     for run in list(manifest["runs"]):
         scenario = scenarios[str(run["scenario_name"])]
         raw_logs = dict(run["raw_logs"])
+        if str(run["method"]) == "ekya":
+            source_path = resolve_relative(comparison_dir, raw_logs.get("cloud"))
+            if source_path is None or not source_path.exists():
+                if source_path is not None:
+                    missing_files.append(str(source_path))
+                continue
+            ekya_raw_dir = _resolve_ekya_raw_dir(source_path)
+            if ekya_raw_dir is None:
+                missing_files.append(str(source_path / "summary.json"))
+                continue
+            row_sets, ekya_report = build_ekya_style_row_sets(
+                raw_dir=ekya_raw_dir,
+                comparison_id=str(manifest["comparison_id"]),
+                scenario_name=str(run["scenario_name"]),
+                video_slug=str(scenario.get("video_slug", "")),
+                plot_method="ekya",
+            )
+            frames.extend(row_sets["frame_metrics.csv"])
+            windows.extend(row_sets["window_metrics.csv"])
+            events.extend(row_sets["adaptation_events.csv"])
+            uploads.extend(row_sets["upload_breakdown.csv"])
+            latency.extend(row_sets["latency_breakdown.csv"])
+            resources.extend(row_sets["resource_timeline.csv"])
+            parsed_files.extend(str(path) for path in discover_files(ekya_raw_dir))
+            notes.append(
+                f"{run['run_id']}: parsed Ekya-style raw logs from {ekya_raw_dir} "
+                f"({ekya_report['evaluated_frame_count']} frame rows)."
+            )
+            continue
         sources: list[tuple[int | None, Path | None]] = [
             (None, resolve_relative(comparison_dir, raw_logs.get("cloud")))
         ]

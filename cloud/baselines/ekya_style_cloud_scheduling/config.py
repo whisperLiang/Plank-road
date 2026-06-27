@@ -200,6 +200,7 @@ def parse_ekya_style_config(
     run_id: str,
     video_path: str | None = None,
     result_root: str | Path | None = None,
+    output_dir: str | Path | None = None,
 ) -> EkyaStyleCloudSchedulingConfig:
     server = _get(runtime_config, "server", runtime_config)
     client = _get(runtime_config, "client", None)
@@ -243,7 +244,11 @@ def parse_ekya_style_config(
     resolved_result_root = Path(
         result_root or _get(section, "result_root", "") or "results/cloud"
     )
-    output_dir = resolved_result_root / resolved_run_id / "baselines" / METHOD
+    resolved_output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else resolved_result_root / resolved_run_id / "baselines" / METHOD
+    )
     microprofile_section = _get(section, "microprofile", None)
     accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
     config = EkyaStyleCloudSchedulingConfig(
@@ -272,7 +277,7 @@ def parse_ekya_style_config(
         seed=int(_get(section, "seed", 42)),
         class_names=tuple(str(value) for value in list(_get(client, "class_names", []) or [])),
         result_root=resolved_result_root,
-        output_dir=output_dir,
+        output_dir=resolved_output_dir,
         edge_streaming=_edge_streaming_config(_get(section, "edge_streaming", None)),
         cloud_inference=_cloud_inference_config(
             _get(section, "cloud_inference", None),

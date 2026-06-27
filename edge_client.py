@@ -18,6 +18,7 @@ from loguru import logger
 
 from baselines.runtime import BaselineEdgeAdapter
 from common.experiment_results import (
+    EKYA_METHOD,
     PLANK_ROAD_METHOD,
     PURE_EDGE_METHOD,
     ExperimentJsonlWriter,
@@ -292,6 +293,10 @@ def _split_learning_status(config) -> str:
 
 def _baseline_requires_cloud(baseline_method: str) -> bool:
     return validate_baseline_method(baseline_method) != PURE_EDGE_METHOD
+
+
+def _experiment_method_for_runtime(method: str | None) -> str:
+    return EKYA_METHOD if str(method or "") == EKYA_STYLE_METHOD else str(method or "")
 
 
 def _experiment_result_upload_enabled(
@@ -849,6 +854,7 @@ def _run_ekya_style_edge_stream(
     config,
     baseline_run_id: str,
     headless: bool,
+    output_dir: Path | None = None,
 ) -> Path:
     from cloud.baselines.ekya_style_cloud_scheduling.config import parse_ekya_style_config
     from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import DISPLAY_FIELDS
@@ -858,12 +864,8 @@ def _run_ekya_style_edge_stream(
         run_id=baseline_run_id,
         video_path=_effective_video_source(config),
     )
-    edge_output_dir = (
-        Path("results")
-        / "edge"
-        / baseline_run_id
-        / "baselines"
-        / EKYA_STYLE_METHOD
+    edge_output_dir = Path(output_dir) if output_dir is not None else (
+        Path("results") / "edge" / baseline_run_id / "baselines" / EKYA_STYLE_METHOD
     )
     edge_output_dir.mkdir(parents=True, exist_ok=True)
     display_events_path = edge_output_dir / "display_events.csv"
@@ -1100,6 +1102,13 @@ def _write_csv_header(path: Path, fields: list[str]) -> None:
         csv.DictWriter(handle, fieldnames=fields).writeheader()
 
 
+def _count_csv_records(path: Path) -> int:
+    if not Path(path).is_file():
+        return 0
+    with Path(path).open("r", encoding="utf-8", newline="") as handle:
+        return sum(1 for _row in csv.DictReader(handle))
+
+
 def _append_display_event_row(path: Path, fields: list[str], event) -> None:
     row = {
         "method": EKYA_STYLE_METHOD,
@@ -1295,7 +1304,11 @@ if __name__ == "__main__":
             rotation="500 MB",
         )
 
-    method = baseline_method if args.mode == "baseline" else PLANK_ROAD_METHOD
+    method = (
+        _experiment_method_for_runtime(baseline_method)
+        if args.mode == "baseline"
+        else PLANK_ROAD_METHOD
+    )
     run_id = (
         str(baseline_run_id)
         if args.mode == "baseline"
@@ -1315,14 +1328,71 @@ if __name__ == "__main__":
         clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
 
     if args.mode == "baseline" and baseline_method == EKYA_STYLE_METHOD:
+        run_dir = None
+        experiment_log_sink = None
         try:
-            _run_ekya_style_edge_stream(
+            if bool(experiment_results.enabled):
+                run_dir = edge_run_dir(
+                    str(experiment_results.local_root_dir),
+                    comparison_id,
+                    method,
+                    int(config.edge_id),
+                    run_id,
+                )
+                _prepare_experiment_run_dir(
+                    run_dir,
+                    enabled=True,
+                )
+                if bool(getattr(experiment_results, "include_runtime_logs", False)):
+                    experiment_log_sink = logger.add(
+                        str(run_dir / "edge.log"),
+                        level="INFO",
+                        rotation="500 MB",
+                    )
+            display_events_path = _run_ekya_style_edge_stream(
                 runtime_config=runtime_config,
                 config=config,
                 baseline_run_id=run_id,
                 headless=args.headless,
+                output_dir=run_dir,
             )
+            if run_dir is not None and bool(experiment_results.enabled):
+                sampled_frame_count = _count_csv_records(display_events_path)
+                if bool(getattr(experiment_results, "include_edge_summary", True)):
+                    _write_edge_summary(
+                        run_dir / "edge_summary.json",
+                        config=config,
+                        comparison_id=comparison_id,
+                        method=method,
+                        run_id=run_id,
+                        sampled_frame_count=sampled_frame_count,
+                        video_identity=video_identity,
+                    )
+                artifacts = collect_edge_artifacts(
+                    method=method,
+                    run_id=run_id,
+                    edge_id=int(config.edge_id),
+                    comparison_id=comparison_id,
+                    config=experiment_results,
+                    inference_result_path=run_dir / "latest_cloud_inference_results.jsonl",
+                    baseline_metrics_path=None,
+                    cache_path=Path(config.retrain.cache_path),
+                )
+                _upload_experiment_run_artifacts_if_enabled(
+                    server_ip=str(config.server_ip),
+                    mode=args.mode,
+                    baseline_method=baseline_method,
+                    experiment_results=experiment_results,
+                    disable_experiment_result_upload=args.disable_experiment_result_upload,
+                    comparison_id=comparison_id,
+                    run_id=run_id,
+                    method=method,
+                    edge_id=int(config.edge_id),
+                    artifacts=artifacts,
+                )
         finally:
+            if experiment_log_sink is not None:
+                logger.remove(experiment_log_sink)
             if not args.headless:
                 cv2.destroyAllWindows()
         raise SystemExit(0)
