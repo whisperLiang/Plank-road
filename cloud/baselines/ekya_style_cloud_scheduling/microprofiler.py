@@ -54,11 +54,6 @@ class DetectionMicroProfiler:
         )
         results: list[MicroProfileResult] = []
         for candidate in self.config.microprofile.candidate_hyperparameters:
-            logger.info(
-                "ekya_style_cloud_scheduling microprofile start: window={} hp_id={}",
-                window.window_id,
-                candidate.id,
-            )
             result = self._candidate_result(
                 window=window,
                 candidate=candidate,
@@ -66,15 +61,6 @@ class DetectionMicroProfiler:
                 val_samples=val_samples,
                 base_state_dict=base_state_dict,
                 model_builder=model_builder,
-            )
-            logger.info(
-                "ekya_style_cloud_scheduling microprofile end: window={} hp_id={} "
-                "pre_map={:.4f} post_map={:.4f} predicted_final_map={:.4f}",
-                window.window_id,
-                candidate.id,
-                result.preretrain_map,
-                result.post_microprofile_map,
-                result.predicted_final_map,
             )
             results.append(result)
         return results, time.perf_counter() - started
@@ -119,14 +105,28 @@ class DetectionMicroProfiler:
             iou_threshold=float(self.config.evaluation.iou_threshold),
             metric_mode="teacher_proxy",
         )
-        train_started = time.perf_counter()
-        for _epoch in range(1, microprofile_epochs + 1):
-            run_one_training_epoch(
+        train_time_s = 0.0
+        epoch_losses: list[float | None] = []
+        for epoch in range(1, microprofile_epochs + 1):
+            epoch_train_started = time.perf_counter()
+            train_loss, _metrics = run_one_training_epoch(
                 components=components,
                 samples=candidate_train_samples,
                 batch_size=int(candidate.train_batch_size),
             )
-        train_time_s = time.perf_counter() - train_started
+            train_time_s += time.perf_counter() - epoch_train_started
+            epoch_losses.append(train_loss)
+            if epoch < microprofile_epochs:
+                logger.info(
+                    "[EkyaMicroprofile] window={} hp_id={} epoch={}/{} loss={:.4f} "
+                    "metric_mode={}",
+                    window.window_id,
+                    candidate.id,
+                    epoch,
+                    microprofile_epochs,
+                    _loss_for_log(train_loss),
+                    "teacher_proxy",
+                )
         post = evaluate_model_on_samples(
             components.model,
             val_samples,
@@ -143,6 +143,22 @@ class DetectionMicroProfiler:
             full_epochs=int(candidate.epochs),
         )
         predicted_final = _clamp01(float(pre.map) + predicted_gain)
+        final_loss = epoch_losses[-1] if epoch_losses else None
+        logger.info(
+            "[EkyaMicroprofile] window={} hp_id={} epoch={}/{} loss={:.4f} "
+            "pre_map={:.4f} post_map={:.4f} gain={:.4f} predicted_final_map={:.4f} "
+            "metric_mode={}",
+            window.window_id,
+            candidate.id,
+            microprofile_epochs,
+            microprofile_epochs,
+            _loss_for_log(final_loss),
+            pre.map,
+            post.map,
+            observed_gain,
+            predicted_final,
+            post.metric_mode,
+        )
         return MicroProfileResult(
             task_id=int(window.task_id),
             hp_id=candidate.id,
@@ -200,3 +216,7 @@ def _seed(seed: int, task_id: int, salt: str) -> int:
 
 def _clamp01(value: float) -> float:
     return float(min(1.0, max(0.0, float(value))))
+
+
+def _loss_for_log(value: float | None) -> float:
+    return float(value) if value is not None else float("nan")

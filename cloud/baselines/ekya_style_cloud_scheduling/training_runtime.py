@@ -102,6 +102,7 @@ def run_one_training_epoch(
         device=components.device,
         loss_fn=components.loss_fn,
         optimizer=components.optimizer,
+        log_epochs=False,
     )
     epoch_losses = list(metrics.get("epoch_losses") or [])
     loss = float(epoch_losses[-1]) if epoch_losses else metrics.get("final_loss")

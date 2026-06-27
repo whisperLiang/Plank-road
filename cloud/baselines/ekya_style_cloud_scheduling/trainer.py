@@ -130,14 +130,14 @@ class EkyaCloudTrainer:
             seed=_seed(self.config.seed, window.task_id, decision.selected_hp_id),
             min_samples=int(self.config.dataset.min_train_samples),
         )
+        checkpoint_path = self.checkpoint_dir / (
+            f"task_{int(window.task_id)}_{decision.selected_hp_id}_model.pt"
+        )
+        epoch_log_path = self.checkpoint_dir / (
+            f"task_{int(window.task_id)}_{decision.selected_hp_id}_epochs.csv"
+        )
 
         train_start = time.time()
-        logger.info(
-            "ekya_style_cloud_scheduling training start: window={} hp_id={} epochs={}",
-            window.window_id,
-            decision.selected_hp_id,
-            epochs,
-        )
         model = model_builder()
         load_base_state_dict(model, base_state_dict)
         components = build_training_components(
@@ -169,12 +169,14 @@ class EkyaCloudTrainer:
                 metric_mode="teacher_proxy",
             )
             epoch_time_s = time.perf_counter() - epoch_started
+            updated_best = False
             if float(validation.map) > best_val_map:
                 best_epoch = epoch
                 best_val_map = float(validation.map)
                 best_val_ap50 = float(validation.ap50)
                 best_val_foreground_f1 = float(validation.foreground_f1)
                 best_state = cpu_state_dict(components.model)
+                updated_best = True
             row = {
                 "epoch": int(epoch),
                 "train_loss": train_loss,
@@ -186,27 +188,31 @@ class EkyaCloudTrainer:
                 "metric_mode": validation.metric_mode,
             }
             epoch_rows.append(row)
-            logger.info(
-                "ekya_style_cloud_scheduling training epoch: window={} hp_id={} "
-                "epoch={} train_loss={} val_map={:.4f} val_ap50={:.4f} val_f1={:.4f}",
+            log_message = (
+                "[EkyaRetraining] window={} hp_id={} epoch={}/{} loss={:.4f} "
+                "val_map={:.4f} val_ap50={:.4f} val_f1={:.4f} best_epoch={} "
+                "metric_mode={}"
+            )
+            log_args: list[Any] = [
                 window.window_id,
                 decision.selected_hp_id,
                 epoch,
-                train_loss,
+                epochs,
+                _loss_for_log(train_loss),
                 validation.map,
                 validation.ap50,
                 validation.foreground_f1,
-            )
+                best_epoch,
+                validation.metric_mode,
+            ]
+            if updated_best:
+                log_message = f"{log_message} checkpoint={{}}"
+                log_args.append(checkpoint_path)
+            logger.info(log_message, *log_args)
 
         if best_state is None:
             raise RuntimeError("Ekya training completed without a validated checkpoint state")
 
-        checkpoint_path = self.checkpoint_dir / (
-            f"task_{int(window.task_id)}_{decision.selected_hp_id}_model.pt"
-        )
-        epoch_log_path = self.checkpoint_dir / (
-            f"task_{int(window.task_id)}_{decision.selected_hp_id}_epochs.csv"
-        )
         train_end = time.time()
         metadata = {
             "method": "ekya_style_cloud_scheduling",
@@ -236,12 +242,6 @@ class EkyaCloudTrainer:
         adoptable = assert_non_empty_checkpoint_state(str(checkpoint_path))
         if not adoptable:
             raise RuntimeError("Ekya training checkpoint did not contain trained model weights")
-        logger.info(
-            "ekya_style_cloud_scheduling training end: window={} hp_id={} checkpoint={}",
-            window.window_id,
-            decision.selected_hp_id,
-            checkpoint_path,
-        )
         return TrainingResult(
             task_id=int(window.task_id),
             edge_id=int(window.edge_id),
@@ -304,3 +304,7 @@ def _require_sample_counts(
 def _seed(seed: int, task_id: int, salt: str) -> int:
     salt_value = sum((index + 1) * ord(char) for index, char in enumerate(str(salt)))
     return int(seed) + int(task_id) * 1009 + salt_value
+
+
+def _loss_for_log(value: float | None) -> float:
+    return float(value) if value is not None else float("nan")

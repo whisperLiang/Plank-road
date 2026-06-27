@@ -193,6 +193,8 @@ def run_parameter_ratio_freeze_training(
     device: torch.device,
     loss_fn: Callable[[Any, Any], torch.Tensor] | None,
     optimizer: torch.optim.Optimizer,
+    log_epochs: bool = True,
+    epoch_log_prefix: str = "[BaselineTraining] freeze",
 ) -> dict[str, Any]:
     sample_list = list(samples)
     losses: list[float] = []
@@ -226,18 +228,22 @@ def run_parameter_ratio_freeze_training(
         if epoch_losses_for_batches:
             avg_loss = sum(epoch_losses_for_batches) / float(len(epoch_losses_for_batches))
             epoch_losses.append(avg_loss)
-            logger.info(
-                "[BaselineTraining] freeze epoch {}/{} avg_loss={:.6f}.",
-                epoch,
-                int(epochs),
-                avg_loss,
-            )
+            if log_epochs:
+                logger.info(
+                    "{} epoch {}/{} avg_loss={:.6f}.",
+                    epoch_log_prefix,
+                    epoch,
+                    int(epochs),
+                    avg_loss,
+                )
         else:
-            logger.info(
-                "[BaselineTraining] freeze epoch {}/{} skipped: no training batches.",
-                epoch,
-                int(epochs),
-            )
+            if log_epochs:
+                logger.info(
+                    "{} epoch {}/{} skipped: no training batches.",
+                    epoch_log_prefix,
+                    epoch,
+                    int(epochs),
+                )
     return {
         "full_train_time_sec": time.perf_counter() - started,
         "final_loss": losses[-1] if losses else None,

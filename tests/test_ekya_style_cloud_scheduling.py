@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from loguru import logger
 
 from cloud.baselines.ekya_style_cloud_scheduling.cloud_frame_receiver import CloudFrameReceiver
 from cloud.baselines.ekya_style_cloud_scheduling.config import parse_ekya_style_config
@@ -28,6 +29,20 @@ from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import EkyaUnifi
 from tools.experiments.experiment_common import read_csv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _capture_info_logs(action):
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda message: messages.append(str(message)),
+        level="INFO",
+        format="{message}",
+    )
+    try:
+        result = action()
+    finally:
+        logger.remove(sink_id)
+    return result, "\n".join(messages)
 
 
 def _runtime(tmp_path: Path):
@@ -346,6 +361,55 @@ def test_ekya_scheduler_task0_is_inference_only_by_default() -> None:
     assert decision.decision_reason == "task0_inference_only"
 
 
+def test_baseline_freeze_epoch_logs_stay_enabled_by_default() -> None:
+    import torch
+
+    from cloud.training.parameter_freeze import RawFrameTrainingSample
+    from cloud.training.strategies.baseline_freeze import run_parameter_ratio_freeze_training
+
+    class TinyTrainModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([0.0]))
+
+        def forward(self, inputs):
+            batch_size = int(inputs.shape[0]) if torch.is_tensor(inputs) else len(inputs)
+            return self.weight.repeat(batch_size)
+
+    def loss_fn(outputs, targets):
+        target_counts = torch.tensor(
+            [float(len(target["boxes"])) for target in targets],
+            dtype=outputs.dtype,
+            device=outputs.device,
+        )
+        return torch.nn.functional.mse_loss(outputs, target_counts)
+
+    model = TinyTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    samples = [
+        RawFrameTrainingSample(
+            frame_id=1,
+            image_bgr=np.zeros((8, 8, 3), dtype=np.uint8),
+            target={"boxes": [[1.0, 1.0, 4.0, 4.0]], "labels": [1]},
+        )
+    ]
+
+    _metrics, logs = _capture_info_logs(
+        lambda: run_parameter_ratio_freeze_training(
+            model=model,
+            trainable_module=model,
+            samples=samples,
+            batch_size=1,
+            epochs=1,
+            device=torch.device("cpu"),
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+        )
+    )
+
+    assert "[BaselineTraining] freeze epoch 1/1 avg_loss=" in logs
+
+
 def test_microprofile_runs_training_loop_and_not_static_formula(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -397,25 +461,35 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
     monkeypatch.setattr(mp, "evaluate_model_on_samples", evaluate)
     base = TinyTrainModel().state_dict()
 
-    results, elapsed = DetectionMicroProfiler(cfg).profile(
-        window=CompletedFrameWindow(
-            task_id=1,
-            window_id="1:1:2",
-            start_frame=1,
-            end_frame=2,
-            records=(_decoded_record(1), _decoded_record(2)),
-            edge_id=1,
-            camera_id=0,
-        ),
-        teacher_labels=_teacher_labels(1, 2),
-        base_state_dict=base,
-        model_builder=TinyTrainModel,
+    (results, elapsed), logs = _capture_info_logs(
+        lambda: DetectionMicroProfiler(cfg).profile(
+            window=CompletedFrameWindow(
+                task_id=1,
+                window_id="1:1:2",
+                start_frame=1,
+                end_frame=2,
+                records=(_decoded_record(1), _decoded_record(2)),
+                edge_id=1,
+                camera_id=0,
+            ),
+            teacher_labels=_teacher_labels(1, 2),
+            base_state_dict=base,
+            model_builder=TinyTrainModel,
+        )
     )
 
     assert calls["epochs"] == 1
     assert elapsed >= 0.0
     assert results[0].post_microprofile_map > results[0].preretrain_map
     assert results[0].predicted_full_train_time_s != pytest.approx(0.001 + 0.01 * 0.5 * 2)
+    assert logs.count("[EkyaMicroprofile]") == 1
+    assert "window=1:1:2 hp_id=hp epoch=1/1" in logs
+    assert "pre_map=" in logs
+    assert "post_map=" in logs
+    assert "predicted_final_map=" in logs
+    assert "[BaselineTraining] freeze epoch" not in logs
+    assert "microprofile start" not in logs
+    assert "microprofile end" not in logs
 
 
 def test_cloud_frame_receiver_drops_stale_queue_entry(tmp_path: Path) -> None:
@@ -639,21 +713,23 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
         selected_subsample=1.0,
     )
 
-    result = EkyaCloudTrainer(cfg, checkpoint_dir=tmp_path).train(
-        window=CompletedFrameWindow(
-            task_id=1,
-            window_id="1:1:2",
-            start_frame=1,
-            end_frame=2,
-            records=(_decoded_record(1), _decoded_record(2)),
-            edge_id=1,
-            camera_id=0,
-        ),
-        decision=decision,
-        teacher_labels=_teacher_labels(1, 2),
-        previous_val_map=0.0,
-        base_state_dict=TinyTrainModel().state_dict(),
-        model_builder=TinyTrainModel,
+    result, logs = _capture_info_logs(
+        lambda: EkyaCloudTrainer(cfg, checkpoint_dir=tmp_path).train(
+            window=CompletedFrameWindow(
+                task_id=1,
+                window_id="1:1:2",
+                start_frame=1,
+                end_frame=2,
+                records=(_decoded_record(1), _decoded_record(2)),
+                edge_id=1,
+                camera_id=0,
+            ),
+            decision=decision,
+            teacher_labels=_teacher_labels(1, 2),
+            previous_val_map=0.0,
+            base_state_dict=TinyTrainModel().state_dict(),
+            model_builder=TinyTrainModel,
+        )
     )
 
     checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=False)
@@ -661,6 +737,12 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
     assert checkpoint["state_dict"]
     assert Path(result.epoch_log_path).exists()
     assert "train_loss" in Path(result.epoch_log_path).read_text(encoding="utf-8")
+    assert logs.count("[EkyaRetraining]") == 1
+    assert "window=1:1:2 hp_id=hp epoch=1/1" in logs
+    assert "checkpoint=" in logs
+    assert "[BaselineTraining] freeze epoch" not in logs
+    assert "training start" not in logs
+    assert "training end" not in logs
 
 
 def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path: Path) -> None:
@@ -713,7 +795,7 @@ def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path
         checkpoint_adoptable=True,
     )
 
-    adopted = controller._maybe_adopt(result)
+    adopted, logs = _capture_info_logs(lambda: controller._maybe_adopt(result))
 
     updates = read_csv(controller.output_dir / "model_update_events.csv")
     assert adopted
@@ -722,6 +804,61 @@ def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path
     assert updates[-1]["adopted"] == "true"
     assert updates[-1]["old_model_version"] == "0"
     assert updates[-1]["new_model_version"] == "1"
+    assert "[EkyaModelUpdate]" in logs
+    assert "task_id=1 hp_id=hp adopted=true old_version=0 new_version=1" in logs
+
+
+def test_controller_model_update_log_reports_not_adopted_reason(tmp_path: Path) -> None:
+    import torch
+
+    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+        EkyaStyleCloudSchedulingController,
+    )
+    from cloud.baselines.ekya_style_cloud_scheduling.trainer import TrainingResult
+
+    class TinyTrainModel(torch.nn.Module):
+        def __init__(self, value: float = 0.0) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([value]))
+
+        def forward(self, inputs):
+            batch_size = len(inputs) if isinstance(inputs, list) else int(inputs.shape[0])
+            return self.weight.reshape(1, 1).repeat(batch_size, 1)
+
+    controller = EkyaStyleCloudSchedulingController(
+        parse_ekya_style_config(_runtime(tmp_path), run_id="run"),
+        detector=SimpleNamespace(model=TinyTrainModel(0.0)),
+    )
+    controller._previous_val_map = 0.95
+    result = TrainingResult(
+        task_id=1,
+        edge_id=1,
+        camera_id=0,
+        hp_id="hp",
+        epochs=1,
+        lr=1.0e-5,
+        batch_size=2,
+        num_samples=2,
+        train_start_time=1.0,
+        train_end_time=2.0,
+        train_duration_s=1.0,
+        best_epoch=1,
+        best_val_map=0.9,
+        best_val_ap50=0.9,
+        best_val_foreground_f1=0.9,
+        checkpoint_path=str(tmp_path / "unused.pt"),
+        checkpoint_adoptable=True,
+    )
+
+    adopted, logs = _capture_info_logs(lambda: controller._maybe_adopt(result))
+
+    updates = read_csv(controller.output_dir / "model_update_events.csv")
+    assert not adopted
+    assert updates[-1]["adopted"] == "false"
+    assert updates[-1]["new_model_version"] == "0"
+    assert "[EkyaModelUpdate]" in logs
+    assert "adopted=false old_version=0 new_version=0" in logs
+    assert "reason=not_improved" in logs
 
 
 def test_production_ekya_code_has_no_static_microprofile_or_checkpoint_paths() -> None:

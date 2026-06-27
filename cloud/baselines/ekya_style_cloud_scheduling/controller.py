@@ -334,9 +334,45 @@ class EkyaStyleCloudSchedulingController:
                 "update_time": time.time(),
             }
         )
+        final_version = new_version if adopted else old_version
+        reason = "" if adopted else _model_update_rejection_reason(result, gain, threshold)
+        message = (
+            "[EkyaModelUpdate] task_id={} hp_id={} adopted={} old_version={} "
+            "new_version={} best_val_map={:.4f} previous_val_map={:.4f} gain={:.4f}"
+        )
+        args: list[Any] = [
+            int(result.task_id),
+            result.hp_id,
+            _bool_token(adopted),
+            old_version,
+            final_version,
+            result.best_val_map,
+            previous_val_map,
+            gain,
+        ]
+        if reason:
+            message = f"{message} reason={{}}"
+            args.append(reason)
+        logger.info(message, *args)
         return adopted
 
 
 def _mean(values) -> float | None:
     numbers = [float(value) for value in values if value is not None]
     return sum(numbers) / len(numbers) if numbers else None
+
+
+def _model_update_rejection_reason(
+    result: TrainingResult,
+    gain: float,
+    threshold: float,
+) -> str:
+    if not bool(result.checkpoint_adoptable):
+        return "checkpoint_not_adoptable"
+    if float(gain) <= float(threshold):
+        return "not_improved"
+    return "not_adopted"
+
+
+def _bool_token(value: bool) -> str:
+    return "true" if bool(value) else "false"
