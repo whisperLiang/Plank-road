@@ -222,11 +222,14 @@ def test_legacy_baseline_files_are_removed() -> None:
         assert not (PROJECT_ROOT / relpath).exists(), relpath
 
 
-def test_only_two_baseline_methods_are_registered() -> None:
+def test_native_baseline_methods_are_registered() -> None:
     assert registered_methods() == (
         "pure_edge_local_updating",
         "accuracy_trigger_cloud_retraining",
+        "ekya_style_cloud_scheduling",
     )
+    with pytest.raises(ValueError, match="does not use the edge policy factory"):
+        create_policy("ekya_style_cloud_scheduling")
     with pytest.raises(ValueError, match="not a baseline method"):
         create_policy("plank_road" + "_multi_device")
     assert str(PLANK_ROAD_BASELINE_ERROR).startswith("plank_road" + "_multi_device")

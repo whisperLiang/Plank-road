@@ -27,7 +27,7 @@ METHOD_LABELS = {
     "plank_road": "Plank-road",
     "pure_edge_local_updating": "Pure Edge",
     "accuracy_trigger_cloud_retraining": "Accuracy-Trigger",
-    "ekya": "Ekya",
+    "ekya": "Ekya-style",
 }
 METHOD_COLORS = {
     "plank_road": "#1f77b4",

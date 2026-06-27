@@ -414,6 +414,143 @@ class EdgeAffineWorkersConfig(ConfigSection):
 
 
 @dataclass
+class EkyaCandidateHyperparameterConfig(ConfigSection):
+    id: str = "hp_small"
+    epochs: int = 1
+    train_batch_size: int = 2
+    test_batch_size: int = 1
+    learning_rate: float = 1.0e-5
+    subsample: float = 0.25
+
+
+@dataclass
+class EkyaEdgeStreamingConfig(ConfigSection):
+    enabled: bool = True
+    upload_format: str = "jpeg"
+    jpeg_quality: int = 85
+    max_inflight_frames: int = 4
+    upload_queue_size: int = 8
+    result_queue_size: int = 8
+    drop_stale_results: bool = True
+    display_cloud_results_only: bool = True
+
+
+@dataclass
+class EkyaCloudInferenceConfig(ConfigSection):
+    score_threshold: float = 0.3
+    batch_size: int = 1
+    high_priority: bool = True
+    async_result_return: bool = True
+    result_queue_size: int = 8
+    drop_stale_display_packets: bool = True
+
+
+@dataclass
+class EkyaTeacherLabelingConfig(ConfigSection):
+    enabled: bool = True
+    batch_size: int = 1
+    score_threshold: float = 0.3
+    cache_labels: bool = True
+    run_async: bool = True
+
+
+@dataclass
+class EkyaMicroprofileConfig(ConfigSection):
+    enabled: bool = True
+    microprofile_epochs: int = 1
+    microprofile_subsample_rate: float = 0.25
+    resources_per_trial: float = 0.25
+    metric: str = "map"
+    prediction_model: str = "simple_linear"
+    candidate_hyperparameters: list[EkyaCandidateHyperparameterConfig] = field(
+        default_factory=lambda: [
+            EkyaCandidateHyperparameterConfig(
+                id="hp_small",
+                epochs=1,
+                train_batch_size=2,
+                test_batch_size=1,
+                learning_rate=1.0e-5,
+                subsample=0.25,
+            ),
+            EkyaCandidateHyperparameterConfig(
+                id="hp_medium",
+                epochs=2,
+                train_batch_size=2,
+                test_batch_size=1,
+                learning_rate=1.0e-5,
+                subsample=0.5,
+            ),
+            EkyaCandidateHyperparameterConfig(
+                id="hp_large",
+                epochs=3,
+                train_batch_size=2,
+                test_batch_size=1,
+                learning_rate=5.0e-6,
+                subsample=1.0,
+            ),
+        ]
+    )
+
+
+@dataclass
+class EkyaSchedulerConfig(ConfigSection):
+    name: str = "ekya_thief_style"
+    retraining_period_s: float = 64.0
+    inference_resource_floor: float = 0.5
+    microprofile_resource_fraction: float = 0.25
+    steal_increment: float = 0.1
+    allow_inference_only_when_no_gain: bool = True
+    fail_on_microprofile_overrun: bool = False
+    protect_inference_from_training: bool = True
+    warm_start_retraining: bool = False
+
+
+@dataclass
+class EkyaRetrainingConfig(ConfigSection):
+    enabled: bool = True
+    adopt_only_if_improved: bool = True
+    min_map_gain_to_adopt: float = 0.0
+    max_concurrent_train_jobs: int = 1
+    save_checkpoints: bool = True
+    run_async: bool = True
+    trainable_param_ratio: float | None = None
+
+
+@dataclass
+class EkyaLoggingConfig(ConfigSection):
+    result_schema_version: int = 1
+    log_internal_ids: bool = False
+    diagnostics: bool = False
+
+
+@dataclass
+class EkyaStyleCloudSchedulingServerConfig(ConfigSection):
+    enabled: bool = True
+    student_model: str = "rfdetr_nano"
+    teacher_model: str = "rtdetr_x"
+    video_path: str = "./video_data/road.mp4"
+    offline_cloud_video_debug: bool = False
+    num_frames: int = 512
+    window_size: int = 64
+    seed: int = 42
+    allow_model_override: bool = False
+    edge_streaming: EkyaEdgeStreamingConfig = field(default_factory=EkyaEdgeStreamingConfig)
+    cloud_inference: EkyaCloudInferenceConfig = field(default_factory=EkyaCloudInferenceConfig)
+    teacher_labeling: EkyaTeacherLabelingConfig = field(default_factory=EkyaTeacherLabelingConfig)
+    microprofile: EkyaMicroprofileConfig = field(default_factory=EkyaMicroprofileConfig)
+    scheduler: EkyaSchedulerConfig = field(default_factory=EkyaSchedulerConfig)
+    retraining: EkyaRetrainingConfig = field(default_factory=EkyaRetrainingConfig)
+    logging: EkyaLoggingConfig = field(default_factory=EkyaLoggingConfig)
+
+
+@dataclass
+class ServerBaselinesConfig(ConfigSection):
+    ekya_style_cloud_scheduling: EkyaStyleCloudSchedulingServerConfig = field(
+        default_factory=EkyaStyleCloudSchedulingServerConfig
+    )
+
+
+@dataclass
 class ClientConfig(ConfigSection):
     source: SourceConfig = field(default_factory=SourceConfig)
     interval: int = 1
@@ -466,6 +603,7 @@ class ServerConfig(ConfigSection):
     workspace_root: str = "./cache/server_workspace"
     sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
     edge_affine_workers: EdgeAffineWorkersConfig = field(default_factory=EdgeAffineWorkersConfig)
+    baselines: ServerBaselinesConfig = field(default_factory=ServerBaselinesConfig)
     experiment_results: ExperimentResultsConfig = field(
         default_factory=ExperimentResultsConfig
     )
@@ -576,6 +714,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             EdgeAffineWorkersConfig,
             known.get("edge_affine_workers"),
         )
+        known["baselines"] = _section(
+            ServerBaselinesConfig,
+            known.get("baselines"),
+        )
         known["experiment_results"] = _section(
             ExperimentResultsConfig,
             known.get("experiment_results"),
@@ -585,6 +727,37 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["mps"] = _section(MPSConfig, known.get("mps"))
         known["gpu_lease"] = _section(GpuLeaseConfig, known.get("gpu_lease"))
         known["worker"] = _section(WorkerServiceConfig, known.get("worker"))
+    elif section_cls is ServerBaselinesConfig:
+        known["ekya_style_cloud_scheduling"] = _section(
+            EkyaStyleCloudSchedulingServerConfig,
+            known.get("ekya_style_cloud_scheduling"),
+        )
+    elif section_cls is EkyaStyleCloudSchedulingServerConfig:
+        known["edge_streaming"] = _section(
+            EkyaEdgeStreamingConfig,
+            known.get("edge_streaming"),
+        )
+        known["cloud_inference"] = _section(
+            EkyaCloudInferenceConfig,
+            known.get("cloud_inference"),
+        )
+        known["teacher_labeling"] = _section(
+            EkyaTeacherLabelingConfig,
+            known.get("teacher_labeling"),
+        )
+        known["microprofile"] = _section(
+            EkyaMicroprofileConfig,
+            known.get("microprofile"),
+        )
+        known["scheduler"] = _section(EkyaSchedulerConfig, known.get("scheduler"))
+        known["retraining"] = _section(EkyaRetrainingConfig, known.get("retraining"))
+        known["logging"] = _section(EkyaLoggingConfig, known.get("logging"))
+    elif section_cls is EkyaMicroprofileConfig:
+        if "candidate_hyperparameters" in known:
+            known["candidate_hyperparameters"] = [
+                _section(EkyaCandidateHyperparameterConfig, item)
+                for item in list(known.get("candidate_hyperparameters") or [])
+            ]
     elif section_cls is BaselineConfig:
         known["edge"] = _section(
             BaselineEdgeConfig,
@@ -830,7 +1003,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             f"baseline section(s) removed and no longer supported: {names}. "
             "Valid baseline methods are pure_edge_local_updating and "
-            "accuracy_trigger_cloud_retraining."
+            "accuracy_trigger_cloud_retraining, and ekya_style_cloud_scheduling."
         )
     if not isinstance(config.baseline.enabled, bool):
         raise ValueError("baseline.enabled must be a boolean")
@@ -847,6 +1020,43 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "baseline.training.min_training_samples",
         int(baseline_training.min_training_samples),
     )
+    ekya_cfg = config.server.baselines.ekya_style_cloud_scheduling
+    if bool(ekya_cfg.enabled):
+        if not bool(ekya_cfg.allow_model_override):
+            if str(ekya_cfg.student_model) != "rfdetr_nano":
+                raise ValueError(
+                    "server.baselines.ekya_style_cloud_scheduling.student_model "
+                    "must be rfdetr_nano unless allow_model_override=true"
+                )
+            if str(ekya_cfg.teacher_model) != "rtdetr_x":
+                raise ValueError(
+                    "server.baselines.ekya_style_cloud_scheduling.teacher_model "
+                    "must be rtdetr_x unless allow_model_override=true"
+                )
+        if not bool(ekya_cfg.edge_streaming.enabled):
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.edge_streaming.enabled "
+                "must be true"
+            )
+        if not bool(ekya_cfg.edge_streaming.display_cloud_results_only):
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.edge_streaming."
+                "display_cloud_results_only must be true"
+            )
+        _validate_positive(
+            "server.baselines.ekya_style_cloud_scheduling.window_size",
+            int(ekya_cfg.window_size),
+        )
+        if int(ekya_cfg.num_frames) < int(ekya_cfg.window_size):
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.num_frames must be "
+                ">= window_size"
+            )
+        if not list(ekya_cfg.microprofile.candidate_hyperparameters):
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.microprofile."
+                "candidate_hyperparameters must not be empty"
+            )
     _validate_positive(
         "baseline.training.training_window_size",
         int(baseline_training.training_window_size),

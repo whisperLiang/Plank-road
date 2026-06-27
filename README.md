@@ -149,6 +149,7 @@ Plank-road/
 |   `-- feature_shard/          # Edge-side safetensors/npy feature shard writers
 |-- cloud/                      # Cloud ingest, orchestration, resource state, model updates
 |   |-- annotation/             # Teacher annotation service and label cache
+|   |-- baselines/              # Cloud-side baseline controllers, including Ekya-style scheduling
 |   |-- feature_cache/          # Cloud feature shard store, planner, materializer, GC
 |   |-- orchestration/          # Fixed-split training pipeline stages
 |   |-- sample_pool/            # Canonical sample pool, labels, staging, views
@@ -239,6 +240,29 @@ server:
       memory_usage_threshold: 0.85
       reserve_memory_gb: 4
       default_estimated_job_memory_gb: 18
+```
+
+Ekya-style cloud scheduling is configured under the cloud baseline section. It
+streams JPEG frames from the edge, returns cloud inference results online, labels
+completed windows with the teacher, microprofiles candidate hyperparameters, and
+optionally adopts retrained student checkpoints.
+
+```yaml
+server:
+  baselines:
+    ekya_style_cloud_scheduling:
+      enabled: true
+      student_model: rfdetr_nano
+      teacher_model: rtdetr_x
+      num_frames: 512
+      window_size: 64
+      edge_streaming:
+        enabled: true
+        upload_format: jpeg
+        jpeg_quality: 85
+        display_cloud_results_only: true
+      retraining:
+        max_concurrent_train_jobs: 1
 ```
 
 ## Usage
@@ -336,6 +360,7 @@ The supported baseline methods are:
 ```text
 pure_edge_local_updating
 accuracy_trigger_cloud_retraining
+ekya_style_cloud_scheduling
 ```
 
 Cloud-backed baseline updates use the shared training-job API with one generic
@@ -402,9 +427,39 @@ experiment archival is enabled. It does not upload frames, metrics, teacher
 requests, or shutdown artifacts to the cloud by default, so it can run without a
 cloud server.
 
-Ekya is not implemented or run in this repository. Real Ekya measurements may
-be imported from an external repository for optional summary-level comparison;
-they are never generated or simulated here.
+#### Ekya-Style Cloud Scheduling
+
+The Ekya-style baseline uses a bidirectional gRPC stream. Each sampled edge frame
+is uploaded as JPEG, the cloud immediately returns the student-model detection
+result for display, and completed windows trigger teacher labeling,
+microprofiling, scheduling, and optional retraining on the cloud. This path is
+implemented under
+[cloud/baselines/ekya_style_cloud_scheduling/](./cloud/baselines/ekya_style_cloud_scheduling/).
+
+Cloud:
+
+```shell
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --listen_address "[::]:50051" --run_id ekya_style_001
+```
+
+Ekya-style edge:
+
+```shell
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --run_id ekya_style_001 --edge_id 1 --server_ip 192.168.66.205:50051 --video_path ./video_data/road.mp4 --display_cloud_results_only --headless
+```
+
+Cloud-side raw logs are written under
+`results/cloud/{run_id}/baselines/ekya_style_cloud_scheduling/`, including
+`per_frame_metrics.csv`, `per_window_metrics.csv`, `training_events.csv`,
+`scheduler_events.csv`, `model_update_events.csv`, `upload_events.csv`,
+`sampled_frames.json`, and `summary.json`. Edge display events are mirrored
+under `results/edge/{run_id}/baselines/ekya_style_cloud_scheduling/`.
+
+Convert one Ekya-style run into the existing plot schema with:
+
+```shell
+python tools/convert_ekya_style_results_to_plot_schema.py --run_id ekya_style_001 --result_dir results/cloud --comparison_id comparison-001 --scenario_name road --video_slug road --append_to_normalized_dir results/experiments/comparison-001/normalized
+```
 
 ## Experiment Post-processing and Figures
 
@@ -419,6 +474,9 @@ accuracy_trigger_cloud_retraining
 `plank_road` is the result label for the normal `main` path and is not
 registered as a baseline. Experiment tools only consume existing logs and
 metrics; they do not launch edge/cloud processes or modify runtime behavior.
+Ekya-style runs are normalized separately with
+`tools/convert_ekya_style_results_to_plot_schema.py`, which writes method alias
+`ekya` and can append those rows to an existing normalized experiment directory.
 
 Start from
 [configs/experiments/plank_road_baselines_manifest.example.yaml](./configs/experiments/plank_road_baselines_manifest.example.yaml).
@@ -523,9 +581,10 @@ Upload, download, and model-apply latency use measured runtime durations when
 available; otherwise the normalizer falls back to paired event timestamps.
 Offline result archival remains excluded from these communication metrics.
 
-External Ekya data uses
+Legacy external Ekya summary data uses
 [configs/experiments/external_ekya_schema.example.csv](./configs/experiments/external_ekya_schema.example.csv)
-and is excluded from default plots. Import it explicitly with:
+and is excluded from default plots. Use this only for measurements generated
+outside this repository. Import it explicitly with:
 
 ```shell
 python tools/experiments/merge_external_ekya_results.py --plank_road_summary results/experiments/{comparison_id}/normalized/summary.csv --ekya_csv path/to/external_ekya_results.csv --output results/experiments/{comparison_id}/normalized/summary_with_external_ekya.csv

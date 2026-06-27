@@ -32,6 +32,10 @@ service MessageTransmission {
   rpc RequestCloudInference (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
   rpc PollCommand (BaselineCommandRequest) returns (BaselineCommandReply) {}
   rpc DownloadInferenceResult (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
+  // Ekya-style cloud scheduling: edge streams JPEG frames and receives
+  // cloud inference results in the same online stream.
+  rpc EkyaFrameStream (stream EkyaClientMessage)
+      returns (stream EkyaServerMessage) {}
   // Offline experiment artifact archival. This is not method communication.
   rpc UploadExperimentResult (UploadExperimentResultRequest)
       returns (UploadExperimentResultResponse) {}
@@ -304,6 +308,95 @@ message BaselineCommandReply {
   bool success = 1;
   string message = 2;
   repeated string command_json = 3;
+}
+
+message EkyaFrameUpload {
+  string method = 1;
+  string run_id = 2;
+  int64 edge_id = 3;
+  int64 camera_id = 4;
+  int64 task_id = 5;
+  int64 chunk_id = 6;
+  int64 frame_idx = 7;
+  string video_name = 8;
+  double timestamp_edge_capture = 9;
+  double timestamp_edge_send = 10;
+  repeated int64 image_shape = 11;
+  bytes encoded_frame_jpeg = 12;
+  int64 jpeg_quality = 13;
+}
+
+message EkyaDetectionBox {
+  double x1 = 1;
+  double y1 = 2;
+  double x2 = 3;
+  double y2 = 4;
+  int64 label = 5;
+  double score = 6;
+  string class_name = 7;
+}
+
+message EkyaDetectionResult {
+  string method = 1;
+  string run_id = 2;
+  int64 edge_id = 3;
+  int64 camera_id = 4;
+  int64 task_id = 5;
+  int64 chunk_id = 6;
+  int64 frame_idx = 7;
+  string video_name = 8;
+  double timestamp_edge_capture = 9;
+  double timestamp_edge_send = 10;
+  double timestamp_cloud_receive = 11;
+  double timestamp_inference_start = 12;
+  double timestamp_inference_end = 13;
+  double timestamp_cloud_send = 14;
+  repeated int64 image_shape = 15;
+  repeated EkyaDetectionBox detections = 16;
+  string model_version = 17;
+  bytes encoded_frame_jpeg = 18;
+}
+
+message EkyaDisplayEvent {
+  string method = 1;
+  string run_id = 2;
+  int64 edge_id = 3;
+  int64 camera_id = 4;
+  int64 task_id = 5;
+  int64 chunk_id = 6;
+  int64 frame_idx = 7;
+  double timestamp_edge_capture = 8;
+  double timestamp_edge_send = 9;
+  double timestamp_edge_receive = 10;
+  double timestamp_edge_display = 11;
+  bool displayed = 12;
+  string drop_reason = 13;
+}
+
+message EkyaStreamClose {
+  string run_id = 1;
+  int64 edge_id = 2;
+}
+
+message EkyaAck {
+  bool success = 1;
+  string message = 2;
+}
+
+message EkyaClientMessage {
+  oneof payload {
+    EkyaFrameUpload frame_upload = 1;
+    EkyaDisplayEvent display_event = 2;
+    EkyaStreamClose close = 3;
+  }
+}
+
+message EkyaServerMessage {
+  oneof payload {
+    EkyaDetectionResult detection_result = 1;
+    EkyaAck ack = 2;
+    EkyaAck error = 3;
+  }
 }
 
 message ExperimentResultArtifact {

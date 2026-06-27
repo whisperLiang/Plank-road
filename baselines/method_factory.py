@@ -15,6 +15,10 @@ _REGISTRY: dict[str, type[BaseBaselinePolicy]] = {
 
 def create_policy(method: str, config: object | None = None) -> BaseBaselinePolicy:
     method_name = validate_baseline_method(method)
+    if method_name not in _REGISTRY:
+        raise ValueError(
+            f"Baseline method {method_name!r} does not use the edge policy factory."
+        )
     return _REGISTRY[method_name](config)
 
 

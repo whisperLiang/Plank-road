@@ -458,6 +458,160 @@ class BaselineCommandReply(_message.Message):
     command_json: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, success: bool = ..., message: _Optional[str] = ..., command_json: _Optional[_Iterable[str]] = ...) -> None: ...
 
+class EkyaFrameUpload(_message.Message):
+    __slots__ = ("method", "run_id", "edge_id", "camera_id", "task_id", "chunk_id", "frame_idx", "video_name", "timestamp_edge_capture", "timestamp_edge_send", "image_shape", "encoded_frame_jpeg", "jpeg_quality")
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    CAMERA_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_ID_FIELD_NUMBER: _ClassVar[int]
+    FRAME_IDX_FIELD_NUMBER: _ClassVar[int]
+    VIDEO_NAME_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_EDGE_CAPTURE_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_EDGE_SEND_FIELD_NUMBER: _ClassVar[int]
+    IMAGE_SHAPE_FIELD_NUMBER: _ClassVar[int]
+    ENCODED_FRAME_JPEG_FIELD_NUMBER: _ClassVar[int]
+    JPEG_QUALITY_FIELD_NUMBER: _ClassVar[int]
+    method: str
+    run_id: str
+    edge_id: int
+    camera_id: int
+    task_id: int
+    chunk_id: int
+    frame_idx: int
+    video_name: str
+    timestamp_edge_capture: float
+    timestamp_edge_send: float
+    image_shape: _containers.RepeatedScalarFieldContainer[int]
+    encoded_frame_jpeg: bytes
+    jpeg_quality: int
+    def __init__(self, method: _Optional[str] = ..., run_id: _Optional[str] = ..., edge_id: _Optional[int] = ..., camera_id: _Optional[int] = ..., task_id: _Optional[int] = ..., chunk_id: _Optional[int] = ..., frame_idx: _Optional[int] = ..., video_name: _Optional[str] = ..., timestamp_edge_capture: _Optional[float] = ..., timestamp_edge_send: _Optional[float] = ..., image_shape: _Optional[_Iterable[int]] = ..., encoded_frame_jpeg: _Optional[bytes] = ..., jpeg_quality: _Optional[int] = ...) -> None: ...
+
+class EkyaDetectionBox(_message.Message):
+    __slots__ = ("x1", "y1", "x2", "y2", "label", "score", "class_name")
+    X1_FIELD_NUMBER: _ClassVar[int]
+    Y1_FIELD_NUMBER: _ClassVar[int]
+    X2_FIELD_NUMBER: _ClassVar[int]
+    Y2_FIELD_NUMBER: _ClassVar[int]
+    LABEL_FIELD_NUMBER: _ClassVar[int]
+    SCORE_FIELD_NUMBER: _ClassVar[int]
+    CLASS_NAME_FIELD_NUMBER: _ClassVar[int]
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    label: int
+    score: float
+    class_name: str
+    def __init__(self, x1: _Optional[float] = ..., y1: _Optional[float] = ..., x2: _Optional[float] = ..., y2: _Optional[float] = ..., label: _Optional[int] = ..., score: _Optional[float] = ..., class_name: _Optional[str] = ...) -> None: ...
+
+class EkyaDetectionResult(_message.Message):
+    __slots__ = ("method", "run_id", "edge_id", "camera_id", "task_id", "chunk_id", "frame_idx", "video_name", "timestamp_edge_capture", "timestamp_edge_send", "timestamp_cloud_receive", "timestamp_inference_start", "timestamp_inference_end", "timestamp_cloud_send", "image_shape", "detections", "model_version", "encoded_frame_jpeg")
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    CAMERA_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_ID_FIELD_NUMBER: _ClassVar[int]
+    FRAME_IDX_FIELD_NUMBER: _ClassVar[int]
+    VIDEO_NAME_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_EDGE_CAPTURE_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_EDGE_SEND_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_CLOUD_RECEIVE_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_INFERENCE_START_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_INFERENCE_END_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_CLOUD_SEND_FIELD_NUMBER: _ClassVar[int]
+    IMAGE_SHAPE_FIELD_NUMBER: _ClassVar[int]
+    DETECTIONS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    ENCODED_FRAME_JPEG_FIELD_NUMBER: _ClassVar[int]
+    method: str
+    run_id: str
+    edge_id: int
+    camera_id: int
+    task_id: int
+    chunk_id: int
+    frame_idx: int
+    video_name: str
+    timestamp_edge_capture: float
+    timestamp_edge_send: float
+    timestamp_cloud_receive: float
+    timestamp_inference_start: float
+    timestamp_inference_end: float
+    timestamp_cloud_send: float
+    image_shape: _containers.RepeatedScalarFieldContainer[int]
+    detections: _containers.RepeatedCompositeFieldContainer[EkyaDetectionBox]
+    model_version: str
+    encoded_frame_jpeg: bytes
+    def __init__(self, method: _Optional[str] = ..., run_id: _Optional[str] = ..., edge_id: _Optional[int] = ..., camera_id: _Optional[int] = ..., task_id: _Optional[int] = ..., chunk_id: _Optional[int] = ..., frame_idx: _Optional[int] = ..., video_name: _Optional[str] = ..., timestamp_edge_capture: _Optional[float] = ..., timestamp_edge_send: _Optional[float] = ..., timestamp_cloud_receive: _Optional[float] = ..., timestamp_inference_start: _Optional[float] = ..., timestamp_inference_end: _Optional[float] = ..., timestamp_cloud_send: _Optional[float] = ..., image_shape: _Optional[_Iterable[int]] = ..., detections: _Optional[_Iterable[_Union[EkyaDetectionBox, _Mapping]]] = ..., model_version: _Optional[str] = ..., encoded_frame_jpeg: _Optional[bytes] = ...) -> None: ...
+
+class EkyaDisplayEvent(_message.Message):
+    __slots__ = ("method", "run_id", "edge_id", "camera_id", "task_id", "chunk_id", "frame_idx", "timestamp_edge_capture", "timestamp_edge_send", "timestamp_edge_receive", "timestamp_edge_display", "displayed", "drop_reason")
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    CAMERA_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_ID_FIELD_NUMBER: _ClassVar[int]
+    FRAME_IDX_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_EDGE_CAPTURE_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_EDGE_SEND_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_EDGE_RECEIVE_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_EDGE_DISPLAY_FIELD_NUMBER: _ClassVar[int]
+    DISPLAYED_FIELD_NUMBER: _ClassVar[int]
+    DROP_REASON_FIELD_NUMBER: _ClassVar[int]
+    method: str
+    run_id: str
+    edge_id: int
+    camera_id: int
+    task_id: int
+    chunk_id: int
+    frame_idx: int
+    timestamp_edge_capture: float
+    timestamp_edge_send: float
+    timestamp_edge_receive: float
+    timestamp_edge_display: float
+    displayed: bool
+    drop_reason: str
+    def __init__(self, method: _Optional[str] = ..., run_id: _Optional[str] = ..., edge_id: _Optional[int] = ..., camera_id: _Optional[int] = ..., task_id: _Optional[int] = ..., chunk_id: _Optional[int] = ..., frame_idx: _Optional[int] = ..., timestamp_edge_capture: _Optional[float] = ..., timestamp_edge_send: _Optional[float] = ..., timestamp_edge_receive: _Optional[float] = ..., timestamp_edge_display: _Optional[float] = ..., displayed: bool = ..., drop_reason: _Optional[str] = ...) -> None: ...
+
+class EkyaStreamClose(_message.Message):
+    __slots__ = ("run_id", "edge_id")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    EDGE_ID_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    edge_id: int
+    def __init__(self, run_id: _Optional[str] = ..., edge_id: _Optional[int] = ...) -> None: ...
+
+class EkyaAck(_message.Message):
+    __slots__ = ("success", "message")
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    success: bool
+    message: str
+    def __init__(self, success: bool = ..., message: _Optional[str] = ...) -> None: ...
+
+class EkyaClientMessage(_message.Message):
+    __slots__ = ("frame_upload", "display_event", "close")
+    FRAME_UPLOAD_FIELD_NUMBER: _ClassVar[int]
+    DISPLAY_EVENT_FIELD_NUMBER: _ClassVar[int]
+    CLOSE_FIELD_NUMBER: _ClassVar[int]
+    frame_upload: EkyaFrameUpload
+    display_event: EkyaDisplayEvent
+    close: EkyaStreamClose
+    def __init__(self, frame_upload: _Optional[_Union[EkyaFrameUpload, _Mapping]] = ..., display_event: _Optional[_Union[EkyaDisplayEvent, _Mapping]] = ..., close: _Optional[_Union[EkyaStreamClose, _Mapping]] = ...) -> None: ...
+
+class EkyaServerMessage(_message.Message):
+    __slots__ = ("detection_result", "ack", "error")
+    DETECTION_RESULT_FIELD_NUMBER: _ClassVar[int]
+    ACK_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    detection_result: EkyaDetectionResult
+    ack: EkyaAck
+    error: EkyaAck
+    def __init__(self, detection_result: _Optional[_Union[EkyaDetectionResult, _Mapping]] = ..., ack: _Optional[_Union[EkyaAck, _Mapping]] = ..., error: _Optional[_Union[EkyaAck, _Mapping]] = ...) -> None: ...
+
 class ExperimentResultArtifact(_message.Message):
     __slots__ = ("comparison_id", "run_id", "method", "edge_id", "relative_path", "content", "size_bytes", "sha256", "content_type", "is_final")
     COMPARISON_ID_FIELD_NUMBER: _ClassVar[int]

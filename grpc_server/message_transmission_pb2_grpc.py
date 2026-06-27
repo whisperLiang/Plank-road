@@ -129,6 +129,11 @@ class MessageTransmissionStub(object):
                 request_serializer=message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
                 response_deserializer=message__transmission__pb2.BaselineInferenceReply.FromString,
                 _registered_method=True)
+        self.EkyaFrameStream = channel.stream_stream(
+                '/MessageTransmission/EkyaFrameStream',
+                request_serializer=message__transmission__pb2.EkyaClientMessage.SerializeToString,
+                response_deserializer=message__transmission__pb2.EkyaServerMessage.FromString,
+                _registered_method=True)
         self.UploadExperimentResult = channel.unary_unary(
                 '/MessageTransmission/UploadExperimentResult',
                 request_serializer=message__transmission__pb2.UploadExperimentResultRequest.SerializeToString,
@@ -265,6 +270,14 @@ class MessageTransmissionServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def EkyaFrameStream(self, request_iterator, context):
+        """Ekya-style cloud scheduling: edge streams JPEG frames and receives
+        cloud inference results in the same online stream.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def UploadExperimentResult(self, request, context):
         """Offline experiment artifact archival. This is not method communication.
         """
@@ -369,6 +382,11 @@ def add_MessageTransmissionServicer_to_server(servicer, server):
                     servicer.DownloadInferenceResult,
                     request_deserializer=message__transmission__pb2.BaselineInferenceRequest.FromString,
                     response_serializer=message__transmission__pb2.BaselineInferenceReply.SerializeToString,
+            ),
+            'EkyaFrameStream': grpc.stream_stream_rpc_method_handler(
+                    servicer.EkyaFrameStream,
+                    request_deserializer=message__transmission__pb2.EkyaClientMessage.FromString,
+                    response_serializer=message__transmission__pb2.EkyaServerMessage.SerializeToString,
             ),
             'UploadExperimentResult': grpc.unary_unary_rpc_method_handler(
                     servicer.UploadExperimentResult,
@@ -889,6 +907,33 @@ class MessageTransmission(object):
             '/MessageTransmission/DownloadInferenceResult',
             message__transmission__pb2.BaselineInferenceRequest.SerializeToString,
             message__transmission__pb2.BaselineInferenceReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EkyaFrameStream(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/MessageTransmission/EkyaFrameStream',
+            message__transmission__pb2.EkyaClientMessage.SerializeToString,
+            message__transmission__pb2.EkyaServerMessage.FromString,
             options,
             channel_credentials,
             insecure,

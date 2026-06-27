@@ -5,6 +5,7 @@ import os
 from concurrent import futures
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 if __name__ == "__main__":
     from common.cuda_visibility import configure_default_cuda_visible_devices
@@ -42,6 +43,8 @@ from grpc_server.rpc_server import MessageTransmissionServicer
 from tools.grpc_options import grpc_message_options
 
 __all__ = ["CloudServer"]
+
+EKYA_STYLE_METHOD = "ekya_style_cloud_scheduling"
 
 
 class BaselineHeavyLaneBusy(RuntimeError):
@@ -91,6 +94,23 @@ class CloudServer:
             resolved_run_id = str(run_id or getattr(baseline_config, "run_id", "") or "")
             if not resolved_run_id:
                 resolved_run_id = default_run_id(method)
+            if method == EKYA_STYLE_METHOD:
+                from cloud.baselines.ekya_style_cloud_scheduling import (
+                    EkyaStyleCloudSchedulingController,
+                    parse_ekya_style_config,
+                )
+
+                ekya_config = parse_ekya_style_config(
+                    SimpleNamespace(server=config, baseline=baseline_config),
+                    run_id=resolved_run_id,
+                )
+                self.baseline_controller = EkyaStyleCloudSchedulingController(
+                    ekya_config,
+                    runtime_config=config,
+                )
+                self.baseline_method = method
+                self.run_id = resolved_run_id
+                return
             teacher_annotator = None
             heavy_gpu_lease = None
             if method != "pure_edge_local_updating":
@@ -148,7 +168,11 @@ class CloudServer:
             self.baseline_method = PLANK_ROAD_METHOD
 
         experiment_config = getattr(config, "experiment_results", None)
-        if experiment_config is not None and bool(getattr(experiment_config, "enabled", False)):
+        if (
+            experiment_config is not None
+            and bool(getattr(experiment_config, "enabled", False))
+            and getattr(self, "baseline_method", "") != EKYA_STYLE_METHOD
+        ):
             comparison_id = str(getattr(experiment_config, "comparison_id", "") or "")
             root_dir = str(getattr(experiment_config, "root_dir", "results/experiments"))
             method = (
@@ -586,6 +610,14 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
     parser.add_argument("--run_id", default=None, help="baseline run id")
+    parser.add_argument(
+        "--ekya_offline_cloud_video_debug",
+        action="store_true",
+        help=(
+            "Ekya-style baseline debug only: allow offline cloud video settings. "
+            "Default operation streams frames from the edge."
+        ),
+    )
     parser.add_argument("--comparison_id", default=None, help="experiment comparison id")
     parser.add_argument(
         "--experiment_results_root",
@@ -622,6 +654,8 @@ if __name__ == "__main__":
         )
     if args.edge_affine_worker_mode is not None:
         server_config.edge_affine_workers.mode = args.edge_affine_worker_mode
+    if args.ekya_offline_cloud_video_debug:
+        server_config.baselines.ekya_style_cloud_scheduling.offline_cloud_video_debug = True
     if args.run_id is not None and args.mode == "main":
         server_config.edge_affine_workers.run_id = args.run_id
     baseline_method = args.baseline_method or config.baseline.method

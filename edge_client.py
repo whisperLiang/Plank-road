@@ -1,5 +1,7 @@
 import argparse
+import csv
 import json
+import queue
 import shutil
 import time
 from pathlib import Path
@@ -11,6 +13,7 @@ if __name__ == "__main__":
     configure_default_cuda_visible_devices()
 
 import cv2
+import grpc
 from loguru import logger
 
 from baselines.runtime import BaselineEdgeAdapter
@@ -36,9 +39,13 @@ from edge.info import TASK_STATE
 from edge.pure_edge_remote_sync import PureEdgeRemoteSyncer, PureEdgeRemoteSyncError
 from edge.replay_frame_archiver import ReplayFrameArchiver
 from edge.task import Task
+from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from model_management.utils import draw_detection
 from tools.file_op import clear_folder
+from tools.grpc_options import grpc_message_options
 from tools.video_processor import VideoProcessor
+
+EKYA_STYLE_METHOD = "ekya_style_cloud_scheduling"
 
 
 def _task_state_name(task: Task) -> str:
@@ -836,6 +843,303 @@ def _write_trigger_manifest_from_metrics(run_dir: Path) -> None:
     )
 
 
+def _run_ekya_style_edge_stream(
+    *,
+    runtime_config,
+    config,
+    baseline_run_id: str,
+    headless: bool,
+    display_cloud_results_only: bool,
+) -> Path:
+    from cloud.baselines.ekya_style_cloud_scheduling.config import parse_ekya_style_config
+    from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import DISPLAY_FIELDS
+
+    ekya_config = parse_ekya_style_config(
+        runtime_config,
+        run_id=baseline_run_id,
+        video_path=_effective_video_source(config),
+    )
+    if not display_cloud_results_only:
+        raise ValueError(
+            "ekya_style_cloud_scheduling requires --display_cloud_results_only"
+        )
+    edge_output_dir = (
+        Path("results")
+        / "edge"
+        / baseline_run_id
+        / "baselines"
+        / EKYA_STYLE_METHOD
+    )
+    edge_output_dir.mkdir(parents=True, exist_ok=True)
+    display_events_path = edge_output_dir / "display_events.csv"
+    result_path = edge_output_dir / "latest_cloud_inference_results.jsonl"
+    _write_csv_header(display_events_path, DISPLAY_FIELDS)
+    window_name = f"Edge {config.edge_id} Cloud Inference"
+    window_created = False
+    request_queue: queue.Queue[message_transmission_pb2.EkyaClientMessage | None] = queue.Queue(
+        maxsize=max(1, int(ekya_config.edge_streaming.upload_queue_size))
+    )
+
+    def request_iter():
+        while True:
+            item = request_queue.get()
+            try:
+                if item is None:
+                    return
+                yield item
+            finally:
+                request_queue.task_done()
+
+    channel = grpc.insecure_channel(str(config.server_ip), options=grpc_message_options())
+    stub = message_transmission_pb2_grpc.MessageTransmissionStub(channel)
+    responses = stub.EkyaFrameStream(request_iter())
+    logger.info(
+        "ekya_style edge streaming start: run_id={} edge_id={} video={} output={}",
+        baseline_run_id,
+        int(config.edge_id),
+        summarize_path(_effective_video_source(config)),
+        edge_output_dir,
+    )
+    try:
+        with result_path.open("w", encoding="utf-8") as result_file:
+            with VideoProcessor(config.source) as video:
+                video_fps = float(video.fps or 25.0)
+                display_delay_ms = max(1, int(1000 / max(video_fps, 1.0)))
+                frame_idx = 0
+                while frame_idx < int(ekya_config.num_frames):
+                    frame = next(video)
+                    if frame is None:
+                        break
+                    frame_idx += 1
+                    timestamp_capture = time.time()
+                    ok, encoded = cv2.imencode(
+                        ".jpg",
+                        frame,
+                        [
+                            int(cv2.IMWRITE_JPEG_QUALITY),
+                            int(ekya_config.edge_streaming.jpeg_quality),
+                        ],
+                    )
+                    if not ok:
+                        raise RuntimeError(f"failed to JPEG encode frame {frame_idx}")
+                    timestamp_send = time.time()
+                    task_id = (frame_idx - 1) // max(1, int(ekya_config.window_size))
+                    upload = message_transmission_pb2.EkyaFrameUpload(
+                        method=EKYA_STYLE_METHOD,
+                        run_id=baseline_run_id,
+                        edge_id=int(config.edge_id),
+                        camera_id=0,
+                        task_id=int(task_id),
+                        chunk_id=int(task_id),
+                        frame_idx=int(frame_idx),
+                        video_name=ekya_config.video_name,
+                        timestamp_edge_capture=float(timestamp_capture),
+                        timestamp_edge_send=float(timestamp_send),
+                        image_shape=[int(frame.shape[0]), int(frame.shape[1])],
+                        encoded_frame_jpeg=encoded.tobytes(),
+                        jpeg_quality=int(ekya_config.edge_streaming.jpeg_quality),
+                    )
+                    request_queue.put(
+                        message_transmission_pb2.EkyaClientMessage(frame_upload=upload)
+                    )
+                    result = _next_ekya_detection_result(responses, frame_idx)
+                    timestamp_receive = time.time()
+                    boxes, labels, scores, class_names = _ekya_result_lists(result)
+                    display_frame = _build_display_frame(
+                        frame,
+                        frame_index=frame_idx,
+                        detection_boxes=boxes,
+                        detection_class=labels,
+                        detection_score=scores,
+                        mode="Cloud",
+                        sampled=True,
+                        latency_ms=max(0.0, (timestamp_receive - timestamp_capture) * 1000.0),
+                        show_boxes=True,
+                        detection_count=len(boxes),
+                        class_names=class_names or getattr(config, "class_names", None),
+                    )
+                    if not headless and not window_created:
+                        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                        window_created = True
+                    if not headless:
+                        cv2.imshow(window_name, display_frame)
+                        key = cv2.waitKey(display_delay_ms) & 0xFF
+                        if key in (27, ord("q")):
+                            logger.info("Ekya-style cloud display stopped by user.")
+                            break
+                    timestamp_display = time.time()
+                    display_event = message_transmission_pb2.EkyaDisplayEvent(
+                        method=EKYA_STYLE_METHOD,
+                        run_id=baseline_run_id,
+                        edge_id=int(config.edge_id),
+                        camera_id=0,
+                        task_id=int(result.task_id),
+                        chunk_id=int(result.chunk_id),
+                        frame_idx=int(frame_idx),
+                        timestamp_edge_capture=float(result.timestamp_edge_capture),
+                        timestamp_edge_send=float(result.timestamp_edge_send),
+                        timestamp_edge_receive=float(timestamp_receive),
+                        timestamp_edge_display=float(timestamp_display),
+                        displayed=True,
+                        drop_reason="",
+                    )
+                    request_queue.put(
+                        message_transmission_pb2.EkyaClientMessage(display_event=display_event)
+                    )
+                    _append_display_event_row(display_events_path, DISPLAY_FIELDS, display_event)
+                    result_file.write(
+                        json.dumps(
+                            {
+                                "method": EKYA_STYLE_METHOD,
+                                "run_id": baseline_run_id,
+                                "edge_id": int(config.edge_id),
+                                "frame_index": int(frame_idx),
+                                "timestamp_ms": int(timestamp_capture * 1000),
+                                "model_name": ekya_config.student_model,
+                                "model_version": str(result.model_version),
+                                "result_source": "cloud_inference",
+                                "latency_ms": max(
+                                    0.0,
+                                    (timestamp_display - timestamp_capture) * 1000.0,
+                                ),
+                                "result": {
+                                    "boxes": boxes,
+                                    "labels": labels,
+                                    "scores": scores,
+                                },
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    result_file.flush()
+    finally:
+        _close_ekya_frame_stream(
+            request_queue=request_queue,
+            responses=responses,
+            channel=channel,
+            run_id=baseline_run_id,
+            edge_id=int(config.edge_id),
+        )
+    logger.info(
+        "ekya_style edge streaming complete: display_events={}",
+        display_events_path,
+    )
+    return display_events_path
+
+
+def _next_ekya_detection_result(responses, frame_idx: int):
+    while True:
+        message = next(responses)
+        payload_type = message.WhichOneof("payload")
+        if payload_type == "error":
+            raise RuntimeError(message.error.message)
+        if payload_type == "detection_result":
+            result = message.detection_result
+            if int(result.frame_idx) == int(frame_idx):
+                return result
+
+
+def _close_ekya_frame_stream(
+    *,
+    request_queue: queue.Queue,
+    responses,
+    channel,
+    run_id: str,
+    edge_id: int,
+) -> None:
+    try:
+        request_queue.put(
+            message_transmission_pb2.EkyaClientMessage(
+                close=message_transmission_pb2.EkyaStreamClose(
+                    run_id=str(run_id),
+                    edge_id=int(edge_id),
+                )
+            ),
+            timeout=5.0,
+        )
+        request_queue.put(None, timeout=5.0)
+        _wait_ekya_stream_close_ack(responses)
+    except Exception as exc:
+        logger.warning("Ekya-style stream close handshake failed: {}", exc)
+    finally:
+        channel.close()
+
+
+def _wait_ekya_stream_close_ack(responses) -> None:
+    for message in responses:
+        payload_type = message.WhichOneof("payload")
+        if payload_type == "error":
+            raise RuntimeError(message.error.message)
+        if payload_type != "ack":
+            continue
+        if not bool(message.ack.success):
+            raise RuntimeError(message.ack.message)
+        if str(message.ack.message) == "stream closed":
+            return
+    raise RuntimeError("Ekya-style stream ended before close ack")
+
+
+def _ekya_result_lists(result) -> tuple[list[list[float]], list[int], list[float], list[str]]:
+    boxes = []
+    labels = []
+    scores = []
+    class_names = []
+    for detection in list(result.detections):
+        boxes.append(
+            [
+                float(detection.x1),
+                float(detection.y1),
+                float(detection.x2),
+                float(detection.y2),
+            ]
+        )
+        labels.append(int(detection.label))
+        scores.append(float(detection.score))
+        class_names.append(str(detection.class_name))
+    return boxes, labels, scores, class_names
+
+
+def _write_csv_header(path: Path, fields: list[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=fields).writeheader()
+
+
+def _append_display_event_row(path: Path, fields: list[str], event) -> None:
+    row = {
+        "method": EKYA_STYLE_METHOD,
+        "run_id": event.run_id,
+        "edge_id": int(event.edge_id),
+        "camera_id": int(event.camera_id),
+        "task_id": int(event.task_id),
+        "chunk_id": int(event.chunk_id),
+        "frame_idx": int(event.frame_idx),
+        "timestamp_edge_capture": float(event.timestamp_edge_capture),
+        "timestamp_edge_send": float(event.timestamp_edge_send),
+        "timestamp_edge_receive": float(event.timestamp_edge_receive),
+        "timestamp_edge_display": float(event.timestamp_edge_display),
+        "edge_upload_to_result_latency_ms": max(
+            0.0,
+            (float(event.timestamp_edge_receive) - float(event.timestamp_edge_send)) * 1000.0,
+        ),
+        "edge_render_latency_ms": max(
+            0.0,
+            (float(event.timestamp_edge_display) - float(event.timestamp_edge_receive))
+            * 1000.0,
+        ),
+        "edge_e2e_display_latency_ms": max(
+            0.0,
+            (float(event.timestamp_edge_display) - float(event.timestamp_edge_capture))
+            * 1000.0,
+        ),
+        "displayed": "true" if bool(event.displayed) else "false",
+        "drop_reason": event.drop_reason,
+    }
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writerow(row)
+
+
 if __name__ == "__main__":
     from tools.logging_config import configure_logging
 
@@ -879,6 +1183,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
+    parser.add_argument(
+        "--display_cloud_results_only",
+        action="store_true",
+        help="Ekya-style baseline: display only cloud-returned detections",
+    )
     parser.add_argument("--run_id", default=None, help="experiment run id")
     parser.add_argument("--comparison_id", default=None, help="experiment comparison id")
     parser.add_argument(
@@ -892,6 +1201,8 @@ if __name__ == "__main__":
         help="disable shutdown experiment artifact upload without disabling local results",
     )
     args = parser.parse_args()
+    if args.baseline_method == EKYA_STYLE_METHOD and args.mode != "baseline":
+        args.mode = "baseline"
 
     runtime_config = load_runtime_config(args.yaml_path)
     config = runtime_config.client
@@ -955,7 +1266,20 @@ if __name__ == "__main__":
             level="INFO",
             rotation="500 MB",
         )
-        _configure_baseline_client_runtime(config, runtime_config.baseline)
+        if baseline_method == EKYA_STYLE_METHOD:
+            config.baseline = runtime_config.baseline
+            if getattr(config, "retrain", None) is not None:
+                config.retrain.flag = False
+            if getattr(config, "resource_aware_trigger", None) is not None:
+                config.resource_aware_trigger.enabled = False
+            if getattr(config, "sample_pool", None) is not None:
+                config.sample_pool.enabled = False
+            split_learning = getattr(config, "split_learning", None)
+            if split_learning is not None:
+                split_learning.enabled = False
+            logger.info("[EkyaStyleEdge] split/runtime/triggers disabled for cloud streaming.")
+        else:
+            _configure_baseline_client_runtime(config, runtime_config.baseline)
         logger.info(
             "baseline edge effective startup config: run_id={}, baseline_method={}, "
             "edge_id={}, server_ip={}, video_source={}, split_learning={}",
@@ -999,6 +1323,31 @@ if __name__ == "__main__":
     _log_startup_config(config)
     if clear_retrain_cache:
         clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
+
+    if args.mode == "baseline" and baseline_method == EKYA_STYLE_METHOD:
+        try:
+            _run_ekya_style_edge_stream(
+                runtime_config=runtime_config,
+                config=config,
+                baseline_run_id=run_id,
+                headless=args.headless,
+                display_cloud_results_only=bool(
+                    args.display_cloud_results_only
+                    or getattr(
+                        getattr(
+                            runtime_config.server.baselines.ekya_style_cloud_scheduling,
+                            "edge_streaming",
+                            None,
+                        ),
+                        "display_cloud_results_only",
+                        False,
+                    )
+                ),
+            )
+        finally:
+            if not args.headless:
+                cv2.destroyAllWindows()
+        raise SystemExit(0)
 
     run_dir = edge_run_dir(
         str(experiment_results.local_root_dir),

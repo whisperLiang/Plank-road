@@ -66,9 +66,6 @@ extend-exclude = [
   "grpc_server/message_transmission_pb2.py",
   "grpc_server/message_transmission_pb2.pyi",
   "grpc_server/message_transmission_pb2_grpc.py",
-  "grpc_server/protos/message_transmission_pb2.py",
-  "grpc_server/protos/message_transmission_pb2.pyi",
-  "grpc_server/protos/message_transmission_pb2_grpc.py",
 ]
 
 [tool.ruff.lint]

@@ -426,6 +426,71 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             message="baseline cloud inference is not supported",
         )
 
+    def EkyaFrameStream(self, request_iterator, context):
+        del context
+        controller = self.baseline_controller
+        if controller is None or not hasattr(controller, "handle_frame_upload"):
+            yield message_transmission_pb2.EkyaServerMessage(
+                error=message_transmission_pb2.EkyaAck(
+                    success=False,
+                    message="Ekya-style cloud scheduling controller is not configured",
+                )
+            )
+            return
+        closed = False
+
+        def close_controller() -> None:
+            nonlocal closed
+            if closed:
+                return
+            close = getattr(controller, "close", None)
+            if callable(close):
+                close()
+            closed = True
+
+        try:
+            for request in request_iterator:
+                payload_type = request.WhichOneof("payload")
+                try:
+                    if payload_type == "frame_upload":
+                        packet = _ekya_frame_upload_from_proto(request.frame_upload)
+                        result = controller.handle_frame_upload(packet)
+                        yield message_transmission_pb2.EkyaServerMessage(
+                            detection_result=_ekya_detection_result_to_proto(result)
+                        )
+                    elif payload_type == "display_event":
+                        controller.record_display_event(
+                            _ekya_display_event_from_proto(request.display_event)
+                        )
+                        yield message_transmission_pb2.EkyaServerMessage(
+                            ack=message_transmission_pb2.EkyaAck(
+                                success=True,
+                                message="display event recorded",
+                            )
+                        )
+                    elif payload_type == "close":
+                        close_controller()
+                        yield message_transmission_pb2.EkyaServerMessage(
+                            ack=message_transmission_pb2.EkyaAck(
+                                success=True,
+                                message="stream closed",
+                            )
+                        )
+                        return
+                except Exception as exc:
+                    self._log_failure("EkyaFrameStream", exc)
+                    yield message_transmission_pb2.EkyaServerMessage(
+                        error=message_transmission_pb2.EkyaAck(
+                            success=False,
+                            message=str(exc),
+                        )
+                    )
+        finally:
+            try:
+                close_controller()
+            except Exception as exc:
+                self._log_failure("EkyaFrameStream", exc)
+
 def _baseline_frame_from_request(request) -> BaselineFramePayload:
     return BaselineFramePayload(
         run_id=request.run_id,
@@ -500,4 +565,88 @@ def _baseline_inference_reply(
         cloud_prediction_json=cloud_prediction_json,
         confidence=confidence,
         timestamp_ms=timestamp_ms,
+    )
+
+
+def _ekya_frame_upload_from_proto(message):
+    from cloud.baselines.ekya_style_cloud_scheduling.protocol import FrameUploadPacket
+
+    shape = list(message.image_shape)
+    if len(shape) < 2:
+        shape = [0, 0]
+    return FrameUploadPacket(
+        method=str(message.method),
+        run_id=str(message.run_id),
+        edge_id=int(message.edge_id),
+        camera_id=int(message.camera_id),
+        task_id=int(message.task_id),
+        chunk_id=int(message.chunk_id),
+        frame_idx=int(message.frame_idx),
+        video_name=str(message.video_name),
+        timestamp_edge_capture=float(message.timestamp_edge_capture),
+        timestamp_edge_send=float(message.timestamp_edge_send),
+        image_shape=(int(shape[0]), int(shape[1])),
+        encoded_frame_jpeg=bytes(message.encoded_frame_jpeg or b""),
+        jpeg_quality=int(message.jpeg_quality),
+    )
+
+
+def _ekya_display_event_from_proto(message):
+    from cloud.baselines.ekya_style_cloud_scheduling.protocol import DisplayEventPacket
+
+    return DisplayEventPacket(
+        method=str(message.method),
+        run_id=str(message.run_id),
+        edge_id=int(message.edge_id),
+        camera_id=int(message.camera_id),
+        task_id=int(message.task_id),
+        chunk_id=int(message.chunk_id),
+        frame_idx=int(message.frame_idx),
+        timestamp_edge_capture=float(message.timestamp_edge_capture),
+        timestamp_edge_send=float(message.timestamp_edge_send),
+        timestamp_edge_receive=float(message.timestamp_edge_receive),
+        timestamp_edge_display=float(message.timestamp_edge_display),
+        displayed=bool(message.displayed),
+        drop_reason=str(message.drop_reason),
+    )
+
+
+def _ekya_detection_result_to_proto(packet):
+    detections = []
+    for index, box in enumerate(packet.boxes_xyxy):
+        values = list(box)
+        if len(values) < 4:
+            values = [0.0, 0.0, 0.0, 0.0]
+        detections.append(
+            message_transmission_pb2.EkyaDetectionBox(
+                x1=float(values[0]),
+                y1=float(values[1]),
+                x2=float(values[2]),
+                y2=float(values[3]),
+                label=int(packet.labels[index]) if index < len(packet.labels) else 0,
+                score=float(packet.scores[index]) if index < len(packet.scores) else 0.0,
+                class_name=(
+                    str(packet.class_names[index]) if index < len(packet.class_names) else ""
+                ),
+            )
+        )
+    return message_transmission_pb2.EkyaDetectionResult(
+        method=str(packet.method),
+        run_id=str(packet.run_id),
+        edge_id=int(packet.edge_id),
+        camera_id=int(packet.camera_id),
+        task_id=int(packet.task_id),
+        chunk_id=int(packet.chunk_id),
+        frame_idx=int(packet.frame_idx),
+        video_name=str(packet.video_name),
+        timestamp_edge_capture=float(packet.timestamp_edge_capture),
+        timestamp_edge_send=float(packet.timestamp_edge_send),
+        timestamp_cloud_receive=float(packet.timestamp_cloud_receive),
+        timestamp_inference_start=float(packet.timestamp_inference_start),
+        timestamp_inference_end=float(packet.timestamp_inference_end),
+        timestamp_cloud_send=float(packet.timestamp_cloud_send),
+        image_shape=[int(value) for value in packet.image_shape],
+        detections=detections,
+        model_version=str(packet.model_version),
+        encoded_frame_jpeg=bytes(packet.encoded_frame_jpeg or b""),
     )

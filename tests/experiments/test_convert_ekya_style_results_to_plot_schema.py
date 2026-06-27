@@ -1,0 +1,617 @@
+from __future__ import annotations
+
+import csv
+import json
+import shutil
+from pathlib import Path
+
+from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import (
+    DISPLAY_FIELDS,
+    INFERENCE_FIELDS,
+    MICROPROFILE_FIELDS,
+    MODEL_UPDATE_FIELDS,
+    PER_FRAME_FIELDS,
+    PER_WINDOW_FIELDS,
+    SCHEDULER_FIELDS,
+    TRAINING_FIELDS,
+    UPLOAD_EVENT_FIELDS,
+)
+from tools.convert_ekya_style_results_to_plot_schema import (
+    append_ekya_style_to_normalized_dir,
+    convert_ekya_style_results,
+)
+from tools.experiments.experiment_common import CSV_SCHEMAS, read_csv, write_csv
+from tools.experiments.plot_plank_road_baseline_figures import plot_figures
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+EXISTING_NORMALIZED = (
+    PROJECT_ROOT
+    / "results"
+    / "experiments"
+    / "exp_road_plankroad_vs_baselines_001"
+    / "normalized"
+)
+
+
+def _raw_ekya_dir(tmp_path: Path) -> Path:
+    return (
+        tmp_path
+        / "results"
+        / "cloud"
+        / "ekya-run"
+        / "baselines"
+        / "ekya_style_cloud_scheduling"
+    )
+
+
+def _header(path: Path) -> list[str]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle).fieldnames or [])
+
+
+def _write_raw_ekya_fixture(raw_dir: Path) -> None:
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "student_model": "rfdetr_nano",
+                "teacher_model": "rtdetr_x",
+                "video_name": "road.mp4",
+                "num_frames": 3,
+                "window_size": 2,
+                "avg_map": 0.7,
+                "evaluated_frame_count": 3,
+                "evaluated_frame_indices": [1, 2, 3],
+                "missing_result_count": 1,
+                "dropped_display_count": 1,
+                "num_retraining_jobs": 1,
+                "num_model_updates": 1,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    write_csv(
+        raw_dir / "per_frame_metrics.csv",
+        PER_FRAME_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "timestamp_edge_capture": 10.0,
+                "timestamp_edge_send": 10.01,
+                "timestamp_cloud_receive": 10.02,
+                "timestamp_inference_start": 10.03,
+                "timestamp_inference_end": 10.04,
+                "timestamp_cloud_send": 10.05,
+                "model_version": "0",
+                "num_pred_boxes": 2,
+                "foreground_f1": 0.8,
+                "map": 0.75,
+                "cloud_inference_latency_ms": 10,
+                "edge_e2e_display_latency_ms": 80,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 1,
+                "chunk_id": 1,
+                "frame_idx": 3,
+                "timestamp_edge_capture": 10.2,
+                "timestamp_edge_send": 10.21,
+                "timestamp_cloud_receive": 10.22,
+                "timestamp_inference_start": 10.23,
+                "timestamp_inference_end": 10.24,
+                "timestamp_cloud_send": 10.25,
+                "model_version": "0",
+                "num_pred_boxes": 1,
+                "foreground_f1": 0.6,
+                "map": 0.65,
+                "cloud_inference_latency_ms": 10,
+            },
+        ],
+    )
+    write_csv(
+        raw_dir / "display_events.csv",
+        DISPLAY_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "timestamp_edge_capture": 10.0,
+                "timestamp_edge_send": 10.01,
+                "timestamp_edge_receive": 10.07,
+                "timestamp_edge_display": 10.08,
+                "edge_upload_to_result_latency_ms": 60,
+                "edge_render_latency_ms": 10,
+                "edge_e2e_display_latency_ms": 80,
+                "displayed": True,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 1,
+                "chunk_id": 1,
+                "frame_idx": 3,
+                "timestamp_edge_capture": 10.2,
+                "timestamp_edge_send": 10.21,
+                "timestamp_edge_receive": 10.27,
+                "timestamp_edge_display": 10.27,
+                "displayed": False,
+                "drop_reason": "stale_result",
+            },
+        ],
+    )
+    write_csv(
+        raw_dir / "per_window_metrics.csv",
+        PER_WINDOW_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "task_id": 0,
+                "window_start_frame": 1,
+                "window_end_frame": 2,
+                "num_frames": 2,
+                "avg_foreground_f1": 0.8,
+                "avg_edge_upload_to_result_latency_ms": 60,
+                "training_time_s": 0.2,
+                "microprofile_time_s": 0.03,
+                "teacher_labeling_time_s": 0.04,
+                "num_model_updates": 1,
+            }
+        ],
+    )
+    write_csv(
+        raw_dir / "training_events.csv",
+        TRAINING_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "task_id": 0,
+                "train_start_time": 10.5,
+                "train_end_time": 10.7,
+                "train_duration_s": 0.2,
+                "num_epochs": 1,
+                "batch_size": 2,
+                "lr": 0.00001,
+            }
+        ],
+    )
+    write_csv(
+        raw_dir / "model_update_events.csv",
+        MODEL_UPDATE_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "task_id": 0,
+                "old_model_version": "0",
+                "new_model_version": "1",
+                "adopted": True,
+                "best_val_map": 0.8,
+                "previous_val_map": 0.7,
+                "map_gain": 0.1,
+                "update_time": 10.8,
+            }
+        ],
+    )
+    write_csv(
+        raw_dir / "scheduler_events.csv",
+        SCHEDULER_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "task_id": 0,
+                "scheduler_name": "ekya_thief_style",
+                "selected_hp_id": "hp_small",
+                "decision_reason": "selected",
+            }
+        ],
+    )
+    write_csv(
+        raw_dir / "upload_events.csv",
+        UPLOAD_EVENT_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "window_id": "0:1:2",
+                "raw_frame_bytes": 1000,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 2,
+                "window_id": "0:1:2",
+                "raw_frame_bytes": 1100,
+            },
+        ],
+    )
+    write_csv(raw_dir / "inference_events.csv", INFERENCE_FIELDS, [])
+    write_csv(raw_dir / "microprofile_events.csv", MICROPROFILE_FIELDS, [])
+
+
+def test_ekya_converter_writes_existing_csv_schemas_exactly(tmp_path: Path) -> None:
+    raw_dir = _raw_ekya_dir(tmp_path)
+    output_dir = tmp_path / "normalized"
+    _write_raw_ekya_fixture(raw_dir)
+
+    report = convert_ekya_style_results(raw_dir=raw_dir, output_dir=output_dir)
+
+    for filename, fields in CSV_SCHEMAS.items():
+        assert _header(output_dir / filename) == fields
+    assert report["method_alias"] == {"ekya_style_cloud_scheduling": "ekya"}
+    assert report["evaluated_frame_count"] == 3
+    assert report["missing_result_count"] == 1
+    assert report["dropped_display_count"] == 1
+    persisted_report = json.loads(
+        (output_dir / "normalization_report.json").read_text(encoding="utf-8")
+    )
+    assert persisted_report["missing_values"].startswith("empty strings")
+
+    frames = read_csv(output_dir / "frame_metrics.csv")
+    assert [row["frame_id"] for row in frames] == ["1", "2", "3"]
+    assert {row["method"] for row in frames} == {"ekya"}
+    assert frames[1]["result_source"] == "missing_result"
+    assert frames[1]["num_detections"] == ""
+    assert frames[2]["result_source"] == "stale_result"
+
+
+def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None:
+    raw_dir = _raw_ekya_dir(tmp_path)
+    output_dir = tmp_path / "normalized"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "student_model": "rfdetr_nano",
+                "teacher_model": "rtdetr_x",
+                "video_name": "road.mp4",
+                "num_frames": 1,
+                "window_size": 1,
+                "evaluated_frame_indices": [1],
+                "num_retraining_jobs": 2,
+                "num_model_updates": 2,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    write_csv(
+        raw_dir / "per_frame_metrics.csv",
+        PER_FRAME_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "timestamp_edge_capture": 10.0,
+                "timestamp_edge_send": 10.01,
+                "timestamp_cloud_receive": 10.02,
+                "timestamp_inference_start": 10.03,
+                "timestamp_inference_end": 10.04,
+                "timestamp_cloud_send": 10.05,
+                "model_version": "0",
+                "num_pred_boxes": 2,
+                "foreground_f1": 0.8,
+                "map": 0.75,
+                "cloud_inference_latency_ms": 10,
+                "edge_e2e_display_latency_ms": 80,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 2,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "timestamp_edge_capture": 20.0,
+                "timestamp_edge_send": 20.01,
+                "timestamp_cloud_receive": 20.02,
+                "timestamp_inference_start": 20.03,
+                "timestamp_inference_end": 20.04,
+                "timestamp_cloud_send": 20.05,
+                "model_version": "0",
+                "num_pred_boxes": 1,
+                "foreground_f1": 0.5,
+                "map": 0.45,
+                "cloud_inference_latency_ms": 10,
+                "edge_e2e_display_latency_ms": 90,
+            },
+        ],
+    )
+    write_csv(
+        raw_dir / "display_events.csv",
+        DISPLAY_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "timestamp_edge_capture": 10.0,
+                "timestamp_edge_send": 10.01,
+                "timestamp_edge_receive": 10.07,
+                "timestamp_edge_display": 10.08,
+                "edge_e2e_display_latency_ms": 80,
+                "displayed": True,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 2,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "timestamp_edge_capture": 20.0,
+                "timestamp_edge_send": 20.01,
+                "timestamp_edge_receive": 20.07,
+                "timestamp_edge_display": 20.09,
+                "edge_e2e_display_latency_ms": 90,
+                "displayed": True,
+            },
+        ],
+    )
+    write_csv(
+        raw_dir / "per_window_metrics.csv",
+        PER_WINDOW_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "window_start_frame": 1,
+                "window_end_frame": 1,
+                "num_frames": 1,
+                "avg_foreground_f1": 0.8,
+                "avg_edge_upload_to_result_latency_ms": 60,
+                "training_time_s": 0.2,
+                "microprofile_time_s": 0.03,
+                "teacher_labeling_time_s": 0.04,
+                "num_model_updates": 1,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 2,
+                "camera_id": 0,
+                "task_id": 0,
+                "window_start_frame": 1,
+                "window_end_frame": 1,
+                "num_frames": 1,
+                "avg_foreground_f1": 0.5,
+                "avg_edge_upload_to_result_latency_ms": 70,
+                "training_time_s": 0.3,
+                "microprofile_time_s": 0.04,
+                "teacher_labeling_time_s": 0.05,
+                "num_model_updates": 1,
+            },
+        ],
+    )
+    write_csv(
+        raw_dir / "training_events.csv",
+        TRAINING_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "train_start_time": 10.5,
+                "train_end_time": 10.7,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 2,
+                "camera_id": 0,
+                "task_id": 0,
+                "train_start_time": 20.5,
+                "train_end_time": 20.8,
+            },
+        ],
+    )
+    write_csv(
+        raw_dir / "model_update_events.csv",
+        MODEL_UPDATE_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "old_model_version": "0",
+                "new_model_version": "1",
+                "adopted": True,
+                "update_time": 10.8,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 2,
+                "camera_id": 0,
+                "task_id": 0,
+                "old_model_version": "0",
+                "new_model_version": "1",
+                "adopted": True,
+                "update_time": 20.9,
+            },
+        ],
+    )
+    write_csv(
+        raw_dir / "scheduler_events.csv",
+        SCHEDULER_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "scheduler_name": "ekya_thief_style",
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "edge_id": 2,
+                "camera_id": 0,
+                "task_id": 0,
+                "scheduler_name": "ekya_thief_style",
+            },
+        ],
+    )
+    write_csv(
+        raw_dir / "upload_events.csv",
+        UPLOAD_EVENT_FIELDS,
+        [
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 1,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "window_id": "1:0:0:1:1",
+                "raw_frame_bytes": 1000,
+            },
+            {
+                "method": "ekya_style_cloud_scheduling",
+                "run_id": "ekya-run",
+                "video_name": "road.mp4",
+                "edge_id": 2,
+                "camera_id": 0,
+                "task_id": 0,
+                "chunk_id": 0,
+                "frame_idx": 1,
+                "window_id": "2:0:0:1:1",
+                "raw_frame_bytes": 1200,
+            },
+        ],
+    )
+    write_csv(raw_dir / "inference_events.csv", INFERENCE_FIELDS, [])
+    write_csv(raw_dir / "microprofile_events.csv", MICROPROFILE_FIELDS, [])
+
+    report = convert_ekya_style_results(raw_dir=raw_dir, output_dir=output_dir)
+
+    frames = read_csv(output_dir / "frame_metrics.csv")
+    windows = read_csv(output_dir / "window_metrics.csv")
+    adaptations = read_csv(output_dir / "adaptation_events.csv")
+    latencies = read_csv(output_dir / "latency_breakdown.csv")
+    summaries = read_csv(output_dir / "summary.csv")
+
+    assert report["evaluated_frame_count"] == 2
+    assert sorted((row["edge_id"], row["frame_id"], row["map"]) for row in frames) == [
+        ("1", "1", "0.75"),
+        ("2", "1", "0.45"),
+    ]
+    assert sorted(row["edge_id"] for row in windows) == ["1", "2"]
+    assert sorted(row["window_id"] for row in windows) == [
+        "1:0:0:1:1",
+        "2:0:0:1:1",
+    ]
+    assert {row["edge_id"] for row in adaptations} == {"1", "2"}
+    assert sorted(row["edge_id"] for row in latencies) == ["1", "2"]
+    assert summaries[0]["edge_count"] == "2"
+
+
+def test_ekya_converter_uses_summary_student_model(tmp_path: Path) -> None:
+    raw_dir = _raw_ekya_dir(tmp_path)
+    output_dir = tmp_path / "normalized"
+    _write_raw_ekya_fixture(raw_dir)
+    summary_path = raw_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["student_model"] = "custom_student"
+    summary_path.write_text(json.dumps(summary, sort_keys=True) + "\n", encoding="utf-8")
+
+    convert_ekya_style_results(raw_dir=raw_dir, output_dir=output_dir)
+
+    frames = read_csv(output_dir / "frame_metrics.csv")
+    assert {row["model_name"] for row in frames} == {"custom_student"}
+
+
+def test_ekya_schema_contract_appends_to_existing_normalized_and_plots(
+    tmp_path: Path,
+) -> None:
+    raw_dir = _raw_ekya_dir(tmp_path)
+    ekya_normalized = tmp_path / "ekya_normalized"
+    combined = tmp_path / "combined_normalized"
+    figures = tmp_path / "figures"
+    _write_raw_ekya_fixture(raw_dir)
+    convert_ekya_style_results(raw_dir=raw_dir, output_dir=ekya_normalized)
+
+    combined.mkdir(parents=True)
+    for filename in CSV_SCHEMAS:
+        shutil.copy2(EXISTING_NORMALIZED / filename, combined / filename)
+    shutil.copy2(
+        EXISTING_NORMALIZED / "normalization_report.json",
+        combined / "normalization_report.json",
+    )
+
+    append_ekya_style_to_normalized_dir(
+        ekya_normalized_dir=ekya_normalized,
+        target_normalized_dir=combined,
+    )
+
+    for filename, fields in CSV_SCHEMAS.items():
+        assert _header(combined / filename) == fields
+    assert any(row["method"] == "ekya" for row in read_csv(combined / "summary.csv"))
+
+    report = plot_figures(combined, figures)
+    assert (figures / "plot_report.json").exists()
+    assert report["input_files"]["summary.csv"] == str(combined / "summary.csv")
