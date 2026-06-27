@@ -91,6 +91,10 @@ TRAINING_FIELDS = [
     "best_val_ap50",
     "best_val_foreground_f1",
     "checkpoint_path",
+    "checkpoint_adoptable",
+    "train_loss",
+    "metric_mode",
+    "epoch_log_path",
 ]
 
 INFERENCE_FIELDS = [
@@ -152,6 +156,7 @@ MICROPROFILE_FIELDS = [
     "time_per_epoch_s",
     "predicted_full_train_time_s",
     "predicted_final_map",
+    "metric_mode",
 ]
 
 MODEL_UPDATE_FIELDS = [

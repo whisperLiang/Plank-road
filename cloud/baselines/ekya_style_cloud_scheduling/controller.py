@@ -226,10 +226,15 @@ class EkyaStyleCloudSchedulingController:
         frame_scores = self._update_frame_quality(window, teacher_labels)
         micro_results = []
         microprofile_time_s = 0.0
+        base_state_dict = None
+        if self.config.microprofile.enabled or self.config.retraining.enabled:
+            base_state_dict = self.inference.export_state_dict()
         if self.config.microprofile.enabled:
             micro_results, microprofile_time_s = self.microprofiler.profile(
                 window=window,
                 teacher_labels=teacher_labels,
+                base_state_dict=base_state_dict,
+                model_builder=self.inference.build_student_model_clone,
             )
             for result in micro_results:
                 row = result.as_dict()
@@ -259,6 +264,8 @@ class EkyaStyleCloudSchedulingController:
                 decision=decision,
                 teacher_labels=teacher_labels,
                 previous_val_map=self._previous_val_map_snapshot(),
+                base_state_dict=base_state_dict or {},
+                model_builder=self.inference.build_student_model_clone,
             )
             self.logger.append_training_event(training_result.as_event_row())
             adopted = self._maybe_adopt(training_result)

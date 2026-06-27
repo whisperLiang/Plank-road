@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import copy
 from types import SimpleNamespace
 from typing import Any
 
@@ -85,16 +86,55 @@ class CloudInferenceEngine:
         detector = self._ensure_detector()
         model = getattr(detector, "model", detector)
         if not isinstance(model, torch.nn.Module):
-            self._model_version = str(model_version)
-            return
+            raise RuntimeError("Ekya checkpoint adoption requires a torch.nn.Module detector")
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
-        if isinstance(state, dict):
-            with self._lock:
-                model.load_state_dict(state, strict=False)
-                model.eval()
-                self._model_version = str(model_version)
+        if not isinstance(state, dict) or not state:
+            raise RuntimeError("Ekya checkpoint is missing trained model weights")
+        with self._lock:
+            model.load_state_dict(state, strict=False)
+            model.eval()
+            self._model_version = str(model_version)
+
+    def export_state_dict(self) -> dict[str, torch.Tensor]:
+        detector = self._ensure_detector()
+        model = getattr(detector, "model", detector)
+        if not isinstance(model, torch.nn.Module):
+            raise RuntimeError("Ekya model export requires a torch.nn.Module detector")
+        with self._lock:
+            state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+                if torch.is_tensor(value)
+            }
+        if not state:
+            raise RuntimeError("Ekya model export produced no model weights")
+        return state
+
+    def build_student_model_clone(self) -> torch.nn.Module:
+        if self._runtime_config is not None:
+            from model_management.model_zoo import build_detection_model
+
+            od_config = self._object_detection_config(self._runtime_config)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = build_detection_model(
+                str(getattr(od_config, "lightweight", None) or self.config.student_model),
+                pretrained=True,
+                device=device,
+                weights_path=getattr(od_config, "weights_path", None),
+            )
+            model.to(device)
+            model.eval()
+            return model
+        detector = self._ensure_detector()
+        model = getattr(detector, "model", detector)
+        if not isinstance(model, torch.nn.Module):
+            raise RuntimeError("Ekya model clone requires a torch.nn.Module detector")
+        with self._lock:
+            clone = copy.deepcopy(model)
+        clone.eval()
+        return clone
 
     def _ensure_detector(self) -> Any:
         if self._detector is not None:

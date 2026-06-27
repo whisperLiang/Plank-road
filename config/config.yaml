@@ -293,6 +293,14 @@ server:
        test_batch_size: 1
        learning_rate: 0.000005
        subsample: 1.0
+   dataset:
+    train_val_split: 0.75
+    min_train_samples: 1
+    min_val_samples: 1
+   evaluation:
+    metric_mode: teacher_proxy
+    score_threshold: 0.3
+    iou_threshold: 0.5
    scheduler:
     name: ekya_thief_style
     retraining_period_s: 64
@@ -309,6 +317,10 @@ server:
     max_concurrent_train_jobs: 1
     save_checkpoints: true
     run_async: true
+    train_mode: full
+    trainable_param_ratio: null
+    optimizer_name: adamw
+    weight_decay: 0.0
    logging:
     result_schema_version: 1
     log_internal_ids: false

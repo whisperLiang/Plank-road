@@ -26,6 +26,7 @@ class MicroProfileResult:
     predicted_final_map: float
     microprofile_epochs: int
     subsample: float
+    metric_mode: str = "teacher_proxy"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +46,7 @@ class MicroProfileResult:
             "predicted_final_map": float(self.predicted_final_map),
             "microprofile_epochs": int(self.microprofile_epochs),
             "subsample": float(self.subsample),
+            "metric_mode": self.metric_mode,
         }
 
 

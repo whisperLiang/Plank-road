@@ -118,6 +118,20 @@ class MicroprofileConfig:
 
 
 @dataclass(frozen=True)
+class DatasetConfig:
+    train_val_split: float = 0.75
+    min_train_samples: int = 1
+    min_val_samples: int = 1
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    metric_mode: str = "teacher_proxy"
+    score_threshold: float = 0.3
+    iou_threshold: float = 0.5
+
+
+@dataclass(frozen=True)
 class SchedulerConfig:
     name: str = "ekya_thief_style"
     retraining_period_s: float = 64.0
@@ -138,7 +152,10 @@ class RetrainingConfig:
     max_concurrent_train_jobs: int = 1
     save_checkpoints: bool = True
     run_async: bool = True
+    train_mode: str = "full"
     trainable_param_ratio: float | None = None
+    optimizer_name: str = "adamw"
+    weight_decay: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -167,6 +184,8 @@ class EkyaStyleCloudSchedulingConfig:
     cloud_inference: CloudInferenceConfig
     teacher_labeling: TeacherLabelingConfig
     microprofile: MicroprofileConfig
+    dataset: DatasetConfig
+    evaluation: EvaluationConfig
     scheduler: SchedulerConfig
     retraining: RetrainingConfig
     logging: LoggingConfig
@@ -208,6 +227,55 @@ class EkyaStyleCloudSchedulingConfig:
             )
         if not 1 <= int(self.edge_streaming.jpeg_quality) <= 100:
             raise ValueError("ekya_style_cloud_scheduling.jpeg_quality must be in [1, 100]")
+        if self.dataset.train_val_split <= 0.0 or self.dataset.train_val_split >= 1.0:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.dataset.train_val_split must be in (0, 1)"
+            )
+        if self.dataset.min_train_samples <= 0 or self.dataset.min_val_samples <= 0:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.dataset min sample counts must be positive"
+            )
+        if self.evaluation.metric_mode != "teacher_proxy":
+            raise ValueError(
+                "ekya_style_cloud_scheduling.evaluation.metric_mode must be teacher_proxy"
+            )
+        if self.evaluation.score_threshold < 0.0:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.evaluation.score_threshold must be non-negative"
+            )
+        if self.evaluation.iou_threshold <= 0.0 or self.evaluation.iou_threshold > 1.0:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.evaluation.iou_threshold must be in (0, 1]"
+            )
+        train_mode = str(self.retraining.train_mode or "").strip().lower()
+        if train_mode not in {"full", "freeze"}:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.retraining.train_mode must be full or freeze"
+            )
+        if train_mode == "freeze" and self.retraining.trainable_param_ratio is None:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.retraining.trainable_param_ratio is required "
+                "when train_mode=freeze"
+            )
+        if self.retraining.trainable_param_ratio is not None and (
+            self.retraining.trainable_param_ratio <= 0.0
+            or self.retraining.trainable_param_ratio > 1.0
+        ):
+            raise ValueError(
+                "ekya_style_cloud_scheduling.retraining.trainable_param_ratio must be in (0, 1]"
+            )
+        if str(self.retraining.optimizer_name or "").strip().lower() not in {
+            "adamw",
+            "adam",
+            "sgd",
+        }:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.retraining.optimizer_name must be adamw, adam, or sgd"
+            )
+        if self.retraining.weight_decay < 0.0:
+            raise ValueError("ekya_style_cloud_scheduling.retraining.weight_decay must be >= 0")
+        if not self.retraining.save_checkpoints:
+            raise ValueError("ekya_style_cloud_scheduling.retraining.save_checkpoints must be true")
 
 
 def parse_ekya_style_config(
@@ -284,6 +352,8 @@ def parse_ekya_style_config(
             _get(section, "microprofile", None),
             candidates=candidates,
         ),
+        dataset=_dataset_config(_get(section, "dataset", None)),
+        evaluation=_evaluation_config(_get(section, "evaluation", None)),
         scheduler=_scheduler_config(_get(section, "scheduler", None)),
         retraining=_retraining_config(_get(section, "retraining", None)),
         logging=_logging_config(_get(section, "logging", None)),
@@ -343,6 +413,22 @@ def _microprofile_config(
     )
 
 
+def _dataset_config(value: object) -> DatasetConfig:
+    return DatasetConfig(
+        train_val_split=float(_get(value, "train_val_split", 0.75)),
+        min_train_samples=int(_get(value, "min_train_samples", 1)),
+        min_val_samples=int(_get(value, "min_val_samples", 1)),
+    )
+
+
+def _evaluation_config(value: object) -> EvaluationConfig:
+    return EvaluationConfig(
+        metric_mode=str(_get(value, "metric_mode", "teacher_proxy") or "teacher_proxy"),
+        score_threshold=float(_get(value, "score_threshold", 0.3)),
+        iou_threshold=float(_get(value, "iou_threshold", 0.5)),
+    )
+
+
 def _scheduler_config(value: object) -> SchedulerConfig:
     return SchedulerConfig(
         name=str(_get(value, "name", "ekya_thief_style") or "ekya_thief_style"),
@@ -368,7 +454,10 @@ def _retraining_config(value: object) -> RetrainingConfig:
         max_concurrent_train_jobs=int(_get(value, "max_concurrent_train_jobs", 1)),
         save_checkpoints=bool(_get(value, "save_checkpoints", True)),
         run_async=bool(_get(value, "run_async", True)),
+        train_mode=str(_get(value, "train_mode", "full") or "full").strip().lower(),
         trainable_param_ratio=None if ratio in (None, "") else float(ratio),
+        optimizer_name=str(_get(value, "optimizer_name", "adamw") or "adamw").strip().lower(),
+        weight_decay=float(_get(value, "weight_decay", 0.0)),
     )
 
 

@@ -493,6 +493,20 @@ class EkyaMicroprofileConfig(ConfigSection):
 
 
 @dataclass
+class EkyaDatasetConfig(ConfigSection):
+    train_val_split: float = 0.75
+    min_train_samples: int = 1
+    min_val_samples: int = 1
+
+
+@dataclass
+class EkyaEvaluationConfig(ConfigSection):
+    metric_mode: str = "teacher_proxy"
+    score_threshold: float = 0.3
+    iou_threshold: float = 0.5
+
+
+@dataclass
 class EkyaSchedulerConfig(ConfigSection):
     name: str = "ekya_thief_style"
     retraining_period_s: float = 64.0
@@ -513,7 +527,10 @@ class EkyaRetrainingConfig(ConfigSection):
     max_concurrent_train_jobs: int = 1
     save_checkpoints: bool = True
     run_async: bool = True
+    train_mode: str = "full"
     trainable_param_ratio: float | None = None
+    optimizer_name: str = "adamw"
+    weight_decay: float = 0.0
 
 
 @dataclass
@@ -538,6 +555,8 @@ class EkyaStyleCloudSchedulingServerConfig(ConfigSection):
     cloud_inference: EkyaCloudInferenceConfig = field(default_factory=EkyaCloudInferenceConfig)
     teacher_labeling: EkyaTeacherLabelingConfig = field(default_factory=EkyaTeacherLabelingConfig)
     microprofile: EkyaMicroprofileConfig = field(default_factory=EkyaMicroprofileConfig)
+    dataset: EkyaDatasetConfig = field(default_factory=EkyaDatasetConfig)
+    evaluation: EkyaEvaluationConfig = field(default_factory=EkyaEvaluationConfig)
     scheduler: EkyaSchedulerConfig = field(default_factory=EkyaSchedulerConfig)
     retraining: EkyaRetrainingConfig = field(default_factory=EkyaRetrainingConfig)
     logging: EkyaLoggingConfig = field(default_factory=EkyaLoggingConfig)
@@ -749,6 +768,8 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             EkyaMicroprofileConfig,
             known.get("microprofile"),
         )
+        known["dataset"] = _section(EkyaDatasetConfig, known.get("dataset"))
+        known["evaluation"] = _section(EkyaEvaluationConfig, known.get("evaluation"))
         known["scheduler"] = _section(EkyaSchedulerConfig, known.get("scheduler"))
         known["retraining"] = _section(EkyaRetrainingConfig, known.get("retraining"))
         known["logging"] = _section(EkyaLoggingConfig, known.get("logging"))
@@ -1056,6 +1077,79 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             raise ValueError(
                 "server.baselines.ekya_style_cloud_scheduling.microprofile."
                 "candidate_hyperparameters must not be empty"
+            )
+        if float(ekya_cfg.dataset.train_val_split) <= 0.0 or float(
+            ekya_cfg.dataset.train_val_split
+        ) >= 1.0:
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.dataset."
+                "train_val_split must be in (0, 1)"
+            )
+        _validate_positive(
+            "server.baselines.ekya_style_cloud_scheduling.dataset.min_train_samples",
+            int(ekya_cfg.dataset.min_train_samples),
+        )
+        _validate_positive(
+            "server.baselines.ekya_style_cloud_scheduling.dataset.min_val_samples",
+            int(ekya_cfg.dataset.min_val_samples),
+        )
+        if str(ekya_cfg.evaluation.metric_mode) != "teacher_proxy":
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.evaluation."
+                "metric_mode must be teacher_proxy"
+            )
+        if float(ekya_cfg.evaluation.score_threshold) < 0.0:
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.evaluation."
+                "score_threshold must be non-negative"
+            )
+        if float(ekya_cfg.evaluation.iou_threshold) <= 0.0 or float(
+            ekya_cfg.evaluation.iou_threshold
+        ) > 1.0:
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.evaluation."
+                "iou_threshold must be in (0, 1]"
+            )
+        ekya_train_mode = str(ekya_cfg.retraining.train_mode or "").strip().lower()
+        if ekya_train_mode not in {"full", "freeze"}:
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.retraining."
+                "train_mode must be full or freeze"
+            )
+        if ekya_train_mode == "freeze" and ekya_cfg.retraining.trainable_param_ratio is None:
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.retraining."
+                "trainable_param_ratio is required when train_mode=freeze"
+            )
+        if ekya_cfg.retraining.trainable_param_ratio is not None:
+            _validate_positive(
+                "server.baselines.ekya_style_cloud_scheduling.retraining."
+                "trainable_param_ratio",
+                float(ekya_cfg.retraining.trainable_param_ratio),
+            )
+            if float(ekya_cfg.retraining.trainable_param_ratio) > 1.0:
+                raise ValueError(
+                    "server.baselines.ekya_style_cloud_scheduling.retraining."
+                    "trainable_param_ratio must be <= 1"
+                )
+        if str(ekya_cfg.retraining.optimizer_name or "").strip().lower() not in {
+            "adamw",
+            "adam",
+            "sgd",
+        }:
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.retraining."
+                "optimizer_name must be adamw, adam, or sgd"
+            )
+        if float(ekya_cfg.retraining.weight_decay) < 0.0:
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.retraining."
+                "weight_decay must be >= 0"
+            )
+        if not bool(ekya_cfg.retraining.save_checkpoints):
+            raise ValueError(
+                "server.baselines.ekya_style_cloud_scheduling.retraining."
+                "save_checkpoints must be true"
             )
     _validate_positive(
         "baseline.training.training_window_size",
