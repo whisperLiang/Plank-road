@@ -27,6 +27,7 @@ from tools.experiments.experiment_common import (  # noqa: E402
     METHOD_LABELS,
     METHOD_ORDER,
     mean,
+    mean_positive,
     optional_float,
     optional_int,
     read_csv,
@@ -814,7 +815,7 @@ def _aggregate_breakdown(
             "scenario_name": scenario,
             "method": method,
             "run_id": run_id,
-            **{field: mean(row.get(field) for row in group) for field, _ in fields},
+            **{field: _component_mean(field, group) for field, _ in fields},
         }
         for (scenario, method, run_id), group in per_run.items()
     ]
@@ -823,12 +824,21 @@ def _aggregate_breakdown(
         scenario_rows = [row for row in run_rows if row["scenario_name"] == scenario]
         values[scenario] = {
             method: {
-                field: mean(row.get(field) for row in scenario_rows if row["method"] == method)
+                field: _component_mean(
+                    field,
+                    (row for row in scenario_rows if row["method"] == method),
+                )
                 for field, _ in fields
             }
             for method in _method_order(row["method"] for row in scenario_rows)
         }
     return values
+
+
+def _component_mean(field: str, rows: Iterable[Mapping[str, Any]]) -> float | None:
+    if field == "training_ms":
+        return mean_positive(row.get(field) for row in rows)
+    return mean(row.get(field) for row in rows)
 
 
 def _stacked_method_bars(

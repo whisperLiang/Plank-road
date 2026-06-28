@@ -545,6 +545,15 @@ def mean(values: Iterable[Any]) -> float | None:
     return sum(numbers) / len(numbers) if numbers else None
 
 
+def mean_positive(values: Iterable[Any]) -> float | None:
+    numbers = [
+        number
+        for value in values
+        if (number := optional_float(value)) is not None and number > 0
+    ]
+    return sum(numbers) / len(numbers) if numbers else None
+
+
 def percentile(values: Iterable[Any], quantile: float) -> float | None:
     numbers = sorted(number for value in values if (number := optional_float(value)) is not None)
     if not numbers:

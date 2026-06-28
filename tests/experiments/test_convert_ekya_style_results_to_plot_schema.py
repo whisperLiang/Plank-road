@@ -494,6 +494,39 @@ def test_ekya_converter_writes_existing_csv_schemas_exactly(tmp_path: Path) -> N
     assert frames[2]["result_source"] == "stale_result"
 
 
+def test_ekya_converter_training_mean_ignores_inference_only_windows(
+    tmp_path: Path,
+) -> None:
+    raw_dir = _raw_ekya_dir(tmp_path)
+    output_dir = tmp_path / "normalized"
+    _write_raw_ekya_fixture(raw_dir)
+    per_window = read_csv(raw_dir / "per_window_metrics.csv")
+    per_window.append(
+        {
+            **per_window[0],
+            "task_id": 1,
+            "window_start_frame": 3,
+            "window_end_frame": 3,
+            "num_frames": 1,
+            "avg_foreground_f1": 0.6,
+            "avg_edge_upload_to_result_latency_ms": 55,
+            "training_time_s": 0.0,
+            "teacher_labeling_time_s": 0.01,
+            "microprofile_time_s": 0.02,
+            "num_model_updates": 0,
+        }
+    )
+    write_csv(raw_dir / "per_window_metrics.csv", PER_WINDOW_FIELDS, per_window)
+
+    convert_ekya_style_results(raw_dir=raw_dir, output_dir=output_dir)
+
+    latencies = read_csv(output_dir / "latency_breakdown.csv")
+    summary = read_csv(output_dir / "summary.csv")[0]
+    assert [row["training_ms"] for row in latencies] == ["200.0", "0.0"]
+    assert summary["mean_training_ms"] == "200.0"
+    assert summary["mean_adaptation_ms"] == "150.0"
+
+
 def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None:
     raw_dir = _raw_ekya_dir(tmp_path)
     output_dir = tmp_path / "normalized"

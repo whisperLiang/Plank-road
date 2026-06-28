@@ -339,6 +339,33 @@ def test_breakdown_averages_runs_before_repeats_and_keeps_scenarios_separate() -
     assert values["city"]["plank_road"]["upload_ms"] == 20.0
 
 
+def test_breakdown_training_mean_ignores_inference_only_windows() -> None:
+    rows = [
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r1",
+            "training_ms": "0",
+        },
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r1",
+            "training_ms": "100",
+        },
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r2",
+            "training_ms": "200",
+        },
+    ]
+
+    values = _aggregate_breakdown(rows, [("training_ms", "Training")])
+
+    assert values["road"]["ekya"]["training_ms"] == 150.0
+
+
 def test_event_timeline_is_zeroed_per_method_run() -> None:
     rows = [
         {

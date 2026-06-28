@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from tools.experiments.experiment_common import CSV_SCHEMAS, ManifestError, read_csv
-from tools.experiments.normalize_plank_road_baseline_logs import normalize
+from tools.experiments.normalize_plank_road_baseline_logs import _summary_rows, normalize
 
 
 def _write_jsonl(path: Path, rows: list[dict], *, bad_line: bool = False) -> None:
@@ -118,6 +118,35 @@ def _minimal_frame(frame_index: int) -> dict:
             "scores": [0.8],
         },
     }
+
+
+def test_summary_rows_training_mean_uses_actual_training_jobs() -> None:
+    manifest = {
+        "comparison_id": "comparison-test",
+        "student_model": "rfdetr_nano",
+        "teacher_model": "rtdetr_x",
+        "runs": [
+            {
+                "run_id": "ekya-r1",
+                "method": "ekya",
+                "scenario_name": "road",
+                "edge_ids": [1],
+            }
+        ],
+    }
+    latency = [
+        {"run_id": "ekya-r1", "training_ms": "0", "total_adaptation_ms": "30"},
+        {
+            "run_id": "ekya-r1",
+            "training_ms": "111000",
+            "total_adaptation_ms": "111030",
+        },
+    ]
+
+    summary = _summary_rows(manifest, frames=[], events=[], uploads=[], latency=latency)
+
+    assert summary[0]["mean_training_ms"] == 111000.0
+    assert summary[0]["mean_adaptation_ms"] == 55530.0
 
 
 def test_manifest_requires_log_timezone(tmp_path: Path) -> None:
