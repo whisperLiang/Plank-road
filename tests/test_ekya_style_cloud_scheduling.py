@@ -685,6 +685,21 @@ def test_cloud_frame_buffer_keeps_streams_separate(tmp_path: Path) -> None:
     assert len({window.window_id for window in windows}) == 2
 
 
+def test_cloud_frame_buffer_completes_final_partial_window(tmp_path: Path) -> None:
+    buffer = CloudFrameBuffer(window_size=2, output_dir=tmp_path, num_frames=3)
+
+    buffer.append_packet(_packet(1), timestamp_cloud_receive=1.0, decode=False)
+    assert buffer.completed_windows() == []
+    buffer.append_packet(_packet(2), timestamp_cloud_receive=2.0, decode=False)
+    first = buffer.completed_windows()
+    buffer.append_packet(_packet(3), timestamp_cloud_receive=3.0, decode=False)
+    final = buffer.completed_windows()
+
+    assert [window.frame_indices for window in first] == [(1, 2)]
+    assert [window.frame_indices for window in final] == [(3,)]
+    assert final[0].window_id == "1:0:1:3:3"
+
+
 @pytest.mark.parametrize(
     ("scope", "candidate", "admitted"),
     [
@@ -729,7 +744,7 @@ def test_ekya_training_admission_scope_controls_active_key(
         controller._end_training(active)
 
 
-def test_ekya_active_same_connection_launch_skip_creates_no_thread_or_drop_artifact(
+def test_ekya_active_same_connection_launch_still_records_window_metrics(
     tmp_path: Path,
 ) -> None:
     controller = _controller_for_admission_tests(tmp_path)
@@ -742,13 +757,20 @@ def test_ekya_active_same_connection_launch_skip_creates_no_thread_or_drop_artif
                 controller._launch_window_pipeline(
                     _decoded_window(task_id=2, window_id="same-active-window")
                 ),
-                controller.wait_for_background(timeout=0.01),
+                controller.wait_for_background(timeout=2.0),
             )
         )
     finally:
         controller._end_training(active)
 
     assert not hasattr(controller, "_pipeline_semaphore")
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    window_rows = read_csv(controller.output_dir / "per_window_metrics.csv")
+    assert scheduler_rows
+    assert scheduler_rows[-1]["decision_reason"] == "same_connection_training_active"
+    assert window_rows
+    assert window_rows[-1]["task_id"] == "2"
+    assert read_csv(controller.output_dir / "training_events.csv") == []
     assert controller._background_threads == []
     assert "[EkyaTrainingDrop]" not in logs
     assert not (controller.output_dir / "training_drop_events.csv").exists()
@@ -797,6 +819,26 @@ def test_ekya_training_admission_skip_does_not_train_or_add_drop_schema(
         assert key not in summary
 
 
+def test_ekya_launch_time_training_block_survives_until_scheduler(
+    tmp_path: Path,
+) -> None:
+    controller = _controller_for_admission_tests(tmp_path)
+    trainer = _RecordingTrainer(tmp_path)
+    controller.trainer = trainer
+
+    controller._run_window_pipeline(
+        _decoded_window(task_id=2, window_id="launch-blocked-window"),
+        training_admission_blocked=True,
+    )
+
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    window_rows = read_csv(controller.output_dir / "per_window_metrics.csv")
+    assert trainer.calls == []
+    assert scheduler_rows[-1]["decision_reason"] == "same_connection_training_active"
+    assert window_rows[-1]["task_id"] == "2"
+    assert read_csv(controller.output_dir / "training_events.csv") == []
+
+
 def test_ekya_training_lease_released_after_successful_training(tmp_path: Path) -> None:
     controller = _controller_for_admission_tests(tmp_path)
     controller.trainer = _RecordingTrainer(tmp_path)
@@ -832,6 +874,7 @@ def test_ekya_frame_inference_result_return_unaffected_by_training_skip(tmp_path
     try:
         first = controller.handle_frame_upload(_packet(1, edge_id=1, camera_id=0))
         second = controller.handle_frame_upload(_packet(2, edge_id=1, camera_id=0))
+        controller.wait_for_background(timeout=2.0)
     finally:
         controller._end_training(active)
 
@@ -840,6 +883,8 @@ def test_ekya_frame_inference_result_return_unaffected_by_training_skip(tmp_path
     assert second.edge_id == 1
     assert second.camera_id == 0
     assert len(read_csv(controller.output_dir / "inference_events.csv")) == 2
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    assert scheduler_rows[-1]["decision_reason"] == "same_connection_training_active"
     assert controller._background_threads == []
 
 

@@ -59,8 +59,17 @@ class CompletedFrameWindow:
 
 
 class CloudFrameBuffer:
-    def __init__(self, *, window_size: int, output_dir: str | Path) -> None:
+    def __init__(
+        self,
+        *,
+        window_size: int,
+        output_dir: str | Path,
+        num_frames: int | None = None,
+    ) -> None:
         self.window_size = max(1, int(window_size))
+        self.num_frames = (
+            int(num_frames) if num_frames is not None and int(num_frames) > 0 else None
+        )
         self.output_dir = Path(output_dir)
         self._records: dict[FrameKey, UploadedFrameRecord] = {}
         self._completed_window_ids: set[str] = set()
@@ -141,10 +150,11 @@ class CloudFrameBuffer:
             completed: list[CompletedFrameWindow] = []
             for (edge_id, camera_id, task_id, window_index), records in sorted(groups.items()):
                 records = sorted(records, key=lambda item: item.frame_idx)
-                if len(records) < self.window_size:
+                if len(records) < self.window_size and not self._is_final_partial_window(records):
                     continue
                 start = records[0].frame_idx
-                end = records[min(self.window_size, len(records)) - 1].frame_idx
+                selected = tuple(records[: self.window_size])
+                end = selected[-1].frame_idx
                 window_id = stable_window_id(
                     task_id,
                     start,
@@ -154,7 +164,6 @@ class CloudFrameBuffer:
                 )
                 if window_id in self._completed_window_ids:
                     continue
-                selected = tuple(records[: self.window_size])
                 window = CompletedFrameWindow(
                     task_id=int(task_id),
                     window_id=window_id,
@@ -170,6 +179,11 @@ class CloudFrameBuffer:
         if completed:
             self.write_sampled_frames()
         return completed
+
+    def _is_final_partial_window(self, records: list[UploadedFrameRecord]) -> bool:
+        if self.num_frames is None or not records:
+            return False
+        return max(record.frame_idx for record in records) >= int(self.num_frames)
 
     def write_sampled_frames(self) -> Path:
         payload = {

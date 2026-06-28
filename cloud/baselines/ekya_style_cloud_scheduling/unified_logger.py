@@ -361,6 +361,8 @@ class EkyaUnifiedLogger:
     ) -> None:
         start = int(packet.task_id) * max(1, int(self.window_size)) + 1
         end = start + max(1, int(self.window_size)) - 1
+        if int(self.num_frames) > 0:
+            end = min(end, int(self.num_frames))
         self._append(
             "upload_events.csv",
             UPLOAD_EVENT_FIELDS,

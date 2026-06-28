@@ -89,6 +89,7 @@ class EkyaStyleCloudSchedulingController:
         self.frame_buffer = CloudFrameBuffer(
             window_size=config.window_size,
             output_dir=config.output_dir,
+            num_frames=config.num_frames,
         )
         self.frame_receiver = CloudFrameReceiver(
             frame_buffer=self.frame_buffer,
@@ -192,18 +193,18 @@ class EkyaStyleCloudSchedulingController:
             threads[0].join(timeout=remaining if remaining is not None else 0.5)
 
     def close(self) -> None:
-        self.wait_for_background(timeout=10.0)
+        self.wait_for_background(timeout=None)
         self.frame_buffer.write_sampled_frames()
         self.logger.write_summary()
 
     def _launch_window_pipeline(self, window: CompletedFrameWindow) -> None:
-        if bool(self.config.retraining.drop_training_when_active_same_connection):
-            if self._has_active_training(window):
-                return
-
+        training_admission_blocked = bool(
+            self.config.retraining.drop_training_when_active_same_connection
+            and self._has_active_training(window)
+        )
         thread = threading.Thread(
             target=self._run_window_pipeline_guarded,
-            args=(window,),
+            args=(window, training_admission_blocked),
             name=f"ekya-window-{window.window_id}",
             daemon=True,
         )
@@ -211,9 +212,16 @@ class EkyaStyleCloudSchedulingController:
             self._background_threads.append(thread)
         thread.start()
 
-    def _run_window_pipeline_guarded(self, window: CompletedFrameWindow) -> None:
+    def _run_window_pipeline_guarded(
+        self,
+        window: CompletedFrameWindow,
+        training_admission_blocked: bool = False,
+    ) -> None:
         try:
-            self._run_window_pipeline(window)
+            self._run_window_pipeline(
+                window,
+                training_admission_blocked=training_admission_blocked,
+            )
         except Exception as exc:
             logger.warning(
                 "ekya_style_cloud_scheduling window pipeline failed: window={} error={}",
@@ -221,7 +229,12 @@ class EkyaStyleCloudSchedulingController:
                 exc,
             )
 
-    def _run_window_pipeline(self, window: CompletedFrameWindow) -> None:
+    def _run_window_pipeline(
+        self,
+        window: CompletedFrameWindow,
+        *,
+        training_admission_blocked: bool = False,
+    ) -> None:
         logger.info(
             "ekya_style_cloud_scheduling window start: task_id={} frames={}..{}",
             window.task_id,
@@ -275,9 +288,12 @@ class EkyaStyleCloudSchedulingController:
         adopted = False
         lease: TrainingLease | None = None
         if decision.trains:
-            lease = self._try_begin_training(window)
-            if lease is None:
+            if training_admission_blocked:
                 scheduler_row = _scheduler_row_for_training_admission_skip(scheduler_row)
+            else:
+                lease = self._try_begin_training(window)
+                if lease is None:
+                    scheduler_row = _scheduler_row_for_training_admission_skip(scheduler_row)
         self.logger.append_scheduler_event(scheduler_row)
 
         if lease is not None:
