@@ -24,7 +24,9 @@ from cloud.baselines.ekya_style_cloud_scheduling.protocol import (
 from cloud.baselines.ekya_style_cloud_scheduling.scheduler import (
     EkyaThiefStyleScheduler,
     MicroProfileResult,
+    SchedulerDecision,
 )
+from cloud.baselines.ekya_style_cloud_scheduling.trainer import TrainingResult
 from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import EkyaUnifiedLogger
 from tools.experiments.experiment_common import read_csv
 
@@ -122,23 +124,38 @@ def _packet(frame_idx: int, *, edge_id: int = 1, camera_id: int = 0) -> FrameUpl
     )
 
 
-def _decoded_record(frame_idx: int) -> UploadedFrameRecord:
+def _decoded_record(
+    frame_idx: int,
+    *,
+    edge_id: int = 1,
+    camera_id: int = 0,
+) -> UploadedFrameRecord:
     return UploadedFrameRecord(
-        packet=_packet(frame_idx),
+        packet=_packet(frame_idx, edge_id=edge_id, camera_id=camera_id),
         timestamp_cloud_receive=1.2,
         decoded_frame_bgr=np.full((8, 8, 3), frame_idx, dtype=np.uint8),
     )
 
 
-def _decoded_window() -> CompletedFrameWindow:
+def _decoded_window(
+    *,
+    edge_id: int = 1,
+    camera_id: int = 0,
+    task_id: int = 1,
+    window_id: str | None = None,
+) -> CompletedFrameWindow:
     return CompletedFrameWindow(
-        task_id=1,
-        window_id="1:1:3",
+        task_id=int(task_id),
+        window_id=window_id or f"{int(edge_id)}:{int(camera_id)}:{int(task_id)}:1:3",
         start_frame=1,
         end_frame=3,
-        records=(_decoded_record(1), _decoded_record(2), _decoded_record(3)),
-        edge_id=1,
-        camera_id=0,
+        records=(
+            _decoded_record(1, edge_id=edge_id, camera_id=camera_id),
+            _decoded_record(2, edge_id=edge_id, camera_id=camera_id),
+            _decoded_record(3, edge_id=edge_id, camera_id=camera_id),
+        ),
+        edge_id=int(edge_id),
+        camera_id=int(camera_id),
     )
 
 
@@ -151,6 +168,138 @@ def _teacher_labels(*frame_ids: int) -> dict[int, dict[str, object]]:
         }
         for frame_id in frame_ids
     }
+
+
+class _TinyTrainModelFactory:
+    def __call__(self):
+        import torch
+
+        class TinyTrainModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([0.0]))
+
+            def forward(self, inputs):
+                batch_size = len(inputs) if isinstance(inputs, list) else int(inputs.shape[0])
+                return self.weight.reshape(1, 1).repeat(batch_size, 1)
+
+        return TinyTrainModel()
+
+
+class _FakeTeacherLabeler:
+    def label_window(self, window: CompletedFrameWindow):
+        return _teacher_labels(*window.frame_indices), 0.0
+
+
+class _FakeMicroprofiler:
+    def profile(self, *, window: CompletedFrameWindow, **_kwargs):
+        return _microprofile_result(int(window.task_id)), 0.0
+
+
+class _TrainingScheduler:
+    def schedule(self, *, task_id: int, **_kwargs):
+        return _training_decision(int(task_id))
+
+
+class _RecordingTrainer:
+    def __init__(self, tmp_path: Path, *, raises: bool = False) -> None:
+        self.tmp_path = tmp_path
+        self.raises = bool(raises)
+        self.calls: list[CompletedFrameWindow] = []
+
+    def train(self, *, window: CompletedFrameWindow, **_kwargs) -> TrainingResult:
+        self.calls.append(window)
+        if self.raises:
+            raise RuntimeError("training failed")
+        return TrainingResult(
+            task_id=int(window.task_id),
+            edge_id=int(window.edge_id),
+            camera_id=int(window.camera_id),
+            hp_id="fixed",
+            epochs=1,
+            lr=1.0e-5,
+            batch_size=1,
+            num_samples=len(window.records),
+            train_start_time=1.0,
+            train_end_time=2.0,
+            train_duration_s=1.0,
+            best_epoch=1,
+            best_val_map=0.9,
+            best_val_ap50=0.9,
+            best_val_foreground_f1=0.9,
+            checkpoint_path=str(self.tmp_path / "fake.pt"),
+            checkpoint_adoptable=False,
+        )
+
+
+def _microprofile_result(task_id: int = 1) -> MicroProfileResult:
+    return MicroProfileResult(
+        task_id=int(task_id),
+        hp_id="fixed",
+        hyperparameters={
+            "epochs": 1,
+            "learning_rate": 1.0e-5,
+            "train_batch_size": 1,
+            "subsample": 1.0,
+        },
+        preretrain_map=0.5,
+        post_microprofile_map=0.6,
+        map_gain=0.1,
+        preretrain_ap50=0.5,
+        post_microprofile_ap50=0.6,
+        preretrain_foreground_f1=0.5,
+        post_microprofile_foreground_f1=0.6,
+        init_time_s=0.0,
+        time_per_epoch_s=0.1,
+        predicted_full_train_time_s=0.1,
+        predicted_final_map=0.6,
+        microprofile_epochs=1,
+        subsample=1.0,
+    )
+
+
+def _training_decision(task_id: int = 1) -> SchedulerDecision:
+    return SchedulerDecision(
+        task_id=int(task_id),
+        scheduler_name="ekya_thief_style",
+        teacher_labeling_time_s=0.0,
+        microprofile_time_s=0.0,
+        total_pipeline_time_s=0.0,
+        remaining_for_retraining_s=1.0,
+        inference_resource_weight=0.5,
+        training_resource_weight=0.5,
+        selected_hp_id="fixed",
+        selected_epochs=1,
+        selected_lr=1.0e-5,
+        selected_subsample=1.0,
+        decision_reason="selected_fixed_training_config",
+    )
+
+
+def _controller_for_admission_tests(
+    tmp_path: Path,
+    *,
+    scope: str = "edge_camera",
+    drop_when_active: bool = True,
+):
+    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+        EkyaStyleCloudSchedulingController,
+    )
+
+    runtime = _runtime(tmp_path)
+    retraining = runtime.server.baselines.ekya_style_cloud_scheduling.retraining
+    retraining.drop_training_when_active_same_connection = bool(drop_when_active)
+    retraining.training_admission_scope = scope
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+    model = _TinyTrainModelFactory()()
+    controller = EkyaStyleCloudSchedulingController(
+        cfg,
+        detector=SimpleNamespace(model=model),
+    )
+    controller.teacher_labeler = _FakeTeacherLabeler()
+    controller.microprofiler = _FakeMicroprofiler()
+    controller.scheduler = _TrainingScheduler()
+    return controller
 
 
 def test_window_to_samples_preserves_frames_and_skips_incomplete_records() -> None:
@@ -197,6 +346,21 @@ def test_ekya_config_validation_rejects_wrong_default_student(tmp_path: Path) ->
     runtime.server.baselines.ekya_style_cloud_scheduling.student_model = "tinynext_s"
 
     with pytest.raises(ValueError, match="student_model"):
+        parse_ekya_style_config(runtime, run_id="run")
+
+
+def test_ekya_training_admission_config_defaults_and_validation(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+
+    assert cfg.retraining.drop_training_when_active_same_connection is True
+    assert cfg.retraining.training_admission_scope == "edge_camera"
+
+    runtime.server.baselines.ekya_style_cloud_scheduling.retraining.training_admission_scope = (
+        "unsupported"
+    )
+    with pytest.raises(ValueError, match="training_admission_scope"):
         parse_ekya_style_config(runtime, run_id="run")
 
 
@@ -521,6 +685,164 @@ def test_cloud_frame_buffer_keeps_streams_separate(tmp_path: Path) -> None:
     assert len({window.window_id for window in windows}) == 2
 
 
+@pytest.mark.parametrize(
+    ("scope", "candidate", "admitted"),
+    [
+        ("edge_camera", {"edge_id": 1, "camera_id": 1}, True),
+        ("edge_only", {"edge_id": 1, "camera_id": 1}, False),
+        ("edge_only", {"edge_id": 2, "camera_id": 0}, True),
+        ("global", {"edge_id": 2, "camera_id": 1}, False),
+    ],
+)
+def test_ekya_training_admission_scope_controls_active_key(
+    tmp_path: Path,
+    scope: str,
+    candidate: dict[str, int],
+    admitted: bool,
+) -> None:
+    controller = _controller_for_admission_tests(tmp_path, scope=scope)
+    active_window = _decoded_window(edge_id=1, camera_id=0, task_id=1)
+    active = controller._try_begin_training(active_window)
+    assert active is not None
+
+    try:
+        same_connection = _decoded_window(
+            edge_id=1,
+            camera_id=0,
+            task_id=2,
+            window_id="same-connection",
+        )
+        assert controller._try_begin_training(same_connection) is None
+
+        candidate_lease = controller._try_begin_training(
+            _decoded_window(
+                edge_id=candidate["edge_id"],
+                camera_id=candidate["camera_id"],
+                task_id=3,
+                window_id=f"{scope}-candidate",
+            )
+        )
+        assert (candidate_lease is not None) is admitted
+        if candidate_lease is not None:
+            controller._end_training(candidate_lease)
+    finally:
+        controller._end_training(active)
+
+
+def test_ekya_active_same_connection_launch_skip_creates_no_thread_or_drop_artifact(
+    tmp_path: Path,
+) -> None:
+    controller = _controller_for_admission_tests(tmp_path)
+    active = controller._try_begin_training(_decoded_window())
+    assert active is not None
+
+    try:
+        _unused, logs = _capture_info_logs(
+            lambda: (
+                controller._launch_window_pipeline(
+                    _decoded_window(task_id=2, window_id="same-active-window")
+                ),
+                controller.wait_for_background(timeout=0.01),
+            )
+        )
+    finally:
+        controller._end_training(active)
+
+    assert not hasattr(controller, "_pipeline_semaphore")
+    assert controller._background_threads == []
+    assert "[EkyaTrainingDrop]" not in logs
+    assert not (controller.output_dir / "training_drop_events.csv").exists()
+
+
+def test_ekya_training_admission_skip_does_not_train_or_add_drop_schema(
+    tmp_path: Path,
+) -> None:
+    controller = _controller_for_admission_tests(tmp_path, drop_when_active=False)
+    trainer = _RecordingTrainer(tmp_path)
+    controller.trainer = trainer
+    active = controller._try_begin_training(_decoded_window())
+    assert active is not None
+
+    try:
+        _unused, logs = _capture_info_logs(
+            lambda: controller._run_window_pipeline(
+                _decoded_window(task_id=2, window_id="same-active-race-window")
+            )
+        )
+    finally:
+        controller._end_training(active)
+
+    summary = json.loads((controller.output_dir / "summary.json").read_text(encoding="utf-8"))
+
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    assert trainer.calls == []
+    assert scheduler_rows
+    assert scheduler_rows[-1]["decision_reason"] == "same_connection_training_active"
+    assert scheduler_rows[-1]["selected_hp_id"] == ""
+    assert scheduler_rows[-1]["selected_epochs"] == "0"
+    assert scheduler_rows[-1]["training_resource_weight"] == "0.0"
+    assert read_csv(controller.output_dir / "training_events.csv") == []
+    assert read_csv(controller.output_dir / "model_update_events.csv") == []
+    assert not (controller.output_dir / "training_drop_events.csv").exists()
+    assert "[EkyaTrainingDrop]" not in logs
+    assert summary["num_retraining_jobs"] == 0
+    assert summary["num_model_updates"] == 0
+    for key in (
+        "training_drop_reason",
+        "active_training_task_id",
+        "active_training_window_id",
+        "dropped_training_request_count",
+        "dropped_training_same_connection_count",
+    ):
+        assert key not in summary
+
+
+def test_ekya_training_lease_released_after_successful_training(tmp_path: Path) -> None:
+    controller = _controller_for_admission_tests(tmp_path)
+    controller.trainer = _RecordingTrainer(tmp_path)
+
+    controller._run_window_pipeline(_decoded_window(task_id=2, window_id="trained-window"))
+
+    assert controller.trainer.calls
+    assert controller._active_training_by_key == {}
+    assert len(read_csv(controller.output_dir / "training_events.csv")) == 1
+    assert len(read_csv(controller.output_dir / "model_update_events.csv")) == 1
+
+
+def test_ekya_training_lease_released_after_trainer_exception(tmp_path: Path) -> None:
+    controller = _controller_for_admission_tests(tmp_path)
+    controller.trainer = _RecordingTrainer(tmp_path, raises=True)
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        controller._run_window_pipeline(
+            _decoded_window(task_id=2, window_id="training-exception-window")
+        )
+
+    assert controller._active_training_by_key == {}
+    assert len(controller.trainer.calls) == 1
+    assert read_csv(controller.output_dir / "training_events.csv") == []
+    assert read_csv(controller.output_dir / "model_update_events.csv") == []
+
+
+def test_ekya_frame_inference_result_return_unaffected_by_training_skip(tmp_path: Path) -> None:
+    controller = _controller_for_admission_tests(tmp_path)
+    active = controller._try_begin_training(_decoded_window(edge_id=1, camera_id=0))
+    assert active is not None
+
+    try:
+        first = controller.handle_frame_upload(_packet(1, edge_id=1, camera_id=0))
+        second = controller.handle_frame_upload(_packet(2, edge_id=1, camera_id=0))
+    finally:
+        controller._end_training(active)
+
+    assert first.frame_idx == 1
+    assert second.frame_idx == 2
+    assert second.edge_id == 1
+    assert second.camera_id == 0
+    assert len(read_csv(controller.output_dir / "inference_events.csv")) == 2
+    assert controller._background_threads == []
+
+
 def test_unified_logger_records_missing_and_dropped_counts(tmp_path: Path) -> None:
     logger = EkyaUnifiedLogger(
         output_dir=tmp_path,
@@ -603,7 +925,7 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
     from cloud.baselines.ekya_style_cloud_scheduling.controller import (
         EkyaStyleCloudSchedulingController,
     )
-    from cloud_server import CloudServer
+    from cloud_server import CloudServer, _experiment_method_for
 
     runtime = _runtime(tmp_path)
     config = runtime.server
@@ -634,6 +956,7 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
     assert server.baseline_controller.output_dir == (
         tmp_path / "experiments" / "comparison" / "raw_logs" / "ekya" / "cloud" / "run"
     )
+    assert _experiment_method_for("ekya_style_cloud_scheduling") == "ekya"
 
 
 def test_ekya_edge_route_archives_before_edge_worker_construction() -> None:

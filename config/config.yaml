@@ -255,6 +255,8 @@ server:
    retraining:
     adopt_only_if_improved: true
     min_map_gain_to_adopt: 0.0
+    drop_training_when_active_same_connection: true
+    training_admission_scope: edge_camera
  edge_affine_workers:
   enabled: true
   run_id: null

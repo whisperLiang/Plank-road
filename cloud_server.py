@@ -47,6 +47,13 @@ __all__ = ["CloudServer"]
 EKYA_STYLE_METHOD = "ekya_style_cloud_scheduling"
 
 
+def _experiment_method_for(method: str) -> str:
+    normalized = str(method or "").strip()
+    if normalized == EKYA_STYLE_METHOD:
+        return EKYA_METHOD
+    return normalized or PLANK_ROAD_METHOD
+
+
 class BaselineHeavyLaneBusy(RuntimeError):
     retryable = True
 
@@ -327,6 +334,9 @@ class CloudServer:
             "cloud server startup paths",
             lambda: {"workspace_root": workspace_root},
         )
+        experiment_method = _experiment_method_for(
+            getattr(self, "baseline_method", PLANK_ROAD_METHOD)
+        )
         server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=grpc_max_workers),
             options=grpc_message_options(),
@@ -342,9 +352,7 @@ class CloudServer:
                 log_internal_ids=self.log_internal_ids,
                 experiment_result_repository=self.experiment_result_repository,
                 experiment_comparison_id=str(getattr(experiment_config, "comparison_id", "") or ""),
-                experiment_method=str(
-                    getattr(self, "baseline_method", PLANK_ROAD_METHOD) or PLANK_ROAD_METHOD
-                ),
+                experiment_method=experiment_method,
                 experiment_run_id=str(getattr(self, "run_id", "") or ""),
             ),
             server,
@@ -360,9 +368,7 @@ class CloudServer:
         if self.experiment_result_repository is not None:
             self.experiment_result_repository.record_cloud_event(
                 comparison_id=str(getattr(experiment_config, "comparison_id", "") or ""),
-                method=str(
-                    getattr(self, "baseline_method", PLANK_ROAD_METHOD) or PLANK_ROAD_METHOD
-                ),
+                method=experiment_method,
                 run_id=str(getattr(self, "run_id", "") or ""),
                 event="cloud_server_started",
                 mode=self.mode,

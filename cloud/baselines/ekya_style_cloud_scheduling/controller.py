@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -41,6 +42,27 @@ from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import (
 )
 
 METHOD = "ekya_style_cloud_scheduling"
+
+
+@dataclass(frozen=True)
+class TrainingAdmissionKey:
+    edge_id: int | None
+    camera_id: int | None
+
+
+@dataclass(frozen=True)
+class ActiveTrainingInfo:
+    task_id: int
+    window_id: str
+    edge_id: int
+    camera_id: int
+    started_at: float
+
+
+@dataclass(frozen=True)
+class TrainingLease:
+    key: TrainingAdmissionKey
+    info: ActiveTrainingInfo
 
 
 class EkyaStyleCloudSchedulingController:
@@ -87,9 +109,8 @@ class EkyaStyleCloudSchedulingController:
         self.trainer = EkyaCloudTrainer(config, checkpoint_dir=self.logger.checkpoint_dir)
         self._background_threads: list[threading.Thread] = []
         self._window_threads_lock = threading.Lock()
-        self._pipeline_semaphore = threading.Semaphore(
-            max(1, int(config.retraining.max_concurrent_train_jobs))
-        )
+        self._training_admission_lock = threading.Lock()
+        self._active_training_by_key: dict[TrainingAdmissionKey, ActiveTrainingInfo] = {}
         self._adoption_lock = threading.Lock()
         self._summary_lock = threading.Lock()
         self._previous_val_map = 0.0
@@ -176,6 +197,10 @@ class EkyaStyleCloudSchedulingController:
         self.logger.write_summary()
 
     def _launch_window_pipeline(self, window: CompletedFrameWindow) -> None:
+        if bool(self.config.retraining.drop_training_when_active_same_connection):
+            if self._has_active_training(window):
+                return
+
         thread = threading.Thread(
             target=self._run_window_pipeline_guarded,
             args=(window,),
@@ -188,8 +213,7 @@ class EkyaStyleCloudSchedulingController:
 
     def _run_window_pipeline_guarded(self, window: CompletedFrameWindow) -> None:
         try:
-            with self._pipeline_semaphore:
-                self._run_window_pipeline(window)
+            self._run_window_pipeline(window)
         except Exception as exc:
             logger.warning(
                 "ekya_style_cloud_scheduling window pipeline failed: window={} error={}",
@@ -242,29 +266,37 @@ class EkyaStyleCloudSchedulingController:
             teacher_labeling_time_s=teacher_labeling_time_s,
             microprofile_time_s=microprofile_time_s,
         )
-        self.logger.append_scheduler_event(
-            {
-                "edge_id": int(window.edge_id),
-                "camera_id": int(window.camera_id),
-                **decision.as_dict(),
-            }
-        )
+        scheduler_row = {
+            "edge_id": int(window.edge_id),
+            "camera_id": int(window.camera_id),
+            **decision.as_dict(),
+        }
         training_result: TrainingResult | None = None
         adopted = False
+        lease: TrainingLease | None = None
         if decision.trains:
-            training_result = self.trainer.train(
-                window=window,
-                decision=decision,
-                teacher_labels=teacher_labels,
-                previous_val_map=self._previous_val_map_snapshot(
-                    window.edge_id,
-                    window.camera_id,
-                ),
-                base_state_dict=base_state_dict or {},
-                model_builder=inference.build_student_model_clone,
-            )
-            self.logger.append_training_event(training_result.as_event_row())
-            adopted = self._maybe_adopt(training_result)
+            lease = self._try_begin_training(window)
+            if lease is None:
+                scheduler_row = _scheduler_row_for_training_admission_skip(scheduler_row)
+        self.logger.append_scheduler_event(scheduler_row)
+
+        if lease is not None:
+            try:
+                training_result = self.trainer.train(
+                    window=window,
+                    decision=decision,
+                    teacher_labels=teacher_labels,
+                    previous_val_map=self._previous_val_map_snapshot(
+                        window.edge_id,
+                        window.camera_id,
+                    ),
+                    base_state_dict=base_state_dict or {},
+                    model_builder=inference.build_student_model_clone,
+                )
+                self.logger.append_training_event(training_result.as_event_row())
+                adopted = self._maybe_adopt(training_result)
+            finally:
+                self._end_training(lease)
 
         self.logger.record_window_metrics(
             int(window.task_id),
@@ -280,6 +312,47 @@ class EkyaStyleCloudSchedulingController:
             edge_id=int(window.edge_id),
             camera_id=int(window.camera_id),
         )
+
+    def _training_admission_key(self, window: CompletedFrameWindow) -> TrainingAdmissionKey:
+        scope = str(
+            self.config.retraining.training_admission_scope or "edge_camera"
+        ).strip().lower()
+        if scope == "edge_camera":
+            return TrainingAdmissionKey(
+                edge_id=int(window.edge_id),
+                camera_id=int(window.camera_id),
+            )
+        if scope == "edge_only":
+            return TrainingAdmissionKey(edge_id=int(window.edge_id), camera_id=None)
+        if scope == "global":
+            return TrainingAdmissionKey(edge_id=None, camera_id=None)
+        raise ValueError(f"unsupported Ekya training_admission_scope: {scope!r}")
+
+    def _has_active_training(self, window: CompletedFrameWindow) -> bool:
+        key = self._training_admission_key(window)
+        with self._training_admission_lock:
+            return key in self._active_training_by_key
+
+    def _try_begin_training(self, window: CompletedFrameWindow) -> TrainingLease | None:
+        key = self._training_admission_key(window)
+        info = ActiveTrainingInfo(
+            task_id=int(window.task_id),
+            window_id=str(window.window_id),
+            edge_id=int(window.edge_id),
+            camera_id=int(window.camera_id),
+            started_at=time.time(),
+        )
+        with self._training_admission_lock:
+            if key in self._active_training_by_key:
+                return None
+            self._active_training_by_key[key] = info
+        return TrainingLease(key=key, info=info)
+
+    def _end_training(self, lease: TrainingLease) -> None:
+        with self._training_admission_lock:
+            current = self._active_training_by_key.get(lease.key)
+            if current == lease.info:
+                self._active_training_by_key.pop(lease.key, None)
 
     def _update_frame_quality(
         self,
@@ -400,6 +473,24 @@ class EkyaStyleCloudSchedulingController:
 def _mean(values) -> float | None:
     numbers = [float(value) for value in values if value is not None]
     return sum(numbers) / len(numbers) if numbers else None
+
+
+def _scheduler_row_for_training_admission_skip(row: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(row)
+    inference_weight = float(updated.get("inference_resource_weight") or 0.0)
+    training_weight = float(updated.get("training_resource_weight") or 0.0)
+    updated.update(
+        {
+            "inference_resource_weight": inference_weight + training_weight,
+            "training_resource_weight": 0.0,
+            "selected_hp_id": "",
+            "selected_epochs": 0,
+            "selected_lr": 0.0,
+            "selected_subsample": 0.0,
+            "decision_reason": "same_connection_training_active",
+        }
+    )
+    return updated
 
 
 def _model_update_rejection_reason(

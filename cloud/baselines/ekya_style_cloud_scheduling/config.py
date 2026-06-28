@@ -96,6 +96,8 @@ class SchedulerConfig:
 class RetrainingConfig:
     adopt_only_if_improved: bool = True
     min_map_gain_to_adopt: float = 0.0
+    drop_training_when_active_same_connection: bool = True
+    training_admission_scope: str = "edge_camera"
     max_concurrent_train_jobs: int = 1
     train_mode: str = "full"
     trainable_param_ratio: float | None = None
@@ -192,6 +194,14 @@ class EkyaStyleCloudSchedulingConfig:
             )
         if self.retraining.weight_decay < 0.0:
             raise ValueError("ekya_style_cloud_scheduling.retraining.weight_decay must be >= 0")
+        scope = str(
+            self.retraining.training_admission_scope or "edge_camera"
+        ).strip().lower()
+        if scope not in {"edge_camera", "edge_only", "global"}:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.retraining.training_admission_scope "
+                "must be edge_camera, edge_only, or global"
+            )
 
 
 def parse_ekya_style_config(
@@ -526,6 +536,14 @@ def _retraining_config(
     return RetrainingConfig(
         adopt_only_if_improved=bool(_get(value, "adopt_only_if_improved", True)),
         min_map_gain_to_adopt=float(_get(value, "min_map_gain_to_adopt", 0.0)),
+        drop_training_when_active_same_connection=bool(
+            _get(value, "drop_training_when_active_same_connection", True)
+        ),
+        training_admission_scope=str(
+            _get(value, "training_admission_scope", "edge_camera") or "edge_camera"
+        )
+        .strip()
+        .lower(),
         max_concurrent_train_jobs=int(
             _configured_value(
                 _get(value, "max_concurrent_train_jobs", None),
