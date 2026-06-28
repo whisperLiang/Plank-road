@@ -149,6 +149,41 @@ def test_summary_rows_training_mean_uses_actual_training_jobs() -> None:
     assert summary[0]["mean_adaptation_ms"] == 55530.0
 
 
+def test_summary_rows_training_job_count_prefers_windowed_successes() -> None:
+    manifest = {
+        "comparison_id": "comparison-test",
+        "student_model": "rfdetr_nano",
+        "teacher_model": "rtdetr_x",
+        "runs": [
+            {
+                "run_id": "accuracy-r1",
+                "method": "accuracy_trigger_cloud_retraining",
+                "scenario_name": "road",
+                "edge_ids": [1],
+            }
+        ],
+    }
+    events = [
+        {"run_id": "accuracy-r1", "event_name": "training_job_succeeded", "job_id": "old-a"},
+        {"run_id": "accuracy-r1", "event_name": "training_job_succeeded", "job_id": "old-b"},
+        {
+            "run_id": "accuracy-r1",
+            "event_name": "training_job_succeeded",
+            "job_id": "current",
+        },
+        {
+            "run_id": "accuracy-r1",
+            "event_name": "training_job_succeeded",
+            "job_id": "current",
+            "window_id": "window-current",
+        },
+    ]
+
+    summary = _summary_rows(manifest, frames=[], events=events, uploads=[], latency=[])
+
+    assert summary[0]["num_training_jobs"] == 1
+
+
 def test_accuracy_trigger_upload_summary_uses_encoded_raw_bytes(tmp_path: Path) -> None:
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)

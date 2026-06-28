@@ -881,7 +881,9 @@ def test_ekya_training_lease_released_after_successful_training(tmp_path: Path) 
 
     assert controller.trainer.calls
     assert controller._active_training_by_key == {}
-    assert len(read_csv(controller.output_dir / "training_events.csv")) == 1
+    training_rows = read_csv(controller.output_dir / "training_events.csv")
+    assert len(training_rows) == 1
+    assert training_rows[0]["train_gpu_fraction"] == "0.5"
     assert len(read_csv(controller.output_dir / "model_update_events.csv")) == 1
 
 

@@ -17,6 +17,8 @@ from tools.experiments.plot_plank_road_baseline_figures import (
     EXPORT_SUFFIXES,
     _aggregate_breakdown,
     _event_origins,
+    _filter_fig2_timeline_rows,
+    _frame_inference_intervals,
     _paired_event_intervals,
     _relative_event_seconds,
     _relative_stage_intervals,
@@ -408,6 +410,51 @@ def test_event_timeline_is_zeroed_per_method_run() -> None:
     assert _relative_event_seconds(rows[3], origins) == 0.5
 
 
+def test_fig2_timeline_drops_unanchored_training_success() -> None:
+    rows = [
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "training_job_succeeded",
+            "event_time_ms": "1000",
+            "job_id": "old-job",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "trigger_decision",
+            "event_time_ms": "5000",
+            "job_id": "job-1",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "training_job_succeeded",
+            "event_time_ms": "6000",
+            "job_id": "job-1",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "trigger",
+            "edge_id": "1",
+            "event_name": "model_update_applied",
+            "event_time_ms": "6500",
+            "job_id": "job-1",
+        },
+    ]
+
+    filtered = _filter_fig2_timeline_rows(rows)
+
+    assert [row["job_id"] for row in filtered] == ["job-1", "job-1", "job-1"]
+
+
 def test_stage_intervals_are_zeroed_per_run_edge() -> None:
     plank_key = ("road", "plank_road", "plank", "1")
     trigger_key = ("road", "accuracy_trigger_cloud_retraining", "trigger", "1")
@@ -423,6 +470,31 @@ def test_stage_intervals_are_zeroed_per_run_edge() -> None:
         (plank_key, 0.0, 0.5, "uploading"),
         (trigger_key, 0.0, 1.0, "training"),
     ]
+
+
+def test_frame_inference_intervals_group_by_method_run_edge() -> None:
+    rows = [
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "ekya-r1",
+            "edge_id": "1",
+            "timestamp_ms": "1000",
+            "timing_inference_ms": "25",
+        },
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "ekya-r1",
+            "edge_id": "1",
+            "timestamp_ms": "1400",
+            "timing_inference_ms": "40",
+        },
+    ]
+
+    intervals = _frame_inference_intervals(rows)
+
+    assert intervals == [(("road", "ekya", "ekya-r1", "1"), 1000.0, 1440.0, "inference")]
 
 
 def test_event_stage_pairing_ignores_orphan_success_before_start() -> None:

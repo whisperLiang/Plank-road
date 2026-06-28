@@ -992,12 +992,25 @@ def _summary_rows(
                 mean_upload_bytes=mean(row.get("total_upload_bytes") for row in run_uploads),
                 mean_raw_exposure_ratio=mean(row.get("raw_exposure_ratio") for row in run_uploads),
                 mean_training_ms=mean_positive(row.get("training_ms") for row in run_latency),
-                num_training_jobs=count_event(run_events, "training_job_succeeded"),
+                num_training_jobs=count_training_jobs(run_events),
                 num_model_updates=count_event(run_events, "model_update_applied"),
                 num_trigger_decisions=count_event(run_events, "trigger_decision"),
             )
         )
     return rows
+
+
+def count_training_jobs(rows: list[dict[str, Any]]) -> int:
+    successes = [row for row in rows if row.get("event_name") == "training_job_succeeded"]
+    current_window_successes = [row for row in successes if str(row.get("window_id", "") or "")]
+    candidates = current_window_successes or successes
+    seen: set[tuple[str, str, str]] = set()
+    for row in candidates:
+        job_id = str(row.get("job_id", "") or "")
+        window_id = str(row.get("window_id", "") or "")
+        event_time = "" if job_id or window_id else str(row.get("event_time_ms", "") or "")
+        seen.add((job_id, window_id, event_time))
+    return len(seen)
 
 
 def _coalesce_window_rows(

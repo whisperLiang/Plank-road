@@ -218,6 +218,7 @@ def _window_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, A
 
 def _adaptation_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, Any]]:
     rows = []
+    scheduler_decision_times = _scheduler_decision_timestamps(raw_dir)
     for raw in read_csv(raw_dir / "training_events.csv"):
         edge_id = _edge_id(raw)
         task_id = str(raw.get("task_id", ""))
@@ -268,18 +269,79 @@ def _adaptation_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[st
             )
         )
     for raw in read_csv(raw_dir / "scheduler_events.csv"):
+        key = _task_key(raw)
+        job_id = f"ekya-edge-{key[0]}-task-{key[2]}" if _scheduler_row_trains(raw) else ""
         rows.append(
             empty_row(
                 ADAPTATION_FIELDS,
                 **base_run,
                 edge_id=_edge_id(raw),
                 event_name="trigger_decision",
+                event_time_ms=scheduler_decision_times.get(key),
                 window_id=_window_id(raw),
+                job_id=job_id,
                 message=raw.get("decision_reason") or raw.get("scheduler_name"),
             )
         )
     rows.sort(key=lambda row: (str(row.get("run_id", "")), str(row.get("event_time_ms", ""))))
     return rows
+
+
+def _scheduler_decision_timestamps(raw_dir: Path) -> dict[tuple[int, int, int], int]:
+    training_starts: dict[tuple[int, int, int], int] = {}
+    for row in read_csv(raw_dir / "training_events.csv"):
+        start_ms = _timestamp_ms(row.get("train_start_time"))
+        if start_ms is not None:
+            training_starts[_task_key(row)] = start_ms
+
+    window_completion_s: dict[tuple[int, int, int], float] = {}
+    for filename in ("per_frame_metrics.csv", "display_events.csv"):
+        for row in read_csv(raw_dir / filename):
+            timestamp_s = _latest_frame_timestamp_s(row)
+            if timestamp_s is None:
+                continue
+            key = _task_key(row)
+            window_completion_s[key] = max(
+                timestamp_s,
+                window_completion_s.get(key, 0.0),
+            )
+
+    timestamps: dict[tuple[int, int, int], int] = {}
+    for row in read_csv(raw_dir / "scheduler_events.csv"):
+        key = _task_key(row)
+        explicit_ms = _timestamp_ms(row.get("decision_time"))
+        if explicit_ms is not None:
+            timestamps[key] = explicit_ms
+            continue
+        completion_s = window_completion_s.get(key)
+        pipeline_s = optional_float(row.get("total_pipeline_time_s"))
+        if completion_s is not None and pipeline_s is not None:
+            timestamps[key] = int((completion_s + pipeline_s) * 1000)
+            continue
+        if _scheduler_row_trains(row) and key in training_starts:
+            timestamps[key] = training_starts[key]
+    return timestamps
+
+
+def _latest_frame_timestamp_s(row: Mapping[str, Any]) -> float | None:
+    values = [
+        optional_float(row.get(field))
+        for field in (
+            "timestamp_cloud_send",
+            "timestamp_inference_end",
+            "timestamp_edge_display",
+            "timestamp_edge_receive",
+            "timestamp_edge_capture",
+        )
+    ]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def _scheduler_row_trains(row: Mapping[str, Any]) -> bool:
+    return bool(str(row.get("selected_hp_id", "") or "")) and (
+        optional_float(row.get("training_resource_weight")) or 0.0
+    ) > 0.0
 
 
 def _upload_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -318,6 +380,16 @@ def _latency_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, 
         training_ms = _seconds_to_ms(raw.get("training_time_s"))
         teacher_ms = _seconds_to_ms(raw.get("teacher_labeling_time_s"))
         micro_ms = _seconds_to_ms(raw.get("microprofile_time_s"))
+        has_training = training_ms is not None and training_ms > 0
+        total_adaptation_ms = (
+            sum(
+                value
+                for value in (teacher_ms, micro_ms, training_ms)
+                if value is not None
+            )
+            if has_training
+            else ""
+        )
         rows.append(
             empty_row(
                 LATENCY_FIELDS,
@@ -330,11 +402,7 @@ def _latency_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, 
                 training_ms=training_ms,
                 model_update_download_ms=0,
                 model_apply_ms=0,
-                total_adaptation_ms=sum(
-                    value
-                    for value in (teacher_ms, micro_ms, training_ms)
-                    if value is not None
-                ),
+                total_adaptation_ms=total_adaptation_ms,
             )
         )
     return rows
@@ -381,6 +449,14 @@ def _read_summary(path: Path) -> dict[str, Any]:
 
 def _frame_key(row: Mapping[str, Any]) -> FrameKey:
     return (_edge_id(row), _camera_id(row), int(row.get("frame_idx") or 0))
+
+
+def _task_key(row: Mapping[str, Any]) -> tuple[int, int, int]:
+    return (
+        _edge_id(row),
+        _camera_id(row),
+        _optional_int(row.get("task_id"), default=0),
+    )
 
 
 def _edge_id(row: Mapping[str, Any]) -> int:

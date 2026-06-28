@@ -427,7 +427,14 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
             {
                 "method": "ekya_style_cloud_scheduling",
                 "run_id": "ekya-run",
+                "edge_id": 1,
+                "camera_id": 0,
                 "task_id": 0,
+                "teacher_labeling_time_s": 0.04,
+                "microprofile_time_s": 0.03,
+                "total_pipeline_time_s": 0.07,
+                "inference_resource_weight": 0.0,
+                "training_resource_weight": 1.0,
                 "scheduler_name": "ekya_thief_style",
                 "selected_hp_id": "fixed",
                 "decision_reason": "selected",
@@ -523,8 +530,34 @@ def test_ekya_converter_training_mean_ignores_inference_only_windows(
     latencies = read_csv(output_dir / "latency_breakdown.csv")
     summary = read_csv(output_dir / "summary.csv")[0]
     assert [row["training_ms"] for row in latencies] == ["200.0", "0.0"]
+    assert [row["total_adaptation_ms"] for row in latencies] == ["270.0", ""]
     assert summary["mean_training_ms"] == "200.0"
-    assert summary["mean_adaptation_ms"] == "150.0"
+    assert summary["mean_adaptation_ms"] == "270.0"
+    events = read_csv(output_dir / "adaptation_events.csv")
+    trigger = next(row for row in events if row["event_name"] == "trigger_decision")
+    assert trigger["event_time_ms"] == "10150"
+    assert trigger["job_id"] == "ekya-edge-1-task-0"
+
+
+def test_ekya_converter_training_latency_stays_wall_clock_with_split_resources(
+    tmp_path: Path,
+) -> None:
+    raw_dir = _raw_ekya_dir(tmp_path)
+    output_dir = tmp_path / "normalized"
+    _write_raw_ekya_fixture(raw_dir)
+    scheduler_rows = read_csv(raw_dir / "scheduler_events.csv")
+    scheduler_rows[0]["inference_resource_weight"] = 0.5
+    scheduler_rows[0]["training_resource_weight"] = 0.5
+    write_csv(raw_dir / "scheduler_events.csv", SCHEDULER_FIELDS, scheduler_rows)
+
+    convert_ekya_style_results(raw_dir=raw_dir, output_dir=output_dir)
+
+    latency = read_csv(output_dir / "latency_breakdown.csv")[0]
+    summary = read_csv(output_dir / "summary.csv")[0]
+    assert latency["training_ms"] == "200.0"
+    assert latency["total_adaptation_ms"] == "270.0"
+    assert summary["mean_training_ms"] == "200.0"
+    assert summary["mean_adaptation_ms"] == "270.0"
 
 
 def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None:

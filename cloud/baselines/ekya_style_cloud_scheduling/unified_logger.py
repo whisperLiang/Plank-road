@@ -122,6 +122,7 @@ SCHEDULER_FIELDS = [
     "edge_id",
     "camera_id",
     "task_id",
+    "decision_time",
     "scheduler_name",
     "teacher_labeling_time_s",
     "microprofile_time_s",

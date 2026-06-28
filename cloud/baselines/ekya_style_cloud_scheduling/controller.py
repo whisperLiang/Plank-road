@@ -282,6 +282,7 @@ class EkyaStyleCloudSchedulingController:
         scheduler_row = {
             "edge_id": int(window.edge_id),
             "camera_id": int(window.camera_id),
+            "decision_time": time.time(),
             **decision.as_dict(),
         }
         training_result: TrainingResult | None = None
@@ -309,7 +310,11 @@ class EkyaStyleCloudSchedulingController:
                     base_state_dict=base_state_dict or {},
                     model_builder=inference.build_student_model_clone,
                 )
-                self.logger.append_training_event(training_result.as_event_row())
+                self.logger.append_training_event(
+                    training_result.as_event_row(
+                        train_gpu_fraction=decision.training_resource_weight
+                    )
+                )
                 adopted = self._maybe_adopt(training_result)
             finally:
                 self._end_training(lease)

@@ -59,6 +59,14 @@ EVENT_LABELS = {
     "training_job_succeeded": "Training done",
     "model_update_applied": "Update applied",
 }
+FIG2_ANCHOR_EVENTS = {
+    "trigger_decision",
+    "bundle_upload_done",
+    "window_uploaded",
+    "teacher_annotation_done",
+    "model_update_applied",
+}
+FIG2_CHAIN_EVENTS = {"training_job_succeeded"}
 METHOD_COLORS = {
     "plank_road": "#0F4D92",
     "pure_edge_local_updating": "#767676",
@@ -81,6 +89,7 @@ COMPONENT_COLORS = (
 )
 COMPONENT_HATCHES = ("", "///", "\\\\\\", "...", "xx", "oo")
 STAGE_COLORS = {
+    "inference": "#B4C0E4",
     "uploading": "#7884B4",
     "waiting_gpu_lease": "#D8D8D8",
     "teacher_annotation": "#AADCA9",
@@ -298,6 +307,40 @@ def _relative_event_seconds(
     return (float(timestamp) - origin) / 1000.0
 
 
+def _filter_fig2_timeline_rows(
+    rows: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    materialized = list(rows)
+    anchors: dict[tuple[str, str, str, str], tuple[set[str], set[str]]] = defaultdict(
+        lambda: (set(), set())
+    )
+    for row in materialized:
+        if row.get("event_name") not in FIG2_ANCHOR_EVENTS:
+            continue
+        job_id = str(row.get("job_id", "") or "")
+        window_id = str(row.get("window_id", "") or "")
+        job_ids, window_ids = anchors[_event_group_key(row)]
+        if job_id:
+            job_ids.add(job_id)
+        if window_id:
+            window_ids.add(window_id)
+
+    filtered: list[Mapping[str, Any]] = []
+    for row in materialized:
+        event_name = str(row.get("event_name", "") or "")
+        if event_name not in FIG2_CHAIN_EVENTS:
+            filtered.append(row)
+            continue
+        job_ids, window_ids = anchors[_event_group_key(row)]
+        job_id = str(row.get("job_id", "") or "")
+        window_id = str(row.get("window_id", "") or "")
+        if not job_ids and not window_ids:
+            filtered.append(row)
+        elif (job_id and job_id in job_ids) or (window_id and window_id in window_ids):
+            filtered.append(row)
+    return filtered
+
+
 def _relative_stage_intervals(
     intervals: Iterable[tuple[tuple[str, str, str, str], float, float, str]],
 ) -> list[tuple[tuple[str, str, str, str], float, float, str]]:
@@ -308,6 +351,30 @@ def _relative_stage_intervals(
     return [
         (key, (start - origins[key]) / 1000.0, (end - origins[key]) / 1000.0, stage)
         for key, start, end, stage in materialized
+    ]
+
+
+def _frame_inference_intervals(
+    frame_rows: Iterable[Mapping[str, Any]],
+) -> list[tuple[tuple[str, str, str, str], float, float, str]]:
+    spans: dict[tuple[str, str, str, str], list[float]] = defaultdict(
+        lambda: [math.inf, -math.inf]
+    )
+    for row in frame_rows:
+        timestamp = optional_float(row.get("timestamp_ms"))
+        if timestamp is None:
+            continue
+        inference_ms = optional_float(row.get("timing_inference_ms"))
+        latency_ms = optional_float(row.get("latency_ms"))
+        duration = inference_ms if inference_ms is not None else latency_ms
+        duration = max(0.0, float(duration or 0.0))
+        key = _event_group_key(row)
+        spans[key][0] = min(spans[key][0], float(timestamp))
+        spans[key][1] = max(spans[key][1], float(timestamp) + duration)
+    return [
+        (key, start, end, "inference")
+        for key, (start, end) in spans.items()
+        if math.isfinite(start) and math.isfinite(end) and end > start
     ]
 
 
@@ -613,6 +680,7 @@ def _plot_fig2(
         if row.get("event_name") in EVENT_MARKERS
         and optional_float(row.get("event_time_ms")) is not None
     ]
+    rows = list(_filter_fig2_timeline_rows(rows))
     if not rows:
         return [], "adaptation event timestamps missing", []
     scenarios = sorted({str(row.get("scenario_name", "")) for row in rows})
@@ -646,7 +714,7 @@ def _plot_fig2(
                         alpha=0.9,
                     )
         axis.set_yticks(range(len(methods)), [_method_label(item) for item in methods])
-        axis.set_xlabel("Time since method trigger/event (s)")
+        axis.set_xlabel("Wall-clock time since method trigger/event (s)")
         axis.set_title(scenario)
         axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
         if plotted_x:
@@ -1033,6 +1101,7 @@ def _plot_fig6(
 def _plot_fig7(
     resource_rows: list[dict[str, str]],
     event_rows: list[dict[str, str]],
+    frame_rows: list[dict[str, str]],
     figure_dir: Path,
 ) -> tuple[list[str], str | None, list[str]]:
     grouped: dict[tuple[str, str, str, str], list[tuple[float, str]]] = defaultdict(list)
@@ -1048,7 +1117,7 @@ def _plot_fig7(
             str(row.get("edge_id", "")),
         )
         grouped[key].append((timestamp, stage))
-    intervals = []
+    intervals = _frame_inference_intervals(frame_rows)
     for key, points in grouped.items():
         points.sort()
         for (start, stage), (end, _) in zip(points, points[1:]):
@@ -1079,7 +1148,8 @@ def _plot_fig7(
                 color=STAGE_COLORS[stage],
                 edgecolor="white",
                 linewidth=0.55,
-                height=0.5,
+                height=0.64 if stage == "inference" else 0.46,
+                alpha=0.55 if stage == "inference" else 0.95,
             )
         axis.set_yticks(range(len(labels)), labels)
         axis.invert_yaxis()
@@ -1298,6 +1368,7 @@ def plot_figures(
         "fig7_resource_timeline": lambda: _plot_fig7(
             inputs["resource_timeline.csv"],
             inputs["adaptation_events.csv"],
+            inputs["frame_metrics.csv"],
             figure_dir,
         ),
         "fig8_component_ablation_style_summary": lambda: _plot_fig8(
