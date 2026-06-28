@@ -149,6 +149,39 @@ def test_summary_rows_training_mean_uses_actual_training_jobs() -> None:
     assert summary[0]["mean_adaptation_ms"] == 55530.0
 
 
+def test_accuracy_trigger_upload_summary_uses_encoded_raw_bytes(tmp_path: Path) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    _write_jsonl(
+        comparison_dir
+        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        [
+            {
+                "event": "bundle_upload_done",
+                "timestamp_ms": 1000,
+                "window_id": "window-a",
+                "raw_frame_bytes": 70,
+                "feature_bytes": 0,
+                "prediction_metadata_bytes": 30,
+                "total_upload_bytes": 100,
+                "raw_sample_count": 1,
+                "feature_sample_count": 0,
+            }
+        ],
+    )
+
+    normalize(comparison_dir, manifest_path)
+
+    uploads = read_csv(comparison_dir / "normalized/upload_breakdown.csv")
+    row = next(item for item in uploads if item["run_id"] == "accuracy-r1")
+    assert row["raw_frame_bytes"] == "70"
+    assert row["total_upload_bytes"] == "70"
+
+    summary = read_csv(comparison_dir / "normalized/summary.csv")
+    row = next(item for item in summary if item["run_id"] == "accuracy-r1")
+    assert row["mean_upload_bytes"] == "70.0"
+
+
 def test_manifest_requires_log_timezone(tmp_path: Path) -> None:
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)

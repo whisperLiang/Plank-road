@@ -529,6 +529,11 @@ def _baseline_window_from_request(request) -> BaselineWindowPayload:
         window_start_frame_id=int(request.window_start_frame_id),
         window_end_frame_id=int(request.window_end_frame_id),
         timestamp_ms=int(request.timestamp_ms),
+        source_window_id=int(request.source_window_id),
+        source_start_frame_idx=int(request.source_start_frame_idx),
+        source_end_frame_idx=int(request.source_end_frame_idx),
+        source_frame_count=int(request.source_frame_count),
+        uploaded_keyframe_count=int(request.uploaded_keyframe_count),
         selected_samples=tuple(
             BaselineWindowSample(
                 frame_id=int(sample.frame_id),
@@ -587,7 +592,6 @@ def _ekya_frame_upload_from_proto(message):
         timestamp_edge_send=float(message.timestamp_edge_send),
         image_shape=(int(shape[0]), int(shape[1])),
         encoded_frame_jpeg=bytes(message.encoded_frame_jpeg or b""),
-        jpeg_quality=int(message.jpeg_quality),
     )
 
 

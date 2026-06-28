@@ -252,7 +252,7 @@ server:
   baselines:
     ekya_style_cloud_scheduling:
       edge_streaming:
-        jpeg_quality: 85
+        upload_queue_size: 8
       retraining:
         min_map_gain_to_adopt: 0.0
 ```

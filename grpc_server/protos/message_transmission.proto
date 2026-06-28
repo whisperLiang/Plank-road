@@ -276,6 +276,11 @@ message BaselineWindowRequest {
   int64 window_end_frame_id = 9;
   int64 timestamp_ms = 10;
   repeated BaselineWindowSample selected_samples = 11;
+  int64 source_window_id = 12;
+  int64 source_start_frame_idx = 13;
+  int64 source_end_frame_idx = 14;
+  int64 source_frame_count = 15;
+  int64 uploaded_keyframe_count = 16;
 }
 
 message BaselineInferenceRequest {
@@ -311,6 +316,7 @@ message BaselineCommandReply {
 }
 
 message EkyaFrameUpload {
+  reserved 13;
   string method = 1;
   string run_id = 2;
   int64 edge_id = 3;
@@ -323,7 +329,6 @@ message EkyaFrameUpload {
   double timestamp_edge_send = 10;
   repeated int64 image_shape = 11;
   bytes encoded_frame_jpeg = 12;
-  int64 jpeg_quality = 13;
 }
 
 message EkyaDetectionBox {

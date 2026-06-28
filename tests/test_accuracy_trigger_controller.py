@@ -644,6 +644,47 @@ def test_cloud_controller_window_annotation_is_single_batch_without_pending_queu
     assert backend.requests == []
 
 
+def test_cloud_controller_accepts_empty_source_window_without_teacher_work(tmp_path) -> None:
+    backend = RecordingTrainingBackend()
+    annotator = RecordingSharedAnnotator([])
+    controller = DistributedBaselineController(
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="run-a",
+        results_root=str(tmp_path),
+        training_backend=backend,
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_method_config=_accuracy_config(),
+        sample_pool_max_samples=64,
+        model_weights_path="weights.pt",
+        tinynext_input_size=None,
+        teacher_annotator=annotator,
+    )
+
+    response = controller.upload_accuracy_trigger_window(
+        BaselineWindowPayload.empty_source_window(
+            run_id="run-a",
+            baseline_method="accuracy_trigger_cloud_retraining",
+            edge_id=1,
+            model_name="tiny",
+            model_version="0",
+            video_source="road.mp4",
+            window_id="empty-window-0",
+            window_start_frame_id=1,
+            window_end_frame_id=60,
+            source_window_id=0,
+            source_start_frame_idx=0,
+            source_end_frame_idx=59,
+            source_frame_count=60,
+        )
+    )
+
+    assert response["accepted"] is True
+    assert response["selected_count"] == 0
+    assert response["uploaded_keyframe_count"] == 0
+    assert annotator.sample_ids == []
+    assert backend.requests == []
+
+
 def test_cloud_controller_defers_retryable_window_annotation_without_dropping_window(
     tmp_path,
 ) -> None:

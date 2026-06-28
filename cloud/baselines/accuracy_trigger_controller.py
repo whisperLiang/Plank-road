@@ -86,6 +86,11 @@ class AccuracyTriggerFrame:
 @dataclass(frozen=True)
 class AccuracyTriggerWindow:
     window_id: str
+    source_window_id: int
+    source_start_frame_idx: int
+    source_end_frame_idx: int
+    source_frame_count: int
+    uploaded_keyframe_count: int
     samples: tuple[AccuracyTriggerFrame, ...]
     accuracy: float
     foreground_accuracy: float
@@ -114,6 +119,11 @@ class AccuracyTriggerSubmission:
     model_version: str
     video_source: str
     window_id: str
+    source_window_id: int
+    source_start_frame_idx: int
+    source_end_frame_idx: int
+    source_frame_count: int
+    uploaded_keyframe_count: int
     trigger_window_frame_ids: tuple[int, ...]
     training_samples: tuple[AccuracyTriggerFrame, ...]
     window_accuracy: float
@@ -147,6 +157,11 @@ class AccuracyTriggerSubmission:
             "accuracy_gap": float(self.accuracy_gap),
             "active_pending": bool(self.active_pending),
             "buffered_window_count": int(self.buffered_window_count),
+            "source_window_id": int(self.source_window_id),
+            "source_start_frame_idx": int(self.source_start_frame_idx),
+            "source_end_frame_idx": int(self.source_end_frame_idx),
+            "source_frame_count": int(self.source_frame_count),
+            "uploaded_keyframe_count": int(self.uploaded_keyframe_count),
             "trigger_window_frame_ids": [int(v) for v in self.trigger_window_frame_ids],
             "training_frame_ids": [int(v) for v in self.training_frame_ids],
         }
@@ -306,6 +321,11 @@ class AccuracyTriggerController:
                 state,
                 frames,
                 window_id=window_id,
+                source_window_id=int(payload.source_window_id),
+                source_start_frame_idx=int(payload.source_start_frame_idx),
+                source_end_frame_idx=int(payload.source_end_frame_idx),
+                source_frame_count=int(payload.source_frame_count),
+                uploaded_keyframe_count=int(payload.uploaded_keyframe_count),
             )
 
     def record_submission_result(
@@ -537,6 +557,15 @@ class AccuracyTriggerController:
                 "last_decision": (
                     {
                         "window_id": state.last_decision.window_id,
+                        "source_window_id": state.last_decision.source_window_id,
+                        "source_start_frame_idx": (
+                            state.last_decision.source_start_frame_idx
+                        ),
+                        "source_end_frame_idx": state.last_decision.source_end_frame_idx,
+                        "source_frame_count": state.last_decision.source_frame_count,
+                        "uploaded_keyframe_count": (
+                            state.last_decision.uploaded_keyframe_count
+                        ),
                         "accuracy": state.last_decision.accuracy,
                         "foreground_accuracy": state.last_decision.foreground_accuracy,
                         "agreement_stats": state.last_decision.agreement_stats.as_dict(),
@@ -563,6 +592,11 @@ class AccuracyTriggerController:
         samples: tuple[AccuracyTriggerFrame, ...],
         *,
         window_id: str,
+        source_window_id: int,
+        source_start_frame_idx: int,
+        source_end_frame_idx: int,
+        source_frame_count: int,
+        uploaded_keyframe_count: int,
     ) -> AccuracyTriggerSubmission | None:
         agreement_stats = detection_agreement_stats(
             (
@@ -599,6 +633,11 @@ class AccuracyTriggerController:
         triggered = trigger_reason != "none"
         window = AccuracyTriggerWindow(
             window_id=window_id,
+            source_window_id=int(source_window_id),
+            source_start_frame_idx=int(source_start_frame_idx),
+            source_end_frame_idx=int(source_end_frame_idx),
+            source_frame_count=int(source_frame_count),
+            uploaded_keyframe_count=int(uploaded_keyframe_count),
             samples=samples,
             accuracy=accuracy,
             foreground_accuracy=foreground_accuracy,
@@ -625,7 +664,9 @@ class AccuracyTriggerController:
             "accuracy_gap={:.4f} active_pending={} triggered={} trigger_reason={} "
             "buffer_size={} total_samples={} evaluated_samples={} empty_empty={} "
             "teacher_only={} edge_only={} both_non_empty={} avg_teacher_boxes={:.4f} "
-            "avg_edge_boxes={:.4f} f1_p10={:.4f} f1_p50={:.4f} f1_p90={:.4f}",
+            "avg_edge_boxes={:.4f} f1_p10={:.4f} f1_p50={:.4f} f1_p90={:.4f} "
+            "source_window={} source_range={}-{} source_frame_count={} "
+            "uploaded_keyframe_count={}",
             key[1],
             accuracy,
             foreground_accuracy,
@@ -650,6 +691,11 @@ class AccuracyTriggerController:
             agreement_stats.f1_p10,
             agreement_stats.f1_p50,
             agreement_stats.f1_p90,
+            source_window_id,
+            source_start_frame_idx,
+            source_end_frame_idx,
+            source_frame_count,
+            uploaded_keyframe_count,
         )
         if not triggered:
             return None
@@ -662,6 +708,11 @@ class AccuracyTriggerController:
             model_version=key[3],
             video_source=str(samples[-1].video_source if samples else ""),
             window_id=window_id,
+            source_window_id=int(source_window_id),
+            source_start_frame_idx=int(source_start_frame_idx),
+            source_end_frame_idx=int(source_end_frame_idx),
+            source_frame_count=int(source_frame_count),
+            uploaded_keyframe_count=int(uploaded_keyframe_count),
             trigger_window_frame_ids=tuple(int(sample.frame_id) for sample in samples),
             training_samples=training_samples,
             window_accuracy=accuracy,

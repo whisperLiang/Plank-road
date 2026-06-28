@@ -377,7 +377,7 @@ class BaselineWindowSample(_message.Message):
     def __init__(self, frame_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ..., raw_frame: _Optional[bytes] = ..., edge_prediction_json: _Optional[str] = ..., confidence: _Optional[float] = ..., entropy: _Optional[float] = ..., quality_metadata_json: _Optional[str] = ..., upload_mode: _Optional[str] = ..., is_keyframe: bool = ...) -> None: ...
 
 class BaselineWindowRequest(_message.Message):
-    __slots__ = ("run_id", "baseline_method", "edge_id", "model_name", "model_version", "video_source", "window_id", "window_start_frame_id", "window_end_frame_id", "timestamp_ms", "selected_samples")
+    __slots__ = ("run_id", "baseline_method", "edge_id", "model_name", "model_version", "video_source", "window_id", "window_start_frame_id", "window_end_frame_id", "timestamp_ms", "selected_samples", "source_window_id", "source_start_frame_idx", "source_end_frame_idx", "source_frame_count", "uploaded_keyframe_count")
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     BASELINE_METHOD_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -389,6 +389,11 @@ class BaselineWindowRequest(_message.Message):
     WINDOW_END_FRAME_ID_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_MS_FIELD_NUMBER: _ClassVar[int]
     SELECTED_SAMPLES_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_WINDOW_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_START_FRAME_IDX_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_END_FRAME_IDX_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FRAME_COUNT_FIELD_NUMBER: _ClassVar[int]
+    UPLOADED_KEYFRAME_COUNT_FIELD_NUMBER: _ClassVar[int]
     run_id: str
     baseline_method: str
     edge_id: int
@@ -400,7 +405,12 @@ class BaselineWindowRequest(_message.Message):
     window_end_frame_id: int
     timestamp_ms: int
     selected_samples: _containers.RepeatedCompositeFieldContainer[BaselineWindowSample]
-    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., model_name: _Optional[str] = ..., model_version: _Optional[str] = ..., video_source: _Optional[str] = ..., window_id: _Optional[str] = ..., window_start_frame_id: _Optional[int] = ..., window_end_frame_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ..., selected_samples: _Optional[_Iterable[_Union[BaselineWindowSample, _Mapping]]] = ...) -> None: ...
+    source_window_id: int
+    source_start_frame_idx: int
+    source_end_frame_idx: int
+    source_frame_count: int
+    uploaded_keyframe_count: int
+    def __init__(self, run_id: _Optional[str] = ..., baseline_method: _Optional[str] = ..., edge_id: _Optional[int] = ..., model_name: _Optional[str] = ..., model_version: _Optional[str] = ..., video_source: _Optional[str] = ..., window_id: _Optional[str] = ..., window_start_frame_id: _Optional[int] = ..., window_end_frame_id: _Optional[int] = ..., timestamp_ms: _Optional[int] = ..., selected_samples: _Optional[_Iterable[_Union[BaselineWindowSample, _Mapping]]] = ..., source_window_id: _Optional[int] = ..., source_start_frame_idx: _Optional[int] = ..., source_end_frame_idx: _Optional[int] = ..., source_frame_count: _Optional[int] = ..., uploaded_keyframe_count: _Optional[int] = ...) -> None: ...
 
 class BaselineInferenceRequest(_message.Message):
     __slots__ = ("run_id", "baseline_method", "edge_id", "frame_id")
@@ -459,7 +469,7 @@ class BaselineCommandReply(_message.Message):
     def __init__(self, success: bool = ..., message: _Optional[str] = ..., command_json: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class EkyaFrameUpload(_message.Message):
-    __slots__ = ("method", "run_id", "edge_id", "camera_id", "task_id", "chunk_id", "frame_idx", "video_name", "timestamp_edge_capture", "timestamp_edge_send", "image_shape", "encoded_frame_jpeg", "jpeg_quality")
+    __slots__ = ("method", "run_id", "edge_id", "camera_id", "task_id", "chunk_id", "frame_idx", "video_name", "timestamp_edge_capture", "timestamp_edge_send", "image_shape", "encoded_frame_jpeg")
     METHOD_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -472,7 +482,6 @@ class EkyaFrameUpload(_message.Message):
     TIMESTAMP_EDGE_SEND_FIELD_NUMBER: _ClassVar[int]
     IMAGE_SHAPE_FIELD_NUMBER: _ClassVar[int]
     ENCODED_FRAME_JPEG_FIELD_NUMBER: _ClassVar[int]
-    JPEG_QUALITY_FIELD_NUMBER: _ClassVar[int]
     method: str
     run_id: str
     edge_id: int
@@ -485,8 +494,7 @@ class EkyaFrameUpload(_message.Message):
     timestamp_edge_send: float
     image_shape: _containers.RepeatedScalarFieldContainer[int]
     encoded_frame_jpeg: bytes
-    jpeg_quality: int
-    def __init__(self, method: _Optional[str] = ..., run_id: _Optional[str] = ..., edge_id: _Optional[int] = ..., camera_id: _Optional[int] = ..., task_id: _Optional[int] = ..., chunk_id: _Optional[int] = ..., frame_idx: _Optional[int] = ..., video_name: _Optional[str] = ..., timestamp_edge_capture: _Optional[float] = ..., timestamp_edge_send: _Optional[float] = ..., image_shape: _Optional[_Iterable[int]] = ..., encoded_frame_jpeg: _Optional[bytes] = ..., jpeg_quality: _Optional[int] = ...) -> None: ...
+    def __init__(self, method: _Optional[str] = ..., run_id: _Optional[str] = ..., edge_id: _Optional[int] = ..., camera_id: _Optional[int] = ..., task_id: _Optional[int] = ..., chunk_id: _Optional[int] = ..., frame_idx: _Optional[int] = ..., video_name: _Optional[str] = ..., timestamp_edge_capture: _Optional[float] = ..., timestamp_edge_send: _Optional[float] = ..., image_shape: _Optional[_Iterable[int]] = ..., encoded_frame_jpeg: _Optional[bytes] = ...) -> None: ...
 
 class EkyaDetectionBox(_message.Message):
     __slots__ = ("x1", "y1", "x2", "y2", "label", "score", "class_name")

@@ -32,11 +32,17 @@ class BaselineUploadMetrics:
     total_upload_bytes: int
 
 
+def encode_frame_for_raw_upload(frame: object) -> bytes:
+    ok, encoded = cv2.imencode(".jpg", frame)
+    if not ok:
+        raise RuntimeError("failed to JPEG encode frame for raw upload")
+    return bytes(encoded.tobytes())
+
+
 def encode_frame(frame: object | None) -> bytes:
     if frame is None:
         return b""
-    ok, encoded = cv2.imencode(".jpg", frame)
-    return bytes(encoded.tobytes()) if ok else b""
+    return encode_frame_for_raw_upload(frame)
 
 
 def measure_accuracy_trigger_window_upload(
@@ -293,6 +299,11 @@ def _window_payload_to_proto(payload: BaselineWindowPayload):
         window_start_frame_id=int(payload.window_start_frame_id),
         window_end_frame_id=int(payload.window_end_frame_id),
         timestamp_ms=int(payload.timestamp_ms),
+        source_window_id=int(payload.source_window_id),
+        source_start_frame_idx=int(payload.source_start_frame_idx),
+        source_end_frame_idx=int(payload.source_end_frame_idx),
+        source_frame_count=int(payload.source_frame_count),
+        uploaded_keyframe_count=int(payload.uploaded_keyframe_count),
         selected_samples=[
             message_transmission_pb2.BaselineWindowSample(
                 frame_id=int(sample.frame_id),

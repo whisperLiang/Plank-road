@@ -239,6 +239,8 @@ def _parse_baseline_metric(
     ):
         components = [raw_bytes, feature_bytes, metadata_bytes]
         total = optional_int(payload.get("total_upload_bytes"))
+        if str(run.get("method", "")) == "accuracy_trigger_cloud_retraining":
+            total = raw_bytes
         if total is None and all(value is not None for value in components):
             total = sum(value or 0 for value in components)
         raw_count = optional_int(

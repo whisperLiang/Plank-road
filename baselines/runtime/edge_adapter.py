@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import threading
 import time
+from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any
 
@@ -19,7 +20,7 @@ from baselines.runtime.training_state import (
 )
 from baselines.runtime.upload_client import (
     BaselineUploadClient,
-    encode_frame,
+    encode_frame_for_raw_upload,
     measure_accuracy_trigger_window_upload,
     validate_baseline_training_strategy,
 )
@@ -96,6 +97,8 @@ class BaselineEdgeAdapter:
         self._queue: Queue[BaselineFramePayload | BaselineWindowPayload] = Queue()
         self._worker: threading.Thread | None = None
         self._accuracy_window_buffer: list[BaselineFramePayload] = []
+        self._accuracy_source_window: _AccuracySourceWindow | None = None
+        self._accuracy_upload_stats = _RawUploadStats()
         self._accuracy_window_lock = threading.Lock()
         self._cloud_scheduled_active_job: BaselineActiveTrainingJob | None = None
         self._known_cloud_scheduled_job_ids: set[str] = set()
@@ -187,7 +190,7 @@ class BaselineEdgeAdapter:
             "model_version": str(artifacts.get("model_version", "0") or "0"),
             "result_source": str(artifacts.get("result_source", "") or ""),
         }
-        raw_frame = encode_frame(frame) if decision.upload_frame else b""
+        raw_frame = encode_frame_for_raw_upload(frame) if decision.upload_frame else b""
         quality_metadata = {
             "decision_reason": decision.reason,
             "training_strategy": self.training_strategy,
@@ -230,14 +233,21 @@ class BaselineEdgeAdapter:
                 latency_ms,
             )
             self._surgeon_tta.try_apply_pending_update()
-        if decision.upload_frame and self.transport is not None:
-            if self.baseline_method == "accuracy_trigger_cloud_retraining":
-                self._buffer_accuracy_trigger_payload(payload)
-            else:
-                self._queue.put(payload)
+        if self.baseline_method == "accuracy_trigger_cloud_retraining":
+            self._observe_accuracy_trigger_source_frame(
+                frame_id=int(frame_index),
+                selected_payload=payload if decision.upload_frame else None,
+            )
+        elif decision.upload_frame and self.transport is not None:
+            self._queue.put(payload)
 
     def on_unsampled_frame(self, *, frame, frame_index: int, latest_visual: dict[str, Any]) -> None:
-        del frame, frame_index, latest_visual
+        del frame, latest_visual
+        if self.baseline_method == "accuracy_trigger_cloud_retraining":
+            self._observe_accuracy_trigger_source_frame(
+                frame_id=int(frame_index),
+                selected_payload=None,
+            )
         if self._surgeon_tta is not None:
             self._surgeon_tta.try_apply_pending_update()
 
@@ -313,67 +323,206 @@ class BaselineEdgeAdapter:
                 total_upload_bytes=upload_metrics.total_upload_bytes,
                 raw_sample_count=len(payload.selected_samples),
                 feature_sample_count=0,
+                **self._upload_summary_fields(),
             )
             self.metrics.record(
                 "accuracy_trigger_window_uploaded",
                 window_id=payload.window_id,
                 selected_count=len(payload.selected_samples),
+                uploaded_keyframe_count=int(payload.uploaded_keyframe_count),
                 window_start_frame_id=int(payload.window_start_frame_id),
                 window_end_frame_id=int(payload.window_end_frame_id),
+                source_window_id=int(payload.source_window_id),
+                source_start_frame_idx=int(payload.source_start_frame_idx),
+                source_end_frame_idx=int(payload.source_end_frame_idx),
+                source_frame_count=int(payload.source_frame_count),
+                window_upload_bytes=int(upload_metrics.raw_frame_bytes),
+                **self._upload_summary_fields(),
             )
             return
         self.transport.upload_frame(payload)
         self.metrics.record("frame_uploaded", frame_id=int(payload.frame_id))
 
-    def _buffer_accuracy_trigger_payload(self, payload: BaselineFramePayload) -> None:
-        ready_windows: list[tuple[BaselineFramePayload, ...]] = []
+    def _observe_accuracy_trigger_source_frame(
+        self,
+        *,
+        frame_id: int,
+        selected_payload: BaselineFramePayload | None,
+    ) -> None:
+        ready_windows: list[BaselineWindowPayload] = []
+        frame_id = int(frame_id)
+        source_frame_idx = max(0, frame_id - 1)
+        source_window_id = source_frame_idx // max(1, int(self._accuracy_window_size))
+        context = self._accuracy_window_context(selected_payload)
+        source_start_frame_idx = source_window_id * self._accuracy_window_size
         with self._accuracy_window_lock:
-            if self._accuracy_window_buffer and not _same_accuracy_window_lineage(
-                self._accuracy_window_buffer[0],
-                payload,
+            if (
+                self._accuracy_source_window is not None
+                and int(self._accuracy_source_window.source_window_id) != source_window_id
             ):
-                ready_windows.append(tuple(self._accuracy_window_buffer))
-                self._accuracy_window_buffer.clear()
-            self._accuracy_window_buffer.append(payload)
-            if len(self._accuracy_window_buffer) >= self._accuracy_window_size:
-                ready_windows.append(
-                    tuple(self._accuracy_window_buffer[: self._accuracy_window_size])
+                ready_windows.append(self._accuracy_window_payload_locked())
+                self._clear_accuracy_source_window_locked()
+            elif (
+                selected_payload is not None
+                and self._accuracy_window_buffer
+                and not _same_accuracy_window_context(
+                    self._accuracy_window_context(self._accuracy_window_buffer[0]),
+                    context,
                 )
-                del self._accuracy_window_buffer[: self._accuracy_window_size]
-        for ready_payloads in ready_windows:
-            self._queue.put(self._accuracy_window_payload(ready_payloads))
+            ):
+                ready_windows.append(self._accuracy_window_payload_locked())
+                self._clear_accuracy_source_window_locked()
+                source_start_frame_idx = source_frame_idx
+            if self._accuracy_source_window is None:
+                self._accuracy_source_window = _AccuracySourceWindow(
+                    source_window_id=source_window_id,
+                    source_start_frame_idx=source_start_frame_idx,
+                    window_start_frame_id=frame_id,
+                )
+            self._accuracy_source_window.observe_frame(
+                frame_id=frame_id,
+                source_frame_idx=source_frame_idx,
+                context=context,
+            )
+            self._accuracy_upload_stats.source_frames += 1
+            if selected_payload is not None:
+                self._accuracy_window_buffer.append(selected_payload)
+                self._accuracy_upload_stats.uploaded_frames += 1
+                self._accuracy_upload_stats.upload_bytes += len(
+                    bytes(selected_payload.raw_frame or b"")
+                )
+            if (
+                self._accuracy_source_window is not None
+                and int(self._accuracy_source_window.source_frame_count)
+                >= int(self._accuracy_window_size)
+            ):
+                ready_windows.append(self._accuracy_window_payload_locked())
+                self._clear_accuracy_source_window_locked()
+        for ready_window in ready_windows:
+            self._queue.put(ready_window)
 
     def _flush_accuracy_trigger_window_buffer(self, *, inline: bool) -> None:
         with self._accuracy_window_lock:
-            if not self._accuracy_window_buffer:
+            if self._accuracy_source_window is None:
                 return
-            payloads = tuple(self._accuracy_window_buffer)
-            self._accuracy_window_buffer.clear()
-        window_payload = self._accuracy_window_payload(payloads)
+            window_payload = self._accuracy_window_payload_locked()
+            self._clear_accuracy_source_window_locked()
         if inline:
             self._process_payload(window_payload)
         else:
             self._queue.put(window_payload)
 
-    def _accuracy_window_payload(
-        self,
-        payloads: tuple[BaselineFramePayload, ...],
-    ) -> BaselineWindowPayload:
-        frame_ids = [int(payload.frame_id) for payload in payloads]
-        first = payloads[0]
+    def _accuracy_window_payload_locked(self) -> BaselineWindowPayload:
+        source_window = self._accuracy_source_window
+        if source_window is None:
+            raise RuntimeError("accuracy source window is not open")
+        payloads = tuple(self._accuracy_window_buffer)
+        context = self._accuracy_window_context(payloads[0]) if payloads else source_window.context
+        if context is None:
+            context = _AccuracyWindowContext(
+                run_id=self.run_id,
+                baseline_method=self.baseline_method,
+                edge_id=self.edge_id,
+                model_name=str(getattr(self.config, "lightweight", "") or ""),
+                model_version=str(getattr(self._edge, "model_version", "0") or "0"),
+                video_source=self.video_path,
+            )
+        frame_ids = (
+            [int(payload.frame_id) for payload in payloads]
+            or [
+                int(source_window.window_start_frame_id),
+                int(source_window.window_end_frame_id),
+            ]
+        )
         window_id = stable_window_id(
-            run_id=first.run_id,
-            baseline_method=first.baseline_method,
+            run_id=context.run_id,
+            baseline_method=context.baseline_method,
             training_strategy=self.training_strategy,
             trainable_param_ratio=self.trainable_param_ratio,
-            edge_id=int(first.edge_id),
-            model_version=str(first.model_version or "0"),
-            frame_ids=frame_ids,
+            edge_id=int(context.edge_id),
+            model_version=str(context.model_version or "0"),
+            frame_ids=frame_ids + [-(int(source_window.source_window_id) + 1)],
         )
-        return BaselineWindowPayload.from_frame_payloads(
+        self._accuracy_upload_stats.source_window_count += 1
+        if payloads:
+            return BaselineWindowPayload.from_frame_payloads(
+                window_id=window_id,
+                payloads=payloads,
+                source_window_id=int(source_window.source_window_id),
+                source_start_frame_idx=int(source_window.source_start_frame_idx),
+                source_end_frame_idx=int(source_window.source_end_frame_idx),
+                source_frame_count=int(source_window.source_frame_count),
+                window_start_frame_id=int(source_window.window_start_frame_id),
+                window_end_frame_id=int(source_window.window_end_frame_id),
+            )
+        return BaselineWindowPayload.empty_source_window(
+            run_id=context.run_id,
+            baseline_method=context.baseline_method,
+            edge_id=int(context.edge_id),
+            model_name=context.model_name,
+            model_version=context.model_version,
+            video_source=context.video_source,
             window_id=window_id,
-            payloads=payloads,
+            window_start_frame_id=int(source_window.window_start_frame_id),
+            window_end_frame_id=int(source_window.window_end_frame_id),
+            source_window_id=int(source_window.source_window_id),
+            source_start_frame_idx=int(source_window.source_start_frame_idx),
+            source_end_frame_idx=int(source_window.source_end_frame_idx),
+            source_frame_count=int(source_window.source_frame_count),
         )
+
+    def _clear_accuracy_source_window_locked(self) -> None:
+        self._accuracy_window_buffer.clear()
+        self._accuracy_source_window = None
+
+    def _accuracy_window_context(
+        self,
+        payload: BaselineFramePayload | None,
+    ) -> "_AccuracyWindowContext":
+        if payload is not None:
+            return _AccuracyWindowContext(
+                run_id=payload.run_id,
+                baseline_method=payload.baseline_method,
+                edge_id=int(payload.edge_id),
+                model_name=payload.model_name,
+                model_version=payload.model_version,
+                video_source=payload.video_source,
+            )
+        return _AccuracyWindowContext(
+            run_id=self.run_id,
+            baseline_method=self.baseline_method,
+            edge_id=self.edge_id,
+            model_name=str(getattr(self.config, "lightweight", "") or ""),
+            model_version=str(getattr(self._edge, "model_version", "0") or "0"),
+            video_source=self.video_path,
+        )
+
+    def _upload_summary_fields(self) -> dict[str, float | int]:
+        stats = self._accuracy_upload_stats
+        source_frames = int(stats.source_frames)
+        uploaded_frames = int(stats.uploaded_frames)
+        upload_bytes = int(stats.upload_bytes)
+        return {
+            "source_frames": source_frames,
+            "uploaded_frames": uploaded_frames,
+            "dropped_frames": max(0, source_frames - uploaded_frames),
+            "upload_rate": (
+                float(uploaded_frames) / float(source_frames) if source_frames else 0.0
+            ),
+            "upload_bytes": upload_bytes,
+            "upload_bytes_mb": float(upload_bytes) / (1024.0 * 1024.0),
+            "avg_kb_per_uploaded_frame": (
+                float(upload_bytes) / 1024.0 / float(uploaded_frames)
+                if uploaded_frames
+                else 0.0
+            ),
+            "avg_kb_per_source_frame": (
+                float(upload_bytes) / 1024.0 / float(source_frames)
+                if source_frames
+                else 0.0
+            ),
+            "source_window_count": int(stats.source_window_count),
+        }
 
     def _poll_active_training(self) -> None:
         if self.baseline_method == "accuracy_trigger_cloud_retraining":
@@ -734,6 +883,47 @@ class BaselineEdgeAdapter:
             self._cloud_scheduled_active_job = None
 
 
+@dataclass(slots=True)
+class _AccuracyWindowContext:
+    run_id: str
+    baseline_method: str
+    edge_id: int
+    model_name: str
+    model_version: str
+    video_source: str
+
+
+@dataclass(slots=True)
+class _AccuracySourceWindow:
+    source_window_id: int
+    source_start_frame_idx: int
+    window_start_frame_id: int
+    source_end_frame_idx: int = 0
+    window_end_frame_id: int = 0
+    source_frame_count: int = 0
+    context: _AccuracyWindowContext | None = None
+
+    def observe_frame(
+        self,
+        *,
+        frame_id: int,
+        source_frame_idx: int,
+        context: _AccuracyWindowContext,
+    ) -> None:
+        self.window_end_frame_id = int(frame_id)
+        self.source_end_frame_idx = int(source_frame_idx)
+        self.source_frame_count += 1
+        self.context = context
+
+
+@dataclass(slots=True)
+class _RawUploadStats:
+    source_frames: int = 0
+    uploaded_frames: int = 0
+    upload_bytes: int = 0
+    source_window_count: int = 0
+
+
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -751,9 +941,9 @@ def _base64_payload_bytes(value: str) -> int:
         return len(payload.encode("utf-8"))
 
 
-def _same_accuracy_window_lineage(
-    left: BaselineFramePayload,
-    right: BaselineFramePayload,
+def _same_accuracy_window_context(
+    left: _AccuracyWindowContext,
+    right: _AccuracyWindowContext,
 ) -> bool:
     return (
         str(left.run_id) == str(right.run_id)

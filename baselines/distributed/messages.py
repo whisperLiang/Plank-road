@@ -117,6 +117,11 @@ class BaselineWindowPayload:
     window_start_frame_id: int
     window_end_frame_id: int
     timestamp_ms: int = field(default_factory=now_ms)
+    source_window_id: int = 0
+    source_start_frame_idx: int = 0
+    source_end_frame_idx: int = 0
+    source_frame_count: int = 0
+    uploaded_keyframe_count: int = 0
     selected_samples: tuple[BaselineWindowSample, ...] = field(default_factory=tuple)
 
     @classmethod
@@ -125,12 +130,22 @@ class BaselineWindowPayload:
         *,
         window_id: str,
         payloads: Sequence[BaselineFramePayload],
+        source_window_id: int | None = None,
+        source_start_frame_idx: int | None = None,
+        source_end_frame_idx: int | None = None,
+        source_frame_count: int | None = None,
+        window_start_frame_id: int | None = None,
+        window_end_frame_id: int | None = None,
     ) -> "BaselineWindowPayload":
         payload_list = list(payloads or [])
         if not payload_list:
             raise ValueError("selected_samples must be non-empty")
         first = payload_list[0]
         frame_ids = [int(payload.frame_id) for payload in payload_list]
+        start_frame = (
+            min(frame_ids) if window_start_frame_id is None else int(window_start_frame_id)
+        )
+        end_frame = max(frame_ids) if window_end_frame_id is None else int(window_end_frame_id)
         return cls(
             run_id=str(first.run_id),
             baseline_method=str(first.baseline_method),
@@ -139,12 +154,66 @@ class BaselineWindowPayload:
             model_version=str(first.model_version or "0"),
             video_source=str(first.video_source or ""),
             window_id=str(window_id),
-            window_start_frame_id=min(frame_ids),
-            window_end_frame_id=max(frame_ids),
+            window_start_frame_id=start_frame,
+            window_end_frame_id=end_frame,
             timestamp_ms=now_ms(),
+            source_window_id=(
+                int(source_window_id) if source_window_id is not None else 0
+            ),
+            source_start_frame_idx=(
+                int(source_start_frame_idx)
+                if source_start_frame_idx is not None
+                else start_frame
+            ),
+            source_end_frame_idx=(
+                int(source_end_frame_idx) if source_end_frame_idx is not None else end_frame
+            ),
+            source_frame_count=(
+                int(source_frame_count)
+                if source_frame_count is not None
+                else max(0, end_frame - start_frame + 1)
+            ),
+            uploaded_keyframe_count=len(payload_list),
             selected_samples=tuple(
                 BaselineWindowSample.from_frame_payload(payload) for payload in payload_list
             ),
+        )
+
+    @classmethod
+    def empty_source_window(
+        cls,
+        *,
+        run_id: str,
+        baseline_method: str,
+        edge_id: int,
+        model_name: str,
+        model_version: str,
+        video_source: str,
+        window_id: str,
+        window_start_frame_id: int,
+        window_end_frame_id: int,
+        source_window_id: int,
+        source_start_frame_idx: int,
+        source_end_frame_idx: int,
+        source_frame_count: int,
+    ) -> "BaselineWindowPayload":
+        return cls(
+            run_id=str(run_id),
+            baseline_method=str(baseline_method),
+            edge_id=int(edge_id),
+            model_name=str(model_name or ""),
+            model_version=str(model_version or "0"),
+            video_source=str(video_source or ""),
+            window_id=str(window_id),
+            window_start_frame_id=int(window_start_frame_id),
+            window_end_frame_id=int(window_end_frame_id),
+            timestamp_ms=now_ms(),
+            source_window_id=int(source_window_id),
+            source_start_frame_idx=int(source_start_frame_idx),
+            source_end_frame_idx=int(source_end_frame_idx),
+            source_frame_count=int(source_frame_count),
+            uploaded_keyframe_count=0,
+            selected_samples=(),
         )
 
     @property
@@ -163,6 +232,11 @@ class BaselineWindowPayload:
             "window_start_frame_id": int(self.window_start_frame_id),
             "window_end_frame_id": int(self.window_end_frame_id),
             "timestamp_ms": int(self.timestamp_ms),
+            "source_window_id": int(self.source_window_id),
+            "source_start_frame_idx": int(self.source_start_frame_idx),
+            "source_end_frame_idx": int(self.source_end_frame_idx),
+            "source_frame_count": int(self.source_frame_count),
+            "uploaded_keyframe_count": int(self.uploaded_keyframe_count),
             "selected_count": len(self.selected_samples),
             "frame_ids": [int(sample.frame_id) for sample in self.selected_samples],
             "raw_frame_bytes": [

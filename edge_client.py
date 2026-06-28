@@ -17,6 +17,7 @@ import grpc
 from loguru import logger
 
 from baselines.runtime import BaselineEdgeAdapter
+from baselines.runtime.upload_client import encode_frame_for_raw_upload
 from common.experiment_results import (
     EKYA_METHOD,
     PLANK_ROAD_METHOD,
@@ -909,16 +910,7 @@ def _run_ekya_style_edge_stream(
                         break
                     frame_idx += 1
                     timestamp_capture = time.time()
-                    ok, encoded = cv2.imencode(
-                        ".jpg",
-                        frame,
-                        [
-                            int(cv2.IMWRITE_JPEG_QUALITY),
-                            int(ekya_config.edge_streaming.jpeg_quality),
-                        ],
-                    )
-                    if not ok:
-                        raise RuntimeError(f"failed to JPEG encode frame {frame_idx}")
+                    encoded = encode_frame_for_raw_upload(frame)
                     timestamp_send = time.time()
                     task_id = (frame_idx - 1) // max(1, int(ekya_config.window_size))
                     upload = message_transmission_pb2.EkyaFrameUpload(
@@ -933,8 +925,7 @@ def _run_ekya_style_edge_stream(
                         timestamp_edge_capture=float(timestamp_capture),
                         timestamp_edge_send=float(timestamp_send),
                         image_shape=[int(frame.shape[0]), int(frame.shape[1])],
-                        encoded_frame_jpeg=encoded.tobytes(),
-                        jpeg_quality=int(ekya_config.edge_streaming.jpeg_quality),
+                        encoded_frame_jpeg=encoded,
                     )
                     request_queue.put(
                         message_transmission_pb2.EkyaClientMessage(frame_upload=upload)

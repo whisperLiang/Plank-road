@@ -23,7 +23,6 @@ class FrameUploadPacket:
     timestamp_edge_send: float
     image_shape: tuple[int, int]
     encoded_frame_jpeg: bytes
-    jpeg_quality: int
 
     def to_json_dict(self) -> dict[str, Any]:
         payload = _json_dict(self)

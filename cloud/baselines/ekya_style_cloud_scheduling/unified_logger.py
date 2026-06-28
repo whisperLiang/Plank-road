@@ -385,6 +385,7 @@ class EkyaUnifiedLogger:
                 "timestamp_cloud_receive": float(timestamp_cloud_receive),
             },
         )
+        self.write_summary()
 
     def update_frame_metrics(
         self,
@@ -466,6 +467,15 @@ class EkyaUnifiedLogger:
             training = _read_csv(self.output_dir / "training_events.csv")
             microprofile = _read_csv(self.output_dir / "microprofile_events.csv")
             model_updates = _read_csv(self.output_dir / "model_update_events.csv")
+            uploads = _read_csv(self.output_dir / "upload_events.csv")
+            source_frames = int(self.num_frames)
+            uploaded_frames = len(uploads)
+            upload_bytes = int(_sum(row.get("raw_frame_bytes") for row in uploads))
+            source_window_count = (
+                (source_frames + int(self.window_size) - 1) // int(self.window_size)
+                if source_frames > 0
+                else 0
+            )
             frame_keys = {
                 _frame_metric_key(
                     row.get("edge_id", 1),
@@ -534,6 +544,25 @@ class EkyaUnifiedLogger:
                 "evaluated_frame_count": len(expected),
                 "missing_result_count": len(expected - observed),
                 "dropped_display_count": int(dropped_display_count),
+                "source_frames": source_frames,
+                "uploaded_frames": uploaded_frames,
+                "dropped_frames": max(0, source_frames - uploaded_frames),
+                "upload_rate": (
+                    float(uploaded_frames) / float(source_frames) if source_frames else 0.0
+                ),
+                "upload_bytes": upload_bytes,
+                "upload_bytes_mb": float(upload_bytes) / (1024.0 * 1024.0),
+                "avg_kb_per_uploaded_frame": (
+                    float(upload_bytes) / 1024.0 / float(uploaded_frames)
+                    if uploaded_frames
+                    else 0.0
+                ),
+                "avg_kb_per_source_frame": (
+                    float(upload_bytes) / 1024.0 / float(source_frames)
+                    if source_frames
+                    else 0.0
+                ),
+                "source_window_count": source_window_count,
                 "evaluated_frame_indices": sorted(expected_indices),
                 "evaluated_frame_keys": [
                     {

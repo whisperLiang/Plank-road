@@ -47,6 +47,9 @@ baseline:
   # Engineering variant for this refactor: this reuses the existing
   # Plank-Road frame filter as the keyframe selector, while training
   # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
+  # Number of source video frames per fixed trigger window.
+  # Filtering only affects how many keyframes are uploaded inside this
+  # source-frame window.
   trigger_window_size: 60
   agreement_empty_empty_policy: exclude
   absolute_accuracy_floor: 0.85
@@ -239,7 +242,6 @@ server:
   ekya_style_cloud_scheduling:
    seed: 42
    edge_streaming:
-    jpeg_quality: 85
     upload_queue_size: 8
    cloud_inference:
     batch_size: 1

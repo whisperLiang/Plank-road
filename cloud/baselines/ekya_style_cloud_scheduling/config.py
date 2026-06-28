@@ -45,7 +45,6 @@ class FixedTrainingConfig:
 
 @dataclass(frozen=True)
 class EdgeStreamingConfig:
-    jpeg_quality: int = 85
     upload_queue_size: int = 8
 
 
@@ -149,8 +148,6 @@ class EkyaStyleCloudSchedulingConfig:
             raise ValueError(
                 "ekya_style_cloud_scheduling.microprofile.microprofile_epochs must be positive"
             )
-        if not 1 <= int(self.edge_streaming.jpeg_quality) <= 100:
-            raise ValueError("ekya_style_cloud_scheduling.jpeg_quality must be in [1, 100]")
         if self.dataset.train_val_split <= 0.0 or self.dataset.train_val_split >= 1.0:
             raise ValueError(
                 "ekya_style_cloud_scheduling.dataset.train_val_split must be in (0, 1)"
@@ -398,8 +395,9 @@ def _model_family(model_name: str) -> str:
 
 
 def _edge_streaming_config(value: object) -> EdgeStreamingConfig:
+    if _has_config_value(value, "jpeg_quality"):
+        raise ValueError("ekya_style_cloud_scheduling.edge_streaming.jpeg_quality is removed")
     return EdgeStreamingConfig(
-        jpeg_quality=int(_get(value, "jpeg_quality", 85)),
         upload_queue_size=int(_get(value, "upload_queue_size", 8)),
     )
 
@@ -569,3 +567,13 @@ def _get(value: object, name: str, default: Any = None) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return default
     return getattr(value, name, default)
+
+
+def _has_config_value(value: object, name: str) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, Mapping):
+        return name in value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return False
+    return hasattr(value, name)

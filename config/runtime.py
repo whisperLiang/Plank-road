@@ -415,7 +415,6 @@ class EdgeAffineWorkersConfig(ConfigSection):
 
 @dataclass
 class EkyaEdgeStreamingConfig(ConfigSection):
-    jpeg_quality: int = 85
     upload_queue_size: int = 8
 
 
@@ -793,6 +792,7 @@ def _reject_removed_ekya_config_fields(
                 "enabled",
                 "upload_format",
                 "max_inflight_frames",
+                "jpeg_quality",
                 "result_queue_size",
                 "drop_stale_results",
                 "display_cloud_results_only",

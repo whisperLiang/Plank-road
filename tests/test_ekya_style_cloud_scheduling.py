@@ -56,7 +56,6 @@ def _runtime(tmp_path: Path):
         window_size=2,
         seed=42,
         edge_streaming=SimpleNamespace(
-            jpeg_quality=85,
             upload_queue_size=8,
         ),
         cloud_inference=SimpleNamespace(score_threshold=0.3),
@@ -120,7 +119,6 @@ def _packet(frame_idx: int, *, edge_id: int = 1, camera_id: int = 0) -> FrameUpl
         timestamp_edge_send=1.1,
         image_shape=(10, 20),
         encoded_frame_jpeg=b"",
-        jpeg_quality=85,
     )
 
 
@@ -364,6 +362,43 @@ def test_ekya_training_admission_config_defaults_and_validation(tmp_path: Path) 
         parse_ekya_style_config(runtime, run_id="run")
 
 
+def test_ekya_legacy_jpeg_quality_config_is_rejected(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.server.baselines.ekya_style_cloud_scheduling.edge_streaming.jpeg_quality = -1
+
+    with pytest.raises(ValueError, match="jpeg_quality"):
+        parse_ekya_style_config(runtime, run_id="run")
+
+
+def test_ekya_summary_records_encoded_upload_bytes(tmp_path: Path) -> None:
+    logger = EkyaUnifiedLogger(
+        output_dir=tmp_path,
+        run_id="run",
+        video_name="road.mp4",
+        student_model="rfdetr_nano",
+        teacher_model="rtdetr_x",
+        window_size=2,
+        num_frames=3,
+    )
+    first = _packet(1)
+    first.encoded_frame_jpeg = b"1234"
+    second = _packet(2)
+    second.encoded_frame_jpeg = b"abcdef"
+
+    logger.record_frame_upload(first, timestamp_cloud_receive=1.2)
+    logger.record_frame_upload(second, timestamp_cloud_receive=1.3)
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["source_frames"] == 3
+    assert summary["uploaded_frames"] == 2
+    assert summary["dropped_frames"] == 1
+    assert summary["upload_bytes"] == 10
+    assert summary["upload_rate"] == pytest.approx(2 / 3)
+    assert summary["avg_kb_per_uploaded_frame"] == pytest.approx(10 / 2 / 1024)
+    assert summary["avg_kb_per_source_frame"] == pytest.approx(10 / 3 / 1024)
+    assert summary["source_window_count"] == 2
+
+
 def test_ekya_config_inherits_shared_plank_road_settings() -> None:
     from config.runtime import RuntimeConfig
 
@@ -432,7 +467,6 @@ def test_ekya_protocol_json_roundtrip_preserves_bytes() -> None:
         timestamp_edge_send=1.1,
         image_shape=(10, 20),
         encoded_frame_jpeg=b"jpeg-bytes",
-        jpeg_quality=85,
     )
 
     restored = FrameUploadPacket.from_json(packet.to_json())

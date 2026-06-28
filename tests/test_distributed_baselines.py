@@ -639,9 +639,9 @@ def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_pa
         adapter.close()
 
 
-def test_accuracy_adapter_flushes_buffer_on_model_version_change(tmp_path) -> None:
+def test_accuracy_adapter_uses_fixed_source_windows_across_filtered_frames(tmp_path) -> None:
     config = _config(tmp_path)
-    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 8
+    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 2
     transport = RecordingTransport()
     adapter = BaselineEdgeAdapter(
         config=config,
@@ -657,7 +657,7 @@ def test_accuracy_adapter_flushes_buffer_on_model_version_change(tmp_path) -> No
         adapter.on_sampled_inference_result(
             frame=frame,
             frame_index=1,
-            task=FakeTask(source="inference", model_version="0"),
+            task=FakeTask(source="cached", model_version="0"),
             detection_boxes=[],
             detection_class=[],
             detection_score=[],
@@ -672,17 +672,95 @@ def test_accuracy_adapter_flushes_buffer_on_model_version_change(tmp_path) -> No
             detection_score=[],
             latency_ms=1.0,
         )
+        adapter.on_sampled_inference_result(
+            frame=frame,
+            frame_index=3,
+            task=FakeTask(source="cached", model_version="1"),
+            detection_boxes=[],
+            detection_class=[],
+            detection_score=[],
+            latency_ms=1.0,
+        )
+
+        _wait_until(lambda: len(transport.uploaded_windows) == 1)
+        first = transport.uploaded_windows[0]
+        assert [sample.frame_id for sample in first.selected_samples] == [2]
+        assert first.source_window_id == 0
+        assert first.source_start_frame_idx == 0
+        assert first.source_end_frame_idx == 1
+        assert first.source_frame_count == 2
+        assert first.uploaded_keyframe_count == 1
+
+        adapter.close()
+        assert len(transport.uploaded_windows) == 2
+        second = transport.uploaded_windows[1]
+        assert [sample.frame_id for sample in second.selected_samples] == []
+        assert second.source_window_id == 1
+        assert second.source_start_frame_idx == 2
+        assert second.source_end_frame_idx == 2
+        assert second.source_frame_count == 1
+        assert second.uploaded_keyframe_count == 0
+        metric_rows = [
+            json.loads(line)
+            for line in Path(adapter.metrics_path).read_text(encoding="utf-8").splitlines()
+        ]
+        uploaded = [
+            row for row in metric_rows if row["event"] == "accuracy_trigger_window_uploaded"
+        ]
+        assert [row["source_frame_count"] for row in uploaded] == [2, 1]
+        assert [row["uploaded_keyframe_count"] for row in uploaded] == [1, 0]
+        assert uploaded[-1]["source_frames"] == 3
+        assert uploaded[-1]["uploaded_frames"] == 1
+        assert uploaded[-1]["dropped_frames"] == 2
+        assert uploaded[-1]["source_window_count"] == 2
+    finally:
+        adapter.close()
+
+
+def test_accuracy_adapter_splits_source_window_on_model_version_change(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 4
+    transport = RecordingTransport()
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="accuracy_trigger_cloud_retraining",
+        run_id="acc-run",
+        edge_id=2,
+        server_ip="127.0.0.1:1",
+        transport=transport,
+    )
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    try:
+        adapter.before_video_start(FakeEdge())
+        for frame_index, model_version in ((1, "0"), (2, "1")):
+            adapter.on_sampled_inference_result(
+                frame=frame,
+                frame_index=frame_index,
+                task=FakeTask(source="inference", model_version=model_version),
+                detection_boxes=[],
+                detection_class=[],
+                detection_score=[],
+                latency_ms=1.0,
+            )
 
         _wait_until(lambda: len(transport.uploaded_windows) == 1)
         first = transport.uploaded_windows[0]
         assert first.model_version == "0"
         assert [sample.frame_id for sample in first.selected_samples] == [1]
+        assert first.source_window_id == 0
+        assert first.source_start_frame_idx == 0
+        assert first.source_end_frame_idx == 0
+        assert first.source_frame_count == 1
 
         adapter.close()
         assert len(transport.uploaded_windows) == 2
         second = transport.uploaded_windows[1]
         assert second.model_version == "1"
         assert [sample.frame_id for sample in second.selected_samples] == [2]
+        assert second.source_window_id == 0
+        assert second.source_start_frame_idx == 1
+        assert second.source_end_frame_idx == 1
+        assert second.source_frame_count == 1
     finally:
         adapter.close()
 

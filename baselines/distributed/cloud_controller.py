@@ -207,12 +207,36 @@ class DistributedBaselineController:
         selected_samples = tuple(payload.selected_samples)
         frame_ids = [int(sample.frame_id) for sample in selected_samples]
         logger.info(
-            "accuracy_trigger_window_uploaded edge={} selected_count={} frame_range={}-{}",
+            "accuracy_trigger_window_uploaded edge={} selected_count={} "
+            "source_window={} source_range={}-{} frame_range={}-{}",
             payload.edge_id,
             len(selected_samples),
+            payload.source_window_id,
+            payload.source_start_frame_idx,
+            payload.source_end_frame_idx,
             payload.window_start_frame_id,
             payload.window_end_frame_id,
         )
+        if not selected_samples:
+            with self._lock:
+                self.register_edge(
+                    run_id=payload.run_id,
+                    baseline_method=payload.baseline_method,
+                    edge_id=payload.edge_id,
+                    model_name=payload.model_name,
+                    model_version=payload.model_version,
+                    video_source=payload.video_source,
+                )
+            return {
+                "accepted": True,
+                "message": "empty source window accepted",
+                "window_id": payload.window_id,
+                "selected_count": 0,
+                "uploaded_keyframe_count": 0,
+                "source_window_id": int(payload.source_window_id),
+                "source_frame_count": int(payload.source_frame_count),
+                "frame_ids": [],
+            }
         try:
             self._process_accuracy_trigger_window(payload, key=key)
         except TeacherAnnotationRetryableError:
@@ -223,6 +247,9 @@ class DistributedBaselineController:
                 "message": "window annotation pending",
                 "window_id": payload.window_id,
                 "selected_count": len(selected_samples),
+                "uploaded_keyframe_count": int(payload.uploaded_keyframe_count),
+                "source_window_id": int(payload.source_window_id),
+                "source_frame_count": int(payload.source_frame_count),
                 "frame_ids": frame_ids,
             }
         return {
@@ -230,6 +257,9 @@ class DistributedBaselineController:
             "message": "window accepted",
             "window_id": payload.window_id,
             "selected_count": len(selected_samples),
+            "uploaded_keyframe_count": int(payload.uploaded_keyframe_count),
+            "source_window_id": int(payload.source_window_id),
+            "source_frame_count": int(payload.source_frame_count),
             "frame_ids": frame_ids,
         }
 
@@ -461,12 +491,14 @@ class DistributedBaselineController:
     ) -> None:
         if payload.baseline_method != _ACCURACY_TRIGGER_METHOD:
             raise RuntimeError("window upload is only supported for Accuracy-Trigger")
-        if self.teacher_annotator is None:
-            raise RuntimeError("shared teacher annotator is required")
         if not str(payload.window_id or ""):
             raise RuntimeError("window_id is required")
+        if int(payload.source_frame_count) < 0:
+            raise RuntimeError("source_frame_count must be non-negative")
         if not payload.selected_samples:
-            raise RuntimeError("selected_samples must be non-empty")
+            return
+        if self.teacher_annotator is None:
+            raise RuntimeError("shared teacher annotator is required")
         seen_frame_ids: set[int] = set()
         missing = [
             int(sample.frame_id)
