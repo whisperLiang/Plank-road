@@ -19,6 +19,7 @@ from tools.experiments.plot_plank_road_baseline_figures import (
     _event_origins,
     _filter_fig2_timeline_rows,
     _frame_inference_intervals,
+    _is_fig1_training_trigger_event,
     _paired_event_intervals,
     _relative_event_seconds,
     _relative_stage_intervals,
@@ -366,6 +367,31 @@ def test_breakdown_training_mean_ignores_inference_only_windows() -> None:
     values = _aggregate_breakdown(rows, [("training_ms", "Training")])
 
     assert values["road"]["ekya"]["training_ms"] == 150.0
+
+
+def test_fig1_filters_ekya_inference_only_trigger_markers() -> None:
+    assert not _is_fig1_training_trigger_event(
+        {
+            "method": "ekya",
+            "event_name": "trigger_decision",
+            "message": "fixed_training_does_not_fit_window_inference_only",
+        }
+    )
+    assert _is_fig1_training_trigger_event(
+        {
+            "method": "ekya",
+            "event_name": "trigger_decision",
+            "job_id": "ekya-edge-1-task-4",
+            "message": "selected_fixed_training_config",
+        }
+    )
+    assert _is_fig1_training_trigger_event(
+        {
+            "method": "accuracy_trigger_cloud_retraining",
+            "event_name": "trigger_decision",
+            "message": "accuracy_trigger_decision",
+        }
+    )
 
 
 def test_event_timeline_is_zeroed_per_method_run() -> None:

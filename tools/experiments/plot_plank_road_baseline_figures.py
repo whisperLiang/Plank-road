@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from matplotlib import transforms  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 from matplotlib.ticker import MaxNLocator  # noqa: E402
@@ -521,6 +522,17 @@ def _resolved_event_frame(
     )
 
 
+def _is_fig1_training_trigger_event(event: Mapping[str, Any]) -> bool:
+    if event.get("event_name") != "trigger_decision":
+        return False
+    if str(event.get("method", "") or "") != "ekya":
+        return True
+    if str(event.get("job_id", "") or ""):
+        return True
+    message = str(event.get("message", "") or "").lower()
+    return bool(message) and "inference_only" not in message
+
+
 def _plot_fig1(
     frame_rows: list[dict[str, str]],
     event_rows: list[dict[str, str]],
@@ -546,6 +558,8 @@ def _plot_fig1(
         ]
         plotted_values: list[float] = []
         event_styles_used: set[str] = set()
+        event_positions: list[tuple[int, str, str]] = []
+        endpoint_labels: list[tuple[str, int, float]] = []
         for method in _method_order(row.get("method", "") for row in scenario_rows):
             grouped: dict[int, list[float]] = defaultdict(list)
             for row in scenario_rows:
@@ -570,16 +584,7 @@ def _plot_fig1(
                 markeredgewidth=0.35,
             )
             if x_values:
-                axis.annotate(
-                    _method_label(method),
-                    xy=(x_values[-1], y_values[-1]),
-                    xytext=(4, 0),
-                    textcoords="offset points",
-                    va="center",
-                    fontsize=6,
-                    color=_method_color(method),
-                    clip_on=False,
-                )
+                endpoint_labels.append((method, x_values[-1], y_values[-1]))
             updates = [
                 optional_int(row.get("frame_id"))
                 for row in event_rows
@@ -604,23 +609,13 @@ def _plot_fig1(
                 if row.get("scenario_name") == scenario and row.get("method") == method
             ]
 
-            for event_name, linestyle, alpha, label_suffix in (
-                ("trigger_decision", ":", 0.45, "training trigger"),
-            ):
-                for event in method_events:
-                    if event.get("event_name") != event_name:
-                        continue
-                    frame_id = _resolved_event_frame(event, timestamped_frames)
-                    if frame_id is None:
-                        continue
-                    axis.axvline(
-                        frame_id,
-                        color=_method_color(method),
-                        alpha=alpha * 0.65,
-                        linestyle=linestyle,
-                        linewidth=0.8,
-                    )
-                    event_styles_used.add(label_suffix)
+            for event in method_events:
+                if not _is_fig1_training_trigger_event(event):
+                    continue
+                frame_id = _resolved_event_frame(event, timestamped_frames)
+                if frame_id is None:
+                    continue
+                event_positions.append((frame_id, method, "training trigger"))
 
             for event in event_rows:
                 if (
@@ -638,14 +633,7 @@ def _plot_fig1(
             for update in sorted(set(resolved_updates)):
                 if update is None:
                     continue
-                axis.axvline(
-                    update,
-                    color=_method_color(method),
-                    alpha=0.26,
-                    linestyle="--",
-                    linewidth=0.9,
-                )
-                event_styles_used.add("model update")
+                event_positions.append((update, method, "model update"))
         title = (
             "Teacher-supervised F1 over time"
             if metric == "f1" and accuracy_definition == "teacher_supervised_f1"
@@ -655,18 +643,110 @@ def _plot_fig1(
         axis.set_xlabel("Frame ID")
         axis.set_ylabel(_accuracy_label(metric, accuracy_definition))
         _set_tight_ylim(axis, plotted_values, floor=0.0)
+        if endpoint_labels:
+            y_min, y_max = axis.get_ylim()
+            label_gap = max((y_max - y_min) * 0.055, 0.025)
+            ordered = sorted(endpoint_labels, key=lambda item: item[2])
+            adjusted: list[list[Any]] = []
+            for method, x_value, y_value in ordered:
+                target = y_value
+                if adjusted:
+                    target = max(target, float(adjusted[-1][3]) + label_gap)
+                adjusted.append([method, x_value, y_value, target])
+            overflow = float(adjusted[-1][3]) - y_max if adjusted else 0.0
+            if overflow > 0:
+                for item in adjusted:
+                    item[3] = max(y_min, float(item[3]) - overflow)
+            x_min, x_max = axis.get_xlim()
+            x_offset = (x_max - x_min) * 0.006
+            for method, x_value, y_value, target in adjusted:
+                axis.annotate(
+                    _method_label(method),
+                    xy=(x_value, y_value),
+                    xytext=(float(x_value) + x_offset, float(target)),
+                    textcoords="data",
+                    va="center",
+                    fontsize=6,
+                    color=_method_color(method),
+                    clip_on=False,
+                    arrowprops=(
+                        {
+                            "arrowstyle": "-",
+                            "color": _method_color(method),
+                            "linewidth": 0.45,
+                            "alpha": 0.65,
+                        }
+                        if abs(float(target) - float(y_value)) > label_gap * 0.3
+                        else None
+                    ),
+                )
+        if event_positions:
+            event_transform = transforms.blended_transform_factory(axis.transData, axis.transAxes)
+            event_methods = _method_order(method for _, method, _ in event_positions)
+            lane_y = {method: 0.055 + index * 0.038 for index, method in enumerate(event_methods)}
+            for frame_id, method, event_kind in sorted(event_positions):
+                y = lane_y[method]
+                marker = "^" if event_kind == "training trigger" else "*"
+                size = 38 if event_kind == "training trigger" else 64
+                color = _method_color(method)
+                axis.plot(
+                    [frame_id, frame_id],
+                    [max(0.012, y - 0.019), min(0.22, y + 0.019)],
+                    transform=event_transform,
+                    color=color,
+                    linewidth=1.15,
+                    alpha=0.86,
+                    solid_capstyle="round",
+                    zorder=5,
+                    clip_on=False,
+                )
+                axis.scatter(
+                    [frame_id],
+                    [y],
+                    transform=event_transform,
+                    marker=marker,
+                    s=size,
+                    facecolor=color,
+                    edgecolor="white",
+                    linewidth=0.5,
+                    zorder=6,
+                    clip_on=False,
+                )
+                event_styles_used.add(event_kind)
         _style_axis(axis, grid_axis="both")
         event_handles = []
         if "training trigger" in event_styles_used:
             event_handles.append(
-                Line2D([0], [0], color="#606060", linestyle=":", linewidth=0.9, label="Trigger")
+                Line2D(
+                    [0],
+                    [0],
+                    color="#606060",
+                    marker="^",
+                    linestyle="None",
+                    markersize=5,
+                    label="Trigger",
+                )
             )
         if "model update" in event_styles_used:
             event_handles.append(
-                Line2D([0], [0], color="#606060", linestyle="--", linewidth=0.9, label="Update")
+                Line2D(
+                    [0],
+                    [0],
+                    color="#606060",
+                    marker="*",
+                    linestyle="None",
+                    markersize=7,
+                    label="Update",
+                )
             )
         if event_handles:
-            axis.legend(handles=event_handles, loc="lower right", ncol=2, handlelength=1.8)
+            axis.legend(
+                handles=event_handles,
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.18),
+                ncol=2,
+                handlelength=1.0,
+            )
     return _save(fig, figure_dir, "fig1_accuracy_over_time"), None, []
 
 
