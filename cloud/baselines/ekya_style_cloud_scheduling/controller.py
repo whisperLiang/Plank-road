@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +32,8 @@ from cloud.baselines.ekya_style_cloud_scheduling.protocol import (
 )
 from cloud.baselines.ekya_style_cloud_scheduling.scheduler import (
     EkyaThiefStyleScheduler,
+    MicroProfileResult,
+    SchedulerDecision,
 )
 from cloud.baselines.ekya_style_cloud_scheduling.teacher_labeler import TeacherLabeler
 from cloud.baselines.ekya_style_cloud_scheduling.trainer import (
@@ -63,6 +66,27 @@ class ActiveTrainingInfo:
 class TrainingLease:
     key: TrainingAdmissionKey
     info: ActiveTrainingInfo
+
+
+@dataclass(frozen=True)
+class TrainingCandidate:
+    edge_id: int
+    camera_id: int
+    task_id: int
+    window_id: str
+    score: float
+    microprofile_result: MicroProfileResult
+    decision: SchedulerDecision
+    window: CompletedFrameWindow
+    teacher_labels: dict[int, dict[str, Any]]
+    base_state_dict: Mapping[str, Any]
+    model_builder: Callable[[], Any]
+    created_at: float
+    teacher_labeling_time_s: float
+    microprofile_time_s: float
+    frame_scores: tuple[dict[str, float], ...]
+    scheduler_row: dict[str, Any]
+    training_admission_blocked: bool = False
 
 
 class EkyaStyleCloudSchedulingController:
@@ -110,6 +134,9 @@ class EkyaStyleCloudSchedulingController:
         self.trainer = EkyaCloudTrainer(config, checkpoint_dir=self.logger.checkpoint_dir)
         self._background_threads: list[threading.Thread] = []
         self._window_threads_lock = threading.Lock()
+        self._candidate_lock = threading.Lock()
+        self._pending_candidates_by_task: dict[int, list[TrainingCandidate]] = {}
+        self._active_window_pipelines_by_task: dict[int, int] = {}
         self._training_admission_lock = threading.Lock()
         self._active_training_by_key: dict[TrainingAdmissionKey, ActiveTrainingInfo] = {}
         self._adoption_lock = threading.Lock()
@@ -169,8 +196,7 @@ class EkyaStyleCloudSchedulingController:
                 "prediction_json_path": str(prediction_path),
             }
         )
-        for window in self.frame_buffer.completed_windows():
-            self._launch_window_pipeline(window)
+        self._launch_window_pipelines(self.frame_buffer.completed_windows())
         return result
 
     def record_display_event(self, event: DisplayEventPacket) -> None:
@@ -198,13 +224,23 @@ class EkyaStyleCloudSchedulingController:
         self.logger.write_summary()
 
     def _launch_window_pipeline(self, window: CompletedFrameWindow) -> None:
+        self._launch_window_pipelines([window])
+
+    def _launch_window_pipelines(self, windows: list[CompletedFrameWindow]) -> None:
+        windows = list(windows or [])
+        for window in windows:
+            self._begin_window_pipeline(window.task_id)
+        for window in windows:
+            self._start_window_pipeline_thread(window)
+
+    def _start_window_pipeline_thread(self, window: CompletedFrameWindow) -> None:
         training_admission_blocked = bool(
             self.config.retraining.drop_training_when_active_same_connection
             and self._has_active_training(window)
         )
         thread = threading.Thread(
             target=self._run_window_pipeline_guarded,
-            args=(window, training_admission_blocked),
+            args=(window, training_admission_blocked, False),
             name=f"ekya-window-{window.window_id}",
             daemon=True,
         )
@@ -216,11 +252,13 @@ class EkyaStyleCloudSchedulingController:
         self,
         window: CompletedFrameWindow,
         training_admission_blocked: bool = False,
+        manage_registration: bool = True,
     ) -> None:
         try:
             self._run_window_pipeline(
                 window,
                 training_admission_blocked=training_admission_blocked,
+                manage_registration=manage_registration,
             )
         except Exception as exc:
             logger.warning(
@@ -228,97 +266,280 @@ class EkyaStyleCloudSchedulingController:
                 window.window_id,
                 exc,
             )
+        finally:
+            if not manage_registration:
+                self._finish_window_pipeline(window.task_id)
 
     def _run_window_pipeline(
         self,
         window: CompletedFrameWindow,
         *,
         training_admission_blocked: bool = False,
+        manage_registration: bool = True,
     ) -> None:
-        logger.info(
-            "ekya_style_cloud_scheduling window start: task_id={} frames={}..{}",
-            window.task_id,
-            window.start_frame,
-            window.end_frame,
-        )
-        teacher_labels: dict[int, dict[str, Any]] = {}
-        teacher_labeling_time_s = 0.0
-        teacher_labels, teacher_labeling_time_s = self.teacher_labeler.label_window(window)
-        with self._summary_lock:
-            self._total_teacher_labeling_time_s += float(teacher_labeling_time_s)
-            total_teacher_labeling_time_s = self._total_teacher_labeling_time_s
-        self.logger.update_summary_extra(
-            total_teacher_labeling_time_s=total_teacher_labeling_time_s
-        )
-        for record in window.records:
-            labels = teacher_labels.get(int(record.frame_idx), {})
-            self.frame_buffer.update_teacher_labels(record, labels)
+        if manage_registration:
+            self._begin_window_pipeline(window.task_id)
+        try:
+            logger.info(
+                "ekya_style_cloud_scheduling window start: task_id={} frames={}..{}",
+                window.task_id,
+                window.start_frame,
+                window.end_frame,
+            )
+            teacher_labels: dict[int, dict[str, Any]] = {}
+            teacher_labeling_time_s = 0.0
+            teacher_labels, teacher_labeling_time_s = self.teacher_labeler.label_window(window)
+            with self._summary_lock:
+                self._total_teacher_labeling_time_s += float(teacher_labeling_time_s)
+                total_teacher_labeling_time_s = self._total_teacher_labeling_time_s
+            self.logger.update_summary_extra(
+                total_teacher_labeling_time_s=total_teacher_labeling_time_s
+            )
+            for record in window.records:
+                labels = teacher_labels.get(int(record.frame_idx), {})
+                self.frame_buffer.update_teacher_labels(record, labels)
 
-        frame_scores = self._update_frame_quality(window, teacher_labels)
-        micro_results = []
-        microprofile_time_s = 0.0
-        inference = self._inference_for(window.edge_id, window.camera_id)
-        base_state_dict = inference.export_state_dict()
-        micro_result, microprofile_time_s = self.microprofiler.profile(
-            window=window,
-            teacher_labels=teacher_labels,
-            base_state_dict=base_state_dict,
-            model_builder=inference.build_student_model_clone,
-        )
-        micro_results = [micro_result]
-        for result in micro_results:
-            row = result.as_dict()
-            row.pop("hyperparameters", None)
-            row["edge_id"] = int(window.edge_id)
-            row["camera_id"] = int(window.camera_id)
-            self.logger.append_microprofile_event(row)
+            frame_scores = self._update_frame_quality(window, teacher_labels)
+            micro_results = []
+            microprofile_time_s = 0.0
+            inference = self._inference_for(window.edge_id, window.camera_id)
+            base_state_dict = inference.export_state_dict()
+            micro_result, microprofile_time_s = self.microprofiler.profile(
+                window=window,
+                teacher_labels=teacher_labels,
+                base_state_dict=base_state_dict,
+                model_builder=inference.build_student_model_clone,
+            )
+            micro_results = [micro_result]
+            for result in micro_results:
+                row = result.as_dict()
+                row.pop("hyperparameters", None)
+                row["edge_id"] = int(window.edge_id)
+                row["camera_id"] = int(window.camera_id)
+                self.logger.append_microprofile_event(row)
 
-        decision = self.scheduler.schedule(
-            task_id=int(window.task_id),
-            microprofile_results=micro_results,
-            teacher_labeling_time_s=teacher_labeling_time_s,
-            microprofile_time_s=microprofile_time_s,
-        )
-        scheduler_row = {
-            "edge_id": int(window.edge_id),
-            "camera_id": int(window.camera_id),
-            "decision_time": time.time(),
-            **decision.as_dict(),
-        }
-        training_result: TrainingResult | None = None
-        adopted = False
-        lease: TrainingLease | None = None
-        if decision.trains:
-            if training_admission_blocked:
-                scheduler_row = _scheduler_row_for_training_admission_skip(scheduler_row)
-            else:
-                lease = self._try_begin_training(window)
-                if lease is None:
-                    scheduler_row = _scheduler_row_for_training_admission_skip(scheduler_row)
-        self.logger.append_scheduler_event(scheduler_row)
-
-        if lease is not None:
-            try:
-                training_result = self.trainer.train(
-                    window=window,
-                    decision=decision,
-                    teacher_labels=teacher_labels,
-                    previous_val_map=self._previous_val_map_snapshot(
-                        window.edge_id,
-                        window.camera_id,
-                    ),
-                    base_state_dict=base_state_dict or {},
-                    model_builder=inference.build_student_model_clone,
-                )
-                self.logger.append_training_event(
-                    training_result.as_event_row(
-                        train_gpu_fraction=decision.training_resource_weight
+            decision = self.scheduler.schedule(
+                task_id=int(window.task_id),
+                microprofile_results=micro_results,
+                teacher_labeling_time_s=teacher_labeling_time_s,
+                microprofile_time_s=microprofile_time_s,
+            )
+            scheduler_row = {
+                "edge_id": int(window.edge_id),
+                "camera_id": int(window.camera_id),
+                "decision_time": time.time(),
+                **decision.as_dict(),
+            }
+            if decision.trains:
+                self._add_training_candidate(
+                    TrainingCandidate(
+                        edge_id=int(window.edge_id),
+                        camera_id=int(window.camera_id),
+                        task_id=int(window.task_id),
+                        window_id=str(window.window_id),
+                        score=float(getattr(decision, "candidate_score", 0.0) or 0.0),
+                        microprofile_result=micro_result,
+                        decision=decision,
+                        window=window,
+                        teacher_labels=teacher_labels,
+                        base_state_dict=base_state_dict or {},
+                        model_builder=inference.build_student_model_clone,
+                        created_at=time.time(),
+                        teacher_labeling_time_s=float(teacher_labeling_time_s),
+                        microprofile_time_s=float(microprofile_time_s),
+                        frame_scores=tuple(frame_scores),
+                        scheduler_row=scheduler_row,
+                        training_admission_blocked=bool(training_admission_blocked),
                     )
                 )
-                adopted = self._maybe_adopt(training_result)
-            finally:
-                self._end_training(lease)
+            else:
+                self.logger.append_scheduler_event(scheduler_row)
+                self._record_window_metrics(
+                    window=window,
+                    frame_scores=frame_scores,
+                    training_result=None,
+                    adopted=False,
+                    microprofile_time_s=microprofile_time_s,
+                    teacher_labeling_time_s=teacher_labeling_time_s,
+                )
+        finally:
+            if manage_registration:
+                self._finish_window_pipeline(window.task_id)
 
+    def _begin_window_pipeline(self, task_id: int) -> None:
+        task_id = int(task_id)
+        with self._candidate_lock:
+            self._active_window_pipelines_by_task[task_id] = (
+                self._active_window_pipelines_by_task.get(task_id, 0) + 1
+            )
+
+    def _finish_window_pipeline(self, task_id: int) -> None:
+        task_id = int(task_id)
+        candidates: list[TrainingCandidate] = []
+        with self._candidate_lock:
+            active = self._active_window_pipelines_by_task.get(task_id, 0)
+            if active > 1:
+                self._active_window_pipelines_by_task[task_id] = active - 1
+                return
+            self._active_window_pipelines_by_task.pop(task_id, None)
+            candidates = self._pending_candidates_by_task.pop(task_id, [])
+        if candidates:
+            self._drain_training_candidates(candidates)
+
+    def _add_training_candidate(self, candidate: TrainingCandidate) -> None:
+        with self._candidate_lock:
+            self._pending_candidates_by_task.setdefault(int(candidate.task_id), []).append(
+                candidate
+            )
+
+    def _drain_training_candidates(self, candidates: list[TrainingCandidate]) -> None:
+        sorted_candidates = _sort_training_candidates(candidates)
+        unique_candidates: list[TrainingCandidate] = []
+        duplicate_drops: list[tuple[TrainingCandidate, str]] = []
+        seen_keys: set[TrainingAdmissionKey] = set()
+        for candidate in sorted_candidates:
+            key = self._training_admission_key(candidate.window)
+            if key in seen_keys:
+                duplicate_drops.append((candidate, "not_selected_by_global_top_k"))
+                continue
+            seen_keys.add(key)
+            unique_candidates.append(candidate)
+
+        selected, admission_drops = self._reserve_training_candidates(unique_candidates)
+        selected_by_id = {id(candidate): lease for candidate, lease in selected}
+        dropped_by_id = {
+            id(candidate): reason for candidate, reason in duplicate_drops + admission_drops
+        }
+
+        for candidate in sorted_candidates:
+            lease = selected_by_id.get(id(candidate))
+            if lease is not None:
+                self.logger.append_scheduler_event(candidate.scheduler_row)
+                self._start_training_candidate_thread(candidate, lease)
+                continue
+            reason = dropped_by_id.get(id(candidate), "not_selected_by_global_top_k")
+            self.logger.append_scheduler_event(
+                _scheduler_row_for_training_admission_skip(
+                    candidate.scheduler_row,
+                    reason=reason,
+                )
+            )
+            self._record_window_metrics(
+                window=candidate.window,
+                frame_scores=candidate.frame_scores,
+                training_result=None,
+                adopted=False,
+                microprofile_time_s=candidate.microprofile_time_s,
+                teacher_labeling_time_s=candidate.teacher_labeling_time_s,
+            )
+
+    def _reserve_training_candidates(
+        self,
+        candidates: list[TrainingCandidate],
+    ) -> tuple[
+        list[tuple[TrainingCandidate, TrainingLease]],
+        list[tuple[TrainingCandidate, str]],
+    ]:
+        selected: list[tuple[TrainingCandidate, TrainingLease]] = []
+        dropped: list[tuple[TrainingCandidate, str]] = []
+        with self._training_admission_lock:
+            max_jobs = max(1, int(self.config.retraining.max_concurrent_train_jobs))
+            active_count = len(self._active_training_by_key)
+            initial_slots = max(0, max_jobs - active_count)
+            slots = initial_slots
+            for candidate in candidates:
+                key = self._training_admission_key(candidate.window)
+                if candidate.training_admission_blocked or key in self._active_training_by_key:
+                    dropped.append((candidate, "same_connection_training_active"))
+                    continue
+                if slots <= 0:
+                    reason = (
+                        "max_concurrent_train_jobs_exhausted"
+                        if initial_slots <= 0
+                        else "not_selected_by_global_top_k"
+                    )
+                    dropped.append((candidate, reason))
+                    continue
+                info = ActiveTrainingInfo(
+                    task_id=int(candidate.task_id),
+                    window_id=str(candidate.window_id),
+                    edge_id=int(candidate.edge_id),
+                    camera_id=int(candidate.camera_id),
+                    started_at=time.time(),
+                )
+                self._active_training_by_key[key] = info
+                selected.append((candidate, TrainingLease(key=key, info=info)))
+                slots -= 1
+        return selected, dropped
+
+    def _start_training_candidate_thread(
+        self,
+        candidate: TrainingCandidate,
+        lease: TrainingLease,
+    ) -> None:
+        thread = threading.Thread(
+            target=self._run_training_candidate_guarded,
+            args=(candidate, lease),
+            name=f"ekya-train-{candidate.window_id}",
+            daemon=True,
+        )
+        with self._window_threads_lock:
+            self._background_threads.append(thread)
+        thread.start()
+
+    def _run_training_candidate_guarded(
+        self,
+        candidate: TrainingCandidate,
+        lease: TrainingLease,
+    ) -> None:
+        training_result: TrainingResult | None = None
+        adopted = False
+        try:
+            training_result = self.trainer.train(
+                window=candidate.window,
+                decision=candidate.decision,
+                teacher_labels=candidate.teacher_labels,
+                previous_val_map=self._previous_val_map_snapshot(
+                    candidate.edge_id,
+                    candidate.camera_id,
+                ),
+                base_state_dict=candidate.base_state_dict or {},
+                model_builder=candidate.model_builder,
+            )
+            self.logger.append_training_event(
+                training_result.as_event_row(
+                    train_gpu_fraction=candidate.decision.training_resource_weight,
+                    candidate_score=candidate.score,
+                )
+            )
+            adopted = self._maybe_adopt(training_result)
+        except Exception as exc:
+            logger.warning(
+                "ekya_style_cloud_scheduling training failed: window={} error={}",
+                candidate.window_id,
+                exc,
+            )
+        finally:
+            self._end_training(lease)
+            self._record_window_metrics(
+                window=candidate.window,
+                frame_scores=candidate.frame_scores,
+                training_result=training_result,
+                adopted=adopted,
+                microprofile_time_s=candidate.microprofile_time_s,
+                teacher_labeling_time_s=candidate.teacher_labeling_time_s,
+            )
+
+    def _record_window_metrics(
+        self,
+        *,
+        window: CompletedFrameWindow,
+        frame_scores: list[dict[str, float]] | tuple[dict[str, float], ...],
+        training_result: TrainingResult | None,
+        adopted: bool,
+        microprofile_time_s: float,
+        teacher_labeling_time_s: float,
+    ) -> None:
         self.logger.record_window_metrics(
             int(window.task_id),
             int(window.start_frame),
@@ -496,7 +717,27 @@ def _mean(values) -> float | None:
     return sum(numbers) / len(numbers) if numbers else None
 
 
-def _scheduler_row_for_training_admission_skip(row: dict[str, Any]) -> dict[str, Any]:
+def _sort_training_candidates(
+    candidates: list[TrainingCandidate],
+) -> list[TrainingCandidate]:
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            -float(candidate.score),
+            float(candidate.created_at),
+            int(candidate.edge_id),
+            int(candidate.camera_id),
+            int(candidate.task_id),
+            str(candidate.window_id),
+        ),
+    )
+
+
+def _scheduler_row_for_training_admission_skip(
+    row: dict[str, Any],
+    *,
+    reason: str = "same_connection_training_active",
+) -> dict[str, Any]:
     updated = dict(row)
     inference_weight = float(updated.get("inference_resource_weight") or 0.0)
     training_weight = float(updated.get("training_resource_weight") or 0.0)
@@ -508,7 +749,7 @@ def _scheduler_row_for_training_admission_skip(row: dict[str, Any]) -> dict[str,
             "selected_epochs": 0,
             "selected_lr": 0.0,
             "selected_subsample": 0.0,
-            "decision_reason": "same_connection_training_active",
+            "decision_reason": str(reason),
         }
     )
     return updated

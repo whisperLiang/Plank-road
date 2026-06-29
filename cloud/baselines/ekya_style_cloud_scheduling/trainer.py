@@ -53,7 +53,12 @@ class TrainingResult:
     metric_mode: str = "teacher_proxy"
     epoch_log_path: str = ""
 
-    def as_event_row(self, *, train_gpu_fraction: float = 0.0) -> dict[str, Any]:
+    def as_event_row(
+        self,
+        *,
+        train_gpu_fraction: float = 0.0,
+        candidate_score: float = 0.0,
+    ) -> dict[str, Any]:
         return {
             "edge_id": int(self.edge_id),
             "camera_id": int(self.camera_id),
@@ -66,6 +71,7 @@ class TrainingResult:
             "lr": float(self.lr),
             "num_samples": int(self.num_samples),
             "train_gpu_fraction": float(train_gpu_fraction),
+            "candidate_score": float(candidate_score),
             "best_epoch": int(self.best_epoch),
             "best_val_map": float(self.best_val_map),
             "best_val_ap50": float(self.best_val_ap50),

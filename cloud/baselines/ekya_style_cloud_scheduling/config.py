@@ -81,13 +81,10 @@ class EvaluationConfig:
 @dataclass(frozen=True)
 class SchedulerConfig:
     name: str = "ekya_thief_style"
-    retraining_period_s: float = 64.0
     inference_resource_floor: float = 0.5
     microprofile_resource_fraction: float = 0.25
     steal_increment: float = 0.1
     allow_inference_only_when_no_gain: bool = True
-    fail_on_microprofile_overrun: bool = False
-    protect_inference_from_training: bool = True
     warm_start_retraining: bool = False
 
 
@@ -493,17 +490,29 @@ def _evaluation_config(value: object, *, baseline: object | None) -> EvaluationC
 
 
 def _scheduler_config(value: object) -> SchedulerConfig:
+    removed = [
+        name
+        for name in (
+            "retraining_period_s",
+            "protect_inference_from_training",
+            "fail_on_microprofile_overrun",
+        )
+        if _has_config_value(value, name)
+    ]
+    if removed:
+        names = ", ".join(f"ekya_style_cloud_scheduling.scheduler.{name}" for name in removed)
+        raise ValueError(
+            f"Ekya-style cloud scheduling no longer supports these config fields: {names}. "
+            "Training admission is controlled by microprofile score and global top-k."
+        )
     return SchedulerConfig(
         name=str(_get(value, "name", "ekya_thief_style") or "ekya_thief_style"),
-        retraining_period_s=float(_get(value, "retraining_period_s", 64.0)),
         inference_resource_floor=float(_get(value, "inference_resource_floor", 0.5)),
         microprofile_resource_fraction=float(_get(value, "microprofile_resource_fraction", 0.25)),
         steal_increment=float(_get(value, "steal_increment", 0.1)),
         allow_inference_only_when_no_gain=bool(
             _get(value, "allow_inference_only_when_no_gain", True)
         ),
-        fail_on_microprofile_overrun=bool(_get(value, "fail_on_microprofile_overrun", False)),
-        protect_inference_from_training=bool(_get(value, "protect_inference_from_training", True)),
         warm_start_retraining=bool(_get(value, "warm_start_retraining", False)),
     )
 

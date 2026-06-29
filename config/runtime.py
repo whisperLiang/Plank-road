@@ -451,13 +451,10 @@ class EkyaEvaluationConfig(ConfigSection):
 @dataclass
 class EkyaSchedulerConfig(ConfigSection):
     name: str = "ekya_thief_style"
-    retraining_period_s: float = 64.0
     inference_resource_floor: float = 0.5
     microprofile_resource_fraction: float = 0.25
     steal_increment: float = 0.1
     allow_inference_only_when_no_gain: bool = True
-    fail_on_microprofile_overrun: bool = False
-    protect_inference_from_training: bool = True
     warm_start_retraining: bool = False
 
 
@@ -825,6 +822,14 @@ def _reject_removed_ekya_config_fields(
         "server.baselines.ekya_style_cloud_scheduling.evaluation": (
             ekya_cfg.evaluation,
             {"metric_mode"},
+        ),
+        "server.baselines.ekya_style_cloud_scheduling.scheduler": (
+            ekya_cfg.scheduler,
+            {
+                "retraining_period_s",
+                "protect_inference_from_training",
+                "fail_on_microprofile_overrun",
+            },
         ),
         "server.baselines.ekya_style_cloud_scheduling.retraining": (
             ekya_cfg.retraining,

@@ -247,13 +247,10 @@ server:
     batch_size: 1
    scheduler:
     name: ekya_thief_style
-    retraining_period_s: 64
     inference_resource_floor: 0.5
     microprofile_resource_fraction: 0.25
     steal_increment: 0.1
     allow_inference_only_when_no_gain: true
-    fail_on_microprofile_overrun: false
-    protect_inference_from_training: true
    retraining:
     adopt_only_if_improved: true
     min_map_gain_to_adopt: 0.0

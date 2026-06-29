@@ -194,6 +194,15 @@ class _FakeMicroprofiler:
         return _microprofile_result(int(window.task_id)), 0.0
 
 
+class _ScoredMicroprofiler:
+    def __init__(self, scores_by_edge: dict[int, float]) -> None:
+        self.scores_by_edge = dict(scores_by_edge)
+
+    def profile(self, *, window: CompletedFrameWindow, **_kwargs):
+        score = self.scores_by_edge[int(window.edge_id)]
+        return _microprofile_result(int(window.task_id), score=score), 0.0
+
+
 class _TrainingScheduler:
     def schedule(self, *, task_id: int, **_kwargs):
         return _training_decision(int(task_id))
@@ -230,7 +239,9 @@ class _RecordingTrainer:
         )
 
 
-def _microprofile_result(task_id: int = 1) -> MicroProfileResult:
+def _microprofile_result(task_id: int = 1, *, score: float = 0.1) -> MicroProfileResult:
+    preretrain_map = 0.5
+    predicted_final_map = preretrain_map + float(score)
     return MicroProfileResult(
         task_id=int(task_id),
         hp_id="fixed",
@@ -240,32 +251,32 @@ def _microprofile_result(task_id: int = 1) -> MicroProfileResult:
             "train_batch_size": 1,
             "subsample": 1.0,
         },
-        preretrain_map=0.5,
-        post_microprofile_map=0.6,
-        map_gain=0.1,
-        preretrain_ap50=0.5,
-        post_microprofile_ap50=0.6,
-        preretrain_foreground_f1=0.5,
-        post_microprofile_foreground_f1=0.6,
+        preretrain_map=preretrain_map,
+        post_microprofile_map=predicted_final_map,
+        map_gain=float(score),
+        preretrain_ap50=preretrain_map,
+        post_microprofile_ap50=predicted_final_map,
+        preretrain_foreground_f1=preretrain_map,
+        post_microprofile_foreground_f1=predicted_final_map,
         init_time_s=0.0,
         time_per_epoch_s=0.1,
         predicted_full_train_time_s=0.1,
-        predicted_final_map=0.6,
+        predicted_final_map=predicted_final_map,
         microprofile_epochs=1,
         subsample=1.0,
     )
 
 
-def _training_decision(task_id: int = 1) -> SchedulerDecision:
+def _training_decision(task_id: int = 1, *, candidate_score: float = 0.1) -> SchedulerDecision:
     return SchedulerDecision(
         task_id=int(task_id),
         scheduler_name="ekya_thief_style",
         teacher_labeling_time_s=0.0,
         microprofile_time_s=0.0,
         total_pipeline_time_s=0.0,
-        remaining_for_retraining_s=1.0,
         inference_resource_weight=0.5,
         training_resource_weight=0.5,
+        candidate_score=float(candidate_score),
         selected_hp_id="fixed",
         selected_epochs=1,
         selected_lr=1.0e-5,
@@ -279,6 +290,7 @@ def _controller_for_admission_tests(
     *,
     scope: str = "edge_camera",
     drop_when_active: bool = True,
+    max_concurrent_train_jobs: int = 1,
 ):
     from cloud.baselines.ekya_style_cloud_scheduling.controller import (
         EkyaStyleCloudSchedulingController,
@@ -288,6 +300,7 @@ def _controller_for_admission_tests(
     retraining = runtime.server.baselines.ekya_style_cloud_scheduling.retraining
     retraining.drop_training_when_active_same_connection = bool(drop_when_active)
     retraining.training_admission_scope = scope
+    retraining.max_concurrent_train_jobs = int(max_concurrent_train_jobs)
     cfg = parse_ekya_style_config(runtime, run_id="run")
     model = _TinyTrainModelFactory()()
     controller = EkyaStyleCloudSchedulingController(
@@ -298,6 +311,48 @@ def _controller_for_admission_tests(
     controller.microprofiler = _FakeMicroprofiler()
     controller.scheduler = _TrainingScheduler()
     return controller
+
+
+def _training_candidate_for_test(
+    *,
+    edge_id: int,
+    camera_id: int = 0,
+    task_id: int = 2,
+    score: float = 0.1,
+    window_id: str | None = None,
+):
+    from cloud.baselines.ekya_style_cloud_scheduling.controller import TrainingCandidate
+
+    window = _decoded_window(
+        edge_id=edge_id,
+        camera_id=camera_id,
+        task_id=task_id,
+        window_id=window_id or f"candidate-{edge_id}-{camera_id}-{score}",
+    )
+    decision = _training_decision(task_id, candidate_score=score)
+    return TrainingCandidate(
+        edge_id=int(edge_id),
+        camera_id=int(camera_id),
+        task_id=int(task_id),
+        window_id=str(window.window_id),
+        score=float(score),
+        microprofile_result=_microprofile_result(task_id, score=score),
+        decision=decision,
+        window=window,
+        teacher_labels=_teacher_labels(*window.frame_indices),
+        base_state_dict={},
+        model_builder=_TinyTrainModelFactory(),
+        created_at=float(score),
+        teacher_labeling_time_s=0.0,
+        microprofile_time_s=0.0,
+        frame_scores=({"foreground_f1": 1.0, "map50": 1.0, "map": 1.0},),
+        scheduler_row={
+            "edge_id": int(edge_id),
+            "camera_id": int(camera_id),
+            "decision_time": 1.0,
+            **decision.as_dict(),
+        },
+    )
 
 
 def test_window_to_samples_preserves_frames_and_skips_incomplete_records() -> None:
@@ -359,6 +414,25 @@ def test_ekya_training_admission_config_defaults_and_validation(tmp_path: Path) 
         "unsupported"
     )
     with pytest.raises(ValueError, match="training_admission_scope"):
+        parse_ekya_style_config(runtime, run_id="run")
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "retraining_period_s",
+        "protect_inference_from_training",
+        "fail_on_microprofile_overrun",
+    ],
+)
+def test_ekya_removed_scheduler_config_fields_are_rejected(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    runtime = _runtime(tmp_path)
+    setattr(runtime.server.baselines.ekya_style_cloud_scheduling.scheduler, field_name, 1)
+
+    with pytest.raises(ValueError, match=field_name):
         parse_ekya_style_config(runtime, run_id="run")
 
 
@@ -476,7 +550,7 @@ def test_ekya_protocol_json_roundtrip_preserves_bytes() -> None:
     assert restored.encoded_frame_jpeg == b"jpeg-bytes"
 
 
-def test_ekya_scheduler_selects_fixed_config_when_gain_and_time_fit() -> None:
+def test_ekya_scheduler_selects_fixed_config_when_gain_even_if_full_train_time_is_long() -> None:
     cfg = parse_ekya_style_config(_runtime(Path("/tmp")), run_id="run").scheduler
     scheduler = EkyaThiefStyleScheduler(cfg)
     result = MicroProfileResult(
@@ -497,7 +571,7 @@ def test_ekya_scheduler_selects_fixed_config_when_gain_and_time_fit() -> None:
         post_microprofile_foreground_f1=0.6,
         init_time_s=0.1,
         time_per_epoch_s=0.1,
-        predicted_full_train_time_s=1.0,
+        predicted_full_train_time_s=9999.0,
         predicted_final_map=0.6,
         microprofile_epochs=1,
         subsample=1.0,
@@ -517,6 +591,60 @@ def test_ekya_scheduler_selects_fixed_config_when_gain_and_time_fit() -> None:
     assert decision.selected_subsample == pytest.approx(1.0)
     assert decision.decision_reason == "selected_fixed_training_config"
     assert decision.inference_resource_weight == pytest.approx(0.5)
+    assert decision.candidate_score == pytest.approx(0.1)
+
+
+def test_ekya_scheduler_non_positive_gain_respects_inference_only_flag() -> None:
+    runtime = _runtime(Path("/tmp"))
+    cfg = parse_ekya_style_config(runtime, run_id="run").scheduler
+    scheduler = EkyaThiefStyleScheduler(cfg)
+    result = MicroProfileResult(
+        task_id=1,
+        hp_id="fixed",
+        hyperparameters={
+            "epochs": 2,
+            "learning_rate": 1.0e-5,
+            "train_batch_size": 2,
+            "subsample": 1.0,
+        },
+        preretrain_map=0.5,
+        post_microprofile_map=0.4,
+        map_gain=-0.1,
+        preretrain_ap50=0.5,
+        post_microprofile_ap50=0.4,
+        preretrain_foreground_f1=0.5,
+        post_microprofile_foreground_f1=0.4,
+        init_time_s=0.1,
+        time_per_epoch_s=0.1,
+        predicted_full_train_time_s=0.1,
+        predicted_final_map=0.4,
+        microprofile_epochs=1,
+        subsample=1.0,
+    )
+
+    decision = scheduler.schedule(
+        task_id=1,
+        microprofile_results=[result],
+        teacher_labeling_time_s=0.0,
+        microprofile_time_s=0.0,
+    )
+
+    assert not decision.trains
+    assert decision.candidate_score == pytest.approx(-0.1)
+    assert decision.decision_reason == "no_positive_gain_inference_only"
+
+    scheduler_cfg = runtime.server.baselines.ekya_style_cloud_scheduling.scheduler
+    scheduler_cfg.allow_inference_only_when_no_gain = False
+    cfg = parse_ekya_style_config(runtime, run_id="run").scheduler
+    decision = EkyaThiefStyleScheduler(cfg).schedule(
+        task_id=1,
+        microprofile_results=[result],
+        teacher_labeling_time_s=0.0,
+        microprofile_time_s=0.0,
+    )
+
+    assert decision.trains
+    assert decision.candidate_score == pytest.approx(-0.1)
 
 
 def test_ekya_scheduler_task0_is_inference_only_by_default() -> None:
@@ -873,17 +1001,170 @@ def test_ekya_launch_time_training_block_survives_until_scheduler(
     assert read_csv(controller.output_dir / "training_events.csv") == []
 
 
+def test_ekya_candidate_pool_selects_global_top_k_by_score(tmp_path: Path) -> None:
+    controller = _controller_for_admission_tests(
+        tmp_path,
+        max_concurrent_train_jobs=2,
+    )
+    controller.trainer = _RecordingTrainer(tmp_path)
+
+    controller._drain_training_candidates(
+        [
+            _training_candidate_for_test(edge_id=1, score=0.08),
+            _training_candidate_for_test(edge_id=2, score=0.15),
+            _training_candidate_for_test(edge_id=3, score=0.03),
+            _training_candidate_for_test(edge_id=4, score=0.11),
+        ]
+    )
+    controller.wait_for_background(timeout=2.0)
+
+    trained_edges = {int(window.edge_id) for window in controller.trainer.calls}
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    training_rows = read_csv(controller.output_dir / "training_events.csv")
+    dropped = {
+        int(row["edge_id"]): row["decision_reason"]
+        for row in scheduler_rows
+        if not row["selected_hp_id"]
+    }
+
+    assert trained_edges == {2, 4}
+    assert dropped == {
+        1: "not_selected_by_global_top_k",
+        3: "not_selected_by_global_top_k",
+    }
+    assert sorted(float(row["candidate_score"]) for row in training_rows) == pytest.approx(
+        [0.11, 0.15]
+    )
+
+
+def test_ekya_launch_window_pipelines_drains_same_task_as_global_top_k_round(
+    tmp_path: Path,
+) -> None:
+    controller = _controller_for_admission_tests(
+        tmp_path,
+        max_concurrent_train_jobs=2,
+    )
+    controller.microprofiler = _ScoredMicroprofiler(
+        {
+            1: 0.08,
+            2: 0.15,
+            3: 0.03,
+            4: 0.11,
+        }
+    )
+    controller.scheduler = EkyaThiefStyleScheduler(controller.config.scheduler)
+    controller.trainer = _RecordingTrainer(tmp_path)
+    with controller._inference_lock:
+        for edge_id in (2, 3, 4):
+            controller._inference_engines[(edge_id, 0)] = controller.inference
+
+    controller._launch_window_pipelines(
+        [
+            _decoded_window(edge_id=1, task_id=7, window_id="round-edge-1"),
+            _decoded_window(edge_id=2, task_id=7, window_id="round-edge-2"),
+            _decoded_window(edge_id=3, task_id=7, window_id="round-edge-3"),
+            _decoded_window(edge_id=4, task_id=7, window_id="round-edge-4"),
+        ]
+    )
+    controller.wait_for_background(timeout=3.0)
+
+    trained_edges = {int(window.edge_id) for window in controller.trainer.calls}
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    dropped = {
+        int(row["edge_id"]): row["decision_reason"]
+        for row in scheduler_rows
+        if not row["selected_hp_id"]
+    }
+
+    assert trained_edges == {2, 4}
+    assert dropped == {
+        1: "not_selected_by_global_top_k",
+        3: "not_selected_by_global_top_k",
+    }
+    assert controller._pending_candidates_by_task == {}
+    assert controller._active_window_pipelines_by_task == {}
+
+
+def test_ekya_candidate_pool_keeps_highest_same_connection_per_round(
+    tmp_path: Path,
+) -> None:
+    controller = _controller_for_admission_tests(
+        tmp_path,
+        max_concurrent_train_jobs=2,
+    )
+    controller.trainer = _RecordingTrainer(tmp_path)
+
+    controller._drain_training_candidates(
+        [
+            _training_candidate_for_test(
+                edge_id=1,
+                score=0.01,
+                window_id="same-connection-low",
+            ),
+            _training_candidate_for_test(
+                edge_id=1,
+                score=0.2,
+                window_id="same-connection-high",
+            ),
+        ]
+    )
+    controller.wait_for_background(timeout=2.0)
+
+    assert [window.window_id for window in controller.trainer.calls] == [
+        "same-connection-high"
+    ]
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    low_row = next(row for row in scheduler_rows if row["candidate_score"] == "0.01")
+    assert low_row["decision_reason"] == "not_selected_by_global_top_k"
+    assert low_row["selected_hp_id"] == ""
+
+
+def test_ekya_candidate_pool_drops_active_same_connection_and_full_global_capacity(
+    tmp_path: Path,
+) -> None:
+    controller = _controller_for_admission_tests(
+        tmp_path,
+        max_concurrent_train_jobs=1,
+    )
+    controller.trainer = _RecordingTrainer(tmp_path)
+    active = controller._try_begin_training(_decoded_window(edge_id=1, camera_id=0))
+    assert active is not None
+
+    try:
+        controller._drain_training_candidates(
+            [
+                _training_candidate_for_test(edge_id=1, score=0.2),
+                _training_candidate_for_test(edge_id=2, score=0.1),
+            ]
+        )
+        controller.wait_for_background(timeout=2.0)
+    finally:
+        controller._end_training(active)
+
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    reasons = {int(row["edge_id"]): row["decision_reason"] for row in scheduler_rows}
+
+    assert controller.trainer.calls == []
+    assert reasons == {
+        1: "same_connection_training_active",
+        2: "max_concurrent_train_jobs_exhausted",
+    }
+    assert read_csv(controller.output_dir / "training_events.csv") == []
+
+
 def test_ekya_training_lease_released_after_successful_training(tmp_path: Path) -> None:
     controller = _controller_for_admission_tests(tmp_path)
     controller.trainer = _RecordingTrainer(tmp_path)
 
     controller._run_window_pipeline(_decoded_window(task_id=2, window_id="trained-window"))
+    controller.wait_for_background(timeout=2.0)
 
     assert controller.trainer.calls
     assert controller._active_training_by_key == {}
     training_rows = read_csv(controller.output_dir / "training_events.csv")
     assert len(training_rows) == 1
     assert training_rows[0]["train_gpu_fraction"] == "0.5"
+    assert training_rows[0]["candidate_score"] == "0.1"
     assert len(read_csv(controller.output_dir / "model_update_events.csv")) == 1
 
 
@@ -891,10 +1172,10 @@ def test_ekya_training_lease_released_after_trainer_exception(tmp_path: Path) ->
     controller = _controller_for_admission_tests(tmp_path)
     controller.trainer = _RecordingTrainer(tmp_path, raises=True)
 
-    with pytest.raises(RuntimeError, match="training failed"):
-        controller._run_window_pipeline(
-            _decoded_window(task_id=2, window_id="training-exception-window")
-        )
+    controller._run_window_pipeline(
+        _decoded_window(task_id=2, window_id="training-exception-window")
+    )
+    controller.wait_for_background(timeout=2.0)
 
     assert controller._active_training_by_key == {}
     assert len(controller.trainer.calls) == 1
