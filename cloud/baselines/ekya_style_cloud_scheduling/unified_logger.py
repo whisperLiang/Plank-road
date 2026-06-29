@@ -360,6 +360,7 @@ class EkyaUnifiedLogger:
         packet: FrameUploadPacket,
         *,
         timestamp_cloud_receive: float,
+        update_summary: bool = True,
     ) -> None:
         start = int(packet.task_id) * max(1, int(self.window_size)) + 1
         end = start + max(1, int(self.window_size)) - 1
@@ -387,7 +388,8 @@ class EkyaUnifiedLogger:
                 "timestamp_cloud_receive": float(timestamp_cloud_receive),
             },
         )
-        self.write_summary()
+        if update_summary:
+            self.write_summary()
 
     def update_frame_metrics(
         self,

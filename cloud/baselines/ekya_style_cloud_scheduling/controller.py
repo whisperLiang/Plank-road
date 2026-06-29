@@ -168,6 +168,7 @@ class EkyaStyleCloudSchedulingController:
         self.logger.record_frame_upload(
             packet,
             timestamp_cloud_receive=record.timestamp_cloud_receive,
+            update_summary=False,
         )
         result = inference.infer(
             packet=packet,
