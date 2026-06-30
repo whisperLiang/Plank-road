@@ -859,6 +859,52 @@ def test_structured_events_capture_bytes_and_derive_stage_latency(tmp_path: Path
     assert any(row["total_adaptation_ms"] == "1600" for row in latency)
 
 
+def test_accuracy_terminal_message_training_ms_overrides_job_interval(
+    tmp_path: Path,
+) -> None:
+    comparison_dir = tmp_path / "comparison"
+    manifest_path = _manifest(comparison_dir)
+    for path in (
+        "raw_logs/plank_road/cloud/main-r1",
+        "raw_logs/plank_road/edge_1/main-r1",
+        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
+        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+    ):
+        (comparison_dir / path).mkdir(parents=True, exist_ok=True)
+    _write_jsonl(
+        comparison_dir
+        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        [
+            {
+                "event": "cloud_scheduled_training_job_started",
+                "timestamp_ms": 1000,
+                "window_id": "w",
+                "job_id": "job-w",
+            },
+            {
+                "event": "cloud_scheduled_training_job_terminal",
+                "timestamp_ms": 9000,
+                "window_id": "w",
+                "job_id": "job-w",
+                "status": "SUCCEEDED",
+                "message": (
+                    "[BaselineTraining] strategy=freeze samples=60 "
+                    "training_ms=1234.5 serialization_ms=25.0 elapsed=8.000s"
+                ),
+            },
+        ],
+    )
+
+    normalize(comparison_dir, manifest_path)
+
+    latency = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
+    accuracy_rows = [
+        row for row in latency if row["run_id"] == "accuracy-r1" and row["training_ms"]
+    ]
+    assert [row["training_ms"] for row in accuracy_rows] == ["1234.5"]
+
+
 def test_stage_latency_keeps_existing_total_without_total_pair(tmp_path: Path) -> None:
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)

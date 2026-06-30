@@ -227,6 +227,9 @@ class _RecordingTrainer:
             lr=1.0e-5,
             batch_size=1,
             num_samples=len(window.records),
+            total_sample_count=len(window.records),
+            train_sample_count=len(window.records),
+            val_sample_count=0,
             train_start_time=1.0,
             train_end_time=2.0,
             train_duration_s=1.0,
@@ -750,11 +753,12 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
             batch_size = len(inputs) if isinstance(inputs, list) else int(inputs.shape[0])
             return self.weight.reshape(1, 1).repeat(batch_size, 1)
 
-    calls = {"epochs": 0}
+    calls = {"epochs": 0, "sample_count": 0}
     original_run_epoch = mp.run_one_training_epoch
 
     def counting_epoch(**kwargs):
         calls["epochs"] += 1
+        calls["sample_count"] = len(list(kwargs["samples"]))
         return original_run_epoch(**kwargs)
 
     def evaluate(model, samples, **_kwargs):
@@ -796,6 +800,7 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
     )
 
     assert calls["epochs"] == 1
+    assert calls["sample_count"] == 2
     assert elapsed >= 0.0
     assert result.hp_id == "fixed"
     assert result.subsample == pytest.approx(1.0)
@@ -1163,6 +1168,9 @@ def test_ekya_training_lease_released_after_successful_training(tmp_path: Path) 
     assert controller._active_training_by_key == {}
     training_rows = read_csv(controller.output_dir / "training_events.csv")
     assert len(training_rows) == 1
+    assert training_rows[0]["total_sample_count"] == "3"
+    assert training_rows[0]["train_sample_count"] == "3"
+    assert training_rows[0]["val_sample_count"] == "0"
     assert training_rows[0]["train_gpu_fraction"] == "0.5"
     assert training_rows[0]["candidate_score"] == "0.1"
     assert len(read_csv(controller.output_dir / "model_update_events.csv")) == 1
@@ -1450,6 +1458,9 @@ def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path
         lr=1.0e-5,
         batch_size=2,
         num_samples=2,
+        total_sample_count=2,
+        train_sample_count=2,
+        val_sample_count=0,
         train_start_time=1.0,
         train_end_time=2.0,
         train_duration_s=1.0,
@@ -1517,6 +1528,9 @@ def test_controller_keeps_model_updates_per_edge(tmp_path: Path) -> None:
         lr=1.0e-5,
         batch_size=2,
         num_samples=2,
+        total_sample_count=2,
+        train_sample_count=2,
+        val_sample_count=0,
         train_start_time=1.0,
         train_end_time=2.0,
         train_duration_s=1.0,
@@ -1567,6 +1581,9 @@ def test_controller_model_update_log_reports_not_adopted_reason(tmp_path: Path) 
         lr=1.0e-5,
         batch_size=2,
         num_samples=2,
+        total_sample_count=2,
+        train_sample_count=2,
+        val_sample_count=0,
         train_start_time=1.0,
         train_end_time=2.0,
         train_duration_s=1.0,

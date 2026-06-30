@@ -214,9 +214,15 @@ def _parse_baseline_metric(
             )
         )
     mapped = BASELINE_EVENT_MAP.get(event)
+    event_payload = payload
     if event in {"training_job_terminal", "cloud_scheduled_training_job_terminal"}:
         if str(payload.get("status", "")).upper() == "SUCCEEDED":
             mapped = "training_job_succeeded"
+            parsed_training_ms = _training_ms_from_message(
+                str(payload.get("message", "") or "")
+            )
+            if parsed_training_ms is not None and payload.get("training_ms") in (None, ""):
+                event_payload = {**payload, "training_ms": parsed_training_ms}
     if mapped:
         events.append(
             _adaptation_event(
@@ -226,7 +232,7 @@ def _parse_baseline_metric(
                 edge_id=edge_id,
                 timestamp_ms=timestamp_ms,
                 message=event,
-                payload=payload,
+                payload=event_payload,
             )
         )
     raw_bytes = optional_int(payload.get("raw_frame_bytes"))
@@ -762,6 +768,15 @@ def _parse_log_file(
 def _elapsed_seconds(message: str) -> float | None:
     match = re.search(r"(?:elapsed=|took )(\d+(?:\.\d+)?)s", message)
     return float(match.group(1)) * 1000.0 if match else None
+
+
+def _training_ms_from_message(message: str) -> float | None:
+    values = parse_key_values(message)
+    value = optional_float(values.get("training_ms"))
+    if value is not None:
+        return value
+    seconds = optional_float(values.get("training_s"))
+    return seconds * 1000.0 if seconds is not None else None
 
 
 def _named_size_bytes(message: str, name: str) -> int | None:

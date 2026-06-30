@@ -146,6 +146,10 @@ class CloudBaselineFreezeTrainingStrategy:
             optimizer=optimizer,
         )
         metrics["parameter_freeze"] = _serializable_freeze_summary(freeze_summary)
+        training_elapsed_s = float(
+            metrics.get("full_train_time_sec") or time.perf_counter() - started
+        )
+        serialization_started = time.perf_counter()
 
         update_bytes = self.update_serializer(
             model,
@@ -167,12 +171,18 @@ class CloudBaselineFreezeTrainingStrategy:
             },
             metadata_path=str(workspace_path / "model_update" / "baseline_freeze_metadata.json"),
         )
+        encoded_model_data = base64.b64encode(update_bytes).decode("ascii")
+        serialization_elapsed_s = time.perf_counter() - serialization_started
+        total_elapsed_s = time.perf_counter() - started
         return {
             "success": True,
-            "model_data": base64.b64encode(update_bytes).decode("ascii"),
+            "model_data": encoded_model_data,
             "message": (
                 "[BaselineTraining] strategy=freeze "
-                f"samples={len(samples)} elapsed={time.perf_counter() - started:.3f}s"
+                f"samples={len(samples)} "
+                f"training_ms={training_elapsed_s * 1000.0:.3f} "
+                f"serialization_ms={serialization_elapsed_s * 1000.0:.3f} "
+                f"elapsed={total_elapsed_s:.3f}s"
             ),
             "metrics": metrics,
             "result_model_version": str(result_model_version or "1"),

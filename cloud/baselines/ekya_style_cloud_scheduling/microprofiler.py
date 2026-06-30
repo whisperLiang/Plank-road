@@ -38,11 +38,13 @@ class DetectionMicroProfiler:
     ) -> tuple[MicroProfileResult, float]:
         started = time.perf_counter()
         samples = window_to_samples(window, teacher_labels)
-        train_samples, val_samples = split_train_val_samples(
+        train_samples = list(samples)
+        _holdout_samples, val_samples = split_train_val_samples(
             samples,
             val_ratio=1.0 - float(self.config.dataset.train_val_split),
             seed=_seed(self.config.seed, window.task_id, "split"),
         )
+        del _holdout_samples
         _require_sample_counts(
             train_samples=train_samples,
             val_samples=val_samples,

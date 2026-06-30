@@ -97,6 +97,8 @@ def test_freeze_strategy_uses_cloud_teacher_targets(tmp_path: Path, monkeypatch)
 
     assert result["success"] is True
     assert result["model_data"]
+    assert "training_ms=" in result["message"]
+    assert "serialization_ms=" in result["message"]
     assert teacher.calls == 2
     payload = torch.load(
         io.BytesIO(base64.b64decode(result["model_data"])),

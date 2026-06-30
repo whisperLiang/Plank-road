@@ -40,6 +40,9 @@ class TrainingResult:
     lr: float
     batch_size: int
     num_samples: int
+    total_sample_count: int
+    train_sample_count: int
+    val_sample_count: int
     train_start_time: float
     train_end_time: float
     train_duration_s: float
@@ -70,6 +73,9 @@ class TrainingResult:
             "batch_size": int(self.batch_size),
             "lr": float(self.lr),
             "num_samples": int(self.num_samples),
+            "total_sample_count": int(self.total_sample_count),
+            "train_sample_count": int(self.train_sample_count),
+            "val_sample_count": int(self.val_sample_count),
             "train_gpu_fraction": float(train_gpu_fraction),
             "candidate_score": float(candidate_score),
             "best_epoch": int(self.best_epoch),
@@ -111,11 +117,14 @@ class EkyaCloudTrainer:
         fixed = self.config.fixed_training
 
         samples = window_to_samples(window, teacher_labels)
-        train_samples, val_samples = split_train_val_samples(
+        total_sample_count = len(samples)
+        train_samples = list(samples)
+        _holdout_samples, val_samples = split_train_val_samples(
             samples,
             val_ratio=1.0 - float(self.config.dataset.train_val_split),
             seed=_seed(self.config.seed, window.task_id, "train_split"),
         )
+        del _holdout_samples
         _require_sample_counts(
             train_samples=train_samples,
             val_samples=val_samples,
@@ -127,7 +136,6 @@ class EkyaCloudTrainer:
         batch_size = max(1, int(fixed.train_batch_size))
         lr = float(fixed.learning_rate)
         hp_id = str(fixed.hp_id)
-        train_samples = list(train_samples)
         checkpoint_prefix = (
             f"edge_{int(window.edge_id)}_camera_{int(window.camera_id)}_"
             f"task_{int(window.task_id)}_{hp_id}"
@@ -255,6 +263,9 @@ class EkyaCloudTrainer:
             lr=lr,
             batch_size=batch_size,
             num_samples=len(train_samples),
+            total_sample_count=int(total_sample_count),
+            train_sample_count=len(train_samples),
+            val_sample_count=len(val_samples),
             train_start_time=float(train_start),
             train_end_time=float(train_end),
             train_duration_s=max(0.0, float(train_end - train_start)),
