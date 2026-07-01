@@ -74,6 +74,16 @@ class StudentRecord:
     prediction_file: Path
 
 
+@dataclass(frozen=True)
+class PendingTeacherFrame:
+    record: StudentRecord
+    replay_key: tuple[str, int]
+    frame: np.ndarray
+    expected_cache: dict[str, Any]
+    cache_path: Path
+    source_fingerprint: str
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -361,19 +371,52 @@ class _Teacher:
             self.class_names = ()
 
     def infer(self, frame: np.ndarray) -> dict[str, list[Any]]:
-        tensor = bgr_image_to_tensor(frame, target_device=self.device)
+        return self.infer_batch([frame])[0]
+
+    def infer_batch(self, frames: Sequence[np.ndarray]) -> list[dict[str, list[Any]]]:
+        tensors = [
+            bgr_image_to_tensor(frame, target_device=self.device)
+            for frame in list(frames)
+        ]
+        if not tensors:
+            return []
         with torch.inference_mode():
-            output = self.model([tensor])
-        if isinstance(output, tuple):
-            output = output[0]
-        first = output[0] if isinstance(output, (list, tuple)) and output else {}
-        if not isinstance(first, Mapping):
-            return {"boxes": [], "labels": [], "scores": []}
-        return {
-            "boxes": _tensor_list(first.get("boxes")),
-            "labels": _tensor_list(first.get("labels")),
-            "scores": _tensor_list(first.get("scores")),
-        }
+            outputs = self.model(tensors)
+        if isinstance(outputs, tuple):
+            outputs = outputs[0]
+        if isinstance(outputs, Mapping):
+            output_items = [outputs]
+        elif isinstance(outputs, (list, tuple)):
+            output_items = list(outputs)
+        else:
+            output_items = []
+        predictions = [_prediction_from_model_output(item) for item in output_items]
+        while len(predictions) < len(tensors):
+            predictions.append({"boxes": [], "labels": [], "scores": []})
+        return predictions[: len(tensors)]
+
+
+def _prediction_from_model_output(output: Any) -> dict[str, list[Any]]:
+    if not isinstance(output, Mapping):
+        return {"boxes": [], "labels": [], "scores": []}
+    return {
+        "boxes": _tensor_list(output.get("boxes")),
+        "labels": _tensor_list(output.get("labels")),
+        "scores": _tensor_list(output.get("scores")),
+    }
+
+
+def _infer_teacher_batch(
+    teacher: Any,
+    frames: Sequence[np.ndarray],
+) -> list[dict[str, list[Any]]]:
+    if hasattr(teacher, "infer_batch"):
+        predictions = list(teacher.infer_batch(frames))
+    else:
+        predictions = [teacher.infer(frame) for frame in frames]
+    while len(predictions) < len(frames):
+        predictions.append({"boxes": [], "labels": [], "scores": []})
+    return predictions[: len(frames)]
 
 
 def _tensor_list(value: Any) -> list[Any]:
@@ -526,6 +569,7 @@ def evaluate_teacher_accuracy(
     frame_stride: int = 1,
     update_manifest: bool = False,
     overwrite_teacher_cache: bool = False,
+    teacher_batch_size: int = 8,
     save_teacher_predictions: bool = False,
 ) -> dict[str, Any]:
     comparison_dir = comparison_dir.resolve()
@@ -550,6 +594,7 @@ def evaluate_teacher_accuracy(
         "teacher_model": teacher_model,
         "teacher_weights": str(resolved_weights) if resolved_weights else "",
         "teacher_weights_fingerprint": weights_fingerprint,
+        "teacher_batch_size": max(1, int(teacher_batch_size)),
         "iou_threshold": float(iou_threshold),
         "score_threshold": float(score_threshold),
         "accuracy_definition": ACCURACY_DEFINITION,
@@ -627,6 +672,10 @@ def evaluate_teacher_accuracy(
     frame_reader = _FrameReader(comparison_dir, report)
     teacher: _Teacher | None = None
     raw_teacher_predictions: dict[tuple[str, int], dict[str, Any]] = {}
+    prepared_records: list[tuple[StudentRecord, tuple[str, int] | None]] = []
+    pending_teacher_frames: list[PendingTeacherFrame] = []
+    pending_replay_keys: set[tuple[str, int]] = set()
+    teacher_batch_size = max(1, int(teacher_batch_size))
     output_rows: list[dict[str, Any]] = []
     teacher_prediction_rows: list[dict[str, Any]] = []
     try:
@@ -643,12 +692,14 @@ def evaluate_teacher_accuracy(
                         "reason": "frame_replayable=false",
                     }
                 )
+                prepared_records.append((record, None))
                 continue
             frame: np.ndarray | None = None
             if not is_remote_video_source(record.video_source):
                 video_path = _resolve_video_path(comparison_dir, record.video_source)
                 if video_path is None:
                     report["missing_video_sources"].append(record.video_source)
+                    prepared_records.append((record, None))
                     continue
                 source_fingerprint = video_hashes_by_path.get(video_path)
                 if source_fingerprint is None:
@@ -665,11 +716,15 @@ def evaluate_teacher_accuracy(
                             "reason": reason,
                         }
                     )
+                    prepared_records.append((record, None))
                     continue
                 source_fingerprint = hashlib.sha256(frame.tobytes()).hexdigest()
             replay_key = (source_fingerprint, record.frame_id)
+            prepared_records.append((record, replay_key))
             raw_teacher = raw_teacher_predictions.get(replay_key)
             if raw_teacher is None:
+                if replay_key in pending_replay_keys:
+                    continue
                 expected_cache = {
                     "video_slug": record.video_slug,
                     "source_fingerprint": source_fingerprint,
@@ -700,6 +755,21 @@ def evaluate_teacher_accuracy(
                     raw_teacher = dict(cache_payload.get("prediction") or {})
                     teacher_schema = str(cache_payload.get("teacher_label_schema", "coco_91"))
                     teacher_names = tuple(cache_payload.get("teacher_class_names") or [])
+                    raw_teacher_predictions[replay_key] = {
+                        "prediction": raw_teacher,
+                        "teacher_label_schema": teacher_schema,
+                        "teacher_class_names": list(teacher_names),
+                    }
+                    if save_teacher_predictions:
+                        teacher_prediction_rows.append(
+                            {
+                                "scenario_name": record.scenario_name,
+                                "video_slug": record.video_slug,
+                                "frame_id": record.frame_id,
+                                "teacher_model": teacher_model,
+                                "prediction": raw_teacher,
+                            }
+                        )
                 else:
                     report["cache_misses"] += 1
                     if frame is None:
@@ -715,42 +785,61 @@ def evaluate_teacher_accuracy(
                             }
                         )
                         continue
-                    try:
-                        if teacher is None:
-                            teacher = _Teacher(
-                                model_name=teacher_model,
-                                weights_path=resolved_weights
-                                if resolved_weights.is_file()
-                                else None,
-                                device=device,
-                                score_threshold=score_threshold,
-                            )
-                        raw_teacher = teacher.infer(frame)
-                        teacher_schema = teacher.label_schema
-                        teacher_names = teacher.class_names
-                    except Exception as exc:
-                        report["failed_teacher_inference"].append(
-                            {
-                                "video_slug": record.video_slug,
-                                "frame_id": record.frame_id,
-                                "reason": str(exc),
-                            }
+                    pending_teacher_frames.append(
+                        PendingTeacherFrame(
+                            record=record,
+                            replay_key=replay_key,
+                            frame=frame,
+                            expected_cache=expected_cache,
+                            cache_path=cache_path,
+                            source_fingerprint=source_fingerprint,
                         )
-                        continue
-                    cache_payload = {
-                        **expected_cache,
-                        "video_source": record.video_source,
-                        "scenario_name": record.scenario_name,
-                        "teacher_weights": str(resolved_weights),
-                        "teacher_label_schema": teacher_schema,
-                        "teacher_class_names": list(teacher_names),
-                        "prediction": raw_teacher,
-                    }
-                    _atomic_write_text(
-                        cache_path,
-                        json.dumps(cache_payload, indent=2, ensure_ascii=False) + "\n",
                     )
-                raw_teacher_predictions[replay_key] = {
+                    pending_replay_keys.add(replay_key)
+
+        for start in range(0, len(pending_teacher_frames), teacher_batch_size):
+            batch = pending_teacher_frames[start : start + teacher_batch_size]
+            try:
+                if teacher is None:
+                    teacher = _Teacher(
+                        model_name=teacher_model,
+                        weights_path=resolved_weights
+                        if resolved_weights.is_file()
+                        else None,
+                        device=device,
+                        score_threshold=score_threshold,
+                    )
+                raw_predictions = _infer_teacher_batch(
+                    teacher,
+                    [item.frame for item in batch],
+                )
+            except Exception as exc:
+                for item in batch:
+                    report["failed_teacher_inference"].append(
+                        {
+                            "video_slug": item.record.video_slug,
+                            "frame_id": item.record.frame_id,
+                            "reason": str(exc),
+                        }
+                    )
+                continue
+            for item, raw_teacher in zip(batch, raw_predictions):
+                teacher_schema = teacher.label_schema
+                teacher_names = teacher.class_names
+                cache_payload = {
+                    **item.expected_cache,
+                    "video_source": item.record.video_source,
+                    "scenario_name": item.record.scenario_name,
+                    "teacher_weights": str(resolved_weights),
+                    "teacher_label_schema": teacher_schema,
+                    "teacher_class_names": list(teacher_names),
+                    "prediction": raw_teacher,
+                }
+                _atomic_write_text(
+                    item.cache_path,
+                    json.dumps(cache_payload, indent=2, ensure_ascii=False) + "\n",
+                )
+                raw_teacher_predictions[item.replay_key] = {
                     "prediction": raw_teacher,
                     "teacher_label_schema": teacher_schema,
                     "teacher_class_names": list(teacher_names),
@@ -758,14 +847,20 @@ def evaluate_teacher_accuracy(
                 if save_teacher_predictions:
                     teacher_prediction_rows.append(
                         {
-                            "scenario_name": record.scenario_name,
-                            "video_slug": record.video_slug,
-                            "frame_id": record.frame_id,
+                            "scenario_name": item.record.scenario_name,
+                            "video_slug": item.record.video_slug,
+                            "frame_id": item.record.frame_id,
                             "teacher_model": teacher_model,
                             "prediction": raw_teacher,
                         }
                     )
-            teacher_entry = raw_teacher_predictions[replay_key]
+
+        for record, replay_key in prepared_records:
+            if replay_key is None:
+                continue
+            teacher_entry = raw_teacher_predictions.get(replay_key)
+            if teacher_entry is None:
+                continue
             mapped_teacher = _map_teacher_prediction(
                 teacher_entry["prediction"],
                 teacher_schema=teacher_entry["teacher_label_schema"],
@@ -872,6 +967,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frame_stride", type=int, default=1)
     parser.add_argument("--update_manifest", action="store_true")
     parser.add_argument("--overwrite_teacher_cache", action="store_true")
+    parser.add_argument(
+        "--teacher_batch_size",
+        type=int,
+        default=8,
+        help="Number of cache-miss replay frames to run per teacher inference batch.",
+    )
     parser.add_argument("--save_teacher_predictions", action="store_true")
     parser.add_argument("--allow_empty", action="store_true")
     parser.add_argument("--compute_map", type=_parse_compute_map, default=False)
@@ -904,6 +1005,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         frame_stride=max(1, args.frame_stride),
         update_manifest=args.update_manifest,
         overwrite_teacher_cache=args.overwrite_teacher_cache,
+        teacher_batch_size=max(1, args.teacher_batch_size),
         save_teacher_predictions=args.save_teacher_predictions,
     )
     print(f"Wrote {report['row_count']} teacher accuracy row(s) to {output_path}")

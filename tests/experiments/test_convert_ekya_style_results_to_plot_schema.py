@@ -501,6 +501,36 @@ def test_ekya_converter_writes_existing_csv_schemas_exactly(tmp_path: Path) -> N
     assert frames[2]["result_source"] == "stale_result"
 
 
+def test_ekya_converter_ignores_same_connection_skip_as_trigger(
+    tmp_path: Path,
+) -> None:
+    raw_dir = _raw_ekya_dir(tmp_path)
+    output_dir = tmp_path / "normalized"
+    _write_raw_ekya_fixture(raw_dir)
+    scheduler_rows = read_csv(raw_dir / "scheduler_events.csv")
+    scheduler_rows.append(
+        {
+            **scheduler_rows[0],
+            "task_id": 1,
+            "selected_hp_id": "",
+            "selected_epochs": 0,
+            "training_resource_weight": 0.0,
+            "decision_reason": "same_connection_training_active",
+        }
+    )
+    write_csv(raw_dir / "scheduler_events.csv", SCHEDULER_FIELDS, scheduler_rows)
+
+    convert_ekya_style_results(raw_dir=raw_dir, output_dir=output_dir)
+
+    events = read_csv(output_dir / "adaptation_events.csv")
+    summary = read_csv(output_dir / "summary.csv")[0]
+    triggers = [row for row in events if row["event_name"] == "trigger_decision"]
+    assert len(triggers) == 1
+    assert triggers[0]["job_id"] == "ekya-edge-1-task-0"
+    assert summary["num_trigger_decisions"] == "1"
+    assert all(row["message"] != "same_connection_training_active" for row in events)
+
+
 def test_ekya_converter_training_mean_ignores_inference_only_windows(
     tmp_path: Path,
 ) -> None:

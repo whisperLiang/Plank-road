@@ -528,10 +528,7 @@ def _is_fig1_training_trigger_event(event: Mapping[str, Any]) -> bool:
         return False
     if str(event.get("method", "") or "") != "ekya":
         return True
-    if str(event.get("job_id", "") or ""):
-        return True
-    message = str(event.get("message", "") or "").lower()
-    return bool(message) and "inference_only" not in message
+    return bool(str(event.get("job_id", "") or ""))
 
 
 def _plot_fig1(

@@ -519,6 +519,20 @@ def test_fig1_filters_ekya_inference_only_trigger_markers() -> None:
             "message": "fixed_training_does_not_fit_window_inference_only",
         }
     )
+    assert not _is_fig1_training_trigger_event(
+        {
+            "method": "ekya",
+            "event_name": "trigger_decision",
+            "message": "same_connection_training_active",
+        }
+    )
+    assert not _is_fig1_training_trigger_event(
+        {
+            "method": "ekya",
+            "event_name": "trigger_decision",
+            "message": "selected_fixed_training_config",
+        }
+    )
     assert _is_fig1_training_trigger_event(
         {
             "method": "ekya",

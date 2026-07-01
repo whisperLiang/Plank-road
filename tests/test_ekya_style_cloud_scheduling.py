@@ -933,12 +933,15 @@ def test_ekya_active_same_connection_launch_still_records_window_metrics(
     assert not hasattr(controller, "_pipeline_semaphore")
     scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
     window_rows = read_csv(controller.output_dir / "per_window_metrics.csv")
-    assert scheduler_rows
-    assert scheduler_rows[-1]["decision_reason"] == "same_connection_training_active"
+    assert scheduler_rows == []
     assert window_rows
     assert window_rows[-1]["task_id"] == "2"
+    assert window_rows[-1]["training_time_s"] == "0.0"
+    assert window_rows[-1]["microprofile_time_s"] == "0.0"
+    assert window_rows[-1]["teacher_labeling_time_s"] == "0.0"
     assert read_csv(controller.output_dir / "training_events.csv") == []
     assert controller._background_threads == []
+    assert "training check skipped" in logs
     assert "[EkyaTrainingDrop]" not in logs
     assert not (controller.output_dir / "training_drop_events.csv").exists()
 
@@ -986,7 +989,7 @@ def test_ekya_training_admission_skip_does_not_train_or_add_drop_schema(
         assert key not in summary
 
 
-def test_ekya_launch_time_training_block_survives_until_scheduler(
+def test_ekya_launch_time_training_block_skips_scheduler(
     tmp_path: Path,
 ) -> None:
     controller = _controller_for_admission_tests(tmp_path)
@@ -1001,8 +1004,37 @@ def test_ekya_launch_time_training_block_survives_until_scheduler(
     scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
     window_rows = read_csv(controller.output_dir / "per_window_metrics.csv")
     assert trainer.calls == []
-    assert scheduler_rows[-1]["decision_reason"] == "same_connection_training_active"
+    assert scheduler_rows == []
     assert window_rows[-1]["task_id"] == "2"
+    assert window_rows[-1]["training_time_s"] == "0.0"
+    assert read_csv(controller.output_dir / "training_events.csv") == []
+
+
+def test_ekya_runtime_active_same_connection_skips_scheduler(
+    tmp_path: Path,
+) -> None:
+    controller = _controller_for_admission_tests(tmp_path)
+    trainer = _RecordingTrainer(tmp_path)
+    controller.trainer = trainer
+    active = controller._try_begin_training(_decoded_window())
+    assert active is not None
+
+    try:
+        controller._run_window_pipeline(
+            _decoded_window(task_id=2, window_id="runtime-active-window"),
+            training_admission_blocked=False,
+        )
+    finally:
+        controller._end_training(active)
+
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    window_rows = read_csv(controller.output_dir / "per_window_metrics.csv")
+    assert trainer.calls == []
+    assert scheduler_rows == []
+    assert window_rows[-1]["task_id"] == "2"
+    assert window_rows[-1]["training_time_s"] == "0.0"
+    assert window_rows[-1]["microprofile_time_s"] == "0.0"
+    assert window_rows[-1]["teacher_labeling_time_s"] == "0.0"
     assert read_csv(controller.output_dir / "training_events.csv") == []
 
 
@@ -1209,7 +1241,7 @@ def test_ekya_frame_inference_result_return_unaffected_by_training_skip(tmp_path
     assert second.camera_id == 0
     assert len(read_csv(controller.output_dir / "inference_events.csv")) == 2
     scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
-    assert scheduler_rows[-1]["decision_reason"] == "same_connection_training_active"
+    assert scheduler_rows == []
     assert controller._background_threads == []
 
 

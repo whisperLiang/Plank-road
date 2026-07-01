@@ -97,7 +97,11 @@ def build_ekya_style_row_sets(
             frame_rows,
             upload_rows,
             latency_rows,
-            num_trigger_decisions=len(read_csv(raw_dir / "scheduler_events.csv")),
+            num_trigger_decisions=sum(
+                1
+                for row in read_csv(raw_dir / "scheduler_events.csv")
+                if _scheduler_row_trains(row)
+            ),
         )
     ]
     row_sets = {
@@ -275,8 +279,10 @@ def _adaptation_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[st
             )
         )
     for raw in read_csv(raw_dir / "scheduler_events.csv"):
+        if not _scheduler_row_trains(raw):
+            continue
         key = _task_key(raw)
-        job_id = f"ekya-edge-{key[0]}-task-{key[2]}" if _scheduler_row_trains(raw) else ""
+        job_id = f"ekya-edge-{key[0]}-task-{key[2]}"
         rows.append(
             empty_row(
                 ADAPTATION_FIELDS,

@@ -46,6 +46,14 @@ class _CountingTeacher(_FakeTeacher):
         return super().infer(frame)
 
 
+class _BatchTeacher(_FakeTeacher):
+    batch_call_sizes: list[int] = []
+
+    def infer_batch(self, frames):
+        type(self).batch_call_sizes.append(len(frames))
+        return [_FakeTeacher.infer(self, frame) for frame in frames]
+
+
 def _fixture(tmp_path: Path) -> tuple[Path, Path]:
     comparison_dir = tmp_path / "comparison"
     video_path = tmp_path / "road-night.rain.mp4"
@@ -279,6 +287,28 @@ def test_teacher_replay_does_not_share_predictions_across_different_videos(
 
     assert report["cache_misses"] == 2
     assert _CountingTeacher.inference_count == 2
+
+
+def test_teacher_replay_batches_cache_misses(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    comparison_dir, manifest_path = _fixture(tmp_path)
+    _BatchTeacher.batch_call_sizes = []
+    monkeypatch.setattr(evaluator, "_Teacher", _BatchTeacher)
+
+    report = evaluator.evaluate_teacher_accuracy(
+        comparison_dir,
+        manifest_path,
+        comparison_dir / "teacher_accuracy.jsonl",
+        device="cpu",
+        teacher_batch_size=2,
+    )
+
+    assert report["row_count"] == 9
+    assert report["cache_misses"] == 3
+    assert report["teacher_batch_size"] == 2
+    assert _BatchTeacher.batch_call_sizes == [2, 1]
 
 
 def test_empty_evaluation_does_not_update_manifest(

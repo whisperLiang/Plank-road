@@ -235,10 +235,7 @@ class EkyaStyleCloudSchedulingController:
             self._start_window_pipeline_thread(window)
 
     def _start_window_pipeline_thread(self, window: CompletedFrameWindow) -> None:
-        training_admission_blocked = bool(
-            self.config.retraining.drop_training_when_active_same_connection
-            and self._has_active_training(window)
-        )
+        training_admission_blocked = self._same_connection_training_active(window)
         thread = threading.Thread(
             target=self._run_window_pipeline_guarded,
             args=(window, training_admission_blocked, False),
@@ -281,6 +278,12 @@ class EkyaStyleCloudSchedulingController:
         if manage_registration:
             self._begin_window_pipeline(window.task_id)
         try:
+            if training_admission_blocked or self._same_connection_training_active(window):
+                self._record_training_check_skipped_window(
+                    window,
+                    reason="same_connection_training_active",
+                )
+                return
             logger.info(
                 "ekya_style_cloud_scheduling window start: task_id={} frames={}..{}",
                 window.task_id,
@@ -556,6 +559,31 @@ class EkyaStyleCloudSchedulingController:
             camera_id=int(window.camera_id),
         )
 
+    def _record_training_check_skipped_window(
+        self,
+        window: CompletedFrameWindow,
+        *,
+        reason: str,
+    ) -> None:
+        logger.info(
+            "ekya_style_cloud_scheduling training check skipped: task_id={} "
+            "window={} reason={}",
+            int(window.task_id),
+            window.window_id,
+            reason,
+        )
+        self.logger.record_window_metrics(
+            int(window.task_id),
+            int(window.start_frame),
+            int(window.end_frame),
+            training_time_s=0.0,
+            microprofile_time_s=0.0,
+            teacher_labeling_time_s=0.0,
+            num_model_updates=0,
+            edge_id=int(window.edge_id),
+            camera_id=int(window.camera_id),
+        )
+
     def _training_admission_key(self, window: CompletedFrameWindow) -> TrainingAdmissionKey:
         scope = str(
             self.config.retraining.training_admission_scope or "edge_camera"
@@ -575,6 +603,12 @@ class EkyaStyleCloudSchedulingController:
         key = self._training_admission_key(window)
         with self._training_admission_lock:
             return key in self._active_training_by_key
+
+    def _same_connection_training_active(self, window: CompletedFrameWindow) -> bool:
+        return bool(
+            self.config.retraining.drop_training_when_active_same_connection
+            and self._has_active_training(window)
+        )
 
     def _try_begin_training(self, window: CompletedFrameWindow) -> TrainingLease | None:
         key = self._training_admission_key(window)
