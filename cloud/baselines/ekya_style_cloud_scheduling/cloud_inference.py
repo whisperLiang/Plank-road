@@ -162,25 +162,57 @@ class CloudInferenceEngine:
             golden=getattr(runtime_config, "golden", None) or self.config.teacher_model,
             weights_path=getattr(runtime_config, "weights_path", None),
             tinynext_input_size=getattr(runtime_config, "tinynext_input_size", None),
+            final_detection_threshold=float(self.config.cloud_inference.score_threshold),
         )
 
 
 def _infer_detector(detector: Any, frame_bgr: np.ndarray, *, threshold: float):
     if hasattr(detector, "small_inference"):
         _unused, boxes, labels, scores = detector.small_inference(frame_bgr)
-        return boxes or [], labels or [], scores or []
+        return _filter_prediction_by_threshold(boxes, labels, scores, threshold=threshold)
     if hasattr(detector, "infer_sample"):
         artifacts = detector.infer_sample(frame_bgr)
-        return (
+        return _filter_prediction_by_threshold(
             getattr(artifacts, "final_detection_boxes", []) or [],
             getattr(artifacts, "final_detection_labels", []) or [],
             getattr(artifacts, "final_detection_scores", []) or [],
+            threshold=threshold,
         )
     if callable(detector):
         value = detector(frame_bgr, threshold=threshold)
         if isinstance(value, tuple) and len(value) >= 3:
-            return value[0], value[1], value[2]
+            return _filter_prediction_by_threshold(
+                value[0],
+                value[1],
+                value[2],
+                threshold=threshold,
+            )
     raise RuntimeError(f"unsupported cloud inference detector: {type(detector)!r}")
+
+
+def _filter_prediction_by_threshold(
+    boxes: Any,
+    labels: Any,
+    scores: Any,
+    *,
+    threshold: float,
+) -> tuple[list[Any], list[Any], list[Any]]:
+    filtered = [
+        (box, label, score)
+        for box, label, score in zip(
+            list(boxes or []),
+            list(labels or []),
+            list(scores or []),
+        )
+        if float(score) > float(threshold)
+    ]
+    if not filtered:
+        return [], [], []
+    return (
+        [item[0] for item in filtered],
+        [item[1] for item in filtered],
+        [item[2] for item in filtered],
+    )
 
 
 def _class_names_for_labels(configured: tuple[str, ...], labels: list[int]) -> list[str]:

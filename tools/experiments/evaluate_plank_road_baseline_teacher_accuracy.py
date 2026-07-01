@@ -120,11 +120,11 @@ def _resolve_video_path(comparison_dir: Path, video_source: str) -> Path | None:
     return next((path.resolve() for path in candidates if path.is_file()), None)
 
 
-def _fallback_student_metadata(yaml_path: Path) -> tuple[str, tuple[str, ...]]:
+def _fallback_student_metadata(yaml_path: Path) -> tuple[str, tuple[str, ...], float]:
     config = load_runtime_config(yaml_path)
     class_names = tuple(str(item) for item in list(config.client.class_names or []))
     schema = "zero_based" if class_names else "coco_91"
-    return schema, class_names
+    return schema, class_names, float(config.client.final_detection_threshold)
 
 
 def _prediction_records(
@@ -495,6 +495,36 @@ def _cache_matches(payload: Mapping[str, Any], expected: Mapping[str, Any]) -> b
     return all(payload.get(key) == value for key, value in expected.items())
 
 
+def _manifest_metric_float(
+    manifest: Mapping[str, Any],
+    key: str,
+    fallback: float,
+) -> float:
+    metrics = manifest.get("metrics")
+    value = optional_float(metrics.get(key) if isinstance(metrics, Mapping) else None)
+    return float(fallback) if value is None else float(value)
+
+
+def _filter_prediction_by_score(
+    prediction: Mapping[str, Any],
+    *,
+    score_threshold: float,
+) -> dict[str, list[Any]]:
+    boxes = list(prediction.get("boxes") or [])
+    labels = list(prediction.get("labels") or [])
+    scores = list(prediction.get("scores") or [])
+    filtered = [
+        (box, label, score)
+        for box, label, score in zip(boxes, labels, scores)
+        if float(score) >= float(score_threshold)
+    ]
+    return {
+        "boxes": [item[0] for item in filtered],
+        "labels": [item[1] for item in filtered],
+        "scores": [item[2] for item in filtered],
+    }
+
+
 def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     for row in rows:
         if list(row) != ACCURACY_FIELDS:
@@ -512,6 +542,9 @@ def _update_manifest(
     accuracy_path: Path,
     teacher_model: str,
     video_hashes: Mapping[str, str],
+    score_threshold: float,
+    iou_threshold: float,
+    student_score_threshold: float,
 ) -> None:
     payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
@@ -539,6 +572,9 @@ def _update_manifest(
             "accuracy_definition": ACCURACY_DEFINITION,
             "teacher_model": teacher_model,
             "teacher_replay_cache": "teacher_replay_cache",
+            "teacher_score_threshold": float(score_threshold),
+            "teacher_iou_threshold": float(iou_threshold),
+            "student_score_threshold": float(student_score_threshold),
         }
     )
     updated["metrics"] = metrics
@@ -563,8 +599,9 @@ def evaluate_teacher_accuracy(
     teacher_weights: Path | None = None,
     yaml_path: Path = Path("./config/config.yaml"),
     device: str = "cuda:0",
-    iou_threshold: float = 0.5,
-    score_threshold: float = 0.0,
+    iou_threshold: float | None = None,
+    score_threshold: float | None = None,
+    student_score_threshold: float | None = None,
     max_frames: int | None = None,
     frame_stride: int = 1,
     update_manifest: bool = False,
@@ -574,7 +611,28 @@ def evaluate_teacher_accuracy(
 ) -> dict[str, Any]:
     comparison_dir = comparison_dir.resolve()
     manifest = load_manifest(manifest_path)
-    fallback_schema, fallback_names = _fallback_student_metadata(yaml_path)
+    fallback_schema, fallback_names, fallback_student_score_threshold = (
+        _fallback_student_metadata(yaml_path)
+    )
+    score_threshold = (
+        float(score_threshold)
+        if score_threshold is not None
+        else _manifest_metric_float(manifest, "teacher_score_threshold", 0.0)
+    )
+    iou_threshold = (
+        float(iou_threshold)
+        if iou_threshold is not None
+        else _manifest_metric_float(manifest, "teacher_iou_threshold", 0.5)
+    )
+    student_score_threshold = (
+        float(student_score_threshold)
+        if student_score_threshold is not None
+        else _manifest_metric_float(
+            manifest,
+            "student_score_threshold",
+            fallback_student_score_threshold,
+        )
+    )
     if teacher_weights is not None:
         resolved_weights = teacher_weights.expanduser().resolve()
         if not resolved_weights.is_file():
@@ -597,6 +655,7 @@ def evaluate_teacher_accuracy(
         "teacher_batch_size": max(1, int(teacher_batch_size)),
         "iou_threshold": float(iou_threshold),
         "score_threshold": float(score_threshold),
+        "student_score_threshold": float(student_score_threshold),
         "accuracy_definition": ACCURACY_DEFINITION,
         "metric_definition": METRIC_DEFINITION,
         "prediction_files": [],
@@ -889,10 +948,13 @@ def evaluate_teacher_accuracy(
                     "timestamp_ms": record.timestamp_ms,
                     "window_id": "",
                     "f1": teacher_f1(
-                        record.prediction,
+                        _filter_prediction_by_score(
+                            record.prediction,
+                            score_threshold=float(student_score_threshold),
+                        ),
                         mapped_teacher,
                         iou_threshold=float(iou_threshold),
-                        score_threshold=float(score_threshold),
+                        score_threshold=float(student_score_threshold),
                     ),
                     "map": "",
                     "window_accuracy": "",
@@ -929,6 +991,9 @@ def evaluate_teacher_accuracy(
             accuracy_path=output_path,
             teacher_model=teacher_model,
             video_hashes=video_hashes,
+            score_threshold=float(score_threshold),
+            iou_threshold=float(iou_threshold),
+            student_score_threshold=float(student_score_threshold),
         )
         report["manifest_updated"] = True
     elif update_manifest:
@@ -961,8 +1026,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_weights", type=Path)
     parser.add_argument("--yaml_path", type=Path, default=Path("./config/config.yaml"))
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--iou_threshold", type=float, default=0.5)
-    parser.add_argument("--score_threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--iou_threshold",
+        type=float,
+        default=None,
+        help="IoU threshold; defaults to metrics.teacher_iou_threshold, then 0.5.",
+    )
+    parser.add_argument(
+        "--score_threshold",
+        type=float,
+        default=None,
+        help="Score threshold; defaults to metrics.teacher_score_threshold, then 0.0.",
+    )
+    parser.add_argument(
+        "--student_score_threshold",
+        type=float,
+        default=None,
+        help=(
+            "Student prediction score threshold; defaults to "
+            "metrics.student_score_threshold, then client.final_detection_threshold."
+        ),
+    )
     parser.add_argument("--max_frames", type=int)
     parser.add_argument("--frame_stride", type=int, default=1)
     parser.add_argument("--update_manifest", action="store_true")
@@ -1001,6 +1085,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=args.device,
         iou_threshold=args.iou_threshold,
         score_threshold=args.score_threshold,
+        student_score_threshold=args.student_score_threshold,
         max_frames=args.max_frames,
         frame_stride=max(1, args.frame_stride),
         update_manifest=args.update_manifest,

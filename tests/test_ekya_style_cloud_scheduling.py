@@ -530,6 +530,45 @@ def test_ekya_config_inherits_shared_plank_road_settings() -> None:
     assert cfg.fixed_training.subsample == pytest.approx(1.0)
 
 
+def test_ekya_cloud_inference_config_passes_final_detection_threshold(
+    tmp_path: Path,
+) -> None:
+    from cloud.baselines.ekya_style_cloud_scheduling.cloud_inference import (
+        CloudInferenceEngine,
+    )
+
+    runtime = _runtime(tmp_path)
+    runtime.server.baselines.ekya_style_cloud_scheduling.cloud_inference.score_threshold = 0.61
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+
+    object_detection_config = CloudInferenceEngine(cfg)._object_detection_config(runtime)
+
+    assert object_detection_config.final_detection_threshold == pytest.approx(0.61)
+
+
+def test_ekya_cloud_inference_filters_artifacts_with_cloud_threshold() -> None:
+    from cloud.baselines.ekya_style_cloud_scheduling.cloud_inference import _infer_detector
+
+    class Detector:
+        def small_inference(self, _frame):
+            return (
+                None,
+                [[0, 0, 1, 1], [1, 1, 2, 2], [2, 2, 3, 3]],
+                [2, 4, 4],
+                [0.59, 0.6, 0.61],
+            )
+
+    boxes, labels, scores = _infer_detector(
+        Detector(),
+        np.zeros((4, 4, 3), dtype=np.uint8),
+        threshold=0.6,
+    )
+
+    assert boxes == [[2, 2, 3, 3]]
+    assert labels == [4]
+    assert scores == [0.61]
+
+
 def test_ekya_protocol_json_roundtrip_preserves_bytes() -> None:
     packet = FrameUploadPacket(
         method="ekya_style_cloud_scheduling",

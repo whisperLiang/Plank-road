@@ -171,6 +171,9 @@ def test_teacher_replay_maps_labels_caches_and_updates_manifest(
     updated = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
     assert updated["metrics"]["accuracy_definition"] == "teacher_supervised_f1"
     assert updated["metrics"]["accuracy_file"] == output.name
+    assert updated["metrics"]["teacher_score_threshold"] == 0.0
+    assert updated["metrics"]["teacher_iou_threshold"] == 0.5
+    assert updated["metrics"]["student_score_threshold"] == 0.6
     assert updated["scenarios"][0]["video_sha256"]
     index = json.loads((comparison_dir / "experiment_index.json").read_text(encoding="utf-8"))
     assert index["metrics"] == updated["metrics"]
@@ -186,6 +189,96 @@ def test_teacher_replay_maps_labels_caches_and_updates_manifest(
     assert second["row_count"] == 6
     assert second["cache_hits"] == 2
     assert second["cache_misses"] == 0
+
+
+def test_teacher_replay_uses_manifest_teacher_score_threshold(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    comparison_dir, manifest_path = _fixture(tmp_path)
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["metrics"] = {"teacher_score_threshold": 0.5}
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=False),
+        encoding="utf-8",
+    )
+    for prediction in comparison_dir.rglob("latest_inference_results.jsonl"):
+        rows = [
+            json.loads(line)
+            for line in prediction.read_text(encoding="utf-8").splitlines()
+        ]
+        for row in rows:
+            row["result"]["scores"] = [0.4]
+        prediction.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(evaluator, "_Teacher", _FakeTeacher)
+
+    report = evaluator.evaluate_teacher_accuracy(
+        comparison_dir,
+        manifest_path,
+        comparison_dir / "teacher_accuracy.jsonl",
+        device="cpu",
+        max_frames=1,
+    )
+    rows = [
+        json.loads(line)
+        for line in (comparison_dir / "teacher_accuracy.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert report["score_threshold"] == 0.5
+    assert rows
+    assert all(row["f1"] == 0.0 for row in rows)
+
+
+def test_teacher_replay_uses_manifest_student_score_threshold(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    comparison_dir, manifest_path = _fixture(tmp_path)
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["metrics"] = {
+        "teacher_score_threshold": 0.4,
+        "student_score_threshold": 0.6,
+    }
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=False),
+        encoding="utf-8",
+    )
+    for prediction in comparison_dir.rglob("latest_inference_results.jsonl"):
+        rows = [
+            json.loads(line)
+            for line in prediction.read_text(encoding="utf-8").splitlines()
+        ]
+        for row in rows:
+            row["result"]["scores"] = [0.5]
+        prediction.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(evaluator, "_Teacher", _FakeTeacher)
+
+    report = evaluator.evaluate_teacher_accuracy(
+        comparison_dir,
+        manifest_path,
+        comparison_dir / "teacher_accuracy.jsonl",
+        device="cpu",
+        max_frames=1,
+    )
+    rows = [
+        json.loads(line)
+        for line in (comparison_dir / "teacher_accuracy.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert report["score_threshold"] == 0.4
+    assert report["student_score_threshold"] == 0.6
+    assert rows
+    assert all(row["f1"] == 0.0 for row in rows)
 
 
 def test_teacher_replay_reports_unreplayable_frames(tmp_path: Path) -> None:
