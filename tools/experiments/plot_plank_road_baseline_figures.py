@@ -83,12 +83,13 @@ METHOD_MARKERS = {
 COMPONENT_COLORS = (
     "#B4C0E4",
     "#E4CCD8",
+    "#C8B7E8",
     "#AADCA9",
     "#F0E0D0",
     "#D8D8D8",
     "#E9A6A1",
 )
-COMPONENT_HATCHES = ("", "///", "\\\\\\", "...", "xx", "oo")
+COMPONENT_HATCHES = ("", "///", "++", "\\\\\\", "...", "xx", "oo")
 STAGE_COLORS = {
     "inference": "#B4C0E4",
     "uploading": "#7884B4",
@@ -948,7 +949,14 @@ def _plot_fig3(
 def _aggregate_breakdown(
     rows: list[dict[str, str]],
     fields: list[tuple[str, str]],
+    *,
+    component_aggregation: str = "mean",
+    expected_fields_by_method: Mapping[str, set[str]] | None = None,
 ) -> dict[str, dict[str, dict[str, float | None]]]:
+    if component_aggregation not in {"mean", "sum"}:
+        raise ValueError(f"unsupported component aggregation: {component_aggregation}")
+    reducer = _component_mean if component_aggregation == "mean" else _component_sum
+    field_names = [field for field, _ in fields]
     per_run: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         per_run[
@@ -963,7 +971,12 @@ def _aggregate_breakdown(
             "scenario_name": scenario,
             "method": method,
             "run_id": run_id,
-            **{field: _component_mean(field, group) for field, _ in fields},
+            **{
+                field: reducer(field, group)
+                if _expects_component(method, field, expected_fields_by_method)
+                else None
+                for field in field_names
+            },
         }
         for (scenario, method, run_id), group in per_run.items()
     ]
@@ -983,10 +996,86 @@ def _aggregate_breakdown(
     return values
 
 
+def _expects_component(
+    method: str,
+    field: str,
+    expected_fields_by_method: Mapping[str, set[str]] | None,
+) -> bool:
+    if expected_fields_by_method is None:
+        return True
+    return field in expected_fields_by_method.get(method, set())
+
+
 def _component_mean(field: str, rows: Iterable[Mapping[str, Any]]) -> float | None:
     if field == "training_ms":
         return mean_positive(row.get(field) for row in rows)
     return mean(row.get(field) for row in rows)
+
+
+def _component_sum(field: str, rows: Iterable[Mapping[str, Any]]) -> float | None:
+    values = [
+        value
+        for row in rows
+        if (value := optional_float(row.get(field))) is not None
+    ]
+    if not values:
+        return None
+    return float(sum(values))
+
+
+def _has_positive(row: Mapping[str, Any], field: str) -> bool:
+    value = optional_float(row.get(field))
+    return value is not None and value > 0
+
+
+def _adaptation_stage_rows(
+    rows: list[dict[str, str]],
+    fields: list[tuple[str, str]],
+) -> list[dict[str, str]]:
+    component_fields = [field for field, _ in fields]
+    anchor_fields = (
+        "training_ms",
+        "model_update_download_ms",
+        "model_apply_ms",
+        "total_adaptation_ms",
+    )
+    contexts: dict[tuple[str, str, str, str], dict[str, Any]] = defaultdict(
+        lambda: {"windows": set(), "has_blank_window": False}
+    )
+    for row in rows:
+        if not any(_has_positive(row, field) for field in anchor_fields):
+            continue
+        key = (
+            str(row.get("scenario_name", "")),
+            str(row.get("method", "")),
+            str(row.get("run_id", "")),
+            str(row.get("edge_id", "")),
+        )
+        window_id = str(row.get("window_id", "") or "")
+        if window_id:
+            contexts[key]["windows"].add(window_id)
+        else:
+            contexts[key]["has_blank_window"] = True
+
+    filtered: list[dict[str, str]] = []
+    for row in rows:
+        if not any(optional_float(row.get(field)) is not None for field in component_fields):
+            continue
+        key = (
+            str(row.get("scenario_name", "")),
+            str(row.get("method", "")),
+            str(row.get("run_id", "")),
+            str(row.get("edge_id", "")),
+        )
+        context = contexts.get(key)
+        if context is None:
+            continue
+        window_id = str(row.get("window_id", "") or "")
+        if window_id and window_id in context["windows"]:
+            filtered.append(row)
+        elif not window_id and context["has_blank_window"]:
+            filtered.append(row)
+    return filtered
 
 
 def _stacked_method_bars(
@@ -997,8 +1086,15 @@ def _stacked_method_bars(
     title: str,
     figure_dir: Path,
     stem: str,
+    component_aggregation: str = "mean",
+    expected_fields_by_method: Mapping[str, set[str]] | None = None,
 ) -> tuple[list[str], str | None, list[str]]:
-    values = _aggregate_breakdown(rows, fields)
+    values = _aggregate_breakdown(
+        rows,
+        fields,
+        component_aggregation=component_aggregation,
+        expected_fields_by_method=expected_fields_by_method,
+    )
     scenarios = sorted(values)
     if not scenarios:
         return [], "input data missing", []
@@ -1015,6 +1111,10 @@ def _stacked_method_bars(
         for method, item in scenario_values.items()
         for field, value in item.items()
         if value is None
+        and (
+            expected_fields_by_method is None
+            or field in expected_fields_by_method.get(method, set())
+        )
     ]
     raw_values = [
         float(value)
@@ -1426,19 +1526,54 @@ def plot_figures(
             stem="fig4_upload_breakdown",
         ),
         "fig5_latency_breakdown": lambda: _stacked_method_bars(
-            inputs["latency_breakdown.csv"],
+            _adaptation_stage_rows(
+                inputs["latency_breakdown.csv"],
+                [
+                    ("upload_ms", "Upload"),
+                    ("teacher_annotation_ms", "Teacher annotation"),
+                    ("microprofile_ms", "Microprofile"),
+                    ("feature_rebuild_ms", "Feature rebuild"),
+                    ("training_ms", "Training"),
+                    ("model_update_download_ms", "Model update download"),
+                    ("model_apply_ms", "Model apply"),
+                ],
+            ),
             fields=[
                 ("upload_ms", "Upload"),
                 ("teacher_annotation_ms", "Teacher annotation"),
+                ("microprofile_ms", "Microprofile"),
                 ("feature_rebuild_ms", "Feature rebuild"),
                 ("training_ms", "Training"),
                 ("model_update_download_ms", "Model update download"),
                 ("model_apply_ms", "Model apply"),
             ],
             ylabel="Latency (ms)",
-            title="Adaptation latency breakdown",
+            title="Total adaptation latency breakdown",
             figure_dir=figure_dir,
             stem="fig5_latency_breakdown",
+            component_aggregation="sum",
+            expected_fields_by_method={
+                "pure_edge_local_updating": {"training_ms", "model_apply_ms"},
+                "accuracy_trigger_cloud_retraining": {
+                    "upload_ms",
+                    "training_ms",
+                    "model_update_download_ms",
+                    "model_apply_ms",
+                },
+                "plank_road": {
+                    "upload_ms",
+                    "teacher_annotation_ms",
+                    "feature_rebuild_ms",
+                    "training_ms",
+                    "model_update_download_ms",
+                    "model_apply_ms",
+                },
+                "ekya": {
+                    "teacher_annotation_ms",
+                    "microprofile_ms",
+                    "training_ms",
+                },
+            },
         ),
         "fig6_multi_edge_scalability": lambda: _plot_fig6(
             inputs["summary.csv"],

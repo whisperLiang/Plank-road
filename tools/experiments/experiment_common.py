@@ -140,6 +140,7 @@ LATENCY_FIELDS = [
     "window_id",
     "upload_ms",
     "teacher_annotation_ms",
+    "microprofile_ms",
     "feature_rebuild_ms",
     "training_ms",
     "model_update_download_ms",

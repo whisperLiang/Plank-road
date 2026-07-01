@@ -84,10 +84,11 @@ def build_ekya_style_row_sets(
         "video_slug": video_slug,
     }
     frame_rows = _frame_rows(raw_dir, summary, base_run, video_name)
-    window_rows = _window_rows(raw_dir, base_run)
+    training_duration_by_task = _training_duration_by_task(raw_dir)
+    window_rows = _window_rows(raw_dir, base_run, training_duration_by_task)
     adaptation_rows = _adaptation_rows(raw_dir, base_run)
     upload_rows = _upload_rows(raw_dir, base_run)
-    latency_rows = _latency_rows(raw_dir, base_run)
+    latency_rows = _latency_rows(raw_dir, base_run, training_duration_by_task)
     resource_rows: list[dict[str, Any]] = []
     summary_rows = [
         _summary_row(
@@ -193,10 +194,15 @@ def _frame_rows(
     return rows
 
 
-def _window_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _window_rows(
+    raw_dir: Path,
+    base_run: Mapping[str, Any],
+    training_duration_by_task: Mapping[tuple[int, int, int], float],
+) -> list[dict[str, Any]]:
     rows = []
     for raw in read_csv(raw_dir / "per_window_metrics.csv"):
         window_id = _window_id(raw)
+        training_s = _training_time_s(raw, training_duration_by_task)
         rows.append(
             empty_row(
                 WINDOW_FIELDS,
@@ -209,7 +215,7 @@ def _window_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, A
                 window_accuracy=raw.get("avg_foreground_f1"),
                 foreground_accuracy=raw.get("avg_foreground_f1"),
                 trigger_decision=(
-                    "train" if optional_float(raw.get("training_time_s")) else "inference_only"
+                    "train" if training_s and training_s > 0 else "inference_only"
                 ),
             )
         )
@@ -374,10 +380,16 @@ def _upload_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, A
     return rows
 
 
-def _latency_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _latency_rows(
+    raw_dir: Path,
+    base_run: Mapping[str, Any],
+    training_duration_by_task: Mapping[tuple[int, int, int], float],
+) -> list[dict[str, Any]]:
     rows = []
     for raw in read_csv(raw_dir / "per_window_metrics.csv"):
-        training_ms = _seconds_to_ms(raw.get("training_time_s"))
+        training_ms = _seconds_to_ms(
+            _training_time_s(raw, training_duration_by_task)
+        )
         teacher_ms = _seconds_to_ms(raw.get("teacher_labeling_time_s"))
         micro_ms = _seconds_to_ms(raw.get("microprofile_time_s"))
         has_training = training_ms is not None and training_ms > 0
@@ -398,7 +410,7 @@ def _latency_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, 
                 window_id=_window_id(raw),
                 upload_ms=raw.get("avg_edge_upload_to_result_latency_ms"),
                 teacher_annotation_ms=teacher_ms,
-                feature_rebuild_ms=micro_ms,
+                microprofile_ms=micro_ms,
                 training_ms=training_ms,
                 model_update_download_ms=0,
                 model_apply_ms=0,
@@ -406,6 +418,32 @@ def _latency_rows(raw_dir: Path, base_run: Mapping[str, Any]) -> list[dict[str, 
             )
         )
     return rows
+
+
+def _training_duration_by_task(raw_dir: Path) -> dict[tuple[int, int, int], float]:
+    durations: dict[tuple[int, int, int], float] = {}
+    for row in read_csv(raw_dir / "training_events.csv"):
+        duration = optional_float(row.get("train_duration_s"))
+        if duration is None:
+            start = optional_float(row.get("train_start_time"))
+            end = optional_float(row.get("train_end_time"))
+            if start is not None and end is not None and end >= start:
+                duration = end - start
+        if duration is None or duration <= 0:
+            continue
+        key = _task_key(row)
+        durations[key] = max(float(duration), durations.get(key, 0.0))
+    return durations
+
+
+def _training_time_s(
+    row: Mapping[str, Any],
+    training_duration_by_task: Mapping[tuple[int, int, int], float],
+) -> float | None:
+    raw_duration = optional_float(row.get("training_time_s"))
+    event_duration = training_duration_by_task.get(_task_key(row))
+    values = [value for value in (raw_duration, event_duration) if value is not None]
+    return max(values) if values else None
 
 
 def _summary_row(

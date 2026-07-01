@@ -1332,6 +1332,53 @@ def _can_pair_by_time(start: Mapping[str, Any], end: Mapping[str, Any]) -> bool:
     return start_identity == end_identity
 
 
+def _job_window_ids_from_triggers(
+    group: list[dict[str, Any]],
+) -> dict[str, str]:
+    triggers = [
+        row
+        for row in group
+        if row.get("event_name") == "trigger_decision"
+        and str(row.get("window_id", "") or "")
+    ]
+    trigger_pool = list(triggers)
+    mapping: dict[str, str] = {}
+    for event in [row for row in group if row.get("event_name") == "bundle_built"]:
+        job_id = str(event.get("job_id", "") or "")
+        event_time = optional_int(event.get("event_time_ms"))
+        if not job_id or event_time is None:
+            continue
+        candidates = [
+            (index, trigger_time)
+            for index, trigger in enumerate(trigger_pool)
+            if (trigger_time := optional_int(trigger.get("event_time_ms"))) is not None
+            and trigger_time <= event_time
+        ]
+        if not candidates:
+            continue
+        trigger_index, _ = max(candidates, key=lambda item: item[1])
+        trigger = trigger_pool.pop(trigger_index)
+        mapping[job_id] = str(trigger.get("window_id", "") or "")
+    return mapping
+
+
+def _latency_window_id(
+    end: Mapping[str, Any],
+    start: Mapping[str, Any] | None = None,
+    *,
+    job_window_ids: Mapping[str, str],
+) -> str:
+    for row in (end, start or {}):
+        window_id = str(row.get("window_id", "") or "")
+        if window_id:
+            return window_id
+    for row in (end, start or {}):
+        job_id = str(row.get("job_id", "") or "")
+        if job_id and job_window_ids.get(job_id):
+            return str(job_window_ids[job_id])
+    return ""
+
+
 def _derive_adaptation_latency(
     events: list[dict[str, Any]],
     latency: list[dict[str, Any]],
@@ -1354,15 +1401,36 @@ def _derive_adaptation_latency(
         if method == "ekya":
             continue
         group.sort(key=lambda row: optional_int(row.get("event_time_ms")) or 0)
-        stage_pairs = (
+        job_window_ids = _job_window_ids_from_triggers(group)
+        has_explicit_teacher_annotation = any(
+            str(row.get("run_id", "")) == run_id
+            and str(row.get("method", "")) == method
+            and str(row.get("edge_id", "") or "") in {"", edge_id}
+            and optional_float(row.get("teacher_annotation_ms")) is not None
+            for row in latency
+        )
+        stage_pairs = [
+            ("trigger_decision", "bundle_built", "feature_rebuild_ms"),
             ("bundle_upload_started", "bundle_upload_done", "upload_ms"),
-            ("training_job_started", "training_job_succeeded", "training_ms"),
-            (
-                "training_job_succeeded",
-                "model_update_downloaded",
-                "model_update_download_ms",
-            ),
-            ("model_update_downloaded", "model_update_applied", "model_apply_ms"),
+        ]
+        if method == "plank_road" and not has_explicit_teacher_annotation:
+            stage_pairs.append(
+                (
+                    "bundle_upload_done",
+                    "training_job_started",
+                    "teacher_annotation_ms",
+                )
+            )
+        stage_pairs.extend(
+            [
+                ("training_job_started", "training_job_succeeded", "training_ms"),
+                (
+                    "training_job_succeeded",
+                    "model_update_downloaded",
+                    "model_update_download_ms",
+                ),
+                ("model_update_downloaded", "model_update_applied", "model_apply_ms"),
+            ]
         )
         for start_name, end_name, field in stage_pairs:
             unused_starts = [
@@ -1383,7 +1451,10 @@ def _derive_adaptation_latency(
                             method=method,
                             edge_id=edge_id,
                             scenario_name=end.get("scenario_name"),
-                            window_id=end.get("window_id"),
+                            window_id=_latency_window_id(
+                                end,
+                                job_window_ids=job_window_ids,
+                            ),
                             **{field: exact_value},
                         )
                     )
@@ -1413,8 +1484,20 @@ def _derive_adaptation_latency(
                             and (optional_int(start.get("event_time_ms")) or end_time + 1)
                             <= end_time
                         ),
-                        None,
-                    )
+                    None,
+                )
+                if candidate_index is None and field == "feature_rebuild_ms":
+                    candidates = [
+                        (index, start_time)
+                        for index, start in enumerate(unused_starts)
+                        if (
+                            start_time := optional_int(start.get("event_time_ms"))
+                        )
+                        is not None
+                        and start_time <= end_time
+                    ]
+                    if candidates:
+                        candidate_index = max(candidates, key=lambda item: item[1])[0]
                 if candidate_index is None:
                     continue
                 start = unused_starts.pop(candidate_index)
@@ -1429,7 +1512,11 @@ def _derive_adaptation_latency(
                         method=method,
                         edge_id=edge_id,
                         scenario_name=end.get("scenario_name"),
-                        window_id=end.get("window_id") or start.get("window_id"),
+                        window_id=_latency_window_id(
+                            end,
+                            start,
+                            job_window_ids=job_window_ids,
+                        ),
                         **{field: end_time - start_time},
                     )
                 )

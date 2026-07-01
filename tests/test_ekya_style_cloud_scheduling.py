@@ -1412,6 +1412,8 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
     assert result.epochs == 1
     assert result.batch_size == 1
     assert result.lr == pytest.approx(0.1)
+    assert result.train_end_time > result.train_start_time
+    assert result.train_duration_s > 0
     assert "window=1:1:2 hp_id=fixed epoch=1/1" in logs
     assert "checkpoint=" in logs
     assert "[BaselineTraining] freeze epoch" not in logs

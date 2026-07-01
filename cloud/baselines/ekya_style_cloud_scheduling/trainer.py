@@ -114,6 +114,8 @@ class EkyaCloudTrainer:
         del previous_val_map
         if not decision.trains:
             raise ValueError("scheduler decision does not select a training job")
+        train_start = time.time()
+        train_started_perf = time.perf_counter()
         fixed = self.config.fixed_training
 
         samples = window_to_samples(window, teacher_labels)
@@ -147,7 +149,6 @@ class EkyaCloudTrainer:
             f"{checkpoint_prefix}_epochs.csv"
         )
 
-        train_start = time.time()
         model = model_builder()
         load_base_state_dict(model, base_state_dict)
         components = build_training_components(
@@ -223,7 +224,6 @@ class EkyaCloudTrainer:
         if best_state is None:
             raise RuntimeError("Ekya training completed without a validated checkpoint state")
 
-        train_end = time.time()
         metadata = {
             "method": "ekya_style_cloud_scheduling",
             "student_model": self.config.student_model,
@@ -254,6 +254,8 @@ class EkyaCloudTrainer:
         adoptable = assert_non_empty_checkpoint_state(str(checkpoint_path))
         if not adoptable:
             raise RuntimeError("Ekya training checkpoint did not contain trained model weights")
+        train_duration_s = time.perf_counter() - train_started_perf
+        train_end = time.time()
         return TrainingResult(
             task_id=int(window.task_id),
             edge_id=int(window.edge_id),
@@ -268,7 +270,7 @@ class EkyaCloudTrainer:
             val_sample_count=len(val_samples),
             train_start_time=float(train_start),
             train_end_time=float(train_end),
-            train_duration_s=max(0.0, float(train_end - train_start)),
+            train_duration_s=max(0.0, float(train_duration_s)),
             best_epoch=int(best_epoch),
             best_val_map=float(best_val_map),
             best_val_ap50=float(best_val_ap50),

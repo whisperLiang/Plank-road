@@ -530,6 +530,8 @@ def test_ekya_converter_training_mean_ignores_inference_only_windows(
     latencies = read_csv(output_dir / "latency_breakdown.csv")
     summary = read_csv(output_dir / "summary.csv")[0]
     assert [row["training_ms"] for row in latencies] == ["200.0", "0.0"]
+    assert [row["microprofile_ms"] for row in latencies] == ["30.0", "20.0"]
+    assert [row["feature_rebuild_ms"] for row in latencies] == ["", ""]
     assert [row["total_adaptation_ms"] for row in latencies] == ["270.0", ""]
     assert summary["mean_training_ms"] == "200.0"
     assert summary["mean_adaptation_ms"] == "270.0"
@@ -555,9 +557,33 @@ def test_ekya_converter_training_latency_stays_wall_clock_with_split_resources(
     latency = read_csv(output_dir / "latency_breakdown.csv")[0]
     summary = read_csv(output_dir / "summary.csv")[0]
     assert latency["training_ms"] == "200.0"
+    assert latency["microprofile_ms"] == "30.0"
+    assert latency["feature_rebuild_ms"] == ""
     assert latency["total_adaptation_ms"] == "270.0"
     assert summary["mean_training_ms"] == "200.0"
     assert summary["mean_adaptation_ms"] == "270.0"
+
+
+def test_ekya_converter_uses_training_event_duration_when_window_time_is_shorter(
+    tmp_path: Path,
+) -> None:
+    raw_dir = _raw_ekya_dir(tmp_path)
+    output_dir = tmp_path / "normalized"
+    _write_raw_ekya_fixture(raw_dir)
+    training_events = read_csv(raw_dir / "training_events.csv")
+    training_events[0]["train_duration_s"] = 0.35
+    training_events[0]["train_end_time"] = 10.85
+    write_csv(raw_dir / "training_events.csv", TRAINING_FIELDS, training_events)
+
+    convert_ekya_style_results(raw_dir=raw_dir, output_dir=output_dir)
+
+    latency = read_csv(output_dir / "latency_breakdown.csv")[0]
+    summary = read_csv(output_dir / "summary.csv")[0]
+    assert latency["training_ms"] == "350.0"
+    assert latency["microprofile_ms"] == "30.0"
+    assert latency["total_adaptation_ms"] == "420.0"
+    assert summary["mean_training_ms"] == "350.0"
+    assert summary["mean_adaptation_ms"] == "420.0"
 
 
 def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None:

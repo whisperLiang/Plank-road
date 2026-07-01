@@ -15,6 +15,7 @@ from tools.experiments.experiment_common import (
 )
 from tools.experiments.plot_plank_road_baseline_figures import (
     EXPORT_SUFFIXES,
+    _adaptation_stage_rows,
     _aggregate_breakdown,
     _event_origins,
     _filter_fig2_timeline_rows,
@@ -367,6 +368,147 @@ def test_breakdown_training_mean_ignores_inference_only_windows() -> None:
     values = _aggregate_breakdown(rows, [("training_ms", "Training")])
 
     assert values["road"]["ekya"]["training_ms"] == 150.0
+
+
+def test_breakdown_can_sum_actual_component_time_per_run() -> None:
+    rows = [
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r1",
+            "training_ms": "0",
+        },
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r1",
+            "training_ms": "100",
+        },
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r1",
+            "training_ms": "50",
+        },
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r2",
+            "training_ms": "200",
+        },
+    ]
+
+    values = _aggregate_breakdown(
+        rows,
+        [("training_ms", "Training")],
+        component_aggregation="sum",
+    )
+
+    assert values["road"]["ekya"]["training_ms"] == 175.0
+
+
+def test_breakdown_drops_components_not_expected_for_method() -> None:
+    rows = [
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r1",
+            "upload_ms": "100",
+            "microprofile_ms": "40",
+            "training_ms": "2000",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "r2",
+            "upload_ms": "25",
+            "microprofile_ms": "30",
+            "training_ms": "500",
+        },
+    ]
+
+    values = _aggregate_breakdown(
+        rows,
+        [
+            ("upload_ms", "Upload"),
+            ("microprofile_ms", "Microprofile"),
+            ("training_ms", "Training"),
+        ],
+        component_aggregation="sum",
+        expected_fields_by_method={
+            "ekya": {"microprofile_ms", "training_ms"},
+            "accuracy_trigger_cloud_retraining": {"upload_ms", "training_ms"},
+        },
+    )
+
+    assert values["road"]["ekya"]["upload_ms"] is None
+    assert values["road"]["ekya"]["microprofile_ms"] == 40.0
+    assert values["road"]["ekya"]["training_ms"] == 2000.0
+    assert values["road"]["accuracy_trigger_cloud_retraining"]["upload_ms"] == 25.0
+    assert (
+        values["road"]["accuracy_trigger_cloud_retraining"]["microprofile_ms"]
+        is None
+    )
+    assert values["road"]["accuracy_trigger_cloud_retraining"]["training_ms"] == 500.0
+
+
+def test_fig5_stage_rows_keep_only_adaptation_windows() -> None:
+    fields = [
+        ("upload_ms", "Upload"),
+        ("microprofile_ms", "Microprofile"),
+        ("training_ms", "Training"),
+    ]
+    rows = [
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "r1",
+            "edge_id": "1",
+            "window_id": "ordinary-upload",
+            "upload_ms": "25",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "r1",
+            "edge_id": "1",
+            "window_id": "adapt-window",
+            "upload_ms": "100",
+        },
+        {
+            "scenario_name": "road",
+            "method": "accuracy_trigger_cloud_retraining",
+            "run_id": "r1",
+            "edge_id": "1",
+            "window_id": "adapt-window",
+            "training_ms": "1000",
+        },
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r2",
+            "edge_id": "1",
+            "window_id": "infer-only",
+            "microprofile_ms": "30",
+        },
+        {
+            "scenario_name": "road",
+            "method": "ekya",
+            "run_id": "r2",
+            "edge_id": "1",
+            "window_id": "train-window",
+            "microprofile_ms": "40",
+            "training_ms": "2000",
+        },
+    ]
+
+    filtered = _adaptation_stage_rows(rows, fields)
+
+    assert [(row["method"], row["window_id"], row.get("upload_ms", "")) for row in filtered] == [
+        ("accuracy_trigger_cloud_retraining", "adapt-window", "100"),
+        ("accuracy_trigger_cloud_retraining", "adapt-window", ""),
+        ("ekya", "train-window", ""),
+    ]
 
 
 def test_fig1_filters_ekya_inference_only_trigger_markers() -> None:

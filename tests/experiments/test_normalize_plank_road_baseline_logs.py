@@ -796,7 +796,16 @@ def test_structured_events_capture_bytes_and_derive_stage_latency(tmp_path: Path
                 "window_id": "w1",
                 "trigger_decision": True,
             },
-            {"event": "bundle_upload_started", "timestamp_ms": 1100},
+            {
+                "event": "bundle_built",
+                "timestamp_ms": 1080,
+                "job_id": "job-1",
+            },
+            {
+                "event": "bundle_upload_started",
+                "timestamp_ms": 1100,
+                "job_id": "job-1",
+            },
             {
                 "event": "bundle_upload_done",
                 "timestamp_ms": 1300,
@@ -852,7 +861,15 @@ def test_structured_events_capture_bytes_and_derive_stage_latency(tmp_path: Path
     assert download["total_upload_bytes"] == ""
 
     latency = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
+    assert any(
+        row["feature_rebuild_ms"] == "80" and row["window_id"] == "w1"
+        for row in latency
+    )
     assert any(row["upload_ms"] == "200" for row in latency)
+    assert any(
+        row["teacher_annotation_ms"] == "100" and row["window_id"] == "w1"
+        for row in latency
+    )
     assert any(row["training_ms"] == "1000" for row in latency)
     assert any(row["model_update_download_ms"] == "100" for row in latency)
     assert any(row["model_apply_ms"] == "100" for row in latency)
