@@ -221,6 +221,45 @@ def _set_tight_ylim(axis: plt.Axes, values: Iterable[float], *, floor: float | N
     axis.set_ylim(low, high + margin)
 
 
+def _tradeoff_label_offsets(points: list[Mapping[str, Any]]) -> list[tuple[int, int]]:
+    if not points:
+        return []
+    xs = [float(point["x"]) for point in points]
+    ys = [float(point["y"]) for point in points]
+    x_range = max(max(xs) - min(xs), 1e-9)
+    y_range = max(max(ys) - min(ys), 1e-9)
+    x_threshold = max(x_range * 0.1, 1e-6)
+    y_threshold = max(y_range * 0.16, 0.004)
+    offsets = [(5, 3) for _point in points]
+    candidates = ((5, 8), (5, -10), (9, 16), (9, -18), (-44, 8), (-44, -10))
+    visited: set[int] = set()
+    for index, point in enumerate(points):
+        if index in visited:
+            continue
+        x = float(point["x"])
+        y = float(point["y"])
+        cluster = [
+            other_index
+            for other_index, other in enumerate(points)
+            if abs(float(other["x"]) - x) <= x_threshold
+            and abs(float(other["y"]) - y) <= y_threshold
+        ]
+        if len(cluster) <= 1:
+            visited.add(index)
+            continue
+        cluster.sort(
+            key=lambda item: (
+                float(points[item]["x"]),
+                float(points[item]["y"]),
+                str(points[item].get("label", "")),
+            )
+        )
+        for offset_index, item in enumerate(cluster):
+            offsets[item] = candidates[offset_index % len(candidates)]
+            visited.add(item)
+    return offsets
+
+
 def _data_scale(values: Iterable[float], kind: str) -> tuple[float, str]:
     finite = [abs(float(value)) for value in values if math.isfinite(float(value))]
     maximum = max(finite, default=0.0)
@@ -839,6 +878,7 @@ def _plot_fig3(
     plotted = 0
     plotted_y: list[float] = []
     if accuracy_field:
+        plot_points: list[dict[str, Any]] = []
         for row in aggregated:
             x_raw = optional_float(row.get("mean_adaptation_ms"))
             y = optional_float(row.get(accuracy_field))
@@ -854,25 +894,37 @@ def _plot_fig3(
             )
             method = str(row["method"])
             x = x_raw / latency_scale
+            plot_points.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "size": max(40.0, size),
+                    "method": method,
+                    "label": _method_label(method),
+                    "alpha": 0.86,
+                }
+            )
+        for point, xytext in zip(plot_points, _tradeoff_label_offsets(plot_points)):
+            method = str(point["method"])
             axis.scatter(
-                x,
-                y,
-                s=max(40.0, size),
+                point["x"],
+                point["y"],
+                s=point["size"],
                 color=_method_color(method),
                 marker=_method_marker(method),
-                alpha=0.86,
+                alpha=point["alpha"],
                 edgecolors="white",
                 linewidths=0.45,
             )
             axis.annotate(
-                _method_label(method),
-                xy=(x, y),
-                xytext=(5, 3),
+                str(point["label"]),
+                xy=(point["x"], point["y"]),
+                xytext=xytext,
                 textcoords="offset points",
                 fontsize=6,
                 color=_method_color(method),
             )
-            plotted_y.append(y)
+            plotted_y.append(float(point["y"]))
             plotted += 1
         axis.set_ylabel(
             _accuracy_label(
@@ -890,6 +942,7 @@ def _plot_fig3(
             if (value := optional_float(row.get("mean_upload_bytes"))) is not None
         ]
         upload_scale, upload_unit = _data_scale(upload_values, "bytes")
+        plot_points = []
         for row in aggregated:
             x_raw = optional_float(row.get("mean_adaptation_ms"))
             y_raw = optional_float(row.get("mean_upload_bytes"))
@@ -898,24 +951,37 @@ def _plot_fig3(
             method = str(row["method"])
             x = x_raw / latency_scale
             y = y_raw / upload_scale
+            plot_points.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "size": 48,
+                    "method": method,
+                    "label": _method_label(method),
+                    "alpha": 1.0,
+                }
+            )
+        for point, xytext in zip(plot_points, _tradeoff_label_offsets(plot_points)):
+            method = str(point["method"])
             axis.scatter(
-                x,
-                y,
-                s=48,
+                point["x"],
+                point["y"],
+                s=point["size"],
                 color=_method_color(method),
                 marker=_method_marker(method),
+                alpha=point["alpha"],
                 edgecolors="white",
                 linewidths=0.45,
             )
             axis.annotate(
-                _method_label(method),
-                xy=(x, y),
-                xytext=(5, 3),
+                str(point["label"]),
+                xy=(point["x"], point["y"]),
+                xytext=xytext,
                 textcoords="offset points",
                 fontsize=6,
                 color=_method_color(method),
             )
-            plotted_y.append(y)
+            plotted_y.append(float(point["y"]))
             plotted += 1
         axis.set_ylabel(f"Mean upload ({upload_unit})")
         axis.set_title("Latency-upload tradeoff (accuracy unavailable)")
