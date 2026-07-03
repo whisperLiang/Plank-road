@@ -17,9 +17,16 @@ from experiments.privacy_reconstruction_attack.collect_attack_targets import (
     _resolve_split_points,
     configure_object_detection_device,
 )
+from experiments.privacy_reconstruction_attack.edge_prefix_whitebox import (
+    configure_edge_prefix_parameters,
+    validate_edge_prefix_matches_manifest,
+)
 from experiments.privacy_reconstruction_attack.evaluate_privacy_score import (
     _metrics_files,
     _summary_rows,
+)
+from experiments.privacy_reconstruction_attack.plot_privacy_reconstruction import (
+    plot_reconstruction_grid,
 )
 from experiments.privacy_reconstruction_attack.reconstruction_metrics import object_metrics
 
@@ -52,6 +59,16 @@ def test_boundary_feature_adapter_multi_tensor_ignores_metadata_and_nonfloating(
     distance = adapter.feature_distance(pred, target)
     assert torch.isfinite(distance)
     assert distance.item() > 0.0
+
+
+def test_boundary_feature_adapter_channel_cosine_for_conv_features() -> None:
+    adapter = BoundaryFeatureAdapter(cosine_mode="channel", nmse_weight=0.0)
+    pred = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]])
+    target = torch.tensor([[[[1.0, 1.0]], [[0.0, 0.0]]]])
+
+    distance = adapter.feature_distance({"feat": pred}, {"feat": target})
+
+    assert distance.item() == pytest.approx(0.5)
 
 
 def test_object_metrics_marks_empty_original_teacher_as_nan() -> None:
@@ -95,7 +112,7 @@ def test_object_metrics_normalizes_boxes_when_image_sizes_differ() -> None:
 def test_summary_rows_ignores_nan_object_f1() -> None:
     rows = [
         {
-            "method": "pixel_dra",
+            "method": "drag",
             "privacy_leakage_score": 0.8,
             "ObjectF1": float("nan"),
             "L_actual": float("nan"),
@@ -106,7 +123,7 @@ def test_summary_rows_ignores_nan_object_f1() -> None:
             "FeatureDistanceFinal": 3.0,
         },
         {
-            "method": "pixel_dra",
+            "method": "drag",
             "privacy_leakage_score": 0.8,
             "ObjectF1": 0.25,
             "L_actual": 0.4,
@@ -147,8 +164,13 @@ def test_attack_sample_discovery_accepts_custom_split_names(tmp_path) -> None:
 
 def test_metrics_file_discovery_accepts_custom_split_names(tmp_path) -> None:
     metrics_path = tmp_path / "custom_split" / "sample_a" / "metrics.json"
-    write_json(metrics_path, {"method": "pixel_dra", "privacy_leakage_score": 0.5})
+    write_json(metrics_path, {"method": "drag", "privacy_leakage_score": 0.5})
     assert _metrics_files(tmp_path) == [metrics_path]
+
+
+def test_plot_reconstruction_grid_reports_empty_inputs(tmp_path) -> None:
+    with pytest.raises(RuntimeError, match="No reconstruction metrics"):
+        plot_reconstruction_grid(tmp_path / "missing_drag", [], tmp_path / "figures")
 
 
 def test_auto_split_resolver_picks_unique_nearest_candidates() -> None:
@@ -170,3 +192,40 @@ def test_auto_split_resolver_picks_unique_nearest_candidates() -> None:
     }
     resolved = _resolve_split_points(splitter, config)
     assert [item.split_point for item in resolved] == ["after:a", "after:b", "after:c", "after:d"]
+
+
+def test_edge_prefix_weights_override_records_sha256(tmp_path) -> None:
+    weights = tmp_path / "edge-prefix.pth"
+    weights.write_bytes(b"edge prefix parameters")
+    runtime_config = SimpleNamespace(
+        client=SimpleNamespace(lightweight="toy_edge", weights_path=None)
+    )
+
+    info = configure_edge_prefix_parameters(runtime_config, weights)
+
+    assert runtime_config.client.weights_path == str(weights.resolve())
+    assert info["whitebox_edge_prefix"] is True
+    assert info["source"] == "cli"
+    assert info["model_name"] == "toy_edge"
+    assert info["resolved_weights_path"] == str(weights.resolve())
+    assert info["sha256"] == (
+        "ab0ae2c30a76a787db77fe65a354403087d4eae6645af26c6bb37611c68759a9"
+    )
+
+
+def test_edge_prefix_manifest_mismatch_is_rejected() -> None:
+    current = {
+        "whitebox_edge_prefix": True,
+        "model_name": "toy_edge",
+        "sha256": "current",
+    }
+    manifest = {
+        "edge_prefix_parameters": {
+            "whitebox_edge_prefix": True,
+            "model_name": "toy_edge",
+            "sha256": "target",
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="edge-prefix weights differ"):
+        validate_edge_prefix_matches_manifest(current, manifest)

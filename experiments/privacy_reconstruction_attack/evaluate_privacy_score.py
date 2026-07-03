@@ -26,11 +26,19 @@ PER_SAMPLE_FIELDS = [
     "sample_id",
     "frame_index",
     "privacy_leakage_score",
+    "reconstruction_mode",
     "MSE",
     "PSNR",
     "SSIM",
     "LPIPS",
     "FeatureDistanceFinal",
+    "drag_latent_init",
+    "drag_strength",
+    "init_label",
+    "init_feature_loss",
+    "linear_decoder_label",
+    "linear_init_feature_loss",
+    "metric_reference",
     "ObjectPrecision",
     "ObjectRecall",
     "ObjectF1",
@@ -244,7 +252,8 @@ def _delta(summary: list[dict[str, Any]], method: str, metric: str) -> float:
 
 def _correlations(summary: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
-    for method in ("pixel_dra", "drag"):
+    methods = sorted({str(row.get("method") or "") for row in summary if row.get("method")})
+    for method in methods:
         scores_l, l_actual = _series_for(summary, method, "L_actual_mean")
         scores_f1, object_f1 = _series_for(summary, method, "ObjectF1_mean")
         result[method] = {
@@ -265,12 +274,9 @@ def _correlations(summary: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
 def evaluate(args: argparse.Namespace) -> None:
     load_experiment_config(args.config)
     output_dir = Path(args.output_dir)
-    pixel_rows = _read_method_rows("pixel_dra", Path(args.pixel_dir))
-    drag_rows = _read_method_rows("drag", Path(args.drag_dir))
-    all_rows = pixel_rows + drag_rows
-    _write_csv(output_dir / "pixel_dra_per_sample.csv", pixel_rows, PER_SAMPLE_FIELDS)
-    _write_csv(output_dir / "drag_per_sample.csv", drag_rows, PER_SAMPLE_FIELDS)
-    summary = _summary_rows(all_rows)
+    rows = _read_method_rows("drag_linear_clean", Path(args.drag_dir))
+    _write_csv(output_dir / "drag_per_sample.csv", rows, PER_SAMPLE_FIELDS)
+    summary = _summary_rows(rows)
     _write_csv(output_dir / "summary_by_score.csv", summary, SUMMARY_FIELDS)
     write_json(output_dir / "score_correlation.json", _correlations(summary))
 
@@ -278,7 +284,6 @@ def evaluate(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate privacy reconstruction scores.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--pixel_dir", required=True)
     parser.add_argument("--drag_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     return parser

@@ -6,7 +6,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 
 def _nan() -> float:
@@ -93,14 +92,14 @@ def _as_list(value: Any) -> list[Any]:
 
 def _image_size(
     prediction: Mapping[str, Any] | None,
-    fallback: tuple[int, int] | list[int] | None,
+    default_size: tuple[int, int] | list[int] | None,
 ) -> tuple[float, float] | None:
     candidates: list[Any] = []
     if isinstance(prediction, Mapping):
         candidates.extend(
             prediction.get(key) for key in ("image_size", "image_shape", "raw_image_size")
         )
-    candidates.append(fallback)
+    candidates.append(default_size)
     for value in candidates:
         if value is None:
             continue
@@ -249,19 +248,6 @@ def _to_lpips_tensor(image: np.ndarray, device: torch.device) -> torch.Tensor:
     arr = _rgb_float(image)
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float()
     return tensor.mul(2.0).sub(1.0).to(device)
-
-
-def total_variation(image: torch.Tensor) -> torch.Tensor:
-    if image.ndim == 3:
-        image = image.unsqueeze(0)
-    dx = (image[..., :, 1:] - image[..., :, :-1]).abs().mean()
-    dy = (image[..., 1:, :] - image[..., :-1, :]).abs().mean()
-    return dx + dy
-
-
-def range_loss(image: torch.Tensor, image_range: tuple[float, float]) -> torch.Tensor:
-    low, high = image_range
-    return F.relu(float(low) - image).mean() + F.relu(image - float(high)).mean()
 
 
 def l_actual(

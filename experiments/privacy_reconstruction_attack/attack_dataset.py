@@ -169,7 +169,7 @@ class AttackSample:
             if path.is_absolute():
                 return path
             return (self.sample_dir / path).resolve()
-        fallback = {
+        default_name = {
             "raw_image_path": "raw_frame.png",
             "model_input_tensor_path": "model_input_tensor.pt",
             "boundary_payload_path": "boundary_payload.pt.gz",
@@ -177,7 +177,7 @@ class AttackSample:
             "teacher_prediction_path": "teacher_prediction.json",
             "student_prediction_path": "student_prediction.json",
         }.get(key, key)
-        return self.sample_dir / fallback
+        return self.sample_dir / default_name
 
 
 def load_attack_samples(targets_dir: str | Path) -> list[AttackSample]:

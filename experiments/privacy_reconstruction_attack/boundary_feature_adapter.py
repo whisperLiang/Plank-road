@@ -20,13 +20,15 @@ class BoundaryFeatureAdapter:
         self,
         *,
         cosine_weight: float = 1.0,
-        nmse_weight: float = 1.0,
+        nmse_weight: float = 0.0,
+        cosine_mode: str = "channel",
         eps: float = 1.0e-8,
         tensor_weights: Mapping[str, float] | None = None,
         device: str | torch.device | None = None,
     ) -> None:
         self.cosine_weight = float(cosine_weight)
         self.nmse_weight = float(nmse_weight)
+        self.cosine_mode = str(cosine_mode or "channel").lower()
         self.eps = float(eps)
         self.tensor_weights = {
             str(key): float(value) for key, value in dict(tensor_weights or {}).items()
@@ -43,7 +45,8 @@ class BoundaryFeatureAdapter:
         cfg = dict(config or {})
         return cls(
             cosine_weight=float(cfg.get("cosine_weight", 1.0)),
-            nmse_weight=float(cfg.get("nmse_weight", 1.0)),
+            nmse_weight=float(cfg.get("nmse_weight", 0.0)),
+            cosine_mode=str(cfg.get("cosine_mode", "channel")),
             eps=float(cfg.get("eps", 1.0e-8)),
             tensor_weights=cfg.get("tensor_weights") or {},
             device=device,
@@ -92,6 +95,34 @@ class BoundaryFeatureAdapter:
             return client_model(image_tensor)
         raise TypeError("client_model must expose edge_forward, run_prefix, or be callable.")
 
+    def _cosine_distance(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.cosine_mode == "flat":
+            pred_flat = pred.reshape(1, -1)
+            target_flat = target.reshape(1, -1)
+            return 1.0 - F.cosine_similarity(
+                pred_flat, target_flat, dim=1, eps=self.eps
+            ).mean()
+        if self.cosine_mode != "channel":
+            raise ValueError(f"Unsupported cosine_mode: {self.cosine_mode!r}.")
+
+        if pred.ndim == 4:
+            pred_view = pred.flatten(2)
+            target_view = target.flatten(2)
+            return 1.0 - F.cosine_similarity(
+                pred_view, target_view, dim=1, eps=self.eps
+            ).mean()
+        if pred.ndim == 3:
+            pred_view = pred.permute(0, 2, 1)
+            target_view = target.permute(0, 2, 1)
+            return 1.0 - F.cosine_similarity(
+                pred_view, target_view, dim=1, eps=self.eps
+            ).mean()
+        if pred.ndim == 2:
+            return 1.0 - F.cosine_similarity(pred, target, dim=1, eps=self.eps).mean()
+        pred_flat = pred.reshape(1, -1)
+        target_flat = target.reshape(1, -1)
+        return 1.0 - F.cosine_similarity(pred_flat, target_flat, dim=1, eps=self.eps).mean()
+
     def feature_distance(
         self,
         pred_payload: Any,
@@ -128,7 +159,7 @@ class BoundaryFeatureAdapter:
 
             pred_flat = pred_f.reshape(1, -1)
             target_flat = target_f.reshape(1, -1)
-            cosine = 1.0 - F.cosine_similarity(pred_flat, target_flat, dim=1, eps=self.eps).mean()
+            cosine = self._cosine_distance(pred_f, target_f)
             numerator = (pred_flat - target_flat).square().sum()
             denominator = target_flat.square().sum().clamp_min(self.eps)
             nmse = numerator / denominator

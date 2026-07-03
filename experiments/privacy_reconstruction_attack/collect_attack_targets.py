@@ -29,6 +29,9 @@ from experiments.privacy_reconstruction_attack.attack_dataset import (
     sanitize_segment,
     write_json,
 )
+from experiments.privacy_reconstruction_attack.edge_prefix_whitebox import (
+    configure_edge_prefix_parameters,
+)
 from model_management.model_zoo import get_model_family
 from model_management.object_detection import Object_Detection
 from model_management.split_model_adapters import (
@@ -268,12 +271,19 @@ def collect_targets(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     experiment_config = load_experiment_config(args.config)
     runtime_config = load_runtime_config(args.yaml_path)
+    edge_prefix_parameters = configure_edge_prefix_parameters(
+        runtime_config,
+        args.edge_prefix_weights,
+    )
     video_path = Path(args.video_path)
 
     logger.info(
-        "[PrivacyAttack] loading models student={} teacher={}",
+        "[PrivacyAttack] loading models student={} teacher={} "
+        "edge_prefix_source={} edge_prefix_sha256={}",
         runtime_config.client.lightweight,
         runtime_config.server.golden,
+        edge_prefix_parameters.get("source"),
+        edge_prefix_parameters.get("sha256"),
     )
     student = Object_Detection(runtime_config.client, "small inference")
     teacher = Object_Detection(runtime_config.server, "large inference")
@@ -377,6 +387,7 @@ def collect_targets(args: argparse.Namespace) -> None:
                 "boundary_feature_path": "boundary_feature.pt",
                 "teacher_prediction_path": "teacher_prediction.json",
                 "student_prediction_path": "student_prediction.json",
+                "edge_prefix_parameters": edge_prefix_parameters,
             }
             write_json(sample_dir / "metadata.json", metadata)
             logger.info(
@@ -402,6 +413,7 @@ def collect_targets(args: argparse.Namespace) -> None:
             "git_head": _git_head(),
             "student_model": str(runtime_config.client.lightweight),
             "teacher_model": str(runtime_config.server.golden),
+            "edge_prefix_parameters": edge_prefix_parameters,
             "privacy_score_split_points": [asdict(item) for item in resolved],
         },
     )
@@ -416,6 +428,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_frames", type=int, default=100)
     parser.add_argument("--frame_stride", type=int, default=5)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--edge-prefix-weights",
+        default=None,
+        help=(
+            "Path to the exact edge-side lightweight checkpoint whose split prefix "
+            "produces the boundary payloads. Overrides client.weights_path and is "
+            "recorded with sha256 for white-box reconstruction."
+        ),
+    )
     return parser
 
 

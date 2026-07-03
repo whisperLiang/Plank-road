@@ -32,6 +32,8 @@ dependencies = [
   "tqdm>=4.66",
   "transformers",
   "ultralytics>=8.4.41",
+  "diffusers>=0.38.0",
+  "lpips>=0.1.4",
 ]
 
 [tool.uv.sources]

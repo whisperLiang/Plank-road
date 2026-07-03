@@ -14,11 +14,16 @@ if str(REPO_ROOT) not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
+from PIL import Image, ImageDraw, ImageFont
 
 from experiments.privacy_reconstruction_attack.attack_dataset import load_rgb_image, read_json
 
-METHOD_LABELS = {"pixel_dra": "Pixel DRA", "drag": "DRAG"}
-METHOD_COLORS = {"pixel_dra": "#2A6F97", "drag": "#B64342"}
+METHOD_LABELS = {
+    "drag_linear_clean": "DRAG linear clean",
+}
+METHOD_COLORS = {
+    "drag_linear_clean": "#2E8B57",
+}
 
 
 def _to_float(value: Any) -> float:
@@ -44,7 +49,7 @@ def _find_first_sample(root: Path, split_name: str) -> Path | None:
     return None
 
 
-def _fallback_split_name(score: float) -> str:
+def _score_split_name(score: float) -> str:
     text = f"{score:.6g}".replace(".", "_")
     return f"split_score_{text}"
 
@@ -67,15 +72,28 @@ def _score_split_names(
     for row in summary_rows:
         score = _to_float(row.get("privacy_leakage_score"))
         if not math.isnan(score):
-            pairs.setdefault(score, _fallback_split_name(score))
-    if not pairs:
-        pairs = {
-            0.8: "split_score_0_8",
-            0.6: "split_score_0_6",
-            0.4: "split_score_0_4",
-            0.2: "split_score_0_2",
-        }
+            pairs.setdefault(score, _score_split_name(score))
     return sorted(pairs.items(), key=lambda item: -item[0])
+
+
+def _safe_file_segment(value: object) -> str:
+    text = str(value or "").strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text)
+    return cleaned or "unknown"
+
+
+def _infer_model_name(drag_dir: Path, override: str | None = None) -> str:
+    if override:
+        return _safe_file_segment(override)
+    manifest_path = drag_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = read_json(manifest_path)
+        edge_prefix = manifest.get("edge_prefix_parameters")
+        if isinstance(edge_prefix, Mapping):
+            model_name = edge_prefix.get("model_name")
+            if model_name:
+                return _safe_file_segment(model_name)
+    return "unknown_model"
 
 
 def _blank(ax: plt.Axes, title: str) -> None:
@@ -113,43 +131,46 @@ def _draw_boxes(ax: plt.Axes, prediction: Mapping[str, Any] | None) -> None:
 
 
 def plot_reconstruction_grid(
-    pixel_dir: Path, drag_dir: Path, summary_rows: list[Mapping[str, Any]], output_dir: Path
+    drag_dir: Path,
+    summary_rows: list[Mapping[str, Any]],
+    output_dir: Path,
 ) -> None:
-    splits = _score_split_names(summary_rows, [pixel_dir, drag_dir])
-    fig, axes = plt.subplots(len(splits), 4, figsize=(10.5, 2.5 * len(splits)), squeeze=False)
+    method_roots = [drag_dir]
+    splits = _score_split_names(summary_rows, method_roots)
+    if not splits:
+        raise RuntimeError(
+            f"No reconstruction metrics found under {drag_dir}; run drag_attack.py "
+            "and evaluate_privacy_score.py before plotting."
+        )
+    fig, axes = plt.subplots(len(splits), 3, figsize=(8.0, 2.5 * len(splits)), squeeze=False)
     titles = [
-        "Raw Image",
-        "Pixel DRA Reconstruction",
-        "DRAG Reconstruction",
-        "Teacher Detection on DRAG",
+        "Model-input Reference",
+        "DRAG linear clean",
+        "Teacher Detection on Reconstruction",
     ]
     for col, title in enumerate(titles):
         axes[0][col].set_title(title, fontsize=10)
     for row_index, (score, split_name) in enumerate(splits):
-        pixel_sample = _find_first_sample(pixel_dir, split_name)
         drag_sample = _find_first_sample(drag_dir, split_name)
         axes[row_index][0].set_ylabel(f"score={score:.1f}", fontsize=10)
 
-        if pixel_sample is not None and (pixel_sample / "raw.png").exists():
-            axes[row_index][0].imshow(load_rgb_image(pixel_sample / "raw.png"))
-        elif drag_sample is not None and (drag_sample / "raw.png").exists():
-            axes[row_index][0].imshow(load_rgb_image(drag_sample / "raw.png"))
+        reference_path = (
+            drag_sample / "model_input_reference.png" if drag_sample is not None else None
+        )
+        if reference_path is not None and reference_path.exists():
+            axes[row_index][0].imshow(load_rgb_image(reference_path))
         else:
-            _blank(axes[row_index][0], "")
-        if pixel_sample is not None and (pixel_sample / "recon.png").exists():
-            axes[row_index][1].imshow(load_rgb_image(pixel_sample / "recon.png"))
-        else:
-            _blank(axes[row_index][1], "missing")
+            _blank(axes[row_index][0], "missing reference")
         if drag_sample is not None and (drag_sample / "recon.png").exists():
             drag_image = load_rgb_image(drag_sample / "recon.png")
+            axes[row_index][1].imshow(drag_image)
             axes[row_index][2].imshow(drag_image)
-            axes[row_index][3].imshow(drag_image)
             metrics = read_json(drag_sample / "metrics.json")
-            _draw_boxes(axes[row_index][3], metrics.get("recon_teacher_prediction"))
+            _draw_boxes(axes[row_index][2], metrics.get("recon_teacher_prediction"))
         else:
+            _blank(axes[row_index][1], "missing")
             _blank(axes[row_index][2], "missing")
-            _blank(axes[row_index][3], "missing")
-        for col in range(4):
+        for col in range(3):
             axes[row_index][col].set_xticks([])
             axes[row_index][col].set_yticks([])
     fig.tight_layout()
@@ -157,6 +178,139 @@ def plot_reconstruction_grid(
     fig.savefig(output_dir / "reconstruction_grid.png", dpi=220)
     fig.savefig(output_dir / "reconstruction_grid.pdf")
     plt.close(fig)
+
+
+def _figure_font(name: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    path = Path("/usr/share/fonts/truetype/dejavu") / name
+    return ImageFont.truetype(str(path), size=size) if path.exists() else ImageFont.load_default()
+
+
+def _draw_centered_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    x: int,
+    width: int,
+    y: int,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+) -> None:
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.text((x + (width - (box[2] - box[0])) / 2, y), text, font=font, fill=fill)
+
+
+def plot_compact_reconstruction_grid(
+    drag_dir: Path,
+    summary_rows: list[Mapping[str, Any]],
+    output_dir: Path,
+    *,
+    model_name: str | None = None,
+) -> None:
+    splits = _score_split_names(summary_rows, [drag_dir])
+    if not splits:
+        raise RuntimeError(
+            f"No reconstruction metrics found under {drag_dir}; run drag_attack.py "
+            "and evaluate_privacy_score.py before plotting."
+        )
+
+    resolved_model_name = _infer_model_name(drag_dir, model_name)
+    rows: list[tuple[float, Path, Mapping[str, Any]]] = []
+    for score, split_name in splits:
+        sample_dir = _find_first_sample(drag_dir, split_name)
+        if sample_dir is None:
+            continue
+        metrics_path = sample_dir / "metrics.json"
+        if not metrics_path.exists():
+            continue
+        rows.append((score, sample_dir, read_json(metrics_path)))
+    if not rows:
+        raise RuntimeError(f"No complete reconstruction samples found under {drag_dir}.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"privacy_reconstruction_drag_{resolved_model_name}"
+    png_path = output_dir / f"{stem}.png"
+    pdf_path = output_dir / f"{stem}.pdf"
+
+    f_head = _figure_font("DejaVuSans-Bold.ttf", 24)
+    f_score = _figure_font("DejaVuSans-Bold.ttf", 24)
+    f_metric = _figure_font("DejaVuSans.ttf", 16)
+
+    width = 900
+    margin_x = 40
+    label_width = 150
+    image_size = 238
+    col_gap = 60
+    x_ref = margin_x + label_width + 40
+    x_rec = x_ref + image_size + col_gap
+    header_y = 28
+    row_top = 78
+    row_gap = 70
+    row_height = image_size + row_gap
+    height = row_top + len(rows) * row_height + 18
+
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    ink = (31, 38, 46)
+    muted = (95, 111, 127)
+    green = (35, 137, 64)
+    line = (218, 224, 231)
+
+    _draw_centered_text(
+        draw,
+        "Reference",
+        x=x_ref,
+        width=image_size,
+        y=header_y,
+        font=f_head,
+        fill=ink,
+    )
+    _draw_centered_text(
+        draw,
+        "DRAG reconstruction",
+        x=x_rec,
+        width=image_size,
+        y=header_y,
+        font=f_head,
+        fill=ink,
+    )
+
+    for row_index, (score, sample_dir, metrics) in enumerate(rows):
+        y = row_top + row_index * row_height
+        label_x = margin_x
+        draw.text((label_x, y + 72), f"score {score:.1f}", font=f_score, fill=ink)
+        draw.text(
+            (label_x, y + 112),
+            f"SSIM {_to_float(metrics.get('SSIM')):.3f}",
+            font=f_metric,
+            fill=green,
+        )
+        draw.text(
+            (label_x, y + 138),
+            f"L_actual {_to_float(metrics.get('L_actual')):.3f}",
+            font=f_metric,
+            fill=muted,
+        )
+
+        for image_name, x in (
+            ("model_input_reference.png", x_ref),
+            ("recon.png", x_rec),
+        ):
+            image_path = sample_dir / image_name
+            if not image_path.exists():
+                continue
+            image = Image.open(image_path).convert("RGB")
+            image.thumbnail((image_size, image_size), Image.Resampling.LANCZOS)
+            bx = x + (image_size - image.width) // 2
+            by = y + (image_size - image.height) // 2
+            draw.rectangle(
+                (bx - 1, by - 1, bx + image.width, by + image.height),
+                outline=line,
+                width=1,
+            )
+            canvas.paste(image, (bx, by))
+
+    canvas.save(png_path)
+    canvas.save(pdf_path, "PDF", resolution=300.0)
 
 
 def plot_score_curve(
@@ -167,7 +321,8 @@ def plot_score_curve(
     output_stem: Path,
 ) -> None:
     fig, ax = plt.subplots(figsize=(5.2, 3.4))
-    for method in ("pixel_dra", "drag"):
+    methods = sorted({str(row.get("method") or "") for row in summary_rows if row.get("method")})
+    for method in methods:
         points: list[tuple[float, float]] = []
         for row in summary_rows:
             if row.get("method") != method:
@@ -184,12 +339,20 @@ def plot_score_curve(
             [y for _x, y in points],
             marker="o",
             linewidth=1.8,
-            color=METHOD_COLORS[method],
-            label=METHOD_LABELS[method],
+            color=METHOD_COLORS.get(method),
+            label=METHOD_LABELS.get(method, method),
         )
     ax.set_xlabel("Privacy leakage score")
     ax.set_ylabel(ylabel)
-    ax.set_xticks([0.2, 0.4, 0.6, 0.8])
+    ticks = sorted(
+        {
+            _to_float(row.get("privacy_leakage_score"))
+            for row in summary_rows
+            if not math.isnan(_to_float(row.get("privacy_leakage_score")))
+        }
+    )
+    if ticks:
+        ax.set_xticks(ticks)
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
     fig.tight_layout()
@@ -202,8 +365,19 @@ def plot_score_curve(
 def plot(args: argparse.Namespace) -> None:
     results_dir = Path(args.results_dir)
     output_dir = Path(args.output_dir)
+    drag_dir = Path(args.drag_dir)
     summary_rows = _read_csv(results_dir / "summary_by_score.csv")
-    plot_reconstruction_grid(Path(args.pixel_dir), Path(args.drag_dir), summary_rows, output_dir)
+    plot_reconstruction_grid(
+        drag_dir,
+        summary_rows,
+        output_dir,
+    )
+    plot_compact_reconstruction_grid(
+        drag_dir,
+        summary_rows,
+        output_dir,
+        model_name=args.model_name,
+    )
     plot_score_curve(
         summary_rows,
         metric="ObjectF1_mean",
@@ -221,14 +395,21 @@ def plot(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Plot privacy reconstruction attack results.")
     parser.add_argument("--results_dir", required=True)
-    parser.add_argument("--pixel_dir", required=True)
     parser.add_argument("--drag_dir", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--model-name",
+        default=None,
+        help="Model name used for privacy_reconstruction_drag_<model>.png/pdf filenames.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    plot(build_parser().parse_args(argv))
+    try:
+        plot(build_parser().parse_args(argv))
+    except RuntimeError as exc:
+        raise SystemExit(f"{exc}\n") from None
 
 
 if __name__ == "__main__":
