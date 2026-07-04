@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 import model_management.object_detection as object_detection_runtime
 from experiments.privacy_reconstruction_attack.attack_dataset import (
@@ -24,8 +25,14 @@ from experiments.privacy_reconstruction_attack.edge_prefix_whitebox import (
 from experiments.privacy_reconstruction_attack.evaluate_privacy_score import (
     _metrics_files,
     _summary_rows,
+    evaluate,
+)
+from experiments.privacy_reconstruction_attack.feature_inversion_attack import (
+    _optimise_feature_inversion,
+    _payload_feature_loss,
 )
 from experiments.privacy_reconstruction_attack.plot_privacy_reconstruction import (
+    plot_compact_reconstruction_grid,
     plot_reconstruction_grid,
 )
 from experiments.privacy_reconstruction_attack.reconstruction_metrics import object_metrics
@@ -69,6 +76,92 @@ def test_boundary_feature_adapter_channel_cosine_for_conv_features() -> None:
     distance = adapter.feature_distance({"feat": pred}, {"feat": target})
 
     assert distance.item() == pytest.approx(0.5)
+
+
+def test_boundary_feature_adapter_mse_for_multi_tensor_payload() -> None:
+    adapter = BoundaryFeatureAdapter(
+        cosine_weight=0.0,
+        nmse_weight=0.0,
+        mse_weight=1.0,
+        tensor_weights={"a": 2.0, "b": 1.0},
+    )
+    pred = {"a": torch.zeros(1, 2), "b": torch.zeros(1, 2)}
+    target = {"a": torch.ones(1, 2), "b": torch.full((1, 2), 2.0)}
+
+    distance = adapter.feature_distance(pred, target)
+
+    assert distance.item() == pytest.approx(2.0)
+
+
+def test_feature_inversion_toy_prefix_reduces_feature_loss() -> None:
+    class IdentityRuntimeAdapter:
+        def to_runtime_input(self, image: torch.Tensor) -> torch.Tensor:
+            return image
+
+    class IdentityPrefix:
+        def edge_forward(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
+            return {"payload": image}
+
+    target = torch.full((1, 3, 4, 4), 0.75)
+    adapter = BoundaryFeatureAdapter(cosine_weight=0.0, nmse_weight=0.0, mse_weight=1.0)
+
+    result = _optimise_feature_inversion(
+        target_payload={"payload": target},
+        splitter=IdentityPrefix(),
+        runtime_adapter=IdentityRuntimeAdapter(),
+        adapter=adapter,
+        input_shape=tuple(target.shape),
+        inversion_cfg={
+            "iterations": 60,
+            "learning_rate": 0.1,
+            "adam_eps": 1.0e-8,
+            "amsgrad": False,
+            "init": "gray",
+            "tv_weight": 0.0,
+            "l2_weight": 0.0,
+            "log_every_n_steps": 100,
+        },
+        device=torch.device("cpu"),
+    )
+
+    assert result.final_feature_loss < result.initial_feature_loss
+
+
+def test_feature_inversion_prefers_differentiable_training_prefix() -> None:
+    class IdentityRuntimeAdapter:
+        def to_runtime_input(self, image: torch.Tensor) -> torch.Tensor:
+            return image
+
+    class TrainingPrefix:
+        def __call__(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
+            return {"payload": image * 2.0}
+
+    class Splitter:
+        def _ensure_runtime(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                segments=SimpleNamespace(training_prefix=TrainingPrefix())
+            )
+
+        def edge_forward(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
+            return {"payload": image.detach()}
+
+    image = torch.full((1, 3, 4, 4), 0.25, requires_grad=True)
+    target = {"payload": torch.ones_like(image)}
+    adapter = BoundaryFeatureAdapter(cosine_weight=0.0, nmse_weight=0.0, mse_weight=1.0)
+
+    loss = _payload_feature_loss(
+        splitter=Splitter(),
+        runtime_adapter=IdentityRuntimeAdapter(),
+        adapter=adapter,
+        image=image,
+        target_payload=target,
+        require_grad=True,
+    )
+    loss.backward()
+
+    assert loss.requires_grad
+    assert image.grad is not None
+    assert image.grad.abs().sum().item() > 0.0
 
 
 def test_object_metrics_marks_empty_original_teacher_as_nan() -> None:
@@ -168,9 +261,74 @@ def test_metrics_file_discovery_accepts_custom_split_names(tmp_path) -> None:
     assert _metrics_files(tmp_path) == [metrics_path]
 
 
+def test_evaluate_accepts_generic_attack_dir_and_keeps_drag_csv_alias(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    attack_dir = tmp_path / "attack"
+    write_json(attack_dir / "manifest.json", {"method": "whitebox_feature_inversion"})
+    write_json(
+        attack_dir / "split_score_0_8" / "sample_a" / "metrics.json",
+        {
+            "method": "whitebox_feature_inversion",
+            "privacy_leakage_score": 0.8,
+            "SSIM": 0.5,
+            "L_actual": 0.25,
+        },
+    )
+
+    output_dir = tmp_path / "results"
+    evaluate(
+        SimpleNamespace(
+            config=str(config_path),
+            attack_dir=str(attack_dir),
+            drag_dir=None,
+            output_dir=str(output_dir),
+        )
+    )
+
+    assert (output_dir / "per_sample.csv").exists()
+    assert (output_dir / "drag_per_sample.csv").exists()
+    assert "whitebox_feature_inversion" in (output_dir / "summary_by_score.csv").read_text()
+
+
 def test_plot_reconstruction_grid_reports_empty_inputs(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="No reconstruction metrics"):
         plot_reconstruction_grid(tmp_path / "missing_drag", [], tmp_path / "figures")
+
+
+def test_compact_plot_uses_feature_inversion_filename(tmp_path) -> None:
+    attack_dir = tmp_path / "attack"
+    sample_dir = attack_dir / "split_score_0_8" / "sample_a"
+    sample_dir.mkdir(parents=True)
+    write_json(
+        attack_dir / "manifest.json",
+        {
+            "method": "whitebox_feature_inversion",
+            "edge_prefix_parameters": {"model_name": "toy_model"},
+        },
+    )
+    write_json(
+        sample_dir / "metrics.json",
+        {
+            "method": "whitebox_feature_inversion",
+            "split_name": "split_score_0_8",
+            "privacy_leakage_score": 0.8,
+            "SSIM": 0.5,
+            "L_actual": 0.25,
+        },
+    )
+    Image.new("RGB", (8, 8), "white").save(sample_dir / "model_input_reference.png")
+    Image.new("RGB", (8, 8), "gray").save(sample_dir / "recon.png")
+
+    output_dir = tmp_path / "figures"
+    plot_compact_reconstruction_grid(attack_dir, [], output_dir)
+
+    assert (
+        output_dir / "privacy_reconstruction_whitebox_feature_inversion_toy_model.png"
+    ).exists()
+    assert (
+        output_dir / "privacy_reconstruction_whitebox_feature_inversion_toy_model.pdf"
+    ).exists()
 
 
 def test_auto_split_resolver_picks_unique_nearest_candidates() -> None:
@@ -192,6 +350,43 @@ def test_auto_split_resolver_picks_unique_nearest_candidates() -> None:
     }
     resolved = _resolve_split_points(splitter, config)
     assert [item.split_point for item in resolved] == ["after:a", "after:b", "after:c", "after:d"]
+
+
+def test_first_compute_split_resolver_skips_non_compute_candidates() -> None:
+    candidates = [
+        SimpleNamespace(
+            candidate_id="after:to_1_2",
+            edge_parameter_ratio=0.0,
+            legacy_layer_index=2,
+        ),
+        SimpleNamespace(
+            candidate_id="after:conv2d_1_3",
+            edge_parameter_ratio=0.01,
+            legacy_layer_index=3,
+        ),
+        SimpleNamespace(
+            candidate_id="after:batchnorm_1_4",
+            edge_parameter_ratio=0.02,
+            legacy_layer_index=4,
+        ),
+    ]
+    splitter = SimpleNamespace(enumerate_candidates=lambda max_candidates=None: candidates)
+    config = {
+        "privacy_score_split_points": [
+            {
+                "name": "split_first_compute",
+                "privacy_leakage_score": "auto",
+                "split_point": "first_compute",
+            },
+        ],
+        "split_resolution": {"require_unique": True},
+    }
+
+    resolved = _resolve_split_points(splitter, config)
+
+    assert resolved[0].split_point == "after:conv2d_1_3"
+    assert resolved[0].privacy_leakage_score == pytest.approx(0.99)
+    assert resolved[0].actual_privacy_leakage_score == pytest.approx(0.99)
 
 
 def test_edge_prefix_weights_override_records_sha256(tmp_path) -> None:

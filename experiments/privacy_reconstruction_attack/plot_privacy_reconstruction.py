@@ -20,9 +20,19 @@ from experiments.privacy_reconstruction_attack.attack_dataset import load_rgb_im
 
 METHOD_LABELS = {
     "drag_linear_clean": "DRAG linear clean",
+    "whitebox_feature_inversion": "White-box feature inversion",
 }
 METHOD_COLORS = {
     "drag_linear_clean": "#2E8B57",
+    "whitebox_feature_inversion": "#3366CC",
+}
+METHOD_COMPACT_LABELS = {
+    "drag_linear_clean": "DRAG reconstruction",
+    "whitebox_feature_inversion": "White-box inversion",
+}
+METHOD_FILE_STEMS = {
+    "drag_linear_clean": "drag",
+    "whitebox_feature_inversion": "whitebox_feature_inversion",
 }
 
 
@@ -96,6 +106,25 @@ def _infer_model_name(drag_dir: Path, override: str | None = None) -> str:
     return "unknown_model"
 
 
+def _method_from_manifest(attack_dir: Path) -> str:
+    manifest_path = attack_dir / "manifest.json"
+    if not manifest_path.exists():
+        return "drag_linear_clean"
+    manifest = read_json(manifest_path)
+    return str(manifest.get("method") or "drag_linear_clean")
+
+
+def _method_file_stem(method: str) -> str:
+    return METHOD_FILE_STEMS.get(method, _safe_file_segment(method))
+
+
+def _compact_row_label(score: float, metrics: Mapping[str, Any]) -> tuple[str, str | None]:
+    split_name = str(metrics.get("split_name") or "")
+    if split_name == "split_first_compute":
+        return "first compute", f"score {score:.3f}"
+    return f"score {score:.1f}", None
+
+
 def _blank(ax: plt.Axes, title: str) -> None:
     ax.imshow(np.ones((32, 32, 3), dtype=np.float32))
     ax.set_title(title, fontsize=9)
@@ -135,17 +164,18 @@ def plot_reconstruction_grid(
     summary_rows: list[Mapping[str, Any]],
     output_dir: Path,
 ) -> None:
+    method = _method_from_manifest(drag_dir)
     method_roots = [drag_dir]
     splits = _score_split_names(summary_rows, method_roots)
     if not splits:
         raise RuntimeError(
-            f"No reconstruction metrics found under {drag_dir}; run drag_attack.py "
+            f"No reconstruction metrics found under {drag_dir}; run an attack "
             "and evaluate_privacy_score.py before plotting."
         )
     fig, axes = plt.subplots(len(splits), 3, figsize=(8.0, 2.5 * len(splits)), squeeze=False)
     titles = [
         "Model-input Reference",
-        "DRAG linear clean",
+        METHOD_LABELS.get(method, method),
         "Teacher Detection on Reconstruction",
     ]
     for col, title in enumerate(titles):
@@ -206,10 +236,11 @@ def plot_compact_reconstruction_grid(
     *,
     model_name: str | None = None,
 ) -> None:
+    method = _method_from_manifest(drag_dir)
     splits = _score_split_names(summary_rows, [drag_dir])
     if not splits:
         raise RuntimeError(
-            f"No reconstruction metrics found under {drag_dir}; run drag_attack.py "
+            f"No reconstruction metrics found under {drag_dir}; run an attack "
             "and evaluate_privacy_score.py before plotting."
         )
 
@@ -227,7 +258,7 @@ def plot_compact_reconstruction_grid(
         raise RuntimeError(f"No complete reconstruction samples found under {drag_dir}.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"privacy_reconstruction_drag_{resolved_model_name}"
+    stem = f"privacy_reconstruction_{_method_file_stem(method)}_{resolved_model_name}"
     png_path = output_dir / f"{stem}.png"
     pdf_path = output_dir / f"{stem}.pdf"
 
@@ -266,7 +297,7 @@ def plot_compact_reconstruction_grid(
     )
     _draw_centered_text(
         draw,
-        "DRAG reconstruction",
+        METHOD_COMPACT_LABELS.get(method, "Reconstruction"),
         x=x_rec,
         width=image_size,
         y=header_y,
@@ -277,15 +308,20 @@ def plot_compact_reconstruction_grid(
     for row_index, (score, sample_dir, metrics) in enumerate(rows):
         y = row_top + row_index * row_height
         label_x = margin_x
-        draw.text((label_x, y + 72), f"score {score:.1f}", font=f_score, fill=ink)
+        row_label, row_subtitle = _compact_row_label(score, metrics)
+        draw.text((label_x, y + 60), row_label, font=f_score, fill=ink)
+        metric_y = y + 112
+        if row_subtitle is not None:
+            draw.text((label_x, y + 94), row_subtitle, font=f_metric, fill=muted)
+            metric_y = y + 120
         draw.text(
-            (label_x, y + 112),
+            (label_x, metric_y),
             f"SSIM {_to_float(metrics.get('SSIM')):.3f}",
             font=f_metric,
             fill=green,
         )
         draw.text(
-            (label_x, y + 138),
+            (label_x, metric_y + 26),
             f"L_actual {_to_float(metrics.get('L_actual')):.3f}",
             font=f_metric,
             fill=muted,
@@ -365,7 +401,7 @@ def plot_score_curve(
 def plot(args: argparse.Namespace) -> None:
     results_dir = Path(args.results_dir)
     output_dir = Path(args.output_dir)
-    drag_dir = Path(args.drag_dir)
+    drag_dir = Path(args.attack_dir or args.drag_dir)
     summary_rows = _read_csv(results_dir / "summary_by_score.csv")
     plot_reconstruction_grid(
         drag_dir,
@@ -395,7 +431,8 @@ def plot(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Plot privacy reconstruction attack results.")
     parser.add_argument("--results_dir", required=True)
-    parser.add_argument("--drag_dir", required=True)
+    parser.add_argument("--attack_dir", default=None)
+    parser.add_argument("--drag_dir", default=None)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument(
         "--model-name",
@@ -407,7 +444,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     try:
-        plot(build_parser().parse_args(argv))
+        args = build_parser().parse_args(argv)
+        if not args.attack_dir and not args.drag_dir:
+            raise RuntimeError("Either --attack_dir or --drag_dir is required.")
+        plot(args)
     except RuntimeError as exc:
         raise SystemExit(f"{exc}\n") from None
 

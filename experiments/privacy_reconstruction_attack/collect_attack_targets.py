@@ -66,11 +66,72 @@ def _normalise_candidate_id(value: object) -> str:
     if (
         text
         and text != "auto"
+        and text != "first_compute"
         and not text.startswith("after:")
         and not text.startswith("percent:")
     ):
         return f"after:{text}"
     return text
+
+
+def _candidate_label(candidate: Any) -> str:
+    text = str(getattr(candidate, "candidate_id", "") or "")
+    return text.removeprefix("after:")
+
+
+def _candidate_label_order(label: str) -> int:
+    for item in reversed(label.split("_")):
+        try:
+            return int(item)
+        except ValueError:
+            continue
+    return 10**9
+
+
+def _looks_like_compute_candidate(candidate: Any) -> bool:
+    label = _candidate_label(candidate)
+    op = label.split("_", maxsplit=1)[0].lower()
+    return op in {
+        "conv1d",
+        "conv2d",
+        "conv3d",
+        "linear",
+        "matmul",
+        "bmm",
+        "batchnorm",
+        "layernorm",
+        "groupnorm",
+        "relu",
+        "gelu",
+        "silu",
+        "softmax",
+        "maxpool2d",
+        "avgpool2d",
+    }
+
+
+def _first_compute_candidate(candidates: Sequence[Any]) -> Any:
+    compute_candidates = [
+        candidate for candidate in candidates if _looks_like_compute_candidate(candidate)
+    ]
+    if not compute_candidates:
+        raise RuntimeError("No first compute split candidate could be resolved.")
+    return min(
+        compute_candidates,
+        key=lambda candidate: (
+            getattr(candidate, "legacy_layer_index", None)
+            if getattr(candidate, "legacy_layer_index", None) is not None
+            else _candidate_label_order(_candidate_label(candidate)),
+            str(getattr(candidate, "candidate_id", "")),
+        ),
+    )
+
+
+def _target_score(entry: Mapping[str, Any]) -> float | None:
+    value = entry.get("privacy_leakage_score")
+    if value is None or str(value).strip().lower() in {"", "auto", "actual"}:
+        return None
+    return float(value)
 
 
 def _resolve_split_points(
@@ -99,9 +160,21 @@ def _resolve_split_points(
         name = str(entry.get("name") or "").strip()
         if not name:
             raise RuntimeError("Every split entry must define a non-empty name.")
-        target_score = float(entry.get("privacy_leakage_score"))
+        target_score = _target_score(entry)
         requested = str(entry.get("split_point") or "auto").strip()
-        if requested.lower() == "auto":
+        requested_lower = requested.lower()
+        if requested_lower == "first_compute":
+            chosen = _first_compute_candidate(candidates)
+            split_point = str(chosen.candidate_id)
+            actual = _candidate_privacy_score(chosen)
+            if target_score is None:
+                target_score = actual
+            error = abs(actual - target_score)
+        elif requested_lower == "auto":
+            if target_score is None:
+                raise RuntimeError(
+                    "privacy_leakage_score is required when split_point is auto."
+                )
             pool = [
                 candidate
                 for candidate in candidates
@@ -124,6 +197,12 @@ def _resolve_split_points(
         else:
             split_point = _normalise_candidate_id(requested)
             actual = score_by_id.get(split_point)
+            if target_score is None:
+                target_score = actual
+            if target_score is None:
+                raise RuntimeError(
+                    f"privacy_leakage_score is required for unknown split point {split_point!r}."
+                )
             error = None if actual is None else abs(actual - target_score)
         if require_unique and split_point in used:
             raise RuntimeError(f"Resolved duplicate split point {split_point!r}.")

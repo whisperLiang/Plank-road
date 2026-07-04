@@ -21,6 +21,7 @@ class BoundaryFeatureAdapter:
         *,
         cosine_weight: float = 1.0,
         nmse_weight: float = 0.0,
+        mse_weight: float = 0.0,
         cosine_mode: str = "channel",
         eps: float = 1.0e-8,
         tensor_weights: Mapping[str, float] | None = None,
@@ -28,6 +29,7 @@ class BoundaryFeatureAdapter:
     ) -> None:
         self.cosine_weight = float(cosine_weight)
         self.nmse_weight = float(nmse_weight)
+        self.mse_weight = float(mse_weight)
         self.cosine_mode = str(cosine_mode or "channel").lower()
         self.eps = float(eps)
         self.tensor_weights = {
@@ -46,6 +48,7 @@ class BoundaryFeatureAdapter:
         return cls(
             cosine_weight=float(cfg.get("cosine_weight", 1.0)),
             nmse_weight=float(cfg.get("nmse_weight", 0.0)),
+            mse_weight=float(cfg.get("mse_weight", 0.0)),
             cosine_mode=str(cfg.get("cosine_mode", "channel")),
             eps=float(cfg.get("eps", 1.0e-8)),
             tensor_weights=cfg.get("tensor_weights") or {},
@@ -163,7 +166,12 @@ class BoundaryFeatureAdapter:
             numerator = (pred_flat - target_flat).square().sum()
             denominator = target_flat.square().sum().clamp_min(self.eps)
             nmse = numerator / denominator
-            pieces.append(self.cosine_weight * cosine + self.nmse_weight * nmse)
+            mse = (pred_flat - target_flat).square().mean()
+            pieces.append(
+                self.cosine_weight * cosine
+                + self.nmse_weight * nmse
+                + self.mse_weight * mse
+            )
             raw_weights.append(max(float(tensor_weights.get(label, 1.0)), 0.0))
 
         if not pieces:

@@ -17,9 +17,15 @@ privacy_leakage_score = 1 - edge_parameter_ratio
 Resolved split IDs are written to `resolved_split_points.json` and reused by the
 reconstruction script.
 
-## Reconstruction Method
+## Reconstruction Methods
 
-The only supported reconstruction method is `drag_linear_clean`.
+Two reconstruction methods are supported:
+
+- `whitebox_feature_inversion`: Torch_SFL-style white-box feature inversion.
+  It directly optimizes an input image so the exact edge-side split prefix
+  reproduces the leaked boundary payload.
+- `drag_linear_clean`: the DRAG-style baseline used for the previous
+  linear-clean quantification figure.
 
 `drag_linear_clean` is the DRAG-style reconstruction used for the previous
 linear-clean quantification figure. It first tries to compute a clean
@@ -59,16 +65,24 @@ python experiments/privacy_reconstruction_attack/drag_attack.py \
   --edge-prefix-weights ./model_management/models/rf-detr-nano.pth \
   --device cuda:0
 
+# 2b. Or run white-box feature inversion reconstruction
+python experiments/privacy_reconstruction_attack/feature_inversion_attack.py \
+  --config experiments/privacy_reconstruction_attack/configs/privacy_reconstruction.yaml \
+  --targets_dir ./outputs/privacy_reconstruction/targets \
+  --output_dir ./outputs/privacy_reconstruction/feature_inversion \
+  --edge-prefix-weights ./model_management/models/rf-detr-nano.pth \
+  --device cuda:0
+
 # 3. Summarize evaluation
 python experiments/privacy_reconstruction_attack/evaluate_privacy_score.py \
   --config experiments/privacy_reconstruction_attack/configs/privacy_reconstruction.yaml \
-  --drag_dir ./outputs/privacy_reconstruction/drag \
+  --attack_dir ./outputs/privacy_reconstruction/feature_inversion \
   --output_dir ./outputs/privacy_reconstruction/results
 
 # 4. Plot figures
 python experiments/privacy_reconstruction_attack/plot_privacy_reconstruction.py \
   --results_dir ./outputs/privacy_reconstruction/results \
-  --drag_dir ./outputs/privacy_reconstruction/drag \
+  --attack_dir ./outputs/privacy_reconstruction/feature_inversion \
   --output_dir ./outputs/privacy_reconstruction/figures
 ```
 
@@ -79,9 +93,10 @@ sample. Each sample contains `raw_frame.png`, `boundary_payload.pt.gz`,
 `model_input_tensor.pt`, `boundary_feature.pt`, prediction JSON files, and
 `metadata.json`.
 
-The reconstruction script writes `recon.png`, `raw.png`, `metrics.json`, and a
-384x384 `model_input_reference.png` for each reconstructed sample. Evaluation
-writes `drag_per_sample.csv`, `summary_by_score.csv`, and `score_correlation.json`.
+The reconstruction scripts write `recon.png`, `raw.png`, `metrics.json`, and a
+model-input `model_input_reference.png` for each reconstructed sample. Evaluation
+writes `per_sample.csv`, compatibility `drag_per_sample.csv`, `summary_by_score.csv`,
+and `score_correlation.json`.
 
 The plotting script generates reconstruction grids and score-vs-leakage curves:
 `reconstruction_grid.png/pdf`, `score_vs_object_f1.png/pdf`, and

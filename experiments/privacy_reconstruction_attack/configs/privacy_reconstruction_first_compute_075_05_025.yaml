@@ -1,15 +1,15 @@
 privacy_score_split_points:
-  - name: split_score_0_8
-    privacy_leakage_score: 0.8
+  - name: split_first_compute
+    privacy_leakage_score: auto
+    split_point: first_compute
+  - name: split_score_0_75
+    privacy_leakage_score: 0.75
     split_point: auto
-  - name: split_score_0_6
-    privacy_leakage_score: 0.6
+  - name: split_score_0_5
+    privacy_leakage_score: 0.5
     split_point: auto
-  - name: split_score_0_4
-    privacy_leakage_score: 0.4
-    split_point: auto
-  - name: split_score_0_2
-    privacy_leakage_score: 0.2
+  - name: split_score_0_25
+    privacy_leakage_score: 0.25
     split_point: auto
 
 split_resolution:

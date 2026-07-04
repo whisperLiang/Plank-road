@@ -31,6 +31,7 @@ PER_SAMPLE_FIELDS = [
     "PSNR",
     "SSIM",
     "LPIPS",
+    "FeatureDistanceInitial",
     "FeatureDistanceFinal",
     "drag_latent_init",
     "drag_strength",
@@ -38,6 +39,10 @@ PER_SAMPLE_FIELDS = [
     "init_feature_loss",
     "linear_decoder_label",
     "linear_init_feature_loss",
+    "feature_inversion_init",
+    "feature_inversion_feature_loss",
+    "feature_inversion_total_loss_final",
+    "num_iterations",
     "metric_reference",
     "ObjectPrecision",
     "ObjectRecall",
@@ -274,7 +279,14 @@ def _correlations(summary: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
 def evaluate(args: argparse.Namespace) -> None:
     load_experiment_config(args.config)
     output_dir = Path(args.output_dir)
-    rows = _read_method_rows("drag_linear_clean", Path(args.drag_dir))
+    attack_root = Path(args.attack_dir or args.drag_dir)
+    manifest_path = attack_root / "manifest.json"
+    default_method = "drag_linear_clean"
+    if manifest_path.exists():
+        manifest = read_json(manifest_path)
+        default_method = str(manifest.get("method") or default_method)
+    rows = _read_method_rows(default_method, attack_root)
+    _write_csv(output_dir / "per_sample.csv", rows, PER_SAMPLE_FIELDS)
     _write_csv(output_dir / "drag_per_sample.csv", rows, PER_SAMPLE_FIELDS)
     summary = _summary_rows(rows)
     _write_csv(output_dir / "summary_by_score.csv", summary, SUMMARY_FIELDS)
@@ -284,13 +296,17 @@ def evaluate(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate privacy reconstruction scores.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--drag_dir", required=True)
+    parser.add_argument("--attack_dir", default=None)
+    parser.add_argument("--drag_dir", default=None)
     parser.add_argument("--output_dir", required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    evaluate(build_parser().parse_args(argv))
+    args = build_parser().parse_args(argv)
+    if not args.attack_dir and not args.drag_dir:
+        raise SystemExit("Either --attack_dir or --drag_dir is required.\n")
+    evaluate(args)
 
 
 if __name__ == "__main__":
