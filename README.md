@@ -324,7 +324,7 @@ python edge_client.py --yaml_path ./config/config.yaml --edge_id 2 --server_ip 1
 ```
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --edge_id 3 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_3 --video_path "./video_data/suwon#86_04_01.mp4" --headless
+python edge_client.py --yaml_path ./config/config.yaml --edge_id 3 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_3 --video_path "./video_data/suwon#5a_01_01.mp4" --headless
 ```
 
 When GPU memory approaches the configured threshold, additional edge workers wait until an active worker releases its lease. If a lease heartbeat expires, the lease is released automatically and the job is treated as retryable.
