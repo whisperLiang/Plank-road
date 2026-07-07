@@ -6,7 +6,7 @@ import json
 import math
 import sys
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -19,87 +19,64 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from matplotlib import transforms  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
-from matplotlib.patches import Patch  # noqa: E402
+from matplotlib.patches import Ellipse, Patch  # noqa: E402
 from matplotlib.ticker import MaxNLocator  # noqa: E402
 
 from tools.experiments.experiment_common import (  # noqa: E402
     METHOD_LABELS,
     METHOD_ORDER,
-    mean,
-    mean_positive,
     optional_float,
     optional_int,
     read_csv,
 )
 
 FIGURES = {
-    "fig1_accuracy_over_time": "Accuracy over time",
-    "fig2_adaptation_timeline": "Adaptation timeline after drift",
-    "fig3_accuracy_latency_upload_tradeoff": "Accuracy-latency-upload tradeoff",
-    "fig4_upload_breakdown": "Upload breakdown",
-    "fig5_latency_breakdown": "Adaptation latency breakdown",
-    "fig6_multi_edge_scalability": "Multi-edge scalability",
-    "fig7_resource_timeline": "Resource timeline",
-    "fig8_component_ablation_style_summary": "Component-style summary",
+    "fig1_dynamic_accuracy_recovery": "Dynamic Accuracy Recovery",
+    "fig2_accuracy_retraining_time_tradeoff": "Accuracy vs Total Retraining Time",
+    "fig3_retraining_time_breakdown": "Average Time Cost for Retraining Breakdown",
 }
-EVENT_MARKERS = {
-    "trigger_decision": "o",
-    "bundle_upload_done": "s",
-    "window_uploaded": "s",
-    "teacher_annotation_done": "^",
-    "training_job_succeeded": "D",
-    "model_update_applied": "*",
+REMOVED_FIGURE_STEMS = (
+    "fig1_accuracy_over_time",
+    "fig2_adaptation_timeline",
+    "fig3_accuracy_latency_upload_tradeoff",
+    "fig4_upload_breakdown",
+    "fig5_latency_breakdown",
+    "fig6_multi_edge_scalability",
+    "fig7_resource_timeline",
+    "fig8_component_ablation_style_summary",
+)
+EXPORT_SUFFIXES = (".svg", ".pdf", ".tiff", ".png")
+EXPORT_DPI = 600
+SCENARIO_ORDER = ("Sunny", "Rainy", "Snowy")
+DEFAULT_VIDEO_PATHS = {
+    "Sunny": "video_data/suwon#5a_01_01.mp4",
+    "Rainy": "video_data/suwon#5a_04_01.mp4",
+    "Snowy": "video_data/suwon#5a_06_01.mp4",
 }
-EVENT_LABELS = {
-    "trigger_decision": "Trigger",
-    "bundle_upload_done": "Upload done",
-    "window_uploaded": "Window uploaded",
-    "teacher_annotation_done": "Teacher done",
-    "training_job_succeeded": "Training done",
-    "model_update_applied": "Update applied",
-}
-FIG2_ANCHOR_EVENTS = {
-    "trigger_decision",
-    "bundle_upload_done",
-    "window_uploaded",
-    "teacher_annotation_done",
-    "model_update_applied",
-}
-FIG2_CHAIN_EVENTS = {"training_job_succeeded"}
+POST_UPDATE_WINDOW_FRAMES = 300
+FRAME_BIN_SIZE = 50
 METHOD_COLORS = {
     "plank_road": "#0F4D92",
     "pure_edge_local_updating": "#767676",
     "accuracy_trigger_cloud_retraining": "#B64342",
-    "ekya": "#42949E",
+    "ekya_style_centralized_scheduling": "#42949E",
 }
 METHOD_MARKERS = {
+    "plank_road": "D",
     "pure_edge_local_updating": "o",
     "accuracy_trigger_cloud_retraining": "s",
-    "plank_road": "D",
-    "ekya": "^",
+    "ekya_style_centralized_scheduling": "^",
 }
-COMPONENT_COLORS = (
-    "#B4C0E4",
-    "#E4CCD8",
-    "#C8B7E8",
-    "#AADCA9",
-    "#F0E0D0",
-    "#D8D8D8",
-    "#E9A6A1",
-)
-COMPONENT_HATCHES = ("", "///", "++", "\\\\\\", "...", "xx", "oo")
-STAGE_COLORS = {
-    "inference": "#B4C0E4",
-    "uploading": "#7884B4",
-    "waiting_gpu_lease": "#D8D8D8",
-    "teacher_annotation": "#AADCA9",
-    "training": "#B64342",
-    "model_update": "#42949E",
+COMPONENT_COLORS = {
+    "transmit": "#7EA7C8",
+    "upload": "#7EA7C8",
+    "label": "#8EC59A",
+    "profile": "#B7B7B7",
+    "retrain": "#D8908A",
+    "update": "#88B6B0",
+    "apply": "#88B6B0",
 }
-EXPORT_SUFFIXES = (".svg", ".pdf", ".tiff", ".png")
-EXPORT_DPI = 600
 
 plt.rcParams.update(
     {
@@ -124,21 +101,63 @@ plt.rcParams.update(
 )
 
 
-def _method_order(methods: Iterable[str]) -> list[str]:
-    available = set(methods)
-    return [method for method in METHOD_ORDER if method in available]
+def _method_id(method: object) -> str:
+    return str(method or "").strip()
 
 
 def _method_label(method: str) -> str:
-    return METHOD_LABELS.get(method, method)
+    method_id = _method_id(method)
+    return METHOD_LABELS.get(method_id, method_id)
 
 
 def _method_color(method: str) -> str:
-    return METHOD_COLORS.get(method, "#606060")
+    return METHOD_COLORS.get(_method_id(method), "#606060")
 
 
 def _method_marker(method: str) -> str:
-    return METHOD_MARKERS.get(method, "o")
+    return METHOD_MARKERS.get(_method_id(method), "o")
+
+
+def _method_order(methods: Iterable[str]) -> list[str]:
+    available = {_method_id(method) for method in methods if str(method or "")}
+    return [method for method in METHOD_ORDER if method in available]
+
+
+def _normalized_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["method"] = _method_id(item.get("method", ""))
+        item["scenario_name"] = _scenario_name(item.get("scenario_name", ""))
+        result.append(item)
+    return result
+
+
+def _scenario_name(value: object) -> str:
+    text = str(value or "").strip()
+    folded = "".join(ch.lower() if ch.isalnum() else "_" for ch in text)
+    folded = "_".join(part for part in folded.split("_") if part)
+    if folded in {"sunny", "sun"}:
+        return "Sunny"
+    if folded in {"rainy", "rain"}:
+        return "Rainy"
+    if folded in {"snowy", "snow"}:
+        return "Snowy"
+    return text
+
+
+def _ordered_scenarios(rows: Iterable[Mapping[str, Any]]) -> list[str]:
+    del rows
+    return list(SCENARIO_ORDER)
+
+
+def _unknown_scenarios(rows: Iterable[Mapping[str, Any]]) -> list[str]:
+    available = {str(row.get("scenario_name", "")) for row in rows if row.get("scenario_name")}
+    return sorted(available - set(SCENARIO_ORDER))
+
+
+def _has_formal_scenario(rows: Iterable[Mapping[str, Any]]) -> bool:
+    return any(str(row.get("scenario_name", "")) in SCENARIO_ORDER for row in rows)
 
 
 def _save(fig: plt.Figure, figure_dir: Path, stem: str) -> list[str]:
@@ -155,15 +174,12 @@ def _save(fig: plt.Figure, figure_dir: Path, stem: str) -> list[str]:
     return outputs
 
 
-def _subplots(count: int, *, width: float = 7.1, height: float = 2.8):
-    fig, axes = plt.subplots(
-        count,
-        1,
-        figsize=(width, max(height, 2.15 * count)),
-        squeeze=False,
-        constrained_layout=True,
-    )
-    return fig, [axes[index][0] for index in range(count)]
+def _remove_outputs(figure_dir: Path, stems: Iterable[str]) -> None:
+    for stem in stems:
+        for suffix in EXPORT_SUFFIXES:
+            path = figure_dir / f"{stem}{suffix}"
+            if path.exists():
+                path.unlink()
 
 
 def _style_axis(axis: plt.Axes, *, grid_axis: str | None = "y") -> None:
@@ -178,25 +194,172 @@ def _style_axis(axis: plt.Axes, *, grid_axis: str | None = "y") -> None:
     axis.tick_params(colors="#4D4D4D", length=2.5, width=0.7)
 
 
-def _legend_unique(axis: plt.Axes, **kwargs: Any) -> None:
-    handles, labels = axis.get_legend_handles_labels()
-    unique = {
-        label: handle
-        for handle, label in zip(handles, labels)
-        if label and not label.startswith("_")
+def _set_tight_ylim(axis: plt.Axes, values: Iterable[float], *, floor: float = 0.0) -> None:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return
+    low = min(finite)
+    high = max(finite)
+    margin = max((high - low) * 0.08, 0.02)
+    axis.set_ylim(max(floor, low - margin), high + margin)
+
+
+def _accuracy_metric(
+    frame_rows: Sequence[Mapping[str, Any]],
+    accuracy_definition: str,
+) -> tuple[str | None, str]:
+    if any(optional_float(row.get("teacher_supervised_f1")) is not None for row in frame_rows):
+        return "teacher_supervised_f1", "Teacher-supervised F1"
+    if accuracy_definition == "teacher_supervised_f1" and any(
+        optional_float(row.get("f1")) is not None for row in frame_rows
+    ):
+        return "f1", "Teacher-supervised F1"
+    return None, ""
+
+
+FrameKey = tuple[str, str, str]
+
+
+def _frame_series_by_run(
+    frame_rows: Sequence[Mapping[str, Any]],
+    metric: str,
+) -> dict[FrameKey, dict[int, float]]:
+    grouped: dict[FrameKey, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for row in frame_rows:
+        value = optional_float(row.get(metric))
+        frame_id = optional_int(row.get("frame_id"))
+        if value is None or frame_id is None:
+            continue
+        key = (
+            str(row.get("scenario_name", "")),
+            _method_id(row.get("method", "")),
+            str(row.get("run_id", "")),
+        )
+        grouped[key][frame_id].append(float(value))
+    return {
+        key: {frame_id: float(np.mean(values)) for frame_id, values in frames.items()}
+        for key, frames in grouped.items()
     }
-    if unique:
-        axis.legend(unique.values(), unique.keys(), **kwargs)
 
 
-def _method_legend_handles(methods: Iterable[str]) -> list[Line2D]:
+def _timestamped_frames(
+    frame_rows: Sequence[Mapping[str, Any]],
+) -> dict[FrameKey, list[tuple[int, float]]]:
+    grouped: dict[FrameKey, list[tuple[int, float]]] = defaultdict(list)
+    for row in frame_rows:
+        frame_id = optional_int(row.get("frame_id"))
+        timestamp_ms = optional_float(row.get("timestamp_ms"))
+        if frame_id is None or timestamp_ms is None:
+            continue
+        key = (
+            str(row.get("scenario_name", "")),
+            _method_id(row.get("method", "")),
+            str(row.get("run_id", "")),
+        )
+        grouped[key].append((frame_id, float(timestamp_ms)))
+    for values in grouped.values():
+        values.sort()
+    return grouped
+
+
+def _nearest_frame(
+    timestamped: Sequence[tuple[int, float]],
+    timestamp_ms: float | None,
+) -> int | None:
+    if timestamp_ms is None or not timestamped:
+        return None
+    return min(timestamped, key=lambda item: abs(item[1] - timestamp_ms))[0]
+
+
+def _event_frame(
+    row: Mapping[str, Any],
+    timestamped: Sequence[tuple[int, float]],
+) -> int | None:
+    frame_id = optional_int(row.get("frame_id"))
+    if frame_id is not None:
+        return frame_id
+    return _nearest_frame(timestamped, optional_float(row.get("event_time_ms")))
+
+
+def _mean_event_frames(
+    event_rows: Sequence[Mapping[str, Any]],
+    frame_rows: Sequence[Mapping[str, Any]],
+    *,
+    scenario: str,
+    method: str,
+) -> dict[str, float]:
+    timestamps = _timestamped_frames(frame_rows)
+    positions: dict[str, list[float]] = defaultdict(list)
+    for row in event_rows:
+        if row.get("scenario_name") != scenario or _method_id(row.get("method")) != method:
+            continue
+        event_name = str(row.get("event_name", ""))
+        if event_name not in {"trigger_decision", "model_update_applied"}:
+            continue
+        key = (scenario, method, str(row.get("run_id", "")))
+        frame_id = _event_frame(row, timestamps.get(key, []))
+        if frame_id is not None:
+            positions[event_name].append(float(frame_id))
+    return {event_name: float(np.mean(values)) for event_name, values in positions.items()}
+
+
+def _run_series_for(
+    series_by_run: Mapping[FrameKey, Mapping[int, float]],
+    *,
+    scenario: str,
+    method: str,
+) -> dict[str, dict[int, float]]:
+    return {
+        run_id: dict(series)
+        for (item_scenario, item_method, run_id), series in series_by_run.items()
+        if item_scenario == scenario and item_method == method
+    }
+
+
+def _aggregate_runs_at_coordinates(
+    run_series: Mapping[str, Mapping[int, float]],
+) -> tuple[list[float], list[float], list[float], bool]:
+    if not run_series:
+        return [], [], [], False
+    frame_sets = [set(series) for series in run_series.values() if series]
+    if not frame_sets:
+        return [], [], [], False
+    common = set.intersection(*frame_sets) if len(frame_sets) > 1 else set(frame_sets[0])
+    used_bins = False
+    if common:
+        x_values = sorted(common)
+        per_x = [[series[x] for series in run_series.values() if x in series] for x in x_values]
+    else:
+        used_bins = True
+        binned: dict[str, dict[int, float]] = {}
+        for run_id, series in run_series.items():
+            buckets: dict[int, list[float]] = defaultdict(list)
+            for frame_id, value in series.items():
+                bucket = (int(frame_id) // FRAME_BIN_SIZE) * FRAME_BIN_SIZE
+                buckets[bucket].append(float(value))
+            binned[run_id] = {
+                bucket: float(np.mean(values)) for bucket, values in buckets.items()
+            }
+        bucket_sets = [set(series) for series in binned.values() if series]
+        common_buckets = set.intersection(*bucket_sets) if len(bucket_sets) > 1 else set(
+            bucket_sets[0] if bucket_sets else []
+        )
+        x_values = sorted(common_buckets)
+        per_x = [[series[x] for series in binned.values() if x in series] for x in x_values]
+        x_values = [x + FRAME_BIN_SIZE / 2.0 for x in x_values]
+    means = [float(np.mean(values)) for values in per_x if values]
+    stds = [float(np.std(values)) for values in per_x if values]
+    return [float(x) for x in x_values], means, stds, used_bins
+
+
+def _legend_handles(methods: Iterable[str]) -> list[Line2D]:
     return [
         Line2D(
             [0],
             [0],
             color=_method_color(method),
             marker=_method_marker(method),
-            linewidth=1.2,
+            linewidth=1.35,
             markersize=4,
             label=_method_label(method),
         )
@@ -204,1323 +367,659 @@ def _method_legend_handles(methods: Iterable[str]) -> list[Line2D]:
     ]
 
 
-def _set_tight_ylim(axis: plt.Axes, values: Iterable[float], *, floor: float | None = None) -> None:
-    finite = [float(value) for value in values if math.isfinite(float(value))]
-    if not finite:
-        return
-    low = min(finite)
-    high = max(finite)
-    if math.isclose(low, high):
-        margin = max(abs(high) * 0.03, 0.01)
-    else:
-        margin = (high - low) * 0.08
-    if floor is not None:
-        low = max(floor, low - margin)
-    else:
-        low = low - margin
-    axis.set_ylim(low, high + margin)
-
-
-def _tradeoff_label_offsets(points: list[Mapping[str, Any]]) -> list[tuple[int, int]]:
-    if not points:
-        return []
-    xs = [float(point["x"]) for point in points]
-    ys = [float(point["y"]) for point in points]
-    x_range = max(max(xs) - min(xs), 1e-9)
-    y_range = max(max(ys) - min(ys), 1e-9)
-    x_threshold = max(x_range * 0.1, 1e-6)
-    y_threshold = max(y_range * 0.16, 0.004)
-    offsets = [(5, 3) for _point in points]
-    candidates = ((5, 8), (5, -10), (9, 16), (9, -18), (-44, 8), (-44, -10))
-    visited: set[int] = set()
-    for index, point in enumerate(points):
-        if index in visited:
-            continue
-        x = float(point["x"])
-        y = float(point["y"])
-        cluster = [
-            other_index
-            for other_index, other in enumerate(points)
-            if abs(float(other["x"]) - x) <= x_threshold
-            and abs(float(other["y"]) - y) <= y_threshold
-        ]
-        if len(cluster) <= 1:
-            visited.add(index)
-            continue
-        cluster.sort(
-            key=lambda item: (
-                float(points[item]["x"]),
-                float(points[item]["y"]),
-                str(points[item].get("label", "")),
-            )
-        )
-        for offset_index, item in enumerate(cluster):
-            offsets[item] = candidates[offset_index % len(candidates)]
-            visited.add(item)
-    return offsets
-
-
-def _data_scale(values: Iterable[float], kind: str) -> tuple[float, str]:
-    finite = [abs(float(value)) for value in values if math.isfinite(float(value))]
-    maximum = max(finite, default=0.0)
-    if kind == "bytes":
-        if maximum >= 1_000_000_000:
-            return 1_000_000_000.0, "GB"
-        if maximum >= 1_000_000:
-            return 1_000_000.0, "MB"
-        if maximum >= 1_000:
-            return 1_000.0, "KB"
-        return 1.0, "bytes"
-    if kind == "ms":
-        if maximum >= 1_000:
-            return 1_000.0, "s"
-        return 1.0, "ms"
-    return 1.0, ""
-
-
-def _format_compact(value: float) -> str:
-    value = float(value)
-    abs_value = abs(value)
-    if abs_value >= 100:
-        return f"{value:.0f}"
-    if abs_value >= 10:
-        return f"{value:.1f}"
-    if abs_value >= 1:
-        return f"{value:.2f}"
-    return f"{value:.3f}".rstrip("0").rstrip(".")
-
-
-def _annotate_bar_value(axis: plt.Axes, x: float, y: float, value: float, unit: str) -> None:
-    axis.annotate(
-        f"{_format_compact(value)} {unit}".strip(),
-        xy=(x, y),
-        xytext=(2, 0),
-        textcoords="offset points",
-        va="center",
-        ha="left",
-        fontsize=6,
-        color="#4D4D4D",
-        clip_on=False,
-    )
-
-
-def _event_group_key(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
-    return (
-        str(row.get("scenario_name", "")),
-        str(row.get("method", "")),
-        str(row.get("run_id", "")),
-        str(row.get("edge_id", "")),
-    )
-
-
-def _event_origins(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str, str, str], float]:
-    grouped: dict[tuple[str, str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
-    for row in rows:
-        if optional_float(row.get("event_time_ms")) is not None:
-            grouped[_event_group_key(row)].append(row)
-    origins = {}
-    for key, group in grouped.items():
-        trigger_times = [
-            float(value)
-            for row in group
-            if row.get("event_name") in {"drift_detected", "trigger_decision"}
-            and (value := optional_float(row.get("event_time_ms"))) is not None
-        ]
-        all_times = [
-            float(value)
-            for row in group
-            if (value := optional_float(row.get("event_time_ms"))) is not None
-        ]
-        origins[key] = min(trigger_times or all_times)
-    return origins
-
-
-def _relative_event_seconds(
-    row: Mapping[str, Any],
-    origins: Mapping[tuple[str, str, str, str], float],
-) -> float | None:
-    timestamp = optional_float(row.get("event_time_ms"))
-    if timestamp is None:
-        return None
-    origin = origins.get(_event_group_key(row))
-    if origin is None:
-        return None
-    return (float(timestamp) - origin) / 1000.0
-
-
-def _filter_fig2_timeline_rows(
-    rows: Iterable[Mapping[str, Any]],
-) -> list[Mapping[str, Any]]:
-    materialized = list(rows)
-    anchors: dict[tuple[str, str, str, str], tuple[set[str], set[str]]] = defaultdict(
-        lambda: (set(), set())
-    )
-    for row in materialized:
-        if row.get("event_name") not in FIG2_ANCHOR_EVENTS:
-            continue
-        job_id = str(row.get("job_id", "") or "")
-        window_id = str(row.get("window_id", "") or "")
-        job_ids, window_ids = anchors[_event_group_key(row)]
-        if job_id:
-            job_ids.add(job_id)
-        if window_id:
-            window_ids.add(window_id)
-
-    filtered: list[Mapping[str, Any]] = []
-    for row in materialized:
-        event_name = str(row.get("event_name", "") or "")
-        if event_name not in FIG2_CHAIN_EVENTS:
-            filtered.append(row)
-            continue
-        job_ids, window_ids = anchors[_event_group_key(row)]
-        job_id = str(row.get("job_id", "") or "")
-        window_id = str(row.get("window_id", "") or "")
-        if not job_ids and not window_ids:
-            filtered.append(row)
-        elif (job_id and job_id in job_ids) or (window_id and window_id in window_ids):
-            filtered.append(row)
-    return filtered
-
-
-def _relative_stage_intervals(
-    intervals: Iterable[tuple[tuple[str, str, str, str], float, float, str]],
-) -> list[tuple[tuple[str, str, str, str], float, float, str]]:
-    materialized = list(intervals)
-    origins: dict[tuple[str, str, str, str], float] = {}
-    for key, start, _, _ in materialized:
-        origins[key] = min(start, origins.get(key, start))
-    return [
-        (key, (start - origins[key]) / 1000.0, (end - origins[key]) / 1000.0, stage)
-        for key, start, end, stage in materialized
-    ]
-
-
-def _frame_inference_intervals(
-    frame_rows: Iterable[Mapping[str, Any]],
-) -> list[tuple[tuple[str, str, str, str], float, float, str]]:
-    spans: dict[tuple[str, str, str, str], list[float]] = defaultdict(
-        lambda: [math.inf, -math.inf]
-    )
-    for row in frame_rows:
-        timestamp = optional_float(row.get("timestamp_ms"))
-        if timestamp is None:
-            continue
-        inference_ms = optional_float(row.get("timing_inference_ms"))
-        latency_ms = optional_float(row.get("latency_ms"))
-        duration = inference_ms if inference_ms is not None else latency_ms
-        duration = max(0.0, float(duration or 0.0))
-        key = _event_group_key(row)
-        spans[key][0] = min(spans[key][0], float(timestamp))
-        spans[key][1] = max(spans[key][1], float(timestamp) + duration)
-    return [
-        (key, start, end, "inference")
-        for key, (start, end) in spans.items()
-        if math.isfinite(start) and math.isfinite(end) and end > start
-    ]
-
-
-def _same_event_artifact(start: Mapping[str, Any], end: Mapping[str, Any]) -> bool:
-    for field in ("job_id", "window_id"):
-        start_value = str(start.get(field, "") or "")
-        if start_value:
-            return str(end.get(field, "") or "") == start_value
-    return True
-
-
-def _paired_event_intervals(
-    event_rows: Iterable[Mapping[str, Any]],
-    event_pairs: Iterable[tuple[str, str, str]],
-) -> list[tuple[tuple[str, str, str, str], float, float, str]]:
-    event_groups: dict[tuple[str, str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
-    for row in event_rows:
-        if optional_float(row.get("event_time_ms")) is not None:
-            event_groups[_event_group_key(row)].append(row)
-
-    intervals: list[tuple[tuple[str, str, str, str], float, float, str]] = []
-    for key, rows in event_groups.items():
-        rows.sort(key=lambda row: optional_float(row.get("event_time_ms")) or 0.0)
-        for start_name, end_name, stage in event_pairs:
-            starts = [row for row in rows if row.get("event_name") == start_name]
-            ends = [row for row in rows if row.get("event_name") == end_name]
-            used_end_indexes: set[int] = set()
-            for start_row in starts:
-                start_time = optional_float(start_row.get("event_time_ms"))
-                if start_time is None:
-                    continue
-                matching_candidates = [
-                    (index, end_row, float(end_time))
-                    for index, end_row in enumerate(ends)
-                    if index not in used_end_indexes
-                    and (end_time := optional_float(end_row.get("event_time_ms"))) is not None
-                    and float(end_time) > start_time
-                    and _same_event_artifact(start_row, end_row)
-                ]
-                fallback_candidates = [
-                    (index, end_row, float(end_time))
-                    for index, end_row in enumerate(ends)
-                    if index not in used_end_indexes
-                    and (end_time := optional_float(end_row.get("event_time_ms"))) is not None
-                    and float(end_time) > start_time
-                ]
-                candidates = matching_candidates or fallback_candidates
-                if not candidates:
-                    continue
-                end_index, _, end_time = min(candidates, key=lambda item: item[2])
-                used_end_indexes.add(end_index)
-                intervals.append((key, start_time, end_time, stage))
-    return intervals
-
-
-def _numeric_rows(rows: Iterable[Mapping[str, Any]], field: str) -> list[Mapping[str, Any]]:
-    return [row for row in rows if optional_float(row.get(field)) is not None]
-
-
-def _aggregate_summary(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str, int], list[dict[str, str]]] = defaultdict(list)
-    for row in rows:
-        edge_count = optional_int(row.get("edge_count"))
-        if edge_count is None:
-            continue
-        grouped[(str(row.get("scenario_name", "")), str(row.get("method", "")), edge_count)].append(
-            row
-        )
-    result = []
-    numeric_fields = (
-        "mean_f1",
-        "mean_map",
-        "mean_latency_ms",
-        "mean_adaptation_ms",
-        "mean_upload_bytes",
-        "mean_raw_exposure_ratio",
-        "mean_training_ms",
-    )
-    for (scenario, method, edge_count), group in sorted(grouped.items()):
-        row: dict[str, Any] = {
-            "scenario_name": scenario,
-            "method": method,
-            "edge_count": edge_count,
-        }
-        for field in numeric_fields:
-            row[field] = mean(item.get(field) for item in group)
-        result.append(row)
-    return result
-
-
-def _accuracy_field(rows: list[dict[str, str]]) -> str | None:
-    coverage = {
-        "f1": len(_numeric_rows(rows, "f1")),
-        "map": len(_numeric_rows(rows, "map")),
-    }
-    best = max(coverage, key=coverage.get)
-    return best if coverage[best] > 0 else None
-
-
-def _summary_accuracy_field(rows: list[Mapping[str, Any]]) -> str | None:
-    coverage = {}
-    for field in ("mean_f1", "mean_map"):
-        numeric = [row for row in rows if optional_float(row.get(field)) is not None]
-        coverage[field] = (
-            len({str(row.get("method", "")) for row in numeric}),
-            len(numeric),
-        )
-    best = max(coverage, key=coverage.get)
-    return best if coverage[best][0] > 0 else None
-
-
-def _accuracy_label(
-    metric: str,
-    accuracy_definition: str,
-    *,
-    average: bool = False,
-) -> str:
-    if metric in {"f1", "mean_f1"} and accuracy_definition == "teacher_supervised_f1":
-        return "Average teacher-supervised F1" if average else "Teacher-supervised F1"
-    if metric in {"f1", "mean_f1"}:
-        return "Mean F1" if average else "F1"
-    return "Mean mAP" if average else "mAP"
-
-
-def _nearest_frame_for_time(
-    timestamped_frames: list[tuple[int, float]],
-    event_time_ms: float | None,
-) -> int | None:
-    if event_time_ms is None or not timestamped_frames:
-        return None
-    return min(timestamped_frames, key=lambda item: abs(item[1] - event_time_ms))[0]
-
-
-def _resolved_event_frame(
-    event: Mapping[str, Any],
-    timestamped_frames: list[tuple[int, float]],
-) -> int | None:
-    frame_id = optional_int(event.get("frame_id"))
-    if frame_id is not None:
-        return frame_id
-    return _nearest_frame_for_time(
-        timestamped_frames,
-        optional_float(event.get("event_time_ms")),
-    )
-
-
-def _is_fig1_training_trigger_event(event: Mapping[str, Any]) -> bool:
-    if event.get("event_name") != "trigger_decision":
-        return False
-    if str(event.get("method", "") or "") != "ekya":
-        return True
-    return bool(str(event.get("job_id", "") or ""))
-
-
 def _plot_fig1(
-    frame_rows: list[dict[str, str]],
-    event_rows: list[dict[str, str]],
+    frame_rows: list[dict[str, Any]],
+    event_rows: list[dict[str, Any]],
     figure_dir: Path,
-    accuracy_definition: str = "",
-) -> tuple[list[str], str | None, list[str]]:
-    metric = _accuracy_field(frame_rows)
+    accuracy_definition: str,
+) -> tuple[list[str], str | None, list[str], dict[str, Any]]:
+    metric, ylabel = _accuracy_metric(frame_rows, accuracy_definition)
     if metric is None:
-        return [], "accuracy data missing", []
-    scenarios = sorted(
-        {
-            str(row.get("scenario_name", ""))
-            for row in frame_rows
-            if optional_float(row.get(metric)) is not None
-        }
+        return [], "accuracy data missing", [], {}
+    partial: list[str] = [
+        f"{scenario}: ignored non-Suwon scenario data for Fig.1"
+        for scenario in _unknown_scenarios(frame_rows)
+    ]
+    if not _has_formal_scenario(frame_rows):
+        return [], "formal Suwon scenario data missing", partial, {}
+    scenarios = _ordered_scenarios(frame_rows)
+    series_by_run = _frame_series_by_run(frame_rows, metric)
+    fig, axes = plt.subplots(
+        1,
+        len(scenarios),
+        figsize=(7.1, 2.45),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
     )
-    fig, axes = _subplots(len(scenarios), height=2.65)
-    for axis, scenario in zip(axes, scenarios):
-        scenario_rows = [
-            row
-            for row in frame_rows
-            if row.get("scenario_name") == scenario and optional_float(row.get(metric)) is not None
-        ]
-        plotted_values: list[float] = []
-        event_styles_used: set[str] = set()
-        event_positions: list[tuple[int, str, str]] = []
-        endpoint_labels: list[tuple[str, int, float]] = []
-        for method in _method_order(row.get("method", "") for row in scenario_rows):
-            grouped: dict[int, list[float]] = defaultdict(list)
-            for row in scenario_rows:
-                if row.get("method") != method:
-                    continue
-                frame_id = optional_int(row.get("frame_id"))
-                value = optional_float(row.get(metric))
-                if frame_id is not None and value is not None:
-                    grouped[frame_id].append(value)
-            x_values = sorted(grouped)
-            y_values = [float(np.mean(grouped[x])) for x in x_values]
-            plotted_values.extend(y_values)
+    axes_list = list(axes[0])
+    plotted_methods: set[str] = set()
+    plotted_values: list[float] = []
+    used_bin = False
+    marker_count = 0
+    for axis, scenario in zip(axes_list, scenarios):
+        scenario_methods = _method_order(
+            row.get("method", "") for row in frame_rows if row.get("scenario_name") == scenario
+        )
+        if not scenario_methods:
+            partial.append(f"{scenario}: scenario data missing for Fig.1")
+        for method in scenario_methods:
+            run_series = _run_series_for(series_by_run, scenario=scenario, method=method)
+            if len(run_series) < 2:
+                partial.append(
+                    f"{scenario}/{_method_label(method)} has fewer than 2 repeats for Fig.1"
+                )
+            x_values, y_mean, y_std, binned = _aggregate_runs_at_coordinates(run_series)
+            if not x_values:
+                partial.append(
+                    f"{scenario}/{_method_label(method)} has no shared frame coordinates for Fig.1"
+                )
+                continue
+            used_bin = used_bin or binned
+            plotted_methods.add(method)
+            plotted_values.extend(y_mean)
+            color = _method_color(method)
             axis.plot(
                 x_values,
-                y_values,
-                color=_method_color(method),
+                y_mean,
+                color=color,
                 linewidth=1.35,
                 marker=_method_marker(method),
-                markevery=[-1] if x_values else None,
-                markersize=3.4,
+                markevery=[-1] if len(x_values) else None,
+                markersize=3.3,
                 markeredgecolor="white",
                 markeredgewidth=0.35,
             )
-            if x_values:
-                endpoint_labels.append((method, x_values[-1], y_values[-1]))
-            updates = [
-                optional_int(row.get("frame_id"))
-                for row in event_rows
-                if row.get("scenario_name") == scenario
-                and row.get("method") == method
-                and row.get("event_name") == "model_update_applied"
-            ]
-            resolved_updates = [value for value in updates if value is not None]
-            timestamped_frames = [
-                (
-                    int(frame_id),
-                    float(timestamp),
-                )
-                for row in scenario_rows
-                if row.get("method") == method
-                and (frame_id := optional_int(row.get("frame_id"))) is not None
-                and (timestamp := optional_float(row.get("timestamp_ms"))) is not None
-            ]
-            method_events = [
-                row
-                for row in event_rows
-                if row.get("scenario_name") == scenario and row.get("method") == method
-            ]
-
-            for event in method_events:
-                if not _is_fig1_training_trigger_event(event):
-                    continue
-                frame_id = _resolved_event_frame(event, timestamped_frames)
-                if frame_id is None:
-                    continue
-                event_positions.append((frame_id, method, "training trigger"))
-
-            for event in event_rows:
-                if (
-                    event.get("scenario_name") != scenario
-                    or event.get("method") != method
-                    or event.get("event_name") != "model_update_applied"
-                    or optional_int(event.get("frame_id")) is not None
-                ):
-                    continue
-                event_time = optional_float(event.get("event_time_ms"))
-                if event_time is not None and timestamped_frames:
-                    resolved_updates.append(
-                        _nearest_frame_for_time(timestamped_frames, event_time)
-                    )
-            for update in sorted(set(resolved_updates)):
-                if update is None:
-                    continue
-                event_positions.append((update, method, "model update"))
-        title = (
-            "Teacher-supervised F1 over time"
-            if metric == "f1" and accuracy_definition == "teacher_supervised_f1"
-            else "Accuracy over time"
-        )
-        axis.set_title(title if len(scenarios) == 1 else f"{title}: {scenario}")
-        axis.set_xlabel("Frame ID")
-        axis.set_ylabel(_accuracy_label(metric, accuracy_definition))
-        _set_tight_ylim(axis, plotted_values, floor=0.0)
-        if endpoint_labels:
-            y_min, y_max = axis.get_ylim()
-            label_gap = max((y_max - y_min) * 0.055, 0.025)
-            ordered = sorted(endpoint_labels, key=lambda item: item[2])
-            adjusted: list[list[Any]] = []
-            for method, x_value, y_value in ordered:
-                target = y_value
-                if adjusted:
-                    target = max(target, float(adjusted[-1][3]) + label_gap)
-                adjusted.append([method, x_value, y_value, target])
-            overflow = float(adjusted[-1][3]) - y_max if adjusted else 0.0
-            if overflow > 0:
-                for item in adjusted:
-                    item[3] = max(y_min, float(item[3]) - overflow)
-            x_min, x_max = axis.get_xlim()
-            x_offset = (x_max - x_min) * 0.006
-            for method, x_value, y_value, target in adjusted:
-                axis.annotate(
-                    _method_label(method),
-                    xy=(x_value, y_value),
-                    xytext=(float(x_value) + x_offset, float(target)),
-                    textcoords="data",
-                    va="center",
-                    fontsize=6,
-                    color=_method_color(method),
-                    clip_on=False,
-                    arrowprops=(
-                        {
-                            "arrowstyle": "-",
-                            "color": _method_color(method),
-                            "linewidth": 0.45,
-                            "alpha": 0.65,
-                        }
-                        if abs(float(target) - float(y_value)) > label_gap * 0.3
-                        else None
-                    ),
-                )
-        if event_positions:
-            event_transform = transforms.blended_transform_factory(axis.transData, axis.transAxes)
-            event_methods = _method_order(method for _, method, _ in event_positions)
-            lane_y = {method: 0.055 + index * 0.038 for index, method in enumerate(event_methods)}
-            for frame_id, method, event_kind in sorted(event_positions):
-                y = lane_y[method]
-                marker = "^" if event_kind == "training trigger" else "*"
-                size = 38 if event_kind == "training trigger" else 64
-                color = _method_color(method)
-                axis.plot(
-                    [frame_id, frame_id],
-                    [max(0.012, y - 0.019), min(0.22, y + 0.019)],
-                    transform=event_transform,
+            if any(value > 0 for value in y_std):
+                lower = np.array(y_mean) - np.array(y_std)
+                upper = np.array(y_mean) + np.array(y_std)
+                axis.fill_between(
+                    x_values,
+                    lower,
+                    upper,
                     color=color,
-                    linewidth=1.15,
-                    alpha=0.86,
-                    solid_capstyle="round",
+                    alpha=0.16,
+                    linewidth=0,
+                )
+        event_positions = {
+            event_name: value
+            for event_name, value in _mean_event_frames(
+                event_rows,
+                frame_rows,
+                scenario=scenario,
+                method="",
+            ).items()
+        }
+        del event_positions
+        for method in scenario_methods:
+            positions = _mean_event_frames(
+                event_rows,
+                frame_rows,
+                scenario=scenario,
+                method=method,
+            )
+            for event_name, marker in (
+                ("trigger_decision", "^"),
+                ("model_update_applied", "*"),
+            ):
+                frame = positions.get(event_name)
+                if frame is None:
+                    continue
+                marker_count += 1
+                axis.axvline(
+                    frame,
+                    color=_method_color(method),
+                    linewidth=0.8,
+                    alpha=0.32,
+                    linestyle="--",
+                )
+                y = 0.05 if event_name == "trigger_decision" else 0.12
+                axis.scatter(
+                    [frame],
+                    [y],
+                    transform=axis.get_xaxis_transform(),
+                    marker=marker,
+                    s=30 if marker == "^" else 50,
+                    color=_method_color(method),
+                    edgecolor="white",
+                    linewidth=0.4,
                     zorder=5,
                     clip_on=False,
                 )
-                axis.scatter(
-                    [frame_id],
-                    [y],
-                    transform=event_transform,
-                    marker=marker,
-                    s=size,
-                    facecolor=color,
-                    edgecolor="white",
-                    linewidth=0.5,
-                    zorder=6,
-                    clip_on=False,
-                )
-                event_styles_used.add(event_kind)
+        axis.set_title(scenario)
+        axis.set_xlabel("Frame ID")
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
         _style_axis(axis, grid_axis="both")
-        event_handles = []
-        if "training trigger" in event_styles_used:
-            event_handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    color="#606060",
-                    marker="^",
-                    linestyle="None",
-                    markersize=5,
-                    label="Trigger",
+    axes_list[0].set_ylabel(ylabel)
+    _set_tight_ylim(axes_list[0], plotted_values, floor=0.0)
+    if plotted_methods:
+        fig.legend(
+            handles=_legend_handles(plotted_methods),
+            loc="lower center",
+            ncol=min(4, len(plotted_methods)),
+            bbox_to_anchor=(0.5, -0.04),
+        )
+    if event_rows and marker_count == 0:
+        partial.append(
+            "event markers omitted because trigger/update frame positions were incomplete"
+        )
+    if not plotted_methods:
+        plt.close(fig)
+        return [], "accuracy data missing for formal Suwon scenarios", partial, {}
+    metadata = {
+        "frame_bin_size": FRAME_BIN_SIZE if used_bin else None,
+        "variability": "standard deviation across repeated runs",
+        "event_markers": "mean trigger/update frame" if marker_count else "omitted",
+    }
+    return _save(fig, figure_dir, "fig1_dynamic_accuracy_recovery"), None, partial, metadata
+
+
+def _event_identities(row: Mapping[str, Any]) -> set[str]:
+    return {
+        value
+        for field in ("job_id", "window_id")
+        if (value := str(row.get(field, "") or ""))
+    }
+
+
+def _trigger_to_update_seconds(
+    event_rows: Sequence[Mapping[str, Any]],
+    *,
+    scenario: str,
+    method: str,
+    run_id: str,
+) -> float | None:
+    by_edge: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in event_rows:
+        if (
+            row.get("scenario_name") == scenario
+            and _method_id(row.get("method")) == method
+            and str(row.get("run_id", "")) == run_id
+            and optional_float(row.get("event_time_ms")) is not None
+        ):
+            by_edge[str(row.get("edge_id", "") or "")].append(row)
+    durations: list[float] = []
+    for rows in by_edge.values():
+        triggers = sorted(
+            [row for row in rows if row.get("event_name") == "trigger_decision"],
+            key=lambda row: optional_float(row.get("event_time_ms")) or 0.0,
+        )
+        updates = sorted(
+            [row for row in rows if row.get("event_name") == "model_update_applied"],
+            key=lambda row: optional_float(row.get("event_time_ms")) or 0.0,
+        )
+        unused = list(triggers)
+        for update in updates:
+            update_time = optional_float(update.get("event_time_ms"))
+            if update_time is None:
+                continue
+            update_identities = _event_identities(update)
+            if update_identities:
+                candidate_index = next(
+                    (
+                        index
+                        for index, trigger in enumerate(unused)
+                        if update_identities.intersection(_event_identities(trigger))
+                        and (optional_float(trigger.get("event_time_ms")) or update_time + 1)
+                        <= update_time
+                    ),
+                    None,
                 )
-            )
-        if "model update" in event_styles_used:
-            event_handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    color="#606060",
-                    marker="*",
-                    linestyle="None",
-                    markersize=7,
-                    label="Update",
+            else:
+                candidate_index = next(
+                    (
+                        index
+                        for index, trigger in enumerate(unused)
+                        if (optional_float(trigger.get("event_time_ms")) or update_time + 1)
+                        <= update_time
+                    ),
+                    None,
                 )
-            )
-        if event_handles:
-            axis.legend(
-                handles=event_handles,
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.18),
-                ncol=2,
-                handlelength=1.0,
-            )
-    return _save(fig, figure_dir, "fig1_accuracy_over_time"), None, []
+            if candidate_index is None:
+                continue
+            trigger = unused.pop(candidate_index)
+            trigger_time = optional_float(trigger.get("event_time_ms"))
+            if trigger_time is not None:
+                durations.append((update_time - trigger_time) / 1000.0)
+    return float(np.mean(durations)) if durations else None
+
+
+def _update_frame_for_run(
+    event_rows: Sequence[Mapping[str, Any]],
+    timestamped: Mapping[FrameKey, Sequence[tuple[int, float]]],
+    *,
+    scenario: str,
+    method: str,
+    run_id: str,
+) -> float | None:
+    frames = []
+    for row in event_rows:
+        if (
+            row.get("scenario_name") == scenario
+            and _method_id(row.get("method")) == method
+            and str(row.get("run_id", "")) == run_id
+            and row.get("event_name") == "model_update_applied"
+        ):
+            frame_id = _event_frame(row, timestamped.get((scenario, method, run_id), []))
+            if frame_id is not None:
+                frames.append(float(frame_id))
+    return float(np.mean(frames)) if frames else None
+
+
+def _post_update_accuracy(
+    series: Mapping[int, float],
+    update_frame: float | None,
+) -> tuple[float | None, str | None]:
+    if not series:
+        return None, "frame-level accuracy missing"
+    if update_frame is not None:
+        values = [
+            value
+            for frame_id, value in series.items()
+            if frame_id > update_frame and frame_id <= update_frame + POST_UPDATE_WINDOW_FRAMES
+        ]
+        if values:
+            return float(np.mean(values)), None
+        return None, "post-update accuracy window missing"
+    return None, "model update frame missing"
 
 
 def _plot_fig2(
-    event_rows: list[dict[str, str]],
+    frame_rows: list[dict[str, Any]],
+    event_rows: list[dict[str, Any]],
     figure_dir: Path,
-) -> tuple[list[str], str | None, list[str]]:
-    rows = [
-        row
-        for row in event_rows
-        if row.get("event_name") in EVENT_MARKERS
-        and optional_float(row.get("event_time_ms")) is not None
+    accuracy_definition: str,
+) -> tuple[list[str], str | None, list[str], dict[str, Any]]:
+    metric, ylabel = _accuracy_metric(frame_rows, accuracy_definition)
+    if metric is None:
+        return [], "accuracy data missing", [], {}
+    partial: list[str] = [
+        f"{scenario}: ignored non-Suwon scenario data for Fig.2"
+        for scenario in _unknown_scenarios(frame_rows)
     ]
-    rows = list(_filter_fig2_timeline_rows(rows))
-    if not rows:
-        return [], "adaptation event timestamps missing", []
-    scenarios = sorted({str(row.get("scenario_name", "")) for row in rows})
-    origins = _event_origins(rows)
-    fig, axes = _subplots(len(scenarios), height=2.7)
-    for axis, scenario in zip(axes, scenarios):
-        subset = [row for row in rows if row.get("scenario_name") == scenario]
-        methods = _method_order(row.get("method", "") for row in subset)
-        plotted_x: list[float] = []
-        event_names_seen: set[str] = set()
-        for y, method in enumerate(methods):
-            for event_name, marker in EVENT_MARKERS.items():
-                x_values = [
-                    value
-                    for row in subset
-                    if row.get("method") == method
-                    and row.get("event_name") == event_name
-                    and (value := _relative_event_seconds(row, origins)) is not None
-                ]
-                if x_values:
-                    plotted_x.extend(x_values)
-                    event_names_seen.add(event_name)
-                    axis.scatter(
-                        x_values,
-                        [y] * len(x_values),
-                        marker=marker,
-                        s=26 if marker != "*" else 48,
-                        color=_method_color(method),
-                        edgecolors="white",
-                        linewidths=0.35,
-                        alpha=0.9,
-                    )
-        axis.set_yticks(range(len(methods)), [_method_label(item) for item in methods])
-        axis.set_xlabel("Wall-clock time since method trigger/event (s)")
+    if not _has_formal_scenario(frame_rows):
+        return [], "formal Suwon scenario data missing", partial, {}
+    scenarios = _ordered_scenarios(frame_rows)
+    series_by_run = _frame_series_by_run(frame_rows, metric)
+    timestamped = _timestamped_frames(frame_rows)
+    points: dict[tuple[str, str], list[dict[str, float | str]]] = defaultdict(list)
+    for key, series in series_by_run.items():
+        scenario, method, run_id = key
+        if scenario not in SCENARIO_ORDER:
+            continue
+        total_s = _trigger_to_update_seconds(
+            event_rows,
+            scenario=scenario,
+            method=method,
+            run_id=run_id,
+        )
+        if total_s is None:
+            partial.append(
+                f"{scenario}/{_method_label(method)}/{run_id}: trigger-to-update "
+                "interval missing"
+            )
+            continue
+        update_frame = _update_frame_for_run(
+            event_rows,
+            timestamped,
+            scenario=scenario,
+            method=method,
+            run_id=run_id,
+        )
+        post_f1, accuracy_warning = _post_update_accuracy(series, update_frame)
+        if accuracy_warning:
+            partial.append(f"{scenario}/{_method_label(method)}/{run_id}: {accuracy_warning}")
+        if post_f1 is None:
+            continue
+        points[(scenario, method)].append({"x": total_s, "y": post_f1, "run_id": run_id})
+    if not points:
+        return [], "accuracy/time tradeoff data missing", partial, {}
+
+    fig, axes = plt.subplots(
+        1,
+        len(scenarios),
+        figsize=(7.1, 2.55),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    axes_list = list(axes[0])
+    ellipses: list[str] = []
+    point_only: list[str] = []
+    plotted_methods: set[str] = set()
+    all_y: list[float] = []
+    all_x: list[float] = []
+    for axis, scenario in zip(axes_list, scenarios):
+        scenario_methods = _method_order(
+            method for item_scenario, method in points if item_scenario == scenario
+        )
+        for method in scenario_methods:
+            method_points = points[(scenario, method)]
+            if not method_points:
+                continue
+            xs = [float(point["x"]) for point in method_points]
+            ys = [float(point["y"]) for point in method_points]
+            center_x = float(np.mean(xs))
+            center_y = float(np.mean(ys))
+            width = float(np.std(xs))
+            height = float(np.std(ys))
+            color = _method_color(method)
+            if len(method_points) >= 2:
+                ellipse = Ellipse(
+                    (center_x, center_y),
+                    width=width,
+                    height=height,
+                    facecolor=color,
+                    edgecolor=color,
+                    alpha=0.18,
+                    linewidth=1.0,
+                )
+                axis.add_patch(ellipse)
+                ellipses.append(f"{scenario}/{_method_label(method)}")
+            else:
+                point_only.append(f"{scenario}/{_method_label(method)}")
+                partial.append(
+                    f"{scenario}/{_method_label(method)}: point drawn without ellipse "
+                    "due to insufficient repeats"
+                )
+            axis.scatter(
+                [center_x],
+                [center_y],
+                color=color,
+                marker=_method_marker(method),
+                s=34,
+                edgecolor="white",
+                linewidth=0.45,
+                zorder=5,
+            )
+            axis.annotate(
+                _method_label(method),
+                xy=(center_x, center_y),
+                xytext=(4, 3),
+                textcoords="offset points",
+                fontsize=6,
+                color=color,
+            )
+            plotted_methods.add(method)
+            all_x.extend(xs)
+            all_y.extend(ys)
         axis.set_title(scenario)
+        axis.set_xlabel("Total Retraining Time (s)")
         axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
-        if plotted_x:
-            axis.set_xlim(left=-0.05 * max(plotted_x or [1.0]))
-        _style_axis(axis, grid_axis="x")
-        event_handles = [
-            Line2D(
-                [0],
-                [0],
-                color="#4D4D4D",
-                marker=EVENT_MARKERS[event_name],
-                linestyle="None",
-                markersize=4.2 if EVENT_MARKERS[event_name] != "*" else 6,
-                label=EVENT_LABELS[event_name],
-            )
-            for event_name in EVENT_MARKERS
-            if event_name in event_names_seen
-        ]
-        if event_handles:
-            axis.legend(
-                handles=event_handles,
-                ncol=3,
-                loc="upper center",
-                bbox_to_anchor=(0.5, 1.22),
-            )
-    return _save(fig, figure_dir, "fig2_adaptation_timeline"), None, []
-
-
-def _plot_fig3(
-    summary_rows: list[dict[str, str]],
-    figure_dir: Path,
-    accuracy_definition: str = "",
-) -> tuple[list[str], str | None, list[str]]:
-    aggregated = _aggregate_summary(summary_rows)
-    accuracy_field = _summary_accuracy_field(aggregated)
-    partial: list[str] = []
-    latency_values = [
-        float(value)
-        for row in aggregated
-        if (value := optional_float(row.get("mean_adaptation_ms"))) is not None
-    ]
-    latency_scale, latency_unit = _data_scale(latency_values, "ms")
-    fig, axis = plt.subplots(figsize=(4.8, 3.1), constrained_layout=True)
-    plotted = 0
-    plotted_y: list[float] = []
-    if accuracy_field:
-        plot_points: list[dict[str, Any]] = []
-        for row in aggregated:
-            x_raw = optional_float(row.get("mean_adaptation_ms"))
-            y = optional_float(row.get(accuracy_field))
-            if x_raw is None or y is None:
-                continue
-            upload = optional_float(row.get("mean_upload_bytes"))
-            exposure = optional_float(row.get("mean_raw_exposure_ratio"))
-            bubble_source = upload if upload is not None else exposure
-            size = (
-                34.0
-                if bubble_source is None
-                else 24.0 + 86.0 * math.log10(max(bubble_source, 1.0)) / 10.0
-            )
-            method = str(row["method"])
-            x = x_raw / latency_scale
-            plot_points.append(
-                {
-                    "x": x,
-                    "y": y,
-                    "size": max(40.0, size),
-                    "method": method,
-                    "label": _method_label(method),
-                    "alpha": 0.86,
-                }
-            )
-        for point, xytext in zip(plot_points, _tradeoff_label_offsets(plot_points)):
-            method = str(point["method"])
-            axis.scatter(
-                point["x"],
-                point["y"],
-                s=point["size"],
-                color=_method_color(method),
-                marker=_method_marker(method),
-                alpha=point["alpha"],
-                edgecolors="white",
-                linewidths=0.45,
-            )
-            axis.annotate(
-                str(point["label"]),
-                xy=(point["x"], point["y"]),
-                xytext=xytext,
-                textcoords="offset points",
-                fontsize=6,
-                color=_method_color(method),
-            )
-            plotted_y.append(float(point["y"]))
-            plotted += 1
-        axis.set_ylabel(
-            _accuracy_label(
-                accuracy_field,
-                accuracy_definition,
-                average=True,
-            )
-        )
-        axis.set_title("Accuracy-latency-upload tradeoff")
-    else:
-        partial.append("accuracy unavailable; generated latency-upload tradeoff")
-        upload_values = [
-            float(value)
-            for row in aggregated
-            if (value := optional_float(row.get("mean_upload_bytes"))) is not None
-        ]
-        upload_scale, upload_unit = _data_scale(upload_values, "bytes")
-        plot_points = []
-        for row in aggregated:
-            x_raw = optional_float(row.get("mean_adaptation_ms"))
-            y_raw = optional_float(row.get("mean_upload_bytes"))
-            if x_raw is None or y_raw is None:
-                continue
-            method = str(row["method"])
-            x = x_raw / latency_scale
-            y = y_raw / upload_scale
-            plot_points.append(
-                {
-                    "x": x,
-                    "y": y,
-                    "size": 48,
-                    "method": method,
-                    "label": _method_label(method),
-                    "alpha": 1.0,
-                }
-            )
-        for point, xytext in zip(plot_points, _tradeoff_label_offsets(plot_points)):
-            method = str(point["method"])
-            axis.scatter(
-                point["x"],
-                point["y"],
-                s=point["size"],
-                color=_method_color(method),
-                marker=_method_marker(method),
-                alpha=point["alpha"],
-                edgecolors="white",
-                linewidths=0.45,
-            )
-            axis.annotate(
-                str(point["label"]),
-                xy=(point["x"], point["y"]),
-                xytext=xytext,
-                textcoords="offset points",
-                fontsize=6,
-                color=_method_color(method),
-            )
-            plotted_y.append(float(point["y"]))
-            plotted += 1
-        axis.set_ylabel(f"Mean upload ({upload_unit})")
-        axis.set_title("Latency-upload tradeoff (accuracy unavailable)")
-    if not plotted:
+        _style_axis(axis, grid_axis="both")
+    if not plotted_methods:
         plt.close(fig)
-        return [], "adaptation latency and tradeoff data missing", partial
-    axis.set_xlabel(f"Mean adaptation latency ({latency_unit})")
-    _set_tight_ylim(axis, plotted_y, floor=0.0 if accuracy_field else None)
-    _style_axis(axis, grid_axis="both")
-    if accuracy_field:
-        axis.text(
-            0.02,
-            0.03,
-            "Bubble area: upload",
-            transform=axis.transAxes,
-            fontsize=6,
-            color="#606060",
-            ha="left",
-            va="bottom",
+        return [], "accuracy/time tradeoff data missing for formal Suwon scenarios", partial, {}
+    axes_list[0].set_ylabel(f"Post-update {ylabel}")
+    if all_x:
+        x_margin = max((max(all_x) - min(all_x)) * 0.12, 0.05)
+        for axis in axes_list:
+            axis.set_xlim(max(0.0, min(all_x) - x_margin), max(all_x) + x_margin)
+    _set_tight_ylim(axes_list[0], all_y, floor=0.0)
+    if plotted_methods:
+        fig.legend(
+            handles=_legend_handles(plotted_methods),
+            loc="lower center",
+            ncol=min(4, len(plotted_methods)),
+            bbox_to_anchor=(0.5, -0.04),
         )
+    metadata = {
+        "ellipses_drawn": ellipses,
+        "points_without_ellipse": point_only,
+        "ellipse_width": "std(total_retraining_time_s)",
+        "ellipse_height": "std(post_update_teacher_supervised_f1)",
+    }
     return (
-        _save(fig, figure_dir, "fig3_accuracy_latency_upload_tradeoff"),
+        _save(fig, figure_dir, "fig2_accuracy_retraining_time_tradeoff"),
         None,
         partial,
+        metadata,
     )
 
 
-def _aggregate_breakdown(
-    rows: list[dict[str, str]],
-    fields: list[tuple[str, str]],
-    *,
-    component_aggregation: str = "mean",
-    expected_fields_by_method: Mapping[str, set[str]] | None = None,
-) -> dict[str, dict[str, dict[str, float | None]]]:
-    if component_aggregation not in {"mean", "sum"}:
-        raise ValueError(f"unsupported component aggregation: {component_aggregation}")
-    reducer = _component_mean if component_aggregation == "mean" else _component_sum
-    field_names = [field for field, _ in fields]
-    per_run: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
+def _sum_fields_ms(rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> float | None:
+    values = []
     for row in rows:
-        per_run[
-            (
-                str(row.get("scenario_name", "")),
-                str(row.get("method", "")),
-                str(row.get("run_id", "")),
-            )
-        ].append(row)
-    run_rows = [
-        {
-            "scenario_name": scenario,
-            "method": method,
-            "run_id": run_id,
-            **{
-                field: reducer(field, group)
-                if _expects_component(method, field, expected_fields_by_method)
-                else None
-                for field in field_names
-            },
-        }
-        for (scenario, method, run_id), group in per_run.items()
-    ]
-    values: dict[str, dict[str, dict[str, float | None]]] = {}
-    for scenario in sorted({str(row["scenario_name"]) for row in run_rows}):
-        scenario_rows = [row for row in run_rows if row["scenario_name"] == scenario]
-        values[scenario] = {
-            method: {
-                field: _component_mean(
-                    field,
-                    (row for row in scenario_rows if row["method"] == method),
-                )
-                for field, _ in fields
-            }
-            for method in _method_order(row["method"] for row in scenario_rows)
-        }
-    return values
-
-
-def _expects_component(
-    method: str,
-    field: str,
-    expected_fields_by_method: Mapping[str, set[str]] | None,
-) -> bool:
-    if expected_fields_by_method is None:
-        return True
-    return field in expected_fields_by_method.get(method, set())
-
-
-def _component_mean(field: str, rows: Iterable[Mapping[str, Any]]) -> float | None:
-    if field == "training_ms":
-        return mean_positive(row.get(field) for row in rows)
-    return mean(row.get(field) for row in rows)
-
-
-def _component_sum(field: str, rows: Iterable[Mapping[str, Any]]) -> float | None:
-    values = [
-        value
-        for row in rows
-        if (value := optional_float(row.get(field))) is not None
-    ]
+        for field in fields:
+            value = optional_float(row.get(field))
+            if value is not None:
+                values.append(float(value))
     if not values:
         return None
     return float(sum(values))
 
 
-def _has_positive(row: Mapping[str, Any], field: str) -> bool:
-    value = optional_float(row.get(field))
-    return value is not None and value > 0
-
-
-def _adaptation_stage_rows(
-    rows: list[dict[str, str]],
-    fields: list[tuple[str, str]],
-) -> list[dict[str, str]]:
-    component_fields = [field for field, _ in fields]
-    anchor_fields = (
-        "training_ms",
-        "model_update_download_ms",
-        "model_apply_ms",
-        "total_adaptation_ms",
-    )
-    contexts: dict[tuple[str, str, str, str], dict[str, Any]] = defaultdict(
-        lambda: {"windows": set(), "has_blank_window": False}
-    )
-    for row in rows:
-        if not any(_has_positive(row, field) for field in anchor_fields):
-            continue
-        key = (
-            str(row.get("scenario_name", "")),
-            str(row.get("method", "")),
-            str(row.get("run_id", "")),
-            str(row.get("edge_id", "")),
-        )
-        window_id = str(row.get("window_id", "") or "")
-        if window_id:
-            contexts[key]["windows"].add(window_id)
-        else:
-            contexts[key]["has_blank_window"] = True
-
-    filtered: list[dict[str, str]] = []
-    for row in rows:
-        if not any(optional_float(row.get(field)) is not None for field in component_fields):
-            continue
-        key = (
-            str(row.get("scenario_name", "")),
-            str(row.get("method", "")),
-            str(row.get("run_id", "")),
-            str(row.get("edge_id", "")),
-        )
-        context = contexts.get(key)
-        if context is None:
-            continue
-        window_id = str(row.get("window_id", "") or "")
-        if window_id and window_id in context["windows"]:
-            filtered.append(row)
-        elif not window_id and context["has_blank_window"]:
-            filtered.append(row)
-    return filtered
-
-
-def _stacked_method_bars(
-    rows: list[dict[str, str]],
-    *,
-    fields: list[tuple[str, str]],
-    ylabel: str,
-    title: str,
-    figure_dir: Path,
-    stem: str,
-    component_aggregation: str = "mean",
-    expected_fields_by_method: Mapping[str, set[str]] | None = None,
-) -> tuple[list[str], str | None, list[str]]:
-    values = _aggregate_breakdown(
-        rows,
-        fields,
-        component_aggregation=component_aggregation,
-        expected_fields_by_method=expected_fields_by_method,
-    )
-    scenarios = sorted(values)
-    if not scenarios:
-        return [], "input data missing", []
-    if not any(
-        value is not None and value > 0
-        for scenario_values in values.values()
-        for item in scenario_values.values()
-        for value in item.values()
-    ):
-        return [], "breakdown values missing", []
-    partial = [
-        f"{scenario}/{METHOD_LABELS.get(method, method)} missing {field}"
-        for scenario, scenario_values in values.items()
-        for method, item in scenario_values.items()
-        for field, value in item.items()
-        if value is None
-        and (
-            expected_fields_by_method is None
-            or field in expected_fields_by_method.get(method, set())
-        )
-    ]
-    raw_values = [
-        float(value)
-        for scenario_values in values.values()
-        for item in scenario_values.values()
-        for value in item.values()
-        if value is not None
-    ]
-    kind = "bytes" if "byte" in ylabel.lower() else "ms"
-    scale, unit = _data_scale(raw_values, kind)
-    xlabel = f"{title.split()[0]} ({unit})" if kind == "bytes" else f"{title} ({unit})"
-    fig, axes = _subplots(len(scenarios), width=7.1, height=2.85)
-    for axis, scenario in zip(axes, scenarios):
-        methods = list(values[scenario])
-        y = np.arange(len(methods))
-        lefts = np.zeros(len(methods))
-        for index, (field, label) in enumerate(fields):
-            widths = np.array(
-                [
-                    values[scenario][method][field] / scale
-                    if values[scenario][method][field] is not None
-                    else 0.0
-                    for method in methods
-                ]
-            )
-            if not np.any(widths):
-                continue
-            axis.barh(
-                y,
-                widths,
-                left=lefts,
-                height=0.56,
-                label=label,
-                color=COMPONENT_COLORS[index % len(COMPONENT_COLORS)],
-                edgecolor="white",
-                linewidth=0.55,
-                hatch=COMPONENT_HATCHES[index % len(COMPONENT_HATCHES)],
-            )
-            lefts += widths
-        for index, total in enumerate(lefts):
-            if total > 0:
-                _annotate_bar_value(axis, total, y[index], total, unit)
-        axis.set_yticks(y, [_method_label(method) for method in methods])
-        axis.invert_yaxis()
-        axis.set_xlabel(xlabel)
-        axis.set_title(f"{title}: {scenario}")
-        axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
-        _style_axis(axis, grid_axis="x")
-        legend_handles = [
-            Patch(
-                facecolor=COMPONENT_COLORS[index % len(COMPONENT_COLORS)],
-                edgecolor="white",
-                hatch=COMPONENT_HATCHES[index % len(COMPONENT_HATCHES)],
-                label=label,
-            )
-            for index, (_, label) in enumerate(fields)
-            if any(
-                values[scenario][method][fields[index][0]] is not None
-                and values[scenario][method][fields[index][0]] > 0
-                for method in methods
-            )
+def _component_specs(method: str) -> list[tuple[str, str, str, tuple[str, ...]]]:
+    if method == "plank_road":
+        return [
+            ("transmit", "Ours-Transmit", "transmit", ("upload_ms",)),
+            ("label", "Ours-Label", "label", ("teacher_annotation_ms",)),
+            ("retrain", "Ours-Retrain", "retrain", ("feature_rebuild_ms", "training_ms")),
+            ("update", "Ours-Update", "update", ("model_update_download_ms", "model_apply_ms")),
         ]
-        if legend_handles:
-            axis.legend(
-                handles=legend_handles,
-                ncol=min(3, len(legend_handles)),
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.18),
-            )
-    return _save(fig, figure_dir, stem), None, partial
-
-
-def _plot_fig6(
-    summary_rows: list[dict[str, str]],
-    figure_dir: Path,
-    accuracy_definition: str = "",
-) -> tuple[list[str], str | None, list[str]]:
-    aggregated = _aggregate_summary(summary_rows)
-    metric = next(
-        (
-            field
-            for field in ("mean_adaptation_ms", "mean_upload_bytes", "mean_f1", "mean_map")
-            if len(
-                {
-                    optional_int(row.get("edge_count"))
-                    for row in aggregated
-                    if optional_float(row.get(field)) is not None
-                }
-                - {None}
-            )
-            >= 2
-        ),
-        None,
-    )
-    if metric is None:
-        return [], "at least two edge-count points with one common metric are required", []
-    scenarios = sorted({str(row.get("scenario_name", "")) for row in aggregated})
-    metric_values = [
-        float(value)
-        for row in aggregated
-        if (value := optional_float(row.get(metric))) is not None
-    ]
-    scale, unit = (1.0, "")
-    if metric.endswith("_bytes"):
-        scale, unit = _data_scale(metric_values, "bytes")
-    elif metric.endswith("_ms"):
-        scale, unit = _data_scale(metric_values, "ms")
-    fig, axes = _subplots(len(scenarios), height=2.65)
-    plotted = 0
-    for axis, scenario in zip(axes, scenarios):
-        subset = [row for row in aggregated if row.get("scenario_name") == scenario]
-        plotted_values: list[float] = []
-        for method in _method_order(row.get("method", "") for row in subset):
-            points = sorted(
-                (
-                    int(edge_count),
-                    float(value) / scale,
-                )
-                for row in subset
-                if row.get("method") == method
-                and (edge_count := optional_int(row.get("edge_count"))) is not None
-                and (value := optional_float(row.get(metric))) is not None
-            )
-            if len(points) < 2:
-                continue
-            axis.plot(
-                [item[0] for item in points],
-                [item[1] for item in points],
-                marker=_method_marker(method),
-                color=_method_color(method),
-                linewidth=1.25,
-                markersize=3.8,
-                markeredgecolor="white",
-                markeredgewidth=0.35,
-            )
-            plotted_values.extend(item[1] for item in points)
-            axis.annotate(
-                _method_label(method),
-                xy=(points[-1][0], points[-1][1]),
-                xytext=(4, 0),
-                textcoords="offset points",
-                va="center",
-                fontsize=6,
-                color=_method_color(method),
-                clip_on=False,
-            )
-            plotted += 1
-        axis.set_title(scenario)
-        axis.set_xlabel("Edge count")
-        if metric in {"mean_f1", "mean_map"}:
-            axis.set_ylabel(_accuracy_label(metric, accuracy_definition, average=True))
-            _set_tight_ylim(axis, plotted_values, floor=0.0)
-        else:
-            axis.set_ylabel(f"{metric.replace('_', ' ').title()} ({unit})")
-            _set_tight_ylim(axis, plotted_values, floor=0.0)
-        axis.xaxis.set_major_locator(MaxNLocator(integer=True))
-        _style_axis(axis, grid_axis="both")
-    if not plotted:
-        plt.close(fig)
-        return [], "no method has at least two edge-count points", []
-    return _save(fig, figure_dir, "fig6_multi_edge_scalability"), None, []
-
-
-def _plot_fig7(
-    resource_rows: list[dict[str, str]],
-    event_rows: list[dict[str, str]],
-    frame_rows: list[dict[str, str]],
-    figure_dir: Path,
-) -> tuple[list[str], str | None, list[str]]:
-    grouped: dict[tuple[str, str, str, str], list[tuple[float, str]]] = defaultdict(list)
-    for row in resource_rows:
-        timestamp = optional_float(row.get("timestamp_ms"))
-        stage = str(row.get("stage", ""))
-        if timestamp is None or stage not in {*STAGE_COLORS, "idle"}:
-            continue
-        key = (
-            str(row.get("scenario_name", "")),
-            str(row.get("method", "")),
-            str(row.get("run_id", "")),
-            str(row.get("edge_id", "")),
-        )
-        grouped[key].append((timestamp, stage))
-    intervals = _frame_inference_intervals(frame_rows)
-    for key, points in grouped.items():
-        points.sort()
-        for (start, stage), (end, _) in zip(points, points[1:]):
-            if end > start and stage in STAGE_COLORS:
-                intervals.append((key, start, end, stage))
-    event_pairs = (
-        ("bundle_upload_started", "bundle_upload_done", "uploading"),
-        ("teacher_annotation_started", "teacher_annotation_done", "teacher_annotation"),
-        ("training_job_started", "training_job_succeeded", "training"),
-        ("model_update_downloaded", "model_update_applied", "model_update"),
-    )
-    intervals.extend(_paired_event_intervals(event_rows, event_pairs))
-    if not intervals:
-        return [], "resource stage intervals cannot be determined from timestamps", []
-    intervals = _relative_stage_intervals(intervals)
-    scenarios = sorted({item[0][0] for item in intervals})
-    fig, axes = _subplots(len(scenarios), height=2.9)
-    for axis, scenario in zip(axes, scenarios):
-        subset = [item for item in intervals if item[0][0] == scenario]
-        labels = sorted({f"{_method_label(item[0][1])} edge {item[0][3]}" for item in subset})
-        label_y = {label: index for index, label in enumerate(labels)}
-        for key, start, end, stage in subset:
-            label = f"{_method_label(key[1])} edge {key[3]}"
-            axis.barh(
-                label_y[label],
-                end - start,
-                left=start,
-                color=STAGE_COLORS[stage],
-                edgecolor="white",
-                linewidth=0.55,
-                height=0.64 if stage == "inference" else 0.46,
-                alpha=0.55 if stage == "inference" else 0.95,
-            )
-        axis.set_yticks(range(len(labels)), labels)
-        axis.invert_yaxis()
-        axis.set_xlabel("Time since run-stage start (s)")
-        axis.set_title(scenario)
-        axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
-        _style_axis(axis, grid_axis="x")
-        stage_names = [stage for stage in STAGE_COLORS if any(item[3] == stage for item in subset)]
-        axis.legend(
-            handles=[
-                Patch(
-                    facecolor=STAGE_COLORS[stage],
-                    edgecolor="white",
-                    label=stage.replace("_", " "),
-                )
-                for stage in stage_names
-            ],
-            ncol=min(3, max(1, len(stage_names))),
-            loc="upper center",
-            bbox_to_anchor=(0.5, 1.2),
-        )
-    return _save(fig, figure_dir, "fig7_resource_timeline"), None, []
-
-
-def _plot_fig8(
-    summary_rows: list[dict[str, str]],
-    figure_dir: Path,
-    accuracy_definition: str = "",
-) -> tuple[list[str], str | None, list[str]]:
-    aggregated = _aggregate_summary(summary_rows)
-    accuracy_field = _summary_accuracy_field(aggregated)
-    if accuracy_field is None:
-        return [], "accuracy data missing", []
-    available_methods = _method_order(row.get("method", "") for row in aggregated)
-
-    def complete_methods(latency_field: str) -> list[str]:
-        result = []
-        for method in available_methods:
-            subset = [row for row in aggregated if row.get("method") == method]
-            if all(
-                mean(row.get(field) for row in subset) is not None
-                for field in (accuracy_field, latency_field, "mean_upload_bytes")
-            ):
-                result.append(method)
-        return result
-
-    latency_field = "mean_adaptation_ms"
-    latency_title = "Average adaptation latency (ms)"
-    methods = complete_methods(latency_field)
-    partial: list[str] = []
-    if len(methods) < 2:
-        fallback_methods = complete_methods("mean_latency_ms")
-        if len(fallback_methods) >= 2:
-            methods = fallback_methods
-            latency_field = "mean_latency_ms"
-            latency_title = "Average inference latency (ms)"
-            partial.append(
-                "adaptation latency incomplete; used mean inference latency for fig8"
-            )
-    if len(methods) < 2:
-        return [], "at least two methods require accuracy, latency, and upload data", partial
-    excluded = [method for method in available_methods if method not in methods]
-    if excluded:
-        partial.append(
-            "excluded incomplete method(s) from fig8: "
-            + ", ".join(METHOD_LABELS.get(method, method) for method in excluded)
-        )
-
-    values = {}
-    for method in methods:
-        subset = [row for row in aggregated if row.get("method") == method]
-        values[method] = (
-            mean(row.get(accuracy_field) for row in subset),
-            mean(row.get(latency_field) for row in subset),
-            mean(row.get("mean_upload_bytes") for row in subset),
-        )
-    latency_values = [value[1] for value in values.values() if value[1] is not None]
-    upload_values = [value[2] for value in values.values() if value[2] is not None]
-    latency_scale, latency_unit = _data_scale(latency_values, "ms")
-    upload_scale, upload_unit = _data_scale(upload_values, "bytes")
-    fig, axes = plt.subplots(1, 3, figsize=(7.1, 2.35), constrained_layout=True)
-    y = np.arange(len(methods))
-    labels = [_method_label(method) for method in methods]
-    colors = [_method_color(method) for method in methods]
-    panels = (
-        (
-            0,
-            _accuracy_label(
-                accuracy_field,
-                accuracy_definition,
-                average=True,
+    if method == "pure_edge_local_updating":
+        return [
+            ("retrain", "PureEdge-Retrain", "retrain", ("training_ms",)),
+            ("apply", "PureEdge-Apply", "apply", ("model_apply_ms",)),
+        ]
+    if method == "accuracy_trigger_cloud_retraining":
+        return [
+            ("upload", "AccuracyTrigger-Upload", "upload", ("upload_ms",)),
+            ("label", "AccuracyTrigger-Label", "label", ("teacher_annotation_ms",)),
+            ("retrain", "AccuracyTrigger-Retrain", "retrain", ("training_ms",)),
+            (
+                "update",
+                "AccuracyTrigger-Update",
+                "update",
+                ("model_update_download_ms", "model_apply_ms"),
             ),
-            1.0,
-            "",
-        ),
-        (1, latency_title.replace(" (ms)", f" ({latency_unit})"), latency_scale, latency_unit),
-        (2, f"Average upload ({upload_unit})", upload_scale, upload_unit),
-    )
-    for axis, (index, label_text, scale, unit) in zip(axes, panels):
-        scaled_values = [
-            (values[method][index] or 0.0) / scale
-            for method in methods
         ]
-        axis.barh(
-            y,
-            scaled_values,
-            color=colors,
-            height=0.56,
-            edgecolor="white",
-            linewidth=0.55,
+    if method == "ekya_style_centralized_scheduling":
+        return [
+            ("upload", "Ekya-Upload", "upload", ("upload_ms",)),
+            ("profile", "Ekya-Profile", "profile", ("microprofile_ms",)),
+            ("retrain", "Ekya-Retrain", "retrain", ("training_ms",)),
+            ("update", "Ekya-Update", "update", ("model_update_download_ms", "model_apply_ms")),
+        ]
+    return []
+
+
+def _run_latency_groups(
+    latency_rows: Sequence[Mapping[str, Any]],
+) -> dict[FrameKey, list[Mapping[str, Any]]]:
+    grouped: dict[FrameKey, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in latency_rows:
+        key = (
+            str(row.get("scenario_name", "")),
+            _method_id(row.get("method", "")),
+            str(row.get("run_id", "")),
         )
-        for item_index, value in enumerate(scaled_values):
-            _annotate_bar_value(axis, value, y[item_index], value, unit)
-        axis.set_title(label_text)
-        axis.set_yticks(y, labels if axis is axes[0] else [])
-        axis.invert_yaxis()
-        axis.xaxis.set_major_locator(MaxNLocator(nbins=4))
-        _style_axis(axis, grid_axis="x")
-        axis.set_xlim(left=0)
-    return _save(fig, figure_dir, "fig8_component_ablation_style_summary"), None, partial
+        grouped[key].append(row)
+    return grouped
+
+
+def _total_seconds_for_error(
+    rows: Sequence[Mapping[str, Any]],
+    components_s: Mapping[str, float | None],
+) -> float | None:
+    total_values = [
+        value / 1000.0
+        for row in rows
+        if (value := optional_float(row.get("total_adaptation_ms"))) is not None
+    ]
+    if total_values:
+        return float(np.mean(total_values))
+    component_values = [value for value in components_s.values() if value is not None]
+    if component_values:
+        return float(sum(component_values))
+    return None
+
+
+def _plot_fig3(
+    latency_rows: list[dict[str, Any]],
+    figure_dir: Path,
+) -> tuple[list[str], str | None, list[str], dict[str, Any]]:
+    partial: list[str] = [
+        f"{scenario}: ignored non-Suwon scenario data for Fig.3"
+        for scenario in _unknown_scenarios(latency_rows)
+    ]
+    if not _has_formal_scenario(latency_rows):
+        return [], "formal Suwon latency data missing", partial, {}
+    scenarios = _ordered_scenarios(latency_rows)
+    run_groups = _run_latency_groups(latency_rows)
+    run_components: dict[FrameKey, dict[str, float | None]] = {}
+    run_totals: dict[FrameKey, float | None] = {}
+    for key, rows in run_groups.items():
+        _, method, _ = key
+        components = {
+            label: (
+                value / 1000.0
+                if (value := _sum_fields_ms(rows, fields)) is not None
+                else None
+            )
+            for _, label, _, fields in _component_specs(method)
+        }
+        run_components[key] = components
+        run_totals[key] = _total_seconds_for_error(rows, components)
+
+    values: dict[tuple[str, str, str], float] = {}
+    totals_by_method: dict[tuple[str, str], list[float]] = defaultdict(list)
+    component_meta: dict[str, list[str]] = defaultdict(list)
+    for scenario in scenarios:
+        for method in METHOD_ORDER:
+            method_keys = [
+                key for key in run_components if key[0] == scenario and key[1] == method
+            ]
+            if not method_keys:
+                partial.append(f"{scenario}/{_method_label(method)} missing latency rows")
+                continue
+            for _, label, _, _ in _component_specs(method):
+                measured = [
+                    run_components[key].get(label)
+                    for key in method_keys
+                    if run_components[key].get(label) is not None
+                ]
+                if measured:
+                    values[(scenario, method, label)] = float(np.mean(measured))
+                    component_meta[f"{scenario}/{_method_label(method)}"].append(label)
+                else:
+                    partial.append(
+                        f"{scenario}/{_method_label(method)} omitted {label} because "
+                        "it is not measured"
+                    )
+            totals_by_method[(scenario, method)].extend(
+                total for key in method_keys if (total := run_totals.get(key)) is not None
+            )
+
+    if not values:
+        return [], "retraining time components missing", partial, {}
+
+    fig, axis = plt.subplots(figsize=(7.1, 3.05), constrained_layout=True)
+    x = np.arange(len(scenarios))
+    bar_width = 0.17
+    offsets = np.linspace(-1.5 * bar_width, 1.5 * bar_width, len(METHOD_ORDER))
+    legend_seen: dict[str, Patch] = {}
+    max_total = 0.0
+    for method_index, method in enumerate(METHOD_ORDER):
+        for scenario_index, scenario in enumerate(scenarios):
+            xpos = x[scenario_index] + offsets[method_index]
+            bottom = 0.0
+            for _, label, color_key, _ in _component_specs(method):
+                height = values.get((scenario, method, label))
+                if height is None:
+                    continue
+                color = COMPONENT_COLORS[color_key]
+                axis.bar(
+                    xpos,
+                    height,
+                    bottom=bottom,
+                    width=bar_width,
+                    color=color,
+                    edgecolor="white",
+                    linewidth=0.55,
+                    label=label,
+                )
+                if label not in legend_seen:
+                    legend_seen[label] = Patch(
+                        facecolor=color,
+                        edgecolor="white",
+                        label=label,
+                    )
+                bottom += height
+            totals = totals_by_method.get((scenario, method), [])
+            if totals:
+                max_total = max(max_total, bottom, max(totals))
+            if len(totals) >= 2:
+                axis.errorbar(
+                    [xpos],
+                    [float(np.mean(totals))],
+                    yerr=[float(np.std(totals))],
+                    fmt="none",
+                    ecolor="#404040",
+                    elinewidth=0.7,
+                    capsize=2,
+                    capthick=0.7,
+                    zorder=6,
+                )
+            if bottom > 0:
+                axis.text(
+                    xpos,
+                    bottom + max(0.015, max_total * 0.01),
+                    _method_label(method),
+                    ha="center",
+                    va="bottom",
+                    rotation=90,
+                    fontsize=5.5,
+                    color="#4D4D4D",
+                )
+    axis.set_xticks(x, scenarios)
+    axis.set_ylabel("Average Time Cost for Retraining (s)")
+    axis.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    _style_axis(axis, grid_axis="y")
+    axis.set_ylim(0, max(max_total * 1.22, 0.1))
+    axis.legend(
+        handles=list(legend_seen.values()),
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=min(4, max(1, len(legend_seen))),
+        fontsize=5.6,
+    )
+    metadata = {
+        "components": dict(component_meta),
+        "total_error_bar": "std(total_retraining_time_s across repeats)",
+    }
+    return _save(fig, figure_dir, "fig3_retraining_time_breakdown"), None, partial, metadata
+
+
+def _video_paths_from_report(normalization_report: Mapping[str, Any]) -> dict[str, str]:
+    paths = dict(DEFAULT_VIDEO_PATHS)
+    for item in list(normalization_report.get("scenarios") or []):
+        if not isinstance(item, Mapping):
+            continue
+        scenario = _scenario_name(item.get("scenario_name") or item.get("name"))
+        source = str(item.get("video_source") or item.get("video_path") or "").strip()
+        if scenario in SCENARIO_ORDER and source:
+            paths[scenario] = source
+    return paths
+
+
+def _repeat_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
+    grouped: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for row in rows:
+        scenario = str(row.get("scenario_name", ""))
+        method = _method_id(row.get("method", ""))
+        run_id = str(row.get("run_id", ""))
+        if scenario in SCENARIO_ORDER and method and run_id:
+            grouped[scenario][_method_label(method)].add(run_id)
+    return {
+        scenario: {method: len(run_ids) for method, run_ids in methods.items()}
+        for scenario, methods in grouped.items()
+    }
 
 
 def plot_figures(
     normalized_dir: Path,
     figure_dir: Path,
-    *,
-    external_ekya_summary: Path | None = None,
-    include_external_ekya: bool = False,
 ) -> dict[str, Any]:
     normalization_report_path = normalized_dir / "normalization_report.json"
     normalization_report: dict[str, Any] = {}
@@ -1533,143 +1032,54 @@ def plot_figures(
             normalization_report = {}
     accuracy_definition = str(normalization_report.get("accuracy_definition", "") or "")
     inputs = {
-        name: read_csv(normalized_dir / name)
+        name: _normalized_rows(read_csv(normalized_dir / name))
         for name in (
             "frame_metrics.csv",
             "adaptation_events.csv",
-            "upload_breakdown.csv",
             "latency_breakdown.csv",
-            "resource_timeline.csv",
             "summary.csv",
         )
     }
-    normalized_ekya_rows = sum(
-        1 for rows in inputs.values() for row in rows if row.get("method") == "ekya"
-    )
-    ekya_status = (
-        f"included {normalized_ekya_rows} normalized row(s)"
-        if normalized_ekya_rows
-        else "disabled"
-    )
-    if include_external_ekya:
-        if external_ekya_summary is None or not external_ekya_summary.exists():
-            ekya_status = "requested but external summary missing"
-        else:
-            external_rows = [
-                row for row in read_csv(external_ekya_summary) if row.get("method") == "ekya"
-            ]
-            inputs["summary.csv"].extend(external_rows)
-            ekya_status = f"included {len(external_rows)} external row(s)"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    _remove_outputs(figure_dir, REMOVED_FIGURE_STEMS)
 
-    plotters: dict[
-        str,
-        Callable[[], tuple[list[str], str | None, list[str]]],
-    ] = {
-        "fig1_accuracy_over_time": lambda: _plot_fig1(
-            inputs["frame_metrics.csv"],
-            inputs["adaptation_events.csv"],
-            figure_dir,
-            accuracy_definition,
-        ),
-        "fig2_adaptation_timeline": lambda: _plot_fig2(inputs["adaptation_events.csv"], figure_dir),
-        "fig3_accuracy_latency_upload_tradeoff": lambda: _plot_fig3(
-            inputs["summary.csv"], figure_dir, accuracy_definition
-        ),
-        "fig4_upload_breakdown": lambda: _stacked_method_bars(
-            inputs["upload_breakdown.csv"],
-            fields=[
-                ("raw_frame_bytes", "Raw frames"),
-                ("feature_bytes", "Features"),
-                ("prediction_metadata_bytes", "Prediction metadata"),
-                ("model_update_download_bytes", "Model update download"),
-            ],
-            ylabel="Bytes",
-            title="Upload breakdown",
-            figure_dir=figure_dir,
-            stem="fig4_upload_breakdown",
-        ),
-        "fig5_latency_breakdown": lambda: _stacked_method_bars(
-            _adaptation_stage_rows(
-                inputs["latency_breakdown.csv"],
-                [
-                    ("upload_ms", "Upload"),
-                    ("teacher_annotation_ms", "Teacher annotation"),
-                    ("microprofile_ms", "Microprofile"),
-                    ("feature_rebuild_ms", "Feature rebuild"),
-                    ("training_ms", "Training"),
-                    ("model_update_download_ms", "Model update download"),
-                    ("model_apply_ms", "Model apply"),
-                ],
-            ),
-            fields=[
-                ("upload_ms", "Upload"),
-                ("teacher_annotation_ms", "Teacher annotation"),
-                ("microprofile_ms", "Microprofile"),
-                ("feature_rebuild_ms", "Feature rebuild"),
-                ("training_ms", "Training"),
-                ("model_update_download_ms", "Model update download"),
-                ("model_apply_ms", "Model apply"),
-            ],
-            ylabel="Latency (ms)",
-            title="Total adaptation latency breakdown",
-            figure_dir=figure_dir,
-            stem="fig5_latency_breakdown",
-            component_aggregation="sum",
-            expected_fields_by_method={
-                "pure_edge_local_updating": {"training_ms", "model_apply_ms"},
-                "accuracy_trigger_cloud_retraining": {
-                    "upload_ms",
-                    "training_ms",
-                    "model_update_download_ms",
-                    "model_apply_ms",
-                },
-                "plank_road": {
-                    "upload_ms",
-                    "teacher_annotation_ms",
-                    "feature_rebuild_ms",
-                    "training_ms",
-                    "model_update_download_ms",
-                    "model_apply_ms",
-                },
-                "ekya": {
-                    "teacher_annotation_ms",
-                    "microprofile_ms",
-                    "training_ms",
-                },
-            },
-        ),
-        "fig6_multi_edge_scalability": lambda: _plot_fig6(
-            inputs["summary.csv"],
-            figure_dir,
-            accuracy_definition,
-        ),
-        "fig7_resource_timeline": lambda: _plot_fig7(
-            inputs["resource_timeline.csv"],
-            inputs["adaptation_events.csv"],
-            inputs["frame_metrics.csv"],
-            figure_dir,
-        ),
-        "fig8_component_ablation_style_summary": lambda: _plot_fig8(
-            inputs["summary.csv"],
-            figure_dir,
-            accuracy_definition,
-        ),
-    }
     generated: dict[str, list[str]] = {}
     skipped: dict[str, str] = {}
     partial: dict[str, list[str]] = {}
+    figure_metadata: dict[str, Any] = {}
+    plotters = {
+        "fig1_dynamic_accuracy_recovery": lambda: _plot_fig1(
+            inputs["frame_metrics.csv"],
+            inputs["adaptation_events.csv"],
+            figure_dir,
+            accuracy_definition,
+        ),
+        "fig2_accuracy_retraining_time_tradeoff": lambda: _plot_fig2(
+            inputs["frame_metrics.csv"],
+            inputs["adaptation_events.csv"],
+            figure_dir,
+            accuracy_definition,
+        ),
+        "fig3_retraining_time_breakdown": lambda: _plot_fig3(
+            inputs["latency_breakdown.csv"],
+            figure_dir,
+        ),
+    }
     for stem in FIGURES:
-        outputs, reason, warnings = plotters[stem]()
+        outputs, reason, warnings, metadata = plotters[stem]()
         if outputs:
             generated[stem] = outputs
         if reason:
             skipped[stem] = reason
-            for suffix in EXPORT_SUFFIXES:
-                stale = figure_dir / f"{stem}{suffix}"
-                if stale.exists():
-                    stale.unlink()
+            _remove_outputs(figure_dir, [stem])
         if warnings:
             partial[stem] = warnings
+        if metadata:
+            figure_metadata[stem] = metadata
+
+    all_rows: list[Mapping[str, Any]] = []
+    for rows in inputs.values():
+        all_rows.extend(rows)
     report = {
         "input_files": {
             name: str(normalized_dir / name) for name in inputs if name.endswith(".csv")
@@ -1677,32 +1087,25 @@ def plot_figures(
         "generated_figures": generated,
         "skipped_figures": skipped,
         "partial_data": partial,
-        "ekya_status": ekya_status,
+        "method_order": [_method_label(method) for method in METHOD_ORDER],
+        "method_ids": list(METHOD_ORDER),
+        "scenario_order": list(SCENARIO_ORDER),
+        "video_paths": _video_paths_from_report(normalization_report),
+        "repeat_counts": _repeat_counts(all_rows),
         "accuracy_definition": accuracy_definition,
-        "accuracy_labels": {
-            "f1": _accuracy_label("f1", accuracy_definition),
-            "mean_f1": _accuracy_label(
-                "mean_f1",
-                accuracy_definition,
-                average=True,
-            ),
-        },
-        "video_slugs": sorted(
-            {
-                str(row.get("video_slug", ""))
-                for rows in inputs.values()
-                for row in rows
-                if str(row.get("video_slug", ""))
-            }
+        "post_update_window_frames": POST_UPDATE_WINDOW_FRAMES,
+        "total_retraining_time_definition": (
+            "trigger_decision -> model_update_applied; runs without this exact "
+            "interval are omitted from Fig.2 and reported as partial data."
         ),
+        "figure_metadata": figure_metadata,
         "notes": [
-            "No interpolation, random data, or placeholder curves are generated.",
-            "Missing breakdown components are omitted and reported as partial data.",
+            "No interpolation, random data, synthetic data, or placeholder curves are generated.",
+            "Missing values remain empty; missing components are omitted and reported "
+            "as partial data.",
+            "Pure Edge cloud-upload components are structural noncomponents and are not plotted.",
         ],
     }
-    if external_ekya_summary is not None:
-        report["input_files"]["external_ekya_summary"] = str(external_ekya_summary)
-    figure_dir.mkdir(parents=True, exist_ok=True)
     (figure_dir / "plot_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -1712,27 +1115,16 @@ def plot_figures(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Plot Plank-road and existing baseline normalized experiment results."
+        description="Plot the three paper-facing Plank-road baseline figures."
     )
     parser.add_argument("--normalized_dir", required=True, type=Path)
     parser.add_argument("--figure_dir", required=True, type=Path)
-    parser.add_argument("--external_ekya_summary", type=Path, default=None)
-    parser.add_argument(
-        "--include_external_ekya",
-        action="store_true",
-        help="Include external Ekya rows in summary-driven figures 3, 6, and 8.",
-    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = plot_figures(
-        args.normalized_dir,
-        args.figure_dir,
-        external_ekya_summary=args.external_ekya_summary,
-        include_external_ekya=args.include_external_ekya,
-    )
+    report = plot_figures(args.normalized_dir, args.figure_dir)
     print(
         f"Generated {len(report['generated_figures'])} figure set(s); "
         f"skipped {len(report['skipped_figures'])}."

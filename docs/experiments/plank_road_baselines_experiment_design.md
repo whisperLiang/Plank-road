@@ -1,102 +1,84 @@
-# Plank-road and Existing Baselines Experiment Design
+# Plank-road Baseline Experiment Design
 
-## Comparison boundary
+Preflight HEAD recorded before this refactor:
 
-This experiment framework compares exactly three methods implemented by the
-current repository:
-
-1. `plank_road`, executed through the normal `main` path.
-2. `pure_edge_local_updating`, executed as an existing baseline.
-3. `accuracy_trigger_cloud_retraining`, executed as an existing baseline.
-
-`plank_road` is only a result and plot label. It is not registered as a
-baseline. The removed `plank_road_multi_device` and Ekya implementations are
-not restored. Ekya measurements must come from an external repository and are
-excluded from default plots.
-
-The tools in this directory only normalize existing outputs and draw figures.
-They do not launch edge or cloud processes and do not modify training,
-inference, trigger, cache, feature-shard, sample-pool, annotation, or baseline
-behavior.
-
-## Experiment commands
-
-Use one explicit `run_id` per method, repeat, scenario, and edge-count setting.
-The command templates below show two edges.
-
-Plank-road cloud:
-
-```bash
-python cloud_server.py --yaml_path ./config/config.yaml --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps --run_id plank_road_road_n2_r1
+```text
+74f132d7ab3bd96365bf04d3145c294fb6cbf10e
 ```
 
-Plank-road edges:
+## Comparison Boundary
 
-```bash
-python edge_client.py --yaml_path ./config/config.yaml --mode main --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
-python edge_client.py --yaml_path ./config/config.yaml --mode main --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/road.mp4 --headless
+The paper-facing baseline comparison uses four methods:
+
+1. `plank_road` -> Ours
+2. `pure_edge_local_updating` -> Pure Edge
+3. `accuracy_trigger_cloud_retraining` -> Accuracy-Trigger
+4. `ekya_style_centralized_scheduling` -> Ekya-style
+
+`ekya_style_centralized_scheduling` is the post-processing and paper-facing
+method identity. Production inference, training, protocol fields, scheduling,
+model updates, sample pools, caches, online RPC behavior, and baseline runtime
+behavior are outside the scope of this experiment refactor.
+
+The tools in this directory normalize existing outputs and draw figures. They
+do not launch edge or cloud processes and do not synthesize missing metrics.
+
+## Formal Matrix
+
+Final paper figures require:
+
+```text
+Sunny / Rainy / Snowy Suwon #5a videos
+x
+Ours / Pure Edge / Accuracy-Trigger / Ekya-style
+x
+3 to 5 repeated runs
 ```
 
-Accuracy-Trigger cloud and edges:
+Five repeats are recommended. Three repeats are the minimum. Every method must
+use the same frame range within a scenario. A dynamic clip of 1500 to 3000
+frames is preferred; otherwise document the fixed frame range in the manifest.
 
-```bash
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --listen_address "[::]:50051" --run_id accuracy_trigger_road_n2_r1
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --run_id accuracy_trigger_road_n2_r1 --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --run_id accuracy_trigger_road_n2_r1 --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/road.mp4 --headless
-```
+The weather scenario mapping is explicit:
 
-Pure Edge:
+| Scenario | Video file |
+|---|---|
+| Sunny | `video_data/suwon#5a_01_01.mp4` |
+| Rainy | `video_data/suwon#5a_04_01.mp4` |
+| Snowy | `video_data/suwon#5a_06_01.mp4` |
 
-```bash
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --run_id pure_edge_road_n2_r1 --edge_id 1 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --run_id pure_edge_road_n2_r1 --edge_id 2 --cache_path ./cache/edge_2 --video_path ./video_data/road.mp4 --headless
-```
+The manifest must provide this mapping. The post-processor does not silently
+guess weather labels from filenames.
 
-## Result layout and run mapping
+## Result Layout
 
-Create one comparison directory and copy logs without changing them:
+Use one comparison directory:
 
 ```text
 results/experiments/{comparison_id}/
   manifest.yaml
   raw_logs/
     plank_road/
-      cloud/{run_id}/
-      edge_1/{run_id}/
-      edge_2/{run_id}/
     pure_edge_local_updating/
-      edge_1/{run_id}/
-      edge_2/{run_id}/
     accuracy_trigger_cloud_retraining/
-      cloud/{run_id}/
-      edge_1/{run_id}/
-      edge_2/{run_id}/
+    ekya_style_centralized_scheduling/
   normalized/
   figures/
 ```
 
-Each manifest `runs` entry explicitly maps a run to its method, scenario,
-edges, and raw-log directories. The normalizer does not guess a run from a
-filename and has no legacy-layout fallback. Add another complete set of three
-run entries for every repeat, scenario, or edge-count setting.
+Each `runs` entry maps one run to its method, scenario, edge IDs, repeat, and
+raw-log directories. Add one complete set of method/scenario run entries for
+each repeat. The example manifest at
+`configs/experiments/plank_road_baselines_manifest.example.yaml` lists repeat
+`r1`; duplicate those entries for `r2` through `r5` as needed.
 
 The required `log_timezone` field must name the IANA timezone used by the
-machines that generated the Loguru text logs, for example `Asia/Shanghai`.
-Text logs do not contain a UTC offset, while JSONL metrics use epoch
-timestamps; this declaration keeps cross-file event correlation independent
-of the machine running the post-processor. Missing, empty, or unknown timezone
-names make the manifest invalid.
+machines that generated Loguru text logs, for example `Asia/Shanghai`.
 
-Relevant raw outputs include:
+## Accuracy Input
 
-- `latest_inference_results*.jsonl` from the shared edge inference loop.
-- Baseline `metrics.jsonl`.
-- Current edge/cloud `.log` or `.txt` output.
-- Copied `trigger_manifest.json` and its referenced shard files when exact
-  upload composition is required.
-- An optional precomputed accuracy CSV/JSONL.
-
-Normalize and plot:
+Teacher replay accuracy is the preferred accuracy source for these figures.
+Run the evaluator before normalization:
 
 ```bash
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
@@ -105,7 +87,16 @@ python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
   --teacher_model rtdetr_x \
   --device cuda:0 \
   --update_manifest
+```
 
+The evaluator records `accuracy_definition: teacher_supervised_f1`, leaves mAP
+empty, and keeps teacher replay time outside online latency and communication
+measurements. If an external accuracy file is used instead, it must contain
+real measured values; detection counts and confidence are not accuracy.
+
+## Normalize And Plot
+
+```bash
 python tools/experiments/normalize_plank_road_baseline_logs.py \
   --comparison_dir results/experiments/{comparison_id} \
   --manifest results/experiments/{comparison_id}/manifest.yaml
@@ -115,83 +106,43 @@ python tools/experiments/plot_plank_road_baseline_figures.py \
   --figure_dir results/experiments/{comparison_id}/figures
 ```
 
-## Accuracy input
+The main plotting command emits exactly:
 
-The optional `metrics.accuracy_file` may be CSV or JSONL with:
+- `fig1_dynamic_accuracy_recovery.{svg,pdf,tiff,png}`
+- `fig2_accuracy_retraining_time_tradeoff.{svg,pdf,tiff,png}`
+- `fig3_retraining_time_breakdown.{svg,pdf,tiff,png}`
+- `plot_report.json`
 
-```text
-run_id,method,scenario_name,edge_id,frame_id,timestamp_ms,window_id,f1,map,window_accuracy
-```
+## Figure Semantics
 
-It contains metrics computed by a real evaluation pipeline. The
-`ground_truth_file` manifest field is provenance only; this post-processor does
-not choose an IoU threshold, category mapping, or mAP convention.
-Accuracy-Trigger teacher agreement is stored as `window_accuracy`, not as
-ground-truth F1 or mAP.
+Fig. 1, Dynamic Accuracy Recovery, shows Teacher-supervised F1 over frame ID
+for Sunny, Rainy, and Snowy. Each method curve is the mean across repeats, with
+a standard-deviation band. The plotter does not interpolate missing frame IDs.
 
-The bundled `evaluate_plank_road_baseline_accuracy.py` command provides the
-explicit evaluation step for detection F1. Ground truth may be a one-scenario
-frame-id JSON mapping, JSONL with `scenario_name`, `frame_id`, `boxes`, and
-`labels`, or COCO detection JSON when `--coco_category_id_map` supplies the
-explicit mapping from COCO `category_id` values to model label indices. The
-command records its IoU and score thresholds in a report next to the generated
-accuracy file, then updates `metrics.accuracy_file` and
-`metrics.ground_truth_file`.
+Fig. 2, Accuracy vs Total Retraining Time, shows one repeated-run ellipse per
+scenario and method. The X center is mean total retraining time in seconds; the
+Y center is mean post-update Teacher-supervised F1 over a 300-frame window.
+Ellipse width and height are standard deviations across repeated runs. A point
+without an ellipse is used when fewer than two valid repeats are available.
 
-The video-aware
-`evaluate_plank_road_baseline_teacher_accuracy.py` command instead replays
-fixed-video frames or archived remote-source JPEGs and computes
-Teacher-supervised F1 from teacher pseudo labels. It records
-`accuracy_definition: teacher_supervised_f1`, leaves mAP empty, and keeps all
-teacher replay time outside online latency and communication measurements.
+Fig. 3, Average Time Cost for Retraining Breakdown, shows averaged stacked time
+components. Component definitions are documented in
+`docs/experiments/plank_road_baselines_plot_spec.md`. Unmeasured components are
+omitted and reported; missing latency or accuracy values are not invented.
 
-Experiment metrics record compressed application-payload bytes for raw shards,
-feature shards, metadata/archive overhead, and model downloads. Adaptation
-stage latency uses measured runtime durations when available and paired event
-timestamps as the compatibility fallback; absent event pairs remain empty.
+## Missing Data Rules
 
-## Aggregation and missing data
+- Missing values remain empty.
+- No synthetic data, interpolation, random data, or placeholder curves are
+  generated.
+- Pure Edge cloud upload, cloud label, and model-download components are
+  structural noncomponents and are not plotted.
+- Final paper figures require all four methods for every scenario.
 
-- `summary.csv` has one row per run.
-- Time-series figures use scenario facets and average only observations with
-  the same frame/time coordinate; they do not interpolate.
-- Summary figures first aggregate each run, then average repeated runs for the
-  same method, scenario, and edge count.
-- Missing values remain empty. A missing metric is never converted to zero.
-- Pure Edge cloud-upload fields are structural zeros because the method
-  contract forbids cloud upload. This exception is recorded in
-  `normalization_report.json`.
-- A measured total bundle size may be present while individual byte components
-  are absent. Components are not estimated from the remainder.
+## Centralized Result Repository
 
-Detection count and confidence are not accuracy. Archive size is not silently
-split into raw, feature, and metadata bytes. Inventing either would make the
-result visually precise but scientifically false.
-
-## Figure intent
-
-- Fig. 1 shows post-drift accuracy recovery.
-- Fig. 2 compares first-update response timelines.
-- Fig. 3 shows the accuracy/latency/upload tradeoff, or latency/upload when
-  accuracy is unavailable.
-- Fig. 4 explains communication composition.
-- Fig. 5 decomposes adaptation latency.
-- Fig. 6 studies scaling with edge count.
-- Fig. 7 shows measured resource-stage scheduling.
-- Fig. 8 is the three-metric paper overview.
-
-The exact inputs and skip rules are listed in
-`plank_road_baselines_plot_spec.md`.
-## Centralized result repository
-
-Each formal comparison uses one `comparison_id`, and each method repetition
-uses a globally unique `run_id`. Edge processes stage immutable run artifacts
-under `experiment_results.local_root_dir`; the cloud archives them under
-`experiment_results.root_dir/{comparison_id}` and updates `manifest.yaml`.
-Scenario names are derived from the video filename stem.
-
-The archive RPC is deliberately separate from Plank-road sample bundles and
-baseline frame/window RPCs. It runs only during shutdown, never populates the
-sample pool, never invokes the teacher or training pipeline, and is excluded
-from normalized method communication costs. In particular, Pure Edge may
-archive JSON/JSONL result files without ceasing to be a pure-edge method.
+The archive RPC remains separate from Plank-road sample bundles and baseline
+frame/window RPCs. It runs only during shutdown, never populates the sample
+pool, never invokes the teacher or training pipeline, and is excluded from
+normalized method communication costs. Pure Edge may archive JSON/JSONL result
+files without ceasing to be a pure-edge method.

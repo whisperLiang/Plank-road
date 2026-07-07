@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.experiments.experiment_common import (  # noqa: E402
     ADAPTATION_FIELDS,
     CSV_SCHEMAS,
+    EKYA_CANONICAL_METHOD,
     FRAME_FIELDS,
     LATENCY_FIELDS,
     SUMMARY_FIELDS,
@@ -30,7 +31,7 @@ from tools.experiments.experiment_common import (  # noqa: E402
 )
 
 RAW_METHOD = "ekya_style_cloud_scheduling"
-PLOT_METHOD = "ekya"
+PLOT_METHOD = EKYA_CANONICAL_METHOD
 FrameKey = tuple[int, int, int]
 
 
@@ -119,7 +120,8 @@ def build_ekya_style_row_sets(
     )
     report = {
         "source_raw_dir": str(raw_dir),
-        "method_alias": {RAW_METHOD: plot_method},
+        "raw_method": RAW_METHOD,
+        "plot_method": plot_method,
         "evaluated_frame_count": len(frame_rows),
         "missing_result_count": missing_result_count,
         "dropped_display_count": dropped_display_count,

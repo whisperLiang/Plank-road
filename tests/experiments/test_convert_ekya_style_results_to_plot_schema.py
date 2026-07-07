@@ -19,7 +19,12 @@ from tools.convert_ekya_style_results_to_plot_schema import (
     append_ekya_style_to_normalized_dir,
     convert_ekya_style_results,
 )
-from tools.experiments.experiment_common import CSV_SCHEMAS, read_csv, write_csv
+from tools.experiments.experiment_common import (
+    CSV_SCHEMAS,
+    EKYA_CANONICAL_METHOD,
+    read_csv,
+    write_csv,
+)
 from tools.experiments.plot_plank_road_baseline_figures import plot_figures
 
 
@@ -484,7 +489,8 @@ def test_ekya_converter_writes_existing_csv_schemas_exactly(tmp_path: Path) -> N
 
     for filename, fields in CSV_SCHEMAS.items():
         assert _header(output_dir / filename) == fields
-    assert report["method_alias"] == {"ekya_style_cloud_scheduling": "ekya"}
+    assert report["raw_method"] == "ekya_style_cloud_scheduling"
+    assert report["plot_method"] == EKYA_CANONICAL_METHOD
     assert report["evaluated_frame_count"] == 3
     assert report["missing_result_count"] == 1
     assert report["dropped_display_count"] == 1
@@ -495,7 +501,7 @@ def test_ekya_converter_writes_existing_csv_schemas_exactly(tmp_path: Path) -> N
 
     frames = read_csv(output_dir / "frame_metrics.csv")
     assert [row["frame_id"] for row in frames] == ["1", "2", "3"]
-    assert {row["method"] for row in frames} == {"ekya"}
+    assert {row["method"] for row in frames} == {EKYA_CANONICAL_METHOD}
     assert frames[1]["result_source"] == "missing_result"
     assert frames[1]["num_detections"] == ""
     assert frames[2]["result_source"] == "stale_result"
@@ -931,7 +937,7 @@ def test_ekya_schema_contract_appends_to_existing_normalized_and_plots(
         assert _header(combined / filename) == fields
     summary_rows = read_csv(combined / "summary.csv")
     assert any(row["method"] == "plank_road" for row in summary_rows)
-    assert any(row["method"] == "ekya" for row in summary_rows)
+    assert any(row["method"] == EKYA_CANONICAL_METHOD for row in summary_rows)
 
     report = plot_figures(combined, figures)
     assert (figures / "plot_report.json").exists()

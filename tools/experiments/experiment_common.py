@@ -18,25 +18,20 @@ METHODS = (
     "pure_edge_local_updating",
     "accuracy_trigger_cloud_retraining",
 )
-OPTIONAL_METHODS = ("ekya",)
+EKYA_CANONICAL_METHOD = "ekya_style_centralized_scheduling"
+OPTIONAL_METHODS = (EKYA_CANONICAL_METHOD,)
 SUPPORTED_METHODS = (*METHODS, *OPTIONAL_METHODS)
 METHOD_ORDER = (
+    "plank_road",
     "pure_edge_local_updating",
     "accuracy_trigger_cloud_retraining",
-    "plank_road",
-    "ekya",
+    EKYA_CANONICAL_METHOD,
 )
 METHOD_LABELS = {
-    "plank_road": "Plank-road",
+    "plank_road": "Ours",
     "pure_edge_local_updating": "Pure Edge",
     "accuracy_trigger_cloud_retraining": "Accuracy-Trigger",
-    "ekya": "Ekya-style",
-}
-METHOD_COLORS = {
-    "plank_road": "#1f77b4",
-    "pure_edge_local_updating": "#7f7f7f",
-    "accuracy_trigger_cloud_retraining": "#ff7f0e",
-    "ekya": "#2ca02c",
+    EKYA_CANONICAL_METHOD: "Ekya-style",
 }
 
 FRAME_FIELDS = [
@@ -312,10 +307,12 @@ def load_manifest(path: Path) -> dict[str, Any]:
     for scenario in scenarios:
         if not isinstance(scenario, Mapping):
             raise ManifestError("every scenario must be a mapping")
-        name = str(scenario.get("name", "") or "").strip()
+        name = str(scenario.get("name") or scenario.get("scenario_name") or "").strip()
         if not name or name in scenario_names:
             raise ManifestError("scenario names must be non-empty and unique")
-        video_source = str(scenario.get("video_source", "") or "").strip()
+        video_source = str(
+            scenario.get("video_source") or scenario.get("video_path") or ""
+        ).strip()
         try:
             identity = resolve_video_identity(
                 video_source,
@@ -326,7 +323,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise ManifestError(str(exc)) from exc
         normalized = dict(scenario)
         normalized["name"] = name
+        normalized["scenario_name"] = name
         normalized["video_source"] = video_source
+        normalized["video_path"] = video_source
         normalized["video_slug"] = identity.video_slug
         if identity.video_slug in video_slugs:
             raise ManifestError("scenario video_slug values must be unique")
@@ -616,7 +615,7 @@ def canonical_base(
     return {
         "comparison_id": comparison_id,
         "run_id": str(run["run_id"]),
-        "method": str(run["method"]),
+        "method": str(run["method"]).strip(),
         "edge_id": "" if edge_id is None else int(edge_id),
         "scenario_name": str(run["scenario_name"]),
         "video_slug": str(run.get("video_slug", "")),

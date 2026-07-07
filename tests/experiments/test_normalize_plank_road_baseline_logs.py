@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tools.experiments.experiment_common import CSV_SCHEMAS, ManifestError, read_csv
+from tools.experiments.experiment_common import (
+    CSV_SCHEMAS,
+    EKYA_CANONICAL_METHOD,
+    ManifestError,
+    read_csv,
+)
 from tools.experiments.normalize_plank_road_baseline_logs import _summary_rows, normalize
 
 
@@ -84,16 +89,18 @@ def _manifest(comparison_dir: Path, *, accuracy_file: str | None = None) -> Path
 
 def _append_ekya_run(manifest_path: Path) -> None:
     payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-    payload["methods"].append("ekya")
+    payload["methods"].append(EKYA_CANONICAL_METHOD)
     payload["runs"].append(
         {
             "run_id": "ekya-r1",
-            "method": "ekya",
+            "method": EKYA_CANONICAL_METHOD,
             "scenario_name": "road",
             "edge_ids": [1],
             "raw_logs": {
-                "cloud": "raw_logs/ekya/cloud/ekya-r1",
-                "edges": {"1": "raw_logs/ekya/edge_1/ekya-r1"},
+                "cloud": "raw_logs/ekya_style_centralized_scheduling/cloud/ekya-r1",
+                "edges": {
+                    "1": "raw_logs/ekya_style_centralized_scheduling/edge_1/ekya-r1"
+                },
             },
         }
     )
@@ -128,7 +135,7 @@ def test_summary_rows_training_mean_uses_actual_training_jobs() -> None:
         "runs": [
             {
                 "run_id": "ekya-r1",
-                "method": "ekya",
+                "method": EKYA_CANONICAL_METHOD,
                 "scenario_name": "road",
                 "edge_ids": [1],
             }
@@ -358,7 +365,13 @@ def test_normalizer_converts_ekya_raw_logs_from_manifest(tmp_path: Path) -> None
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     _append_ekya_run(manifest_path)
-    raw = comparison_dir / "raw_logs" / "ekya" / "cloud" / "ekya-r1"
+    raw = (
+        comparison_dir
+        / "raw_logs"
+        / "ekya_style_centralized_scheduling"
+        / "cloud"
+        / "ekya-r1"
+    )
     raw.mkdir(parents=True)
     (raw / "summary.json").write_text(
         json.dumps(
@@ -452,9 +465,10 @@ def test_normalizer_converts_ekya_raw_logs_from_manifest(tmp_path: Path) -> None
 
     frames = read_csv(comparison_dir / "normalized" / "frame_metrics.csv")
     summary = read_csv(comparison_dir / "normalized" / "summary.csv")
-    assert any(row["method"] == "ekya" and row["f1"] == "0.75" for row in frames)
+    assert any(row["method"] == EKYA_CANONICAL_METHOD and row["f1"] == "0.75" for row in frames)
     assert any(
-        row["method"] == "ekya" and row["mean_upload_bytes"] == "123.0" for row in summary
+        row["method"] == EKYA_CANONICAL_METHOD and row["mean_upload_bytes"] == "123.0"
+        for row in summary
     )
     assert report["row_counts"]["frame_metrics.csv"] >= 1
 

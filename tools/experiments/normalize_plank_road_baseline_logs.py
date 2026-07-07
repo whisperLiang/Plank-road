@@ -26,6 +26,7 @@ from tools.experiments.experiment_common import (  # noqa: E402
     ACCURACY_FIELDS,
     ADAPTATION_FIELDS,
     CSV_SCHEMAS,
+    EKYA_CANONICAL_METHOD,
     FRAME_FIELDS,
     LATENCY_FIELDS,
     RESOURCE_FIELDS,
@@ -888,9 +889,9 @@ def _merge_accuracy(
                 {"source": "accuracy_file", "row": index, "reason": f"unknown run_id {run_id!r}"}
             )
             continue
-        method = str(source.get("method", "") or run["method"])
+        method = str(source.get("method", "") or run["method"]).strip()
         scenario_name = str(source.get("scenario_name", "") or run["scenario_name"])
-        if method != run["method"] or scenario_name != run["scenario_name"]:
+        if method != str(run["method"]).strip() or scenario_name != run["scenario_name"]:
             errors.append(
                 {
                     "source": "accuracy_file",
@@ -993,7 +994,7 @@ def _summary_rows(
                 SUMMARY_FIELDS,
                 comparison_id=manifest["comparison_id"],
                 run_id=run_id,
-                method=run["method"],
+                method=str(run["method"]).strip(),
                 scenario_name=run["scenario_name"],
                 edge_count=len(list(run["edge_ids"])),
                 student_model=manifest.get("student_model"),
@@ -1398,7 +1399,7 @@ def _derive_adaptation_latency(
     derived: list[dict[str, Any]] = []
     derived_total_runs: set[str] = set()
     for (run_id, method, edge_id), group in groups.items():
-        if method == "ekya":
+        if str(method).strip() == EKYA_CANONICAL_METHOD:
             continue
         group.sort(key=lambda row: optional_int(row.get("event_time_ms")) or 0)
         job_window_ids = _job_window_ids_from_triggers(group)
@@ -1646,7 +1647,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
     for run in list(manifest["runs"]):
         scenario = scenarios[str(run["scenario_name"])]
         raw_logs = dict(run["raw_logs"])
-        if str(run["method"]) == "ekya":
+        if str(run["method"]).strip() == EKYA_CANONICAL_METHOD:
             source_path = resolve_relative(comparison_dir, raw_logs.get("cloud"))
             if source_path is None or not source_path.exists():
                 if source_path is not None:
@@ -1661,7 +1662,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
                 comparison_id=str(manifest["comparison_id"]),
                 scenario_name=str(run["scenario_name"]),
                 video_slug=str(scenario.get("video_slug", "")),
-                plot_method="ekya",
+                plot_method=EKYA_CANONICAL_METHOD,
             )
             frames.extend(row_sets["frame_metrics.csv"])
             windows.extend(row_sets["window_metrics.csv"])
@@ -1886,6 +1887,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
                 "scenario_name": str(item.get("name", "")),
                 "video_slug": str(item.get("video_slug", "")),
                 "video_source": str(item.get("video_source", "")),
+                "video_path": str(item.get("video_path") or item.get("video_source", "")),
             }
             for item in list(manifest.get("scenarios") or [])
         ],
