@@ -1,13 +1,13 @@
 # Plank-road Real Weather Drift Detection Test
 
 This offline experiment evaluates whether Plank-road's unlabeled drift signals
-detect harmful real-weather shifts on exactly three Suwon `#5a` camera videos:
+detect harmful real-weather shifts on exactly three weather-named videos:
 
-- `suwon#5a_01_01.mp4`: sunny
-- `suwon#5a_04_01.mp4`: rain
-- `suwon#5a_06_01.mp4`: snow
+- `sunny.mp4`: sunny
+- `rainy.mp4`: rainy
+- `snowy.mp4`: snowy
 
-Scene metadata must be explicit and ordered as `sunny`, `rain`, and `snow`;
+Scene metadata must be explicit and ordered as `sunny`, `rainy`, and `snowy`;
 the runner does not infer missing scene names from file names.
 
 ## Evaluation
@@ -17,7 +17,7 @@ the configured start and end margins. The student detector output is compared
 against teacher pseudo-labels on the same real frame with IoU=0.5 and
 class-aware matching.
 
-The sunny scene defines the clean baseline. Rain and snow windows are labeled
+The sunny scene defines the clean baseline. Rainy and snowy windows are labeled
 as harmful drift only when their teacher-pseudo-label F1 drops beyond
 `window.harmful_f1_drop_threshold`. Plank-road drift scores are computed from
 student-side unlabeled signals and evaluated against those harmful-window

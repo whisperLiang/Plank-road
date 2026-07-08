@@ -43,9 +43,9 @@ The weather scenario mapping is explicit:
 
 | Scenario | Video file |
 |---|---|
-| Sunny | `video_data/suwon#5a_01_01.mp4` |
-| Rainy | `video_data/suwon#5a_04_01.mp4` |
-| Snowy | `video_data/suwon#5a_06_01.mp4` |
+| Sunny | `video_data/sunny.mp4` |
+| Rainy | `video_data/rainy.mp4` |
+| Snowy | `video_data/snowy.mp4` |
 
 The manifest must provide this mapping. The post-processor does not silently
 guess weather labels from filenames.

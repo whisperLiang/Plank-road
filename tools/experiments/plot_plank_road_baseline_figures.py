@@ -50,9 +50,9 @@ EXPORT_SUFFIXES = (".svg", ".pdf", ".tiff", ".png")
 EXPORT_DPI = 600
 SCENARIO_ORDER = ("Sunny", "Rainy", "Snowy")
 DEFAULT_VIDEO_PATHS = {
-    "Sunny": "video_data/suwon#5a_01_01.mp4",
-    "Rainy": "video_data/suwon#5a_04_01.mp4",
-    "Snowy": "video_data/suwon#5a_06_01.mp4",
+    "Sunny": "video_data/sunny.mp4",
+    "Rainy": "video_data/rainy.mp4",
+    "Snowy": "video_data/snowy.mp4",
 }
 POST_UPDATE_WINDOW_FRAMES = 300
 FRAME_BIN_SIZE = 50

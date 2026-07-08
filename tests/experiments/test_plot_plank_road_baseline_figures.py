@@ -155,15 +155,15 @@ def _write_complete_normalized(normalized: Path, *, repeats: int = 3) -> None:
                 "scenarios": [
                     {
                         "scenario_name": "Sunny",
-                        "video_source": "video_data/suwon#5a_01_01.mp4",
+                        "video_source": "video_data/sunny.mp4",
                     },
                     {
                         "scenario_name": "Rainy",
-                        "video_source": "video_data/suwon#5a_04_01.mp4",
+                        "video_source": "video_data/rainy.mp4",
                     },
                     {
                         "scenario_name": "Snowy",
-                        "video_source": "video_data/suwon#5a_06_01.mp4",
+                        "video_source": "video_data/snowy.mp4",
                     },
                 ],
             }
@@ -193,9 +193,9 @@ def test_complete_normalized_data_generates_exactly_three_figure_sets(tmp_path: 
     assert report["method_order"] == list(METHOD_LABELS)
     assert report["scenario_order"] == list(SCENARIOS)
     assert report["video_paths"] == {
-        "Sunny": "video_data/suwon#5a_01_01.mp4",
-        "Rainy": "video_data/suwon#5a_04_01.mp4",
-        "Snowy": "video_data/suwon#5a_06_01.mp4",
+        "Sunny": "video_data/sunny.mp4",
+        "Rainy": "video_data/rainy.mp4",
+        "Snowy": "video_data/snowy.mp4",
     }
     assert report["post_update_window_frames"] == 300
     assert report["accuracy_definition"] == "teacher_supervised_f1"

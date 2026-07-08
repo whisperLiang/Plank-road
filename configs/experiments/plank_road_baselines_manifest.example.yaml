@@ -21,16 +21,16 @@ edge_ids:
 # The plotting pipeline does not infer weather labels from filenames.
 scenarios:
   - scenario_name: Sunny
-    video_path: video_data/suwon#5a_01_01.mp4
-    video_slug: suwon5a_01_01
+    video_path: video_data/sunny.mp4
+    video_slug: sunny
     frame_range: [0, 1999]
   - scenario_name: Rainy
-    video_path: video_data/suwon#5a_04_01.mp4
-    video_slug: suwon5a_04_01
+    video_path: video_data/rainy.mp4
+    video_slug: rainy
     frame_range: [0, 1999]
   - scenario_name: Snowy
-    video_path: video_data/suwon#5a_06_01.mp4
-    video_slug: suwon5a_06_01
+    video_path: video_data/snowy.mp4
+    video_slug: snowy
     frame_range: [0, 1999]
 
 # This example lists repeat r1. Duplicate the twelve run entries for r2-r5,

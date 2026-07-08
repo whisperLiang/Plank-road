@@ -149,7 +149,7 @@ WINDOW_METRIC_FIELDS = [
 ]
 
 REAL_WEATHER_SEQUENCE = "suwon5a_real_weather"
-REQUIRED_SCENE_IDS = ("sunny", "rain", "snow")
+REQUIRED_SCENE_IDS = ("sunny", "rainy", "snowy")
 REQUIRED_SCENE_FIELDS = ("scene_id", "scene_label", "video_path")
 
 
