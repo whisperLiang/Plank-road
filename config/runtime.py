@@ -47,10 +47,6 @@ class TeacherReplaySourceConfig(ConfigSection):
 
 @dataclass
 class SourceConfig(ConfigSection):
-    video_path: str = "./video_data/road.mp4"
-    max_count: int = 1000
-    scenario_name: str = ""
-    video_slug: str = ""
     rtsp: RTSPConfig = field(default_factory=RTSPConfig)
     teacher_replay: TeacherReplaySourceConfig = field(default_factory=TeacherReplaySourceConfig)
 
@@ -337,6 +333,8 @@ class ExperimentResultsConfig(ConfigSection):
 class ExperimentRunConfig(ConfigSection):
     experiment_id: str = "default_experiment"
     scenario: str = ""
+    video_path: str = ""
+    max_count: int = 1000
     edge_count: int = 1
     repeat: int | str = 1
 
@@ -863,6 +861,10 @@ def _reject_removed_config_fields(config: RuntimeConfig) -> None:
             config.server.edge_affine_workers,
             {"run_id"},
         ),
+        "client.source": (
+            config.client.source,
+            {"video_path", "max_count", "scenario_name", "video_slug"},
+        ),
     }
     removed: list[str] = []
     for section_path, (section, fields) in removed_by_section.items():
@@ -1001,10 +1003,18 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         experiment_run.experiment_id = sanitize_component(experiment_run.experiment_id)
         if str(experiment_run.scenario or "").strip():
             experiment_run.scenario = normalize_scenario_slug(experiment_run.scenario)
+        experiment_run.video_path = str(experiment_run.video_path or "").strip()
+        experiment_run.max_count = int(experiment_run.max_count)
+        _validate_positive("experiment_run.max_count", experiment_run.max_count)
         experiment_run.edge_count = normalize_edge_count(experiment_run.edge_count)
         experiment_run.repeat = normalize_repeat(experiment_run.repeat)
     except ValueError as exc:
         raise ValueError(f"experiment_run: {exc}") from exc
+    if experiment_run.video_path:
+        config.client.source.video_path = experiment_run.video_path
+    config.client.source.max_count = experiment_run.max_count
+    if experiment_run.scenario:
+        config.client.source.scenario_name = experiment_run.scenario
     experiment_results = config.experiment_results
     for name in ("enabled",):
         if not isinstance(getattr(experiment_results, name), bool):

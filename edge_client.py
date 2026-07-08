@@ -257,7 +257,7 @@ def _validate_startup_config(config, *, require_server_ip: bool = True) -> None:
         _resolve_video_identity(config)
         return
     if not video_path:
-        raise ValueError("client.source.video_path is required unless RTSP is enabled")
+        raise ValueError("experiment_run.video_path is required unless RTSP is enabled")
     if _is_uri_or_camera_source(video_path):
         _resolve_video_identity(config)
         return
@@ -1155,14 +1155,14 @@ if __name__ == "__main__":
         "--video_path",
         type=str,
         default=None,
-        help="override client.source.video_path",
+        help="override experiment_run.video_path for this edge process",
     )
     parser.add_argument("--server_ip", type=str, default=None, help="override client.server_ip")
     parser.add_argument(
         "--max_count",
         type=int,
         default=None,
-        help="override client.source.max_count",
+        help="override experiment_run.max_count for this edge process",
     )
     parser.add_argument(
         "--headless",

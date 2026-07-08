@@ -73,6 +73,8 @@ def test_experiment_run_config_is_loaded_and_normalized(tmp_path) -> None:
 experiment_run:
   experiment_id: suwon5a_weather
   scenario: Rainy Scene
+  video_path: ./video_data/rainy.mp4
+  max_count: 2000
   edge_count: 1
   repeat: r02
 """,
@@ -82,8 +84,13 @@ experiment_run:
 
     assert config.experiment_run.experiment_id == "suwon5a_weather"
     assert config.experiment_run.scenario == "rainy-scene"
+    assert config.experiment_run.video_path == "./video_data/rainy.mp4"
+    assert config.experiment_run.max_count == 2000
     assert config.experiment_run.edge_count == 1
     assert config.experiment_run.repeat == 2
+    assert config.client.source.video_path == "./video_data/rainy.mp4"
+    assert config.client.source.max_count == 2000
+    assert config.client.source.scenario_name == "rainy-scene"
 
 
 def test_experiment_run_defaults_do_not_force_specific_scenario(tmp_path) -> None:
@@ -94,14 +101,18 @@ def test_experiment_run_defaults_do_not_force_specific_scenario(tmp_path) -> Non
 
     assert config.experiment_run.experiment_id == "default_experiment"
     assert config.experiment_run.scenario == ""
+    assert config.experiment_run.video_path == ""
+    assert config.experiment_run.max_count == 1000
     assert config.experiment_run.edge_count == 1
     assert config.experiment_run.repeat == 1
+    assert config.client.source.max_count == 1000
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("experiment_id", '""', "experiment_run.experiment_id"),
+        ("max_count", "0", "experiment_run.max_count"),
         ("edge_count", "0", "edge_count must be a positive integer"),
         ("repeat", "0", "repeat must be a positive integer"),
     ],
@@ -136,6 +147,12 @@ def test_removed_experiment_result_config_fields_are_rejected(tmp_path) -> None:
 experiment_results:
   comparison_id: comparison-a
   upload_to_cloud: true
+client:
+  source:
+    video_path: road.mp4
+    max_count: 2000
+    scenario_name: road
+    video_slug: road
 baseline:
   run_id: old-run
 server:

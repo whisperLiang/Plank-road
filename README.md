@@ -203,7 +203,7 @@ server:
 ```
 
 The baseline inherits shared experiment settings from the main Plank-Road
-configuration: `server.edge_model_name`, `server.golden`, `client.source`,
+configuration: `server.edge_model_name`, `server.golden`, `experiment_run`,
 `server.continual_learning`, `baseline.training`, and
 `baseline.accuracy_trigger_cloud_retraining`.
 
@@ -231,9 +231,9 @@ Useful edge overrides:
 |----------|---------|
 | `--edge_id` | Override `client.edge_id` for multi-edge isolation |
 | `--cache_path` | Override `client.retrain.cache_path`; use one cache per edge |
-| `--video_path` | Override `client.source.video_path` |
+| `--video_path` | Override `experiment_run.video_path` for this edge process |
 | `--server_ip` | Override `client.server_ip` |
-| `--max_count` | Override `client.source.max_count` |
+| `--max_count` | Override `experiment_run.max_count` for this edge process |
 | `--headless` | Run without OpenCV display windows |
 
 ### Real Multi-Device Deployment
@@ -305,13 +305,16 @@ cloud and every edge device. It can be configured once at the top of
 experiment_run:
   experiment_id: suwon5a_weather
   scenario: snowy
+  video_path: ./video_data/snowy.mp4
+  max_count: 2000
   edge_count: 1
   repeat: 1
 ```
 
-CLI values such as `--scenario` and `--repeat` override `experiment_run`.
-`--run_id` is optional; if omitted it is generated from those dimensions and the
-method. Different repeated runs must use different `repeat` values.
+CLI values such as `--scenario`, `--video_path`, `--max_count`, and `--repeat`
+override `experiment_run`. `--run_id` is optional; if omitted it is generated
+from those dimensions and the method. Different repeated runs must use different
+`repeat` values.
 
 The supported baseline methods are:
 

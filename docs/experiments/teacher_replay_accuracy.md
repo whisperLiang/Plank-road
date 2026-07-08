@@ -57,23 +57,26 @@ scenarios use `teacher_accuracy_all.jsonl`.
 
 ## Video identity and replay
 
-`client.source.video_slug` and `client.source.scenario_name` take precedence.
-For a fixed video they otherwise derive from the filename:
+`experiment_run.scenario` names the scenario for experiment paths and replay
+metadata. If it is left empty for a fixed video, the slug is derived from
+`experiment_run.video_path`:
 
 - `road.mp4` becomes `road`.
 - `road_night-rain.mp4` becomes `road_night_rain`.
 
-Slugs contain only lowercase letters, digits, and underscores. RTSP, camera,
-and other URI sources require an explicit slug or scenario name.
+Slugs contain lowercase letters, digits, and separators normalized by the
+experiment loader. RTSP, camera, and other URI sources require an explicit
+`experiment_run.scenario`.
 
 Fixed files are replayed from the original video using the logged 1-based
 `frame_index`. They do not require saved images. For a remote source, enable:
 
 ```yaml
+experiment_run:
+  scenario: north_gate
+  video_path: rtsp://example.invalid/channel/1
 client:
   source:
-    scenario_name: north_gate
-    video_slug: north_gate
     teacher_replay:
       save_sampled_frames: true
       jpeg_quality: 90

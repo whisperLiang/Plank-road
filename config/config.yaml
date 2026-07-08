@@ -1,6 +1,8 @@
 experiment_run:
  experiment_id: suwon5a_weather
  scenario: snowy
+ video_path: ./video_data/snowy.mp4
+ max_count: 2000
  edge_count: 1
  repeat: 1
 
@@ -48,12 +50,7 @@ baseline:
   absolute_accuracy_floor: 0.85
 
 client:
- # the source video
  source:
-  video_path: ./video_data/snowy.mp4
-  max_count: 2000
-  scenario_name: ""
-  video_slug: ""
   rtsp:
    flag: False
    account: your account
