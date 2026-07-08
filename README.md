@@ -45,70 +45,6 @@ python edge_client.py --headless
 
 Runtime defaults come from [config/config.yaml](./config/config.yaml), including video source, model choices, split-learning settings, resource trigger budgets, cloud workspace paths, and gRPC addresses.
 
-### Centralized Experiment Results
-
-Formal experiment runs are archived through a shutdown-only side channel under:
-
-```text
-results/experiments/{experiment_id}/
-  manifest.yaml
-  raw_logs/
-    {scenario_slug}_n{edge_count}_r{repeat}_{method}/
-      cloud/
-      edge_{edge_id}/
-  normalized/
-  figures/
-```
-
-`experiment_results.root_dir` is the cloud repository and
-`experiment_results.local_root_dir` is the edge staging directory. The shared
-run identity can be configured once at the top of `config/config.yaml`:
-
-```yaml
-experiment_run:
-  experiment_id: suwon5a_weather
-  scenario: sunny
-  edge_count: 1
-  repeat: 1
-```
-
-CLI values such as `--scenario` and `--repeat` override `experiment_run`.
-`--run_id` is optional; if omitted it is generated from those dimensions and the
-method.
-
-```shell
-python cloud_server.py
-python edge_client.py --headless --mode main \
-  --edge_id 1
-```
-
-After the required methods for a scenario have produced their staged result
-files, run the video-aware offline teacher replay evaluation:
-
-```shell
-python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
-  --comparison_dir results/experiments/suwon5a_weather \
-  --teacher_model rtdetr_x \
-  --device cuda:0 \
-  --update_manifest
-python tools/experiments/normalize_plank_road_baseline_logs.py \
-  --comparison_dir results/experiments/comparison-001
-python tools/experiments/plot_plank_road_baseline_figures.py \
-  --normalized_dir results/experiments/comparison-001/normalized \
-  --figure_dir results/experiments/comparison-001/figures
-```
-
-Experiment artifact upload is offline archival traffic. It does not enter
-sample ingestion, teacher annotation, retraining, or `upload_breakdown.csv`.
-Pure Edge therefore remains a zero-cloud-communication method for experiment
-metrics; by default it stages result files locally after shutdown and skips
-cloud artifact upload.
-
-Teacher replay is also offline evaluation work. `Teacher-supervised F1` uses
-teacher pseudo labels, not human ground truth, and is excluded from all online
-latency and communication metrics. See
-[the teacher replay guide](./docs/experiments/teacher_replay_accuracy.md).
-
 Generated gRPC files are committed under [grpc_server/](./grpc_server/). Rebuild them only after changing [grpc_server/protos/message_transmission.proto](./grpc_server/protos/message_transmission.proto):
 
 ```shell
@@ -359,7 +295,23 @@ echo quit | nvidia-cuda-mps-control
 
 ### Distributed Baseline Deployment
 
-Baselines are deployed using the same physical edge-cloud topology as Plank-Road, but they are separate comparison methods. Plank-Road itself is not registered as a `baseline_method`. For cloud-backed baselines, the cloud and every edge device must use the same experiment identity; `run_id` is generated unless explicitly overridden.
+Baselines are deployed using the same physical edge-cloud topology as Plank-Road, but they are separate comparison methods. Plank-Road itself is not registered as a `baseline_method`.
+
+Before launching a formal experiment, choose one shared run identity for the
+cloud and every edge device. It can be configured once at the top of
+`config/config.yaml`:
+
+```yaml
+experiment_run:
+  experiment_id: suwon5a_weather
+  scenario: snowy
+  edge_count: 1
+  repeat: 1
+```
+
+CLI values such as `--scenario` and `--repeat` override `experiment_run`.
+`--run_id` is optional; if omitted it is generated from those dimensions and the
+method. Different repeated runs must use different `repeat` values.
 
 The supported baseline methods are:
 
@@ -483,9 +435,18 @@ results/experiments/{experiment_id}/
   manifest.yaml
   raw_logs/
     {scenario_slug}_n{edge_count}_r{repeat}_{method}/
+      cloud/
+      edge_{edge_id}/
   normalized/
   figures/
 ```
+
+`experiment_results.root_dir` is the cloud repository and
+`experiment_results.local_root_dir` is the edge staging directory. Experiment
+artifact upload is offline archival traffic. It does not enter sample ingestion,
+teacher annotation, retraining, or `upload_breakdown.csv`. Pure Edge therefore
+remains a zero-cloud-communication method for experiment metrics; by default it
+stages result files locally after shutdown and skips cloud artifact upload.
 
 Build teacher-supervised F1, normalize logs, and plot:
 
